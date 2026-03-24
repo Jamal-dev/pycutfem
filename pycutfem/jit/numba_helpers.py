@@ -235,6 +235,13 @@ def vector_dot_grad_value(vec_basis, grad_value, dtype):
     """
     if DEBUG: print("vector_dot_grad_value")
     k, n = vec_basis.shape
+    if grad_value.shape[0] == 1 and k == grad_value.shape[1]:
+        res = np.empty((1, n), dtype=dtype)
+        g = np.ascontiguousarray(grad_value[0])
+        V = np.ascontiguousarray(vec_basis)
+        for j in range(n):
+            res[0, j] = np.dot(V[:, j], g)
+        return res
     if grad_value.shape[0] != k:
         raise ValueError("vector·grad value: incompatible shapes")
     d = grad_value.shape[1]
@@ -318,9 +325,11 @@ def dot_grad_func_trial_vec(grad_func, trial_vec, dtype):
 @numba.njit(cache=True)
 def dot_trial_vec_grad_func(trial_vec, grad_func, dtype):
     """
-    Compute Trial vector basis @ grad(Function).T.
+    Compute dot(Trial vector basis, grad(Function)).
     """
     if DEBUG: print("dot_trial_vec_grad_func")
+    if grad_func.shape[0] == 1 and trial_vec.shape[0] == grad_func.shape[1]:
+        return np.ascontiguousarray(grad_func) @ np.ascontiguousarray(trial_vec)
     return grad_func.T.copy() @ trial_vec
 
 

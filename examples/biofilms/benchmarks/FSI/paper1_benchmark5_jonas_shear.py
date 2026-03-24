@@ -69,6 +69,15 @@ from examples.utils.biofilm.deformation_only import build_deformation_only_forms
 
 
 FULL_DOMAIN_LS = AffineLevelSet(1.0, 0.0, -2.0)
+ALPHA_TRANSPORT_VELOCITY = "biofilm_volume"
+ALPHA_TRANSPORT_FORM = "conservative_weak"
+
+
+def _serialize_param(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return str(value)
 
 
 @dataclass(frozen=True)
@@ -249,6 +258,9 @@ def _build_forms(problem: dict[str, object], bench: JonasShearBenchmark, *, qdeg
         M_alpha=float(params["M_alpha"]),
         gamma_alpha=float(params["gamma_alpha"]),
         eps_alpha=float(params["eps_alpha"]),
+        support_physics="internal_conversion",
+        alpha_advect_with=ALPHA_TRANSPORT_VELOCITY,
+        alpha_advection_form=ALPHA_TRANSPORT_FORM,
         g_t_k=Analytic(lambda x, y: bench.g_t(x, y), degree=8),
         g_t_n=Analytic(lambda x, y: bench.g_t(x, y), degree=8),
         traction_weight_k=Analytic(lambda x, y: bench.traction_weight(x, y), degree=8),
@@ -510,12 +522,14 @@ def _solve_one(
         "theta_time": float(bench.theta),
         "newton_iters": int(n_iters),
         "solve_seconds": float(elapsed),
+        "alpha_transport_velocity": ALPHA_TRANSPORT_VELOCITY,
+        "alpha_transport_form": ALPHA_TRANSPORT_FORM,
         "u_interface_error": abs(u_interface_num - u_interface_exact),
         "alpha_interface_error": abs(alpha_interface_num - alpha_interface_exact),
         "tau_interface_exact": float(np.asarray(bench.g_t(*interface_point), dtype=float).reshape(2)[0]),
     }
     row.update(err)
-    row.update({f"param_{k}": float(v) for k, v in bench.params.items()})
+    row.update({f"param_{k}": _serialize_param(v) for k, v in bench.params.items()})
 
     vtk_path = None
     if vtk_dir is not None:
@@ -591,6 +605,8 @@ def _write_outputs(results: list[CaseResult], *, outdir: Path, save_plot: bool, 
     json_path.write_text(
         json.dumps(
             {
+                "alpha_transport_velocity": ALPHA_TRANSPORT_VELOCITY,
+                "alpha_transport_form": ALPHA_TRANSPORT_FORM,
                 "rows": rows,
                 "best_row": rows[-1] if rows else None,
                 "profiles_csv": str(profiles_csv),
@@ -600,7 +616,19 @@ def _write_outputs(results: list[CaseResult], *, outdir: Path, save_plot: bool, 
         ),
         encoding="utf-8",
     )
-    md_path.write_text(_markdown_table(df), encoding="utf-8")
+    md_path.write_text(
+        "\n".join(
+            [
+                "# Benchmark 5 Jonas Shear",
+                "",
+                f"- alpha transport velocity: `{ALPHA_TRANSPORT_VELOCITY}`",
+                f"- alpha transport form: `{ALPHA_TRANSPORT_FORM}`",
+                "",
+                _markdown_table(df),
+            ]
+        ),
+        encoding="utf-8",
+    )
     _write_profiles_csv(profiles_csv, results[-1].profile_samples)
 
     outputs = {
@@ -711,7 +739,9 @@ def _markdown_table(frame: pd.DataFrame) -> str:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Paper 1 Benchmark 5: Jonas-inspired exact shear FSI benchmark.")
+    ap = argparse.ArgumentParser(
+        description="Paper 1 Benchmark 5: Jonas-inspired exact shear FSI benchmark with support-preserving alpha transport."
+    )
     ap.add_argument("--nx-list", type=str, default="8,16,32")
     ap.add_argument("--q", type=int, default=8)
     ap.add_argument("--q-error", type=int, default=10)

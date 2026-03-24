@@ -112,7 +112,7 @@ PROFILE_CONFIGS = {
                 }
             }
         },
-        "benchmark6": {"overrides": {"benchmark6_blauert_channel": {}}},
+        "benchmark6": {"overrides": {"benchmark6_christan_channel": {}}},
     },
     "baseline": {
         "mms": {
@@ -164,9 +164,9 @@ PROFILE_CONFIGS = {
                 "benchmark4_terzaghi": {
                     "ny_list": "16,32",
                     "nx_cells": "4",
-                    "steps_per_ny": "4",
+                    "steps_per_ny": "8",
                     "Tv_final": "1.0",
-                    "sample_tv": "0.20,0.50,1.00",
+                    "sample_tv": "0.50,1.00",
                     "png_dpi": "220",
                 }
             }
@@ -183,7 +183,7 @@ PROFILE_CONFIGS = {
                 }
             }
         },
-        "benchmark6": {"overrides": {"benchmark6_blauert_channel": {}}},
+        "benchmark6": {"overrides": {"benchmark6_christan_channel": {}}},
     },
     "production": {
         "mms": {
@@ -235,9 +235,9 @@ PROFILE_CONFIGS = {
                 "benchmark4_terzaghi": {
                     "ny_list": "16,32,64",
                     "nx_cells": "4",
-                    "steps_per_ny": "4",
+                    "steps_per_ny": "8",
                     "Tv_final": "1.0",
-                    "sample_tv": "0.20,0.50,1.00",
+                    "sample_tv": "0.50,1.00",
                     "png_dpi": "280",
                 }
             }
@@ -254,7 +254,7 @@ PROFILE_CONFIGS = {
                 }
             }
         },
-        "benchmark6": {"overrides": {"benchmark6_blauert_channel": {}}},
+        "benchmark6": {"overrides": {"benchmark6_christan_channel": {}}},
     },
 }
 
@@ -340,11 +340,11 @@ CASE_SPECS = (
         output_key="jonas_shear",
     ),
     CaseSpec(
-        key="benchmark6_blauert_channel",
-        label="Application benchmark: Blauert attached-patch channel deformation",
+        key="benchmark6_christan_channel",
+        label="Application benchmark: Christan Biofilm I channel deformation",
         family="benchmark6",
-        driver_rel="examples/biofilms/benchmarks/blauert/paper1_benchmark6_blauert_channel.py",
-        output_key="blauert_channel",
+        driver_rel="examples/biofilms/benchmarks/christan/paper1_benchmark6_christan_channel.py",
+        output_key="christan_channel",
     ),
 )
 
@@ -504,7 +504,7 @@ def _build_case_command(spec: CaseSpec, *, profile: str, run_dir: Path, env_name
             "--sample-tv",
             merged["sample_tv"],
             "--backend",
-            "jit",
+            "cpp",
             "--png-dpi",
             merged["png_dpi"],
             "--quiet",
@@ -594,7 +594,7 @@ def _case_csv(case_dir: Path, spec: CaseSpec) -> Path:
     if spec.family == "benchmark5":
         return case_dir / "benchmark5_jonas_shear_summary.csv"
     if spec.family == "benchmark6":
-        return case_dir / "benchmark6_blauert_channel_summary.csv"
+        return case_dir / "benchmark6_christan_channel_summary.csv"
     return case_dir / f"deformation_only_interface_transport_{spec.output_key}.csv"
 
 
@@ -608,7 +608,7 @@ def _case_convergence_png(case_dir: Path, spec: CaseSpec) -> Path:
     if spec.family == "benchmark5":
         return case_dir / "benchmark5_jonas_shear_convergence.png"
     if spec.family == "benchmark6":
-        return case_dir / "benchmark6_blauert_channel_mesh_sensitivity.png"
+        return case_dir / "benchmark6_christan_channel_mesh_sensitivity.png"
     return case_dir / f"deformation_only_interface_transport_{spec.output_key}_convergence.png"
 
 
@@ -721,6 +721,7 @@ def _summary_metric(spec: CaseSpec, finest: dict[str, str]) -> str:
         return (
             f"n_y={_fmt_int(finest.get('ny'))}, "
             f"max pL2={_fmt_float(finest.get('max_pbar_l2'))}, "
+            f"max pFieldL2={_fmt_float(finest.get('max_pbar_field_l2'))}, "
             f"max pInf={_fmt_float(finest.get('max_pbar_linf'))}, "
             f"max s={_fmt_float(finest.get('max_settlement_bar_error'))}"
         )
@@ -735,9 +736,9 @@ def _summary_metric(spec: CaseSpec, finest: dict[str, str]) -> str:
     if spec.family == "benchmark6":
         return (
             f"n_x={_fmt_int(finest.get('nx'))}, "
-            f"RMSE={_fmt_float(finest.get('global_rmse_um'))} um, "
-            f"mean per-y={_fmt_float(finest.get('mean_per_y_rmse_um'))} um, "
-            f"contour(2s)={_fmt_float(finest.get('contour_rmse_2.0s_um'))} um"
+            f"contour RMSE={_fmt_float(finest.get('combined_profile_rmse_um'))} um, "
+            f"mean |dx|={_fmt_float(finest.get('combined_mean_dx_abs_error_um'))} um, "
+            f"nearest max={_fmt_float(finest.get('combined_nearest_max_um'))} um"
         )
     return (
         f"max|dm|={_fmt_float(finest.get('max_mass_drift'))}, "
@@ -780,10 +781,10 @@ def _summary_note(spec: CaseSpec, finest: dict[str, str]) -> str:
         )
     if spec.family == "benchmark6":
         return (
-            "Blauert attached-patch channel benchmark; the full one-domain deformation block "
-            "with active porosity transport and conserved CH interface evolution is calibrated "
-            "against the OCT video using global and per-height front histories, then checked "
-            "on a mesh ladder with contour overlays at representative times."
+            "Christan Biofilm I channel benchmark; the reduced one-domain deformation path "
+            "with fixed body porosity and conserved CH interface transport is calibrated "
+            "against the unloaded/loaded OCT contour pair reported by Picioreanu et al., then "
+            "checked on a mesh ladder with contour overlays and front-displacement profiles."
         )
     if spec.output_key == "translation":
         return "Rigid-body transport benchmark; Crank-Nicolson with light SUPG is used to suppress artificial interface decay."
@@ -889,11 +890,12 @@ def _table_spec(spec: CaseSpec) -> dict[str, list[tuple[str, str]]]:
             "summary": [
                 ("ny", r"$n_y$"),
                 ("num_time_steps", "steps"),
-                ("max_pbar_l2", r"$\max \|\bar p_h-\bar p_{\mathrm{ex}}\|_{L^2}$"),
-                ("max_pbar_linf", r"$\max \|\bar p_h-\bar p_{\mathrm{ex}}\|_{L^\infty}$"),
-                ("max_mid_pressure_bar_error", r"$\max |\bar p_h(H/2)-\bar p_{\mathrm{ex}}(H/2)|$"),
-                ("max_settlement_bar_error", r"$\max |\bar s_h-\bar s_{\mathrm{ex}}|$"),
-                ("final_settlement_bar_error", r"$|\bar s_h(T)-\bar s_{\mathrm{ex}}(T)|$"),
+                ("max_pbar_l2", r"$e_{\bar p}^{L^2}$"),
+                ("max_pbar_field_l2", r"$e_p^{L^2}/p_0$"),
+                ("max_pbar_linf", r"$e_{\bar p}^{L^\infty}$"),
+                ("max_mid_pressure_bar_error", r"$e_{\bar p}^{\mathrm{mid}}$"),
+                ("max_settlement_bar_error", r"$e_{\bar s}$"),
+                ("final_settlement_bar_error", r"$e_{\bar s}(T)$"),
             ]
         }
     if spec.family == "benchmark5":
@@ -922,10 +924,10 @@ def _table_spec(spec: CaseSpec) -> dict[str, list[tuple[str, str]]]:
             "summary": [
                 ("nx", r"$n_x$"),
                 ("ny", r"$n_y$"),
-                ("global_rmse_um", r"global RMSE [$\mu$m]"),
-                ("mean_per_y_rmse_um", r"mean per-$y$ RMSE [$\mu$m]"),
-                ("contour_rmse_2.0s_um", r"contour RMSE at $t=2$ s [$\mu$m]"),
-                ("contour_rmse_4.0s_um", r"contour RMSE at $t=4$ s [$\mu$m]"),
+                ("combined_profile_rmse_um", r"contour RMSE [$\mu$m]"),
+                ("combined_mean_dx_abs_error_um", r"mean $|\Delta x|$ error [$\mu$m]"),
+                ("combined_mean_front_abs_error_um", r"mean front error [$\mu$m]"),
+                ("combined_nearest_max_um", r"max nearest distance [$\mu$m]"),
             ]
         }
     return {
@@ -961,17 +963,33 @@ def _resolution_label(spec: CaseSpec, finest: dict[str, str]) -> str:
     return _fmt_int(finest.get("nx"))
 
 
-def _write_case_table(path: Path, *, rows: list[dict[str, str]], columns: list[tuple[str, str]]) -> None:
+def _write_case_table(
+    path: Path,
+    *,
+    rows: list[dict[str, str]],
+    columns: list[tuple[str, str]],
+    resize_to_line: bool = False,
+    font_cmd: str = "small",
+    tabcolsep_pt: float | None = None,
+    trim_outer_padding: bool = False,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     align = "".join("r" for _ in columns)
-    lines = [
-        "{\\small",
-        "\\begin{center}",
-        f"\\begin{{tabular}}{{{align}}}",
+    if bool(trim_outer_padding):
+        align = f"@{{}}{align}@{{}}"
+    lines = [f"{{\\{str(font_cmd).strip() or 'small'}", "\\begin{center}"]
+    if tabcolsep_pt is not None:
+        lines.append(f"\\setlength{{\\tabcolsep}}{{{float(tabcolsep_pt):.1f}pt}}")
+    if bool(resize_to_line):
+        lines.append("\\resizebox{\\linewidth}{!}{%")
+    lines.extend(
+        [
+            f"\\begin{{tabular}}{{{align}}}",
         "\\toprule",
         " & ".join(label for _, label in columns) + r" \\",
         "\\midrule",
-    ]
+        ]
+    )
     for row in rows:
         vals = [_format_table_value(key, row.get(key, "")) for key, _ in columns]
         lines.append(" & ".join(vals) + r" \\")
@@ -979,6 +997,7 @@ def _write_case_table(path: Path, *, rows: list[dict[str, str]], columns: list[t
         [
             "\\bottomrule",
             "\\end{tabular}",
+            "}" if bool(resize_to_line) else "",
             "\\end{center}",
             "}",
             "",
@@ -1080,27 +1099,30 @@ def _publish_case_assets(spec: CaseSpec, *, case_dir: Path, rows: list[dict[str,
         summary_name = "benchmark5_jonas_shear_summary.json"
     elif spec.family == "benchmark6":
         _write_case_table(
-            VERIFICATION_GENERATED / "benchmark6_blauert_channel_table.tex",
+            VERIFICATION_GENERATED / "benchmark6_christan_channel_table.tex",
             rows=rows,
             columns=spec_tables["summary"],
         )
         shutil.copy2(_case_csv(case_dir, spec), VERIFICATION_GENERATED / f"benchmark6_{spec.output_key}_{profile}.csv")
         extra_files = [
-            ("benchmark6_blauert_channel_calibration.csv", "benchmark6_blauert_channel_calibration.csv"),
-            ("benchmark6_blauert_channel_history.png", "benchmark6_blauert_channel_history.png"),
-            ("benchmark6_blauert_channel_contours.png", "benchmark6_blauert_channel_contours.png"),
-            ("benchmark6_blauert_channel_mesh_sensitivity.png", "benchmark6_blauert_channel_mesh_sensitivity.png"),
+            ("benchmark6_christan_channel_calibration.csv", "benchmark6_christan_channel_calibration.csv"),
+            ("benchmark6_christan_channel_contours.png", "benchmark6_christan_channel_contours.png"),
+            ("benchmark6_christan_channel_front_profile.png", "benchmark6_christan_channel_front_profile.png"),
+            ("benchmark6_christan_channel_mesh_sensitivity.png", "benchmark6_christan_channel_mesh_sensitivity.png"),
         ]
         for src_name, dst_name in extra_files:
             src = case_dir / src_name
             if src.exists():
                 shutil.copy2(src, VERIFICATION_GENERATED / dst_name)
-        summary_name = "benchmark6_blauert_channel_summary.json"
+        summary_name = "benchmark6_christan_channel_summary.json"
     else:
         _write_case_table(
             VERIFICATION_GENERATED / "benchmark4_terzaghi_table.tex",
             rows=rows,
             columns=spec_tables["summary"],
+            font_cmd="scriptsize",
+            tabcolsep_pt=2.0,
+            trim_outer_padding=True,
         )
         shutil.copy2(_case_csv(case_dir, spec), VERIFICATION_GENERATED / f"benchmark4_{spec.output_key}_{profile}.csv")
         extra_pngs = [
@@ -1171,7 +1193,7 @@ def _write_summary(entries: list[dict[str, str]], *, profile: str, run_tag: str)
     tex_lines = [
         "{\\small",
         "\\begin{center}",
-        "\\begin{tabular}{p{0.28\\linewidth}p{0.10\\linewidth}p{0.08\\linewidth}p{0.38\\linewidth}}",
+        "\\begin{tabular}{p{0.27\\linewidth}p{0.10\\linewidth}p{0.09\\linewidth}p{0.37\\linewidth}}",
         "\\toprule",
         "Case & Status & Resolution & Summary \\\\",
         "\\midrule",

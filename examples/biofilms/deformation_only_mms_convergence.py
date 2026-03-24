@@ -39,6 +39,15 @@ from examples.utils.biofilm.mms_deformation_only import (
 
 
 FULL_DOMAIN_LS = AffineLevelSet(1.0, 0.0, -2.0)
+ALPHA_TRANSPORT_VELOCITY = "biofilm_volume"
+ALPHA_TRANSPORT_FORM = "conservative_weak"
+
+
+def _serialize_param(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return str(value)
 
 
 def _tag_unit_square_boundaries(mesh: Mesh, *, tol: float = 1.0e-12) -> None:
@@ -193,6 +202,9 @@ def _build_forms(problem, mms: DeformationOnlyMMS, *, qdeg: int):
         M_alpha=float(params["M_alpha"]),
         gamma_alpha=float(params["gamma_alpha"]),
         eps_alpha=float(params["eps_alpha"]),
+        support_physics="internal_conversion",
+        alpha_advect_with=ALPHA_TRANSPORT_VELOCITY,
+        alpha_advection_form=ALPHA_TRANSPORT_FORM,
         f_v=Analytic(lambda x, y: mms.f_v(x, y), degree=10),
         f_u=Analytic(lambda x, y: mms.f_u(x, y), degree=10),
         f_alpha=Analytic(lambda x, y: mms.f_alpha(x, y), degree=10),
@@ -453,9 +465,11 @@ def _solve_one(
         "theta": float(theta),
         "newton_iters": int(n_iters),
         "solve_seconds": float(elapsed),
+        "alpha_transport_velocity": ALPHA_TRANSPORT_VELOCITY,
+        "alpha_transport_form": ALPHA_TRANSPORT_FORM,
     }
     row.update(err)
-    row.update({f"param_{k}": float(v) for k, v in mms.params.items()})
+    row.update({f"param_{k}": _serialize_param(v) for k, v in mms.params.items()})
     return row
 
 
@@ -500,6 +514,8 @@ def _write_outputs(case: str, rows: list[dict[str, float]], *, outdir: Path, sav
     tex_path.write_text(latex, encoding="utf-8")
     summary = {
         "case": case_key,
+        "alpha_transport_velocity": ALPHA_TRANSPORT_VELOCITY,
+        "alpha_transport_form": ALPHA_TRANSPORT_FORM,
         "rows": rows,
         "best_row": rows[-1] if rows else None,
     }
@@ -508,6 +524,8 @@ def _write_outputs(case: str, rows: list[dict[str, float]], *, outdir: Path, sav
     md_lines = [
         f"# Reduced deformation-only MMS: {case_key}",
         "",
+        f"- alpha transport velocity: `{ALPHA_TRANSPORT_VELOCITY}`",
+        f"- alpha transport form: `{ALPHA_TRANSPORT_FORM}`",
         f"- rows: {len(rows)}",
         f"- finest nx: {rows[-1]['nx'] if rows else '-'}",
         f"- finest Newton iterations: {rows[-1]['newton_iters'] if rows else '-'}",
@@ -549,7 +567,9 @@ def _write_outputs(case: str, rows: list[dict[str, float]], *, outdir: Path, sav
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Reduced deformation-only MMS h-convergence study.")
+    ap = argparse.ArgumentParser(
+        description="Reduced deformation-only MMS h-convergence study with support-preserving alpha transport."
+    )
     ap.add_argument("--case", type=str, default="static", choices=("static", "translation", "shear"))
     ap.add_argument("--nx-list", type=str, default="4,8,12")
     ap.add_argument("--q", type=int, default=8)

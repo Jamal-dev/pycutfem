@@ -1529,7 +1529,12 @@ class DofHandler:
         base = int(info["edge_base"])
         edge_gid = int(edge_gid)
         edge = self.mixed_element.mesh.edge(int(edge_gid))
-        n0, n1 = int(edge.nodes[0]), int(edge.nodes[1])
+        edge_nodes = tuple(int(n) for n in (getattr(edge, "all_nodes", None) or edge.nodes))
+        if len(edge_nodes) >= 2:
+            n0 = int(edge_nodes[0])
+            n1 = int(edge_nodes[-1])
+        else:
+            n0, n1 = int(edge.nodes[0]), int(edge.nodes[1])
         key = (min(n0, n1), max(n0, n1))
         key2ent = info.get("edge_key_to_entity", None)
         if not isinstance(key2ent, dict):
@@ -1654,7 +1659,8 @@ class DofHandler:
                 coeff = np.zeros(m + 1, dtype=float)
                 coeff[-1] = 1.0
                 Pm = legval(s, coeff)
-                out[int(dofs[m])] = float(np.sum(wts * flux * Pm))
+                gd = int(dofs[m])
+                out[gd] = float(out.get(gd, 0.0) + np.sum(wts * flux * Pm))
 
         return out
 
@@ -8431,16 +8437,63 @@ class DofHandler:
                     J_inv[e, q, 1, 1] =  a00 * invd
 
         # ---- basis & first derivatives (union-sized, boundary quadrature) ---------
-        b_tabs = {f: np.zeros((n_edges, n_q, n_loc_out), dtype=float) for f in fields}
-        g_tabs = {f: np.zeros((n_edges, n_q, n_loc_out, 2), dtype=float) for f in fields}
+        families = getattr(me, "_field_families", {}) if me is not None else {}
+        rt_fields = [f for f in fields if isinstance(families, dict) and families.get(f) == "RT"]
+        scalar_fields = [f for f in fields if f not in rt_fields]
+
+        b_tabs = {f: np.zeros((n_edges, n_q, n_loc_out), dtype=float) for f in scalar_fields}
+        g_tabs = {f: np.zeros((n_edges, n_q, n_loc_out, 2), dtype=float) for f in scalar_fields}
         xi_flat  = xi_tab.reshape(-1)
         eta_flat = eta_tab.reshape(-1)
-        for fld in fields:
+        for fld in scalar_fields:
             sl = _field_new_slice(fld)
             B = me._eval_scalar_basis_many(fld, xi_flat, eta_flat).reshape(n_edges, n_q, -1)
             G = me._eval_scalar_grad_many (fld, xi_flat, eta_flat).reshape(n_edges, n_q, -1, 2)
             b_tabs[fld][:, :, sl]    = B
             g_tabs[fld][:, :, sl, :] = G
+
+        hdiv_tabs: Dict[str, np.ndarray] = {}
+        for fld in rt_fields:
+            ref_rt = me._ref[fld]
+            sl_out = _field_new_slice(fld)
+            sl_full = me.component_dof_slices[fld]
+            nloc_f = int(sl_full.stop - sl_full.start)
+
+            bvec = np.zeros((n_edges, n_q, 2, n_loc_out), dtype=float)
+            div = np.zeros((n_edges, n_q, n_loc_out), dtype=float)
+            sign = np.ones((n_edges, n_loc_out), dtype=float)
+
+            for i, eid in enumerate(owner):
+                eid_i = int(eid)
+                sgn_loc = np.asarray(self.element_signs[fld][eid_i], dtype=float).ravel()
+                if sgn_loc.shape[0] != nloc_f:
+                    raise RuntimeError(
+                        f"RT element_signs length mismatch for field '{fld}' on element {eid_i}."
+                    )
+                sign[i, sl_out] = sgn_loc
+                for q in range(n_q):
+                    xi = float(xi_tab[i, q])
+                    eta = float(eta_tab[i, q])
+                    Vhat = np.asarray(ref_rt.tabulate_value(xi, eta), dtype=float)
+                    if Vhat.shape != (nloc_f, 2):
+                        raise RuntimeError("RT tabulate_value shape mismatch in boundary precompute.")
+                    bvec[i, q, 0, sl_out] = Vhat[:, 0]
+                    bvec[i, q, 1, sl_out] = Vhat[:, 1]
+
+                    dV = np.asarray(ref_rt.tabulate_div(xi, eta), dtype=float).ravel()
+                    if dV.shape[0] != nloc_f:
+                        raise RuntimeError("RT tabulate_div shape mismatch in boundary precompute.")
+                    div[i, q, sl_out] = dV
+
+            hdiv_tabs[f"bvec_{fld}"] = np.ascontiguousarray(bvec)
+            hdiv_tabs[f"div_{fld}"] = np.ascontiguousarray(div)
+            hdiv_tabs[f"sign_{fld}"] = np.ascontiguousarray(sign)
+            hdiv_tabs[f"bvec_{fld}_pos"] = hdiv_tabs[f"bvec_{fld}"]
+            hdiv_tabs[f"bvec_{fld}_neg"] = hdiv_tabs[f"bvec_{fld}"]
+            hdiv_tabs[f"div_{fld}_pos"] = hdiv_tabs[f"div_{fld}"]
+            hdiv_tabs[f"div_{fld}_neg"] = hdiv_tabs[f"div_{fld}"]
+            hdiv_tabs[f"sign_{fld}_pos"] = hdiv_tabs[f"sign_{fld}"]
+            hdiv_tabs[f"sign_{fld}_neg"] = hdiv_tabs[f"sign_{fld}"]
 
         # ---- Inverse-map jets for chain rule (Hxi: 2nd, Txi: 3rd, Qxi: 4th) -------
         if need_hess or need_o3 or need_o4:
@@ -8480,7 +8533,7 @@ class DofHandler:
         if max_req >= 3: base |= {(3,0), (2,1), (1,2), (0,3)}
         if max_req >= 4: base |= {(4,0), (3,1), (2,2), (1,3), (0,4)}
         derivs |= base
-        for fld in fields:
+        for fld in scalar_fields:
             sl = _field_new_slice(fld)
             p_f = self.mixed_element._field_orders[fld]
             if isinstance(sl, slice):
@@ -8526,6 +8579,8 @@ class DofHandler:
         out = {
             "eids":        np.asarray(edge_ids, dtype=np.int32),
             "qp_phys":     qp_phys,
+            "qref":        np.stack((xi_tab, eta_tab), axis=2),
+            "qp_ref":      np.stack((xi_tab, eta_tab), axis=2),
             "qw":          qw,
             "normals":     normals,
             "detJ":        detJ,      # present for uniformity; kernels may ignore it
@@ -8548,9 +8603,10 @@ class DofHandler:
             "owner_neg_id": -np.ones_like(owner, dtype=np.int32),
         }
         out.update(basis_tabs)
-        for fld in fields:
+        for fld in scalar_fields:
             out[f"b_{fld}"] = b_tabs[fld]
             out[f"g_{fld}"] = g_tabs[fld]
+        out.update(hdiv_tabs)
         if need_hess:
             out["Hxi0"] = Hxi0; out["Hxi1"] = Hxi1
         if need_o3:

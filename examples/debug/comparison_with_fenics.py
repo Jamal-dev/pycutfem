@@ -4930,6 +4930,222 @@ def run_contact_comparison():
     print_test_summary(success_count, failed_tests)
 
 
+def run_component_semantics_comparison():
+    pc, dof_handler_pc, fenicsx = setup_problems()
+    P_map = create_true_dof_map(dof_handler_pc, fenicsx["W"])
+    initialize_functions(pc, fenicsx, dof_handler_pc, P_map)
+
+    qdeg = int(os.environ.get("COMP_FENICS_QDEG", 6))
+    backend_types = tuple(
+        backend.strip()
+        for backend in os.environ.get("COMP_FENICS_BACKENDS", "python,jit,cpp").split(",")
+        if backend.strip()
+    )
+    metadata = {"quadrature_degree": qdeg}
+
+    W_fx = fenicsx["W"]
+    w_trial = ufl.TrialFunction(W_fx)
+    w_test = ufl.TestFunction(W_fx)
+    du_fx, dp_fx = ufl.split(w_trial)
+    v_fx, q_fx = ufl.split(w_test)
+    u_k_fx, p_k_fx = ufl.split(fenicsx["u_k_p_k"])
+
+    B_arr = np.array([[2.0, -0.5], [1.0, 3.0]], dtype=float)
+    B_pc = Constant(B_arr, dim=2)
+    B_fx = dolfinx.fem.Constant(fenicsx["mesh"], B_arr)
+
+    form_specs = [
+        {
+            "name": "ScalarGradDot Bilinear Left",
+            "kind": "jac",
+            "pc": dot(pc["u_k"], grad(pc["dp"])) * pc["q"] * dx(metadata=metadata),
+            "fx": ufl.dot(u_k_fx, ufl.grad(dp_fx)) * q_fx * ufl.dx(metadata=metadata),
+        },
+        {
+            "name": "ScalarGradDot Bilinear Right",
+            "kind": "jac",
+            "pc": dot(grad(pc["dp"]), pc["u_k"]) * pc["q"] * dx(metadata=metadata),
+            "fx": ufl.dot(ufl.grad(dp_fx), u_k_fx) * q_fx * ufl.dx(metadata=metadata),
+        },
+        {
+            "name": "ScalarGradDot Residual Left",
+            "kind": "res",
+            "pc": dot(pc["u_k"], grad(pc["p_k"])) * pc["q"] * dx(metadata=metadata),
+            "fx": ufl.dot(u_k_fx, ufl.grad(p_k_fx)) * q_fx * ufl.dx(metadata=metadata),
+        },
+        {
+            "name": "ScalarGradDot Residual Right",
+            "kind": "res",
+            "pc": dot(grad(pc["p_k"]), pc["u_k"]) * pc["q"] * dx(metadata=metadata),
+            "fx": ufl.dot(ufl.grad(p_k_fx), u_k_fx) * q_fx * ufl.dx(metadata=metadata),
+        },
+        {
+            "name": "ScalarGradMatrix Bilinear Left",
+            "kind": "jac",
+            "pc": inner(B_pc * grad(pc["dp"]), grad(pc["q"])) * dx(metadata=metadata),
+            "fx": ufl.inner(ufl.dot(B_fx, ufl.grad(dp_fx)), ufl.grad(q_fx)) * ufl.dx(metadata=metadata),
+        },
+        {
+            "name": "ScalarGradMatrix Bilinear Right",
+            "kind": "jac",
+            "pc": inner(grad(pc["dp"]) * B_pc, grad(pc["q"])) * dx(metadata=metadata),
+            "fx": ufl.inner(ufl.dot(ufl.grad(dp_fx), B_fx), ufl.grad(q_fx)) * ufl.dx(metadata=metadata),
+        },
+        {
+            "name": "ScalarGradMatrix Residual Left",
+            "kind": "res",
+            "pc": inner(B_pc * grad(pc["p_k"]), grad(pc["q"])) * dx(metadata=metadata),
+            "fx": ufl.inner(ufl.dot(B_fx, ufl.grad(p_k_fx)), ufl.grad(q_fx)) * ufl.dx(metadata=metadata),
+        },
+        {
+            "name": "ScalarGradMatrix Residual Right",
+            "kind": "res",
+            "pc": inner(grad(pc["p_k"]) * B_pc, grad(pc["q"])) * dx(metadata=metadata),
+            "fx": ufl.inner(ufl.dot(ufl.grad(p_k_fx), B_fx), ufl.grad(q_fx)) * ufl.dx(metadata=metadata),
+        },
+        {
+            "name": "VectorGrad Row Bilinear 0",
+            "kind": "jac",
+            "pc": inner(grad(pc["du"])[0], grad(pc["v"])[0]) * dx(metadata=metadata),
+            "fx": ufl.inner(ufl.grad(du_fx[0]), ufl.grad(v_fx[0])) * ufl.dx(metadata=metadata),
+        },
+        {
+            "name": "VectorGrad Row Bilinear 1",
+            "kind": "jac",
+            "pc": inner(grad(pc["du"])[1], grad(pc["v"])[1]) * dx(metadata=metadata),
+            "fx": ufl.inner(ufl.grad(du_fx[1]), ufl.grad(v_fx[1])) * ufl.dx(metadata=metadata),
+        },
+        {
+            "name": "VectorGrad Row Residual 0",
+            "kind": "res",
+            "pc": inner(grad(pc["u_k"])[0], grad(pc["v"])[0]) * dx(metadata=metadata),
+            "fx": ufl.inner(ufl.grad(u_k_fx[0]), ufl.grad(v_fx[0])) * ufl.dx(metadata=metadata),
+        },
+        {
+            "name": "VectorGrad Row Residual 1",
+            "kind": "res",
+            "pc": inner(grad(pc["u_k"])[1], grad(pc["v"])[1]) * dx(metadata=metadata),
+            "fx": ufl.inner(ufl.grad(u_k_fx[1]), ufl.grad(v_fx[1])) * ufl.dx(metadata=metadata),
+        },
+        {
+            "name": "VectorGrad Components Bilinear Left",
+            "kind": "jac",
+            "pc": sum(
+                grad(pc["du"])[i][j] * pc["u_k"][j] * pc["v"][i]
+                for i in range(2)
+                for j in range(2)
+            ) * dx(metadata=metadata),
+            "fx": sum(
+                ufl.grad(du_fx[i])[j] * u_k_fx[j] * v_fx[i]
+                for i in range(2)
+                for j in range(2)
+            ) * ufl.dx(metadata=metadata),
+        },
+        {
+            "name": "VectorGrad Components Bilinear Right",
+            "kind": "jac",
+            "pc": sum(
+                pc["u_k"][i] * grad(pc["du"])[i][j] * pc["v"][j]
+                for i in range(2)
+                for j in range(2)
+            ) * dx(metadata=metadata),
+            "fx": sum(
+                u_k_fx[i] * ufl.grad(du_fx[i])[j] * v_fx[j]
+                for i in range(2)
+                for j in range(2)
+            ) * ufl.dx(metadata=metadata),
+        },
+        {
+            "name": "VectorGrad Components Residual Left",
+            "kind": "res",
+            "pc": sum(
+                grad(pc["u_k"])[i][j] * pc["u_k"][j] * pc["v"][i]
+                for i in range(2)
+                for j in range(2)
+            ) * dx(metadata=metadata),
+            "fx": sum(
+                ufl.grad(u_k_fx[i])[j] * u_k_fx[j] * v_fx[i]
+                for i in range(2)
+                for j in range(2)
+            ) * ufl.dx(metadata=metadata),
+        },
+        {
+            "name": "VectorGrad Components Residual Right",
+            "kind": "res",
+            "pc": sum(
+                pc["u_k"][i] * grad(pc["u_k"])[i][j] * pc["v"][j]
+                for i in range(2)
+                for j in range(2)
+            ) * dx(metadata=metadata),
+            "fx": sum(
+                u_k_fx[i] * ufl.grad(u_k_fx[i])[j] * v_fx[j]
+                for i in range(2)
+                for j in range(2)
+            ) * ufl.dx(metadata=metadata),
+        },
+    ]
+
+    success_count = 0
+    failed_tests = []
+    for backend_type in backend_types:
+        print(f"\nRunning component semantics comparison with backend='{backend_type}', qdeg={qdeg}")
+        for spec in form_specs:
+            name = f"{spec['name']} [backend={backend_type}]"
+            print(f"\nCompiling/assembling '{name}'")
+            try:
+                if spec["kind"] == "jac":
+                    J_pc, _ = assemble_form(
+                        Equation(spec["pc"], None),
+                        dof_handler_pc,
+                        quad_degree=qdeg,
+                        bcs=[],
+                        backend=backend_type,
+                    )
+                    J_fx_form = dolfinx.fem.form(spec["fx"])
+                    A = dolfinx.fem.petsc.assemble_matrix(J_fx_form)
+                    A.assemble()
+                    indptr, indices, data = A.getValuesCSR()
+                    J_fx = csr_matrix((data, indices, indptr), shape=A.getSize()).toarray()
+                    R_pc = None
+                    R_fx = None
+                else:
+                    _, R_pc = assemble_form(
+                        Equation(None, spec["pc"]),
+                        dof_handler_pc,
+                        quad_degree=qdeg,
+                        bcs=[],
+                        backend=backend_type,
+                    )
+                    R_fx_form = dolfinx.fem.form(spec["fx"])
+                    vec = dolfinx.fem.petsc.assemble_vector(R_fx_form)
+                    R_fx = vec.array
+                    J_pc = None
+                    J_fx = None
+            except Exception as exc:
+                print(f"❌ Assembly failed for '{name}': {exc}")
+                failed_tests.append(f"{name} (assemble)")
+                continue
+
+            is_success = compare_term(
+                name,
+                J_pc,
+                R_pc,
+                J_fx,
+                R_fx,
+                P_map,
+                dof_handler_pc,
+                W_fx,
+                rtol=1e-12,
+                atol=1e-12,
+            )
+            if is_success:
+                success_count += 1
+            else:
+                failed_tests.append(f"{name} (mismatch)")
+
+    print_test_summary(success_count, failed_tests)
+
+
 # ==============================================================================
 #                      MAIN TEST HARNESS
 # ==============================================================================
@@ -4949,6 +5165,14 @@ if __name__ == '__main__':
         sys.exit(0)
     if problem.startswith("poro"):
         run_poro_comparison()
+        sys.exit(0)
+    if (
+        problem.startswith("scalar_grad")
+        or problem.startswith("scalar-grad")
+        or problem.startswith("component_semantics")
+        or problem.startswith("component-semantics")
+    ):
+        run_component_semantics_comparison()
         sys.exit(0)
 
     pc, dof_handler_pc, fenicsx = setup_problems()

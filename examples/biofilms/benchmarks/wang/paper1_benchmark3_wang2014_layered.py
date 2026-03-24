@@ -338,6 +338,7 @@ def run_benchmark(
 
     summary = {
         "benchmark": "wang2014_example61_layered",
+        "paper1_scope": "alpha-independent sharp-interface consistency benchmark",
         "params": asdict(params),
         "k_list": k_list,
         "ny": int(ny),
@@ -355,7 +356,9 @@ def run_benchmark(
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Paper 1 Benchmark 3: Wang2014-style layered one-domain vs two-domain comparison.")
+    ap = argparse.ArgumentParser(
+        description="Paper 1 Benchmark 3: Wang2014-style layered one-domain vs two-domain comparison (alpha-independent reference layer)."
+    )
     ap.add_argument("--outdir", type=str, default="examples/biofilms/benchmarks/wang/results/paper1_benchmark3_wang2014_layered")
     ap.add_argument("--k-list", type=str, default="1e-2,1e-3,1e-4,1e-5")
     ap.add_argument("--ny", type=int, default=4000)

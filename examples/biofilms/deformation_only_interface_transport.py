@@ -23,9 +23,15 @@ from pycutfem.core.dofhandler import DofHandler
 from pycutfem.core.mesh import Mesh
 from pycutfem.fem.mixedelement import MixedElement
 from pycutfem.io.vtk import export_vtk
-from pycutfem.solvers.nonlinear_solver import LinearSolverParameters, NewtonParameters, NewtonSolver
+from pycutfem.solvers.nonlinear_solver import (
+    LinearSolverParameters,
+    NewtonParameters,
+    NewtonSolver,
+    _project_box_with_single_linear_equality,
+)
 from pycutfem.ufl.analytic import Analytic
 from pycutfem.ufl.expressions import Constant, FacetNormal, Function, MeshSize, TestFunction, TrialFunction, avg, dot, grad, inner, jump
+from pycutfem.ufl.forms import Equation, assemble_form
 from pycutfem.ufl.measures import ds, dx
 from pycutfem.utils.functionals import NamedFunctionalEvaluator
 from pycutfem.utils.meshgen import structured_quad
@@ -88,6 +94,58 @@ def _create_problem(nx: int) -> dict[str, object]:
         "alpha_n": Function("alpha_n", "alpha", dof_handler=dh),
         "mu_n": Function("mu_n", "mu_alpha", dof_handler=dh),
     }
+
+
+def _assemble_field_integral_weights(
+    problem: dict[str, object],
+    *,
+    test_function,
+    quad_order: int,
+    backend: str,
+) -> np.ndarray:
+    _, vec = assemble_form(
+        Equation(None, test_function * dx(metadata={"q": int(quad_order)})),
+        dof_handler=problem["dh"],
+        bcs=[],
+        quad_order=int(quad_order),
+        backend=str(backend),
+    )
+    return np.asarray(vec, dtype=float).ravel()
+
+
+def _function_to_full_vector(problem: dict[str, object], func: Function) -> np.ndarray:
+    full = np.zeros(int(problem["dh"].total_dofs), dtype=float)
+    g = np.asarray(getattr(func, "_g_dofs", np.array([], dtype=int)), dtype=int).ravel()
+    vals = np.asarray(getattr(func, "nodal_values", np.array([], dtype=float)), dtype=float).ravel()
+    if g.size != vals.size:
+        raise ValueError(
+            f"Function '{getattr(func, 'name', '<unnamed>')}' has nodal_values size {int(vals.size)} "
+            f"but _g_dofs size {int(g.size)}."
+        )
+    if g.size:
+        full[g] = vals
+    return full
+
+
+def _project_alpha_box_mass(
+    problem: dict[str, object],
+    *,
+    alpha_weights_full: np.ndarray,
+    mass_target: float,
+) -> None:
+    alpha_k = problem["alpha_k"]
+    alpha_vals = np.asarray(alpha_k.nodal_values, dtype=float).ravel()
+    alpha_dofs = np.asarray(problem["dh"].get_field_slice("alpha"), dtype=int).ravel()
+    weights_alpha = np.asarray(alpha_weights_full, dtype=float).ravel()[alpha_dofs]
+    alpha_proj = _project_box_with_single_linear_equality(
+        x=alpha_vals,
+        weights=weights_alpha,
+        lo=np.zeros(alpha_vals.shape, dtype=float),
+        hi=np.ones(alpha_vals.shape, dtype=float),
+        target=float(mass_target),
+        tol=1.0e-12,
+    )
+    alpha_k.set_nodal_values(alpha_k._g_dofs, np.asarray(alpha_proj, dtype=float))
 
 
 def _build_forms(
@@ -430,6 +488,12 @@ def _solve_case(
         quad_order=int(qdeg),
         backend=str(backend),
     )
+    alpha_weights_full = _assemble_field_integral_weights(
+        problem,
+        test_function=problem["alpha_test"],
+        quad_order=int(qdeg),
+        backend=str(backend),
+    )
     functional_eval = _build_functionals(problem, quad_order=q_metrics, backend=backend)
 
     problem["alpha_n"].set_values_from_function(lambda x, y: float(case.alpha(x, y, 0.0)))
@@ -600,6 +664,11 @@ def _solve_case(
             solve_seconds = time.perf_counter() - t_start
             if not converged:
                 raise RuntimeError(f"Newton did not converge for case={case.case_id}, nx={nx}, step={step}.")
+            mass_target = float(alpha_weights_full @ _function_to_full_vector(problem, problem["alpha_n"]))
+            # This benchmark isolates transport in a CG space. The post-step
+            # projection is the limiter: it enforces 0 <= alpha <= 1 while
+            # preserving the previous-step alpha mass exactly.
+            _project_alpha_box_mass(problem, alpha_weights_full=alpha_weights_full, mass_target=mass_target)
 
             should_snapshot = False
             while pending_snapshots and t_k + 1.0e-12 >= float(pending_snapshots[0]):
@@ -651,6 +720,11 @@ def _solve_case(
         "case": case.case_id,
         "title": case.title,
         "geometry": case.geometry,
+        "alpha_transport_velocity": "prescribed_support_velocity",
+        "alpha_transport_form": "conservative_strong",
+        "alpha_bounds_enforced": True,
+        "alpha_mass_equality_enforced": True,
+        "solver": "newton_plus_box_mass_projection",
         "nx": int(nx),
         "h": h,
         "dt": float(dt),
@@ -730,7 +804,17 @@ def _write_outputs(case: str, rows: list[dict[str, float]], *, outdir: Path, sav
         encoding="utf-8",
     )
     (outdir / f"{stem}.json").write_text(
-        json.dumps({"case": case, "rows": rows, "best_row": rows[-1]}, indent=2) + "\n",
+        json.dumps(
+            {
+                "case": case,
+                "alpha_transport_velocity": "prescribed_support_velocity",
+                "alpha_transport_form": "conservative_strong",
+                "rows": rows,
+                "best_row": rows[-1],
+            },
+            indent=2,
+        )
+        + "\n",
         encoding="utf-8",
     )
     try:
@@ -770,7 +854,9 @@ def _write_outputs(case: str, rows: list[dict[str, float]], *, outdir: Path, sav
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Reduced interface transport / geometry-preservation benchmark.")
+    ap = argparse.ArgumentParser(
+        description="Reduced interface transport / geometry-preservation benchmark for the prescribed support velocity."
+    )
     ap.add_argument("--case", type=str, default="translation", choices=("translation", "rotation", "shear_return"))
     ap.add_argument("--nx-list", type=str, default="32,64")
     ap.add_argument("--q", type=int, default=6)

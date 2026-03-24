@@ -96,6 +96,7 @@ def build_jonas_shear_benchmark(
     M_alpha: float = 1.0,
     gamma_alpha: float = 1.0,
     eps_alpha: float = 0.06,
+    support_physics: str = "internal_conversion",
 ) -> JonasShearBenchmark:
     dt = float(dt_val)
     if not (dt > 0.0):
@@ -129,7 +130,16 @@ def build_jonas_shear_benchmark(
     B_expr = sp.simplify(alpha_expr * (1.0 - float(phi_b)))
     rho_expr = sp.simplify(float(rho_f) * C_expr)
     mu_mix_expr = sp.simplify((1.0 - alpha_expr) * float(mu_f) + alpha_expr * float(mu_b))
-    beta_expr = sp.simplify(alpha_expr * float(mu_f) * float(kappa_inv))
+    support_key = str(support_physics or "legacy_exchange").strip().lower()
+    if support_key in {"internal_conversion", "internal-conversion", "conservative_support", "support_preserving"}:
+        beta_expr = sp.simplify(B_expr * (float(phi_b) ** 2) * float(mu_f) * float(kappa_inv))
+    elif support_key in {"legacy_exchange", "legacy-exchange", "legacy"}:
+        beta_expr = sp.simplify(alpha_expr * float(mu_f) * float(kappa_inv))
+    else:
+        raise ValueError(
+            f"Unknown Jonas shear support_physics={support_physics!r}. "
+            "Use 'legacy_exchange' or 'internal_conversion'."
+        )
 
     grad_p_expr = _sym_grad_scalar(p_expr, x, y)
     eps_v_expr = _sym_epsilon(v_expr, x, y)
@@ -177,6 +187,7 @@ def build_jonas_shear_benchmark(
         "gamma_alpha": float(gamma_alpha),
         "eps_alpha": float(eps_alpha),
         "wall_speed": float(wall_speed),
+        "support_physics": str(support_key),
     }
 
     grad_v_expr = _sym_grad_vec(v_expr, x, y)

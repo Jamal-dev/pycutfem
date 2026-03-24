@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from pycutfem.ufl.helpers import GradOpInfo
+from pycutfem.ufl.helpers import GradOpInfo, VecOpInfo
 
 
 def _make_function_grad(matrix):
@@ -77,3 +77,29 @@ def test_function_test_dot_preserves_matrix_structure():
     result_matrix = _extract_matrix_from_basis(result)
     expected = np.asarray(finv.data) @ np.asarray(grad_test.data[:, 0, :])
     np.testing.assert_allclose(result_matrix, expected)
+
+
+def test_scalar_trial_times_function_gradient_stays_gradient_valued():
+    trial = VecOpInfo(np.array([[2.0, -1.0, 0.5]], dtype=float), role="trial", is_rhs=False)
+    grad_fun = GradOpInfo(np.array([[3.0, -4.0]], dtype=float), role="function", is_rhs=False)
+
+    result = trial * grad_fun
+
+    assert isinstance(result, GradOpInfo)
+    assert result.role == "trial"
+    expected = np.array(
+        [[[6.0, -8.0], [-3.0, 4.0], [1.5, -2.0]]],
+        dtype=float,
+    )
+    np.testing.assert_allclose(result.data, expected)
+
+
+def test_scalar_function_times_function_gradient_stays_gradient_valued():
+    coeff = VecOpInfo(np.array([2.5], dtype=float), role="function", is_rhs=False)
+    grad_fun = GradOpInfo(np.array([[3.0, -4.0]], dtype=float), role="function", is_rhs=False)
+
+    result = coeff * grad_fun
+
+    assert isinstance(result, GradOpInfo)
+    assert result.role == "function"
+    np.testing.assert_allclose(result.data, np.array([[7.5, -10.0]], dtype=float))

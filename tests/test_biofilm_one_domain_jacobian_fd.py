@@ -5,6 +5,7 @@ from tests.subprocess_utils import run_module_func_in_subprocess
 from pycutfem.core.dofhandler import DofHandler
 from pycutfem.core.mesh import Mesh
 from pycutfem.fem.mixedelement import MixedElement
+from pycutfem.ufl.analytic import Analytic
 from pycutfem.ufl.expressions import (
     Constant,
     Function,
@@ -55,10 +56,15 @@ def _build_problem(
     v_supg_mode: str = "streamline",
     v_supg_c_nu: float = 4.0,
     v_cip: float = 0.0,
+    u_supg: float = 0.0,
     fluid_convection: str = "full",
     theta: float = 1.0,
     substrate_reaction_scheme: str = "theta",
     substrate_diffusion_scheme: str = "theta",
+    support_physics: str = "legacy_exchange",
+    alpha_advect_with: str = "mix",
+    alpha_advection_form: str = "conservative_weak",
+    use_diffuse_traction: bool = False,
 ):
     nodes, elems, _, corners = structured_quad(1.0, 1.0, nx=nx, ny=ny, poly_order=2)
     mesh = Mesh(
@@ -161,10 +167,44 @@ def _build_problem(
     k_d_c = Constant(0.1)
     monod = mu_max_c * (S_k / (S_k + K_S_c))
     one_m_phi = (-phi_k) + Constant(1.0)
-    s_v = (monod - k_d_c) * one_m_phi
-    denom = S_k + K_S_c
-    dmonod = mu_max_c * (K_S_c / (denom * denom)) * dS
-    ds_v = dmonod * one_m_phi - (monod - k_d_c) * dphi
+    support_key = str(support_physics).strip().lower()
+    if support_key == "internal_conversion":
+        s_v = Constant(0.0)
+        ds_v = Constant(0.0)
+        D_phi_val = 0.0
+        k_g_val = 0.0
+        k_det_val = 0.0
+    else:
+        s_v = (monod - k_d_c) * one_m_phi
+        denom = S_k + K_S_c
+        dmonod = mu_max_c * (K_S_c / (denom * denom)) * dS
+        ds_v = dmonod * one_m_phi - (monod - k_d_c) * dphi
+        D_phi_val = 0.1
+        k_g_val = 0.5
+        k_det_val = 0.2
+
+    if bool(use_diffuse_traction):
+        g_t_k = (
+            Analytic(lambda x, y: 0.35 + 0.08 * np.asarray(x, dtype=float) - 0.05 * np.asarray(y, dtype=float), degree=2),
+            Analytic(lambda x, y: -0.21 + 0.03 * np.asarray(x, dtype=float) + 0.07 * np.asarray(y, dtype=float), degree=2),
+        )
+        g_t_n = (
+            Analytic(lambda x, y: 0.29 + 0.06 * np.asarray(x, dtype=float) - 0.04 * np.asarray(y, dtype=float), degree=2),
+            Analytic(lambda x, y: -0.16 + 0.02 * np.asarray(x, dtype=float) + 0.05 * np.asarray(y, dtype=float), degree=2),
+        )
+        traction_weight_k = Analytic(
+            lambda x, y: 0.40 + 0.09 * np.asarray(x, dtype=float) + 0.04 * np.asarray(y, dtype=float),
+            degree=2,
+        )
+        traction_weight_n = Analytic(
+            lambda x, y: 0.32 + 0.02 * np.asarray(x, dtype=float) + 0.06 * np.asarray(y, dtype=float),
+            degree=2,
+        )
+    else:
+        g_t_k = None
+        g_t_n = None
+        traction_weight_k = None
+        traction_weight_n = None
 
     forms = build_biofilm_one_domain_forms(
         v_k=v_k,
@@ -211,7 +251,7 @@ def _build_problem(
         mu_s=Constant(float(mu_s)),
         lambda_s=Constant(float(lambda_s)),
         gamma_div=float(gamma_div),
-        D_phi=0.1,
+        D_phi=D_phi_val,
         gamma_phi=1.0,
         D_alpha=float(D_alpha),
         alpha_ch_M=float(alpha_ch_M),
@@ -222,6 +262,7 @@ def _build_problem(
         v_supg_mode=str(v_supg_mode),
         v_supg_c_nu=float(v_supg_c_nu),
         v_cip=float(v_cip),
+        u_supg=float(u_supg),
         fluid_convection=str(fluid_convection),
         alpha_cahn_M=float(alpha_cahn_M),
         alpha_cahn_gamma=float(alpha_cahn_gamma),
@@ -238,12 +279,19 @@ def _build_problem(
         substrate_diffusion_scheme=str(substrate_diffusion_scheme),
         mu_max=0.4,
         K_S=0.3,
-        k_g=0.5,
+        k_g=k_g_val,
         k_d=0.1,
         Y=0.8,
-        k_det=0.2,
+        k_det=k_det_val,
         s_v=s_v,
         ds_v=ds_v,
+        g_t_k=g_t_k,
+        g_t_n=g_t_n,
+        traction_weight_k=traction_weight_k,
+        traction_weight_n=traction_weight_n,
+        support_physics=str(support_physics),
+        alpha_advect_with=str(alpha_advect_with),
+        alpha_advection_form=str(alpha_advection_form),
     )
 
     # Map global dof -> state function owning it (k-level only).
@@ -494,6 +542,55 @@ def test_biofilm_one_domain_v_cip_jacobian_fd_consistency():
         assert rel < 5.0e-6, f"FD mismatch at dof {j} ({fld}): rel={rel:.2e}"
 
 
+def _cpp_backend_parity_v_supg_residual_diffuse_traction_impl() -> None:
+    dh, forms, _ = _build_problem(
+        nx=2,
+        ny=2,
+        q=5,
+        v_supg=1.0,
+        v_supg_mode="residual",
+        v_supg_c_nu=4.0,
+        fluid_convection="full",
+        support_physics="internal_conversion",
+        alpha_advect_with="biofilm_volume",
+        alpha_advection_form="conservative_weak",
+        use_diffuse_traction=True,
+    )
+    eq = Equation(forms.jacobian_form, forms.residual_form)
+
+    K_py, R_py = assemble_form(eq, dof_handler=dh, bcs=[], quad_order=5, backend="python")
+    K_cpp, R_cpp = assemble_form(eq, dof_handler=dh, bcs=[], quad_order=5, backend="cpp")
+
+    A_py = K_py.tocsr().toarray()
+    A_cpp = K_cpp.tocsr().toarray()
+    assert np.allclose(A_py, A_cpp, rtol=1.0e-10, atol=1.0e-12)
+    assert np.allclose(np.asarray(R_py, float), np.asarray(R_cpp, float), rtol=1.0e-10, atol=1.0e-12)
+
+
+def test_biofilm_one_domain_v_supg_residual_diffuse_traction_python_assembles():
+    dh, forms, _ = _build_problem(
+        nx=2,
+        ny=2,
+        q=4,
+        v_supg=1.0,
+        v_supg_mode="residual",
+        v_supg_c_nu=4.0,
+        fluid_convection="full",
+        support_physics="internal_conversion",
+        alpha_advect_with="biofilm_volume",
+        alpha_advection_form="conservative_weak",
+        use_diffuse_traction=True,
+    )
+    eq = Equation(forms.jacobian_form, forms.residual_form)
+    K_py, R_py = assemble_form(eq, dof_handler=dh, bcs=[], quad_order=4, backend="python")
+    assert K_py.shape == (dh.total_dofs, dh.total_dofs)
+    assert np.asarray(R_py, dtype=float).shape == (dh.total_dofs,)
+
+
+def test_biofilm_one_domain_v_supg_residual_diffuse_traction_backend_parity_python_cpp():
+    run_module_func_in_subprocess(__name__, "_cpp_backend_parity_v_supg_residual_diffuse_traction_impl")
+
+
 def _cpp_backend_parity_alpha_stabilization_impl() -> None:
     dh, forms, _ = _build_problem(nx=2, ny=2, q=5, D_alpha=0.0, alpha_supg=0.5, alpha_cip=2.0)
     eq = Equation(forms.jacobian_form, forms.residual_form)
@@ -545,6 +642,51 @@ def test_biofilm_one_domain_alpha_stabilization_jacobian_fd_consistency():
         denom = max(1.0, float(np.linalg.norm(fd, ord=np.inf)), float(np.linalg.norm(col, ord=np.inf)))
         rel = float(np.linalg.norm(fd - col, ord=np.inf)) / denom
         assert rel < 1.0e-6, f"FD mismatch at dof {j} ({fld}): rel={rel:.2e}"
+
+
+def test_biofilm_one_domain_alpha_supg_internal_conversion_jacobian_fd_consistency():
+    """
+    FD check for the physically relevant alpha SUPG path:
+    internal-conversion support transport with the weak conservative alpha law.
+    """
+    dh, forms, field_to_func_k = _build_problem(
+        nx=2,
+        ny=2,
+        q=5,
+        D_alpha=0.0,
+        alpha_supg=0.5,
+        support_physics="internal_conversion",
+        alpha_advect_with="biofilm_volume",
+        alpha_advection_form="conservative_weak",
+    )
+    eq = Equation(forms.jacobian_form, forms.residual_form)
+    K, R0 = assemble_form(eq, dof_handler=dh, bcs=[], quad_order=5, backend="python")
+    R0 = np.asarray(R0, dtype=float)
+
+    def assemble_residual():
+        _, R = assemble_form(Equation(None, forms.residual_form), dof_handler=dh, bcs=[], quad_order=5, backend="python")
+        return np.asarray(R, dtype=float)
+
+    probes = []
+    for fld in ("v_x", "vS_x", "alpha", "phi"):
+        sl = dh.get_field_slice(fld)
+        if sl:
+            probes.append(int(sl[len(sl) // 2]))
+
+    eps = 1.0e-8
+    for j in probes:
+        fld, _ = dh._dof_to_node_map[j]
+        func = field_to_func_k[fld]
+        old = float(func.get_nodal_values(np.asarray([j], dtype=int))[0])
+        func.set_nodal_values(np.asarray([j], dtype=int), np.asarray([old + eps], dtype=float))
+        R1 = assemble_residual()
+        func.set_nodal_values(np.asarray([j], dtype=int), np.asarray([old], dtype=float))
+
+        fd = (R1 - R0) / eps
+        col = np.asarray(K.getcol(j).toarray()).reshape(-1)
+        denom = max(1.0, float(np.linalg.norm(fd, ord=np.inf)), float(np.linalg.norm(col, ord=np.inf)))
+        rel = float(np.linalg.norm(fd - col, ord=np.inf)) / denom
+        assert rel < 2.0e-6, f"FD mismatch at dof {j} ({fld}): rel={rel:.2e}"
 
 
 def _cpp_backend_parity_u_cip_impl() -> None:

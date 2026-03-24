@@ -34,6 +34,7 @@ Writes to `out_dir`:
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import logging
 import math
@@ -74,6 +75,7 @@ from pycutfem.fem.mixedelement import MixedElement
 from pycutfem.io.vtk import export_vtk
 from pycutfem.solvers.nonlinear_solver import (
     LinearSolverParameters,
+    LinearEqualityConstraint,
     NewtonParameters,
     NewtonSolver,
     PetscSnesNewtonSolver,
@@ -100,6 +102,7 @@ from pycutfem.ufl.measures import dS as dS_measure, ds, dx
 from pycutfem.ufl.spaces import FunctionSpace
 from pycutfem.utils.meshgen import structured_quad
 
+from examples.utils.biofilm.adhesion import assemble_scalar
 from examples.utils.biofilm.deformation_only import build_deformation_only_forms
 from examples.utils.biofilm.one_domain import _sqrt, build_biofilm_one_domain_forms
 
@@ -137,6 +140,168 @@ def _mark_inactive_dofs(dh: DofHandler, dof_ids: np.ndarray) -> None:
         inactive.add(int(i))
     tags["inactive"] = inactive
     dh.dof_tags = tags
+
+
+def _deepcopy_dof_tags(dh: DofHandler) -> dict[str, object]:
+    tags = getattr(dh, "dof_tags", None) or {}
+    out: dict[str, object] = {}
+    for key, value in tags.items():
+        try:
+            out[str(key)] = copy.deepcopy(value)
+        except Exception:
+            if isinstance(value, set):
+                out[str(key)] = set(value)
+            else:
+                out[str(key)] = value
+    return out
+
+
+def _set_active_fields(
+    dh: DofHandler,
+    *,
+    active_fields: set[str],
+    base_tags: dict[str, object] | None = None,
+) -> None:
+    tags = _deepcopy_dof_tags(dh) if base_tags is None else copy.deepcopy(base_tags)
+    inactive = set(tags.get("inactive", set()))
+    field_names = list(getattr(dh, "field_names", []) or [])
+    for fname in field_names:
+        if str(fname) in active_fields:
+            continue
+        try:
+            sl = np.asarray(dh.get_field_slice(str(fname)), dtype=int).ravel()
+        except Exception:
+            continue
+        inactive.update(int(i) for i in sl.tolist())
+    tags["inactive"] = inactive
+    dh.dof_tags = tags
+
+
+def _assemble_field_integral_weights(
+    problem: dict[str, object],
+    *,
+    test_function,
+    quad_order: int,
+    backend: str,
+) -> np.ndarray:
+    _, vec = assemble_form(
+        Equation(None, test_function * dx(metadata={"q": int(quad_order)})),
+        dof_handler=problem["dh"],
+        bcs=[],
+        quad_order=int(quad_order),
+        backend=str(backend),
+    )
+    return np.asarray(vec, dtype=float).ravel()
+
+
+def _function_to_full_vector(dh: DofHandler, func: Function) -> np.ndarray:
+    full = np.zeros(int(dh.total_dofs), dtype=float)
+    g = np.asarray(getattr(func, "_g_dofs", np.array([], dtype=int)), dtype=int).ravel()
+    vals = np.asarray(getattr(func, "nodal_values", np.array([], dtype=float)), dtype=float).ravel()
+    if g.size != vals.size:
+        raise ValueError(
+            f"Function '{getattr(func, 'name', '<unnamed>')}' has nodal_values size {int(vals.size)} "
+            f"but _g_dofs size {int(g.size)}."
+        )
+    if g.size:
+        full[g] = vals
+    return full
+
+
+def _find_named_function(funcs, template: Function) -> Function:
+    t_name = str(getattr(template, "name", ""))
+    t_field = str(getattr(template, "field", ""))
+    for func in funcs or []:
+        if str(getattr(func, "name", "")) == t_name and str(getattr(func, "field", "")) == t_field:
+            return func
+    raise KeyError(f"Could not find function matching name={t_name!r}, field={t_field!r}.")
+
+
+def _build_vi_linear_equalities(
+    *,
+    support_physics: str,
+    backend: str,
+    qdeg: int,
+    dh: DofHandler,
+    alpha_test,
+    alpha_k: Function,
+    alpha_n: Function,
+    phi_test=None,
+    phi_k: Function | None = None,
+    phi_n: Function | None = None,
+    alpha_box_constraints: bool,
+    phi_box_constraints: bool,
+) -> list[LinearEqualityConstraint]:
+    support_key = str(support_physics).strip().lower()
+    if support_key != "internal_conversion":
+        return []
+    if not bool(alpha_box_constraints):
+        return []
+
+    problem = {
+        "dh": dh,
+        "alpha_test": alpha_test,
+        "alpha_k": alpha_k,
+        "alpha_n": alpha_n,
+        "phi_test": phi_test,
+        "phi_k": phi_k,
+        "phi_n": phi_n,
+    }
+    alpha_weights_full = _assemble_field_integral_weights(
+        problem,
+        test_function=alpha_test,
+        quad_order=int(qdeg),
+        backend=str(backend),
+    )
+
+    def _alpha_mass_target(*, prev_funcs, **_kwargs) -> float:
+        alpha_prev = _find_named_function(prev_funcs, alpha_n)
+        return float(alpha_weights_full @ _function_to_full_vector(dh, alpha_prev))
+
+    equalities: list[LinearEqualityConstraint] = [
+        LinearEqualityConstraint(
+            name="alpha_mass",
+            weights_full=alpha_weights_full,
+            target_callback=_alpha_mass_target,
+            field_name="alpha",
+            project_feasible=True,
+        )
+    ]
+
+    if phi_test is not None and phi_k is not None and phi_n is not None and bool(phi_box_constraints):
+        def _phi_biofilm_fluid_mass_weights(*, funcs, **_kwargs) -> np.ndarray:
+            alpha_cur = _find_named_function(funcs, alpha_k)
+            _, vec = assemble_form(
+                Equation(None, alpha_cur * phi_test * dx(metadata={"q": int(qdeg)})),
+                dof_handler=dh,
+                bcs=[],
+                quad_order=int(qdeg),
+                backend=str(backend),
+            )
+            return np.asarray(vec, dtype=float).ravel()
+
+        def _phi_biofilm_fluid_mass_target(*, prev_funcs, **_kwargs) -> float:
+            alpha_prev = _find_named_function(prev_funcs, alpha_n)
+            phi_prev = _find_named_function(prev_funcs, phi_n)
+            _, weights_prev = assemble_form(
+                Equation(None, alpha_prev * phi_test * dx(metadata={"q": int(qdeg)})),
+                dof_handler=dh,
+                bcs=[],
+                quad_order=int(qdeg),
+                backend=str(backend),
+            )
+            return float(np.asarray(weights_prev, dtype=float).ravel() @ _function_to_full_vector(dh, phi_prev))
+
+        equalities.append(
+            LinearEqualityConstraint(
+                name="phi_biofilm_fluid_mass",
+                weights_callback=_phi_biofilm_fluid_mass_weights,
+                target_callback=_phi_biofilm_fluid_mass_target,
+                field_name="phi",
+                project_feasible=True,
+            )
+        )
+    return equalities
 
 
 def _restrict_skeleton_dofs_to_box(
@@ -853,21 +1018,338 @@ def _alpha_half_contours(alpha_xy: np.ndarray, alpha_vals: np.ndarray, *, alpha_
     vals = np.asarray(alpha_vals, dtype=float).ravel()
     if xy.ndim != 2 or xy.shape[1] < 2 or vals.size != xy.shape[0]:
         return []
+    # Hanging-node/refined mixed spaces can carry repeated alpha coordinates.
+    # Deduplicate before triangulation so matplotlib's contour builder does not
+    # bail out on zero-area simplices or coincident sites.
+    if xy.shape[0] >= 2:
+        xy_key = np.round(xy[:, :2], decimals=14)
+        unique_xy, inverse, counts = np.unique(xy_key, axis=0, return_inverse=True, return_counts=True)
+        if unique_xy.shape[0] != xy.shape[0]:
+            vals_acc = np.zeros(unique_xy.shape[0], dtype=float)
+            np.add.at(vals_acc, inverse, vals)
+            xy = np.asarray(unique_xy, dtype=float)
+            vals = vals_acc / np.maximum(counts.astype(float), 1.0)
+    finite = np.isfinite(xy[:, 0]) & np.isfinite(xy[:, 1]) & np.isfinite(vals)
+    if not np.any(finite):
+        return []
+    xy = xy[finite, :2]
+    vals = vals[finite]
+    if xy.shape[0] < 3:
+        return []
+
+    def _collect_contours(cs) -> list[np.ndarray]:
+        contours: list[np.ndarray] = []
+        collections = getattr(cs, "collections", None)
+        if collections is not None:
+            for coll in collections:
+                for path in coll.get_paths():
+                    verts = np.asarray(path.vertices, dtype=float)
+                    if verts.ndim == 2 and verts.shape[0] >= 2:
+                        contours.append(verts.copy())
+            if contours:
+                return contours
+        allsegs = getattr(cs, "allsegs", None)
+        if allsegs is not None:
+            for level_segs in allsegs:
+                for seg in level_segs:
+                    verts = np.asarray(seg, dtype=float)
+                    if verts.ndim == 2 and verts.shape[0] >= 2:
+                        contours.append(verts.copy())
+        return contours
+
     try:
         triang = mtri.Triangulation(xy[:, 0], xy[:, 1])
         fig = plt.figure()
         ax = fig.add_subplot(111)
         cs = ax.tricontour(triang, vals, levels=[float(alpha_half)])
-        contours: list[np.ndarray] = []
-        for coll in cs.collections:
-            for path in coll.get_paths():
-                verts = np.asarray(path.vertices, dtype=float)
-                if verts.ndim == 2 and verts.shape[0] >= 2:
-                    contours.append(verts.copy())
+        contours = _collect_contours(cs)
+        plt.close(fig)
+        if contours:
+            return contours
+    except Exception:
+        pass
+
+    try:
+        from scipy.interpolate import LinearNDInterpolator, NearestNDInterpolator
+
+        x_min = float(np.min(xy[:, 0]))
+        x_max = float(np.max(xy[:, 0]))
+        y_min = float(np.min(xy[:, 1]))
+        y_max = float(np.max(xy[:, 1]))
+        if not (np.isfinite(x_min) and np.isfinite(x_max) and np.isfinite(y_min) and np.isfinite(y_max)):
+            return []
+        if not (x_max > x_min and y_max > y_min):
+            return []
+
+        nx = int(np.clip(np.ceil(np.sqrt(float(xy.shape[0]))) * 8.0, 96.0, 512.0))
+        aspect = (y_max - y_min) / max(x_max - x_min, 1.0e-16)
+        ny = int(np.clip(np.ceil(float(nx) * float(aspect)), 64.0, 512.0))
+
+        gx = np.linspace(x_min, x_max, nx, dtype=float)
+        gy = np.linspace(y_min, y_max, ny, dtype=float)
+        XX, YY = np.meshgrid(gx, gy)
+        interp_lin = LinearNDInterpolator(xy[:, :2], vals, fill_value=np.nan)
+        ZZ = np.asarray(interp_lin(XX, YY), dtype=float)
+        if np.isnan(ZZ).any():
+            interp_nn = NearestNDInterpolator(xy[:, :2], vals)
+            ZZ_nn = np.asarray(interp_nn(XX, YY), dtype=float)
+            ZZ = np.where(np.isfinite(ZZ), ZZ, ZZ_nn)
+        if not np.isfinite(ZZ).any():
+            return []
+
+        fig = plt.figure()
+        ax = fig.add_subplot(111)
+        cs = ax.contour(XX, YY, ZZ, levels=[float(alpha_half)])
+        contours = _collect_contours(cs)
         plt.close(fig)
         return contours
     except Exception:
         return []
+
+
+def _find_element_containing_point(mesh: Mesh, point: np.ndarray) -> int:
+    xy = np.asarray(point, dtype=float)
+    for elem in mesh.elements_list:
+        verts = mesh.nodes_x_y_pos[list(elem.nodes)]
+        if not (
+            verts[:, 0].min() - 1.0e-12 <= xy[0] <= verts[:, 0].max() + 1.0e-12
+            and verts[:, 1].min() - 1.0e-12 <= xy[1] <= verts[:, 1].max() + 1.0e-12
+        ):
+            continue
+        try:
+            xi, eta = transform.inverse_mapping(mesh, elem.id, xy)
+        except Exception:
+            continue
+        if -1.0001 <= xi <= 1.0001 and -1.0001 <= eta <= 1.0001:
+            return int(elem.id)
+    raise ValueError(f"Point {tuple(point)} not found in mesh.")
+
+
+def _eval_scalar_with_grad(
+    dh: DofHandler,
+    mesh: Mesh,
+    f_scalar: Function,
+    point: tuple[float, float],
+) -> tuple[float, np.ndarray]:
+    xy = np.asarray(point, dtype=float)
+    eid = _find_element_containing_point(mesh, xy)
+    xi, eta = transform.inverse_mapping(mesh, eid, xy)
+    me = dh.mixed_element
+    local_phi = me.basis(f_scalar.field_name, float(xi), float(eta))[me.slice(f_scalar.field_name)]
+    local_grad_ref = me.grad_basis(f_scalar.field_name, float(xi), float(eta))[me.slice(f_scalar.field_name)]
+    local_grad = transform.map_grad_scalar(mesh, eid, local_grad_ref, (float(xi), float(eta)))
+    gdofs = dh.element_maps[f_scalar.field_name][eid]
+    vals = f_scalar.get_nodal_values(gdofs)
+    return float(local_phi @ vals), np.asarray(vals, dtype=float) @ np.asarray(local_grad, dtype=float)
+
+
+def _eval_vector_with_grad(
+    dh: DofHandler,
+    mesh: Mesh,
+    f_vec: VectorFunction,
+    point: tuple[float, float],
+) -> tuple[np.ndarray, np.ndarray]:
+    vals = []
+    grads = []
+    for comp in f_vec.components:
+        vv, gg = _eval_scalar_with_grad(dh, mesh, comp, point)
+        vals.append(vv)
+        grads.append(gg)
+    return np.asarray(vals, dtype=float), np.vstack(grads)
+
+
+def _interface_stress_diagnostics(
+    *,
+    dh: DofHandler,
+    mesh: Mesh,
+    alpha_xy: np.ndarray,
+    alpha_fn: Function,
+    v_fn: VectorFunction | HdivFunction,
+    p_fn: Function,
+    mu_f: float,
+    alpha_half: float = 0.5,
+    max_points: int = 300,
+) -> dict[str, float]:
+    nan = float("nan")
+    if not hasattr(v_fn, "components"):
+        return {
+            "n_samples": 0.0,
+            "p_mean_pa": nan,
+            "p_max_pa": nan,
+            "sigma_n_mean_pa": nan,
+            "sigma_n_min_pa": nan,
+            "sigma_comp_mean_pa": nan,
+            "tau_t_abs_mean_pa": nan,
+            "tau_t_abs_max_pa": nan,
+            "front_samples": 0.0,
+            "front_p_mean_pa": nan,
+            "front_sigma_n_mean_pa": nan,
+            "front_sigma_comp_mean_pa": nan,
+            "front_tau_t_abs_mean_pa": nan,
+            "top_samples": 0.0,
+            "top_p_mean_pa": nan,
+            "top_sigma_n_mean_pa": nan,
+            "top_tau_t_mean_pa": nan,
+            "top_tau_t_abs_mean_pa": nan,
+            "top_mu_du_dh_mean_pa": nan,
+            "top_tau_over_mu_du_dh_mean": nan,
+        }
+
+    contours = _alpha_half_contours(alpha_xy, alpha_fn.nodal_values, alpha_half=float(alpha_half))
+    if not contours:
+        return {
+            "n_samples": 0.0,
+            "p_mean_pa": nan,
+            "p_max_pa": nan,
+            "sigma_n_mean_pa": nan,
+            "sigma_n_min_pa": nan,
+            "sigma_comp_mean_pa": nan,
+            "tau_t_abs_mean_pa": nan,
+            "tau_t_abs_max_pa": nan,
+            "front_samples": 0.0,
+            "front_p_mean_pa": nan,
+            "front_sigma_n_mean_pa": nan,
+            "front_sigma_comp_mean_pa": nan,
+            "front_tau_t_abs_mean_pa": nan,
+            "top_samples": 0.0,
+            "top_p_mean_pa": nan,
+            "top_sigma_n_mean_pa": nan,
+            "top_tau_t_mean_pa": nan,
+            "top_tau_t_abs_mean_pa": nan,
+            "top_mu_du_dh_mean_pa": nan,
+            "top_tau_over_mu_du_dh_mean": nan,
+        }
+
+    pts_all = []
+    for pts in contours:
+        arr = np.asarray(pts, dtype=float)
+        if arr.ndim != 2 or arr.shape[0] < 2 or arr.shape[1] < 2:
+            continue
+        pts_all.append(arr[:, :2].copy())
+    if not pts_all:
+        return {
+            "n_samples": 0.0,
+            "p_mean_pa": nan,
+            "p_max_pa": nan,
+            "sigma_n_mean_pa": nan,
+            "sigma_n_min_pa": nan,
+            "sigma_comp_mean_pa": nan,
+            "tau_t_abs_mean_pa": nan,
+            "tau_t_abs_max_pa": nan,
+            "front_samples": 0.0,
+            "front_p_mean_pa": nan,
+            "front_sigma_n_mean_pa": nan,
+            "front_sigma_comp_mean_pa": nan,
+            "front_tau_t_abs_mean_pa": nan,
+            "top_samples": 0.0,
+            "top_p_mean_pa": nan,
+            "top_sigma_n_mean_pa": nan,
+            "top_tau_t_mean_pa": nan,
+            "top_tau_t_abs_mean_pa": nan,
+            "top_mu_du_dh_mean_pa": nan,
+            "top_tau_over_mu_du_dh_mean": nan,
+        }
+
+    pts = np.vstack(pts_all)
+    if pts.shape[0] > 1:
+        pts_key = np.round(pts, decimals=12)
+        pts = np.unique(pts_key, axis=0)
+    if pts.shape[0] > int(max_points):
+        idx = np.linspace(0, pts.shape[0] - 1, int(max_points), dtype=int)
+        pts = pts[idx]
+
+    p_vals: list[float] = []
+    sigma_n_vals: list[float] = []
+    tau_t_vals: list[float] = []
+    front_p_vals: list[float] = []
+    front_sigma_n_vals: list[float] = []
+    front_tau_t_vals: list[float] = []
+    top_p_vals: list[float] = []
+    top_sigma_n_vals: list[float] = []
+    top_tau_t_vals: list[float] = []
+    top_mu_du_dh_vals: list[float] = []
+    top_tau_ratio_vals: list[float] = []
+
+    for xy in np.asarray(pts, dtype=float):
+        try:
+            p_val, _ = _eval_scalar_with_grad(dh, mesh, p_fn, (float(xy[0]), float(xy[1])))
+            _, grad_a = _eval_scalar_with_grad(dh, mesh, alpha_fn, (float(xy[0]), float(xy[1])))
+            _, grad_v = _eval_vector_with_grad(dh, mesh, v_fn, (float(xy[0]), float(xy[1])))
+        except Exception:
+            continue
+        grad_a = np.asarray(grad_a, dtype=float).ravel()
+        grad_v = np.asarray(grad_v, dtype=float)
+        if grad_a.size != 2 or grad_v.shape != (2, 2):
+            continue
+        grad_norm = float(np.linalg.norm(grad_a))
+        if not np.isfinite(grad_norm) or grad_norm <= 1.0e-12:
+            continue
+        n_out = -grad_a / grad_norm
+        t_hat = np.asarray([-n_out[1], n_out[0]], dtype=float)
+        sigma = -float(p_val) * np.eye(2, dtype=float) + float(mu_f) * (grad_v + grad_v.T)
+        traction = sigma @ n_out
+        sigma_n = float(np.dot(traction, n_out))
+        tau_t = float(np.dot(traction, t_hat))
+
+        p_vals.append(float(p_val))
+        sigma_n_vals.append(sigma_n)
+        tau_t_vals.append(tau_t)
+
+        if float(n_out[0]) < -0.5:
+            front_p_vals.append(float(p_val))
+            front_sigma_n_vals.append(sigma_n)
+            front_tau_t_vals.append(tau_t)
+        if float(n_out[1]) > 0.5:
+            top_p_vals.append(float(p_val))
+            top_sigma_n_vals.append(sigma_n)
+            top_tau_t_vals.append(tau_t)
+            mu_du_dh = float(mu_f) * float(grad_v[0, 1])
+            top_mu_du_dh_vals.append(mu_du_dh)
+            if abs(mu_du_dh) > 1.0e-12:
+                top_tau_ratio_vals.append(float(tau_t / mu_du_dh))
+
+    def _mean_or_nan(vals: list[float]) -> float:
+        arr = np.asarray(vals, dtype=float)
+        arr = arr[np.isfinite(arr)]
+        return float(np.mean(arr)) if arr.size else nan
+
+    def _maxabs_or_nan(vals: list[float]) -> float:
+        arr = np.asarray(vals, dtype=float)
+        arr = arr[np.isfinite(arr)]
+        return float(np.max(np.abs(arr))) if arr.size else nan
+
+    def _min_or_nan(vals: list[float]) -> float:
+        arr = np.asarray(vals, dtype=float)
+        arr = arr[np.isfinite(arr)]
+        return float(np.min(arr)) if arr.size else nan
+
+    def _mean_comp_or_nan(vals: list[float]) -> float:
+        arr = np.asarray(vals, dtype=float)
+        arr = arr[np.isfinite(arr)]
+        return float(np.mean(np.maximum(-arr, 0.0))) if arr.size else nan
+
+    return {
+        "n_samples": float(len(p_vals)),
+        "p_mean_pa": _mean_or_nan(p_vals),
+        "p_max_pa": _maxabs_or_nan(p_vals),
+        "sigma_n_mean_pa": _mean_or_nan(sigma_n_vals),
+        "sigma_n_min_pa": _min_or_nan(sigma_n_vals),
+        "sigma_comp_mean_pa": _mean_comp_or_nan(sigma_n_vals),
+        "tau_t_abs_mean_pa": _mean_or_nan([abs(v) for v in tau_t_vals]),
+        "tau_t_abs_max_pa": _maxabs_or_nan(tau_t_vals),
+        "front_samples": float(len(front_p_vals)),
+        "front_p_mean_pa": _mean_or_nan(front_p_vals),
+        "front_sigma_n_mean_pa": _mean_or_nan(front_sigma_n_vals),
+        "front_sigma_comp_mean_pa": _mean_comp_or_nan(front_sigma_n_vals),
+        "front_tau_t_abs_mean_pa": _mean_or_nan([abs(v) for v in front_tau_t_vals]),
+        "top_samples": float(len(top_p_vals)),
+        "top_p_mean_pa": _mean_or_nan(top_p_vals),
+        "top_sigma_n_mean_pa": _mean_or_nan(top_sigma_n_vals),
+        "top_tau_t_mean_pa": _mean_or_nan(top_tau_t_vals),
+        "top_tau_t_abs_mean_pa": _mean_or_nan([abs(v) for v in top_tau_t_vals]),
+        "top_mu_du_dh_mean_pa": _mean_or_nan(top_mu_du_dh_vals),
+        "top_tau_over_mu_du_dh_mean": _mean_or_nan(top_tau_ratio_vals),
+    }
 
 
 def _write_contours_csv(path: Path, contours: list[np.ndarray]) -> None:
@@ -890,6 +1372,20 @@ def _lame_from_E_nu(E: float, nu: float) -> tuple[float, float]:
     mu = E / (2.0 * (1.0 + nu))
     lam = (E * nu) / ((1.0 + nu) * max(1.0e-16, (1.0 - 2.0 * nu)))
     return float(mu), float(lam)
+
+
+def _phi_init_from_alpha(alpha_vals: np.ndarray, *, phi_b: float, mode: str) -> np.ndarray:
+    aa = np.asarray(alpha_vals, dtype=float)
+    key = str(mode).strip().lower()
+    if key in {"linear_alpha", "linear", "historical"}:
+        phi = 1.0 - (1.0 - float(phi_b)) * aa
+    elif key in {"constant_phi_b", "constant", "phi_b"}:
+        phi = np.full_like(aa, float(phi_b), dtype=float)
+    else:
+        raise ValueError(
+            f"Unknown phi_init_mode {mode!r}. Use 'linear_alpha' or 'constant_phi_b'."
+        )
+    return np.clip(np.asarray(phi, dtype=float), 0.0, 1.0)
 
 
 def _restart_peek(path: Path) -> dict[str, float | int]:
@@ -1208,6 +1704,25 @@ def main() -> None:
     ap.add_argument("--dt", type=float, default=0.05)
     ap.add_argument("--t-final", type=float, default=10.0)
     ap.add_argument("--theta", type=float, default=1.0)
+    ap.add_argument(
+        "--include-skeleton-acceleration",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Include Eulerian skeleton acceleration in the one-domain skeleton momentum block.",
+    )
+    ap.add_argument(
+        "--rho-s0-tilde",
+        type=float,
+        default=0.0,
+        help="Reference solid density coefficient used by the Eulerian skeleton acceleration term.",
+    )
+    ap.add_argument(
+        "--skeleton-inertia-convection",
+        type=str,
+        default="lagged",
+        choices=("lagged", "full"),
+        help="Treatment of the convective part of the Eulerian skeleton inertia.",
+    )
     ap.add_argument("--allow-dt-reduction", action="store_true")
     ap.add_argument("--dt-min", type=float, default=0.01)
     ap.add_argument("--dt-reduction-factor", type=float, default=0.5)
@@ -1230,6 +1745,61 @@ def main() -> None:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Clip predicted alpha/phi to [0,1] (predictor only; does not change converged solution).",
+    )
+    ap.add_argument(
+        "--startup-staggered-predictor",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Before each monolithic Newton/PDAS step, compute a better initial guess by first "
+            "solving the fluid block with frozen solid/transport fields and then the solid block "
+            "with frozen fluid loading."
+        ),
+    )
+    ap.add_argument(
+        "--startup-staggered-max-time",
+        type=float,
+        default=float("nan"),
+        help=(
+            "Apply --startup-staggered-predictor only while t_{n+theta} <= this time. "
+            "Default: disabled limit (all steps when the predictor is enabled)."
+        ),
+    )
+    ap.add_argument(
+        "--startup-fluid-newton-tol",
+        type=float,
+        default=1.0e-10,
+        help="Absolute Newton tolerance used by the restricted fluid startup solve.",
+    )
+    ap.add_argument(
+        "--startup-solid-newton-tol",
+        type=float,
+        default=1.0e-10,
+        help="Absolute Newton tolerance used by the restricted solid startup solve.",
+    )
+    ap.add_argument(
+        "--startup-fluid-max-it",
+        type=int,
+        default=12,
+        help="Maximum Newton iterations for the restricted fluid startup solve.",
+    )
+    ap.add_argument(
+        "--startup-solid-max-it",
+        type=int,
+        default=12,
+        help="Maximum Newton iterations for the restricted solid startup solve.",
+    )
+    ap.add_argument(
+        "--startup-staggered-sweeps",
+        type=int,
+        default=1,
+        help="Number of fluid->solid startup sweeps before the monolithic solve (>=1).",
+    )
+    ap.add_argument(
+        "--startup-staggered-slip-tol",
+        type=float,
+        default=0.0,
+        help="Optional early-stop tolerance on |v-vS|_inf after a startup sweep (<=0 disables).",
     )
 
     ap.add_argument("--newton-tol", type=float, default=1.0e-6)
@@ -1328,6 +1898,15 @@ def main() -> None:
         ),
     )
     ap.add_argument(
+        "--re-char-length",
+        type=float,
+        default=float("nan"),
+        help=(
+            "Characteristic length [m] used only for Reynolds-number reporting in setup logs. "
+            "Default: reuse the channel height H."
+        ),
+    )
+    ap.add_argument(
         "--inflow-profile",
         type=str,
         default="poiseuille",
@@ -1407,8 +1986,29 @@ def main() -> None:
         help="Regularization epsilon used in the Kozeny-Carman porosity scaling.",
     )
     ap.add_argument("--phi-b", type=float, default=0.47, help="Initial porosity inside the biofilm (0<phi_b<1).")
+    ap.add_argument(
+        "--phi-init-mode",
+        type=str,
+        default="linear_alpha",
+        choices=("linear_alpha", "constant_phi_b"),
+        help=(
+            "How the porosity field is initialized from alpha in full PDE mode. "
+            "'linear_alpha' uses phi=1-(1-phi_b)alpha; 'constant_phi_b' sets phi=phi_b everywhere initially."
+        ),
+    )
     ap.add_argument("--E", type=float, default=200.0, help="Young's modulus of the solid phase [Pa] (Dian paper default).")
     ap.add_argument("--nu", type=float, default=0.4, help="Poisson ratio (Dian paper default).")
+    ap.add_argument(
+        "--alpha-biot",
+        type=float,
+        default=float("nan"),
+        help=(
+            "Optional benchmark-local Biot coefficient for an added volumetric skeleton "
+            "pressure load. When finite, the skeleton div(vS_test) pressure coefficient "
+            "is corrected toward alpha_biot * alpha while the original diffuse-interface "
+            "grad(B) term is kept."
+        ),
+    )
     ap.add_argument(
         "--solid-model",
         type=str,
@@ -1804,6 +2404,28 @@ def main() -> None:
         help="RT order used when --fluid-space=hdiv.",
     )
     ap.add_argument(
+        "--hdiv-tangential-dirichlet",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "When --fluid-space=hdiv, keep the normal velocity Dirichlet data strong on the RT trace "
+            "and impose the tangential Dirichlet data weakly in the momentum equation."
+        ),
+    )
+    ap.add_argument(
+        "--hdiv-tangential-gamma",
+        type=float,
+        default=20.0,
+        help="Penalty parameter used for the weak tangential H(div) Dirichlet term.",
+    )
+    ap.add_argument(
+        "--hdiv-tangential-method",
+        type=str,
+        default="penalty",
+        choices=("penalty", "nitsche"),
+        help="Weak tangential H(div) boundary formulation: penalty-only or fully consistent symmetric Nitsche.",
+    )
+    ap.add_argument(
         "--u-supg",
         type=float,
         default=0.0,
@@ -1846,16 +2468,33 @@ def main() -> None:
     ap.add_argument(
         "--alpha-advect-with",
         type=str,
-        default="vS",
-        choices=("vS", "v", "mix", "mix_biofilm"),
-        help="Which velocity advects alpha in the alpha PDE (pde mode).",
+        default="biofilm_volume",
+        choices=("vS", "v", "mix", "mix_biofilm", "biofilm_volume", "relative", "interface"),
+        help=(
+            "Which velocity advects alpha in the alpha PDE (pde mode). "
+            "For the support-preserving alpha law, use 'biofilm_volume' so alpha is "
+            "transported by the conserved biofilm-support flux."
+        ),
     )
     ap.add_argument(
         "--alpha-advection-form",
         type=str,
-        default="conservative",
-        choices=("advective", "conservative"),
-        help="Form of alpha advection by the chosen velocity in the alpha PDE (pde mode).",
+        default="conservative_weak",
+        choices=("advective", "conservative", "conservative_weak"),
+        help=(
+            "Form of alpha advection by the chosen velocity in the alpha PDE (pde mode). "
+            "The recommended physical setup is 'conservative_weak'."
+        ),
+    )
+    ap.add_argument(
+        "--support-physics",
+        type=str,
+        default="internal_conversion",
+        choices=("legacy_exchange", "internal_conversion"),
+        help=(
+            "Biofilm support model. 'internal_conversion' preserves total alpha and evolves phi through "
+            "the conservative solid-volume balance B=alpha(1-phi)."
+        ),
     )
     ap.add_argument(
         "--alpha-mix-gate-alpha0",
@@ -1972,6 +2611,18 @@ def main() -> None:
         help="Comma-separated times [s] at which to export raw alpha=0.5 contour CSVs.",
     )
     ap.add_argument("--vtk-every", type=int, default=0)
+    ap.add_argument(
+        "--interface-diagnostics",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Write interface_diagnostics.csv with sampled alpha=0.5 contour pressure/traction diagnostics.",
+    )
+    ap.add_argument(
+        "--interface-diagnostics-max-points",
+        type=int,
+        default=300,
+        help="Maximum number of alpha=0.5 contour points sampled per output row for --interface-diagnostics.",
+    )
     ap.add_argument("--out-dir", type=str, default="out/_blauert_one_domain")
     ap.add_argument(
         "--restart-from",
@@ -2263,12 +2914,19 @@ def main() -> None:
     alpha_n = Function("alpha_n", "alpha", dof_handler=dh)
     mu_alpha_n = Function("mu_alpha_n", "mu_alpha", dof_handler=dh)
     S_n = Function("S_n", "S", dof_handler=dh) if not paper1_reduced else None
+    if fluid_space_key == "cg":
+        v_trac_n = VectorFunction("v_trac_n", ["v_x", "v_y"], dof_handler=dh)
+    else:
+        v_trac_n = HdivFunction("v_trac_n", "v", dof_handler=dh)
+    p_trac_n = Function("p_trac_n", "p", dof_handler=dh)
 
     # ------------------------------------------------------------------
     # Initial conditions
     # ------------------------------------------------------------------
     v_n.nodal_values[:] = 0.0
     p_n.nodal_values[:] = 0.0
+    v_trac_n.nodal_values[:] = 0.0
+    p_trac_n.nodal_values[:] = 0.0
     vS_n.nodal_values[:] = 0.0
     u_n.nodal_values[:] = 0.0
     mu_alpha_n.nodal_values[:] = 0.0
@@ -2285,8 +2943,13 @@ def main() -> None:
     phi_b = float(args.phi_b)
     if not (0.0 < phi_b < 1.0):
         raise ValueError("--phi-b must be in (0,1).")
+    phi_init_mode = str(getattr(args, "phi_init_mode", "linear_alpha"))
     if phi_n is not None:
-        phi_n.nodal_values[:] = np.clip(1.0 - (1.0 - phi_b) * np.asarray(alpha_n.nodal_values, dtype=float), 0.0, 1.0)
+        phi_n.nodal_values[:] = _phi_init_from_alpha(
+            np.asarray(alpha_n.nodal_values, dtype=float),
+            phi_b=float(phi_b),
+            mode=str(phi_init_mode),
+        )
 
     if transport_mode == "refmap":
         # Refmap mode: freeze transport fields and update alpha/phi after each accepted step.
@@ -2377,7 +3040,11 @@ def main() -> None:
             a = _smooth_step((-_signed_distance_polygon(chi[:, 0], chi[:, 1], poly_m)) / max(1.0e-12, eps0))
             alpha_k.nodal_values[:] = np.clip(np.asarray(a, dtype=float), 0.0, 1.0)
             if phi_k is not None:
-                phi_k.nodal_values[:] = np.clip(1.0 - (1.0 - phi_b) * np.asarray(alpha_k.nodal_values, dtype=float), 0.0, 1.0)
+                phi_k.nodal_values[:] = _phi_init_from_alpha(
+                    np.asarray(alpha_k.nodal_values, dtype=float),
+                    phi_b=float(phi_b),
+                    mode=str(phi_init_mode),
+                )
             _update_regularization_weight(alpha_k.nodal_values)
 
     else:
@@ -2386,6 +3053,17 @@ def main() -> None:
             # Nothing to do in PDE mode; alpha/phi are solved.
             _update_regularization_weight(alpha_k.nodal_values)
             return
+
+    hdiv_tangential_bc_measure = None
+    if fluid_space_key == "hdiv" and bool(getattr(args, "hdiv_tangential_dirichlet", True)):
+        hdiv_tangential_bc_measure = dS_measure(
+            defined_on=(
+                mesh.edge_bitset("left")
+                | mesh.edge_bitset("bottom")
+                | mesh.edge_bitset("top")
+            ),
+            metadata={"q": int(args.q)},
+        )
 
     # ------------------------------------------------------------------
     # Forms
@@ -2426,6 +3104,7 @@ def main() -> None:
 
     mu_s, lambda_s = _lame_from_E_nu(float(args.E), float(args.nu))
     rho_f_c = _named_scalar_expr("rho_f", float(args.rho_f))
+    rho_s0_tilde_c = _named_scalar_expr("rho_s0_tilde", float(args.rho_s0_tilde))
     mu_f_c = _named_scalar_expr("mu_f", float(args.mu_f))
     mu_b_c = _named_scalar_expr("mu_b", float(args.mu_f))
     kappa_inv_c = _named_scalar_expr("kappa_inv", float(args.kappa_inv))
@@ -2619,8 +3298,8 @@ def main() -> None:
             )
         elif shear_model == "lagged_stress":
             diffuse_g_t, diffuse_w_t = _lagged_diffuse_interface_stress_traction(
-                v_lag=v_n,
-                p_lag=p_n,
+                v_lag=v_trac_n,
+                p_lag=p_trac_n,
                 alpha_lag=alpha_n,
                 mu_f=float(args.mu_f),
                 scale=diffuse_scale_expr,
@@ -2628,7 +3307,7 @@ def main() -> None:
             )
         else:
             diffuse_g_t, diffuse_w_t = _lagged_diffuse_interface_shear_traction(
-                v_lag=v_n,
+                v_lag=v_trac_n,
                 alpha_lag=alpha_n,
                 mu_f=float(args.mu_f),
                 scale=diffuse_scale_expr,
@@ -2637,7 +3316,7 @@ def main() -> None:
             )
         if abs(float(target_diffuse_pressure_scale)) > 0.0:
             diffuse_g_p, diffuse_w_p = _lagged_diffuse_interface_pressure_traction(
-                p_lag=p_n,
+                p_lag=p_trac_n,
                 alpha_lag=alpha_n,
                 scale=diffuse_pressure_scale_expr,
                 eta_n=float(args.diffuse_shear_eta),
@@ -2651,8 +3330,8 @@ def main() -> None:
                 diffuse_g_t = (diffuse_g_t[0] + diffuse_g_p[0], diffuse_g_t[1] + diffuse_g_p[1])
         if abs(float(target_diffuse_normal_stress_scale)) > 0.0:
             diffuse_g_n, diffuse_w_n = _lagged_diffuse_interface_normal_stress_traction(
-                v_lag=v_n,
-                p_lag=p_n,
+                v_lag=v_trac_n,
+                p_lag=p_trac_n,
                 alpha_lag=alpha_n,
                 mu_f=float(args.mu_f),
                 scale=diffuse_normal_stress_scale_expr,
@@ -2753,15 +3432,21 @@ def main() -> None:
             mu_s=mu_s_c,
             lambda_s=lambda_s_c,
             solid_visco_eta=solid_visco_eta_c,
+            rho_s0_tilde=rho_s0_tilde_c,
+            include_skeleton_acceleration=bool(args.include_skeleton_acceleration),
+            skeleton_inertia_convection=str(args.skeleton_inertia_convection),
             gamma_div=gamma_div_expr,
             phi_b=float(phi_b),
             M_alpha=alpha_ch_M_c,
             gamma_alpha=alpha_ch_gamma_c,
             eps_alpha=alpha_ch_eps_c,
+            alpha_advect_with=str(args.alpha_advect_with),
+            alpha_advection_form=str(args.alpha_advection_form),
             g_t_k=diffuse_g_t,
             g_t_n=diffuse_g_t,
             traction_weight_k=diffuse_w_t,
             traction_weight_n=diffuse_w_t,
+            alpha_biot=float(args.alpha_biot) if np.isfinite(float(args.alpha_biot)) else None,
         )
     else:
         forms = build_biofilm_one_domain_forms(
@@ -2813,6 +3498,9 @@ def main() -> None:
             lambda_s=lambda_s_c,
             solid_model=str(getattr(args, "solid_model", "linear")),
             solid_visco_eta=solid_visco_eta_c,
+            rho_s0_tilde=rho_s0_tilde_c,
+            include_skeleton_acceleration=bool(args.include_skeleton_acceleration),
+            skeleton_inertia_convection=str(args.skeleton_inertia_convection),
             gamma_u=gamma_u_c,
             u_extension_mode=str(args.u_extension),
             gamma_u_pin=gamma_u_pin_c,
@@ -2839,6 +3527,7 @@ def main() -> None:
             alpha_mix_gate_alpha0=float(getattr(args, "alpha_mix_gate_alpha0", 0.1)),
             alpha_mix_gate_power=int(getattr(args, "alpha_mix_gate_power", 4)),
             alpha_advection_form=str(args.alpha_advection_form) if transport_mode == "pde" else "advective",
+            support_physics=str(args.support_physics),
             alpha_ch_M=alpha_ch_M_c if transport_mode == "pde" else 0.0,
             alpha_ch_gamma=alpha_ch_gamma_c if transport_mode == "pde" else 0.0,
             alpha_ch_eps=alpha_ch_eps_c if transport_mode == "pde" else 1.0,
@@ -2849,6 +3538,10 @@ def main() -> None:
             g_t_n=diffuse_g_t,
             traction_weight_k=diffuse_w_t,
             traction_weight_n=diffuse_w_t,
+            alpha_biot=float(args.alpha_biot) if np.isfinite(float(args.alpha_biot)) else None,
+            ds_hdiv_tangential=hdiv_tangential_bc_measure,
+            hdiv_tangential_gamma=float(getattr(args, "hdiv_tangential_gamma", 20.0)),
+            hdiv_tangential_method=str(getattr(args, "hdiv_tangential_method", "penalty")),
             ds_adh=dS_measure(defined_on=mesh.edge_bitset("bottom"), metadata={"q": int(args.q)})
             if use_bottom_adhesion
             else None,
@@ -2883,29 +3576,37 @@ def main() -> None:
         rho_f0 = float(args.rho_f)
         tau_w = 6.0 * mu_f0 * u_avg / float(H)  # plane Poiseuille between plates
         inflow_speed_ref = u_avg if inflow_profile == "poiseuille" else inflow_plug_speed
-        Re = rho_f0 * inflow_speed_ref * float(H) / max(mu_f0, 1.0e-30)
+        re_char_length = float(args.re_char_length) if np.isfinite(float(args.re_char_length)) else float(H)
+        Re = rho_f0 * inflow_speed_ref * float(re_char_length) / max(mu_f0, 1.0e-30)
         if inflow_profile == "poiseuille":
             logging.info(
-                "[setup] inflow: profile=%s u_avg=%.3e m/s (u_max=%.3e), tau_w≈%.3e Pa, Re≈%.1f",
+                "[setup] inflow: profile=%s u_avg=%.3e m/s (u_max=%.3e), tau_w≈%.3e Pa, Re≈%.1f (L_char=%.3e m)",
                 inflow_profile,
                 u_avg,
                 u_max,
                 tau_w,
                 Re,
+                re_char_length,
             )
         else:
             logging.info(
-                "[setup] inflow: profile=%s u_plug=%.3e m/s (u_avg_ref=%.3e, u_max_ref=%.3e), Re≈%.1f",
+                "[setup] inflow: profile=%s u_plug=%.3e m/s (u_avg_ref=%.3e, u_max_ref=%.3e), Re≈%.1f (L_char=%.3e m)",
                 inflow_profile,
                 inflow_plug_speed,
                 u_avg,
                 u_max,
                 Re,
+                re_char_length,
             )
         logging.info(
-            "[setup] constitutive choices: solid_model=%s mu_b_model=%s",
+            "[setup] constitutive choices: solid_model=%s mu_b_model=%s alpha_biot=%s",
             str(getattr(args, "solid_model", "linear")),
             str(getattr(args, "mu_b_model", "phi_mu")),
+            (
+                f"{float(args.alpha_biot):.3e}"
+                if np.isfinite(float(getattr(args, "alpha_biot", float('nan'))))
+                else "constraint_only"
+            ),
         )
         if flow_shutoff_start_finite:
             logging.info(
@@ -2967,9 +3668,16 @@ def main() -> None:
             BoundaryCondition("p", "dirichlet", "right", lambda x, y, t: 0.0),
         ]
     else:
-        logging.info(
-            "[setup] fluid-space=hdiv imposes only normal-flux Dirichlet data on v; tangential no-slip remains unconstrained."
-        )
+        if bool(getattr(args, "hdiv_tangential_dirichlet", True)):
+            logging.info(
+                "[setup] fluid-space=hdiv uses strong normal-flux Dirichlet data on v and weak tangential Dirichlet data via %s with gamma_t=%.3e.",
+                str(getattr(args, "hdiv_tangential_method", "penalty")),
+                float(getattr(args, "hdiv_tangential_gamma", 20.0)),
+            )
+        else:
+            logging.info(
+                "[setup] fluid-space=hdiv imposes only normal-flux Dirichlet data on v; tangential no-slip remains unconstrained."
+            )
         bcs = [
             BoundaryCondition("v", "dirichlet", "left", lambda x, y, t: np.asarray([inflow_vx(x, y, t), 0.0], dtype=float)),
             BoundaryCondition("v", "dirichlet", "bottom", lambda x, y, t: 0.0),
@@ -3145,6 +3853,8 @@ def main() -> None:
     alpha_vals_ref = np.asarray(alpha_n.nodal_values, dtype=float).ravel()
     alpha_weights_ref = np.clip(alpha_vals_ref, 0.0, 1.0)
     alpha_mask_ref = alpha_vals_ref >= 0.5
+    dx_q = dx(metadata={"q": int(args.q)})
+    alpha_area_ref = float(assemble_scalar(dh, alpha_n * dx_q, backend=str(args.backend), quad_order=int(args.q)))
     if phi_n is not None:
         phi_vals_ref = np.asarray(phi_n.nodal_values, dtype=float).ravel()
         if np.any(alpha_mask_ref):
@@ -3156,25 +3866,61 @@ def main() -> None:
             phi_ref_alpha_weighted = float(np.sum(alpha_weights_ref * phi_vals_ref) / denom_ref)
         else:
             phi_ref_alpha_weighted = float("nan")
+        phi_ref_min = float(np.min(phi_vals_ref)) if phi_vals_ref.size else float("nan")
+        phi_ref_max = float(np.max(phi_vals_ref)) if phi_vals_ref.size else float("nan")
     else:
         phi_ref_alpha05 = float("nan")
         phi_ref_alpha_weighted = float("nan")
+        phi_ref_min = float("nan")
+        phi_ref_max = float("nan")
 
     ts_path = out_dir / "timeseries.csv"
     header = (
         [
             "t_s",
+            "alpha_area",
+            "alpha_area_rel_drift",
             "x_front_global",
             "dx_front_global",
             "phi_mean_alpha05",
             "phi_drop_alpha05_pp",
             "phi_mean_alpha_weighted",
             "phi_drop_alpha_weighted_pp",
+            "phi_min",
+            "phi_max",
+            "phi_min_delta",
+            "phi_max_delta",
         ]
         + [f"x_front_y{int(round(1.0e6 * y))}um" for y in y_lines]
         + [f"dx_front_y{int(round(1.0e6 * y))}um" for y in y_lines]
     )
     header_line = ",".join(header)
+    if_diag_enabled = bool(getattr(args, "interface_diagnostics", False))
+    if_diag_path = out_dir / "interface_diagnostics.csv"
+    if_diag_header = [
+        "t_s",
+        "n_samples",
+        "p_mean_pa",
+        "p_max_pa",
+        "sigma_n_mean_pa",
+        "sigma_n_min_pa",
+        "sigma_comp_mean_pa",
+        "tau_t_abs_mean_pa",
+        "tau_t_abs_max_pa",
+        "front_samples",
+        "front_p_mean_pa",
+        "front_sigma_n_mean_pa",
+        "front_sigma_comp_mean_pa",
+        "front_tau_t_abs_mean_pa",
+        "top_samples",
+        "top_p_mean_pa",
+        "top_sigma_n_mean_pa",
+        "top_tau_t_mean_pa",
+        "top_tau_t_abs_mean_pa",
+        "top_mu_du_dh_mean_pa",
+        "top_tau_over_mu_du_dh_mean",
+    ]
+    if_diag_header_line = ",".join(if_diag_header)
     append_existing_ts = bool(restart_from is not None and ts_path.exists() and ts_path.stat().st_size > 0)
     if append_existing_ts:
         try:
@@ -3192,6 +3938,23 @@ def main() -> None:
     else:
         with ts_path.open("w", encoding="utf-8") as f:
             f.write(header_line + "\n")
+    append_existing_ifdiag = bool(if_diag_enabled and restart_from is not None and if_diag_path.exists() and if_diag_path.stat().st_size > 0)
+    if append_existing_ifdiag:
+        try:
+            with if_diag_path.open("r", encoding="utf-8") as f:
+                first = f.readline().strip()
+            if first != if_diag_header_line:
+                raise RuntimeError(
+                    f"interface_diagnostics.csv header mismatch for restart.\n"
+                    f"  file: {first}\n"
+                    f"  expected: {if_diag_header_line}\n"
+                    f"Use a fresh --out-dir."
+                )
+        except Exception as exc:
+            raise RuntimeError(f"Failed validating existing interface_diagnostics.csv for restart: {exc}") from exc
+    elif if_diag_enabled:
+        with if_diag_path.open("w", encoding="utf-8") as f:
+            f.write(if_diag_header_line + "\n")
 
     x_prev_arr = np.asarray(restart_state.get("x_prev", []), dtype=float).ravel() if restart_state is not None else np.empty((0,), dtype=float)
     if x_prev_arr.size == y_lines.size:
@@ -3209,6 +3972,10 @@ def main() -> None:
         _write_contours_csv(snapshot_dir / f"{stem}_alpha05.csv", contours)
 
     def _append_timeseries(t_s: float) -> None:
+        alpha_area = float(assemble_scalar(dh, alpha_k * dx_q, backend=str(args.backend), quad_order=int(args.q)))
+        alpha_area_rel_drift = (
+            float((alpha_area - alpha_area_ref) / alpha_area_ref) if abs(alpha_area_ref) > 1.0e-14 else float("nan")
+        )
         xg = _x_front_global_quantile(alpha_xy, alpha_k.nodal_values, q=float(args.global_front_quantile), alpha_half=0.5)
         dxg = float(xg - x_ref_global) if (math.isfinite(xg) and math.isfinite(x_ref_global)) else float("nan")
         alpha_vals = np.asarray(alpha_k.nodal_values, dtype=float).ravel()
@@ -3225,9 +3992,13 @@ def main() -> None:
                 phi_mean_alpha_weighted = float(np.sum(alpha_weights * phi_vals) / denom)
             else:
                 phi_mean_alpha_weighted = float("nan")
+            phi_min = float(np.min(phi_vals)) if phi_vals.size else float("nan")
+            phi_max = float(np.max(phi_vals)) if phi_vals.size else float("nan")
         else:
             phi_mean_alpha05 = float("nan")
             phi_mean_alpha_weighted = float("nan")
+            phi_min = float("nan")
+            phi_max = float("nan")
         phi_drop_alpha05_pp = (
             100.0 * float(phi_mean_alpha05 - phi_ref_alpha05)
             if math.isfinite(phi_mean_alpha05) and math.isfinite(phi_ref_alpha05)
@@ -3238,6 +4009,8 @@ def main() -> None:
             if math.isfinite(phi_mean_alpha_weighted) and math.isfinite(phi_ref_alpha_weighted)
             else float("nan")
         )
+        phi_min_delta = float(phi_min - phi_ref_min) if math.isfinite(phi_min) and math.isfinite(phi_ref_min) else float("nan")
+        phi_max_delta = float(phi_max - phi_ref_max) if math.isfinite(phi_max) and math.isfinite(phi_ref_max) else float("nan")
         nonlocal x_prev
         xs = []
         x_new_prev: list[float] = []
@@ -3263,18 +4036,43 @@ def main() -> None:
                 ",".join(
                     [
                         f"{float(t_s):.12e}",
+                        f"{alpha_area:.12e}",
+                        f"{alpha_area_rel_drift:.12e}",
                         f"{xg:.12e}",
                         f"{dxg:.12e}",
                         f"{phi_mean_alpha05:.12e}",
                         f"{phi_drop_alpha05_pp:.12e}",
                         f"{phi_mean_alpha_weighted:.12e}",
                         f"{phi_drop_alpha_weighted_pp:.12e}",
+                        f"{phi_min:.12e}",
+                        f"{phi_max:.12e}",
+                        f"{phi_min_delta:.12e}",
+                        f"{phi_max_delta:.12e}",
                     ]
                     + [f"{z:.12e}" for z in xs]
                     + [f"{z:.12e}" for z in dxs]
                 )
                 + "\n"
             )
+
+    def _append_interface_diagnostics(t_s: float) -> None:
+        if not if_diag_enabled:
+            return
+        diag = _interface_stress_diagnostics(
+            dh=dh,
+            mesh=mesh,
+            alpha_xy=alpha_xy,
+            alpha_fn=alpha_k,
+            v_fn=v_k,
+            p_fn=p_k,
+            mu_f=float(args.mu_f),
+            alpha_half=0.5,
+            max_points=max(16, int(getattr(args, "interface_diagnostics_max_points", 300))),
+        )
+        row = {"t_s": float(t_s)}
+        row.update(diag)
+        with if_diag_path.open("a", encoding="utf-8") as f:
+            f.write(",".join(f"{float(row[name]):.12e}" for name in if_diag_header) + "\n")
 
     # ------------------------------------------------------------------
     # Solver
@@ -3359,6 +4157,12 @@ def main() -> None:
                 active_step_soft_alpha=float(args.vi_active_soft_alpha),
                 active_step_strong_factor=float(args.vi_active_strong_factor),
                 filter_max_delta_active=int(args.vi_filter_max_delta_active),
+                # Bound-aware globalization is essential once alpha/phi box constraints
+                # are active: the first loaded Christan steps can drive many transport
+                # DOFs outside [0,1], and projecting a full unconstrained step after the
+                # fact leads to pathological active-set jumps.
+                bound_step_limit=bool(use_alpha_phi_vi_bounds),
+                bound_blocking_activate=bool(use_alpha_phi_vi_bounds),
                 unconstrained_lm=bool(args.vi_unconstrained_lm),
                 unconstrained_lm_lambda0=float(args.vi_lm_lambda0),
                 unconstrained_lm_lambda_max=float(args.vi_lm_lambda_max),
@@ -3396,6 +4200,298 @@ def main() -> None:
         bounds_by_field["phi"] = (0.0, 1.0)
     if bounds_by_field and hasattr(solver, "set_box_bounds"):
         solver.set_box_bounds(by_field=bounds_by_field)
+    vi_linear_equalities = _build_vi_linear_equalities(
+        support_physics=str(args.support_physics),
+        backend=str(args.backend),
+        qdeg=int(args.q),
+        dh=dh,
+        alpha_test=alpha_test,
+        alpha_k=alpha_k,
+        alpha_n=alpha_n,
+        phi_test=phi_test,
+        phi_k=phi_k,
+        phi_n=phi_n,
+        alpha_box_constraints=bool(args.alpha_box_constraints) or bool(use_alpha_phi_vi_bounds),
+        phi_box_constraints=((phi_k is not None) and (bool(args.phi_box_constraints) or bool(use_alpha_phi_vi_bounds))),
+    )
+    if vi_linear_equalities and hasattr(solver, "set_linear_equalities"):
+        solver.set_linear_equalities(vi_linear_equalities)
+
+    startup_predictor_enabled = bool(getattr(args, "startup_staggered_predictor", False))
+    startup_predictor_max_time = float(getattr(args, "startup_staggered_max_time", float("nan")))
+    startup_base_tags = _deepcopy_dof_tags(dh)
+    startup_active_fields_fluid = {"p"}
+    if fluid_space_key == "cg":
+        startup_active_fields_fluid.update({"v_x", "v_y"})
+    else:
+        startup_active_fields_fluid.add("v")
+    startup_active_fields_solid = {"vS_x", "vS_y", "u_x", "u_y"}
+
+    startup_solver_cache: dict[str, NewtonSolver] = {}
+    startup_state = {"last_signature": None, "force_next": True}
+
+    def _make_startup_solver(*, active_fields: set[str], newton_tol: float, max_it: int) -> NewtonSolver:
+        _set_active_fields(dh, active_fields=active_fields, base_tags=startup_base_tags)
+        try:
+            return NewtonSolver(
+                forms.residual_form,
+                forms.jacobian_form,
+                dof_handler=dh,
+                mixed_element=me,
+                bcs=bcs,
+                bcs_homog=bcs_homog,
+                newton_params=NewtonParameters(
+                    newton_tol=float(newton_tol),
+                    newton_rtol=0.0,
+                    max_newton_iter=int(max_it),
+                    accept_nonconverged_atol_factor=0.0,
+                    line_search=True,
+                    ls_mode=str(args.ls_mode),
+                ),
+                lin_params=LinearSolverParameters(backend=str(args.linear_backend)),
+                quad_order=int(args.q),
+                backend=str(args.backend),
+            )
+        finally:
+            dh.dof_tags = copy.deepcopy(startup_base_tags)
+
+    def _get_startup_solver(name: str) -> NewtonSolver:
+        solver_cached = startup_solver_cache.get(str(name))
+        if solver_cached is not None:
+            return solver_cached
+        if str(name) == "fluid":
+            solver_cached = _make_startup_solver(
+                active_fields=startup_active_fields_fluid,
+                newton_tol=float(getattr(args, "startup_fluid_newton_tol", args.newton_tol)),
+                max_it=int(getattr(args, "startup_fluid_max_it", args.max_it)),
+            )
+        elif str(name) == "solid":
+            solver_cached = _make_startup_solver(
+                active_fields=startup_active_fields_solid,
+                newton_tol=float(getattr(args, "startup_solid_newton_tol", args.newton_tol)),
+                max_it=int(getattr(args, "startup_solid_max_it", args.max_it)),
+            )
+        else:
+            raise KeyError(f"Unknown startup solver '{name}'.")
+        startup_solver_cache[str(name)] = solver_cached
+        return solver_cached
+
+    def _snapshot_values(*funcs) -> list[tuple[object, np.ndarray]]:
+        out: list[tuple[object, np.ndarray]] = []
+        for func in funcs:
+            if func is None or getattr(func, "nodal_values", None) is None:
+                continue
+            out.append((func, np.asarray(func.nodal_values, dtype=float).copy()))
+        return out
+
+    def _copy_function_values(src, dst) -> None:
+        if src is None or dst is None:
+            return
+        dst.nodal_values[:] = np.asarray(src.nodal_values, dtype=float)
+
+    def _restore_snapshot(snapshot: list[tuple[object, np.ndarray]]) -> None:
+        for func, values in snapshot:
+            try:
+                func.nodal_values[:] = np.asarray(values, dtype=float)
+            except Exception:
+                continue
+
+    def _run_restricted_startup_solve(
+        *,
+        stage_name: str,
+        active_fields: set[str],
+        funcs,
+        prev_funcs,
+        aux_funcs,
+        bcs_now,
+    ) -> tuple[bool, int, float]:
+        _set_active_fields(dh, active_fields=active_fields, base_tags=startup_base_tags)
+        try:
+            startup_solver = _get_startup_solver(stage_name)
+            _delta, converged, n_iters = startup_solver._newton_loop(funcs, prev_funcs, aux_funcs, bcs_now)
+            norm_last = getattr(startup_solver, "_last_nonlinear_norm", float("nan"))
+            return bool(converged), int(n_iters), float(norm_last if norm_last is not None else float("nan"))
+        finally:
+            dh.dof_tags = copy.deepcopy(startup_base_tags)
+
+    def _startup_interface_summary(label: str) -> None:
+        try:
+            diag = _interface_stress_diagnostics(
+                dh=dh,
+                mesh=mesh,
+                alpha_xy=alpha_xy,
+                alpha_fn=alpha_k,
+                v_fn=v_k,
+                p_fn=p_k,
+                mu_f=float(args.mu_f),
+                alpha_half=0.5,
+                max_points=120,
+            )
+        except Exception as exc:
+            logging.warning(f"[startup] {label} interface diagnostics failed: {exc}")
+            return
+        logging.info(
+            "[startup] %s interface: p_mean=%.3e Pa p_max=%.3e Pa tau_t_abs_mean=%.3e Pa tau_t_abs_max=%.3e Pa sigma_n_mean=%.3e Pa top_tau_t_abs_mean=%.3e Pa top_mu_du_dh_mean=%.3e Pa top_tau_over_mu_du_dh=%.3e",
+            str(label),
+            float(diag.get("p_mean_pa", float("nan"))),
+            float(diag.get("p_max_pa", float("nan"))),
+            float(diag.get("tau_t_abs_mean_pa", float("nan"))),
+            float(diag.get("tau_t_abs_max_pa", float("nan"))),
+            float(diag.get("sigma_n_mean_pa", float("nan"))),
+            float(diag.get("top_tau_t_abs_mean_pa", float("nan"))),
+            float(diag.get("top_mu_du_dh_mean_pa", float("nan"))),
+            float(diag.get("top_tau_over_mu_du_dh_mean", float("nan"))),
+        )
+
+    def _startup_slip_summary(label: str) -> dict[str, float]:
+        out = {
+            "vx_minus_vSx_inf": float("nan"),
+            "vy_minus_vSy_inf": float("nan"),
+            "v_minus_vS_inf": float("nan"),
+            "v_minus_vS_l2": float("nan"),
+        }
+        if not hasattr(v_k, "components") or not hasattr(vS_k, "components"):
+            logging.info("[startup] %s slip: skipped for non-nodal velocity representation.", str(label))
+            return out
+        try:
+            vx = np.asarray(v_k.components[0].nodal_values, dtype=float).ravel()
+            vy = np.asarray(v_k.components[1].nodal_values, dtype=float).ravel()
+            vsx = np.asarray(vS_k.components[0].nodal_values, dtype=float).ravel()
+            vsy = np.asarray(vS_k.components[1].nodal_values, dtype=float).ravel()
+            dxv = vx - vsx
+            dyv = vy - vsy
+            out = {
+                "vx_minus_vSx_inf": float(np.max(np.abs(dxv))),
+                "vy_minus_vSy_inf": float(np.max(np.abs(dyv))),
+                "v_minus_vS_inf": float(max(np.max(np.abs(dxv)), np.max(np.abs(dyv)))),
+                "v_minus_vS_l2": float(np.sqrt(np.dot(dxv, dxv) + np.dot(dyv, dyv))),
+            }
+            logging.info(
+                "[startup] %s slip: |vx-vSx|_inf=%.3e |vy-vSy|_inf=%.3e |v-vS|_inf=%.3e |v-vS|_2=%.3e",
+                str(label),
+                out["vx_minus_vSx_inf"],
+                out["vy_minus_vSy_inf"],
+                out["v_minus_vS_inf"],
+                out["v_minus_vS_l2"],
+            )
+        except Exception as exc:
+            logging.warning(f"[startup] {label} slip diagnostics failed: {exc}")
+        return out
+
+    def _startup_step_initial_guess_callback(**info):  # noqa: ANN001
+        if not startup_predictor_enabled:
+            return
+        t_bc = float(info.get("t_bc", 0.0) or 0.0)
+        _copy_function_values(v_n, v_trac_n)
+        _copy_function_values(p_n, p_trac_n)
+        if np.isfinite(startup_predictor_max_time) and t_bc > float(startup_predictor_max_time) + 1.0e-15:
+            return
+        step_no = int(info.get("step_no", -1))
+        dt_now = float(info.get("dt", 0.0) or 0.0)
+        signature = (int(step_no), float(dt_now), float(t_bc))
+        if (not bool(startup_state.get("force_next", False))) and startup_state.get("last_signature", None) == signature:
+            return
+
+        funcs = list(info.get("functions", []) or [])
+        prev_funcs = list(info.get("prev_functions", []) or [])
+        aux_funcs = info.get("aux_functions", None)
+        bcs_now = info.get("bcs", None)
+        if not funcs or not prev_funcs or bcs_now is None:
+            return
+
+        startup_state["last_signature"] = signature
+        startup_state["force_next"] = False
+        startup_sweeps = max(1, int(getattr(args, "startup_staggered_sweeps", 1)))
+        startup_slip_tol = float(getattr(args, "startup_staggered_slip_tol", 0.0))
+
+        fluid_backup = _snapshot_values(v_k, p_k)
+        solid_backup = _snapshot_values(vS_k, u_k)
+        traction_backup = _snapshot_values(v_trac_n, p_trac_n)
+
+        logging.info(
+            "[startup] step=%d t_bc=%.6e dt=%.3e: running restricted fluid->solid predictor (%d sweep%s).",
+            int(step_no),
+            float(t_bc),
+            float(dt_now),
+            int(startup_sweeps),
+            "" if int(startup_sweeps) == 1 else "s",
+        )
+
+        for sweep_idx in range(1, startup_sweeps + 1):
+            fluid_ok = False
+            try:
+                fluid_ok, fluid_iters, fluid_norm = _run_restricted_startup_solve(
+                    stage_name="fluid",
+                    active_fields=startup_active_fields_fluid,
+                    funcs=funcs,
+                    prev_funcs=prev_funcs,
+                    aux_funcs=aux_funcs,
+                    bcs_now=bcs_now,
+                )
+                logging.info(
+                    "[startup] fluid predictor sweep=%d/%d: converged=%s iters=%d |F|_inf=%.3e",
+                    int(sweep_idx),
+                    int(startup_sweeps),
+                    str(bool(fluid_ok)).lower(),
+                    int(fluid_iters),
+                    float(fluid_norm),
+                )
+                _copy_function_values(v_k, v_trac_n)
+                _copy_function_values(p_k, p_trac_n)
+                _startup_interface_summary(f"fluid[sweep={int(sweep_idx)}]")
+            except Exception as exc:
+                _restore_snapshot(fluid_backup)
+                _restore_snapshot(solid_backup)
+                _restore_snapshot(traction_backup)
+                logging.warning(f"[startup] fluid predictor failed on sweep {sweep_idx}: {exc}")
+                return
+
+            if not fluid_ok:
+                _restore_snapshot(fluid_backup)
+                _restore_snapshot(solid_backup)
+                _restore_snapshot(traction_backup)
+                return
+
+            try:
+                solid_ok, solid_iters, solid_norm = _run_restricted_startup_solve(
+                    stage_name="solid",
+                    active_fields=startup_active_fields_solid,
+                    funcs=funcs,
+                    prev_funcs=prev_funcs,
+                    aux_funcs=aux_funcs,
+                    bcs_now=bcs_now,
+                )
+                logging.info(
+                    "[startup] solid predictor sweep=%d/%d: converged=%s iters=%d |F|_inf=%.3e",
+                    int(sweep_idx),
+                    int(startup_sweeps),
+                    str(bool(solid_ok)).lower(),
+                    int(solid_iters),
+                    float(solid_norm),
+                )
+                _startup_interface_summary(f"solid[sweep={int(sweep_idx)}]")
+                slip_stats = _startup_slip_summary(f"sweep={int(sweep_idx)}")
+                if not solid_ok:
+                    _restore_snapshot(fluid_backup)
+                    _restore_snapshot(solid_backup)
+                    _restore_snapshot(traction_backup)
+                    return
+                if startup_slip_tol > 0.0 and np.isfinite(slip_stats.get("v_minus_vS_inf", float("nan"))):
+                    if float(slip_stats["v_minus_vS_inf"]) <= float(startup_slip_tol):
+                        logging.info(
+                            "[startup] early stop after sweep %d/%d: |v-vS|_inf=%.3e <= %.3e",
+                            int(sweep_idx),
+                            int(startup_sweeps),
+                            float(slip_stats["v_minus_vS_inf"]),
+                            float(startup_slip_tol),
+                        )
+                        break
+            except Exception as exc:
+                _restore_snapshot(fluid_backup)
+                _restore_snapshot(solid_backup)
+                _restore_snapshot(traction_backup)
+                logging.warning(f"[startup] solid predictor failed on sweep {sweep_idx}: {exc}")
+                return
 
     def _on_dt_change(new_dt: float) -> None:
         dt_c.value = float(new_dt)
@@ -3474,6 +4570,12 @@ def main() -> None:
     predictor_base = str(args.predictor)
     predictor_damping_base = float(args.predictor_damping)
     predictor_clip_01_base = bool(args.predictor_clip_01)
+    if str(args.support_physics).strip().lower() == "internal_conversion" and predictor_clip_01_base:
+        logging.info(
+            "[setup] disabling predictor_clip_01 for support_physics=internal_conversion; "
+            "mass-preserving PDAS equalities provide the bounded predictor path."
+        )
+        predictor_clip_01_base = False
     retry_state = {
         "step_no": None,
         "predictor_fallbacks": 0,
@@ -3491,6 +4593,11 @@ def main() -> None:
         Prints per-field residual norms at the best available iterate so we can
         identify which equation block is driving SNES/Newton failures.
         """
+        def _startup_retry(action: str | None):
+            if startup_predictor_enabled:
+                startup_state["force_next"] = str(action).strip().lower() != "retry_keep_guess"
+            return action
+
         try:
             step_no = int(info.get("step_no", info.get("global_step_no", -1)))
         except Exception:
@@ -3542,7 +4649,7 @@ def main() -> None:
             except Exception:
                 pass
             print("    [retry] line search failed; retrying same Δt with predictor='prev' (no extrapolation).")
-            return "retry"
+            return _startup_retry("retry")
 
         # If we are very close to the requested absolute tolerance but hit SNES max-it at dt==dt_min,
         # retry the same step with a higher max-it (keeps rtol=0 and avoids dt collapse).
@@ -3640,31 +4747,34 @@ def main() -> None:
                 v_fun = coeff_map.get("v_k")
                 vS_fun = coeff_map.get("vS_k")
                 if v_fun is not None and vS_fun is not None:
-                    try:
-                        vx = np.asarray(v_fun.components[0].nodal_values, dtype=float).ravel()
-                        vy = np.asarray(v_fun.components[1].nodal_values, dtype=float).ravel()
-                        vsx = np.asarray(vS_fun.components[0].nodal_values, dtype=float).ravel()
-                        vsy = np.asarray(vS_fun.components[1].nodal_values, dtype=float).ravel()
-                        dxv = vx - vsx
-                        dyv = vy - vsy
-                        slip_l2 = float(np.sqrt(np.dot(dxv, dxv) + np.dot(dyv, dyv)))
-                        slip_inf = float(max(np.max(np.abs(dxv)), np.max(np.abs(dyv))))
-                        slip_norms = {
-                            "vx_minus_vSx_inf": float(np.max(np.abs(dxv))),
-                            "vy_minus_vSy_inf": float(np.max(np.abs(dyv))),
-                            "v_minus_vS_inf": slip_inf,
-                            "v_minus_vS_l2": slip_l2,
-                        }
-                        diag["slip_norms"] = slip_norms
-                        print(
-                            "    [fail_slip] "
-                            f"|vx-vSx|_inf={slip_norms['vx_minus_vSx_inf']:.2e}, "
-                            f"|vy-vSy|_inf={slip_norms['vy_minus_vSy_inf']:.2e}, "
-                            f"|v-vS|_inf={slip_norms['v_minus_vS_inf']:.2e}, "
-                            f"|v-vS|_2={slip_norms['v_minus_vS_l2']:.2e}"
-                        )
-                    except Exception as exc_slip:
-                        print(f"    [fail_slip] failed to compute slip mismatch: {exc_slip}")
+                    if not hasattr(v_fun, "components") or not hasattr(vS_fun, "components"):
+                        print("    [fail_slip] skipped for non-nodal velocity representation.")
+                    else:
+                        try:
+                            vx = np.asarray(v_fun.components[0].nodal_values, dtype=float).ravel()
+                            vy = np.asarray(v_fun.components[1].nodal_values, dtype=float).ravel()
+                            vsx = np.asarray(vS_fun.components[0].nodal_values, dtype=float).ravel()
+                            vsy = np.asarray(vS_fun.components[1].nodal_values, dtype=float).ravel()
+                            dxv = vx - vsx
+                            dyv = vy - vsy
+                            slip_l2 = float(np.sqrt(np.dot(dxv, dxv) + np.dot(dyv, dyv)))
+                            slip_inf = float(max(np.max(np.abs(dxv)), np.max(np.abs(dyv))))
+                            slip_norms = {
+                                "vx_minus_vSx_inf": float(np.max(np.abs(dxv))),
+                                "vy_minus_vSy_inf": float(np.max(np.abs(dyv))),
+                                "v_minus_vS_inf": slip_inf,
+                                "v_minus_vS_l2": slip_l2,
+                            }
+                            diag["slip_norms"] = slip_norms
+                            print(
+                                "    [fail_slip] "
+                                f"|vx-vSx|_inf={slip_norms['vx_minus_vSx_inf']:.2e}, "
+                                f"|vy-vSy|_inf={slip_norms['vy_minus_vSy_inf']:.2e}, "
+                                f"|v-vS|_inf={slip_norms['v_minus_vS_inf']:.2e}, "
+                                f"|v-vS|_2={slip_norms['v_minus_vS_l2']:.2e}"
+                            )
+                        except Exception as exc_slip:
+                            print(f"    [fail_slip] failed to compute slip mismatch: {exc_slip}")
 
                 if at_dt_min:
                     worst_block = str(diag.get("worst_block", ""))
@@ -3686,7 +4796,7 @@ def main() -> None:
         if line_search_failure and at_dt_min and retry_state.get("linesearch_fallbacks", 0) < 1:
             retry_state["linesearch_fallbacks"] = int(retry_state.get("linesearch_fallbacks", 0)) + 1
             print("    [retry] dt==dt_min and line search failed; retrying from best iterate (keep guess).")
-            return "retry_keep_guess"
+            return _startup_retry("retry_keep_guess")
 
         if adaptive_gamma_div and line_search_failure and at_dt_min:
             diag = _compute_failure_diagnostics()
@@ -3710,7 +4820,7 @@ def main() -> None:
                     solver._ls_alpha_prev = 1.0
                 except Exception:
                     pass
-                return "retry_keep_guess"
+                return _startup_retry("retry_keep_guess")
 
         if hit_maxit and at_dt_min:
             retry_state["dtmin_maxit_retries"] = int(retry_state.get("dtmin_maxit_retries", 0)) + 1
@@ -3722,7 +4832,7 @@ def main() -> None:
                     try:
                         solver._invalidate_petsc_cache()
                         print("    [retry] repeated max-it at dt_min; rebuilding PETSc SNES/KSP stack and retrying.")
-                        return "retry_keep_guess"
+                        return _startup_retry("retry_keep_guess")
                     except Exception as exc:
                         print(f"    [retry] failed to reset PETSc stack: {exc}")
 
@@ -3739,7 +4849,7 @@ def main() -> None:
                 print(
                     f"    [retry] SNES hit max-it at dt_min with ‖F‖_inf={float(fnorm):.3e}; retrying with --max-it {new_max}."
                 )
-                return "retry_keep_guess"
+                return _startup_retry("retry_keep_guess")
             except Exception as exc:
                 print(f"    [retry] failed to increase max-it: {exc}")
 
@@ -3757,7 +4867,7 @@ def main() -> None:
                     except Exception:
                         pass
                 print(f"    [retry] SNES hit max-it with ‖F‖_inf={float(fnorm):.3e}; retrying with --max-it {new_max}.")
-                return "retry_keep_guess"
+                return _startup_retry("retry_keep_guess")
             except Exception as exc:
                 print(f"    [retry] failed to increase max-it: {exc}")
 
@@ -3773,6 +4883,10 @@ def main() -> None:
             time_params.predictor_clip_01 = bool(predictor_clip_01_base)
         except Exception:
             pass
+        if startup_predictor_enabled:
+            startup_state["force_next"] = True
+        _copy_function_values(v_k, v_trac_n)
+        _copy_function_values(p_k, p_trac_n)
         # Line search is configured via `petsc_opts` on solver creation; avoid mutating
         # PETSc options mid-run (can rewire KSP/PC and lead to size-mismatch errors).
 
@@ -3808,6 +4922,7 @@ def main() -> None:
         if diffuse_scale_update is not None:
             diffuse_scale_update(float(t_now))
         _append_timeseries(t_now)
+        _append_interface_diagnostics(t_now)
         while pending_snapshots and t_now + 1.0e-12 >= float(pending_snapshots[0]):
             _write_snapshot_contours(float(t_now), int(step_no))
             pending_snapshots.pop(0)
@@ -3871,6 +4986,7 @@ def main() -> None:
         S_k.nodal_values[:] = S_n.nodal_values
     if restart_from is None:
         _append_timeseries(0.0)
+        _append_interface_diagnostics(0.0)
         while pending_snapshots and abs(float(pending_snapshots[0])) <= 1.0e-14:
             _write_snapshot_contours(0.0, 0)
             pending_snapshots.pop(0)
@@ -3917,6 +5033,7 @@ def main() -> None:
             )
     elif not append_existing_ts:
         _append_timeseries(float(t0))
+        _append_interface_diagnostics(float(t0))
         while pending_snapshots and float(t0) + 1.0e-12 >= float(pending_snapshots[0]):
             _write_snapshot_contours(float(t0), int(step0))
             pending_snapshots.pop(0)
@@ -3993,8 +5110,9 @@ def main() -> None:
         predictor=str(predictor_base),
         predictor_damping=float(predictor_damping_base),
         predictor_clip_01=bool(predictor_clip_01_base),
+        step_initial_guess_callback=_startup_step_initial_guess_callback if startup_predictor_enabled else None,
     )
-    aux_solver_functions: dict[str, object] = {"dt": dt_c}
+    aux_solver_functions: dict[str, object] = {"dt": dt_c, "v_trac_n": v_trac_n, "p_trac_n": p_trac_n}
     if regularization_weight is not None:
         aux_solver_functions["reg_weight"] = regularization_weight
     solver.solve_time_interval(

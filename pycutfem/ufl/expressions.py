@@ -165,6 +165,7 @@ def _expr_shape(expr) -> tuple[int, ...]:
     if isinstance(expr, ElementWiseConstant):
         return tuple(expr.shape)
     if isinstance(expr, (Function, TrialFunction, TestFunction, NormalComponent, Derivative, DivOperation, Laplacian,
+                         HdivFunctionComponent, HdivTrialFunctionComponent, HdivTestFunctionComponent,
                          PositivePart, Heaviside, Log, Inner, Trace, Determinant)):
         return ()
     if isinstance(expr, (FacetNormal, VectorFunction, VectorTrialFunction, VectorTestFunction,
@@ -197,6 +198,8 @@ def _expr_shape(expr) -> tuple[int, ...]:
         if len(base_shape) == 1:
             return (base_shape[0], 2, 2)
         raise TypeError(f"Hessian shape not supported for operand shape {base_shape!r}.")
+    if isinstance(expr, (PositivePart, Heaviside, Log, Exp)):
+        return _expr_shape(expr.operand)
     if isinstance(expr, (Sum, Sub)):
         shape_a = _expr_shape(expr.a)
         shape_b = _expr_shape(expr.b)
@@ -1158,8 +1161,7 @@ class HdivTrialFunction(Expression):
         idx = int(i)
         if idx not in (0, 1):
             raise IndexError("HdivTrialFunction has two components (0, 1).")
-        basis = Constant([1.0, 0.0] if idx == 0 else [0.0, 1.0], dim=1)
-        return dot(self, basis)
+        return HdivTrialFunctionComponent(self, idx)
 
 
 class HdivTestFunction(Expression):
@@ -1190,8 +1192,7 @@ class HdivTestFunction(Expression):
         idx = int(i)
         if idx not in (0, 1):
             raise IndexError("HdivTestFunction has two components (0, 1).")
-        basis = Constant([1.0, 0.0] if idx == 0 else [0.0, 1.0], dim=1)
-        return dot(self, basis)
+        return HdivTestFunctionComponent(self, idx)
 
 
 class HdivFunction(Function):
@@ -1227,8 +1228,53 @@ class HdivFunction(Function):
         idx = int(i)
         if idx not in (0, 1):
             raise IndexError("HdivFunction has two components (0, 1).")
-        basis = Constant([1.0, 0.0] if idx == 0 else [0.0, 1.0], dim=1)
-        return dot(self, basis)
+        return HdivFunctionComponent(self, idx)
+
+
+class _HdivComponentBase(Expression):
+    """Scalar component view of a single H(div) field."""
+
+    dim = 0
+    num_components = 1
+
+    def __init__(self, parent, component_index: int):
+        super().__init__()
+        self.parent = parent
+        self.component_index = int(component_index)
+        self.field_name = str(parent.field_name)
+        self.field_names = [self.field_name]
+        self.parent_name = getattr(parent, "name", getattr(parent, "parent_name", ""))
+        self.side = getattr(parent, "side", "")
+        if self.side in ("+", "-"):
+            s = "pos" if self.side == "+" else "neg"
+            self.field_sides = [s]
+        else:
+            self.field_sides = [""]
+
+    def __repr__(self):
+        cls = type(self).__name__
+        return f"{cls}(field='{self.field_name}', component={self.component_index})"
+
+    def get_nodal_values(self, local_dofs):
+        return self.parent.get_nodal_values(local_dofs)
+
+
+class HdivTrialFunctionComponent(_HdivComponentBase):
+    is_trial = True
+    is_function = False
+    is_test = False
+
+
+class HdivTestFunctionComponent(_HdivComponentBase):
+    is_test = True
+    is_function = False
+    is_trial = False
+
+
+class HdivFunctionComponent(_HdivComponentBase):
+    is_function = True
+    is_trial = False
+    is_test = False
 
 
 def _scalar_token(value: float) -> str:
@@ -1466,7 +1512,21 @@ class Derivative(Expression):
 
 
 class Grad(Expression):
-    """Gradient of a scalar expression in 2-D (returns a length-2 vector)."""
+    """
+    Gradient in 2-D.
+
+    Shape conventions:
+      - scalar operand: grad(a) has shape (spatial,)
+      - vector operand: grad(v) has shape (component, spatial)
+
+    Indexing follows those shapes:
+      - grad(a)[j]      -> d_j a
+      - grad(v)[i]      -> grad(v_i)
+      - grad(v)[i, j]   -> d_j v_i
+
+    If a directional derivative of the whole vector field is needed, use
+    ``Derivative(v, ox, oy)`` explicitly rather than ``grad(v)[j]``.
+    """
 
     def __init__(self, operand):
         self.operand = operand          # scalar Expression
@@ -1482,7 +1542,13 @@ class Grad(Expression):
     # ------------------------------------------------------------------
     def __getitem__(self, index):
         idx = _normalize_index(index)
+        base_shape = _expr_shape(self.operand)
         if len(idx) == 1:
+            if len(base_shape) == 1:
+                comp = idx[0]
+                if comp < 0 or comp >= int(base_shape[0]):
+                    raise IndexError(f"Vector component {comp} out of range for shape {base_shape!r}.")
+                return Grad(self.operand[comp])
             if idx[0] == 0:
                 return Derivative(self.operand, 1, 0)
             if idx[0] == 1:
@@ -1490,7 +1556,6 @@ class Grad(Expression):
             raise IndexError("Grad supports indices 0 (x) or 1 (y)")
         if len(idx) == 2:
             comp, coord = idx
-            base_shape = _expr_shape(self.operand)
             if len(base_shape) != 1:
                 raise IndexError(f"Grad component indexing requires a vector operand, got shape {base_shape!r}.")
             if comp < 0 or comp >= int(base_shape[0]):
@@ -1531,6 +1596,15 @@ class Log(Expression):
         self.operand = operand
     def __repr__(self):
         return f"Log({self.operand!r})"
+
+
+class Exp(Expression):
+    """Natural exponential exp(x)."""
+    def __init__(self, operand):
+        super().__init__()
+        self.operand = operand
+    def __repr__(self):
+        return f"Exp({self.operand!r})"
 
 class Inner(Expression):
     def __init__(self, a, b): self.a, self.b = a, b
@@ -1736,6 +1810,7 @@ def dyad(a, b): return Outer(a, b)
 def pos_part(x): return PositivePart(x)
 def heaviside(x): return Heaviside(x)
 def log(x): return Log(x)
+def exp(x): return Exp(x)
 def jump(v, n=None):
     """
     Jump operator.

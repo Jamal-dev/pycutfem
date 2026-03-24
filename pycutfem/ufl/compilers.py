@@ -43,6 +43,7 @@ from pycutfem.ufl.expressions import (
     VectorTestFunction, VectorTrialFunction,
     HdivTestFunction, HdivTrialFunction,
     HdivFunction,
+    HdivFunctionComponent, HdivTrialFunctionComponent, HdivTestFunctionComponent,
     Function,    VectorFunction,
     Grad, DivOperation, Inner, Dot, Outer,
     Sum, Sub, Prod, Pos, Neg,Div, Jump, FacetNormal,
@@ -50,7 +51,7 @@ from pycutfem.ufl.expressions import (
     ElementWiseConstant, Derivative, Transpose,
     CellDiameter, MeshSize, NormalComponent,
     Restriction, Power, Trace, Determinant, Inverse, Hessian, Laplacian,
-    Identity, Cofactor, PositivePart, Heaviside, Log
+    Identity, Cofactor, PositivePart, Heaviside, Log, Exp
 )
 from pycutfem.ufl.forms import Equation
 from pycutfem.ufl.measures import Integral
@@ -82,6 +83,18 @@ import os
 
 logger = logging.getLogger(__name__)
 _INTERFACE_TOL = SIDE.tol
+
+
+def _is_scalar_zero_constant(expr) -> bool:
+    """Return True only for exact scalar Constant(0.0)-style literals."""
+    if not isinstance(expr, Constant):
+        return False
+    if int(getattr(expr, "dim", 0)) != 0:
+        return False
+    try:
+        return float(expr.value) == 0.0
+    except Exception:
+        return False
 
 def interface_normal_for_edge(mesh, e, level_set):
     # mid-point on the physical edge
@@ -166,6 +179,9 @@ class FormCompiler:
             HdivTestFunction: self._visit_HdivTestFunction,
             HdivTrialFunction: self._visit_HdivTrialFunction,
             HdivFunction: self._visit_HdivFunction,
+            HdivTestFunctionComponent: self._visit_HdivTestFunctionComponent,
+            HdivTrialFunctionComponent: self._visit_HdivTrialFunctionComponent,
+            HdivFunctionComponent: self._visit_HdivFunctionComponent,
             Function: self._visit_Function,
             VectorFunction: self._visit_VectorFunction, 
             Grad: self._visit_Grad,
@@ -195,6 +211,7 @@ class FormCompiler:
             PositivePart: self._visit_PositivePart,
             Heaviside: self._visit_Heaviside,
             Log: self._visit_Log,
+            Exp: self._visit_Exp,
         }
     
     @contextmanager
@@ -1153,12 +1170,28 @@ class FormCompiler:
                 expo_val = self._visit(expo)
                 if isinstance(expo, Constant):
                     p = float(expo.value)
-                    return p * (base_val ** (p - 1.0)) * dbase
+                    if isinstance(base_val, VecOpInfo):
+                        base_pow = base_val._with(base_val.data ** (p - 1.0), role=base_val.role)
+                    elif isinstance(base_val, GradOpInfo):
+                        base_pow = base_val._with(base_val.data ** (p - 1.0), role=base_val.role)
+                    elif isinstance(base_val, HessOpInfo):
+                        base_pow = base_val._with(base_val.data ** (p - 1.0), role=base_val.role)
+                    else:
+                        base_pow = base_val ** (p - 1.0)
+                    return p * base_pow * dbase
                 return (base_val ** expo_val) * (dexp * self._visit(Log(base)) + expo_val * dbase / base_val)
             if isinstance(expr, Log):
                 darg = self._visit(Derivative(expr.operand, *order))
                 arg = self._visit(expr.operand)
                 return darg / arg
+            if isinstance(expr, Exp):
+                darg = self._visit(Derivative(expr.operand, *order))
+                arg = self._visit(expr.operand)
+                if isinstance(arg, (VecOpInfo, GradOpInfo, HessOpInfo)):
+                    return arg._with(np.exp(arg.data)) * darg
+                if isinstance(arg, np.ndarray):
+                    return np.exp(arg) * darg
+                return math.exp(float(arg)) * darg
             if isinstance(expr, (PositivePart, Heaviside)):
                 raise NotImplementedError("Derivative of PositivePart/Heaviside is not supported in the Python backend.")
             if not _is_scalar_leaf(expr):
@@ -1226,6 +1259,44 @@ class FormCompiler:
             if isinstance(result, np.ndarray):
                 return np.zeros_like(result)
             return 0.0
+
+        if isinstance(op.f, (HdivFunctionComponent, HdivTrialFunctionComponent, HdivTestFunctionComponent)):
+            fld = str(op.f.field_name)
+            comp = int(op.f.component_index)
+            ox, oy = map(int, op.order)
+            if (ox, oy) not in {(1, 0), (0, 1), (2, 0), (1, 1), (0, 2)}:
+                raise NotImplementedError(f"H(div) component derivative order {(ox, oy)} not implemented.")
+            basis_entry = self._get_hdiv_basis_entry(fld)
+            if (ox, oy) in {(1, 0), (0, 1)}:
+                grad_tbl = basis_entry.get("hdiv_grad")
+                if grad_tbl is None:
+                    raise RuntimeError(f"Missing H(div) gradient cache for field '{fld}'.")
+                deriv_row = np.asarray(grad_tbl, dtype=float)[comp, :, 0 if (ox, oy) == (1, 0) else 1]
+            else:
+                hess_tbl = basis_entry.get("hdiv_hess")
+                if hess_tbl is None:
+                    raise RuntimeError(f"Missing H(div) Hessian cache for field '{fld}'.")
+                if (ox, oy) == (2, 0):
+                    deriv_row = np.asarray(hess_tbl, dtype=float)[comp, :, 0, 0]
+                elif (ox, oy) == (1, 1):
+                    deriv_row = np.asarray(hess_tbl, dtype=float)[comp, :, 0, 1]
+                else:
+                    deriv_row = np.asarray(hess_tbl, dtype=float)[comp, :, 1, 1]
+
+            if getattr(op.f, "is_function", False):
+                coeffs = np.asarray(op.f.get_nodal_values(self._local_dofs()), dtype=float)
+                side = self._get_side() if self._on_sided_path() else ""
+                gd = self.ctx.get("global_dofs", None)
+                if gd is not None:
+                    deriv_row, coeffs = _hac._align_phi_and_coeffs_to_global(
+                        self.ctx, side or "+", fld, deriv_row, coeffs
+                    )
+                val = float(np.asarray(deriv_row, dtype=float) @ np.asarray(coeffs, dtype=float))
+                return self._vecinfo(np.asarray([val], dtype=float), role="function", node=op, field_names=[fld])
+
+            role = "trial" if getattr(op.f, "is_trial", False) else "test"
+            row = np.asarray(deriv_row, dtype=float)[np.newaxis, :]
+            return self._vecinfo(row, role=role, node=op, field_names=[fld])
 
         composite_val = _derivative_of_scalar_expr(op.f, op.order)
         if composite_val is not None:
@@ -1409,6 +1480,18 @@ class FormCompiler:
             return np.log(val)
         return math.log(float(val))
 
+    def _visit_Exp(self, node: Exp):
+        val = self._visit(node.operand)
+        if val is None:
+            return None
+        if isinstance(val, (VecOpInfo, GradOpInfo, HessOpInfo)):
+            if getattr(val, "role", None) in {"trial", "test", "mixed"}:
+                raise NotImplementedError("Exp is only supported for coefficient/value expressions.")
+            return val._with(np.exp(val.data))
+        if isinstance(val, np.ndarray):
+            return np.exp(val)
+        return math.exp(float(val))
+
     def _visit_Jump(self, n: Jump):
         phi_old  = self.ctx.get('phi_val', None)
         eid_old  = self.ctx.get('eid')
@@ -1556,6 +1639,74 @@ class FormCompiler:
         val = np.asarray(hdiv_val, dtype=float) @ np.asarray(coeffs, dtype=float)  # (2,)
         # Repeat field metadata per vector component so restriction masks apply to both.
         return self._vecinfo(np.asarray(val, dtype=float), role="function", node=n, field_names=[n.field_name] * 2)
+
+    def _get_hdiv_basis_entry(self, field_name: str):
+        fld = str(field_name)
+        entry = self._basis_cache.get(fld, {})
+        side = self._get_side() if self._on_sided_path() else None
+        if side == "+":
+            side_entry = {
+                "hdiv_val": entry.get("hdiv_val_pos", None),
+                "hdiv_grad": entry.get("hdiv_grad_pos", None),
+                "hdiv_div": entry.get("hdiv_div_pos", None),
+                "hdiv_hess": entry.get("hdiv_hess_pos", None),
+            }
+        elif side == "-":
+            side_entry = {
+                "hdiv_val": entry.get("hdiv_val_neg", None),
+                "hdiv_grad": entry.get("hdiv_grad_neg", None),
+                "hdiv_div": entry.get("hdiv_div_neg", None),
+                "hdiv_hess": entry.get("hdiv_hess_neg", None),
+            }
+        else:
+            side_entry = {"hdiv_val": None, "hdiv_grad": None, "hdiv_div": None, "hdiv_hess": None}
+
+        for key in ("hdiv_val", "hdiv_grad", "hdiv_div", "hdiv_hess"):
+            if side_entry[key] is None:
+                side_entry[key] = entry.get(key)
+        return side_entry
+
+    def _visit_hdiv_component_leaf(self, n, *, role: str):
+        fld = str(n.field_name)
+        comp = int(n.component_index)
+        basis_entry = self._get_hdiv_basis_entry(fld)
+        hdiv_val = basis_entry.get("hdiv_val")
+        if hdiv_val is None:
+            raise RuntimeError(f"Missing H(div) basis cache for field '{fld}'.")
+
+        row = np.asarray(hdiv_val, dtype=float)[comp, :]
+        if role == "function":
+            coeffs = np.asarray(n.get_nodal_values(self._local_dofs()), dtype=float)
+            side = self._get_side() if self._on_sided_path() else ""
+            gd = self.ctx.get("global_dofs", None)
+            if gd is not None:
+                union_key = "pos_union_mask_by_field" if side == "+" else "neg_union_mask_by_field"
+                union_backup = None
+                masks = self.ctx.get(union_key)
+                if self.ctx.get("_restriction_mask_active", 0):
+                    if isinstance(masks, dict) and masks:
+                        union_backup = masks
+                        self.ctx[union_key] = {f: np.ones_like(np.asarray(m, dtype=float)) for f, m in masks.items()}
+                try:
+                    row, coeffs = _hac._align_phi_and_coeffs_to_global(
+                        self.ctx, side or "+", fld, row, coeffs
+                    )
+                finally:
+                    if union_backup is not None:
+                        self.ctx[union_key] = union_backup
+            val = float(np.asarray(row, dtype=float) @ np.asarray(coeffs, dtype=float))
+            return self._vecinfo(np.asarray([val], dtype=float), role="function", node=n, field_names=[fld])
+
+        return self._vecinfo(np.asarray(row, dtype=float)[np.newaxis, :], role=role, node=n, field_names=[fld])
+
+    def _visit_HdivFunctionComponent(self, n: HdivFunctionComponent):
+        return self._visit_hdiv_component_leaf(n, role="function")
+
+    def _visit_HdivTrialFunctionComponent(self, n: HdivTrialFunctionComponent):
+        return self._visit_hdiv_component_leaf(n, role="trial")
+
+    def _visit_HdivTestFunctionComponent(self, n: HdivTestFunctionComponent):
+        return self._visit_hdiv_component_leaf(n, role="test")
 
     def _visit_VectorFunction(self, n: VectorFunction):
         logger.debug(f"Visiting VectorFunction: {n.field_names}")
@@ -2002,6 +2153,26 @@ class FormCompiler:
                 else:
                     self.ctx["_restriction_mask_active"] = depth
             return self._apply_restriction_mask(result, op)
+
+        if isinstance(op, (HdivFunctionComponent, HdivTrialFunctionComponent, HdivTestFunctionComponent)):
+            fld = str(op.field_name)
+            comp = int(op.component_index)
+            hess_tbl = self._get_hdiv_basis_entry(fld).get("hdiv_hess")
+            if hess_tbl is None:
+                raise RuntimeError(f"Missing H(div) Hessian cache for field '{fld}'.")
+            hess_tbl = np.asarray(hess_tbl, dtype=float)[comp, :, :, :]
+            if getattr(op, "is_function", False):
+                coeffs = np.asarray(op.get_nodal_values(self._local_dofs()), dtype=float)
+                side = self._get_side() if self._on_sided_path() else ""
+                gd = self.ctx.get("global_dofs", None)
+                if gd is not None:
+                    hess_tbl, coeffs = _hac._align_phi_and_coeffs_to_global(
+                        self.ctx, side or "+", fld, hess_tbl, coeffs
+                    )
+                Hval = np.einsum("nij,n->ij", hess_tbl, coeffs, optimize=True)
+                return self._hessinfo(Hval[np.newaxis, :, :], role="function", node=op, field_names=[fld])
+            role = "trial" if getattr(op, "is_trial", False) else "test"
+            return self._hessinfo(hess_tbl[np.newaxis, :, :, :], role=role, node=op, field_names=[fld])
 
         # Role + component names
         if isinstance(op, (TestFunction, VectorTestFunction)):
@@ -3164,6 +3335,8 @@ class FormCompiler:
         is_pure_functional = (trial is None) and (test is None)
         accumulate_scalar = is_pure_functional and (hook is not None)
         if is_pure_functional and hook is None:
+            if _is_scalar_zero_constant(integral.integrand):
+                return
             raise ValueError(
                 "Pure functionals on the python backend require an assembler hook "
                 "(e.g. assemble_form(..., assembler_hooks={integrand:{'name':'I'}}))."
@@ -3208,25 +3381,30 @@ class FormCompiler:
                         # H(div): vector basis values + divergence basis (both union-sized).
                         V = np.asarray(self.me.tabulate_value(f, float(xi), float(eta), element_id=int(eid)), dtype=float)  # (n_loc_f,2)
                         G = np.asarray(self.me.tabulate_grad(f, float(xi), float(eta), element_id=int(eid)), dtype=float)  # (n_loc_f,2,2)
+                        H = np.asarray(self.me.tabulate_hessian(f, float(xi), float(eta), element_id=int(eid)), dtype=float)  # (n_loc_f,2,2,2)
                         divV = np.asarray(self.me.tabulate_div(f, float(xi), float(eta), element_id=int(eid)), dtype=float).ravel()  # (n_loc_f,)
                         sgn = np.asarray(self.dh.element_signs[f][int(eid)], dtype=float).ravel()
                         if sgn.shape[0] != V.shape[0]:
                             raise RuntimeError(f"element_signs length mismatch for RT field '{f}' on element {eid}.")
                         V = sgn[:, None] * V
                         G = sgn[:, None, None] * G
+                        H = sgn[:, None, None, None] * H
                         divV = sgn * divV
 
                         n_union = int(self.me.n_dofs_local)
                         sl = self.me.component_dof_slices[f]
                         hdiv_val = np.zeros((2, n_union), dtype=float)
                         hdiv_grad = np.zeros((2, n_union, 2), dtype=float)
+                        hdiv_hess = np.zeros((2, n_union, 2, 2), dtype=float)
                         hdiv_val[:, sl] = V.T
                         hdiv_grad[:, sl, :] = np.transpose(G, (1, 0, 2))
+                        hdiv_hess[:, sl, :, :] = np.transpose(H, (1, 0, 2, 3))
                         hdiv_div = np.zeros((n_union,), dtype=float)
                         hdiv_div[sl] = divV
                         self._basis_cache[f] = {
                             "hdiv_val": hdiv_val,
                             "hdiv_grad": hdiv_grad,
+                            "hdiv_hess": hdiv_hess,
                             "hdiv_div": hdiv_div,
                         }
                         continue
@@ -6865,9 +7043,36 @@ class FormCompiler:
                 # basis cache ---------------------------------------------------
                 self._basis_cache.clear();self._coeff_cache.clear(); self._collapsed_cache.clear();
                 for f in fields:
+                    fam = getattr(self.me, "_field_families", {}).get(f, "Lagrange")
+                    if fam == "RT":
+                        V = np.asarray(self.me.tabulate_value(f, float(xi), float(eta), element_id=int(eid)), dtype=float)
+                        G = np.asarray(self.me.tabulate_grad(f, float(xi), float(eta), element_id=int(eid)), dtype=float)
+                        divV = np.asarray(self.me.tabulate_div(f, float(xi), float(eta), element_id=int(eid)), dtype=float).ravel()
+                        sgn = np.asarray(self.dh.element_signs[f][int(eid)], dtype=float).ravel()
+                        if sgn.shape[0] != V.shape[0]:
+                            raise RuntimeError(f"element_signs length mismatch for RT field '{f}' on element {eid}.")
+                        V = sgn[:, None] * V
+                        G = sgn[:, None, None] * G
+                        divV = sgn * divV
+
+                        n_union = int(self.me.n_dofs_local)
+                        sl = self.me.component_dof_slices[f]
+                        hdiv_val = np.zeros((2, n_union), dtype=float)
+                        hdiv_grad = np.zeros((2, n_union, 2), dtype=float)
+                        hdiv_val[:, sl] = V.T
+                        hdiv_grad[:, sl, :] = np.transpose(G, (1, 0, 2))
+                        hdiv_div = np.zeros((n_union,), dtype=float)
+                        hdiv_div[sl] = divV
+                        self._basis_cache[f] = {
+                            "hdiv_val": hdiv_val,
+                            "hdiv_grad": hdiv_grad,
+                            "hdiv_div": hdiv_div,
+                        }
+                        continue
+
                     self._basis_cache[f] = {
-                        "val" : self.me.basis      (f, float(xi), float(eta)),
-                        "grad": self.me.grad_basis (f, float(xi), float(eta)) @ Ji
+                        "val": self.me.basis(f, float(xi), float(eta)),
+                        "grad": self.me.grad_basis(f, float(xi), float(eta)) @ Ji,
                     }
 
                 # context for visitors

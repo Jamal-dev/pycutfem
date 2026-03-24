@@ -596,6 +596,7 @@ def run_benchmark(
 
     summary = {
         "benchmark": "wang2014_example62_staircase_reduced",
+        "paper1_scope": "alpha-independent sharp-interface consistency benchmark",
         "params": asdict(params),
         "grid_pairs": [{"K": float(K), "nxy": int(nxy)} for K, nxy in grid_pairs],
         "plot_ks": plot_ks,
@@ -614,7 +615,9 @@ def run_benchmark(
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Paper 1 Benchmark 3: Wang2014-style stepped-interface reduced comparison.")
+    ap = argparse.ArgumentParser(
+        description="Paper 1 Benchmark 3: Wang2014-style stepped-interface reduced comparison (alpha-independent reference layer)."
+    )
     ap.add_argument(
         "--outdir",
         type=str,

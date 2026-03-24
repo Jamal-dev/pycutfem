@@ -441,6 +441,42 @@ def _build_jit_kernel_args(       # ← signature unchanged
             ref[:, _field_new_slice(field)] = ref_loc
         return _expand_per_element(ref)
 
+    def _prebuilt_qref_mode():
+        if pre_built is None:
+            return None
+        qref_raw = pre_built.get("qref")
+        if qref_raw is None:
+            qref_raw = pre_built.get("qp_ref")
+        if qref_raw is None:
+            return None
+        qref_arr = np.asarray(qref_raw, dtype=np.float64)
+        if qref_arr.ndim == 3 and qref_arr.shape[2] == 2:
+            return ("per_element", qref_arr)
+        if qref_arr.ndim == 2 and qref_arr.shape[1] == 2:
+            return ("global", qref_arr)
+        return None
+
+    def _kernel_owner_ids(what: str) -> np.ndarray:
+        """
+        Resolve the owner element id for each kernel row.
+
+        Volume kernels naturally use ``eids``; edge/interface kernels often carry
+        non-element ``eids`` and must instead use ``owner_id`` for RT orientation
+        and physical Piola mappings.
+        """
+        owners = None
+        if pre_built is not None:
+            owners = _first_present(pre_built, "owner_id", "eids")
+        if owners is None:
+            owners = np.arange(n_elem, dtype=np.int32)
+        owners = np.asarray(owners, dtype=np.int64).ravel()
+        if int(owners.shape[0]) != int(n_elem):
+            raise ValueError(
+                f"{what}: owner/eids length mismatch with kernel rows "
+                f"(owners={int(owners.shape[0])}, n_elem={int(n_elem)})."
+            )
+        return owners
+
     # --- H(div) RT tables (reference-space, union-padded) ----------------------
     def _hdiv_bvec_table(field: str) -> np.ndarray:
         """
@@ -451,6 +487,48 @@ def _build_jit_kernel_args(       # ← signature unchanged
         fam = getattr(mixed_element, "_field_families", {}).get(field, None)
         if fam != "RT":
             raise ValueError(f"Requested bvec_{field} for non-RT field family {fam!r}.")
+        key = f"bvec_{field}"
+        if pre_built is not None and key in pre_built:
+            return np.asarray(pre_built[key], dtype=np.float64)
+
+        qref_mode = _prebuilt_qref_mode()
+        if qref_mode is not None:
+            mode, arr = qref_mode
+            sl = _field_new_slice(field)
+            ref_obj = mixed_element._ref[field]
+            n_union = int(_active_n)
+            if mode == "global":
+                token = ("hdiv_bvec_global", _array_token(arr), int(arr.shape[0]), int(sl.start), int(sl.stop))
+
+                def _build():
+                    out = np.zeros((n_elem, int(arr.shape[0]), 2, n_union), dtype=np.float64)
+                    for q, (xi, eta) in enumerate(arr):
+                        Vhat = np.asarray(ref_obj.tabulate_value(float(xi), float(eta)), dtype=np.float64)
+                        out[:, q, :, sl] = Vhat.T[None, :, :]
+                    return np.ascontiguousarray(out)
+
+                return _cached_phys_table("hdiv_bvec_union", field, token, _build)
+
+            token = (
+                "hdiv_bvec_elem",
+                _array_token(arr),
+                _array_token(np.asarray(eids, dtype=np.int64)),
+                int(arr.shape[0]),
+                int(arr.shape[1]),
+                int(sl.start),
+                int(sl.stop),
+            )
+
+            def _build():
+                out = np.zeros((n_elem, int(arr.shape[1]), 2, n_union), dtype=np.float64)
+                for i in range(n_elem):
+                    for q in range(int(arr.shape[1])):
+                        xi, eta = arr[i, q]
+                        Vhat = np.asarray(ref_obj.tabulate_value(float(xi), float(eta)), dtype=np.float64)
+                        out[i, q, :, sl] = Vhat.T
+                return np.ascontiguousarray(out)
+
+            return _cached_phys_table("hdiv_bvec_union", field, token, _build)
 
         def _build():
             n_union = int(_active_n)
@@ -474,6 +552,48 @@ def _build_jit_kernel_args(       # ← signature unchanged
         fam = getattr(mixed_element, "_field_families", {}).get(field, None)
         if fam != "RT":
             raise ValueError(f"Requested div_{field} for non-RT field family {fam!r}.")
+        key = f"div_{field}"
+        if pre_built is not None and key in pre_built:
+            return np.asarray(pre_built[key], dtype=np.float64)
+
+        qref_mode = _prebuilt_qref_mode()
+        if qref_mode is not None:
+            mode, arr = qref_mode
+            sl = _field_new_slice(field)
+            ref_obj = mixed_element._ref[field]
+            n_union = int(_active_n)
+            if mode == "global":
+                token = ("hdiv_div_global", _array_token(arr), int(arr.shape[0]), int(sl.start), int(sl.stop))
+
+                def _build():
+                    out = np.zeros((n_elem, int(arr.shape[0]), n_union), dtype=np.float64)
+                    for q, (xi, eta) in enumerate(arr):
+                        div_hat = np.asarray(ref_obj.tabulate_div(float(xi), float(eta)), dtype=np.float64).ravel()
+                        out[:, q, sl] = div_hat[None, :]
+                    return np.ascontiguousarray(out)
+
+                return _cached_phys_table("hdiv_div_union", field, token, _build)
+
+            token = (
+                "hdiv_div_elem",
+                _array_token(arr),
+                _array_token(np.asarray(eids, dtype=np.int64)),
+                int(arr.shape[0]),
+                int(arr.shape[1]),
+                int(sl.start),
+                int(sl.stop),
+            )
+
+            def _build():
+                out = np.zeros((n_elem, int(arr.shape[1]), n_union), dtype=np.float64)
+                for i in range(n_elem):
+                    for q in range(int(arr.shape[1])):
+                        xi, eta = arr[i, q]
+                        div_hat = np.asarray(ref_obj.tabulate_div(float(xi), float(eta)), dtype=np.float64).ravel()
+                        out[i, q, sl] = div_hat
+                return np.ascontiguousarray(out)
+
+            return _cached_phys_table("hdiv_div_union", field, token, _build)
 
         def _build():
             n_union = int(_active_n)
@@ -498,6 +618,48 @@ def _build_jit_kernel_args(       # ← signature unchanged
         fam = getattr(mixed_element, "_field_families", {}).get(field, None)
         if fam != "RT":
             raise ValueError(f"Requested gvec_{field} for non-RT field family {fam!r}.")
+        key = f"gvec_{field}"
+        if pre_built is not None and key in pre_built:
+            return np.asarray(pre_built[key], dtype=np.float64)
+
+        qref_mode = _prebuilt_qref_mode()
+        if qref_mode is not None:
+            mode, arr = qref_mode
+            sl = _field_new_slice(field)
+            ref_obj = mixed_element._ref[field]
+            n_union = int(_active_n)
+            if mode == "global":
+                token = ("hdiv_grad_global", _array_token(arr), int(arr.shape[0]), int(sl.start), int(sl.stop))
+
+                def _build():
+                    out = np.zeros((n_elem, int(arr.shape[0]), 2, n_union, 2), dtype=np.float64)
+                    for q, (xi, eta) in enumerate(arr):
+                        grad_hat = np.asarray(ref_obj.tabulate_grad(float(xi), float(eta)), dtype=np.float64)
+                        out[:, q, :, sl, :] = np.transpose(grad_hat, (1, 0, 2))[None, :, :, :]
+                    return np.ascontiguousarray(out)
+
+                return _cached_phys_table("hdiv_grad_union", field, token, _build)
+
+            token = (
+                "hdiv_grad_elem",
+                _array_token(arr),
+                _array_token(np.asarray(eids, dtype=np.int64)),
+                int(arr.shape[0]),
+                int(arr.shape[1]),
+                int(sl.start),
+                int(sl.stop),
+            )
+
+            def _build():
+                out = np.zeros((n_elem, int(arr.shape[1]), 2, n_union, 2), dtype=np.float64)
+                for i in range(n_elem):
+                    for q in range(int(arr.shape[1])):
+                        xi, eta = arr[i, q]
+                        grad_hat = np.asarray(ref_obj.tabulate_grad(float(xi), float(eta)), dtype=np.float64)
+                        out[i, q, :, sl, :] = np.transpose(grad_hat, (1, 0, 2))
+                return np.ascontiguousarray(out)
+
+            return _cached_phys_table("hdiv_grad_union", field, token, _build)
 
         def _build():
             n_union = int(_active_n)
@@ -511,6 +673,99 @@ def _build_jit_kernel_args(       # ← signature unchanged
 
         ref = _cached_ref_table("hdiv_grad", field, _build)
         return _expand_per_element(ref)  # (n_elem,n_q,2,n_union,2)
+
+    def _hdiv_phys_component_table(field: str, kind: str) -> np.ndarray:
+        """
+        Physical RT component tables, union-padded.
+
+        kind='val'   -> (n_elem, n_q, 2, n_union)
+        kind='grad'  -> (n_elem, n_q, 2, n_union, 2)
+        kind='hess'  -> (n_elem, n_q, 2, n_union, 2, 2)
+        """
+        fam = getattr(mixed_element, "_field_families", {}).get(field, None)
+        if fam != "RT":
+            raise ValueError(f"Requested physical H(div) component table for non-RT field {field!r}.")
+
+        key_map = {"val": f"hval_{field}", "grad": f"hgrad_{field}", "hess": f"hhess_{field}"}
+        key = key_map[str(kind)]
+        if pre_built is not None and key in pre_built:
+            return np.asarray(pre_built[key], dtype=np.float64)
+
+        qref_mode = _prebuilt_qref_mode()
+        sl = _field_new_slice(field)
+        n_union = int(_active_n)
+        owners = _kernel_owner_ids(f"hdiv_phys_{kind}_{field}")
+        try:
+            signs_all = dof_handler.element_signs[field]
+        except Exception as exc:
+            raise RuntimeError(f"Missing dof_handler.element_signs for RT field '{field}'.") from exc
+        if owners.size:
+            valid_max = int(len(signs_all) - 1)
+            max_owner = int(np.max(owners))
+            min_owner = int(np.min(owners))
+            if min_owner < 0 or max_owner > valid_max:
+                entity_kind = None if pre_built is None else pre_built.get("entity_kind", None)
+                raw_eids = None if pre_built is None else pre_built.get("eids", None)
+                raise ValueError(
+                    f"hdiv_phys_{kind}_{field}: owner ids out of range for element_signs "
+                    f"(min={min_owner}, max={max_owner}, valid=[0,{valid_max}], "
+                    f"entity_kind={entity_kind!r}, "
+                    f"sample_eids={None if raw_eids is None else np.asarray(raw_eids, dtype=np.int64).ravel()[:8].tolist()})."
+                )
+
+        def _build_for_qref(qref_arr: np.ndarray):
+            qref_arr = np.asarray(qref_arr, dtype=np.float64)
+            if qref_arr.ndim == 2:
+                qref_arr = np.broadcast_to(qref_arr[None, :, :], (n_elem, int(qref_arr.shape[0]), 2))
+            out_shape = {
+                "val": (n_elem, int(qref_arr.shape[1]), 2, n_union),
+                "grad": (n_elem, int(qref_arr.shape[1]), 2, n_union, 2),
+                "hess": (n_elem, int(qref_arr.shape[1]), 2, n_union, 2, 2),
+            }[str(kind)]
+            out = np.zeros(out_shape, dtype=np.float64)
+            for i, eid in enumerate(owners):
+                sgn = np.asarray(signs_all[int(eid)], dtype=np.float64).ravel()
+                for q in range(int(qref_arr.shape[1])):
+                    xi, eta = map(float, qref_arr[i, q])
+                    if kind == "val":
+                        tab = np.asarray(mixed_element.tabulate_value(field, xi, eta, element_id=int(eid)), dtype=np.float64)
+                        tab = sgn[:, None] * tab
+                        out[i, q, :, sl] = tab.T
+                    elif kind == "grad":
+                        tab = np.asarray(mixed_element.tabulate_grad(field, xi, eta, element_id=int(eid)), dtype=np.float64)
+                        tab = sgn[:, None, None] * tab
+                        out[i, q, :, sl, :] = np.transpose(tab, (1, 0, 2))
+                    else:
+                        tab = np.asarray(mixed_element.tabulate_hessian(field, xi, eta, element_id=int(eid)), dtype=np.float64)
+                        tab = sgn[:, None, None, None] * tab
+                        out[i, q, :, sl, :, :] = np.transpose(tab, (1, 0, 2, 3))
+            return np.ascontiguousarray(out)
+
+        if qref_mode is not None:
+            mode, arr = qref_mode
+            if mode == "global":
+                token = (f"hdiv_phys_{kind}_global", _array_token(arr), int(arr.shape[0]), int(sl.start), int(sl.stop))
+                return _cached_phys_table(f"hdiv_phys_{kind}_union", field, token, lambda: _build_for_qref(arr))
+            token = (
+                f"hdiv_phys_{kind}_elem",
+                _array_token(arr),
+                _array_token(owners),
+                int(arr.shape[0]),
+                int(arr.shape[1]),
+                int(sl.start),
+                int(sl.stop),
+            )
+            return _cached_phys_table(f"hdiv_phys_{kind}_union", field, token, lambda: _build_for_qref(arr))
+
+        token = (
+            f"hdiv_phys_{kind}_default",
+            _array_token(qp_ref),
+            _array_token(owners),
+            int(qp_ref.shape[0]),
+            int(sl.start),
+            int(sl.stop),
+        )
+        return _cached_phys_table(f"hdiv_phys_{kind}_union", field, token, lambda: _build_for_qref(qp_ref))
 
     def _hdiv_sign_table(field: str) -> np.ndarray:
         """
@@ -1329,6 +1584,18 @@ def _build_jit_kernel_args(       # ← signature unchanged
         elif name.startswith("gvec_"):
             fld = name[5:]
             args[name] = _hdiv_grad_table(fld)
+
+        elif name.startswith("hval_"):
+            fld = name[5:]
+            args[name] = _hdiv_phys_component_table(fld, "val")
+
+        elif name.startswith("hgrad_"):
+            fld = name[6:]
+            args[name] = _hdiv_phys_component_table(fld, "grad")
+
+        elif name.startswith("hhess_"):
+            fld = name[6:]
+            args[name] = _hdiv_phys_component_table(fld, "hess")
 
         elif name.startswith("div_"):
             fld = name[4:]

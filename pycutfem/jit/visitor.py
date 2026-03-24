@@ -3,25 +3,26 @@ from pycutfem.ufl.expressions import (
     Expression, Constant, TestFunction, TrialFunction, Function,
     HdivTestFunction, HdivTrialFunction,
     HdivFunction,
+    HdivTestFunctionComponent, HdivTrialFunctionComponent, HdivFunctionComponent,
     VectorTestFunction, VectorTrialFunction, VectorFunction,
     Sum, Sub, Prod, Div as UflDiv, Inner as UflInner, Dot as UflDot, Outer as UflOuter,
     Grad as UflGrad, DivOperation, Derivative, FacetNormal, Jump, Pos, Neg,
     PositivePart, Heaviside,
-    Log,
+    Log, Exp,
     Avg,
     ElementWiseConstant, Transpose as UFLTranspose, CellDiameter as UFLCellDiameter, MeshSize as UFLMeshSize,
     NormalComponent, Restriction, Power as UFLPower, Trace as UFLTrace,
     Determinant as UFLDeterminant, Inverse as UFLInverse, Cofactor as UFLCofactor,
-    Hessian as UFLHessian, Laplacian as UFLLaplacian
+    Hessian as UFLHessian, Laplacian as UFLLaplacian, _expr_shape
 )
 from pycutfem.ufl.analytic import Analytic
 from pycutfem.jit.ir import (
     LoadVariable, LoadConstant, LoadConstantArray, LoadElementWiseConstant as LoadEWC_IR,
-    LoadAnalytic, LoadFacetNormal, Grad, Div, BinaryOp, Inner, Dot, Store, Transpose,
+    LoadAnalytic, LoadFacetNormal, Grad, PackGradient, Div, BinaryOp, Inner, Dot, Store, Transpose,
     Outer as IROuter,
     CellDiameter, MeshSize, LoadFacetNormalComponent, CheckDomain, Trace, Determinant, Inverse, Cofactor,
     PositivePartOp, HeavisideOp,
-    LogOp,
+    LogOp, ExpOp,
     Hessian as IRHessian, Laplacian as IRLaplacian, HdivDiv
 )
 from dataclasses import replace
@@ -32,6 +33,22 @@ from pycutfem.utils.bitset import bitset_cache_token
 from pycutfem.ufl.jit_parametrization import build_jit_parametrization
 
 logger = logging.getLogger(__name__)
+
+
+_DIRECT_GRAD_LEAF_TYPES = (
+    TestFunction,
+    TrialFunction,
+    Function,
+    HdivTestFunctionComponent,
+    HdivTrialFunctionComponent,
+    HdivFunctionComponent,
+    VectorTestFunction,
+    VectorTrialFunction,
+    VectorFunction,
+    HdivTestFunction,
+    HdivTrialFunction,
+    HdivFunction,
+)
 
 def _find_form_type(node: Expression) -> str:
     """
@@ -182,6 +199,10 @@ class IRGenerator:
             self._visit(node.operand, side=side)
             self.ir_sequence.append(LogOp())
             return
+        if isinstance(node, Exp):
+            self._visit(node.operand, side=side)
+            self.ir_sequence.append(ExpOp())
+            return
         
         if isinstance(node, (Sum, Sub, Prod, UflDiv, UFLPower)):
             self._visit(node.a, side=side)
@@ -224,6 +245,11 @@ class IRGenerator:
                 # grad(restrict(u)) -> restrict(grad(u))
                 self._visit(UflGrad(op.operand), side=side)
                 self._emit_restriction(op.domain, side, op.operand)
+                return
+            if len(_expr_shape(op)) == 0 and not isinstance(op, _DIRECT_GRAD_LEAF_TYPES):
+                self._visit(Derivative(op, 1, 0), side=side)
+                self._visit(Derivative(op, 0, 1), side=side)
+                self.ir_sequence.append(PackGradient())
                 return
             self._visit(op, side=side)
             self.ir_sequence.append(Grad())
@@ -319,17 +345,87 @@ class IRGenerator:
                 self.ir_sequence.append(BinaryOp(op_symbol='-'))
                 return
 
+            if isinstance(operand, (Constant, ElementWiseConstant)):
+                self._visit(Constant(0.0), side=side)
+                return
+
+            # Scalar calculus rules needed for transformed-variable forms where
+            # trial functions appear inside products/powers/exponentials.
+            if isinstance(operand, Sum):
+                self._visit(Derivative(operand.a, *deriv_order), side=side)
+                self._visit(Derivative(operand.b, *deriv_order), side=side)
+                self.ir_sequence.append(BinaryOp(op_symbol='+'))
+                return
+            if isinstance(operand, Sub):
+                self._visit(Derivative(operand.a, *deriv_order), side=side)
+                self._visit(Derivative(operand.b, *deriv_order), side=side)
+                self.ir_sequence.append(BinaryOp(op_symbol='-'))
+                return
+            if isinstance(operand, Prod):
+                self._visit(Derivative(operand.a, *deriv_order), side=side)
+                self._visit(operand.b, side=side)
+                self.ir_sequence.append(BinaryOp(op_symbol='*'))
+                self._visit(operand.a, side=side)
+                self._visit(Derivative(operand.b, *deriv_order), side=side)
+                self.ir_sequence.append(BinaryOp(op_symbol='*'))
+                self.ir_sequence.append(BinaryOp(op_symbol='+'))
+                return
+            if isinstance(operand, UflDiv):
+                self._visit(Derivative(operand.a, *deriv_order), side=side)
+                self._visit(operand.b, side=side)
+                self.ir_sequence.append(BinaryOp(op_symbol='*'))
+                self._visit(operand.a, side=side)
+                self._visit(Derivative(operand.b, *deriv_order), side=side)
+                self.ir_sequence.append(BinaryOp(op_symbol='*'))
+                self.ir_sequence.append(BinaryOp(op_symbol='-'))
+                self._visit(operand.b, side=side)
+                self._visit(Constant(2.0), side=side)
+                self.ir_sequence.append(BinaryOp(op_symbol='**'))
+                self.ir_sequence.append(BinaryOp(op_symbol='/'))
+                return
+            if isinstance(operand, Exp):
+                self._visit(operand, side=side)
+                self._visit(Derivative(operand.operand, *deriv_order), side=side)
+                self.ir_sequence.append(BinaryOp(op_symbol='*'))
+                return
+            if isinstance(operand, Log):
+                self._visit(Derivative(operand.operand, *deriv_order), side=side)
+                self._visit(operand.operand, side=side)
+                self.ir_sequence.append(BinaryOp(op_symbol='/'))
+                return
+            if isinstance(operand, UFLPower):
+                exponent = operand.b
+                exponent_value = getattr(exponent, "value", None)
+                if exponent_value is None:
+                    raise TypeError("Derivative of non-constant powers is not supported in JIT visitor.")
+                exponent_float = float(np.asarray(exponent_value, dtype=float).reshape(()))
+                self._visit(Constant(exponent_float), side=side)
+                self._visit(operand.a, side=side)
+                self._visit(Constant(exponent_float - 1.0), side=side)
+                self.ir_sequence.append(BinaryOp(op_symbol='**'))
+                self.ir_sequence.append(BinaryOp(op_symbol='*'))
+                self._visit(Derivative(operand.a, *deriv_order), side=side)
+                self.ir_sequence.append(BinaryOp(op_symbol='*'))
+                return
+
             # --- GENERIC CASE: Derivative of a standard field ---
             # At this point, the operand MUST be a leaf-like node (Function, etc.)
             # because all operators that could wrap it have been handled above.
             is_vec = isinstance(
                 operand,
-                (VectorTestFunction, VectorTrialFunction, VectorFunction, HdivTestFunction, HdivTrialFunction, HdivFunction),
+                (
+                    VectorTestFunction,
+                    VectorTrialFunction,
+                    VectorFunction,
+                    HdivTestFunction,
+                    HdivTrialFunction,
+                    HdivFunction,
+                ),
             )
             role = 'test' if getattr(operand, 'is_test', False) else 'trial' if getattr(operand, 'is_trial', False) else 'function'
             # Safely get field_names or field_name
             field_names = getattr(operand, 'field_names', None) or [getattr(operand, 'field_name')]
-            name = getattr(getattr(operand, 'space', operand), 'name', 'anon')
+            name = getattr(operand, "parent_name", "") or getattr(getattr(operand, 'space', operand), 'name', 'anon')
 
             side_hint = side
             if side_hint not in ("+", "-"):
@@ -341,7 +437,8 @@ class IRGenerator:
                 LoadVariable(name=name, role=role, is_vector=is_vec,
                              deriv_order=deriv_order, field_names=field_names,
                              side=side_hint,
-                             field_sides=getattr(operand, "field_sides", None))
+                             field_sides=getattr(operand, "field_sides", None),
+                             component_index=getattr(operand, "component_index", None))
             )
             return
 
@@ -351,19 +448,42 @@ class IRGenerator:
 
         if isinstance(
             node,
-            (TestFunction, TrialFunction, Function, VectorTestFunction, VectorTrialFunction, VectorFunction, HdivTestFunction, HdivTrialFunction, HdivFunction),
+            (
+                TestFunction,
+                TrialFunction,
+                Function,
+                HdivTestFunctionComponent,
+                HdivTrialFunctionComponent,
+                HdivFunctionComponent,
+                VectorTestFunction,
+                VectorTrialFunction,
+                VectorFunction,
+                HdivTestFunction,
+                HdivTrialFunction,
+                HdivFunction,
+            ),
         ):
             is_vec = isinstance(node, (VectorTestFunction, VectorTrialFunction, VectorFunction, HdivTestFunction, HdivTrialFunction, HdivFunction))
             role = 'test' if getattr(node, 'is_test', False) else 'trial' if getattr(node, 'is_trial', False) else 'function'
             field_names = getattr(node, 'field_names', None) or [getattr(node, 'field_name')]
-            name = getattr(getattr(node, 'space', node), 'name', 'anon')
+            name = getattr(node, "parent_name", "") or getattr(getattr(node, 'space', node), 'name', 'anon')
             field_sides = getattr(node, "field_sides", None)
             side_hint = side
             if side_hint not in ("+", "-"):
                 node_side = getattr(node, "side", "")
                 if node_side in ("+", "-"):
                     side_hint = node_side
-            self.ir_sequence.append(LoadVariable(name=name, role=role, is_vector=is_vec, field_names=field_names, side=side_hint, field_sides=field_sides))
+            self.ir_sequence.append(
+                LoadVariable(
+                    name=name,
+                    role=role,
+                    is_vector=is_vec,
+                    field_names=field_names,
+                    side=side_hint,
+                    field_sides=field_sides,
+                    component_index=getattr(node, "component_index", None),
+                )
+            )
             return
             
         if isinstance(node, Constant):
@@ -381,6 +501,10 @@ class IRGenerator:
                             f"Invalid JIT constant name {name!r}; must be a valid identifier."
                         )
                 else:
+                    value_arr = np.asarray(node.value)
+                    if value_arr.ndim == 0:
+                        self.ir_sequence.append(LoadConstant(value=float(value_arr.reshape(()))))
+                        return
                     name = f"jit_const_fallback_{id(node)}"
 
             value_arr = np.asarray(node.value)

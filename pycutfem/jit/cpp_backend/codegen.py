@@ -110,6 +110,7 @@ class CppCodeGen:
             MeshSize,
             CheckDomain,
             Grad,
+            PackGradient,
             PosOp,
             NegOp,
             Hessian as IRHessian,
@@ -129,6 +130,7 @@ class CppCodeGen:
             PositivePartOp,
             HeavisideOp,
             LogOp,
+            ExpOp,
         )
         needs_phis = any(isinstance(op, (PosOp, NegOp)) for op in ir_sequence)
         families = getattr(self.mixed_element, "_field_families", {}) if self.mixed_element is not None else {}
@@ -360,6 +362,7 @@ class CppCodeGen:
             Inner,
             Store,
             Trace,
+            ExpOp,
         )
 
         # local helpers ----------------------------------------------------
@@ -815,6 +818,85 @@ class CppCodeGen:
                 nm = new_tmp("nrm_c")
                 emit_line(f"double {nm} = normals_view(e,q,{op.idx});")
                 stack.append(StackItem(nm, "scalar", "const", ()))
+            elif isinstance(op, PackGradient):
+                dy = stack.pop()
+                dx = stack.pop()
+                if dx.shape != dy.shape:
+                    raise NotImplementedError(
+                        f"PackGradient requires matching component shapes, got {dx.shape} and {dy.shape}."
+                    )
+                field_names, parent_name, side, field_sides = resolve_metadata(dx, dy, prefer="basis")
+
+                def _scalar_component_expr(item):
+                    if item.kind == "scalar":
+                        return item.name
+                    if item.kind == "vec" and len(item.shape) == 1 and item.shape[0] == 1:
+                        return f"{item.name}(0)"
+                    if item.kind == "mat" and len(item.shape) == 2 and item.shape == (1, 1):
+                        return f"{item.name}(0,0)"
+                    return None
+
+                if dx.role in {"test", "trial"} or dy.role in {"test", "trial"}:
+                    role = dx.role if dx.role in {"test", "trial"} else dy.role
+                    if dx.kind == "mat" and dy.kind == "mat" and len(dx.shape) == 2 and dx.shape[0] == 1:
+                        ncols = dx.shape[1]
+                        ncols_expr = "n_union" if ncols == -1 else str(ncols)
+                        nm = new_tmp("grad_pack")
+                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize(1);")
+                        emit_line(f"{nm}[0] = Eigen::MatrixXd({ncols_expr}, 2);")
+                        emit_line(f"{nm}[0].col(0) = {dx.name}.transpose();")
+                        emit_line(f"{nm}[0].col(1) = {dy.name}.transpose();")
+                        stack.append(
+                            StackItem(
+                                nm,
+                                "grad",
+                                role,
+                                (1, ncols, 2),
+                                field_names,
+                                parent_name,
+                                side,
+                                field_sides,
+                            )
+                        )
+                        continue
+                    if dx.kind == "vec" and dy.kind == "vec" and len(dx.shape) == 1:
+                        ncols = dx.shape[0]
+                        ncols_expr = "n_union" if ncols == -1 else str(ncols)
+                        nm = new_tmp("grad_pack")
+                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize(1);")
+                        emit_line(f"{nm}[0] = Eigen::MatrixXd({ncols_expr}, 2);")
+                        emit_line(f"{nm}[0].col(0) = {dx.name};")
+                        emit_line(f"{nm}[0].col(1) = {dy.name};")
+                        stack.append(
+                            StackItem(
+                                nm,
+                                "grad",
+                                role,
+                                (1, ncols, 2),
+                                field_names,
+                                parent_name,
+                                side,
+                                field_sides,
+                            )
+                        )
+                        continue
+                    raise NotImplementedError(
+                        f"PackGradient does not support basis component kinds {dx.kind}/{dy.kind} with shapes {dx.shape}/{dy.shape}."
+                    )
+
+                sx = _scalar_component_expr(dx)
+                sy = _scalar_component_expr(dy)
+                if sx is None or sy is None:
+                    raise NotImplementedError(
+                        f"PackGradient does not support value component kinds {dx.kind}/{dy.kind} with shapes {dx.shape}/{dy.shape}."
+                    )
+                role = "value" if (dx.role == "value" or dy.role == "value") else "const"
+                nm = new_tmp("grad_pack")
+                emit_line(f"Eigen::MatrixXd {nm}(1, 2);")
+                emit_line(f"{nm}(0,0) = {sx};")
+                emit_line(f"{nm}(0,1) = {sy};")
+                stack.append(StackItem(nm, "mat", role, (1, 2), field_names, parent_name, side, field_sides))
+                continue
             elif isinstance(op, CheckDomain):
                 a = stack.pop()
                 side = op.side or a.side
@@ -920,6 +1002,7 @@ class CppCodeGen:
                         tuple(op.deriv_order),
                         _field_names_key(getattr(op, "field_names", None)),
                         _field_sides_key(getattr(op, "field_sides", None)),
+                        getattr(op, "component_index", None),
                         bool(apply_restrict_mask),
                     )
                     cached = loadvar_cache.get(lv_key)
@@ -933,6 +1016,36 @@ class CppCodeGen:
                         cand = str(op.field_names[0])
                         if getattr(self.mixed_element, "_field_families", {}).get(cand, None) == "RT":
                             hdiv_field = cand
+                    hdiv_component = hdiv_field is not None and getattr(op, "component_index", None) is not None
+                    if hdiv_component:
+                        if op.side in ("+", "-"):
+                            raise NotImplementedError("Direct H(div) component loads are currently implemented for volume integrals only in the C++ backend.")
+                        comp_idx = int(op.component_index)
+                        if op.deriv_order == (0, 0):
+                            tbl = f"hval_{hdiv_field}"
+                            row_expr = f"{tbl}_view(e,q,{comp_idx},j)"
+                        elif op.deriv_order in {(1, 0), (0, 1)}:
+                            tbl = f"hgrad_{hdiv_field}"
+                            ax = 0 if op.deriv_order == (1, 0) else 1
+                            row_expr = f"{tbl}_view(e,q,{comp_idx},j,{ax})"
+                        elif op.deriv_order in {(2, 0), (1, 1), (0, 2)}:
+                            tbl = f"hhess_{hdiv_field}"
+                            a0, a1 = (0, 0) if op.deriv_order == (2, 0) else (0, 1) if op.deriv_order == (1, 1) else (1, 1)
+                            row_expr = f"{tbl}_view(e,q,{comp_idx},j,{a0},{a1})"
+                        else:
+                            raise NotImplementedError(
+                                f"C++ backend: H(div) component derivative order {op.deriv_order} not implemented."
+                            )
+                        required_args.add(tbl)
+                        nm = new_tmp("hdiv_compv")
+                        emit_line(f"double {nm} = 0.0;")
+                        emit_line("for (ssize_t j=0; j<n_union; ++j) {")
+                        emit_line(f"    {nm} += {coeff_name}_view(e,j) * {row_expr};")
+                        emit_line("}")
+                        item = StackItem(nm, "scalar", "value", (), op.field_names, op.name, op.side, op.field_sides or [])
+                        stack.append(item)
+                        loadvar_cache[lv_key] = _pin_for_cache(item)
+                        continue
                     if hdiv_field is not None:
                         if op.side == "+":
                             required_args.add("J_inv_pos")
@@ -1073,7 +1186,7 @@ class CppCodeGen:
                     stack.append(item)
                     loadvar_cache[lv_key] = _pin_for_cache(item)
                 elif op.role in {"test", "trial"} and op.deriv_order == (0, 0):
-                    if followed_by_diff:
+                    if followed_by_diff and getattr(op, "component_index", None) is None:
                         stack.append(
                             StackItem("__basis__", "basis_ref", op.role, (len(op.field_names), -1), op.field_names, op.name, op.side, op.field_sides)
                         )
@@ -1086,6 +1199,7 @@ class CppCodeGen:
                         tuple(op.deriv_order),
                         _field_names_key(getattr(op, "field_names", None)),
                         _field_sides_key(getattr(op, "field_sides", None)),
+                        getattr(op, "component_index", None),
                     )
                     cached = loadvar_cache.get(lv_key)
                     if cached is not None:
@@ -1096,6 +1210,36 @@ class CppCodeGen:
                         cand = str(op.field_names[0])
                         if getattr(self.mixed_element, "_field_families", {}).get(cand, None) == "RT":
                             hdiv_field = cand
+                    hdiv_component = hdiv_field is not None and getattr(op, "component_index", None) is not None
+                    if hdiv_component:
+                        if op.side in ("+", "-"):
+                            raise NotImplementedError("Direct H(div) component loads are currently implemented for volume integrals only in the C++ backend.")
+                        comp_idx = int(op.component_index)
+                        tbl = f"hval_{hdiv_field}"
+                        required_args.add(tbl)
+                        nm, tmp_kind, tmp_slot = alloc_tmp("mat", "hdiv_comp_basis")
+                        if tmp_kind is not None:
+                            emit_line(f"{nm}.resize(1, n_union);")
+                            emit_line(f"{nm}.setZero();")
+                        else:
+                            emit_line(f"Eigen::MatrixXd {nm}(1, n_union);")
+                            emit_line(f"{nm}.setZero();")
+                        emit_line(f"for (ssize_t j=0; j<n_union; ++j) {nm}(0, j) = {tbl}_view(e,q,{comp_idx},j);")
+                        item = StackItem(
+                            nm,
+                            "mat",
+                            op.role,
+                            (1, -1),
+                            op.field_names,
+                            op.name,
+                            op.side,
+                            op.field_sides,
+                            tmp_kind=tmp_kind,
+                            tmp_slot=tmp_slot,
+                        )
+                        stack.append(item)
+                        loadvar_cache[lv_key] = _pin_for_cache(item)
+                        continue
                     if hdiv_field is not None:
                         # H(div) RT basis values are mapped via the (side-specific)
                         # inverse Jacobian on facet integrals.
@@ -1203,10 +1347,31 @@ class CppCodeGen:
                         tuple(op.deriv_order),
                         _field_names_key(getattr(op, "field_names", None)),
                         _field_sides_key(getattr(op, "field_sides", None)),
+                        getattr(op, "component_index", None),
                     )
                     cached = loadvar_cache.get(lv_key)
                     if cached is not None:
                         stack.append(cached)
+                        continue
+                    hdiv_field = None
+                    if op.field_names and len(op.field_names) == 1:
+                        cand = str(op.field_names[0])
+                        if getattr(self.mixed_element, "_field_families", {}).get(cand, None) == "RT":
+                            hdiv_field = cand
+                    if hdiv_field is not None and getattr(op, "component_index", None) is not None:
+                        if op.side in ("+", "-"):
+                            raise NotImplementedError("Direct H(div) component loads are currently implemented for volume integrals only in the C++ backend.")
+                        comp_idx = int(op.component_index)
+                        ax = 0 if op.deriv_order == (1, 0) else 1
+                        tbl = f"hgrad_{hdiv_field}"
+                        required_args.add(tbl)
+                        nm = new_tmp("hdiv_c_d1")
+                        emit_line(f"Eigen::MatrixXd {nm}(1, n_union);")
+                        emit_line(f"{nm}.setZero();")
+                        emit_line(f"for (ssize_t j=0; j<n_union; ++j) {nm}(0, j) = {tbl}_view(e,q,{comp_idx},j,{ax});")
+                        item = StackItem(nm, "mat", op.role, (1, -1), op.field_names, op.name, op.side, op.field_sides)
+                        stack.append(item)
+                        loadvar_cache[lv_key] = _pin_for_cache(item)
                         continue
                     if op.side == "+":
                         required_args.add("J_inv_pos")
@@ -1266,10 +1431,31 @@ class CppCodeGen:
                         tuple(op.deriv_order),
                         _field_names_key(getattr(op, "field_names", None)),
                         _field_sides_key(getattr(op, "field_sides", None)),
+                        getattr(op, "component_index", None),
                     )
                     cached = loadvar_cache.get(lv_key)
                     if cached is not None:
                         stack.append(cached)
+                        continue
+                    hdiv_field = None
+                    if op.field_names and len(op.field_names) == 1:
+                        cand = str(op.field_names[0])
+                        if getattr(self.mixed_element, "_field_families", {}).get(cand, None) == "RT":
+                            hdiv_field = cand
+                    if hdiv_field is not None and getattr(op, "component_index", None) is not None:
+                        if op.side in ("+", "-"):
+                            raise NotImplementedError("Direct H(div) component loads are currently implemented for volume integrals only in the C++ backend.")
+                        comp_idx = int(op.component_index)
+                        a0, a1 = (0, 0) if op.deriv_order == (2, 0) else (0, 1) if op.deriv_order == (1, 1) else (1, 1)
+                        tbl = f"hhess_{hdiv_field}"
+                        required_args.add(tbl)
+                        nm = new_tmp("hdiv_c_d2")
+                        emit_line(f"Eigen::MatrixXd {nm}(1, n_union);")
+                        emit_line(f"{nm}.setZero();")
+                        emit_line(f"for (ssize_t j=0; j<n_union; ++j) {nm}(0, j) = {tbl}_view(e,q,{comp_idx},j,{a0},{a1});")
+                        item = StackItem(nm, "mat", op.role, (1, -1), op.field_names, op.name, op.side, op.field_sides)
+                        stack.append(item)
+                        loadvar_cache[lv_key] = _pin_for_cache(item)
                         continue
                     k = len(op.field_names)
                     nm = new_tmp("d2")
@@ -1356,6 +1542,7 @@ class CppCodeGen:
                         tuple(op.deriv_order),
                         _field_names_key(getattr(op, "field_names", None)),
                         _field_sides_key(getattr(op, "field_sides", None)),
+                        getattr(op, "component_index", None),
                     )
                     cached = loadvar_cache.get(lv_key)
                     if cached is not None:
@@ -1363,6 +1550,37 @@ class CppCodeGen:
                         continue
                     coeff_name = coeff_array_name(op.name, op.side)
                     required_args.add(coeff_name)
+                    hdiv_field = None
+                    if op.field_names and len(op.field_names) == 1:
+                        cand = str(op.field_names[0])
+                        if getattr(self.mixed_element, "_field_families", {}).get(cand, None) == "RT":
+                            hdiv_field = cand
+                    if hdiv_field is not None and getattr(op, "component_index", None) is not None:
+                        if op.side in ("+", "-"):
+                            raise NotImplementedError("Direct H(div) component loads are currently implemented for volume integrals only in the C++ backend.")
+                        comp_idx = int(op.component_index)
+                        if op.deriv_order in {(1, 0), (0, 1)}:
+                            tbl = f"hgrad_{hdiv_field}"
+                            ax = 0 if op.deriv_order == (1, 0) else 1
+                            expr = f"{tbl}_view(e,q,{comp_idx},j,{ax})"
+                        elif op.deriv_order in {(2, 0), (1, 1), (0, 2)}:
+                            tbl = f"hhess_{hdiv_field}"
+                            a0, a1 = (0, 0) if op.deriv_order == (2, 0) else (0, 1) if op.deriv_order == (1, 1) else (1, 1)
+                            expr = f"{tbl}_view(e,q,{comp_idx},j,{a0},{a1})"
+                        else:
+                            raise NotImplementedError(
+                                f"C++ backend: H(div) component derivative order {op.deriv_order} not implemented."
+                            )
+                        required_args.add(tbl)
+                        nm = new_tmp("hdiv_compdv")
+                        emit_line(f"double {nm} = 0.0;")
+                        emit_line("for (ssize_t j=0; j<n_union; ++j) {")
+                        emit_line(f"    {nm} += {coeff_name}_view(e,j) * {expr};")
+                        emit_line("}")
+                        item = StackItem(nm, "scalar", "value", (), op.field_names, op.name, op.side, op.field_sides or [])
+                        stack.append(item)
+                        loadvar_cache[lv_key] = _pin_for_cache(item)
+                        continue
 
                     if op.deriv_order not in {(1, 0), (0, 1), (2, 0), (1, 1), (0, 2)}:
                         raise NotImplementedError(
@@ -2553,6 +2771,40 @@ class CppCodeGen:
                         emit_line("}")
                         push_bin("grad", b.role, (2, -1, 2))
                         continue
+                    if (
+                        a.kind == "mat"
+                        and a.role in {"const", "value"}
+                        and is_a_row_vec_or_col_vec_2k
+                        and b.kind == "mat"
+                        and b.role in {"test", "trial"}
+                        and len(b.shape) == 2
+                        and b.shape[0] == 1
+                    ):
+                        row_name = new_tmp("rowvec")
+                        emit_line(
+                            f"Eigen::MatrixXd {row_name} = ({a.name}.cols() == 1 ? {a.name}.transpose() : {a.name});"
+                        )
+                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize(1);")
+                        emit_line(f"{nm}[0] = {b.name}.transpose() * {row_name};")
+                        push_bin("grad", b.role, (1, b.shape[1], 2), b.field_names, b.parent, b.side, b.field_sides)
+                        continue
+                    if (
+                        b.kind == "mat"
+                        and b.role in {"const", "value"}
+                        and is_b_row_vec_or_col_vec_2k
+                        and a.kind == "mat"
+                        and a.role in {"test", "trial"}
+                        and len(a.shape) == 2
+                        and a.shape[0] == 1
+                    ):
+                        row_name = new_tmp("rowvec")
+                        emit_line(
+                            f"Eigen::MatrixXd {row_name} = ({b.name}.cols() == 1 ? {b.name}.transpose() : {b.name});"
+                        )
+                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize(1);")
+                        emit_line(f"{nm}[0] = {a.name}.transpose() * {row_name};")
+                        push_bin("grad", a.role, (1, a.shape[1], 2), a.field_names, a.parent, a.side, a.field_sides)
+                        continue
                     if a.kind == "mixed" and b.kind == "mixed":
                         emit_line('throw std::runtime_error("Mixed * mixed not supported in C++ backend");')
                         continue
@@ -2563,6 +2815,36 @@ class CppCodeGen:
                     if b.kind == "scalar" and a.kind == "mixed":
                         emit_line(f"auto {nm} = scale_mixed({a.name}, {b.name});")
                         push_bin("mixed", a.role, a.shape, a.field_names, a.parent)
+                        continue
+                    if (
+                        a.kind == "mat"
+                        and a.role in {"const", "value"}
+                        and len(a.shape) == 2
+                        and a.shape[0] == 1
+                        and b.kind == "mat"
+                        and b.role in {"const", "value"}
+                        and len(b.shape) == 2
+                        and a.shape[1] == b.shape[0]
+                    ):
+                        nm, tmp_kind, tmp_slot = alloc_tmp("mat", "bin")
+                        emit_mat(nm, f"contract_vector_matrix({a.name}, {b.name})", tmp_kind=tmp_kind)
+                        role = "value" if "value" in {a.role, b.role} else "const"
+                        push_bin("mat", role, (1, b.shape[1]), a.field_names or b.field_names, a.parent or b.parent, tmp_kind=tmp_kind, tmp_slot=tmp_slot)
+                        continue
+                    if (
+                        b.kind == "mat"
+                        and b.role in {"const", "value"}
+                        and len(b.shape) == 2
+                        and b.shape[0] == 1
+                        and a.kind == "mat"
+                        and a.role in {"const", "value"}
+                        and len(a.shape) == 2
+                        and a.shape[1] == b.shape[1]
+                    ):
+                        nm, tmp_kind, tmp_slot = alloc_tmp("mat", "bin")
+                        emit_mat(nm, f"contract_matrix_vector({a.name}, {b.name}.transpose())", tmp_kind=tmp_kind)
+                        role = "value" if "value" in {a.role, b.role} else "const"
+                        push_bin("mat", role, (1, a.shape[0]), a.field_names or b.field_names, a.parent or b.parent, tmp_kind=tmp_kind, tmp_slot=tmp_slot)
                         continue
                     if a.kind == "scalar" and b.kind == "mat":
                         nm, tmp_kind, tmp_slot = alloc_tmp("mat", "bin")
@@ -2691,6 +2973,19 @@ class CppCodeGen:
                         emit_line(f"auto {nm} = grad_trial_times_scalar_test({a.name}, _scalar_{nm});")
                         push_bin("mixed", "mixed", (a.shape[0], b.shape[1], a.shape[1], a.shape[2]), a.field_names or b.field_names, a.parent or b.parent)
                         continue
+                    if a.kind == "grad" and b.kind == "mat" and b.role in {"const", "value"} and len(b.shape) == 2 and a.shape[2] == b.shape[0]:
+                        emit_line(f"auto {nm} = contract_last_first({a.name}, {b.name});")
+                        push_bin("grad", a.role, (a.shape[0], a.shape[1], b.shape[1]), a.field_names, a.parent)
+                        continue
+                    if a.kind == "mat" and a.role in {"const", "value"} and len(a.shape) == 2 and b.kind == "grad":
+                        if b.shape[0] == 1 and a.shape[1] == b.shape[2]:
+                            emit_line(f"auto {nm} = contract_last_first({b.name}, {a.name}.transpose());")
+                            push_bin("grad", b.role, (1, b.shape[1], a.shape[0]), b.field_names, b.parent)
+                            continue
+                        if a.shape[1] == b.shape[0]:
+                            emit_line(f"auto {nm} = contract_component_matrix_grad({a.name}, {b.name});")
+                            push_bin("grad", b.role, (a.shape[0], b.shape[1], b.shape[2]), b.field_names, b.parent)
+                            continue
                     if a.kind == "scalar" and b.kind == "grad":
                         emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({b.name}.size());")
                         emit_line(f"for (size_t _i=0; _i<{b.name}.size(); ++_i) {nm}[_i] = {b.name}[_i] * {a.name};")
@@ -3132,11 +3427,16 @@ class CppCodeGen:
                     )
                 elif a.kind == "mat" and b.kind == "mat" and a.role == "trial" and b.role == "value":
                     nm, tmp_kind, tmp_slot = alloc_tmp("mat", "dot")
-                    emit_mat(nm, f"dot_trial_vec_grad_func({a.name}, {b.name})", tmp_kind=tmp_kind)
+                    if b.shape[0] == 1 and a.shape[0] == b.shape[1]:
+                        emit_mat(nm, f"basis_dot_const_vector({a.name}, {b.name}.row(0).transpose())", tmp_kind=tmp_kind)
+                        out_rows = 1
+                    else:
+                        emit_mat(nm, f"dot_trial_vec_grad_func({a.name}, {b.name})", tmp_kind=tmp_kind)
+                        out_rows = b.shape[0] if len(b.shape) > 0 else -1
                     push(
                         "mat",
                         "trial",
-                        (b.shape[1] if len(b.shape) > 1 else -1, -1),
+                        (out_rows, -1),
                         a.field_names,
                         a.parent,
                         tmp_kind=tmp_kind,
@@ -3144,13 +3444,20 @@ class CppCodeGen:
                     )
                 elif a.kind == "mat" and b.kind == "mat" and a.role == "test" and b.role == "value":
                     # Vector test basis dotted with grad(value): (k,n)·(k,d) -> (n,d)
-                    if a.shape[0] == b.shape[0] and (len(a.shape) > 1 and len(b.shape) > 1):
+                    if (len(a.shape) > 1 and len(b.shape) > 1) and (
+                        (a.shape[0] == b.shape[0]) or (b.shape[0] == 1 and a.shape[0] == b.shape[1])
+                    ):
                         nm, tmp_kind, tmp_slot = alloc_tmp("mat", "dot")
-                        emit_mat(nm, f"vector_dot_grad_value({a.name}, {b.name})", tmp_kind=tmp_kind)
+                        if b.shape[0] == 1 and a.shape[0] == b.shape[1]:
+                            emit_mat(nm, f"basis_dot_const_vector({a.name}, {b.name}.row(0).transpose())", tmp_kind=tmp_kind)
+                            out_shape = (1, a.shape[1])
+                        else:
+                            emit_mat(nm, f"vector_dot_grad_value({a.name}, {b.name})", tmp_kind=tmp_kind)
+                            out_shape = (a.shape[1], b.shape[1])
                         push(
                             "mat",
                             "test",
-                            (a.shape[1], b.shape[1]),
+                            out_shape,
                             a.field_names,
                             a.parent,
                             tmp_kind=tmp_kind,
@@ -3258,7 +3565,10 @@ class CppCodeGen:
                         push("grad", a.role, out_shape, a.field_names, a.parent, side, a.field_sides)
                 elif a.kind == "mat" and b.kind == "vec":
                     vec_dim = b.shape[0] if len(b.shape) > 0 and b.shape[0] not in (-1, 0) else -1
-                    if a.role in {"test", "trial"} and a_union_mat \
+                    if a.role in {"test", "trial"} and a.shape[0] == b.shape[0] and (is_b_1d or is_b_col_vec or is_b_row_vec):
+                        emit_mat(nm, f"basis_dot_const_vector({a.name}, {b.name})")
+                        res_shape = (1, a.shape[1])
+                    elif a.role in {"test", "trial"} and a_union_mat \
                           and a.shape[0] == b.shape[0] \
                           and (is_b_1d or is_b_col_vec or is_b_row_vec):
                         # a would have the shape of (k,n)
@@ -3266,11 +3576,6 @@ class CppCodeGen:
 
                         # Result is a row vector with length equal to basis dof count (A.cols).
                         res_shape = (1, a.shape[1])
-                    elif a.role in {"test", "trial"} and (is_b_1d or is_b_col_vec or is_b_row_vec):
-                        # Matrix basis (n,d) dotted with const/value vector (d,) -> (n,)
-                        emit_line(f"Eigen::VectorXd {nm} = {a.name} * {b.name};")
-                        push("vec", a.role, (a.shape[0],), a.field_names, a.parent, side, a.field_sides)
-                        continue
                     elif is_a_2x2 and (is_b_1d or is_b_col_vec or is_b_row_vec):
                         # Value/const matrix-vector dot: return a true 1D vector (Eigen::VectorXd),
                         # not a (1,d) row matrix. Keeping it as vec prevents downstream dot(...) from
@@ -3287,6 +3592,10 @@ class CppCodeGen:
                         else:
                             emit_line(f"double {nm} = {a.name}.dot({b.name});")
                         push("scalar", a.role if a.role in {"test", "trial"} else "value", (), a.field_names, a.parent, side, a.field_sides)
+                        continue
+                    elif a.role == "value" and a.shape[0] == 1 and a.shape[1] == b.shape[0]:
+                        emit_line(f"double {nm} = {a.name}.row(0).dot({b.name});")
+                        push("scalar", "value", (), a.field_names, a.parent, side, a.field_sides)
                         continue
                     else:
                         raise NotImplementedError("dot(mat, vec) only supported for test/trial basis matrices in C++ backend"
@@ -3307,12 +3616,20 @@ class CppCodeGen:
                         emit_line(f"Eigen::VectorXd {nm} = {b.name}.transpose() * {a.name};")
                         push("vec", b.role, (b.shape[1] if len(b.shape) > 1 else -1,), b.field_names, b.parent, side, b.field_sides)
                         continue
-                    if b.role in {"test", "trial"}:
+                    if b.role in {"test", "trial"} and b.shape[0] == a.shape[0]:
+                        emit_mat(nm, f"basis_dot_const_vector({b.name}, {a.name})")
+                        mat_rows = -1
+                        res_shape = (1, b.shape[1])
+                    elif b.role in {"test", "trial"}:
                         # np.einsum('k,kn->n', a, b)
                         emit_line(f"auto {nm} = contract_vector_matrix({a.name}, {b.name});")
 
                         mat_rows = -1
                         res_shape = (1, b.shape[1])
+                    elif b.role == "value" and b.shape[0] == 1 and b.shape[1] == a.shape[0]:
+                        emit_line(f"double {nm} = {b.name}.row(0).dot({a.name});")
+                        push("scalar", "value", (), b.field_names, b.parent, side, b.field_sides)
+                        continue
                     elif is_a_1d and is_b_2x2:
                         # np.einsum('i,ij->j', a, b)
                         emit_line(f"Eigen::VectorXd {nm} = {b.name}.transpose() * {a.name};")
@@ -3787,6 +4104,20 @@ class CppCodeGen:
                     stack.append(StackItem(nm, "mat", a.role, a.shape, a.field_names, a.parent, a.side, a.field_sides))
                 else:
                     raise NotImplementedError(f"LogOp not implemented for kind={a.kind!r}.")
+            elif isinstance(op, ExpOp):
+                a = stack.pop()
+                nm = new_tmp("exp")
+                if a.kind == "scalar":
+                    emit_line(f"double {nm} = std::exp({a.name});")
+                    stack.append(StackItem(nm, "scalar", a.role, (), a.field_names, a.parent, a.side, a.field_sides))
+                elif a.kind == "vec":
+                    emit_line(f"Eigen::VectorXd {nm} = {a.name}.array().exp().matrix();")
+                    stack.append(StackItem(nm, "vec", a.role, a.shape, a.field_names, a.parent, a.side, a.field_sides))
+                elif a.kind == "mat":
+                    emit_line(f"Eigen::MatrixXd {nm} = {a.name}.array().exp().matrix();")
+                    stack.append(StackItem(nm, "mat", a.role, a.shape, a.field_names, a.parent, a.side, a.field_sides))
+                else:
+                    raise NotImplementedError(f"ExpOp not implemented for kind={a.kind!r}.")
             elif isinstance(op, Store):
                 a = stack.pop()
                 if op.store_type == "matrix":
@@ -4033,6 +4364,12 @@ class CppCodeGen:
                 view_lines.append(f"    auto {name}_view = {name}.unchecked<4>();")
             if name.startswith("gvec_"):
                 view_lines.append(f"    auto {name}_view = {name}.unchecked<5>();")
+            if name.startswith("hval_"):
+                view_lines.append(f"    auto {name}_view = {name}.unchecked<4>();")
+            if name.startswith("hgrad_"):
+                view_lines.append(f"    auto {name}_view = {name}.unchecked<5>();")
+            if name.startswith("hhess_"):
+                view_lines.append(f"    auto {name}_view = {name}.unchecked<6>();")
             if name.startswith("g_"):
                 view_lines.append(f"    auto {name}_view = {name}.unchecked<4>();")
             if name.startswith("r0") or name.startswith("r1") or name.startswith("r2") or name.startswith("r3") or name.startswith("r4"):

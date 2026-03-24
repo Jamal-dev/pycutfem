@@ -7,8 +7,9 @@ canonical single-drainage Terzaghi setting:
   - rectangular column in plane strain,
   - drained top boundary, impermeable base,
   - lateral pinning that enforces one-dimensional vertical consolidation,
-  - instantaneous step load represented through the initial excess pressure
-    state and subsequent Biot diffusion.
+  - instantaneous step load represented through a consistent undrained initial
+    excess-pressure state together with the maintained compressive top traction
+    during subsequent Biot diffusion.
 
 The benchmark is intended to verify the poroelastic pressure-diffusion and
 settlement response of the reduced Paper 1 mechanics block. It reports
@@ -43,6 +44,9 @@ try:
 except Exception:  # pragma: no cover - solver path is validated in fenicsx env
     sp = None
     sp_la = None
+
+
+_TRAPEZOID = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
 
 _REPO_ROOT = Path(__file__).resolve().parents[4]
 if str(_REPO_ROOT) not in sys.path:
@@ -178,6 +182,47 @@ def _collapse_profile(values: np.ndarray, groups: list[np.ndarray]) -> np.ndarra
     return np.asarray([float(np.mean(arr[idx])) for idx in groups], dtype=float)
 
 
+def _locate_element(mesh, point: np.ndarray):
+    from pycutfem.fem import transform
+
+    xy = np.asarray(point, dtype=float)
+    for elem in mesh.elements_list:
+        node_ids = elem.nodes
+        coords = mesh.nodes_x_y_pos[list(node_ids)]
+        if not (
+            coords[:, 0].min() - 1.0e-12 <= xy[0] <= coords[:, 0].max() + 1.0e-12
+            and coords[:, 1].min() - 1.0e-12 <= xy[1] <= coords[:, 1].max() + 1.0e-12
+        ):
+            continue
+        try:
+            xi, eta = transform.inverse_mapping(mesh, elem.id, xy)
+        except (np.linalg.LinAlgError, ValueError):
+            continue
+        if -1.0001 <= xi <= 1.0001 and -1.0001 <= eta <= 1.0001:
+            return elem.id, xi, eta
+    return None, None, None
+
+
+def _build_scalar_profile_evaluator(dof_handler: DofHandler, mesh, *, field_name: str, points: np.ndarray):
+    me = dof_handler.mixed_element
+    cache: list[tuple[np.ndarray, np.ndarray]] = []
+    for point in np.asarray(points, dtype=float):
+        eid, xi, eta = _locate_element(mesh, point)
+        if eid is None:
+            raise RuntimeError(f"Failed to locate evaluation point {point.tolist()} in the Terzaghi mesh.")
+        phi = np.asarray(me.basis(field_name, xi, eta)[me.slice(field_name)], dtype=float).ravel()
+        gdofs = np.asarray(dof_handler.element_maps[field_name][eid], dtype=int).ravel()
+        cache.append((phi, gdofs))
+
+    def _evaluate(func: Function) -> np.ndarray:
+        out = np.zeros((len(cache),), dtype=float)
+        for idx, (phi, gdofs) in enumerate(cache):
+            out[idx] = float(phi @ np.asarray(func.get_nodal_values(gdofs), dtype=float).ravel())
+        return out
+
+    return _evaluate
+
+
 def _series_label(Tv: float) -> str:
     text = f"{float(Tv):.2f}".rstrip("0").rstrip(".")
     return text or "0"
@@ -216,7 +261,7 @@ def _solve_case(
         trace,
     )
     from pycutfem.ufl.forms import BoundaryCondition
-    from pycutfem.ufl.measures import dx
+    from pycutfem.ufl.measures import dS, dx
     from pycutfem.ufl.spaces import FunctionSpace
     if int(nx_cells) < 2:
         raise ValueError("nx_cells must be at least 2.")
@@ -227,6 +272,9 @@ def _solve_case(
     ny_cells = int(ny_cells)
     sample_Tv = [float(v) for v in sample_Tv]
     sample_Tv = sorted(sample_Tv)
+    # The step-load Terzaghi solution has a startup singular layer near T_v=0.
+    # Convergence-style profile metrics should therefore use later sample times;
+    # the full history plots still show the entire transient.
 
     final_time = float(Tv_final) * (float(params.H) ** 2) / float(params.consolidation_coefficient)
     num_time_steps = int(max(8, steps_per_ny * ny_cells))
@@ -275,6 +323,9 @@ def _solve_case(
     k_perm = Constant(float(params.permeability))
     k_perm._jit_name = "permeability"
     I2 = Identity(2)
+    top_load = Constant(-float(params.sigma0))
+    top_load._jit_name = "sigma_top"
+    ds_top = dS(defined_on=mesh.edge_bitset("top"), metadata={"q": 5})
 
     def eps(w):
         return 0.5 * (grad(w) + grad(w).T)
@@ -293,12 +344,15 @@ def _solve_case(
         + theta * dt_c * H_pq * dx(metadata={"q": 5})
     )
 
+    # Terzaghi consolidation is quasi-static in the mechanics block:
+    # only the fluid mass balance carries previous-time terms. The
+    # displacement/pressure coupling in the equilibrium equation must be
+    # enforced at the current step, not incrementally against (u_prev, p_prev).
     L = (
-        inner(sigma_s(u_prev), eps(v)) * dx(metadata={"q": 5})
-        - biot * p_prev * div(v) * dx(metadata={"q": 5})
-        + biot * div(u_prev) * q * dx(metadata={"q": 5})
+        biot * div(u_prev) * q * dx(metadata={"q": 5})
         + invM * p_prev * q * dx(metadata={"q": 5})
         - (Constant(1.0) - theta) * dt_c * H0_pq * dx(metadata={"q": 5})
+        + top_load * v[1] * ds_top
     )
 
     bcs = [
@@ -334,14 +388,19 @@ def _solve_case(
     compiler._apply_bcs(K_bc, np.zeros(ndofs, dtype=float), bcs)
     lu = sp_la.splu(K_bc.tocsc())
 
-    p_slice = np.asarray(dh.get_field_slice("p"), dtype=int)
     uy_slice = np.asarray(dh.get_field_slice("uy"), dtype=int)
-    p_coords = dh.get_dof_coords("p")
     uy_coords = dh.get_dof_coords("uy")
-    p_levels, p_groups = _group_profile_levels(p_coords[:, 1])
     top_mask = np.isclose(uy_coords[:, 1], float(params.H))
     if not np.any(top_mask):
         raise RuntimeError("Failed to identify top displacement DOFs for the Terzaghi benchmark.")
+    profile_y = np.linspace(0.0, float(params.H), max(257, 4 * ny_cells + 1), dtype=float)
+    profile_x = np.full(profile_y.shape, 0.5 * float(params.L), dtype=float)
+    profile_eval = _build_scalar_profile_evaluator(
+        dh,
+        mesh,
+        field_name="p",
+        points=np.column_stack([profile_x, profile_y]),
+    )
 
     times: list[float] = []
     time_factor: list[float] = []
@@ -381,22 +440,25 @@ def _solve_case(
 
         w = lu.solve(F)
 
-        p_vals = np.asarray(w[p_slice], dtype=float)
-        p_profile = _collapse_profile(p_vals, p_groups)
+        u_prev.nodal_values = w[u_prev._g_dofs]
+        p_prev.nodal_values = w[p_prev._g_dofs]
+        w_prev[:] = w
+
+        p_profile = np.asarray(profile_eval(p_prev), dtype=float)
         p_profile_bar = p_profile / float(params.initial_pressure)
 
         settlement = float(np.mean(np.asarray(w[uy_slice], dtype=float)[top_mask]))
         settlement_bar_num = settlement / float(params.final_settlement)
 
         Tv = float(params.consolidation_coefficient) * t / (float(params.H) ** 2)
-        p_exact_bar = terzaghi_pressure_bar_exact(p_levels, t, params=params, n_terms=n_terms)
+        p_exact_bar = terzaghi_pressure_bar_exact(profile_y, t, params=params, n_terms=n_terms)
         settlement_bar_ex = terzaghi_settlement_bar_exact(t, params=params, n_terms=n_terms)
 
         err_profile = p_profile_bar - p_exact_bar
-        l2_bar = math.sqrt(float(np.trapezoid(err_profile * err_profile, p_levels / float(params.H))))
+        l2_bar = math.sqrt(float(_TRAPEZOID(err_profile * err_profile, profile_y / float(params.H))))
         linf_bar = float(np.max(np.abs(err_profile)))
 
-        p_mid_bar = float(np.interp(exact_mid_y, p_levels, p_profile_bar))
+        p_mid_bar = float(np.interp(exact_mid_y, profile_y, p_profile_bar))
         p_mid_bar_ex = float(terzaghi_pressure_bar_exact(np.asarray([exact_mid_y]), t, params=params, n_terms=n_terms)[0])
 
         times.append(t)
@@ -411,18 +473,24 @@ def _solve_case(
         for Tv_target, data in sample_targets.items():
             distance = abs(Tv - float(Tv_target))
             if distance < float(data["distance"]):
+                field_l2_bar = float(
+                    dh.l2_error(
+                        p_prev,
+                        exact={"p": (lambda x, y, _t=t: terzaghi_pressure_exact(y, _t, params=params, n_terms=n_terms))},
+                        fields=["p"],
+                        quad_order=8,
+                        relative=False,
+                    )
+                ) / float(params.initial_pressure)
                 data["distance"] = distance
                 data["entry"] = {
                     "Tv": Tv,
                     "time": t,
-                    "y": np.asarray(p_levels, dtype=float).copy(),
+                    "y": np.asarray(profile_y, dtype=float).copy(),
                     "p_bar_num": np.asarray(p_profile_bar, dtype=float).copy(),
                     "p_bar_exact": np.asarray(p_exact_bar, dtype=float).copy(),
+                    "p_field_l2_bar": np.asarray([float(field_l2_bar)], dtype=float),
                 }
-
-        u_prev.nodal_values = w[u_prev._g_dofs]
-        p_prev.nodal_values = w[p_prev._g_dofs]
-        w_prev[:] = w
 
         if print_progress and step % max(1, num_time_steps // 10) == 0:
             print(
@@ -452,17 +520,20 @@ def _solve_case(
             "y": np.asarray(entry["y"], dtype=float),
             "p_bar_num": np.asarray(entry["p_bar_num"], dtype=float),
             "p_bar_exact": np.asarray(entry["p_bar_exact"], dtype=float),
+            "p_field_l2_bar": np.asarray(entry["p_field_l2_bar"], dtype=float),
         }
 
     sampled_l2: list[float] = []
     sampled_linf: list[float] = []
     sampled_mid: list[float] = []
+    sampled_field_l2: list[float] = []
     for data in profile_samples.values():
         y_hat = np.asarray(data["y"], dtype=float) / float(params.H)
         err = np.asarray(data["p_bar_num"], dtype=float) - np.asarray(data["p_bar_exact"], dtype=float)
-        sampled_l2.append(math.sqrt(float(np.trapezoid(err * err, y_hat))))
+        sampled_l2.append(math.sqrt(float(_TRAPEZOID(err * err, y_hat))))
         sampled_linf.append(float(np.max(np.abs(err))))
         sampled_mid.append(float(abs(np.interp(exact_mid_y, np.asarray(data["y"], dtype=float), err))))
+        sampled_field_l2.append(float(np.asarray(data["p_field_l2_bar"], dtype=float).ravel()[0]))
 
     row = {
         "ny": float(ny_cells),
@@ -473,6 +544,7 @@ def _solve_case(
         "theta_step": float(params.theta_step),
         "max_pbar_l2": float(max(sampled_l2) if sampled_l2 else np.max(history["pressure_l2_bar_error"])),
         "max_pbar_linf": float(max(sampled_linf) if sampled_linf else np.max(history["pressure_linf_bar_error"])),
+        "max_pbar_field_l2": float(max(sampled_field_l2) if sampled_field_l2 else float("nan")),
         "max_mid_pressure_bar_error": float(
             max(sampled_mid) if sampled_mid else np.max(np.abs(history["mid_pressure_bar"] - history["mid_pressure_bar_exact"]))
         ),
@@ -496,6 +568,7 @@ def _write_summary_csv(path: Path, rows: list[dict[str, float]]) -> None:
         "theta_step",
         "max_pbar_l2",
         "max_pbar_linf",
+        "max_pbar_field_l2",
         "max_mid_pressure_bar_error",
         "max_settlement_bar_error",
         "final_settlement_bar_error",
@@ -686,6 +759,7 @@ def run_benchmark(
     _plot_error_trends(errors_png, rows=rows, dpi=png_dpi)
 
     payload = {
+        "paper1_scope": "alpha-independent poroelastic response benchmark",
         "params": asdict(params),
         "summary_csv": str(summary_csv),
         "history_csv": str(history_csv),
@@ -700,7 +774,7 @@ def run_benchmark(
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Paper 1 Benchmark 4: Terzaghi consolidation.")
+    ap = argparse.ArgumentParser(description="Paper 1 Benchmark 4: Terzaghi consolidation (alpha-independent poroelastic layer).")
     ap.add_argument("--outdir", type=str, required=True)
     ap.add_argument("--ny-list", type=str, default="32,64,128")
     ap.add_argument("--nx-cells", type=int, default=4)

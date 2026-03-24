@@ -5,8 +5,8 @@ from dataclasses import dataclass, field, replace
 
 from pycutfem.jit.ir import (
     LoadVariable, LoadConstant, LoadConstantArray, LoadElementWiseConstant,
-    LoadAnalytic, LoadFacetNormal, Grad, Div, HdivDiv, PosOp, NegOp,
-    PositivePartOp, HeavisideOp, LogOp,
+    LoadAnalytic, LoadFacetNormal, Grad, PackGradient, Div, HdivDiv, PosOp, NegOp,
+    PositivePartOp, HeavisideOp, LogOp, ExpOp,
     BinaryOp, Inner, Dot, Outer, Store, Transpose, CellDiameter, LoadFacetNormalComponent, CheckDomain,
     MeshSize,
     Trace, Determinant, Inverse, Cofactor, Hessian as IRHessian, Laplacian as IRLaplacian
@@ -312,6 +312,77 @@ class NumbaCodeGen:
                                        role='const',
                                        shape=(),          # scalar
                                        is_vector=False))
+
+            elif isinstance(op, PackGradient):
+                dy = stack.pop()
+                dx = stack.pop()
+                if dx.shape != dy.shape:
+                    raise NotImplementedError(
+                        f"PackGradient requires matching component shapes, got {dx.shape} and {dy.shape}."
+                    )
+                field_names, parent_name, side, field_sides = StackItem.resolve_metadata(
+                    dx, dy, prefer="basis", strict=False
+                )
+                if dx.role in {"test", "trial"} or dy.role in {"test", "trial"}:
+                    role = dx.role if dx.role in {"test", "trial"} else dy.role
+                    var_name = new_var("grad_pack")
+                    if len(dx.shape) == 2:
+                        body_lines.append(f"{var_name} = np.stack(({dx.var_name}, {dy.var_name}), axis=-1)")
+                        shape = (dx.shape[0], dx.shape[1], self.spatial_dim)
+                    elif len(dx.shape) == 1:
+                        body_lines.append(f"{var_name} = np.stack(({dx.var_name}, {dy.var_name}), axis=-1)[None, :, :]")
+                        shape = (1, dx.shape[0], self.spatial_dim)
+                    else:
+                        raise NotImplementedError(
+                            f"PackGradient does not support basis component rank {len(dx.shape)}."
+                        )
+                    stack.append(
+                        StackItem(
+                            var_name=var_name,
+                            role=role,
+                            shape=shape,
+                            is_vector=False,
+                            is_gradient=True,
+                            field_names=field_names,
+                            parent_name=parent_name,
+                            side=side,
+                            field_sides=field_sides,
+                        )
+                    )
+                    continue
+
+                role = "value" if (dx.role == "value" or dy.role == "value") else "const"
+                var_name = new_var("grad_pack")
+                if dx.shape == ():
+                    body_lines.append(f"{var_name} = np.array([{dx.var_name}, {dy.var_name}], dtype={self.dtype})")
+                    shape = (self.spatial_dim,)
+                    is_vector = True
+                    is_gradient = False
+                elif len(dx.shape) == 2 and dx.shape == (1, 1):
+                    body_lines.append(
+                        f"{var_name} = np.array([{dx.var_name}[0, 0], {dy.var_name}[0, 0]], dtype={self.dtype})"
+                    )
+                    shape = (self.spatial_dim,)
+                    is_vector = True
+                    is_gradient = False
+                else:
+                    raise NotImplementedError(
+                        f"PackGradient does not support value component shape {dx.shape}."
+                    )
+                stack.append(
+                    StackItem(
+                        var_name=var_name,
+                        role=role,
+                        shape=shape,
+                        is_vector=is_vector,
+                        is_gradient=is_gradient,
+                        field_names=field_names,
+                        parent_name=parent_name,
+                        side=side,
+                        field_sides=field_sides,
+                    )
+                )
+                continue
             
             elif isinstance(op, CheckDomain):
                 a = stack.pop()
@@ -654,7 +725,8 @@ class NumbaCodeGen:
                 # Fast path: symbolic hand-off to Grad/Hessian/Laplacian
                 if (op.role in ("test", "trial")
                     and op.deriv_order == (0, 0)
-                    and followed_by_diff):
+                    and followed_by_diff
+                    and getattr(op, "component_index", None) is None):
                     stack.append(
                         StackItem(
                             var_name="__basis__",
@@ -686,6 +758,78 @@ class NumbaCodeGen:
                         hdiv_field = str(field_names[0])
                 except Exception:
                     hdiv_field = None
+
+                hdiv_component = hdiv_field is not None and op.component_index is not None
+                if hdiv_component:
+                    if is_sided:
+                        raise NotImplementedError("Direct H(div) component loads are currently implemented for volume integrals only in the JIT backend.")
+                    comp_idx = int(op.component_index)
+                    fld = str(hdiv_field)
+                    if op.role in ("test", "trial"):
+                        if deriv_order == (0, 0):
+                            tbl = f"hval_{fld}"
+                            required_args.add(tbl)
+                            var_name = new_var("hdiv_comp")
+                            body_lines.append(f"{var_name} = {tbl}[e, q, {comp_idx}][None, :].copy()")
+                        elif deriv_order in {(1, 0), (0, 1)}:
+                            tbl = f"hgrad_{fld}"
+                            ax = 0 if deriv_order == (1, 0) else 1
+                            required_args.add(tbl)
+                            var_name = new_var("hdiv_d1")
+                            body_lines.append(f"{var_name} = {tbl}[e, q, {comp_idx}, :, {ax}][None, :].copy()")
+                        elif deriv_order in {(2, 0), (1, 1), (0, 2)}:
+                            tbl = f"hhess_{fld}"
+                            a0, a1 = (0, 0) if deriv_order == (2, 0) else (0, 1) if deriv_order == (1, 1) else (1, 1)
+                            required_args.add(tbl)
+                            var_name = new_var("hdiv_d2")
+                            body_lines.append(f"{var_name} = {tbl}[e, q, {comp_idx}, :, {a0}, {a1}][None, :].copy()")
+                        else:
+                            raise NotImplementedError(f"H(div) component derivative order {deriv_order} not implemented in JIT.")
+                        stack.append(
+                            StackItem(
+                                var_name=var_name,
+                                role=op.role,
+                                shape=(1, self.active_n_dofs),
+                                is_vector=False,
+                                field_names=field_names,
+                                parent_name=op.name,
+                                side=op.side,
+                                field_sides=op.field_sides or [],
+                            )
+                        )
+                        continue
+
+                    coeff_sym = op.name if op.name.startswith("u_") else f"u_{op.name}_loc"
+                    required_args.add(coeff_sym)
+                    if deriv_order == (0, 0):
+                        tbl = f"hval_{fld}"
+                        row_expr = f"{tbl}[e, q, {comp_idx}]"
+                    elif deriv_order in {(1, 0), (0, 1)}:
+                        tbl = f"hgrad_{fld}"
+                        ax = 0 if deriv_order == (1, 0) else 1
+                        row_expr = f"{tbl}[e, q, {comp_idx}, :, {ax}]"
+                    elif deriv_order in {(2, 0), (1, 1), (0, 2)}:
+                        tbl = f"hhess_{fld}"
+                        a0, a1 = (0, 0) if deriv_order == (2, 0) else (0, 1) if deriv_order == (1, 1) else (1, 1)
+                        row_expr = f"{tbl}[e, q, {comp_idx}, :, {a0}, {a1}]"
+                    else:
+                        raise NotImplementedError(f"H(div) component derivative order {deriv_order} not implemented in JIT.")
+                    required_args.add(tbl)
+                    val_var = new_var(f"{op.name}_hdiv_comp")
+                    body_lines.append(f"{val_var} = load_variable_qp({coeff_sym}, {row_expr})")
+                    stack.append(
+                        StackItem(
+                            var_name=val_var,
+                            role="value",
+                            shape=(),
+                            is_vector=False,
+                            field_names=field_names,
+                            parent_name=coeff_sym,
+                            side=op.side,
+                            field_sides=op.field_sides or [],
+                        )
+                    )
+                    continue
 
              
 
@@ -2230,6 +2374,13 @@ class NumbaCodeGen:
                 body_lines.append(f"{res_var} = np.log({a.var_name})")
                 stack.append(a._replace(var_name=res_var))
 
+            elif isinstance(op, ExpOp):
+                a = stack.pop()
+                res_var = new_var("exp")
+                body_lines.append("# Exp: natural exponential")
+                body_lines.append(f"{res_var} = np.exp({a.var_name})")
+                stack.append(a._replace(var_name=res_var))
+
             # --- Inner OPERATORS ---
             elif isinstance(op, Inner):
                 b = stack.pop(); a = stack.pop()
@@ -2738,29 +2889,51 @@ class NumbaCodeGen:
                 # dot( u_trial ,  grad(u_k) )   ← swap of the previous
                 # ---------------------------------------------------------------------
                 elif a.role == 'trial' and a.is_vector and b.role == 'value' and b.is_gradient:
-                    body_lines.append("# Advection: dot(Trial, grad(Function))")
-                    body_lines.append(
-                        f"{res_var} = dot_trial_vec_grad_func({a.var_name}, {b.var_name}, {self.dtype})"
-                    )
-                    stack.append(StackItem(var_name=res_var, role='trial',
-                                        shape=(b.shape[1], a.shape[1]), is_vector=True,
-                                        is_gradient=False, field_names=a.field_names,
-                                        parent_name=a.parent_name,
-                                        side=a.side, field_sides=a.field_sides or []))
+                    if b.shape[0] == 1 and a.shape[0] == b.shape[1]:
+                        body_lines.append("# Advection: dot(Trial, grad(scalar Function))")
+                        body_lines.append(
+                            f"{res_var} = basis_dot_const_vector({a.var_name}, {b.var_name}[0, :], {self.dtype})"
+                        )
+                        stack.append(StackItem(var_name=res_var, role='trial',
+                                            shape=(1, a.shape[1]), is_vector=False,
+                                            is_gradient=False, field_names=a.field_names,
+                                            parent_name=a.parent_name,
+                                            side=a.side, field_sides=a.field_sides or []))
+                    else:
+                        body_lines.append("# Advection: dot(Trial, grad(Function))")
+                        body_lines.append(
+                            f"{res_var} = dot_trial_vec_grad_func({a.var_name}, {b.var_name}, {self.dtype})"
+                        )
+                        stack.append(StackItem(var_name=res_var, role='trial',
+                                            shape=(b.shape[0], a.shape[1]), is_vector=True,
+                                            is_gradient=False, field_names=a.field_names,
+                                            parent_name=a.parent_name,
+                                            side=a.side, field_sides=a.field_sides or []))
 
                 # ---------------------------------------------------------------------
                 # dot( v_test ,  grad(u_k) )    ← test vector dotted with grad(value)
                 # ---------------------------------------------------------------------
                 elif a.role == 'test' and a.is_vector and b.role == 'value' and b.is_gradient and not b.is_vector:
-                    body_lines.append("# Advection: dot(Test, grad(Function))")
-                    body_lines.append(
-                        f"{res_var} = vector_dot_grad_value({a.var_name}, {b.var_name}, {self.dtype})"
-                    )
-                    stack.append(StackItem(var_name=res_var, role='test',
-                                        shape=(a.shape[1], b.shape[1]), is_vector=False,
-                                        is_gradient=False, field_names=a.field_names,
-                                        parent_name=a.parent_name,
-                                        side=a.side, field_sides=a.field_sides or []))
+                    if b.shape[0] == 1 and a.shape[0] == b.shape[1]:
+                        body_lines.append("# Advection: dot(Test, grad(scalar Function))")
+                        body_lines.append(
+                            f"{res_var} = basis_dot_const_vector({a.var_name}, {b.var_name}[0, :], {self.dtype})"
+                        )
+                        stack.append(StackItem(var_name=res_var, role='test',
+                                            shape=(1, a.shape[1]), is_vector=False,
+                                            is_gradient=False, field_names=a.field_names,
+                                            parent_name=a.parent_name,
+                                            side=a.side, field_sides=a.field_sides or []))
+                    else:
+                        body_lines.append("# Advection: dot(Test, grad(Function))")
+                        body_lines.append(
+                            f"{res_var} = vector_dot_grad_value({a.var_name}, {b.var_name}, {self.dtype})"
+                        )
+                        stack.append(StackItem(var_name=res_var, role='test',
+                                            shape=(a.shape[1], b.shape[1]), is_vector=False,
+                                            is_gradient=False, field_names=a.field_names,
+                                            parent_name=a.parent_name,
+                                            side=a.side, field_sides=a.field_sides or []))
 
                 # ---------------------------------------------------------------------
                 # dot( u_k ,  u_k )             ← |u_k|², scalar
@@ -2936,28 +3109,50 @@ class NumbaCodeGen:
                 # dot( u_k ,  grad(u_k) )     ← e.g. rhs advection term
                 # ---------------------------------------------------------------------
                 elif a.role == 'value' and a.is_vector and b.role == 'value' and b.is_gradient:
-                    body_lines.append("# RHS: dot(Function, grad(Function)) (k).(k,d) ->k")
-                    body_lines.append(
-                        f"{res_var} = dot_value_with_grad({a.var_name}, {b.var_name}, {self.dtype})"
-                    )
-                    stack.append(StackItem(var_name=res_var, role='const',
-                                        shape=( b.shape[1],), is_vector=True,
-                                        is_gradient=False, field_names=b.field_names,
-                                        parent_name=b.parent_name,
-                                        side=b.side, field_sides=b.field_sides or []))
+                    if b.shape[0] == 1 and a.shape[0] == b.shape[1]:
+                        body_lines.append("# RHS: dot(vector Function, grad(scalar Function)) -> scalar")
+                        body_lines.append(
+                            f"{res_var} = dot_vec_vec({a.var_name}, {b.var_name}[0, :], {self.dtype})"
+                        )
+                        stack.append(StackItem(var_name=res_var, role='const',
+                                            shape=(), is_vector=False,
+                                            is_gradient=False, field_names=b.field_names,
+                                            parent_name=b.parent_name,
+                                            side=b.side, field_sides=b.field_sides or []))
+                    else:
+                        body_lines.append("# RHS: dot(Function, grad(Function)) (k).(k,d) -> d")
+                        body_lines.append(
+                            f"{res_var} = dot_value_with_grad({a.var_name}, {b.var_name}, {self.dtype})"
+                        )
+                        stack.append(StackItem(var_name=res_var, role='const',
+                                            shape=( b.shape[1],), is_vector=True,
+                                            is_gradient=False, field_names=b.field_names,
+                                            parent_name=b.parent_name,
+                                            side=b.side, field_sides=b.field_sides or []))
                 # ---------------------------------------------------------------------
                 # dot( grad(u_k) ,  u_k )     ← e.g. rhs advection term  -> (k,d).(k) -> k
                 # ---------------------------------------------------------------------
                 elif a.role == 'value' and a.is_gradient and b.role == 'value' and b.is_vector:
-                    body_lines.append("# RHS: dot(grad(Function), Function) (k,d).(k) -> k")
-                    body_lines.append(
-                        f"{res_var} = dot_grad_with_value({a.var_name}, {b.var_name}, {self.dtype})"
-                    )
-                    stack.append(StackItem(var_name=res_var, role='const',
-                                        shape=(a.shape[0], ), is_vector=True,
-                                        is_gradient=False, field_names=a.field_names,
-                                        parent_name=a.parent_name,
-                                        side=a.side, field_sides=a.field_sides or []))
+                    if a.shape[0] == 1 and b.shape[0] == a.shape[1]:
+                        body_lines.append("# RHS: dot(grad(scalar Function), vector Function) -> scalar")
+                        body_lines.append(
+                            f"{res_var} = dot_vec_vec({a.var_name}[0, :], {b.var_name}, {self.dtype})"
+                        )
+                        stack.append(StackItem(var_name=res_var, role='const',
+                                            shape=(), is_vector=False,
+                                            is_gradient=False, field_names=a.field_names,
+                                            parent_name=a.parent_name,
+                                            side=a.side, field_sides=a.field_sides or []))
+                    else:
+                        body_lines.append("# RHS: dot(grad(Function), Function) (k,d).(d) -> k")
+                        body_lines.append(
+                            f"{res_var} = dot_grad_with_value({a.var_name}, {b.var_name}, {self.dtype})"
+                        )
+                        stack.append(StackItem(var_name=res_var, role='const',
+                                            shape=(a.shape[0], ), is_vector=True,
+                                            is_gradient=False, field_names=a.field_names,
+                                            parent_name=a.parent_name,
+                                            side=a.side, field_sides=a.field_sides or []))
                 # ---------------------------------------------------------------------
                 # dot( np.array ,  u_test )     ← e.g. body-force · test -> (n,)
                 # ---------------------------------------------------------------------
@@ -3061,6 +3256,20 @@ class NumbaCodeGen:
                                         shape=shape, is_vector=False,is_gradient=False,
                                         field_names=b.field_names, parent_name=b.parent_name,
                                         side=b.side, field_sides=b.field_sides or []))
+                # ---------------------------------------------------------------------
+                # dot( u_k ,  u_trial )          ← bilinear scalar-gradient value collapsed to vector
+                # ---------------------------------------------------------------------
+                elif a.role == 'value' and a.is_vector and b.role == 'trial' and b.is_vector:
+                    if self.form_rank != 2:
+                        raise NotImplementedError("dot(Function, Trial) vector contraction only supported on bilinear forms")
+                    body_lines.append("# LHS: dot(Function, Trial) (k)·(k,n) -> (1,n)")
+                    body_lines.append(
+                        f"{res_var} = basis_dot_const_vector({b.var_name}, {a.var_name}, {self.dtype})"
+                    )
+                    stack.append(StackItem(var_name=res_var, role='trial',
+                                        shape=(1, b.shape[1]), is_vector=False, is_gradient=False,
+                                        field_names=b.field_names, parent_name=b.parent_name,
+                                        side=b.side, field_sides=b.field_sides or []))
 
                 # ---------------------------------------------------------------------
                 # dot( u_test ,  u_k )          ← load-vector term -> (n,)
@@ -3082,6 +3291,20 @@ class NumbaCodeGen:
                         role = 'test'
                     stack.append(StackItem(var_name=res_var, role=role,
                                         shape=shape, is_vector=False,is_gradient=False,
+                                        field_names=a.field_names, parent_name=a.parent_name,
+                                        side=a.side, field_sides=a.field_sides or []))
+                # ---------------------------------------------------------------------
+                # dot( u_trial ,  u_k )          ← bilinear scalar-gradient value collapsed to vector
+                # ---------------------------------------------------------------------
+                elif a.role == 'trial' and a.is_vector and b.role == 'value' and b.is_vector:
+                    if self.form_rank != 2:
+                        raise NotImplementedError("dot(Trial, Function) vector contraction only supported on bilinear forms")
+                    body_lines.append("# LHS: dot(Trial, Function) (k,n)·(k) -> (1,n)")
+                    body_lines.append(
+                        f"{res_var} = basis_dot_const_vector({a.var_name}, {b.var_name}, {self.dtype})"
+                    )
+                    stack.append(StackItem(var_name=res_var, role='trial',
+                                        shape=(1, a.shape[1]), is_vector=False, is_gradient=False,
                                         field_names=a.field_names, parent_name=a.parent_name,
                                         side=a.side, field_sides=a.field_sides or []))
                 # ---------------------------------------------------------------------
@@ -3751,6 +3974,97 @@ class NumbaCodeGen:
                         stack.append(StackItem(var_name=res_var, role='mixed',
                                             shape=(a.shape[0], b.shape[1], b.shape[2], a.shape[1]),
                                             is_vector=False, is_gradient=True,
+                                            field_names=field_names, parent_name=parent_name,
+                                            side=side, field_sides=field_sides))
+                    elif (
+                        a.role in {"trial", "test"}
+                        and a.is_gradient
+                        and len(a.shape) == 3
+                        and b.role in {"value", "const"}
+                        and not b.is_vector
+                        and len(b.shape) == 2
+                        and a.shape[2] == b.shape[0]
+                    ):
+                        body_lines.append("# Product: Grad(basis) × matrix(value/const) → Grad(basis)")
+                        body_lines.append(
+                            f"{res_var} = contract_last_first({a.var_name}, {b.var_name}, {self.dtype})"
+                        )
+                        field_names, parent_name, side, field_sides = StackItem.resolve_metadata(a, b, prefer='a', strict=False)
+                        stack.append(StackItem(var_name=res_var, role=a.role,
+                                            shape=(a.shape[0], a.shape[1], b.shape[1]),
+                                            is_vector=False, is_gradient=True,
+                                            field_names=field_names, parent_name=parent_name,
+                                            side=side, field_sides=field_sides))
+                    elif (
+                        b.role in {"trial", "test"}
+                        and b.is_gradient
+                        and len(b.shape) == 3
+                        and a.role in {"value", "const"}
+                        and not a.is_vector
+                        and len(a.shape) == 2
+                        and (
+                            (b.shape[0] == 1 and a.shape[1] == b.shape[2])
+                            or a.shape[1] == b.shape[0]
+                        )
+                    ):
+                        field_names, parent_name, side, field_sides = StackItem.resolve_metadata(a, b, prefer='b', strict=False)
+                        if b.shape[0] == 1 and a.shape[1] == b.shape[2]:
+                            body_lines.append("# Product: matrix(value/const) × scalar Grad(basis) → Grad(basis)")
+                            body_lines.append(
+                                f"{res_var} = contract_last_first({b.var_name}, np.ascontiguousarray({a.var_name}.T), {self.dtype})"
+                            )
+                            out_shape = (1, b.shape[1], a.shape[0])
+                        else:
+                            body_lines.append("# Product: matrix(value/const) × vector Grad(basis) → Grad(basis)")
+                            body_lines.append(
+                                f"{res_var} = contract_last_first({a.var_name}, {b.var_name}, {self.dtype})"
+                            )
+                            out_shape = (a.shape[0], b.shape[1], b.shape[2])
+                        stack.append(StackItem(var_name=res_var, role=b.role,
+                                            shape=out_shape,
+                                            is_vector=False, is_gradient=True,
+                                            field_names=field_names, parent_name=parent_name,
+                                            side=side, field_sides=field_sides))
+                    elif (
+                        a.role in {"value", "const"}
+                        and a.is_vector
+                        and not a.is_gradient
+                        and not a.is_hessian
+                        and len(a.shape) == 1
+                        and b.role in {"value", "const"}
+                        and not b.is_vector
+                        and len(b.shape) == 2
+                        and a.shape[0] == b.shape[0]
+                    ):
+                        body_lines.append("# Product: vector(value/const) × matrix(value/const) → vector(value/const)")
+                        body_lines.append(
+                            f"{res_var} = np.ascontiguousarray({a.var_name}) @ np.ascontiguousarray({b.var_name})"
+                        )
+                        role = "value" if "value" in {a.role, b.role} else "const"
+                        field_names, parent_name, side, field_sides = StackItem.resolve_metadata(a, b, prefer='a', strict=False)
+                        stack.append(StackItem(var_name=res_var, role=role,
+                                            shape=(b.shape[1],), is_vector=True,
+                                            field_names=field_names, parent_name=parent_name,
+                                            side=side, field_sides=field_sides))
+                    elif (
+                        b.role in {"value", "const"}
+                        and b.is_vector
+                        and not b.is_gradient
+                        and not b.is_hessian
+                        and len(b.shape) == 1
+                        and a.role in {"value", "const"}
+                        and not a.is_vector
+                        and len(a.shape) == 2
+                        and a.shape[1] == b.shape[0]
+                    ):
+                        body_lines.append("# Product: matrix(value/const) × vector(value/const) → vector(value/const)")
+                        body_lines.append(
+                            f"{res_var} = np.ascontiguousarray({a.var_name}) @ np.ascontiguousarray({b.var_name})"
+                        )
+                        role = "value" if "value" in {a.role, b.role} else "const"
+                        field_names, parent_name, side, field_sides = StackItem.resolve_metadata(a, b, prefer='a', strict=False)
+                        stack.append(StackItem(var_name=res_var, role=role,
+                                            shape=(a.shape[0],), is_vector=True,
                                             field_names=field_names, parent_name=parent_name,
                                             side=side, field_sides=field_sides))
 

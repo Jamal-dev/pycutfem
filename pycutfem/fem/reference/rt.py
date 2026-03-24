@@ -512,6 +512,36 @@ class RaviartThomasRef:
                 out[:, comp, ax] = self.C.T @ grad_phi[:, comp, ax]
         return out
 
+    @lru_cache(maxsize=512)
+    def tabulate_hessian(self, xi: float, eta: float) -> np.ndarray:
+        """
+        Reference Hessians of the nodal RT basis components.
+
+        Returns
+        -------
+        np.ndarray, shape (n_dofs, 2, 2, 2)
+            ``out[j, comp, ax0, ax1] = d^2 / d hat_x_ax0 d hat_x_ax1 (phi_j)_comp``.
+        """
+        xi = float(xi)
+        eta = float(eta)
+        hess_phi = np.empty((self.n_dofs, 2, 2, 2), dtype=float)
+        for j, (px, py) in enumerate(self._poly_basis):
+            hess_phi[j, 0, 0, 0] = px.deriv(2, 0).eval(xi, eta)
+            hess_phi[j, 0, 0, 1] = px.deriv(1, 1).eval(xi, eta)
+            hess_phi[j, 0, 1, 0] = hess_phi[j, 0, 0, 1]
+            hess_phi[j, 0, 1, 1] = px.deriv(0, 2).eval(xi, eta)
+            hess_phi[j, 1, 0, 0] = py.deriv(2, 0).eval(xi, eta)
+            hess_phi[j, 1, 0, 1] = py.deriv(1, 1).eval(xi, eta)
+            hess_phi[j, 1, 1, 0] = hess_phi[j, 1, 0, 1]
+            hess_phi[j, 1, 1, 1] = py.deriv(0, 2).eval(xi, eta)
+
+        out = np.empty_like(hess_phi)
+        for comp in range(2):
+            for ax0 in range(2):
+                for ax1 in range(2):
+                    out[:, comp, ax0, ax1] = self.C.T @ hess_phi[:, comp, ax0, ax1]
+        return out
+
 
 @lru_cache(maxsize=None)
 def get_rt_reference(element_type: str, k: int) -> RaviartThomasRef:

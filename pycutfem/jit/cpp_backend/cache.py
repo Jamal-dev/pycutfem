@@ -9,11 +9,17 @@ import sys
 import sysconfig
 import tempfile
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 from pycutfem.jit.cache import KernelCache
 from .compiler import compile_extension, get_compile_mode_tag
+
+try:  # pragma: no cover - Windows fallback is exercised only off Linux.
+    import fcntl
+except ImportError:  # pragma: no cover - platform dependent.
+    fcntl = None
 
 # Bump when generated C++ changes in a way that requires recompilation of cached kernels.
 # Bump when generated C++ changes or when helper semantics change in a way that
@@ -33,7 +39,44 @@ from .compiler import compile_extension, get_compile_mode_tag
 #   d20/d11/d02 tables directly).
 # - v30 invalidates kernels after wiring the correct Jloc/Hx/Hy selection for
 #   those trial/test second-derivative push-forwards.
-CODEGEN_ABI_CPP = "2026-03-12-cpp-v32-pybind11-no-subinterp"
+# - v33 invalidates kernels after adding direct H(div) component physical-table
+#   views (hval/hgrad/hhess) to the C++ kernel prologue for higher-order RT
+#   whole-domain assembly.
+CODEGEN_ABI_CPP = "2026-03-16-cpp-v33-pybind11-no-subinterp"
+
+
+@contextmanager
+def _module_build_lock(lock_path: Path):
+    """
+    Serialize cross-process compile/import of a single cached extension module.
+
+    Without this lock two long-running benchmark processes can race on the same
+    `<module>.so`: one process starts importing while the other is still linking,
+    which shows up as `ImportError: ... file too short`.
+    """
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "a+b") as handle:
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _looks_like_incomplete_binary_import(exc: BaseException) -> bool:
+    text = str(exc).strip().lower()
+    if not text:
+        return False
+    hints = (
+        "file too short",
+        "invalid elf header",
+        "wrong elf class",
+        "cannot dynamically load position-independent executable",
+        "failed to map segment from shared object",
+    )
+    return any(hint in text for hint in hints)
 
 
 class CppKernelCache:
@@ -118,76 +161,98 @@ class CppKernelCache:
         source_file = self._cache_dir / f"{module_name}.cpp"
         built_module = self._cache_dir / f"{module_name}{self._ext_suffix}"
         digest_file = self._cache_dir / f"{module_name}.sha256"
+        lock_file = self._cache_dir / f"{module_name}.lock"
 
-        # Generate source if needed (or if stale ABI is detected).
-        regenerate = True
-        if source_file.exists():
+        with _module_build_lock(lock_file):
+            if cache_key in self.in_memory_cache:
+                return self.in_memory_cache[cache_key]
+
+            # Generate source if needed (or if stale ABI is detected).
+            regenerate = True
+            if source_file.exists():
+                try:
+                    text = source_file.read_text(encoding="utf-8")
+                except OSError:
+                    text = ""
+                regenerate = f'CODEGEN_ABI") = "{CODEGEN_ABI_CPP}"' not in text
+
+            if regenerate:
+                src, _, param_order = codegen.generate_source(
+                    ir_sequence, "kernel", module_name=module_name
+                )
+                source_file.write_text(src, encoding="utf-8")
+                built_module.unlink(missing_ok=True)
+                digest_file.unlink(missing_ok=True)
+            else:
+                param_order = None
+
             try:
-                text = source_file.read_text(encoding="utf-8")
+                source_digest = hashlib.sha256(source_file.read_bytes()).hexdigest()
             except OSError:
-                text = ""
-            regenerate = f'CODEGEN_ABI") = "{CODEGEN_ABI_CPP}"' not in text
+                source_digest = ""
 
-        if regenerate:
-            src, _, param_order = codegen.generate_source(
-                ir_sequence, "kernel", module_name=module_name
-            )
-            source_file.write_text(src, encoding="utf-8")
-            built_module.unlink(missing_ok=True)
-            digest_file.unlink(missing_ok=True)
-        else:
-            param_order = None
-
-        try:
-            source_digest = hashlib.sha256(source_file.read_bytes()).hexdigest()
-        except OSError:
-            source_digest = ""
-
-        force_reload = False
-        digest_matches = False
-        try:
-            digest_matches = digest_file.read_text(encoding="utf-8").strip() == source_digest
-        except OSError:
+            force_reload = False
             digest_matches = False
+            try:
+                digest_matches = digest_file.read_text(encoding="utf-8").strip() == source_digest
+            except OSError:
+                digest_matches = False
 
-        if built_module.exists() and not digest_matches:
-            built_module.unlink(missing_ok=True)
-            force_reload = True
+            if built_module.exists() and not digest_matches:
+                built_module.unlink(missing_ok=True)
+                force_reload = True
 
-        # Compile when the shared object is missing.
-        if not built_module.exists():
-            include_dirs = list(codegen.include_dirs)
-            compile_extension(
-                module_name,
-                source_file,
-                self._cache_dir,
-                include_dirs=include_dirs,
-                compile_mode=compile_tag,
-            )
-            if source_digest:
+            # Compile when the shared object is missing.
+            if not built_module.exists():
+                include_dirs = list(codegen.include_dirs)
+                compile_extension(
+                    module_name,
+                    source_file,
+                    self._cache_dir,
+                    include_dirs=include_dirs,
+                    compile_mode=compile_tag,
+                )
+                if source_digest:
+                    digest_file.write_text(source_digest, encoding="utf-8")
+                force_reload = True
+
+            try:
+                module = self._import_module(module_name, built_module, force_reload=force_reload)
+            except Exception as exc:
+                if not _looks_like_incomplete_binary_import(exc):
+                    raise
+                built_module.unlink(missing_ok=True)
+                digest_file.unlink(missing_ok=True)
+                compile_extension(
+                    module_name,
+                    source_file,
+                    self._cache_dir,
+                    include_dirs=list(codegen.include_dirs),
+                    compile_mode=compile_tag,
+                )
+                if source_digest:
+                    digest_file.write_text(source_digest, encoding="utf-8")
+                module = self._import_module(module_name, built_module, force_reload=True)
+
+            if getattr(module, "CODEGEN_ABI", None) != CODEGEN_ABI_CPP:
+                # Stale ABI – rebuild and reload once.
+                source_file.unlink(missing_ok=True)
+                built_module.unlink(missing_ok=True)
+                digest_file.unlink(missing_ok=True)
+                src, _, param_order = codegen.generate_source(
+                    ir_sequence, "kernel", module_name=module_name
+                )
+                source_file.write_text(src, encoding="utf-8")
+                source_digest = hashlib.sha256(source_file.read_bytes()).hexdigest()
+                compile_extension(
+                    module_name,
+                    source_file,
+                    self._cache_dir,
+                    include_dirs=list(codegen.include_dirs),
+                    compile_mode=compile_tag,
+                )
                 digest_file.write_text(source_digest, encoding="utf-8")
-            force_reload = True
-
-        module = self._import_module(module_name, built_module, force_reload=force_reload)
-        if getattr(module, "CODEGEN_ABI", None) != CODEGEN_ABI_CPP:
-            # Stale ABI – rebuild and reload once.
-            source_file.unlink(missing_ok=True)
-            built_module.unlink(missing_ok=True)
-            digest_file.unlink(missing_ok=True)
-            src, _, param_order = codegen.generate_source(
-                ir_sequence, "kernel", module_name=module_name
-            )
-            source_file.write_text(src, encoding="utf-8")
-            source_digest = hashlib.sha256(source_file.read_bytes()).hexdigest()
-            compile_extension(
-                module_name,
-                source_file,
-                self._cache_dir,
-                include_dirs=list(codegen.include_dirs),
-                compile_mode=compile_tag,
-            )
-            digest_file.write_text(source_digest, encoding="utf-8")
-            module = self._import_module(module_name, built_module, force_reload=True)
+                module = self._import_module(module_name, built_module, force_reload=True)
 
         param_order = (
             list(getattr(module, "PARAM_ORDER"))

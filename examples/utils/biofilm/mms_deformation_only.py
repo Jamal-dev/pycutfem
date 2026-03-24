@@ -223,6 +223,7 @@ def _build_case(
     M_alpha: float,
     gamma_alpha: float,
     eps_alpha: float,
+    support_physics: str = "internal_conversion",
     v_expr,
     p_expr,
     vS_expr,
@@ -275,7 +276,16 @@ def _build_case(
     B_n_expr = sp.simplify(alpha_n_expr * (1.0 - float(phi_b)))
     rho_n_expr = sp.simplify(float(rho_f) * C_n_expr)
     mu_mix_n_expr = sp.simplify((1.0 - alpha_n_expr) * float(mu_f) + alpha_n_expr * float(mu_b))
-    beta_n_expr = sp.simplify(alpha_n_expr * float(mu_f) * float(kappa_inv))
+    support_key = str(support_physics or "legacy_exchange").strip().lower()
+    if support_key in {"internal_conversion", "internal-conversion", "conservative_support", "support_preserving"}:
+        beta_n_expr = sp.simplify(B_n_expr * (float(phi_b) ** 2) * float(mu_f) * float(kappa_inv))
+    elif support_key in {"legacy_exchange", "legacy-exchange", "legacy"}:
+        beta_n_expr = sp.simplify(alpha_n_expr * float(mu_f) * float(kappa_inv))
+    else:
+        raise ValueError(
+            f"Unknown reduced MMS support_physics={support_physics!r}. "
+            "Use 'legacy_exchange' or 'internal_conversion'."
+        )
 
     grad_p_k = _sym_grad_scalar(p_k_expr, x, y)
     grad_alpha_n = _sym_grad_scalar(alpha_n_expr, x, y)
@@ -296,8 +306,20 @@ def _build_case(
     skel_expr = sp.simplify(-_sym_div_mat(alpha_n_expr * sigma_u_th, x, y) + B_n_expr * grad_p_k - beta_n_expr * (v_th_expr - vS_th_expr))
     f_u_expr = sp.simplify(skel_expr / alpha_n_expr)
 
-    alpha_adv = (_sym_grad_scalar(alpha_th_expr, x, y).dot(vS_n_expr)) + alpha_th_expr * _sym_div_vec(vS_n_expr, x, y)
-    f_alpha_expr = sp.simplify(((alpha_k_expr - alpha_n_expr) / dt) + alpha_adv - float(M_alpha) * _sym_laplacian(mu_k_expr, x, y))
+    if support_key in {"internal_conversion", "internal-conversion", "conservative_support", "support_preserving"}:
+        adv_u_n_expr = sp.simplify(float(phi_b) * v_n_expr + (1.0 - float(phi_b)) * vS_n_expr)
+        div_adv_u_n_expr = sp.simplify(float(phi_b) * _sym_div_vec(v_n_expr, x, y) + (1.0 - float(phi_b)) * _sym_div_vec(vS_n_expr, x, y))
+        alpha_adv_k = sp.simplify(_sym_grad_scalar(alpha_k_expr, x, y).dot(adv_u_n_expr) + alpha_k_expr * div_adv_u_n_expr)
+        alpha_adv_n = sp.simplify(_sym_grad_scalar(alpha_n_expr, x, y).dot(adv_u_n_expr) + alpha_n_expr * div_adv_u_n_expr)
+        f_alpha_expr = sp.simplify(
+            ((alpha_k_expr - alpha_n_expr) / dt)
+            + th * alpha_adv_k
+            + one_m_th * alpha_adv_n
+            - float(M_alpha) * _sym_laplacian(mu_k_expr, x, y)
+        )
+    else:
+        alpha_adv = (_sym_grad_scalar(alpha_th_expr, x, y).dot(vS_n_expr)) + alpha_th_expr * _sym_div_vec(vS_n_expr, x, y)
+        f_alpha_expr = sp.simplify(((alpha_k_expr - alpha_n_expr) / dt) + alpha_adv - float(M_alpha) * _sym_laplacian(mu_k_expr, x, y))
 
     mu_residual_expr = sp.simplify(mu_k_expr - float(gamma_alpha) * ((-float(eps_alpha)) * _sym_laplacian(alpha_k_expr, x, y) + (_double_well_prime(alpha_k_expr) / float(eps_alpha))))
     mass_components = list(mass_expr) if isinstance(mass_expr, sp.MatrixBase) else [mass_expr]
@@ -326,6 +348,7 @@ def _build_case(
         "M_alpha": float(M_alpha),
         "gamma_alpha": float(gamma_alpha),
         "eps_alpha": float(eps_alpha),
+        "support_physics": str(support_key),
     }
 
     return DeformationOnlyMMS(

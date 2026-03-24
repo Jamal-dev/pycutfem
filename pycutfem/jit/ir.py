@@ -14,6 +14,7 @@ class LoadVariable:
     field_names: list = field(default_factory=list) 
     side: str = ""           # "", "+", or "-"   ← NEW
     field_sides: Optional[List[str]] = None
+    component_index: Optional[int] = None
 
 @dataclass(frozen=True, slots=True)
 class LoadConstant:
@@ -43,6 +44,12 @@ class LoadFacetNormal:
 @dataclass(frozen=True, slots =True)
 class Grad:
     """Instruction to compute the gradient of the top of the stack."""
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class PackGradient:
+    """Pack two scalar derivative components (dx, dy) into a gradient value."""
     pass
 
 @dataclass(frozen=True, slots =True)
@@ -83,6 +90,12 @@ class HeavisideOp:
 @dataclass(frozen=True, slots=True)
 class LogOp:
     """Instruction to apply the natural logarithm log(x)."""
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class ExpOp:
+    """Instruction to apply the natural exponential exp(x)."""
     pass
 
 @dataclass(frozen=True, slots =True)

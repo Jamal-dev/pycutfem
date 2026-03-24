@@ -417,6 +417,41 @@ class MixedElement:
             Gphys[a, :, :] = pref @ Ghat[a, :, :] @ Jinv
         return Gphys
 
+    def tabulate_hessian(self, field: str, xi: float, eta: float, *, element_id: int | None = None) -> np.ndarray:
+        """
+        Tabulate Hessians for RT (H(div)) basis components.
+
+        Returns
+        -------
+        np.ndarray
+            Reference Hessians with shape ``(n_loc, 2, 2, 2)`` if
+            ``element_id is None`` and physical Hessians with the same shape
+            otherwise. The physical mapping follows the same affine Piola
+            assumption already used by ``tabulate_grad``.
+        """
+        fam = self._field_families[field]
+        if fam != "RT":
+            raise NotImplementedError("tabulate_hessian is only defined for RT (H(div)) fields.")
+
+        Hhat = np.asarray(self._ref[field].tabulate_hessian(float(xi), float(eta)), dtype=float)
+        if element_id is None:
+            return Hhat
+
+        from pycutfem.fem import transform
+
+        J = np.asarray(transform.jacobian(self.mesh, int(element_id), (float(xi), float(eta))), dtype=float)
+        detJ = float(np.linalg.det(J))
+        Jinv = np.asarray(np.linalg.inv(J), dtype=float)
+        pref = J / detJ
+
+        Hphys = np.zeros_like(Hhat)
+        for a in range(Hhat.shape[0]):
+            for comp in range(2):
+                Hcomp = Jinv.T @ Hhat[a, comp, :, :] @ Jinv
+                Hphys[a, 0, :, :] += pref[0, comp] * Hcomp
+                Hphys[a, 1, :, :] += pref[1, comp] * Hcomp
+        return Hphys
+
     # ..................................................................
     #  Helpers
     # ..................................................................
