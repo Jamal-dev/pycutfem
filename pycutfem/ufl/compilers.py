@@ -63,6 +63,7 @@ from pycutfem.ufl.helpers import (VecOpInfo, GradOpInfo, HessOpInfo, _collapsed_
                                   phys_scalar_third_row, 
                                   phys_scalar_fourth_row,
                                   _as_indices,
+                                  _apply_storage_transform_opinfo,
                                   HelpersFieldAware as _hfa,
                                   HelpersAlignCoefficents as _hac,
                                   normalize_edge_ids,
@@ -73,6 +74,7 @@ from pycutfem.jit import _active_field_order, _active_columns, _compress_static_
 from pycutfem.ufl.helpers_geom import (
     phi_eval, clip_triangle_to_side, fan_triangulate, map_ref_tri_to_phys, corner_tris
 )
+from pycutfem.ufl.tensor_algebra import DotKernelCase, OperationKind, TensorRuleEngine
 from contextlib import contextmanager
 from pycutfem.core.sideconvention import SIDE
 import os
@@ -1864,7 +1866,17 @@ class FormCompiler:
                         f"Cannot coerce derivative part shape {arr.shape} to gradient template shape {tmpl.shape}."
                     )
 
-                grad_data = np.stack([_coerce_part(dx_part), _coerce_part(dy_part)], axis=-1)
+                dx_arr = _coerce_part(dx_part)
+                dy_arr = _coerce_part(dy_part)
+                tmpl = np.asarray(template.data)
+                if template.role in {"trial", "test"} and (tmpl.ndim == 1 or (tmpl.ndim == 2 and tmpl.shape[0] == 1)):
+                    if dx_arr.ndim == 2:
+                        dx_arr = dx_arr[0]
+                    if dy_arr.ndim == 2:
+                        dy_arr = dy_arr[0]
+                    grad_data = np.ascontiguousarray(np.stack([dx_arr, dy_arr], axis=0))
+                else:
+                    grad_data = np.stack([dx_arr, dy_arr], axis=-1)
                 return GradOpInfo(grad_data, role=template.role, coeffs=None, **template.update_meta(template.meta()))
 
             dx_arr = np.asarray(dx_part, dtype=float)
@@ -2075,6 +2087,8 @@ class FormCompiler:
                 f"Grad assembly produced no component blocks for operand type {type(op).__name__} "
                 f"with role={role}, fields={fields}, repr={op!r}."
             )
+        if role in {"trial", "test"} and len(k_blocks) == 1:
+            return self._gradinfo(np.ascontiguousarray(k_blocks[0].T), role=role, node=op, field_names=fields)
         return self._gradinfo(np.stack(k_blocks), role=role, node=op, field_names=fields)
 
     def _visit_GradOfDiv(self, n: DivOperation):
@@ -2266,6 +2280,14 @@ class FormCompiler:
     def _visit_DivOperation(self, n: DivOperation):
         op0 = n.operand
         base_op = op0.operand if isinstance(op0, Restriction) else op0
+        # Canonical composite lowering: div(grad(u)) == Laplacian(u).
+        # Route through the shared Laplacian path so scalar and vector operands
+        # do not fall back to derivative-on-Grad special cases.
+        if isinstance(base_op, Grad):
+            result = self._visit_Laplacian(Laplacian(base_op.operand))
+            if isinstance(op0, Restriction):
+                return self._apply_restriction_mask(result, op0)
+            return result
         # Handle div on H(div) fields directly (no grad/trace).
         if isinstance(base_op, (HdivTestFunction, HdivTrialFunction)):
             fld = str(base_op.field_name)
@@ -2413,6 +2435,13 @@ class FormCompiler:
             return b
         if b is None:
             return a
+        try:
+            sum_lowering = TensorRuleEngine.plan_sum_lowering(a, b)
+        except Exception:
+            sum_lowering = None
+        if sum_lowering is not None:
+            a = _apply_storage_transform_opinfo(a, sum_lowering.lhs_transform)
+            b = _apply_storage_transform_opinfo(b, sum_lowering.rhs_transform)
         return a + b
     def _visit_Sub(self, n):
         a = self._visit(n.a)
@@ -2421,6 +2450,13 @@ class FormCompiler:
             logger.error(f"Sub encountered None operand: a={type(a)} {getattr(a,'role',None)}; sub expr={n}; rhs operand={n.b!r}")
         if a is None:
             logger.error(f"Sub encountered None left operand: b={type(b)} {getattr(b,'role',None)}; expression={n}")
+        try:
+            sum_lowering = TensorRuleEngine.plan_sum_lowering(a, b)
+        except Exception:
+            sum_lowering = None
+        if sum_lowering is not None:
+            a = _apply_storage_transform_opinfo(a, sum_lowering.lhs_transform)
+            b = _apply_storage_transform_opinfo(b, sum_lowering.rhs_transform)
         return a - b
     
     def _visit_Transpose(self, node: Transpose):
@@ -2428,6 +2464,8 @@ class FormCompiler:
 
         # Plain numpy: use .T
         if isinstance(A, np.ndarray):
+            if A.ndim != 2:
+                raise TypeError(f"Transpose is only defined for rank-2 tensors, got ndarray shape {A.shape!r}.")
             return A.T
 
         # Grad basis/operators
@@ -2443,7 +2481,10 @@ class FormCompiler:
         #     return VecOpInfo(A.data.T, role=A.role)
 
         if isinstance(A, VecOpInfo):
-            return A._with(A.data.T)
+            raise TypeError(
+                f"Transpose is only defined for rank-2 tensors; VecOpInfo with shape {A.data.shape!r} "
+                "must be lowered via the tensor rule engine instead."
+            )
 
         raise TypeError(f"Transpose not implemented for {type(A)}")
 
@@ -2451,6 +2492,7 @@ class FormCompiler:
         """Handles scalar, vector, or tensor division by a scalar."""
         numerator = self._visit(n.a)
         denominator = self._visit(n.b)
+        TensorRuleEngine.plan_division(numerator, denominator)
 
         # NumPy correctly handles element-wise division of an array by a scalar.
         return numerator / denominator
@@ -2532,10 +2574,8 @@ class FormCompiler:
         # - If b is a gradient table (trial/test/mixed), delegate to left_dot
         #   which returns a GradOpInfo with the correct shape.
         if isinstance(a, np.ndarray) and a.ndim == 2 and isinstance(b, GradOpInfo) and isinstance(b_data, np.ndarray):
-            if b_data.ndim == 2:
-                return b._with(a @ b_data, role=b.role, coeffs=None)
-            if b_data.ndim in {3, 4}:
-                return b.left_dot(a)
+            if b_data.ndim in {2, 3, 4}:
+                return b.__rmul__(a)
 
         # GradOpInfo × constant 2D tensor:
         # - If a is collapsed to a 2D matrix (function path), keep the result
@@ -2543,10 +2583,8 @@ class FormCompiler:
         # - If a is a gradient table (trial/test/mixed), dot_vec already
         #   produces a GradOpInfo with the correct shape.
         if isinstance(b, np.ndarray) and b.ndim == 2 and isinstance(a, GradOpInfo) and isinstance(a_data, np.ndarray):
-            if a_data.ndim == 2:
-                return a._with(a_data @ b, role=a.role, coeffs=None)
-            if a_data.ndim in {3, 4}:
-                return a.dot_vec(b)
+            if a_data.ndim in {2, 3, 4}:
+                return a.__mul__(b)
 
         # Some older code paths produce intermediate matrices as VecOpInfo with
         # role="vector" and a 2D data array. Treat those as matrices here.
@@ -2568,6 +2606,61 @@ class FormCompiler:
             and a_data.ndim == b_data.ndim == 2
         ):
             return b._with(a_data @ b_data, role=b.role, coeffs=None)
+
+        dot_kernel = None
+        dot_plan = None
+        try:
+            dot_kernel = TensorRuleEngine.plan_dot_kernel(a, b)
+        except Exception:
+            dot_kernel = None
+
+        if dot_kernel is not None:
+            dot_plan = dot_kernel.lowering.algebra
+            dot_case = dot_kernel.case
+        else:
+            dot_case = None
+            try:
+                dot_plan = TensorRuleEngine.plan_dot(a, b)
+            except Exception:
+                dot_plan = None
+
+        if dot_plan is not None:
+            if dot_case == DotKernelCase.BASIS_BASIS_MASS and isinstance(a, VecOpInfo) and isinstance(b, VecOpInfo):
+                return a.dot_vec(b)
+            if dot_case == DotKernelCase.BASIS_GRAD_DOT_VALUE_VECTOR and isinstance(a, GradOpInfo) and isinstance(b, VecOpInfo):
+                return a.dot_vec(b)
+            if dot_case == DotKernelCase.VALUE_VECTOR_DOT_BASIS_GRAD and isinstance(a, VecOpInfo) and isinstance(b, GradOpInfo):
+                return a.dot_grad(b)
+            if dot_case == DotKernelCase.VALUE_GRAD_DOT_BASIS_VECTOR and isinstance(a, GradOpInfo) and isinstance(b, VecOpInfo):
+                return a.dot_vec(b)
+            if dot_case == DotKernelCase.BASIS_VECTOR_DOT_VALUE_GRAD and isinstance(a, VecOpInfo) and isinstance(b, GradOpInfo):
+                return a.dot_grad(b)
+            if dot_case == DotKernelCase.BASIS_GRAD_DOT_BASIS_VECTOR and isinstance(a, GradOpInfo) and isinstance(b, VecOpInfo):
+                return a.dot_vec(b)
+            if dot_case == DotKernelCase.BASIS_VECTOR_DOT_BASIS_GRAD and isinstance(a, VecOpInfo) and isinstance(b, GradOpInfo):
+                return b.left_dot(a)
+            if dot_plan.kind == OperationKind.DOT_HESSIAN_VECTOR and isinstance(a, HessOpInfo):
+                return a.dot_right(b)
+            if dot_plan.kind == OperationKind.DOT_VECTOR_HESSIAN and isinstance(b, HessOpInfo):
+                return b.dot_left(a)
+            if dot_plan.kind == OperationKind.DOT_VECTOR_VECTOR:
+                if isinstance(a, VecOpInfo) and isinstance(b, VecOpInfo):
+                    return a.dot_vec(b)
+                if isinstance(a, GradOpInfo) and isinstance(b, VecOpInfo):
+                    return a.dot_vec(b)
+                if isinstance(a, VecOpInfo) and isinstance(b, GradOpInfo):
+                    if b.role == "function":
+                        return a.dot_grad(b)
+                    return b.left_dot(a)
+                if isinstance(a, np.ndarray) and a.ndim == 1 and isinstance(b, VecOpInfo):
+                    return b.dot_const(a)
+                if isinstance(b, np.ndarray) and b.ndim == 1 and isinstance(a, VecOpInfo):
+                    return a.dot_const(b)
+                if isinstance(a, np.ndarray) and isinstance(b, np.ndarray):
+                    return np.dot(a, b)
+            if dot_plan.kind == OperationKind.DOT_TENSOR_TENSOR:
+                if isinstance(a, GradOpInfo) and isinstance(b, GradOpInfo):
+                    return a.dot(b)
 
         def rhs():
             # ------------------------------------------------------------------
@@ -2805,6 +2898,17 @@ class FormCompiler:
                 data = np.einsum("knd,kd->n", grad_info.data, carr, optimize=True)
                 role = role_hint or grad_info.role
                 return self._vecinfo(data[np.newaxis, :], role=role, node=node, field_names=grad_info.field_names)
+            if grad_info.role == "mixed":
+                if grad_info.data.ndim != 4:
+                    raise TypeError(
+                        f"Grad-constant inner for mixed role expects rank-4 data, got shape {grad_info.data.shape}."
+                    )
+                if grad_info.data.shape[0] != carr.shape[0] or grad_info.data.shape[3] != carr.shape[1]:
+                    raise ValueError(
+                        f"Grad-constant inner shape mismatch: {grad_info.data.shape} vs {carr.shape}."
+                    )
+                data = np.einsum("knmd,kd->nm", grad_info.data, carr, optimize=True)
+                return self._vecinfo(data, role="mixed", node=node, field_names=grad_info.field_names)
             raise TypeError(f"Grad-constant inner not implemented for role '{grad_info.role}'.")
 
         # ============================= RHS =============================
@@ -3271,6 +3375,7 @@ class FormCompiler:
             ir, integral.integrand, self.me, q_order,
             dof_handler=self.dh,
             gdofs_map=gdofs_map,
+            active_cols=active_cols,
             param_order=runner.param_order, # Use the param_order from the CURRENT runner
             pre_built=pre_built
         )
@@ -6450,6 +6555,14 @@ class FormCompiler:
         if valid_eids is None or len(valid_eids) == 0:
             return
 
+        active_fields = _active_field_order(ir, me)
+        runner_active = getattr(runner, "active_fields", None)
+        if runner_active:
+            active_set = set(runner_active)
+            me_order = getattr(me, "field_names", ())
+            active_fields = tuple([f for f in me_order if f in active_set]) if me_order else tuple(runner_active)
+        active_cols = _active_columns(me, active_fields)
+
         kernel_args = _build_jit_kernel_args(
             ir=ir,
             expression=intg.integrand,
@@ -6457,12 +6570,11 @@ class FormCompiler:
             q_order=qdeg,
             dof_handler=dh,
             gdofs_map=geo["gdofs_map"],
+            active_cols=active_cols,
             param_order=runner.param_order,
             pre_built=geo,
         )
 
-        active_fields = _active_field_order(ir, me)
-        active_cols = _active_columns(me, active_fields)
         use_full_union = bool(geo.get("gdofs_map") is not None and geo["gdofs_map"].shape[1] != me.n_dofs_local)
         if not use_full_union:
             kernel_args = _compress_static_for_active(kernel_args, me, active_cols)
@@ -6867,6 +6979,14 @@ class FormCompiler:
         if valid_eids is None or len(valid_eids) == 0:
             return
 
+        active_fields = _active_field_order(ir, me)
+        runner_active = getattr(runner, "active_fields", None)
+        if runner_active:
+            active_set = set(runner_active)
+            me_order = getattr(me, "field_names", ())
+            active_fields = tuple([f for f in me_order if f in active_set]) if me_order else tuple(runner_active)
+        active_cols = _active_columns(me, active_fields)
+
         kernel_args = _build_jit_kernel_args(
             ir=ir,
             expression=intg.integrand,
@@ -6874,12 +6994,11 @@ class FormCompiler:
             q_order=qdeg,
             dof_handler=dh,
             gdofs_map=geo["gdofs_map"],
+            active_cols=active_cols,
             param_order=runner.param_order,
             pre_built=geo,
         )
 
-        active_fields = _active_field_order(ir, me)
-        active_cols = _active_columns(me, active_fields)
         use_full_union = bool(geo.get("gdofs_map") is not None and geo["gdofs_map"].shape[1] != me.n_dofs_local)
         if not use_full_union:
             kernel_args = _compress_static_for_active(kernel_args, me, active_cols)
@@ -7176,10 +7295,19 @@ class FormCompiler:
             return
 
 
+        active_fields = _active_field_order(ir, me)
+        runner_active = getattr(runner, "active_fields", None)
+        if runner_active:
+            active_set = set(runner_active)
+            me_order = getattr(me, "field_names", ())
+            active_fields = tuple([f for f in me_order if f in active_set]) if me_order else tuple(runner_active)
+        active_cols = _active_columns(me, active_fields)
+
         args = _build_jit_kernel_args(
             ir, intg.integrand, me, qdeg,
             dof_handler = dh,
             gdofs_map   = geo["gdofs_map"],
+            active_cols = active_cols,
             param_order = runner.param_order,
             pre_built   = geo
         )
@@ -7223,13 +7351,7 @@ class FormCompiler:
         # not reorder `gdofs_map` (and all union-sized tables) accordingly, the
         # kernel will read the wrong DOF columns and can silently return zeros.
         # ------------------------------------------------------------------
-        active_fields = _active_field_order(ir, me)
         runner_active = getattr(runner, "active_fields", None)
-        if runner_active:
-            active_set = set(runner_active)
-            me_order = getattr(me, "field_names", ())
-            active_fields = tuple([f for f in me_order if f in active_set]) if me_order else tuple(runner_active)
-        active_cols = _active_columns(me, active_fields)
         args = _compress_static_for_active(args, me, active_cols)
         gdofs_map = args.get("gdofs_map", geo.get("gdofs_map"))
 
@@ -7767,6 +7889,7 @@ class FormCompiler:
                 ir, intg.integrand, me_used, qdeg,
                 dof_handler=dh,
                 gdofs_map=gdofs_map,
+                active_cols=active_cols,
                 param_order=runner.param_order,
                 pre_built=prebuilt
             )

@@ -112,7 +112,7 @@ PROFILE_CONFIGS = {
                 }
             }
         },
-        "benchmark6": {"overrides": {"benchmark6_christan_channel": {}}},
+        "benchmark6": {"overrides": {"benchmark6_christan_channel": {}, "benchmark6_blauert_channel": {}}},
     },
     "baseline": {
         "mms": {
@@ -183,7 +183,7 @@ PROFILE_CONFIGS = {
                 }
             }
         },
-        "benchmark6": {"overrides": {"benchmark6_christan_channel": {}}},
+        "benchmark6": {"overrides": {"benchmark6_christan_channel": {}, "benchmark6_blauert_channel": {}}},
     },
     "production": {
         "mms": {
@@ -254,7 +254,7 @@ PROFILE_CONFIGS = {
                 }
             }
         },
-        "benchmark6": {"overrides": {"benchmark6_christan_channel": {}}},
+        "benchmark6": {"overrides": {"benchmark6_christan_channel": {}, "benchmark6_blauert_channel": {}}},
     },
 }
 
@@ -345,6 +345,13 @@ CASE_SPECS = (
         family="benchmark6",
         driver_rel="examples/biofilms/benchmarks/christan/paper1_benchmark6_christan_channel.py",
         output_key="christan_channel",
+    ),
+    CaseSpec(
+        key="benchmark6_blauert_channel",
+        label="Application benchmark: Blauert channel deformation",
+        family="benchmark6",
+        driver_rel="examples/biofilms/benchmarks/blauert/paper1_benchmark6_blauert_channel.py",
+        output_key="blauert_channel",
     ),
 )
 

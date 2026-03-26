@@ -106,12 +106,16 @@ def _build_problem(
 
     if fluid_velocity is not None:
         v_n.set_values_from_function(fluid_velocity)
+    if fluid_velocity_k is None:
+        fluid_velocity_k = fluid_velocity
     if fluid_velocity_k is not None:
         v_k.set_values_from_function(fluid_velocity_k)
     if skeleton_velocity is None:
         # Divergent skeleton velocity: div(vS) = 0.3.
         skeleton_velocity = lambda x, y: np.array([0.1 * x, 0.2 * y])
     vS_n.set_values_from_function(skeleton_velocity)
+    if skeleton_velocity_k is None:
+        skeleton_velocity_k = skeleton_velocity
     if skeleton_velocity_k is not None:
         vS_k.set_values_from_function(skeleton_velocity_k)
 

@@ -1,8 +1,11 @@
 import numpy as np
 import pandas as pd
 import os
+import json
+import re
 import sys
 import scipy.sparse as sp
+import traceback
 
 # FEniCSx imports
 from mpi4py import MPI
@@ -56,6 +59,119 @@ import logging
 #     level=logging.INFO,  # show debug messages
 #     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 # )
+
+
+def _install_keyboard_interrupt_summary_hook() -> None:
+    """Ensure Ctrl+C prints the accumulated test summary."""
+    original_excepthook = sys.excepthook
+
+    def _excepthook(exctype, value, tb):
+        if exctype is KeyboardInterrupt:
+            print("\n⛔ KeyboardInterrupt (Ctrl+C). Showing summary so far...")
+            try:
+                if '_print_global_summary' in globals():
+                    _print_global_summary()
+            finally:
+                try:
+                    sys.stdout.flush()
+                    sys.stderr.flush()
+                except Exception:
+                    pass
+                os._exit(130)
+
+        return original_excepthook(exctype, value, tb)
+
+    sys.excepthook = _excepthook
+
+
+if __name__ == '__main__':
+    _install_keyboard_interrupt_summary_hook()
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes"}
+
+
+def _run_all_terms_requested() -> bool:
+    # Running all suites should also disable any per-suite "safe default subset".
+    return _env_flag("COMP_FENICS_RUN_ALL") or _env_flag("COMP_FENICS_RUN_ALL_SUITES")
+
+
+def _requested_backends(default: str) -> list[str]:
+    spec = os.environ.get("COMP_FENICS_BACKENDS", "").strip()
+    if not spec:
+        spec = os.environ.get("BACKEND", "").strip()
+    if not spec:
+        spec = "python,jit,cpp" if _run_all_terms_requested() else default
+    if spec.strip().lower() == "all":
+        return ["python", "jit", "cpp"]
+    return [backend.strip() for backend in spec.split(",") if backend.strip()]
+
+
+def _parse_filter_terms(spec: str | None) -> set[str]:
+    """Parse COMP_FENICS_TERMS.
+
+    Supports:
+      - JSON list: '["term a", "term, with, commas"]'
+      - newline-separated
+      - semicolon-separated
+      - comma-separated (legacy)
+    """
+    if not spec:
+        return set()
+    spec = spec.strip()
+    if not spec:
+        return set()
+
+    if spec.startswith("["):
+        try:
+            data = json.loads(spec)
+            if isinstance(data, str):
+                return {data.strip()} if data.strip() else set()
+            if isinstance(data, list):
+                out: set[str] = set()
+                for item in data:
+                    if isinstance(item, str):
+                        item = item.strip()
+                        if item:
+                            out.add(item)
+                    elif item is not None:
+                        s = str(item).strip()
+                        if s:
+                            out.add(s)
+                return out
+        except Exception:
+            # Fall back to delimiter parsing below.
+            pass
+
+    if "\n" in spec:
+        parts = spec.splitlines()
+    elif ";" in spec:
+        parts = spec.split(";")
+    else:
+        parts = spec.split(",")
+    return {name.strip() for name in parts if name.strip()}
+
+
+
+_BACKEND_NAME_RE = re.compile(r"^(?P<base>.*?)(?:\s*\[backend=(?P<backend>[^\]]+)\])?$")
+
+
+def _failure_label(name: str, backend_type: str | None = None, reason: str | None = None) -> str:
+    match = _BACKEND_NAME_RE.match(name.strip())
+    base = match.group("base").strip() if match else name.strip()
+    backend = backend_type or (match.group("backend") if match else None)
+    label = base
+    if backend:
+        label = f"{label} (backend={backend})"
+    if reason:
+        label = f"{label} ({reason})"
+    return label
+
+
+def _maybe_print_traceback() -> None:
+    if _env_flag("COMP_FENICS_TRACEBACK"):
+        traceback.print_exc()
 
 I2 = Identity(2)
 lambda_s = Constant(0.0)
@@ -1738,10 +1854,10 @@ def run_poro_comparison():
     }
 
     # Filter terms: never run everything by default (keeps this debug script fast)
-    run_all = os.environ.get("COMP_FENICS_RUN_ALL", "").lower() in {"1", "true", "yes"}
+    run_all = _run_all_terms_requested()
     filter_terms = os.environ.get("COMP_FENICS_TERMS")
     if filter_terms:
-        allowed = {name.strip() for name in filter_terms.split(",") if name.strip()}
+        allowed = _parse_filter_terms(filter_terms)
         terms = {k: v for k, v in terms.items() if k in allowed}
         print(f"Running filtered terms only: {sorted(terms)}")
     elif not run_all:
@@ -1758,11 +1874,7 @@ def run_poro_comparison():
         terms = {k: v for k, v in terms.items() if k in default}
         print(f"COMP_FENICS_TERMS not set; running safe default subset: {sorted(terms)}")
 
-    backends_spec = os.environ.get("BACKEND", "jit")
-    if backends_spec.strip().lower() == "all":
-        backends = ["python", "jit", "cpp"]
-    else:
-        backends = [b.strip() for b in backends_spec.split(",") if b.strip()]
+    backends = _requested_backends("jit")
     parity_rtol = float(os.environ.get("COMP_FENICS_PARITY_RTOL", "1e-9"))
     parity_atol = float(os.environ.get("COMP_FENICS_PARITY_ATOL", "1e-9"))
 
@@ -1774,50 +1886,56 @@ def run_poro_comparison():
         failed_tests = []
         success_count = 0
 
-        for name, forms in terms.items():
-            J_pc, R_pc, J_fx, R_fx = None, None, None, None
-
-            print(f"\nCompiling/assembling '{name}' [backend={backend_type}, qdeg={qdeg}]")
-            try:
-                form_fx_compiled = dolfinx.fem.form(forms["fx"])
-            except Exception as exc:
-                print(f"❌ FEniCSx form compilation failed for '{name}': {exc}")
-                failed_tests.append(f"{name} (fenics-compile)")
-                continue
-
-            try:
-                if forms["mat"]:
-                    J_pc, _ = assemble_form(Equation(forms["pc"], None), dof_handler_pc, quad_degree=qdeg, bcs=[], backend=backend_type)
-                    A = dolfinx.fem.petsc.assemble_matrix(form_fx_compiled)
-                    A.assemble()
-                    indptr, indices, data = A.getValuesCSR()
-                    J_fx = csr_matrix((data, indices, indptr), shape=A.getSize()).toarray()
+        try:
+            for name, forms in terms.items():
+                J_pc, R_pc, J_fx, R_fx = None, None, None, None
+    
+                print(f"\nCompiling/assembling '{name}' [backend={backend_type}, qdeg={qdeg}]")
+                try:
+                    form_fx_compiled = dolfinx.fem.form(forms["fx"])
+                except Exception as exc:
+                    print(f"❌ FEniCSx form compilation failed for '{name}': {exc}")
+                    failed_tests.append(_failure_label(name, backend_type, "fenics-compile"))
+                    continue
+    
+                try:
+                    if forms["mat"]:
+                        J_pc, _ = assemble_form(Equation(forms["pc"], None), dof_handler_pc, quad_degree=qdeg, bcs=[], backend=backend_type)
+                        A = dolfinx.fem.petsc.assemble_matrix(form_fx_compiled)
+                        A.assemble()
+                        indptr, indices, data = A.getValuesCSR()
+                        J_fx = csr_matrix((data, indices, indptr), shape=A.getSize()).toarray()
+                    else:
+                        _, R_pc = assemble_form(Equation(None, forms["pc"]), dof_handler_pc, bcs=[], backend=backend_type)
+                        vec = dolfinx.fem.petsc.assemble_vector(form_fx_compiled)
+                        R_fx = vec.array
+                except Exception as exc:
+                    print(f"❌ Assembly failed for '{name}' on backend '{backend_type}': {exc}")
+                    failed_tests.append(_failure_label(name, backend_type, "assemble"))
+                    continue
+    
+                is_success = compare_term(
+                    f"{name} [backend={backend_type}]",
+                    J_pc,
+                    R_pc,
+                    J_fx,
+                    R_fx,
+                    P_map,
+                    dof_handler_pc,
+                    W_fx,
+                    rtol=1e-8,
+                    atol=1e-8,
+                )
+                if is_success:
+                    success_count += 1
                 else:
-                    _, R_pc = assemble_form(Equation(None, forms["pc"]), dof_handler_pc, bcs=[], backend=backend_type)
-                    vec = dolfinx.fem.petsc.assemble_vector(form_fx_compiled)
-                    R_fx = vec.array
-            except Exception as exc:
-                print(f"❌ Assembly failed for '{name}' on backend '{backend_type}': {exc}")
-                failed_tests.append(f"{name} (assemble-{backend_type})")
-                continue
-
-            is_success = compare_term(
-                f"{name} [backend={backend_type}]",
-                J_pc,
-                R_pc,
-                J_fx,
-                R_fx,
-                P_map,
-                dof_handler_pc,
-                W_fx,
-                rtol=1e-8,
-                atol=1e-8,
-            )
-            if is_success:
-                success_count += 1
-            else:
-                failed_tests.append(name)
-
+                    failed_tests.append(_failure_label(name, backend_type))
+    
+        except KeyboardInterrupt:
+            print("\n⛔ KeyboardInterrupt (Ctrl+C). Showing summary so far...")
+            print_test_summary(success_count, failed_tests)
+            _print_global_summary()
+            sys.exit(130)
         print_test_summary(success_count, failed_tests)
 
 
@@ -2071,7 +2189,7 @@ def run_alpha_ch_comparison():
 
     filter_terms = os.environ.get("COMP_FENICS_TERMS")
     if filter_terms:
-        allowed = {name.strip() for name in filter_terms.split(",") if name.strip()}
+        allowed = _parse_filter_terms(filter_terms)
         terms = {k: v for k, v in terms.items() if k in allowed}
         print(f"Running filtered terms only: {sorted(terms)}")
     else:
@@ -2094,11 +2212,7 @@ def run_alpha_ch_comparison():
             print(f"❌ FEniCSx assembly failed for '{name}': {exc}")
             fenics_ref[name] = None
 
-    backends_spec = os.environ.get("BACKEND", "jit")
-    if backends_spec.strip().lower() == "all":
-        backends = ["python", "jit", "cpp"]
-    else:
-        backends = [b.strip() for b in backends_spec.split(",") if b.strip()]
+    backends = _requested_backends("jit")
     parity_rtol = float(os.environ.get("COMP_FENICS_PARITY_RTOL", "1e-9"))
     parity_atol = float(os.environ.get("COMP_FENICS_PARITY_ATOL", "1e-9"))
 
@@ -2114,64 +2228,70 @@ def run_alpha_ch_comparison():
         failed_tests = []
         success_count = 0
 
-        for name, spec in terms.items():
-            if fenics_ref.get(name) is None:
-                failed_tests.append(f"{name} (fenics-assemble)")
-                continue
-
-            J_pc, R_pc = None, None
-            print(f"\nCompiling/assembling '{name}' [backend={backend_type}]")
-            try:
-                if spec["mat"]:
-                    J_pc, _ = assemble_form(Equation(spec["pc"], None), dof_handler_pc, quad_degree=qdeg, bcs=[], backend=backend_type)
-                else:
-                    _, R_pc = assemble_form(Equation(None, spec["pc"]), dof_handler_pc, bcs=[], backend=backend_type)
-            except Exception as exc:
-                print(f"❌ pycutfem assembly failed for '{name}' on backend '{backend_type}': {exc}")
-                failed_tests.append(f"{name} (assemble-{backend_type})")
-                continue
-
-            # Backend parity (pycutfem) against a reference backend
-            if backend_type == ref_backend:
-                if spec["mat"]:
-                    ref_pc[name] = J_pc.toarray()
-                else:
-                    ref_pc[name] = np.asarray(R_pc, dtype=float).copy()
-            else:
+        try:
+            for name, spec in terms.items():
+                if fenics_ref.get(name) is None:
+                    failed_tests.append(_failure_label(name, backend_type, "fenics-assemble"))
+                    continue
+    
+                J_pc, R_pc = None, None
+                print(f"\nCompiling/assembling '{name}' [backend={backend_type}]")
                 try:
                     if spec["mat"]:
-                        np.testing.assert_allclose(J_pc.toarray(), ref_pc[name], rtol=parity_rtol, atol=parity_atol)
+                        J_pc, _ = assemble_form(Equation(spec["pc"], None), dof_handler_pc, quad_degree=qdeg, bcs=[], backend=backend_type)
                     else:
-                        np.testing.assert_allclose(np.asarray(R_pc, dtype=float), ref_pc[name], rtol=parity_rtol, atol=parity_atol)
-                    print(f"✅ pycutfem backend parity OK vs '{ref_backend}'.")
+                        _, R_pc = assemble_form(Equation(None, spec["pc"]), dof_handler_pc, bcs=[], backend=backend_type)
                 except Exception as exc:
-                    print(f"❌ pycutfem backend parity FAILED vs '{ref_backend}': {exc}")
-                    failed_tests.append(f"{name} (parity-{backend_type}-vs-{ref_backend})")
-
-            # Compare to FEniCSx reference
-            J_fx, R_fx = None, None
-            if spec["mat"]:
-                J_fx = fenics_ref[name]
-            else:
-                R_fx = fenics_ref[name]
-
-            is_success = compare_term(
-                f"{name} [backend={backend_type}]",
-                J_pc,
-                R_pc,
-                J_fx,
-                R_fx,
-                P_map,
-                dof_handler_pc,
-                W_fx,
-                rtol=1e-8,
-                atol=1e-8,
-            )
-            if is_success:
-                success_count += 1
-            else:
-                failed_tests.append(name)
-
+                    print(f"❌ pycutfem assembly failed for '{name}' on backend '{backend_type}': {exc}")
+                    failed_tests.append(_failure_label(name, backend_type, "assemble"))
+                    continue
+    
+                # Backend parity (pycutfem) against a reference backend
+                if backend_type == ref_backend:
+                    if spec["mat"]:
+                        ref_pc[name] = J_pc.toarray()
+                    else:
+                        ref_pc[name] = np.asarray(R_pc, dtype=float).copy()
+                else:
+                    try:
+                        if spec["mat"]:
+                            np.testing.assert_allclose(J_pc.toarray(), ref_pc[name], rtol=parity_rtol, atol=parity_atol)
+                        else:
+                            np.testing.assert_allclose(np.asarray(R_pc, dtype=float), ref_pc[name], rtol=parity_rtol, atol=parity_atol)
+                        print(f"✅ pycutfem backend parity OK vs '{ref_backend}'.")
+                    except Exception as exc:
+                        print(f"❌ pycutfem backend parity FAILED vs '{ref_backend}': {exc}")
+                        failed_tests.append(_failure_label(name, backend_type, f"parity-vs-{ref_backend}"))
+    
+                # Compare to FEniCSx reference
+                J_fx, R_fx = None, None
+                if spec["mat"]:
+                    J_fx = fenics_ref[name]
+                else:
+                    R_fx = fenics_ref[name]
+    
+                is_success = compare_term(
+                    f"{name} [backend={backend_type}]",
+                    J_pc,
+                    R_pc,
+                    J_fx,
+                    R_fx,
+                    P_map,
+                    dof_handler_pc,
+                    W_fx,
+                    rtol=1e-8,
+                    atol=1e-8,
+                )
+                if is_success:
+                    success_count += 1
+                else:
+                    failed_tests.append(_failure_label(name, backend_type))
+    
+        except KeyboardInterrupt:
+            print("\n⛔ KeyboardInterrupt (Ctrl+C). Showing summary so far...")
+            print_test_summary(success_count, failed_tests)
+            _print_global_summary()
+            sys.exit(130)
         print_test_summary(success_count, failed_tests)
 
 
@@ -3806,7 +3926,7 @@ def run_biofilm_comparison():
     # Filter terms (full suite is the default for biofilm).
     filter_terms = os.environ.get("COMP_FENICS_TERMS")
     if filter_terms:
-        allowed = {name.strip() for name in filter_terms.split(",") if name.strip()}
+        allowed = _parse_filter_terms(filter_terms)
         terms = {k: v for k, v in terms.items() if k in allowed}
         print(f"Running filtered terms only: {sorted(terms)}")
     else:
@@ -3830,11 +3950,7 @@ def run_biofilm_comparison():
             print(f"❌ FEniCSx assembly failed for '{name}': {exc}")
             fenics_ref[name] = None
 
-    backends_spec = os.environ.get("BACKEND", "jit")
-    if backends_spec.strip().lower() == "all":
-        backends = ["python", "jit", "cpp"]
-    else:
-        backends = [b.strip() for b in backends_spec.split(",") if b.strip()]
+    backends = _requested_backends("jit")
     parity_rtol = float(os.environ.get("COMP_FENICS_PARITY_RTOL", "1e-9"))
     parity_atol = float(os.environ.get("COMP_FENICS_PARITY_ATOL", "1e-9"))
 
@@ -3850,77 +3966,83 @@ def run_biofilm_comparison():
         failed_tests = []
         success_count = 0
 
-        for name, spec in terms.items():
-            if fenics_ref.get(name) is None:
-                failed_tests.append(f"{name} (fenics-assemble)")
-                continue
-
-            J_pc, R_pc = None, None
-            print(f"\nCompiling/assembling '{name}' [backend={backend_type}]")
-            try:
-                if spec["mat"]:
-                    J_pc, _ = assemble_form(Equation(spec["pc"], None), dof_handler_pc, quad_degree=qdeg, bcs=[], backend=backend_type)
-                else:
-                    _, R_pc = assemble_form(Equation(None, spec["pc"]), dof_handler_pc, bcs=[], backend=backend_type)
-            except Exception as exc:
-                print(f"❌ pycutfem assembly failed for '{name}' on backend '{backend_type}': {exc}")
-                failed_tests.append(f"{name} (assemble-{backend_type})")
-                continue
-
-            # Backend parity (pycutfem) against a reference backend
-            if backend_type == ref_backend:
-                if spec["mat"]:
-                    ref_pc[name] = J_pc.tocsr().copy() if use_sparse_compare else J_pc.toarray()
-                else:
-                    ref_pc[name] = np.asarray(R_pc, dtype=float).copy()
-            else:
+        try:
+            for name, spec in terms.items():
+                if fenics_ref.get(name) is None:
+                    failed_tests.append(_failure_label(name, backend_type, "fenics-assemble"))
+                    continue
+    
+                J_pc, R_pc = None, None
+                print(f"\nCompiling/assembling '{name}' [backend={backend_type}]")
                 try:
                     if spec["mat"]:
-                        if use_sparse_compare:
-                            ok, max_abs, worst = _sparse_matrix_allclose(
-                                J_pc.tocsr(),
-                                ref_pc[name],
-                                rtol=parity_rtol,
-                                atol=parity_atol,
-                            )
-                            if not ok:
-                                raise AssertionError(f"sparse mismatch: max_abs={max_abs:.3e}, worst={worst}")
-                        else:
-                            np.testing.assert_allclose(J_pc.toarray(), ref_pc[name], rtol=parity_rtol, atol=parity_atol)
+                        J_pc, _ = assemble_form(Equation(spec["pc"], None), dof_handler_pc, quad_degree=qdeg, bcs=[], backend=backend_type)
                     else:
-                        np.testing.assert_allclose(np.asarray(R_pc, dtype=float), ref_pc[name], rtol=parity_rtol, atol=parity_atol)
-                    print(f"✅ pycutfem backend parity OK vs '{ref_backend}'.")
+                        _, R_pc = assemble_form(Equation(None, spec["pc"]), dof_handler_pc, bcs=[], backend=backend_type)
                 except Exception as exc:
-                    print(f"❌ pycutfem backend parity FAILED vs '{ref_backend}': {exc}")
-                    failed_tests.append(f"{name} (parity-{backend_type}-vs-{ref_backend})")
-
-            # Compare to FEniCSx reference
-            J_fx, R_fx = None, None
-            if spec["mat"]:
-                J_fx = fenics_ref[name]
-            else:
-                R_fx = fenics_ref[name]
-
-            is_success = compare_term(
-                f"{name} [backend={backend_type}]",
-                J_pc,
-                R_pc,
-                J_fx,
-                R_fx,
-                P_map,
-                dof_handler_pc,
-                W_fx,
-                rtol=1e-8,
-                atol=1e-8,
-                sign_map=sign_map,
-                fx_coords_all=fx_coords_all,
-                transform=transform_map,
-            )
-            if is_success:
-                success_count += 1
-            else:
-                failed_tests.append(name)
-
+                    print(f"❌ pycutfem assembly failed for '{name}' on backend '{backend_type}': {exc}")
+                    failed_tests.append(_failure_label(name, backend_type, "assemble"))
+                    continue
+    
+                # Backend parity (pycutfem) against a reference backend
+                if backend_type == ref_backend:
+                    if spec["mat"]:
+                        ref_pc[name] = J_pc.tocsr().copy() if use_sparse_compare else J_pc.toarray()
+                    else:
+                        ref_pc[name] = np.asarray(R_pc, dtype=float).copy()
+                else:
+                    try:
+                        if spec["mat"]:
+                            if use_sparse_compare:
+                                ok, max_abs, worst = _sparse_matrix_allclose(
+                                    J_pc.tocsr(),
+                                    ref_pc[name],
+                                    rtol=parity_rtol,
+                                    atol=parity_atol,
+                                )
+                                if not ok:
+                                    raise AssertionError(f"sparse mismatch: max_abs={max_abs:.3e}, worst={worst}")
+                            else:
+                                np.testing.assert_allclose(J_pc.toarray(), ref_pc[name], rtol=parity_rtol, atol=parity_atol)
+                        else:
+                            np.testing.assert_allclose(np.asarray(R_pc, dtype=float), ref_pc[name], rtol=parity_rtol, atol=parity_atol)
+                        print(f"✅ pycutfem backend parity OK vs '{ref_backend}'.")
+                    except Exception as exc:
+                        print(f"❌ pycutfem backend parity FAILED vs '{ref_backend}': {exc}")
+                        failed_tests.append(_failure_label(name, backend_type, f"parity-vs-{ref_backend}"))
+    
+                # Compare to FEniCSx reference
+                J_fx, R_fx = None, None
+                if spec["mat"]:
+                    J_fx = fenics_ref[name]
+                else:
+                    R_fx = fenics_ref[name]
+    
+                is_success = compare_term(
+                    f"{name} [backend={backend_type}]",
+                    J_pc,
+                    R_pc,
+                    J_fx,
+                    R_fx,
+                    P_map,
+                    dof_handler_pc,
+                    W_fx,
+                    rtol=1e-8,
+                    atol=1e-8,
+                    sign_map=sign_map,
+                    fx_coords_all=fx_coords_all,
+                    transform=transform_map,
+                )
+                if is_success:
+                    success_count += 1
+                else:
+                    failed_tests.append(_failure_label(name, backend_type))
+    
+        except KeyboardInterrupt:
+            print("\n⛔ KeyboardInterrupt (Ctrl+C). Showing summary so far...")
+            print_test_summary(success_count, failed_tests)
+            _print_global_summary()
+            sys.exit(130)
         print_test_summary(success_count, failed_tests)
 
 
@@ -4227,10 +4349,15 @@ def run_benchmark7_hdiv_comparison():
         solid_model="linear",
         kappa_inv_model="spatial",
         enable_phi_evolution=False,
+        alpha_supg=0.0,                      
+        alpha_cip=0.0,                       
+        include_skeleton_acceleration=False, 
+        rho_s0_tilde=1.0,                    
+        skeleton_inertia_convection="none",  
     )
 
-    dw_fx = ufl.TrialFunction(W_fx)
     w_test_fx = ufl.TestFunction(W_fx)
+    dw_fx = ufl.TrialFunction(W_fx)
     dv_fx, dp_fx, dvS_fx, du_fx, dalpha_fx, dmu_alpha_fx = ufl.split(dw_fx)
     w_fx, q_fx, eta_vS_fx, eta_u_fx, xi_fx, eta_mu_fx = ufl.split(w_test_fx)
     v_k_fx, p_k_fx, vS_k_fx, u_k_fx, alpha_k_fx, mu_alpha_k_fx = ufl.split(fenicsx["w_k"])
@@ -4242,61 +4369,72 @@ def run_benchmark7_hdiv_comparison():
     def div_weighted_fx(weight, grad_weight, vec):
         return weight * ufl.div(vec) + ufl.dot(grad_weight, vec)
 
-    dx_fx = ufl.dx(metadata={"quadrature_degree": int(params["qdeg"])})
+    dx_fx = ufl.dx(domain=fenicsx["mesh"], metadata={"quadrature_degree": int(params["qdeg"])})
     th_fx = fenicsx["theta"]
     one_m_th_fx = dolfinx.fem.Constant(fenicsx["mesh"], 1.0) - th_fx
     inv_dt_fx = dolfinx.fem.Constant(fenicsx["mesh"], 1.0) / fenicsx["dt"]
 
+    C_k_fx = 1.0 - alpha_k_fx * (1.0 - fenicsx["phi_b"])
     C_n_fx = 1.0 - alpha_n_fx * (1.0 - fenicsx["phi_b"])
+    B_k_fx = alpha_k_fx * (1.0 - fenicsx["phi_b"])
     B_n_fx = alpha_n_fx * (1.0 - fenicsx["phi_b"])
+    gradC_k_fx = -(1.0 - fenicsx["phi_b"]) * ufl.grad(alpha_k_fx)
     gradC_n_fx = -(1.0 - fenicsx["phi_b"]) * ufl.grad(alpha_n_fx)
+    gradB_k_fx = (1.0 - fenicsx["phi_b"]) * ufl.grad(alpha_k_fx)
     gradB_n_fx = (1.0 - fenicsx["phi_b"]) * ufl.grad(alpha_n_fx)
+    rho_k_fx = fenicsx["rho_f"] * C_k_fx
     rho_n_fx = fenicsx["rho_f"] * C_n_fx
+    mu_k_fx = (1.0 - alpha_k_fx) * fenicsx["mu_f"] + alpha_k_fx * fenicsx["mu_b"]
     mu_n_fx = (1.0 - alpha_n_fx) * fenicsx["mu_f"] + alpha_n_fx * fenicsx["mu_b"]
 
-    div_C_w_fx = div_weighted_fx(C_n_fx, gradC_n_fx, w_fx)
+    div_C_w_fx = div_weighted_fx(C_k_fx, gradC_k_fx, w_fx)
     div_B_vStest_fx = div_weighted_fx(B_n_fx, gradB_n_fx, eta_vS_fx)
-    div_C_vk_fx = div_weighted_fx(C_n_fx, gradC_n_fx, v_k_fx)
-    div_B_vSk_fx = div_weighted_fx(B_n_fx, gradB_n_fx, vS_k_fx)
+    div_Bk_vStest_fx = div_weighted_fx(B_k_fx, gradB_k_fx, eta_vS_fx)
+    div_C_vk_fx = div_weighted_fx(C_k_fx, gradC_k_fx, v_k_fx)
+    div_Bk_vSk_fx = div_weighted_fx(B_k_fx, gradB_k_fx, vS_k_fx)
+    div_rhov_k_fx = fenicsx["rho_f"] * div_C_vk_fx
+    div_rhov_n_fx = fenicsx["rho_f"] * div_weighted_fx(C_n_fx, gradC_n_fx, v_n_fx)
 
-    r_mom_fx = (rho_n_fx * inv_dt_fx) * (ufl.inner(v_k_fx, w_fx) - ufl.inner(v_n_fx, w_fx)) * dx_fx
-    r_mom_fx += th_fx * rho_n_fx * ufl.dot(ufl.dot(ufl.grad(v_k_fx), v_n_fx), w_fx) * dx_fx
-    r_mom_fx += one_m_th_fx * rho_n_fx * ufl.dot(ufl.dot(ufl.grad(v_n_fx), v_n_fx), w_fx) * dx_fx
-    r_mom_fx += th_fx * 2.0 * mu_n_fx * ufl.inner(eps_fx(v_k_fx), eps_fx(w_fx)) * dx_fx
+    conv_k_fx = ufl.dot(ufl.dot(ufl.grad(v_k_fx), v_k_fx), w_fx)
+    conv_n_fx = ufl.dot(ufl.dot(ufl.grad(v_n_fx), v_n_fx), w_fx)
+    r_mom_fx = ufl.inner((rho_k_fx * v_k_fx - rho_n_fx * v_n_fx) * inv_dt_fx, w_fx) * dx_fx
+    r_mom_fx += (
+        th_fx * (rho_k_fx * conv_k_fx + div_rhov_k_fx * ufl.dot(v_k_fx, w_fx))
+        + one_m_th_fx * (rho_n_fx * conv_n_fx + div_rhov_n_fx * ufl.dot(v_n_fx, w_fx))
+    ) * dx_fx
+    r_mom_fx += th_fx * 2.0 * mu_k_fx * ufl.inner(eps_fx(v_k_fx), eps_fx(w_fx)) * dx_fx
     r_mom_fx += one_m_th_fx * 2.0 * mu_n_fx * ufl.inner(eps_fx(v_n_fx), eps_fx(w_fx)) * dx_fx
     r_mom_fx += -(p_k_fx * div_C_w_fx) * dx_fx
 
-    r_mass_fx = q_fx * (div_C_vk_fx + div_weighted_fx(B_n_fx, gradB_n_fx, vS_k_fx)) * dx_fx
+    r_mass_fx = q_fx * (div_C_vk_fx + div_Bk_vSk_fx) * dx_fx
 
     r_el_k_fx = 2.0 * fenicsx["mu_s"] * ufl.inner(eps_fx(u_k_fx), eps_fx(eta_vS_fx))
     r_el_k_fx += fenicsx["lambda_s"] * ufl.div(u_k_fx) * ufl.div(eta_vS_fx)
-    r_el_n_fx = 2.0 * fenicsx["mu_s"] * ufl.inner(eps_fx(u_n_fx), eps_fx(eta_vS_fx))
-    r_el_n_fx += fenicsx["lambda_s"] * ufl.div(u_n_fx) * ufl.div(eta_vS_fx)
 
-    r_skel_fx = th_fx * alpha_n_fx * r_el_k_fx * dx_fx
-    r_skel_fx += one_m_th_fx * alpha_n_fx * r_el_n_fx * dx_fx
-    r_skel_fx += -(p_k_fx * div_B_vStest_fx) * dx_fx
-
-    beta_n_fx = alpha_n_fx * fenicsx["mu_f"] * fenicsx["kappa_inv"]
+    beta_k_fx = alpha_k_fx * fenicsx["mu_f"] * fenicsx["kappa_inv"]
     diff_k_fx = v_k_fx - vS_k_fx
-    diff_n_fx = v_n_fx - vS_n_fx
-    r_mom_fx += beta_n_fx * (th_fx * ufl.dot(diff_k_fx, w_fx) + one_m_th_fx * ufl.dot(diff_n_fx, w_fx)) * dx_fx
-    r_skel_fx += -beta_n_fx * (th_fx * ufl.dot(diff_k_fx, eta_vS_fx) + one_m_th_fx * ufl.dot(diff_n_fx, eta_vS_fx)) * dx_fx
+    r_mom_fx += beta_k_fx * ufl.dot(diff_k_fx, w_fx) * dx_fx
 
+    r_skel_fx = (alpha_k_fx * r_el_k_fx - p_k_fx * div_Bk_vStest_fx - beta_k_fx * ufl.dot(diff_k_fx, eta_vS_fx)) * dx_fx
+
+    mass_res_fx = div_C_vk_fx + div_Bk_vSk_fx
     if float(params["gamma_div"]) != 0.0:
-        mass_res_fx = div_C_vk_fx + div_weighted_fx(B_n_fx, gradB_n_fx, vS_k_fx)
         r_mom_fx += fenicsx["gamma_div"] * mass_res_fx * div_C_w_fx * dx_fx
-        r_skel_fx += fenicsx["gamma_div"] * mass_res_fx * div_B_vStest_fx * dx_fx
+        r_skel_fx += fenicsx["gamma_div"] * mass_res_fx * div_Bk_vStest_fx * dx_fx
 
-    r_kin_fx = inv_dt_fx * (ufl.inner(u_k_fx, eta_u_fx) - ufl.inner(u_n_fx, eta_u_fx)) * dx_fx
-    r_kin_fx += th_fx * ufl.dot(ufl.dot(ufl.grad(u_k_fx), vS_n_fx), eta_u_fx) * dx_fx
-    r_kin_fx += one_m_th_fx * ufl.dot(ufl.dot(ufl.grad(u_n_fx), vS_n_fx), eta_u_fx) * dx_fx
-    r_kin_fx += -(th_fx * ufl.dot(vS_k_fx, eta_u_fx) + one_m_th_fx * ufl.dot(vS_n_fx, eta_u_fx)) * dx_fx
+    Fkin_dt_fx = (u_k_fx - u_n_fx) * inv_dt_fx
+    Fkin_adv_k_fx = ufl.dot(ufl.grad(u_k_fx), vS_k_fx) - vS_k_fx
+    Fkin_adv_n_fx = ufl.dot(ufl.grad(u_n_fx), vS_n_fx) - vS_n_fx
+    Fkin_k_fx = Fkin_dt_fx + th_fx * Fkin_adv_k_fx + one_m_th_fx * Fkin_adv_n_fx
+    r_kin_fx = alpha_k_fx * ufl.dot(Fkin_k_fx, eta_u_fx) * dx_fx
 
+    div_vS_k_fx = ufl.div(vS_k_fx)
     div_vS_n_fx = ufl.div(vS_n_fx)
+    adv_alpha_k_fx = ufl.dot(ufl.grad(alpha_k_fx), vS_k_fx) + alpha_k_fx * div_vS_k_fx
+    adv_alpha_n_fx = ufl.dot(ufl.grad(alpha_n_fx), vS_n_fx) + alpha_n_fx * div_vS_n_fx
     r_alpha_fx = xi_fx * ((alpha_k_fx - alpha_n_fx) * inv_dt_fx) * dx_fx
-    r_alpha_fx += th_fx * xi_fx * (ufl.dot(ufl.grad(alpha_k_fx), vS_n_fx) + alpha_k_fx * div_vS_n_fx) * dx_fx
-    r_alpha_fx += one_m_th_fx * xi_fx * (ufl.dot(ufl.grad(alpha_n_fx), vS_n_fx) + alpha_n_fx * div_vS_n_fx) * dx_fx
+    r_alpha_fx += th_fx * xi_fx * adv_alpha_k_fx * dx_fx
+    r_alpha_fx += one_m_th_fx * xi_fx * adv_alpha_n_fx * dx_fx
     r_alpha_fx += fenicsx["M_alpha"] * ufl.dot(ufl.grad(mu_alpha_k_fx), ufl.grad(xi_fx)) * dx_fx
 
     Wp_alpha_fx = 2.0 * alpha_k_fx * (1.0 - alpha_k_fx) * (1.0 - 2.0 * alpha_k_fx)
@@ -4333,7 +4471,7 @@ def run_benchmark7_hdiv_comparison():
 
     filter_terms = os.environ.get("COMP_FENICS_TERMS")
     if filter_terms:
-        allowed = {name.strip() for name in filter_terms.split(",") if name.strip()}
+        allowed = _parse_filter_terms(filter_terms)
         terms = {k: v for k, v in terms.items() if k in allowed}
         print(f"Running filtered terms only: {sorted(terms)}")
     else:
@@ -4356,11 +4494,7 @@ def run_benchmark7_hdiv_comparison():
             print(f"❌ FEniCSx assembly failed for '{name}': {exc}")
             fenics_ref[name] = None
 
-    backends_spec = os.environ.get("BACKEND", "jit")
-    if backends_spec.strip().lower() == "all":
-        backends = ["python", "jit", "cpp"]
-    else:
-        backends = [b.strip() for b in backends_spec.split(",") if b.strip()]
+    backends = _requested_backends("jit")
     parity_rtol = float(os.environ.get("COMP_FENICS_PARITY_RTOL", "1e-9"))
     parity_atol = float(os.environ.get("COMP_FENICS_PARITY_ATOL", "1e-9"))
     ref_backend = "python" if "python" in backends else (backends[0] if backends else "python")
@@ -4374,72 +4508,79 @@ def run_benchmark7_hdiv_comparison():
         failed_tests = []
         success_count = 0
 
-        for name, spec in terms.items():
-            if fenics_ref.get(name) is None:
-                failed_tests.append(f"{name} (fenics-assemble)")
-                continue
-
-            J_pc, R_pc = None, None
-            print(f"\nCompiling/assembling '{name}' [backend={backend_type}]")
-            try:
-                if spec["mat"]:
-                    J_pc, _ = assemble_form(Equation(spec["pc"], None), dof_handler_pc, quad_degree=int(params["qdeg"]), bcs=[], backend=backend_type)
-                else:
-                    _, R_pc = assemble_form(Equation(None, spec["pc"]), dof_handler_pc, bcs=[], backend=backend_type)
-            except Exception as exc:
-                print(f"❌ pycutfem assembly failed for '{name}' on backend '{backend_type}': {exc}")
-                failed_tests.append(f"{name} (assemble-{backend_type})")
-                continue
-
-            if backend_type == ref_backend:
-                if spec["mat"]:
-                    ref_pc[name] = J_pc.tocsr().copy() if use_sparse_compare else J_pc.toarray()
-                else:
-                    ref_pc[name] = np.asarray(R_pc, dtype=float).copy()
-            else:
+        try:
+            for name, spec in terms.items():
+                if fenics_ref.get(name) is None:
+                    failed_tests.append(_failure_label(name, backend_type, "fenics-assemble"))
+                    continue
+    
+                J_pc, R_pc = None, None
+                print(f"\nCompiling/assembling '{name}' [backend={backend_type}]")
                 try:
                     if spec["mat"]:
-                        if use_sparse_compare:
-                            ok, max_abs, worst = _sparse_matrix_allclose(
-                                J_pc.tocsr(),
-                                ref_pc[name],
-                                rtol=parity_rtol,
-                                atol=parity_atol,
-                            )
-                            if not ok:
-                                raise AssertionError(
-                                    f"sparse mismatch: max_abs={max_abs:.3e}, worst={worst}"
-                                )
-                        else:
-                            np.testing.assert_allclose(J_pc.toarray(), ref_pc[name], rtol=parity_rtol, atol=parity_atol)
+                        J_pc, _ = assemble_form(Equation(spec["pc"], None), dof_handler_pc, quad_degree=int(params["qdeg"]), bcs=[], backend=backend_type)
                     else:
-                        np.testing.assert_allclose(np.asarray(R_pc, dtype=float), ref_pc[name], rtol=parity_rtol, atol=parity_atol)
-                    print(f"✅ pycutfem backend parity OK vs '{ref_backend}'.")
+                        _, R_pc = assemble_form(Equation(None, spec["pc"]), dof_handler_pc, bcs=[], backend=backend_type)
                 except Exception as exc:
-                    print(f"❌ pycutfem backend parity FAILED vs '{ref_backend}': {exc}")
-                    failed_tests.append(f"{name} (parity-{backend_type}-vs-{ref_backend})")
-
-            J_fx = fenics_ref[name] if spec["mat"] else None
-            R_fx = fenics_ref[name] if not spec["mat"] else None
-            is_success = compare_term(
-                f"{name} [backend={backend_type}]",
-                J_pc,
-                R_pc,
-                J_fx,
-                R_fx,
-                P_map,
-                dof_handler_pc,
-                W_fx,
-                rtol=1e-8,
-                atol=1e-8,
-                sign_map=sign_map,
-                fx_coords_all=fx_coords_all,
-            )
-            if is_success:
-                success_count += 1
-            else:
-                failed_tests.append(name)
-
+                    _maybe_print_traceback()
+                    print(f"❌ pycutfem assembly failed for '{name}' on backend '{backend_type}': {exc}")
+                    failed_tests.append(_failure_label(name, backend_type, "assemble"))
+                    continue
+    
+                if backend_type == ref_backend:
+                    if spec["mat"]:
+                        ref_pc[name] = J_pc.tocsr().copy() if use_sparse_compare else J_pc.toarray()
+                    else:
+                        ref_pc[name] = np.asarray(R_pc, dtype=float).copy()
+                else:
+                    try:
+                        if spec["mat"]:
+                            if use_sparse_compare:
+                                ok, max_abs, worst = _sparse_matrix_allclose(
+                                    J_pc.tocsr(),
+                                    ref_pc[name],
+                                    rtol=parity_rtol,
+                                    atol=parity_atol,
+                                )
+                                if not ok:
+                                    raise AssertionError(
+                                        f"sparse mismatch: max_abs={max_abs:.3e}, worst={worst}"
+                                    )
+                            else:
+                                np.testing.assert_allclose(J_pc.toarray(), ref_pc[name], rtol=parity_rtol, atol=parity_atol)
+                        else:
+                            np.testing.assert_allclose(np.asarray(R_pc, dtype=float), ref_pc[name], rtol=parity_rtol, atol=parity_atol)
+                        print(f"✅ pycutfem backend parity OK vs '{ref_backend}'.")
+                    except Exception as exc:
+                        print(f"❌ pycutfem backend parity FAILED vs '{ref_backend}': {exc}")
+                        failed_tests.append(_failure_label(name, backend_type, f"parity-vs-{ref_backend}"))
+    
+                J_fx = fenics_ref[name] if spec["mat"] else None
+                R_fx = fenics_ref[name] if not spec["mat"] else None
+                is_success = compare_term(
+                    f"{name} [backend={backend_type}]",
+                    J_pc,
+                    R_pc,
+                    J_fx,
+                    R_fx,
+                    P_map,
+                    dof_handler_pc,
+                    W_fx,
+                    rtol=1e-8,
+                    atol=1e-8,
+                    sign_map=sign_map,
+                    fx_coords_all=fx_coords_all,
+                )
+                if is_success:
+                    success_count += 1
+                else:
+                    failed_tests.append(_failure_label(name, backend_type))
+    
+        except KeyboardInterrupt:
+            print("\n⛔ KeyboardInterrupt (Ctrl+C). Showing summary so far...")
+            print_test_summary(success_count, failed_tests)
+            _print_global_summary()
+            sys.exit(130)
         print_test_summary(success_count, failed_tests)
 
 
@@ -4655,6 +4796,12 @@ def compare_term(
                 f"ℹ️ Sparse Jacobian compare: nnz_pycutfem={J_pc_sparse.nnz}, "
                 f"nnz_fenics={J_fx_reordered.nnz}, max_abs={max_abs:.3e}"
             )
+            if _env_truthy("COMP_FENICS_SHOW_WORST", False) and worst is not None:
+                row, col, a_val, b_val, diff, tol = worst
+                print(
+                    f"   Worst entry ({row}, {col}): pycutfem={a_val:.16e}, "
+                    f"fenics={b_val:.16e}, diff={diff:.3e}, tol={tol:.3e}"
+                )
             if ok:
                 print(f"✅ Jacobian matrix for '{term_name}' is numerically equivalent.")
             else:
@@ -4696,23 +4843,30 @@ def compare_term(
                 is_successful = False
     return is_successful
 
+GLOBAL_TOTAL_SUCCESS = 0
+GLOBAL_TOTAL_FAILED = []
+
 def print_test_summary(success_count, failed_tests):
     """Prints a summary of the test results."""
+    global GLOBAL_TOTAL_SUCCESS, GLOBAL_TOTAL_FAILED
+    GLOBAL_TOTAL_SUCCESS += success_count
+    GLOBAL_TOTAL_FAILED.extend(failed_tests)
+    
     total_tests = success_count + len(failed_tests)
     failure_count = len(failed_tests)
 
-    print("\n" + "="*70)
-    print(" " * 25 + "TEST SUITE SUMMARY")
-    print("="*70)
-    print(f"Total tests run: {total_tests}")
-    print(f"✅ Successful tests: {success_count}")
-    print(f"❌ Failed tests:     {failure_count}")
-    
-    if failure_count > 0:
-        print("\n--- List of Failed Tests ---")
-        for test_name in failed_tests:
+
+def _print_global_summary():
+    print("\n" + "★"*70)
+    print(" " * 20 + "GLOBAL TEST EXECUTION SUMMARY")
+    print("★"*70)
+    print(f"✅ OVERALL Successful tests: {GLOBAL_TOTAL_SUCCESS}")
+    print(f"❌ OVERALL Failed tests:     {len(GLOBAL_TOTAL_FAILED)}")
+    if GLOBAL_TOTAL_FAILED:
+        print("\n--- Master List of Failed Tests ---")
+        for test_name in GLOBAL_TOTAL_FAILED:
             print(f"  - {test_name}")
-    print("="*70)
+    print("★"*70)
 
 # ==============================================================================
 #  Semi-smooth contact (PositivePart/Heaviside) comparison harness vs FEniCSx
@@ -4841,92 +4995,94 @@ def run_contact_comparison():
         "active": (0.0, -1.0),
     }
 
-    backends_spec = os.environ.get("BACKEND", "jit")
-    if backends_spec.strip().lower() == "all":
-        backends = ["python", "jit", "cpp"]
-    else:
-        backends = [b.strip() for b in backends_spec.split(",") if b.strip()]
+    backends = _requested_backends("jit")
 
     failed_tests = []
     success_count = 0
 
-    for backend_type in backends:
-        print("\n" + "=" * 70)
-        print(f"CONTACT COMPARISON (backend={backend_type})")
-        print("=" * 70)
-
-        for case_name, (ux_val, uy_val) in cases.items():
-            # --- set pycutfem coefficients ---
-            u_pc.set_values_from_function(lambda x, y, ux=float(ux_val), uy=float(uy_val): np.array([ux, uy], float))
-            p_pc.nodal_values[:] = 0.0
-
-            # --- set dolfinx coefficients via coordinate-based DoF map ---
-            U_full_pc = np.zeros(dof_handler_pc.total_dofs, dtype=float)
-            U_full_pc[dof_handler_pc.get_field_slice("ux")] = float(ux_val)
-            U_full_pc[dof_handler_pc.get_field_slice("uy")] = float(uy_val)
-            U_full_pc[dof_handler_pc.get_field_slice("p")] = 0.0
-
-            w_k_fx.x.array[:] = 0.0
-            w_k_fx.x.array[np.asarray(P_map, dtype=int)] = U_full_pc
-            w_k_fx.x.scatter_forward()
-
-            name = f"Contact ({case_name})"
-            print(f"\nCompiling/assembling '{name}' [backend={backend_type}, qdeg={qdeg}]")
-
-            try:
-                # Assemble pycutfem
-                J_pc, _ = assemble_form(
-                    Equation(a_pc, None),
+    try:
+        for backend_type in backends:
+            print("\n" + "=" * 70)
+            print(f"CONTACT COMPARISON (backend={backend_type})")
+            print("=" * 70)
+    
+            for case_name, (ux_val, uy_val) in cases.items():
+                # --- set pycutfem coefficients ---
+                u_pc.set_values_from_function(lambda x, y, ux=float(ux_val), uy=float(uy_val): np.array([ux, uy], float))
+                p_pc.nodal_values[:] = 0.0
+    
+                # --- set dolfinx coefficients via coordinate-based DoF map ---
+                U_full_pc = np.zeros(dof_handler_pc.total_dofs, dtype=float)
+                U_full_pc[dof_handler_pc.get_field_slice("ux")] = float(ux_val)
+                U_full_pc[dof_handler_pc.get_field_slice("uy")] = float(uy_val)
+                U_full_pc[dof_handler_pc.get_field_slice("p")] = 0.0
+    
+                w_k_fx.x.array[:] = 0.0
+                w_k_fx.x.array[np.asarray(P_map, dtype=int)] = U_full_pc
+                w_k_fx.x.scatter_forward()
+    
+                name = f"Contact ({case_name})"
+                print(f"\nCompiling/assembling '{name}' [backend={backend_type}, qdeg={qdeg}]")
+    
+                try:
+                    # Assemble pycutfem
+                    J_pc, _ = assemble_form(
+                        Equation(a_pc, None),
+                        dof_handler_pc,
+                        quad_degree=qdeg,
+                        bcs=[],
+                        backend=backend_type,
+                    )
+                    _, R_pc = assemble_form(
+                        Equation(None, r_pc),
+                        dof_handler_pc,
+                        quad_degree=qdeg,
+                        bcs=[],
+                        backend=backend_type,
+                    )
+                except Exception as exc:
+                    print(f"❌ pycutfem assembly failed for '{name}' on backend '{backend_type}': {exc}")
+                    failed_tests.append(_failure_label(name, backend_type, "assemble"))
+                    continue
+    
+                try:
+                    # Assemble dolfinx
+                    r_fx_form = dolfinx.fem.form(r_fx)
+                    a_fx_form = dolfinx.fem.form(a_fx)
+                    vec = dolfinx.fem.petsc.assemble_vector(r_fx_form)
+                    R_fx = vec.array
+    
+                    A = dolfinx.fem.petsc.assemble_matrix(a_fx_form)
+                    A.assemble()
+                    indptr, indices, data = A.getValuesCSR()
+                    J_fx = csr_matrix((data, indices, indptr), shape=A.getSize()).toarray()
+                except Exception as exc:
+                    print(f"❌ dolfinx assembly failed for '{name}': {exc}")
+                    failed_tests.append(_failure_label(name, backend_type, "fenics-assemble"))
+                    continue
+    
+                is_success = compare_term(
+                    f"{name} [backend={backend_type}]",
+                    J_pc,
+                    R_pc,
+                    J_fx,
+                    R_fx,
+                    P_map,
                     dof_handler_pc,
-                    quad_degree=qdeg,
-                    bcs=[],
-                    backend=backend_type,
+                    W_fx,
+                    rtol=1e-9,
+                    atol=1e-9,
                 )
-                _, R_pc = assemble_form(
-                    Equation(None, r_pc),
-                    dof_handler_pc,
-                    quad_degree=qdeg,
-                    bcs=[],
-                    backend=backend_type,
-                )
-            except Exception as exc:
-                print(f"❌ pycutfem assembly failed for '{name}' on backend '{backend_type}': {exc}")
-                failed_tests.append(f"{name} (assemble-{backend_type})")
-                continue
-
-            try:
-                # Assemble dolfinx
-                r_fx_form = dolfinx.fem.form(r_fx)
-                a_fx_form = dolfinx.fem.form(a_fx)
-                vec = dolfinx.fem.petsc.assemble_vector(r_fx_form)
-                R_fx = vec.array
-
-                A = dolfinx.fem.petsc.assemble_matrix(a_fx_form)
-                A.assemble()
-                indptr, indices, data = A.getValuesCSR()
-                J_fx = csr_matrix((data, indices, indptr), shape=A.getSize()).toarray()
-            except Exception as exc:
-                print(f"❌ dolfinx assembly failed for '{name}': {exc}")
-                failed_tests.append(f"{name} (fenics-assemble)")
-                continue
-
-            is_success = compare_term(
-                f"{name} [backend={backend_type}]",
-                J_pc,
-                R_pc,
-                J_fx,
-                R_fx,
-                P_map,
-                dof_handler_pc,
-                W_fx,
-                rtol=1e-9,
-                atol=1e-9,
-            )
-            if is_success:
-                success_count += 1
-            else:
-                failed_tests.append(f"{name} (mismatch-{backend_type})")
-
+                if is_success:
+                    success_count += 1
+                else:
+                    failed_tests.append(_failure_label(name, backend_type, "mismatch"))
+    
+    except KeyboardInterrupt:
+        print("\n⛔ KeyboardInterrupt (Ctrl+C). Showing summary so far...")
+        print_test_summary(success_count, failed_tests)
+        _print_global_summary()
+        sys.exit(130)
     print_test_summary(success_count, failed_tests)
 
 
@@ -4936,11 +5092,7 @@ def run_component_semantics_comparison():
     initialize_functions(pc, fenicsx, dof_handler_pc, P_map)
 
     qdeg = int(os.environ.get("COMP_FENICS_QDEG", 6))
-    backend_types = tuple(
-        backend.strip()
-        for backend in os.environ.get("COMP_FENICS_BACKENDS", "python,jit,cpp").split(",")
-        if backend.strip()
-    )
+    backend_types = tuple(_requested_backends("python,jit,cpp"))
     metadata = {"quadrature_degree": qdeg}
 
     W_fx = fenicsx["W"]
@@ -4980,28 +5132,52 @@ def run_component_semantics_comparison():
             "fx": ufl.dot(ufl.grad(p_k_fx), u_k_fx) * q_fx * ufl.dx(metadata=metadata),
         },
         {
-            "name": "ScalarGradMatrix Bilinear Left",
+            "name": "ScalarGradMatrixDot Bilinear Left",
             "kind": "jac",
-            "pc": inner(B_pc * grad(pc["dp"]), grad(pc["q"])) * dx(metadata=metadata),
+            "pc": inner(dot(B_pc, grad(pc["dp"])), grad(pc["q"])) * dx(metadata=metadata),
             "fx": ufl.inner(ufl.dot(B_fx, ufl.grad(dp_fx)), ufl.grad(q_fx)) * ufl.dx(metadata=metadata),
         },
         {
-            "name": "ScalarGradMatrix Bilinear Right",
+            "name": "ScalarGradMatrixDot Bilinear Right",
             "kind": "jac",
-            "pc": inner(grad(pc["dp"]) * B_pc, grad(pc["q"])) * dx(metadata=metadata),
+            "pc": inner(dot(grad(pc["dp"]), B_pc), grad(pc["q"])) * dx(metadata=metadata),
             "fx": ufl.inner(ufl.dot(ufl.grad(dp_fx), B_fx), ufl.grad(q_fx)) * ufl.dx(metadata=metadata),
         },
         {
-            "name": "ScalarGradMatrix Residual Left",
+            "name": "ScalarGradMatrixDot Residual Left",
             "kind": "res",
-            "pc": inner(B_pc * grad(pc["p_k"]), grad(pc["q"])) * dx(metadata=metadata),
+            "pc": inner(dot(B_pc, grad(pc["p_k"])), grad(pc["q"])) * dx(metadata=metadata),
             "fx": ufl.inner(ufl.dot(B_fx, ufl.grad(p_k_fx)), ufl.grad(q_fx)) * ufl.dx(metadata=metadata),
         },
         {
-            "name": "ScalarGradMatrix Residual Right",
+            "name": "ScalarGradMatrixDot Residual Right",
             "kind": "res",
-            "pc": inner(grad(pc["p_k"]) * B_pc, grad(pc["q"])) * dx(metadata=metadata),
+            "pc": inner(dot(grad(pc["p_k"]), B_pc), grad(pc["q"])) * dx(metadata=metadata),
             "fx": ufl.inner(ufl.dot(ufl.grad(p_k_fx), B_fx), ufl.grad(q_fx)) * ufl.dx(metadata=metadata),
+        },
+        {
+            "name": "Vector GradDiv Bilinear",
+            "kind": "jac",
+            "pc": inner(grad(div(pc["du"])), grad(div(pc["v"]))) * dx(metadata=metadata),
+            "fx": ufl.inner(ufl.grad(ufl.div(du_fx)), ufl.grad(ufl.div(v_fx))) * ufl.dx(metadata=metadata),
+        },
+        {
+            "name": "Vector GradDiv Residual",
+            "kind": "res",
+            "pc": inner(grad(div(pc["u_k"])), grad(div(pc["v"]))) * dx(metadata=metadata),
+            "fx": ufl.inner(ufl.grad(ufl.div(u_k_fx)), ufl.grad(ufl.div(v_fx))) * ufl.dx(metadata=metadata),
+        },
+        {
+            "name": "Scalar DivGrad Bilinear",
+            "kind": "jac",
+            "pc": inner(div(grad(pc["dp"])), div(grad(pc["q"]))) * dx(metadata=metadata),
+            "fx": ufl.inner(ufl.div(ufl.grad(dp_fx)), ufl.div(ufl.grad(q_fx))) * ufl.dx(metadata=metadata),
+        },
+        {
+            "name": "Scalar DivGrad Residual",
+            "kind": "res",
+            "pc": inner(div(grad(pc["p_k"])), div(grad(pc["q"]))) * dx(metadata=metadata),
+            "fx": ufl.inner(ufl.div(ufl.grad(p_k_fx)), ufl.div(ufl.grad(q_fx))) * ufl.dx(metadata=metadata),
         },
         {
             "name": "VectorGrad Row Bilinear 0",
@@ -5087,62 +5263,187 @@ def run_component_semantics_comparison():
 
     success_count = 0
     failed_tests = []
-    for backend_type in backend_types:
-        print(f"\nRunning component semantics comparison with backend='{backend_type}', qdeg={qdeg}")
-        for spec in form_specs:
-            name = f"{spec['name']} [backend={backend_type}]"
-            print(f"\nCompiling/assembling '{name}'")
-            try:
-                if spec["kind"] == "jac":
-                    J_pc, _ = assemble_form(
-                        Equation(spec["pc"], None),
-                        dof_handler_pc,
-                        quad_degree=qdeg,
-                        bcs=[],
-                        backend=backend_type,
-                    )
-                    J_fx_form = dolfinx.fem.form(spec["fx"])
-                    A = dolfinx.fem.petsc.assemble_matrix(J_fx_form)
-                    A.assemble()
-                    indptr, indices, data = A.getValuesCSR()
-                    J_fx = csr_matrix((data, indices, indptr), shape=A.getSize()).toarray()
-                    R_pc = None
-                    R_fx = None
+    try:
+        for backend_type in backend_types:
+            print(f"\nRunning component semantics comparison with backend='{backend_type}', qdeg={qdeg}")
+            for spec in form_specs:
+                name = f"{spec['name']} [backend={backend_type}]"
+                print(f"\nCompiling/assembling '{name}'")
+                try:
+                    if spec["kind"] == "jac":
+                        J_pc, _ = assemble_form(
+                            Equation(spec["pc"], None),
+                            dof_handler_pc,
+                            quad_degree=qdeg,
+                            bcs=[],
+                            backend=backend_type,
+                        )
+                        J_fx_form = dolfinx.fem.form(spec["fx"])
+                        A = dolfinx.fem.petsc.assemble_matrix(J_fx_form)
+                        A.assemble()
+                        indptr, indices, data = A.getValuesCSR()
+                        J_fx = csr_matrix((data, indices, indptr), shape=A.getSize()).toarray()
+                        R_pc = None
+                        R_fx = None
+                    else:
+                        _, R_pc = assemble_form(
+                            Equation(None, spec["pc"]),
+                            dof_handler_pc,
+                            quad_degree=qdeg,
+                            bcs=[],
+                            backend=backend_type,
+                        )
+                        R_fx_form = dolfinx.fem.form(spec["fx"])
+                        vec = dolfinx.fem.petsc.assemble_vector(R_fx_form)
+                        R_fx = vec.array
+                        J_pc = None
+                        J_fx = None
+                except Exception as exc:
+                    print(f"❌ Assembly failed for '{name}': {exc}")
+                    failed_tests.append(_failure_label(name, reason="assemble"))
+                    continue
+    
+                is_success = compare_term(
+                    name,
+                    J_pc,
+                    R_pc,
+                    J_fx,
+                    R_fx,
+                    P_map,
+                    dof_handler_pc,
+                    W_fx,
+                    rtol=1e-12,
+                    atol=1e-12,
+                )
+                if is_success:
+                    success_count += 1
                 else:
-                    _, R_pc = assemble_form(
-                        Equation(None, spec["pc"]),
-                        dof_handler_pc,
-                        quad_degree=qdeg,
-                        bcs=[],
-                        backend=backend_type,
-                    )
-                    R_fx_form = dolfinx.fem.form(spec["fx"])
-                    vec = dolfinx.fem.petsc.assemble_vector(R_fx_form)
-                    R_fx = vec.array
-                    J_pc = None
-                    J_fx = None
-            except Exception as exc:
-                print(f"❌ Assembly failed for '{name}': {exc}")
-                failed_tests.append(f"{name} (assemble)")
-                continue
+                    failed_tests.append(_failure_label(name, reason="mismatch"))
+    
+    except KeyboardInterrupt:
+        print("\n⛔ KeyboardInterrupt (Ctrl+C). Showing summary so far...")
+        print_test_summary(success_count, failed_tests)
+        _print_global_summary()
+        sys.exit(130)
+    print_test_summary(success_count, failed_tests)
 
-            is_success = compare_term(
-                name,
-                J_pc,
-                R_pc,
-                J_fx,
-                R_fx,
-                P_map,
-                dof_handler_pc,
-                W_fx,
-                rtol=1e-12,
-                atol=1e-12,
-            )
-            if is_success:
-                success_count += 1
-            else:
-                failed_tests.append(f"{name} (mismatch)")
 
+def run_multiplication_semantics_comparison():
+    pc, dof_handler_pc, fenicsx = setup_problems()
+    P_map = create_true_dof_map(dof_handler_pc, fenicsx["W"])
+    initialize_functions(pc, fenicsx, dof_handler_pc, P_map)
+
+    qdeg = int(os.environ.get("COMP_FENICS_QDEG", 6))
+    backend_types = tuple(_requested_backends("python,jit,cpp"))
+    metadata = {"quadrature_degree": qdeg}
+
+    W_fx = fenicsx["W"]
+    w_trial = ufl.TrialFunction(W_fx)
+    w_test = ufl.TestFunction(W_fx)
+    du_fx, _dp_fx = ufl.split(w_trial)
+    v_fx, q_fx = ufl.split(w_test)
+    u_k_fx, _p_k_fx = ufl.split(fenicsx["u_k_p_k"])
+
+    B_arr = np.array([[2.0, -0.5], [1.0, 3.0]], dtype=float)
+    B_pc = Constant(B_arr, dim=2)
+
+    form_specs = [
+        {
+            "name": "VectorDyad Bilinear 0-1",
+            "kind": "jac",
+            "pc": ((pc["u_k"] * pc["du"])[0, 1]) * pc["v"][0] * dx(metadata=metadata),
+            "fx": (u_k_fx[0] * du_fx[1] * v_fx[0]) * ufl.dx(metadata=metadata),
+        },
+        {
+            "name": "VectorDyad Residual 1-0",
+            "kind": "res",
+            "pc": ((pc["u_k"] * pc["u_k"])[1, 0]) * pc["v"][1] * dx(metadata=metadata),
+            "fx": (u_k_fx[1] * u_k_fx[0] * v_fx[1]) * ufl.dx(metadata=metadata),
+        },
+        {
+            "name": "VectorMatrixConst Residual 0-1-1",
+            "kind": "res",
+            "pc": ((pc["u_k"] * B_pc)[0, 1, 1]) * pc["q"] * dx(metadata=metadata),
+            "fx": (u_k_fx[0] * B_arr[1, 1] * q_fx) * ufl.dx(metadata=metadata),
+        },
+        {
+            "name": "VectorGrad Bilinear 0-1-1",
+            "kind": "jac",
+            "pc": ((pc["u_k"] * grad(pc["du"]))[0, 1, 1]) * pc["q"] * dx(metadata=metadata),
+            "fx": (u_k_fx[0] * ufl.grad(du_fx)[1, 1] * q_fx) * ufl.dx(metadata=metadata),
+        },
+        {
+            "name": "VectorGrad Residual 1-0-0",
+            "kind": "res",
+            "pc": ((pc["u_k"] * grad(pc["u_k"]))[1, 0, 0]) * pc["q"] * dx(metadata=metadata),
+            "fx": (u_k_fx[1] * ufl.grad(u_k_fx)[0, 0] * q_fx) * ufl.dx(metadata=metadata),
+        },
+    ]
+
+    success_count = 0
+    failed_tests = []
+    try:
+        for backend_type in backend_types:
+            print(f"\nRunning multiplication semantics comparison with backend='{backend_type}', qdeg={qdeg}")
+            for spec in form_specs:
+                name = f"{spec['name']} [backend={backend_type}]"
+                print(f"\nCompiling/assembling '{name}'")
+                try:
+                    if spec["kind"] == "jac":
+                        J_pc, _ = assemble_form(
+                            Equation(spec["pc"], None),
+                            dof_handler_pc,
+                            quad_degree=qdeg,
+                            bcs=[],
+                            backend=backend_type,
+                        )
+                        J_fx_form = dolfinx.fem.form(spec["fx"])
+                        A = dolfinx.fem.petsc.assemble_matrix(J_fx_form)
+                        A.assemble()
+                        indptr, indices, data = A.getValuesCSR()
+                        J_fx = csr_matrix((data, indices, indptr), shape=A.getSize()).toarray()
+                        R_pc = None
+                        R_fx = None
+                    else:
+                        _, R_pc = assemble_form(
+                            Equation(None, spec["pc"]),
+                            dof_handler_pc,
+                            quad_degree=qdeg,
+                            bcs=[],
+                            backend=backend_type,
+                        )
+                        R_fx_form = dolfinx.fem.form(spec["fx"])
+                        vec = dolfinx.fem.petsc.assemble_vector(R_fx_form)
+                        R_fx = vec.array
+                        J_pc = None
+                        J_fx = None
+                except Exception as exc:
+                    print(f"❌ Assembly failed for '{name}': {exc}")
+                    failed_tests.append(_failure_label(name, reason="assemble"))
+                    continue
+    
+                is_success = compare_term(
+                    name,
+                    J_pc,
+                    R_pc,
+                    J_fx,
+                    R_fx,
+                    P_map,
+                    dof_handler_pc,
+                    W_fx,
+                    rtol=1e-12,
+                    atol=1e-12,
+                )
+                if is_success:
+                    success_count += 1
+                else:
+                    failed_tests.append(_failure_label(name, reason="mismatch"))
+    
+    except KeyboardInterrupt:
+        print("\n⛔ KeyboardInterrupt (Ctrl+C). Showing summary so far...")
+        print_test_summary(success_count, failed_tests)
+        _print_global_summary()
+        sys.exit(130)
     print_test_summary(success_count, failed_tests)
 
 
@@ -5150,31 +5451,52 @@ def run_component_semantics_comparison():
 #                      MAIN TEST HARNESS
 # ==============================================================================
 if __name__ == '__main__':
+    run_all_suites = _env_flag("COMP_FENICS_RUN_ALL_SUITES")
     problem = os.environ.get("COMP_FENICS_PROBLEM", "fluid").strip().lower()
-    if problem.startswith("contact") or problem.startswith("semismooth"):
-        run_contact_comparison()
-        sys.exit(0)
-    if problem.startswith("alpha_ch") or problem.startswith("cahn_hilliard") or problem.startswith("cahn-hilliard"):
-        run_alpha_ch_comparison()
-        sys.exit(0)
-    if problem.startswith("seboldt_hdiv") or problem.startswith("benchmark7_hdiv") or problem.startswith("b7_hdiv"):
-        run_benchmark7_hdiv_comparison()
-        sys.exit(0)
-    if problem.startswith("biofilm"):
-        run_biofilm_comparison()
-        sys.exit(0)
-    if problem.startswith("poro"):
-        run_poro_comparison()
-        sys.exit(0)
-    if (
-        problem.startswith("scalar_grad")
-        or problem.startswith("scalar-grad")
-        or problem.startswith("component_semantics")
-        or problem.startswith("component-semantics")
-    ):
-        run_component_semantics_comparison()
-        sys.exit(0)
 
+    if run_all_suites:
+        print("\n" + "🔥"*35)
+        print("   INITIATING ALL PROBLEM SUITES")
+        print("🔥"*35)
+        run_contact_comparison()
+        run_alpha_ch_comparison()
+        run_benchmark7_hdiv_comparison()
+        run_biofilm_comparison()
+        run_poro_comparison()
+        run_component_semantics_comparison()
+        run_multiplication_semantics_comparison()
+        # The script will now naturally fall through to run the fluid comparison below
+    else:
+        if problem.startswith("contact") or problem.startswith("semismooth"):
+            run_contact_comparison()
+            _print_global_summary()
+            sys.exit(0)
+        if problem.startswith("alpha_ch") or problem.startswith("cahn_hilliard") or problem.startswith("cahn-hilliard"):
+            run_alpha_ch_comparison()
+            _print_global_summary()
+            sys.exit(0)
+        if problem.startswith("seboldt_hdiv") or problem.startswith("benchmark7_hdiv") or problem.startswith("b7_hdiv"):
+            run_benchmark7_hdiv_comparison()
+            _print_global_summary()
+            sys.exit(0)
+        if problem.startswith("biofilm"):
+            run_biofilm_comparison()
+            _print_global_summary()
+            sys.exit(0)
+        if problem.startswith("poro"):
+            run_poro_comparison()
+            _print_global_summary()
+            sys.exit(0)
+        if problem.startswith("scalar_grad") or problem.startswith("scalar-grad") or problem.startswith("component_semantics") or problem.startswith("component-semantics"):
+            run_component_semantics_comparison()
+            _print_global_summary()
+            sys.exit(0)
+        if problem.startswith("multiplication") or problem.startswith("product_semantics") or problem.startswith("product-semantics"):
+            run_multiplication_semantics_comparison()
+            _print_global_summary()
+            sys.exit(0)
+
+    # Start of Fluid Comparison
     pc, dof_handler_pc, fenicsx = setup_problems()
     P_map = create_true_dof_map(dof_handler_pc, fenicsx['W'])
     initialize_functions(pc, fenicsx, dof_handler_pc, P_map)
@@ -5927,7 +6249,7 @@ if __name__ == '__main__':
             'mat': True,
             'deg': 14,
         },
-        "Solid Cross Tangent [A: invJ*dT]": _solid_cross_component_entry("A: invJ*dT", deg_fe=14, deg_pc=8),
+        "Solid Cross Tangent [A: invJ*dT]": _solid_cross_component_entry("A: invJ*dT", deg_fe=20, deg_pc=18),
         "Solid Cross Tangent [B: -(tr(F^{-1} dF) over J)*T_w]": _solid_cross_component_entry("B: -(tr(F^{-1} dF) over J)*T_w", deg_fe=14, deg_pc=6),
         "Solid Cross Tangent [C: tr(F^{-1} dF F^{-1} Aw)*sigma]": _solid_cross_component_entry("C: tr(F^{-1} dF F^{-1} Aw)*sigma", deg_fe=14, deg_pc=6),
         "Solid Cross Tangent [D: -tr(F^{-1} Aw)*ds_u]": _solid_cross_component_entry("D: -tr(F^{-1} Aw)*ds_u", deg_fe=14, deg_pc=6),
@@ -6202,13 +6524,27 @@ if __name__ == '__main__':
             'mat': False, 'deg': 4,
         },
     }
+
+    # Optional diagnostic: include the expanded (1/J)*dT sub-terms for debugging.
+    # Enable with COMP_FENICS_DECOMPOSE_SOLID_CROSS=1.
+    if _env_flag("COMP_FENICS_DECOMPOSE_SOLID_CROSS"):
+        terms.update({
+            "Solid Cross Tangent [A1: invJ*Aw_dot_dSk_FT]": _solid_cross_component_entry("A1: invJ*Aw_dot_dSk_FT", deg_fe=14, deg_pc=14),
+            "Solid Cross Tangent [A2: invJ*Aw_dot_Sk_dF_T]": _solid_cross_component_entry("A2: invJ*Aw_dot_Sk_dF_T", deg_fe=14, deg_pc=14),
+            "Solid Cross Tangent [A3: invJ*dF_dot_dSw_FT]": _solid_cross_component_entry("A3: invJ*dF_dot_dSw_FT", deg_fe=14, deg_pc=14),
+            "Solid Cross Tangent [A4: invJ*F_dot_ddSw_FT]": _solid_cross_component_entry("A4: invJ*F_dot_ddSw_FT", deg_fe=14, deg_pc=14),
+            "Solid Cross Tangent [A5: invJ*F_dot_dSw_dF_T]": _solid_cross_component_entry("A5: invJ*F_dot_dSw_dF_T", deg_fe=14, deg_pc=14),
+            "Solid Cross Tangent [A6: invJ*dF_dot_Sk_Aw_T]": _solid_cross_component_entry("A6: invJ*dF_dot_Sk_Aw_T", deg_fe=14, deg_pc=14),
+            "Solid Cross Tangent [A7: invJ*F_dot_dSk_Aw_T]": _solid_cross_component_entry("A7: invJ*F_dot_dSk_Aw_T", deg_fe=14, deg_pc=14),
+        })
+
     pc_dummy_side = dot(Constant([0.0,0.0],dim=1), pc['v']) * dx()
     _ = pc_dummy_side
 
-    run_all = os.environ.get("COMP_FENICS_RUN_ALL", "").lower() in {"1", "true", "yes"}
+    run_all = _run_all_terms_requested()
     filter_terms = os.environ.get("COMP_FENICS_TERMS")
     if filter_terms:
-        allowed = {name.strip() for name in filter_terms.split(",") if name.strip()}
+        allowed = _parse_filter_terms(filter_terms)
         terms = {k: v for k, v in terms.items() if k in allowed}
         print(f"Running filtered terms only: {sorted(terms)}")
     elif not run_all:
@@ -6245,11 +6581,7 @@ if __name__ == '__main__':
             print(f"❌ FEniCSx assembly failed for '{name}': {exc}")
             fenics_ref[name] = None
 
-    backends_spec = os.environ.get("BACKEND", "jit")
-    if backends_spec.strip().lower() == "all":
-        backends = ["python", "jit", "cpp"]
-    else:
-        backends = [b.strip() for b in backends_spec.split(",") if b.strip()]
+    backends = _requested_backends("jit")
     parity_rtol = float(os.environ.get("COMP_FENICS_PARITY_RTOL", "1e-9"))
     parity_atol = float(os.environ.get("COMP_FENICS_PARITY_ATOL", "1e-9"))
 
@@ -6264,73 +6596,81 @@ if __name__ == '__main__':
         failed_tests = []
         success_count = 0
 
-        for name, forms in terms.items():
-            if fenics_ref.get(name) is None:
-                failed_tests.append(f"{name} (fenics-assemble)")
-                continue
-
-            J_pc, R_pc = None, None
-            print(f"Compiling/assembling '{name}' with degree {forms['deg']} [backend={backend_type}]")
-            try:
-                if forms["mat"]:
-                    J_pc, _ = assemble_form(
-                        Equation(forms["pc"], None),
-                        dof_handler_pc,
-                        quad_degree=forms["deg"],
-                        bcs=[],
-                        backend=backend_type,
-                    )
-                else:
-                    _, R_pc = assemble_form(
-                        Equation(None, forms["pc"]),
-                        dof_handler_pc,
-                        bcs=[],
-                        backend=backend_type,
-                    )
-            except Exception as exc:
-                print(f"❌ pycutfem assembly failed for '{name}' on backend '{backend_type}': {exc}")
-                failed_tests.append(f"{name} (assemble-{backend_type})")
-                continue
-
-            if backend_type == ref_backend:
-                if forms["mat"]:
-                    ref_pc[name] = J_pc.toarray()
-                else:
-                    ref_pc[name] = np.asarray(R_pc, dtype=float).copy()
-            else:
+        try:
+            for name, forms in terms.items():
+                if fenics_ref.get(name) is None:
+                    failed_tests.append(_failure_label(name, backend_type, "fenics-assemble"))
+                    continue
+    
+                J_pc, R_pc = None, None
+                print(f"Compiling/assembling '{name}' with degree {forms['deg']} [backend={backend_type}]")
                 try:
                     if forms["mat"]:
-                        np.testing.assert_allclose(J_pc.toarray(), ref_pc[name], rtol=parity_rtol, atol=parity_atol)
+                        J_pc, _ = assemble_form(
+                            Equation(forms["pc"], None),
+                            dof_handler_pc,
+                            quad_degree=forms["deg"],
+                            bcs=[],
+                            backend=backend_type,
+                        )
                     else:
-                        np.testing.assert_allclose(np.asarray(R_pc, dtype=float), ref_pc[name], rtol=parity_rtol, atol=parity_atol)
-                    print(f"✅ pycutfem backend parity OK vs '{ref_backend}'.")
+                        _, R_pc = assemble_form(
+                            Equation(None, forms["pc"]),
+                            dof_handler_pc,
+                            bcs=[],
+                            backend=backend_type,
+                        )
                 except Exception as exc:
-                    print(f"❌ pycutfem backend parity FAILED vs '{ref_backend}': {exc}")
-                    failed_tests.append(f"{name} (parity-{backend_type}-vs-{ref_backend})")
-
-            J_fx, R_fx = None, None
-            if forms["mat"]:
-                J_fx = fenics_ref[name]
-            else:
-                R_fx = fenics_ref[name]
-
-            rtol = forms.get("rtol", 1e-8)
-            atol = forms.get("atol", 1e-8)
-            is_success = compare_term(
-                f"{name} [backend={backend_type}]",
-                J_pc,
-                R_pc,
-                J_fx,
-                R_fx,
-                P_map,
-                dof_handler_pc,
-                W_fx,
-                rtol=rtol,
-                atol=atol,
-            )
-            if is_success:
-                success_count += 1
-            else:
-                failed_tests.append(name)
-
+                    print(f"❌ pycutfem assembly failed for '{name}' on backend '{backend_type}': {exc}")
+                    failed_tests.append(_failure_label(name, backend_type, "assemble"))
+                    continue
+    
+                if backend_type == ref_backend:
+                    if forms["mat"]:
+                        ref_pc[name] = J_pc.toarray()
+                    else:
+                        ref_pc[name] = np.asarray(R_pc, dtype=float).copy()
+                else:
+                    try:
+                        if forms["mat"]:
+                            np.testing.assert_allclose(J_pc.toarray(), ref_pc[name], rtol=parity_rtol, atol=parity_atol)
+                        else:
+                            np.testing.assert_allclose(np.asarray(R_pc, dtype=float), ref_pc[name], rtol=parity_rtol, atol=parity_atol)
+                        print(f"✅ pycutfem backend parity OK vs '{ref_backend}'.")
+                    except Exception as exc:
+                        print(f"❌ pycutfem backend parity FAILED vs '{ref_backend}': {exc}")
+                        failed_tests.append(_failure_label(name, backend_type, f"parity-vs-{ref_backend}"))
+    
+                J_fx, R_fx = None, None
+                if forms["mat"]:
+                    J_fx = fenics_ref[name]
+                else:
+                    R_fx = fenics_ref[name]
+    
+                rtol = forms.get("rtol", 1e-8)
+                atol = forms.get("atol", 1e-8)
+                is_success = compare_term(
+                    f"{name} [backend={backend_type}]",
+                    J_pc,
+                    R_pc,
+                    J_fx,
+                    R_fx,
+                    P_map,
+                    dof_handler_pc,
+                    W_fx,
+                    rtol=rtol,
+                    atol=atol,
+                )
+                if is_success:
+                    success_count += 1
+                else:
+                    failed_tests.append(_failure_label(name, backend_type))
+    
+        except KeyboardInterrupt:
+            print("\n⛔ KeyboardInterrupt (Ctrl+C). Showing summary so far...")
+            print_test_summary(success_count, failed_tests)
+            _print_global_summary()
+            sys.exit(130)
         print_test_summary(success_count, failed_tests)
+
+    _print_global_summary()

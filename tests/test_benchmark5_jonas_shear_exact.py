@@ -6,6 +6,8 @@ import numpy as np
 
 from examples.utils.biofilm.benchmark5_jonas_shear_exact import build_jonas_shear_benchmark
 
+_TRAPEZOID = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
+
 
 def test_benchmark5_jonas_shear_exact_properties() -> None:
     bench = build_jonas_shear_benchmark()
@@ -26,7 +28,7 @@ def test_benchmark5_jonas_shear_exact_properties() -> None:
     y = np.linspace(0.0, 1.0, 4001, dtype=float)
     x = np.full_like(y, x_mid)
     weight = np.asarray(bench.traction_weight(x, y), dtype=float)
-    integral = float(np.trapezoid(weight, y))
+    integral = float(_TRAPEZOID(weight, y))
     assert 0.9999 <= integral <= 1.0001
 
     for yy in (0.15, 0.5, 0.85):

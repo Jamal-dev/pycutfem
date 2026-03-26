@@ -64,6 +64,8 @@ class Expression:
             return other.__rmul__(self)
         if not isinstance(other, Expression):
             other = Constant(other)
+        if _should_promote_product_to_outer(self, other):
+            return Outer(self, other)
         return Prod(self, other)
 
     def __rmul__(self, other):
@@ -73,6 +75,8 @@ class Expression:
             return other.__rmul__(self)
         if not isinstance(other, Expression):
             other = Constant(other)
+        if _should_promote_product_to_outer(other, self):
+            return Outer(other, self)
         return Prod(other, self)
 
     def __truediv__(self, other):
@@ -164,13 +168,13 @@ def _expr_shape(expr) -> tuple[int, ...]:
         return tuple(expr.shape)
     if isinstance(expr, ElementWiseConstant):
         return tuple(expr.shape)
+    if isinstance(expr, (FacetNormal, VectorFunction, VectorTrialFunction, VectorTestFunction,
+                         HdivFunction, HdivTrialFunction, HdivTestFunction)):
+        return (int(expr.num_components),)
     if isinstance(expr, (Function, TrialFunction, TestFunction, NormalComponent, Derivative, DivOperation, Laplacian,
                          HdivFunctionComponent, HdivTrialFunctionComponent, HdivTestFunctionComponent,
                          PositivePart, Heaviside, Log, Inner, Trace, Determinant)):
         return ()
-    if isinstance(expr, (FacetNormal, VectorFunction, VectorTrialFunction, VectorTestFunction,
-                         HdivFunction, HdivTrialFunction, HdivTestFunction)):
-        return (int(expr.num_components),)
     if isinstance(expr, (Pos, Neg, Restriction)):
         return _expr_shape(expr.operand)
     if isinstance(expr, Side):
@@ -181,9 +185,9 @@ def _expr_shape(expr) -> tuple[int, ...]:
         return _expr_shape(expr.u_pos)
     if isinstance(expr, Transpose):
         shape = _expr_shape(expr.A)
-        if len(shape) == 2:
-            return (shape[1], shape[0])
-        return shape
+        if len(shape) != 2:
+            raise TypeError(f"Transpose is only defined for rank-2 tensors, got shape {shape!r}.")
+        return (shape[1], shape[0])
     if isinstance(expr, Grad):
         base_shape = _expr_shape(expr.operand)
         if base_shape == ():
@@ -217,9 +221,7 @@ def _expr_shape(expr) -> tuple[int, ...]:
             return shape_b
         if shape_b == ():
             return shape_a
-        if shape_a == shape_b:
-            return shape_a
-        raise TypeError(f"Cannot infer shape for Prod with {shape_a!r}/{shape_b!r}.")
+        return shape_a + shape_b
     if isinstance(expr, Div):
         shape_a = _expr_shape(expr.a)
         shape_b = _expr_shape(expr.b)
@@ -233,8 +235,10 @@ def _expr_shape(expr) -> tuple[int, ...]:
     if isinstance(expr, Dot):
         shape_a = _expr_shape(expr.a)
         shape_b = _expr_shape(expr.b)
-        if not shape_a or not shape_b:
-            raise TypeError(f"Dot expects non-scalar operands, got {shape_a!r}/{shape_b!r}.")
+        if shape_a == ():
+            return shape_b
+        if shape_b == ():
+            return shape_a
         if shape_a[-1] != shape_b[0]:
             raise TypeError(f"Dot shape mismatch: {shape_a!r} vs {shape_b!r}.")
         return shape_a[:-1] + shape_b[1:]
@@ -252,6 +256,19 @@ def _scalar_sum(terms):
     return total if total is not None else Constant(0.0)
 
 
+def _should_promote_product_to_outer(a, b) -> bool:
+    """
+    Tensor-calculus multiplication rule:
+    non-scalar * non-scalar -> tensor product.
+    """
+    try:
+        shape_a = _expr_shape(a)
+        shape_b = _expr_shape(b)
+    except Exception:
+        return False
+    return shape_a != () and shape_b != ()
+
+
 def _slice_constant(value, index):
     arr = np.asarray(value)
     sliced = arr[index]
@@ -264,8 +281,10 @@ def _dot_component(a, b, index):
     idx = _normalize_index(index)
     shape_a = _expr_shape(a)
     shape_b = _expr_shape(b)
-    if not shape_a or not shape_b:
-        raise IndexError("Scalar dot result is not subscriptable.")
+    if shape_a == ():
+        return (a * b)[idx if len(idx) > 1 else idx[0]]
+    if shape_b == ():
+        return (a * b)[idx if len(idx) > 1 else idx[0]]
     if shape_a[-1] != shape_b[0]:
         raise TypeError(f"Dot shape mismatch: {shape_a!r} vs {shape_b!r}.")
     result_shape = shape_a[:-1] + shape_b[1:]
@@ -315,16 +334,20 @@ def _index_expression(expr, index):
         key = idx if len(idx) > 1 else idx[0]
         return expr.a[key] - expr.b[key]
     if isinstance(expr, Prod):
-        key = idx if len(idx) > 1 else idx[0]
         shape_a = _expr_shape(expr.a)
         shape_b = _expr_shape(expr.b)
         if shape_a == ():
+            key = idx if len(idx) > 1 else idx[0]
             return expr.a * expr.b[key]
         if shape_b == ():
+            key = idx if len(idx) > 1 else idx[0]
             return expr.a[key] * expr.b
-        if shape_a == shape_b:
-            return expr.a[key] * expr.b[key]
-        raise TypeError(f"Cannot index Prod with operand shapes {shape_a!r}/{shape_b!r}.")
+        split = len(shape_a)
+        a_idx = idx[:split]
+        b_idx = idx[split:]
+        a_key = a_idx if len(a_idx) > 1 else a_idx[0]
+        b_key = b_idx if len(b_idx) > 1 else b_idx[0]
+        return expr.a[a_key] * expr.b[b_key]
     if isinstance(expr, Div):
         key = idx if len(idx) > 1 else idx[0]
         shape_b = _expr_shape(expr.b)
@@ -378,6 +401,9 @@ class Transpose(Expression):
     """Symbolic transpose (for 2-D tensors)."""
     def __init__(self, A: Expression):
         super().__init__()
+        shape = _expr_shape(A)
+        if len(shape) != 2:
+            raise TypeError(f"Transpose is only defined for rank-2 tensors, got shape {shape!r}.")
         self.A = A
     def __repr__(self):
         return f"Transpose({self.A!r})"

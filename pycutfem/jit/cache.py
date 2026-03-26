@@ -11,10 +11,12 @@ from pycutfem.core import mesh
 from pycutfem.jit.ir import LoadAnalytic
 
 # Bump when generated kernel source semantics/signature change.
-CODEGEN_ABI = "2026-01-26-abi-outer-3-divbasis-runtime"
+# 2026-03-26 invalidates stale JIT kernels after the Hessian push-forward
+# source change that removes the remaining contiguity warning path.
+CODEGEN_ABI = "2026-03-26-abi-dot-product-ghost-layout-v12"
 
 
-def _resolve_cache_dir() -> Path:
+def _resolve_cache_dir(override: str | os.PathLike[str] | None = None) -> Path:
     """
     Resolve a writable cache root for generated kernel modules.
 
@@ -24,15 +26,18 @@ def _resolve_cache_dir() -> Path:
     """
     candidates: list[Path] = []
 
-    root = os.environ.get("PYCUTFEM_CACHE_DIR", "")
-    if root:
-        candidates.append(Path(root))
+    if override is not None:
+        candidates.append(Path(override))
     else:
-        xdg = os.environ.get("XDG_CACHE_HOME", "")
-        if xdg:
-            candidates.append(Path(xdg) / "pycutfem_jit")
+        root = os.environ.get("PYCUTFEM_CACHE_DIR", "")
+        if root:
+            candidates.append(Path(root))
         else:
-            candidates.append(Path.home() / ".cache" / "pycutfem_jit")
+            xdg = os.environ.get("XDG_CACHE_HOME", "")
+            if xdg:
+                candidates.append(Path(xdg) / "pycutfem_jit")
+            else:
+                candidates.append(Path.home() / ".cache" / "pycutfem_jit")
 
     candidates.append(Path(tempfile.gettempdir()) / "pycutfem_jit")
 
@@ -62,10 +67,12 @@ class KernelCache:
     get_kernel(ir_sequence, codegen) -> (callable kernel, param_order list)
     """
 
-    _CACHE_DIR = _resolve_cache_dir()
+    _CACHE_DIR: Path | None = None
 
     def __init__(self) -> None:
         self.in_memory_cache: Dict[str, Tuple[Any, List[str]]] = {}
+        override = getattr(type(self), "_CACHE_DIR", None)
+        self._cache_dir = _resolve_cache_dir(override)
 
     # ------------------------------------------------------------------
     # public API
@@ -83,7 +90,7 @@ class KernelCache:
             return self.in_memory_cache[ir_hash]
 
         module_name = f"_pycutfem_kernel_{ir_hash}"
-        source_file = self._CACHE_DIR / f"{module_name}.py"
+        source_file = self._cache_dir / f"{module_name}.py"
 
         # ------------------------------------------------------------------
         # compile if source does not exist

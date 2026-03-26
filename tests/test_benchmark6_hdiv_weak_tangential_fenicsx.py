@@ -33,7 +33,11 @@ def test_benchmark6_hdiv_weak_tangential_nitsche_supg_matches_fenicsx(tmp_path):
             "COMP_FENICS_HDIV_TANGENTIAL_GAMMA": "20.0",
             "COMP_FENICS_HDIV_TANGENTIAL_METHOD": "nitsche",
             "COMP_FENICS_V_SUPG": "0.5",
-            "COMP_FENICS_V_SUPG_MODE": "residual",
+            # FEniCSx cannot assemble the RT strong-residual form used by the
+            # residual SUPG variant here because it requires unsupported
+            # higher-order reference-gradient wrapping on this H(div) path.
+            # Keep this cross-check on the supported streamline SUPG form.
+            "COMP_FENICS_V_SUPG_MODE": "streamline",
             "COMP_FENICS_TERMS": "Biofilm total residual,Biofilm total jacobian",
             "COMP_FENICS_SPARSE_COMPARE": "1",
             "COMP_FENICS_WRITE_XLSX": "0",
@@ -60,4 +64,4 @@ def test_benchmark6_hdiv_weak_tangential_nitsche_supg_matches_fenicsx(tmp_path):
     assert "Biofilm total jacobian [backend=python]" in output, output
     assert "Residual vector for 'Biofilm total residual [backend=python]' is numerically equivalent." in output, output
     assert "Jacobian matrix for 'Biofilm total jacobian [backend=python]' is numerically equivalent." in output, output
-    assert "❌ Failed tests:     0" in output, output
+    assert "❌ OVERALL Failed tests:     0" in output, output

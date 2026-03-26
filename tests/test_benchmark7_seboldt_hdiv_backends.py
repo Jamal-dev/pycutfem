@@ -239,6 +239,41 @@ def _assemble_benchmark7_hdiv_div_warmup(backend: str) -> np.ndarray:
     return warmup.toarray()
 
 
+def _assemble_benchmark7_momentum_pressure_alpha_term(backend: str) -> np.ndarray:
+    problem = _create_problem(
+        Lx=1.0,
+        Ly=1.5,
+        nx=2,
+        ny=3,
+        poly_order=2,
+        pressure_order=1,
+        scalar_order=1,
+        fluid_space="hdiv",
+        fluid_hdiv_order=0,
+        enable_phi_evolution=False,
+    )
+    _initialize_benchmark7_state(problem)
+
+    phi_b = Constant(0.5)
+    alpha_k = problem["alpha_k"]
+    dalpha = problem["dalpha"]
+    p_k = problem["p_k"]
+    v_test = problem["v_test"]
+
+    dC_k = -(1.0 - phi_b) * dalpha
+    grad_dC_k = -(1.0 - phi_b) * grad(dalpha)
+    d_div_C_vtest = dC_k * div(v_test) + dot(grad_dC_k, v_test)
+    jacobian_form = -(p_k * d_div_C_vtest) * dx(metadata={"q": 6})
+
+    jacobian, _ = assemble_form(
+        Equation(jacobian_form, None),
+        dof_handler=problem["dh"],
+        bcs=[],
+        backend=backend,
+    )
+    return jacobian.toarray()
+
+
 @pytest.mark.parametrize("backend", ("jit", "cpp"))
 def test_benchmark7_seboldt_hdiv_mass_and_total_forms_match_python(backend, monkeypatch, tmp_path):
     monkeypatch.setenv("PYCUTFEM_CACHE_DIR", str(tmp_path / f"jit_cache_{backend}"))
@@ -286,6 +321,23 @@ def test_benchmark7_full_hdiv_pressure_block_matches_python_on_1x1(backend, monk
 
     np.testing.assert_allclose(jac, jac_ref, rtol=1.0e-9, atol=1.0e-9)
     np.testing.assert_allclose(res, res_ref, rtol=1.0e-9, atol=1.0e-9)
+
+
+@pytest.mark.parametrize("backend", ("jit", "cpp"))
+def test_benchmark7_momentum_pressure_alpha_term_matches_python(backend, monkeypatch, tmp_path):
+    monkeypatch.setenv("PYCUTFEM_CACHE_DIR", str(tmp_path / f"jit_cache_pressure_alpha_{backend}"))
+    if backend == "cpp":
+        monkeypatch.setenv("PYCUTFEM_JIT_BACKEND", "cpp")
+        monkeypatch.setenv("PYCUTFEM_CPP_FAST_COMPILE", "1")
+        monkeypatch.setenv("PYCUTFEM_CPP_FAST_OPT_LEVEL", "0")
+        monkeypatch.setenv("PYCUTFEM_CPP_FAST_MARCH_NATIVE", "0")
+    else:
+        monkeypatch.delenv("PYCUTFEM_JIT_BACKEND", raising=False)
+
+    jac_ref = _assemble_benchmark7_momentum_pressure_alpha_term("python")
+    jac = _assemble_benchmark7_momentum_pressure_alpha_term(backend)
+
+    np.testing.assert_allclose(jac, jac_ref, rtol=1.0e-9, atol=1.0e-9)
 
 
 def test_hdiv_ref_table_cache_respects_active_layout(monkeypatch, tmp_path):

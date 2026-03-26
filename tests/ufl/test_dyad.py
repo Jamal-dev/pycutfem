@@ -69,6 +69,48 @@ def test_dyad_vectors_matches_backends_and_expected() -> None:
         pytest.skip(f"CPP backend check failed or unavailable: {exc}")
 
 
+def test_vector_multiplication_uses_dyad_semantics() -> None:
+    nodes, elems, edges, corners = structured_quad(1.0, 1.0, nx=1, ny=1, poly_order=1)
+    mesh = Mesh(
+        nodes=nodes,
+        element_connectivity=elems,
+        edges_connectivity=edges,
+        elements_corner_nodes=corners,
+        element_type="quad",
+        poly_order=1,
+    )
+    me = MixedElement(mesh, field_specs={"u": 1})
+    dh = DofHandler(me, method="cg")
+
+    a = Constant(np.array([1.0, 2.0], dtype=float))
+    b = Constant(np.array([3.0, 4.0], dtype=float))
+    e0 = Constant(np.array([1.0, 0.0], dtype=float))
+    e1 = Constant(np.array([0.0, 1.0], dtype=float))
+
+    A = a * b
+
+    expr = (
+        dot(e0, dot(A, e0))
+        + 2.0 * dot(e0, dot(A, e1))
+        + 3.0 * dot(e1, dot(A, e0))
+        + 4.0 * dot(e1, dot(A, e1))
+    ) * dx(metadata={"q": 4})
+
+    expected = 61.0
+
+    val_py = _assemble_scalar(dh, expr, backend="python")
+    assert np.allclose(val_py, expected, rtol=1e-12, atol=1e-12)
+
+    val_jit = _assemble_scalar(dh, expr, backend="jit")
+    assert np.allclose(val_jit, expected, rtol=1e-12, atol=1e-12)
+
+    try:
+        val_cpp = _assemble_scalar(dh, expr, backend="cpp")
+        assert np.allclose(val_cpp, expected, rtol=1e-12, atol=1e-12)
+    except Exception as exc:  # noqa: BLE001
+        pytest.skip(f"CPP backend check failed or unavailable: {exc}")
+
+
 def test_dyad_matrix_dot_matrix_matches_expected() -> None:
     nodes, elems, edges, corners = structured_quad(1.0, 1.0, nx=1, ny=1, poly_order=1)
     mesh = Mesh(

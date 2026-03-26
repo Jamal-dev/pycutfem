@@ -87,8 +87,10 @@ def test_scalar_trial_times_function_gradient_stays_gradient_valued():
 
     assert isinstance(result, GradOpInfo)
     assert result.role == "trial"
+    # Canonical scalar-gradient basis storage is now (d, n), not the legacy
+    # singleton-wrapped (1, n, d) carrier.
     expected = np.array(
-        [[[6.0, -8.0], [-3.0, 4.0], [1.5, -2.0]]],
+        [[6.0, -3.0, 1.5], [-8.0, 4.0, -2.0]],
         dtype=float,
     )
     np.testing.assert_allclose(result.data, expected)

@@ -18,7 +18,6 @@ from pycutfem.ufl.analytic import y as y_ana
 from pycutfem.ufl.forms import BoundaryCondition, assemble_form
 from pycutfem.core.levelset import AffineLevelSet
 from pycutfem.io.visualization import plot_mesh_2
-import matplotlib.pyplot as plt
 from pycutfem.ufl.compilers import FormCompiler
 
 from tests.subprocess_utils import run_module_func_in_subprocess
@@ -59,8 +58,7 @@ def _build_quad2_problem():
     mesh.classify_edges(level_set)
 
     ghost = mesh.edge_bitset('ghost')
-    fig, ax = plt.subplots(figsize=(10, 8))
-    # plot_mesh_2(mesh, ax=ax, level_set=level_set, show=True, 
+    # plot_mesh_2(mesh, level_set=level_set, show=True,
     #           plot_nodes=False, elem_tags=True, edge_colors=True)
     assert ghost.cardinality() > 0, "Mesh should contain ghost edges for the test."
     # This call now works because of the fixes in visualization.py

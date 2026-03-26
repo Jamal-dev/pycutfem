@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
+import logging
 import os
 import sysconfig
 from pathlib import Path
@@ -120,6 +123,14 @@ def _compile_args_for_mode(mode: str) -> list[str]:
     args = [
         opt_flag,
         "-std=c++17",
+        # Keep diagnostics compact in normal runs; failures still show the first
+        # relevant errors and the generated source path. Suppress warning spam
+        # from Eigen headers and generated-but-unused temporaries so review logs
+        # only show real compile failures.
+        "-w",
+        "-fdiagnostics-color=never",
+        "-fno-diagnostics-show-caret",
+        "-fmax-errors=5",
         # pybind11 enables subinterpreter support on Python >= 3.12 by default,
         # which adds per-module thread-specific storage keys. The C++ backend
         # compiles many kernels as distinct extension modules; with subinterpreter
@@ -127,6 +138,12 @@ def _compile_args_for_mode(mode: str) -> list[str]:
         # during module import. Disable it for robustness in long-running runs.
         "-DPYBIND11_HAS_SUBINTERPRETER_SUPPORT=0",
     ]
+
+    if mode == "fast" and opt_flag == "-O0":
+        # Conda toolchains often inject -D_FORTIFY_SOURCE=2 globally; under -O0 that
+        # produces noisy preprocessor warnings on every kernel compile. Undefine it for
+        # fast review builds so the logs stay signal-rich.
+        args.extend(["-U_FORTIFY_SOURCE", "-D_FORTIFY_SOURCE=0"])
 
     # Performance-first default: enable `-march=native` unless explicitly disabled.
     # (This is the single largest win for Eigen-heavy kernels.)
@@ -235,19 +252,42 @@ def compile_extension(
             super().build_extension(ext)
 
     def _run_build(ext: Extension, tmp: Path) -> None:
-        setup(
-            name=module_name,
-            ext_modules=[ext],
-            cmdclass={"build_ext": _BuildExt},
-            script_args=[
-                "build_ext",
-                "--build-temp",
-                str(tmp),
-                "--build-lib",
-                str(build_dir),
-                "--quiet",
-            ],
-        )
+        script_args = [
+            "build_ext",
+            "--build-temp",
+            str(tmp),
+            "--build-lib",
+            str(build_dir),
+            "--quiet",
+        ]
+        if _bool_env("PYCUTFEM_CPP_VERBOSE", default=False):
+            setup(
+                name=module_name,
+                ext_modules=[ext],
+                cmdclass={"build_ext": _BuildExt},
+                script_args=script_args,
+            )
+            return
+
+        out_buf = io.StringIO()
+        err_buf = io.StringIO()
+        prev_disable = logging.root.manager.disable
+        try:
+            logging.disable(logging.INFO)
+            with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
+                setup(
+                    name=module_name,
+                    ext_modules=[ext],
+                    cmdclass={"build_ext": _BuildExt},
+                    script_args=script_args,
+                )
+        except Exception:
+            captured = (out_buf.getvalue() + err_buf.getvalue()).strip()
+            if captured:
+                print(captured, flush=True)
+            raise
+        finally:
+            logging.disable(prev_disable)
 
     def _without_flag(args: list[str], flag: str) -> list[str]:
         return [a for a in args if a != flag]
@@ -295,7 +335,10 @@ def compile_extension(
         try:
             _run_build(_make_ext(args, link_args), tmp_build)
             succeeded = True
-            if label != compile_mode_resolved:
+            if label != compile_mode_resolved and (
+                _bool_env("PYCUTFEM_CPP_VERBOSE", default=False)
+                or _bool_env("PYCUTFEM_CPP_WARN_FALLBACK", default=False)
+            ):
                 print(
                     f"[pycutfem][cpp] WARNING: kernel {module_name} build fell back to flags: {' '.join(args)}",
                     flush=True,

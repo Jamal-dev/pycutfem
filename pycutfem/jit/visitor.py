@@ -308,6 +308,9 @@ class IRGenerator:
                 self._visit(DivOperation(op.operand), side=side)
                 self._emit_restriction(op.domain, side, op.operand)
                 return
+            if isinstance(op, UflGrad):
+                self._visit(UFLLaplacian(op.operand), side=side)
+                return
             # H(div) divergence is tabulated directly (no Grad() + Div()).
             if isinstance(op, (HdivTestFunction, HdivTrialFunction, HdivFunction)):
                 self._visit(op, side=side)
@@ -343,6 +346,52 @@ class IRGenerator:
                 self._visit(Derivative(operand.u_pos, *deriv_order),side='+')
                 self._visit(Derivative(operand.u_neg, *deriv_order),side='-')
                 self.ir_sequence.append(BinaryOp(op_symbol='-'))
+                return
+
+            if isinstance(operand, DivOperation):
+                div_operand = operand.operand
+                if isinstance(div_operand, Restriction):
+                    self._visit(Derivative(DivOperation(div_operand.operand), *deriv_order), side=side)
+                    self._emit_restriction(div_operand.domain, side, div_operand.operand)
+                    return
+                if isinstance(div_operand, Pos):
+                    self._visit(Derivative(DivOperation(div_operand.operand), *deriv_order), side='+')
+                    return
+                if isinstance(div_operand, Neg):
+                    self._visit(Derivative(DivOperation(div_operand.operand), *deriv_order), side='-')
+                    return
+                if isinstance(div_operand, Jump):
+                    self._visit(Derivative(DivOperation(div_operand.u_pos), *deriv_order), side='+')
+                    self._visit(Derivative(DivOperation(div_operand.u_neg), *deriv_order), side='-')
+                    self.ir_sequence.append(BinaryOp(op_symbol='-'))
+                    return
+                if isinstance(div_operand, (HdivTestFunction, HdivTrialFunction, HdivFunction)):
+                    raise TypeError("Derivative of H(div) divergence is not supported in the JIT visitor.")
+
+                base_shape = _expr_shape(div_operand)
+                if len(base_shape) != 1:
+                    raise TypeError(
+                        f"Derivative of Div expects a vector-valued operand, got shape {base_shape!r}."
+                    )
+                ncomp = int(base_shape[0])
+                if ncomp <= 0 or ncomp > len(deriv_order):
+                    raise TypeError(
+                        f"Derivative of Div only supports up to {len(deriv_order)} spatial components, got {ncomp}."
+                    )
+
+                for comp in range(ncomp):
+                    ox, oy = deriv_order
+                    if comp == 0:
+                        ox += 1
+                    elif comp == 1:
+                        oy += 1
+                    else:
+                        raise TypeError(
+                            f"Derivative of Div is only implemented for 2-D operands; got component {comp}."
+                        )
+                    self._visit(Derivative(div_operand[comp], ox, oy), side=side)
+                    if comp > 0:
+                        self.ir_sequence.append(BinaryOp(op_symbol='+'))
                 return
 
             if isinstance(operand, (Constant, ElementWiseConstant)):

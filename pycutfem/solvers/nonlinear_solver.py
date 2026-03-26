@@ -990,7 +990,8 @@ class NewtonSolver:
         # --- compile one kernel list for K, one for F ----------------------
         _profile_setup = os.getenv("PYCUTFEM_PROFILE_SETUP", "").lower() in {"1", "true", "yes"}
         _t_setup0 = time.perf_counter() if _profile_setup else 0.0
-        parallel_compile = os.getenv("PYCUTFEM_PARALLEL_COMPILE", "1").lower() not in {"0", "false", "no"}
+        parallel_default = "0" if self.backend == "cpp" else "1"
+        parallel_compile = os.getenv("PYCUTFEM_PARALLEL_COMPILE", parallel_default).lower() not in {"0", "false", "no"}
         _start_numba_reduced_pattern_precompile()
         _t_compile0 = time.perf_counter()
         if self._is_jit_backend():

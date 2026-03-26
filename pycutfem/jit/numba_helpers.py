@@ -133,8 +133,9 @@ def contract_first_first(a, b, dtype):
     if b.ndim == 1:
         # b is a 1D vector, shape (k,)
         b_flat = np.ascontiguousarray(b)
+        a_flat_t = np.ascontiguousarray(a_flat.T)
         # dot_flat is (m*n, k) @ (k,) -> (m*n,)
-        dot_flat = a_flat.T @ b_flat
+        dot_flat = a_flat_t @ b_flat
         # out_shape is (m, n)
         out_shape = a.shape[1:]
         # (m*n,).reshape(m, n) -> Correct
@@ -155,7 +156,8 @@ def dot_mixed_const(a, b, dtype):
     k = a.shape[0]
     nm = a.shape[1] * a.shape[2]
     a2 = np.ascontiguousarray(a).reshape(k, nm)
-    return (a2.T @ np.ascontiguousarray(b)).reshape(a.shape[1], a.shape[2])
+    a2_t = np.ascontiguousarray(a2.T)
+    return (a2_t @ np.ascontiguousarray(b)).reshape(a.shape[1], a.shape[2])
 
 
 
@@ -195,10 +197,25 @@ def dot_vector_trial_grad_test(trial_vec, grad_test, dtype):
 @numba.njit(cache=True)
 def dot_grad_basis_vector(grad_basis, vec, dtype):
     """
-    Gradient basis (k, n, d) dotted with spatial vector (d,) -> (k, n).
-    Vectorized via (k*n, d) @ (d,)
+    Gradient basis dotted with spatial vector.
+
+    Supports:
+      (k, n, d) -> (k, n)
+      (d, n)    -> (1, n)
+      (n, d)    -> (1, n)
     """
     if DEBUG: print("dot_grad_basis_vector")
+    if grad_basis.ndim == 2:
+        if grad_basis.shape[0] == vec.shape[0]:
+            res = np.empty((1, grad_basis.shape[1]), dtype=dtype)
+            grad_basis_t = np.ascontiguousarray(grad_basis.T)
+            res[0] = grad_basis_t @ np.ascontiguousarray(vec)
+            return res
+        if grad_basis.shape[1] == vec.shape[0]:
+            res = np.empty((1, grad_basis.shape[0]), dtype=dtype)
+            res[0] = np.ascontiguousarray(grad_basis) @ np.ascontiguousarray(vec)
+            return res
+        raise ValueError("dot_grad_basis_vector: incompatible rank-2 basis/vector shapes")
     k, n, d = grad_basis.shape
     G = np.ascontiguousarray(grad_basis).reshape(k * n, d)
     out = G @ np.ascontiguousarray(vec)
@@ -212,6 +229,17 @@ def vector_dot_grad_basis(vec, grad_basis, dtype):
     Returns (1, n) for scalar fields or (d, n) when len(vec)==k.
     """
     if DEBUG: print("vector_dot_grad_basis")
+    if grad_basis.ndim == 2:
+        if grad_basis.shape[0] == vec.shape[0]:
+            res = np.empty((1, grad_basis.shape[1]), dtype=dtype)
+            grad_basis_t = np.ascontiguousarray(grad_basis.T)
+            res[0] = grad_basis_t @ np.ascontiguousarray(vec)
+            return res
+        if grad_basis.shape[1] == vec.shape[0]:
+            res = np.empty((1, grad_basis.shape[0]), dtype=dtype)
+            res[0] = np.ascontiguousarray(grad_basis) @ np.ascontiguousarray(vec)
+            return res
+        raise ValueError("vector_dot_grad_basis: incompatible rank-2 basis/vector shapes")
     k, n, d = grad_basis.shape
     vlen = vec.shape[0]
     if k == 1 and vlen == d:
@@ -230,8 +258,8 @@ def vector_dot_grad_basis(vec, grad_basis, dtype):
 @numba.njit(cache=True)
 def vector_dot_grad_value(vec_basis, grad_value, dtype):
     """
-    Vector basis (k, n) dotted with grad(value) (k, d) -> (n, d).
-    res[j, d] = sum_i vec_basis[i, j] * grad_value[i, d]
+    Vector basis (k, n) dotted with grad(value) (k, d) -> (d, n).
+    res[p, j] = sum_i vec_basis[i, j] * grad_value[i, p]
     """
     if DEBUG: print("vector_dot_grad_value")
     k, n = vec_basis.shape
@@ -240,17 +268,25 @@ def vector_dot_grad_value(vec_basis, grad_value, dtype):
         g = np.ascontiguousarray(grad_value[0])
         V = np.ascontiguousarray(vec_basis)
         for j in range(n):
-            res[0, j] = np.dot(V[:, j], g)
+            col = np.ascontiguousarray(V[:, j])
+            acc = 0.0
+            for i in range(k):
+                acc += col[i] * g[i]
+            res[0, j] = acc
         return res
     if grad_value.shape[0] != k:
         raise ValueError("vector·grad value: incompatible shapes")
     d = grad_value.shape[1]
-    res = np.empty((n, d), dtype=dtype)
+    res = np.empty((d, n), dtype=dtype)
     V = np.ascontiguousarray(vec_basis)   # (k, n)
     G = np.ascontiguousarray(grad_value)  # (k, d)
     for j in range(n):
-        # (k,) dot (k, d) -> (d,)
-        res[j, :] = V[:, j].T @ G
+        col = np.ascontiguousarray(V[:, j])
+        for p in range(d):
+            acc = 0.0
+            for i in range(k):
+                acc += col[i] * G[i, p]
+            res[p, j] = acc
     return res
 
 
@@ -294,7 +330,7 @@ def dot_grad_value_with_grad_basis(grad_value, grad_basis, dtype):
 def dot_vec_vec(vec_a, vec_b, dtype):
     """Dot product between two vectors."""
     if DEBUG: print("dot_vec_vec")
-    return float(np.dot(vec_a, vec_b))
+    return float(np.dot(np.ascontiguousarray(vec_a), np.ascontiguousarray(vec_b)))
 
 @numba.njit(cache=True)
 def dot_value_with_grad(value_vec, grad_mat, dtype):
@@ -319,7 +355,7 @@ def dot_grad_func_trial_vec(grad_func, trial_vec, dtype):
     Compute grad(Function) @ Trial vector basis.
     """
     if DEBUG: print("dot_grad_func_trial_vec")
-    return grad_func @ trial_vec
+    return np.ascontiguousarray(grad_func) @ np.ascontiguousarray(trial_vec)
 
 
 @numba.njit(cache=True)
@@ -330,7 +366,7 @@ def dot_trial_vec_grad_func(trial_vec, grad_func, dtype):
     if DEBUG: print("dot_trial_vec_grad_func")
     if grad_func.shape[0] == 1 and trial_vec.shape[0] == grad_func.shape[1]:
         return np.ascontiguousarray(grad_func) @ np.ascontiguousarray(trial_vec)
-    return grad_func.T.copy() @ trial_vec
+    return np.ascontiguousarray(grad_func.T.copy()) @ np.ascontiguousarray(trial_vec)
 
 
 @numba.njit(cache=True)
@@ -339,7 +375,7 @@ def dot_vec_vec(vec_a, vec_b, dtype):
     Dot product between two vectors.
     """
     if DEBUG: print("dot_vec_vec")
-    return np.dot(vec_a, vec_b)
+    return np.dot(np.ascontiguousarray(vec_a), np.ascontiguousarray(vec_b))
 
 
 @numba.njit(cache=True)
@@ -348,7 +384,7 @@ def dot_grad_grad_value(grad_a, grad_b, dtype):
     Compute grad(value) @ grad(value).
     """
     if DEBUG: print("dot_grad_grad_value")
-    return grad_a @ grad_b
+    return np.ascontiguousarray(grad_a) @ np.ascontiguousarray(grad_b)
 
 
 
@@ -485,6 +521,25 @@ def transpose_matrix(matrix, dtype):
 
 
 @numba.njit(cache=True)
+def swap_mixed_basis_tensor(tensor, dtype):
+    """
+    Swap the two basis axes of a mixed tensor.
+    Supports:
+      (n_test, n_trial) <-> (n_trial, n_test)
+      (k, n_test, n_trial) <-> (k, n_trial, n_test)
+    """
+    if tensor.ndim == 2:
+        return np.ascontiguousarray(tensor.T.copy())
+    if tensor.ndim == 3:
+        k_dim, n0, n1 = tensor.shape
+        res = np.empty((k_dim, n1, n0), dtype=dtype)
+        for i in range(k_dim):
+            res[i] = np.ascontiguousarray(tensor[i].T.copy())
+        return res
+    raise ValueError(f"swap_mixed_basis_tensor: unsupported ndim={tensor.ndim}")
+
+
+@numba.njit(cache=True)
 def scatter_tensor_to_union(values, mapping, n_union, dtype):
     """
     Scatter local rows (m, ...) into a union-sized tensor (n_union, ...).
@@ -524,7 +579,7 @@ def pushforward_grad_to_union(d10, d01, j_inv, mapping, n_union, s0, s1, dtype):
     Push forward (d10,d01) with J^{-1} and scatter to the union layout.
     """
     if DEBUG: print("pushforward_grad_to_union")
-    grad_loc = np.stack((d10, d01), axis=1) @ j_inv.copy()
+    grad_loc = np.ascontiguousarray(np.stack((d10, d01), axis=1)) @ np.ascontiguousarray(j_inv.copy())
     if grad_loc.shape[0] == n_union:
         return grad_loc
     return scatter_tensor_to_union(grad_loc[s0:s1], mapping, n_union, dtype)
@@ -538,6 +593,8 @@ def compute_physical_hessian(d20, d11, d02, d10, d01, j_inv, hx, hy, dtype):
     if DEBUG: print("compute_physical_hessian")
     nloc = d20.shape[0]
     d_dim = j_inv.shape[0]
+    j_inv_c = np.ascontiguousarray(j_inv)
+    j_inv_t = np.ascontiguousarray(j_inv.T.copy())
     res = np.zeros((nloc, d_dim, d_dim), dtype=dtype)
     for j in range(nloc):
         href00 = d20[j]
@@ -548,7 +605,7 @@ def compute_physical_hessian(d20, d11, d02, d10, d01, j_inv, hx, hy, dtype):
         href[0, 1] = href01
         href[1, 0] = href01
         href[1, 1] = href11
-        core = j_inv.T @ (href @ j_inv)
+        core = j_inv_t @ (np.ascontiguousarray(href) @ j_inv_c)
         res[j] = core + d10[j] * hx + d01[j] * hy
     return res
 
@@ -560,6 +617,8 @@ def compute_physical_laplacian(d20, d11, d02, d10, d01, j_inv, hx, hy, dtype):
     """
     if DEBUG: print("compute_physical_laplacian")
     nloc = d20.shape[0]
+    j_inv_c = np.ascontiguousarray(j_inv)
+    j_inv_t = np.ascontiguousarray(j_inv.T.copy())
     res = np.zeros(nloc, dtype=dtype)
     for j in range(nloc):
         href = np.zeros((2, 2), dtype=dtype)
@@ -567,7 +626,7 @@ def compute_physical_laplacian(d20, d11, d02, d10, d01, j_inv, hx, hy, dtype):
         href[0, 1] = d11[j]
         href[1, 0] = d11[j]
         href[1, 1] = d02[j]
-        core = j_inv.T @ (href @ j_inv)
+        core = j_inv_t @ (np.ascontiguousarray(href) @ j_inv_c)
         hphys = core + d10[j] * hx + d01[j] * hy
         res[j] = hphys[0, 0] + hphys[1, 1]
     return res
@@ -717,21 +776,44 @@ def pushforward_d4(
 def dot_mass_test_trial(test_vec, trial_vec, dtype):
     """
     Compute Test.T @ Trial for mass matrices.
-    Accepts inputs shaped (n_q, n) or flattened (n,), (1, n); always returns (n, n).
+    Accepts basis/value carriers whose basis axis is the second axis for ndim >= 3.
+    Flattens all non-basis/free axes into the contraction dimension and always returns (n, n).
     """
     if DEBUG: print("dot_mass_test_trial")
-    # Normalize to 2-D with quadrature points along axis 0 and basis along axis 1.
+    # Normalize to 2-D with contraction/free axes along axis 0 and basis along axis 1.
     if test_vec.ndim == 1:
         test_arr = test_vec.reshape(1, test_vec.shape[0])
     elif test_vec.ndim == 2:
-        test_arr = test_vec
+        test_arr = np.ascontiguousarray(test_vec)
+    elif test_vec.ndim == 3:
+        # Basis carriers use layout (free0, n, free1).
+        test_arr = np.ascontiguousarray(test_vec.transpose(0, 2, 1)).reshape(
+            test_vec.shape[0] * test_vec.shape[2],
+            test_vec.shape[1],
+        )
+    elif test_vec.ndim == 4:
+        # Basis tensor carriers use layout (free0, n, free1, free2).
+        test_arr = np.ascontiguousarray(test_vec.transpose(0, 2, 3, 1)).reshape(
+            test_vec.shape[0] * test_vec.shape[2] * test_vec.shape[3],
+            test_vec.shape[1],
+        )
     else:
         raise ValueError(f"dot_mass_test_trial: unsupported test_vec ndim={test_vec.ndim}")
 
     if trial_vec.ndim == 1:
         trial_arr = trial_vec.reshape(1, trial_vec.shape[0])
     elif trial_vec.ndim == 2:
-        trial_arr = trial_vec
+        trial_arr = np.ascontiguousarray(trial_vec)
+    elif trial_vec.ndim == 3:
+        trial_arr = np.ascontiguousarray(trial_vec.transpose(0, 2, 1)).reshape(
+            trial_vec.shape[0] * trial_vec.shape[2],
+            trial_vec.shape[1],
+        )
+    elif trial_vec.ndim == 4:
+        trial_arr = np.ascontiguousarray(trial_vec.transpose(0, 2, 3, 1)).reshape(
+            trial_vec.shape[0] * trial_vec.shape[2] * trial_vec.shape[3],
+            trial_vec.shape[1],
+        )
     else:
         raise ValueError(f"dot_mass_test_trial: unsupported trial_vec ndim={trial_vec.ndim}")
 
@@ -745,14 +827,34 @@ def dot_mass_trial_test(trial_vec, test_vec, dtype):
     if trial_vec.ndim == 1:
         trial_arr = trial_vec.reshape(1, trial_vec.shape[0])
     elif trial_vec.ndim == 2:
-        trial_arr = trial_vec
+        trial_arr = np.ascontiguousarray(trial_vec)
+    elif trial_vec.ndim == 3:
+        trial_arr = np.ascontiguousarray(trial_vec.transpose(0, 2, 1)).reshape(
+            trial_vec.shape[0] * trial_vec.shape[2],
+            trial_vec.shape[1],
+        )
+    elif trial_vec.ndim == 4:
+        trial_arr = np.ascontiguousarray(trial_vec.transpose(0, 2, 3, 1)).reshape(
+            trial_vec.shape[0] * trial_vec.shape[2] * trial_vec.shape[3],
+            trial_vec.shape[1],
+        )
     else:
         raise ValueError(f"dot_mass_trial_test: unsupported trial_vec ndim={trial_vec.ndim}")
 
     if test_vec.ndim == 1:
         test_arr = test_vec.reshape(1, test_vec.shape[0])
     elif test_vec.ndim == 2:
-        test_arr = test_vec
+        test_arr = np.ascontiguousarray(test_vec)
+    elif test_vec.ndim == 3:
+        test_arr = np.ascontiguousarray(test_vec.transpose(0, 2, 1)).reshape(
+            test_vec.shape[0] * test_vec.shape[2],
+            test_vec.shape[1],
+        )
+    elif test_vec.ndim == 4:
+        test_arr = np.ascontiguousarray(test_vec.transpose(0, 2, 3, 1)).reshape(
+            test_vec.shape[0] * test_vec.shape[2] * test_vec.shape[3],
+            test_vec.shape[1],
+        )
     else:
         raise ValueError(f"dot_mass_trial_test: unsupported test_vec ndim={test_vec.ndim}")
 
@@ -765,6 +867,18 @@ def inner_grad_function_grad_test(function_grad, test_grad, dtype):
     Vectorized by flattening (k*d): (n x kd) @ (kd,)
     """
     if DEBUG: print("inner_grad_function_grad_test")
+    if test_grad.ndim == 2:
+        if function_grad.ndim == 2:
+            if function_grad.shape[0] != 1 or function_grad.shape[1] != test_grad.shape[0]:
+                raise ValueError("Gradient(Function) shape incompatible with scalar grad(Test)")
+            test_grad_t = np.ascontiguousarray(test_grad.T)
+            return test_grad_t @ np.ascontiguousarray(function_grad[0])
+        if function_grad.ndim == 1:
+            if function_grad.shape[0] != test_grad.shape[0]:
+                raise ValueError("Gradient(Function) shape incompatible with scalar grad(Test)")
+            test_grad_t = np.ascontiguousarray(test_grad.T)
+            return test_grad_t @ np.ascontiguousarray(function_grad)
+        raise ValueError("Gradient(Function) shape incompatible with scalar grad(Test)")
     k_comps, n_locs, d_dim = test_grad.shape
     if function_grad.shape[0] != k_comps or function_grad.shape[1] != d_dim:
         raise ValueError("Gradient(Function) shape incompatible with grad(Test)")
@@ -792,35 +906,82 @@ def inner_grad_function_grad_test(function_grad, test_grad, dtype):
 @numba.njit(cache=True)
 def basis_dot_const_vector(basis, const_vec, dtype):
     """
+    Rank-1 basis carrier dotted with constant vector -> basis row.
 
-    Basis (k,n) dotted with constant vector (k,) -> (1,n).
-    Vectorized: (n,k) @ (k,)
+    Supports canonical basis storage `(k, n)`, free-last planner views `(n, k)`,
+    and carried rank-1 tensor basis layouts `(k, n, d)` where the basis axis is 1.
     """
     if DEBUG: print("basis_dot_const_vector")
-    res = np.empty((1, basis.shape[1]), dtype=dtype)
-    res[0] = np.ascontiguousarray(basis).T @ np.ascontiguousarray(const_vec)
-    return res
+    vec = np.ravel(np.ascontiguousarray(const_vec))
+    if basis.ndim == 1:
+        if basis.shape[0] != vec.shape[0]:
+            raise ValueError(
+                f"basis_dot_const_vector: incompatible shapes {basis.shape} and {const_vec.shape}"
+            )
+        res = np.empty((1, 1), dtype=dtype)
+        res[0, 0] = basis @ vec
+        return res
+    if basis.ndim == 2:
+        if basis.shape[0] == vec.shape[0]:
+            res = np.empty((1, basis.shape[1]), dtype=dtype)
+            basis_t = np.ascontiguousarray(basis.T)
+            res[0] = basis_t @ vec
+            return res
+        if basis.shape[1] == vec.shape[0]:
+            res = np.empty((1, basis.shape[0]), dtype=dtype)
+            basis_c = np.ascontiguousarray(basis)
+            res[0] = basis_c @ vec
+            return res
+    if basis.ndim == 3:
+        basis_flat = np.ascontiguousarray(basis.transpose(0, 2, 1)).reshape(
+            basis.shape[0] * basis.shape[2],
+            basis.shape[1],
+        )
+        if basis_flat.shape[0] == vec.shape[0]:
+            res = np.empty((1, basis.shape[1]), dtype=dtype)
+            res[0] = basis_flat.T @ vec
+            return res
+    raise ValueError(
+        f"basis_dot_const_vector: incompatible shapes {basis.shape} and {const_vec.shape}"
+    )
 
 
 @numba.njit(cache=True)
 def const_vector_dot_basis(const_vec, basis, dtype):
     """
-    Constant vector (k,) dotted with basis (k,n) -> (1,n).
-    (same as above, order swapped)
+    Constant vector dotted with rank-1 basis carrier -> basis row.
     """
     if DEBUG: print("const_vector_dot_basis")
-    res = np.empty((1, basis.shape[1]), dtype=dtype)
-    res[0] = np.ascontiguousarray(basis).T @ np.ascontiguousarray(const_vec)
-    return res
+    return basis_dot_const_vector(basis, const_vec, dtype)
 
 
 @numba.njit(cache=True)
 def const_vector_dot_basis_1d(const_vec, basis, dtype):
     """
-    Constant vector (k,) dotted with basis (k,n) -> (n,).
+    Constant vector dotted with rank-1 basis carrier -> 1D basis vector.
     """
     if DEBUG: print("const_vector_dot_basis_1d")
-    return np.ascontiguousarray(basis).T @ np.ascontiguousarray(const_vec)
+    vec = np.ravel(np.ascontiguousarray(const_vec))
+    if basis.ndim == 1:
+        if basis.shape[0] == vec.shape[0]:
+            return np.asarray([basis @ vec], dtype=dtype)
+    if basis.ndim == 2:
+        if basis.shape[0] == vec.shape[0]:
+            basis_t = np.ascontiguousarray(basis.T)
+            return basis_t @ vec
+        if basis.shape[1] == vec.shape[0]:
+            basis_c = np.ascontiguousarray(basis)
+            return basis_c @ vec
+    if basis.ndim == 3:
+        basis_flat = np.ascontiguousarray(basis.transpose(0, 2, 1)).reshape(
+            basis.shape[0] * basis.shape[2],
+            basis.shape[1],
+        )
+        if basis_flat.shape[0] == vec.shape[0]:
+            return basis_flat.T @ vec
+    raise ValueError(
+        f"const_vector_dot_basis_1d: incompatible shapes {const_vec.shape} and {basis.shape}"
+    )
 
 
 
@@ -841,11 +1002,10 @@ def scalar_basis_times_vector(scalar_basis, vector_vals, dtype):
 @numba.njit(cache=True)
 def scalar_basis_times_vector_as_grad_tensor(scalar_basis, vector_vals, dtype):
     """
-    Scalar basis (1,n) or (n,) times a spatial vector (d,) -> (1,n,d).
+    Scalar basis (1,n) or (n,) times a spatial vector (d,) -> (d,n).
 
-    This is handy when a term like (grad(scalar_value) * trial_scalar) needs to
-    be added to grad(trial_scalar), which is represented as a grad-tensor with
-    shape (1,n,d) in the JIT codegen.
+    This keeps scalar-gradient promotions in the same carried layout as
+    grad(trial_scalar): a rank-1 spatial object over basis columns.
     """
     if DEBUG:
         print("scalar_basis_times_vector_as_grad_tensor")
@@ -853,10 +1013,7 @@ def scalar_basis_times_vector_as_grad_tensor(scalar_basis, vector_vals, dtype):
         phi = scalar_basis[0]
     else:
         phi = scalar_basis
-    d = int(vector_vals.shape[0])
-    res = np.empty((1, phi.shape[0], d), dtype=dtype)
-    res[0] = np.ascontiguousarray(phi)[:, None] * np.ascontiguousarray(vector_vals)[None, :]
-    return res
+    return np.ascontiguousarray(vector_vals)[:, None] * np.ascontiguousarray(phi)[None, :]
 
 
 
@@ -885,6 +1042,32 @@ def scalar_vector_outer_product(scalar_vals, vector_vals, dtype):
     """
     if DEBUG: print("scalar_vector_outer_product")
     return np.ascontiguousarray(vector_vals)[:, None] * np.ascontiguousarray(scalar_vals)[None, :]
+
+@numba.njit(cache=True)
+def vector_trial_times_scalar_test(trial_vec, test_scalar, dtype):
+    """
+    Vector Trial basis (k,n_trial) times scalar Test basis (1,n_test) or (n_test,)
+    -> mixed carried tensor (k, n_test, n_trial) in canonical test/trial order.
+    """
+    if DEBUG: print("vector_trial_times_scalar_test")
+    phi_test = test_scalar[0] if test_scalar.ndim == 2 else test_scalar
+    return (
+        np.ascontiguousarray(trial_vec)[:, None, :]
+        * np.ascontiguousarray(phi_test)[None, :, None]
+    )
+
+@numba.njit(cache=True)
+def vector_test_times_scalar_trial(test_vec, trial_scalar, dtype):
+    """
+    Vector Test basis (k,n_test) times scalar Trial basis (1,n_trial) or (n_trial,)
+    -> mixed carried tensor (k, n_test, n_trial) in canonical test/trial order.
+    """
+    if DEBUG: print("vector_test_times_scalar_trial")
+    phi_trial = trial_scalar[0] if trial_scalar.ndim == 2 else trial_scalar
+    return (
+        np.ascontiguousarray(test_vec)[:, :, None]
+        * np.ascontiguousarray(phi_trial)[None, None, :]
+    )
 
 @numba.njit(cache=True)
 def vector_vector_outer_product(vec_a, vec_b, dtype):
@@ -1092,6 +1275,37 @@ def vector_dot_hessian_value(vec, hessian, dtype):
 # ---------- “inner(·,·)” building blocks ----------
 
 @numba.njit(cache=True)
+def inner_rank2_value_rank2_basis(value_rank2, basis_rank2, dtype):
+    """
+    Inner product between a rank-2 value tensor ``(r0, r1)`` and a rank-2
+    basis carrier ``(r0, n, r1)`` -> ``(n,)``.
+
+    This is the semantic post-dot path for contractions such as ``inner(H·c, V·c)``
+    and ``inner(c·H, c·V)`` once the shared dot planner has collapsed one Hessian
+    axis and the result is no longer a full Hessian.
+    """
+    if DEBUG: print("inner_rank2_value_rank2_basis")
+    V = np.ascontiguousarray(value_rank2)
+    B = np.ascontiguousarray(basis_rank2)
+    if V.ndim != 2 or B.ndim != 3:
+        raise ValueError("inner_rank2_value_rank2_basis: expected value (r0,r1) and basis (r0,n,r1)")
+    r0, r1 = V.shape
+    if B.shape[0] != r0 or B.shape[2] != r1:
+        raise ValueError("inner_rank2_value_rank2_basis: incompatible rank-2 shapes")
+    n = B.shape[1]
+    out = np.zeros(n, dtype=dtype)
+    for i in range(r0):
+        out += B[i] @ V[i]
+    return out
+
+
+@numba.njit(cache=True)
+def inner_rank2_basis_rank2_value(basis_rank2, value_rank2, dtype):
+    if DEBUG: print("inner_rank2_basis_rank2_value")
+    return inner_rank2_value_rank2_basis(value_rank2, basis_rank2, dtype)
+
+
+@numba.njit(cache=True)
 def inner_hessian_function_hessian_test(function_hess, test_hess, dtype):
     """
     Inner product between Hess(Function) (k,d,d) and Hess(Test) (k,n,d,d) -> (n,).
@@ -1150,6 +1364,18 @@ def inner_grad_basis_grad_const(grad_basis, grad_const, dtype):
     Vectorized by flattening (k*d): (n x kd) @ (kd,)
     """
     if DEBUG: print("inner_grad_basis_grad_const")
+    if grad_basis.ndim == 2:
+        if grad_const.ndim == 2:
+            if grad_const.shape[0] != 1 or grad_const.shape[1] != grad_basis.shape[0]:
+                raise ValueError("inner_grad_basis_grad_const: incompatible scalar gradient shapes")
+            grad_basis_t = np.ascontiguousarray(grad_basis.T)
+            return grad_basis_t @ np.ascontiguousarray(grad_const[0])
+        if grad_const.ndim == 1:
+            if grad_const.shape[0] != grad_basis.shape[0]:
+                raise ValueError("inner_grad_basis_grad_const: incompatible scalar gradient shapes")
+            grad_basis_t = np.ascontiguousarray(grad_basis.T)
+            return grad_basis_t @ np.ascontiguousarray(grad_const)
+        raise ValueError("inner_grad_basis_grad_const: incompatible scalar gradient shapes")
     k, n, d = grad_basis.shape
     # Make contiguous *after* transpose so reshape is legal for numba
     A = np.ascontiguousarray(grad_basis.transpose(1, 0, 2)).reshape(n, k * d)
@@ -1163,6 +1389,11 @@ def inner_grad_grad(test_var, trial_var, dtype):
     Inner product of gradient bases -> (n_test, n_trial).
     """
     if DEBUG: print("inner_grad_grad")
+    if test_var.ndim == 2 and trial_var.ndim == 2:
+        if test_var.shape[0] != trial_var.shape[0]:
+            raise ValueError("inner_grad_grad: scalar gradient bases must share spatial dimension")
+        test_var_t = np.ascontiguousarray(test_var.T)
+        return test_var_t @ np.ascontiguousarray(trial_var)
     n_test = test_var.shape[1]
     n_trial = trial_var.shape[1]
     res = np.zeros((n_test, n_trial), dtype=dtype)
@@ -1331,7 +1562,7 @@ def gradient_qp(u_e, grad_phi_q):
     Returns: scalar -> (dim,), vector -> (dim, ncomp)
     """
     # if DEBUG: print("gradient_qp")
-    grad_T = np.ascontiguousarray(grad_phi_q).T
+    grad_T = np.ascontiguousarray(grad_phi_q.T)
     u_c = np.ascontiguousarray(u_e)
     if u_c.ndim == 1:
         # (ndof, dim).T @ (ndof,) -> (dim, ndof) @ (ndof,) -> (dim,)
@@ -1348,9 +1579,9 @@ def laplacian_qp(u_e, lap_phi_q):
     """
     if u_e.ndim == 1:
         # (ndof,) @ (ndof,) -> scalar
-        return float(np.dot(u_e, lap_phi_q))
+        return float(np.dot(np.ascontiguousarray(u_e), np.ascontiguousarray(lap_phi_q)))
     # (ndof, ncomp).T @ (ndof,) -> (ncomp, ndof) @ (ndof,) -> (ncomp,)
-    return (np.ascontiguousarray(u_e.T) @ lap_phi_q).astype(u_e.dtype)
+    return (np.ascontiguousarray(u_e.T) @ np.ascontiguousarray(lap_phi_q)).astype(u_e.dtype)
 
 
 @numba.njit(cache=True)
@@ -1366,17 +1597,19 @@ def hessian_qp(u_e, hess_phi_q):
     # (ndof, dim, dim) -> (ndof, dim*dim)
     Hflat = np.ascontiguousarray(hess_phi_q).reshape(ndof, dim * dim)
     
+    u_c = np.ascontiguousarray(u_e)
+
     if u_e.ndim == 1:
         # (ndof, dd).T @ (ndof,) -> (dd, ndof) @ (ndof,) -> (dd,)
         Hflat_T = np.ascontiguousarray(Hflat.T)
-        out = (Hflat_T @ u_e).reshape(dim, dim)
-        return out.astype(u_e.dtype)
+        out = (Hflat_T @ u_c).reshape(dim, dim)
+        return out.astype(u_c.dtype)
     
     # (ndof, ncomp).T @ (ndof, dd) -> (ncomp, ndof) @ (ndof, dd) -> (ncomp, dd)
     ncomp = u_e.shape[1]
-    ue_T = np.ascontiguousarray(u_e.T)
+    ue_T = np.ascontiguousarray(u_c.T)
     out2 = (ue_T @ Hflat).reshape(ncomp, dim, dim)
-    return out2.astype(u_e.dtype)
+    return out2.astype(u_c.dtype)
 
 
 @numba.njit(cache=True)
@@ -1408,6 +1641,8 @@ for _helper_name in (
     "scale_mixed_basis_with_coeffs",
     "matrix_times_scalar_basis",
     "scalar_vector_outer_product",
+    "vector_trial_times_scalar_test",
+    "vector_test_times_scalar_trial",
     "vector_vector_outer_product",
     "scalar_basis_times_vector",
     "scalar_trial_times_grad_test",

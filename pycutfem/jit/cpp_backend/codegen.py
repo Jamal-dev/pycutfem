@@ -6,8 +6,16 @@ import os
 from pathlib import Path
 from typing import Any, Iterable, Tuple
 from dataclasses import replace
+from types import SimpleNamespace
 
 from .cache import CODEGEN_ABI_CPP
+from pycutfem.ufl.tensor_algebra import (
+    DotKernelCase,
+    MixedLayout,
+    OperandTransform,
+    ProductKernelCase,
+    TensorRuleEngine,
+)
 
 CODEGEN_DEBUG = bool(int(os.environ.get("PYCUTFEM_CPP_CODEGEN_DEBUG", "0")))
 CODEGEN_TEMP_POOL = os.environ.get("PYCUTFEM_CPP_TEMP_POOL", "1").strip().lower() not in {
@@ -32,6 +40,365 @@ namespace py = pybind11;
 using namespace pycutfem::cpp_backend;
 
 """
+
+
+def _try_dot_plan(lhs: Any, rhs: Any):
+    try:
+        return TensorRuleEngine.plan_dot(lhs, rhs)
+    except Exception:
+        return None
+
+
+def _try_dot_lowering(lhs: Any, rhs: Any):
+    try:
+        return TensorRuleEngine.plan_dot_lowering(lhs, rhs)
+    except Exception:
+        return None
+
+
+def _try_dot_kernel(lhs: Any, rhs: Any):
+    try:
+        return TensorRuleEngine.plan_dot_kernel(lhs, rhs)
+    except Exception:
+        return None
+
+
+def _try_sum_plan(lhs: Any, rhs: Any):
+    try:
+        return TensorRuleEngine.plan_sum(lhs, rhs)
+    except Exception:
+        return None
+
+
+def _try_sum_lowering(lhs: Any, rhs: Any):
+    try:
+        return TensorRuleEngine.plan_sum_lowering(lhs, rhs)
+    except Exception:
+        return None
+
+
+def _try_sum_value_spec(lhs: Any, rhs: Any):
+    try:
+        return TensorRuleEngine.plan_sum_value_spec(lhs, rhs)
+    except Exception:
+        return None
+
+
+def _try_inner_plan(lhs: Any, rhs: Any):
+    try:
+        return TensorRuleEngine.plan_inner(lhs, rhs)
+    except Exception:
+        return None
+
+
+def _try_inner_value_spec(lhs: Any, rhs: Any):
+    try:
+        return TensorRuleEngine.plan_inner_value_spec(lhs, rhs)
+    except Exception:
+        return None
+
+
+def _try_trace_meta(item: Any, *, spatial_dim: int = 2):
+    try:
+        return TensorRuleEngine.plan_trace_meta(item, spatial_dim=spatial_dim)
+    except Exception:
+        return None
+
+
+def _try_determinant_meta(item: Any, *, spatial_dim: int = 2):
+    try:
+        return TensorRuleEngine.plan_determinant_meta(item, spatial_dim=spatial_dim)
+    except Exception:
+        return None
+
+
+def _try_transpose_meta(item: Any, *, spatial_dim: int = 2):
+    try:
+        return TensorRuleEngine.plan_transpose_meta(item, spatial_dim=spatial_dim)
+    except Exception:
+        return None
+
+
+def _try_product_lowering(lhs: Any, rhs: Any):
+    try:
+        return TensorRuleEngine.plan_product_lowering(lhs, rhs)
+    except Exception:
+        return None
+
+
+def _try_product_kernel(lhs: Any, rhs: Any):
+    try:
+        return TensorRuleEngine.plan_product_kernel(lhs, rhs)
+    except Exception:
+        return None
+
+
+def _try_dot_value_spec(lhs: Any, rhs: Any):
+    try:
+        return TensorRuleEngine.plan_dot_value_spec(lhs, rhs)
+    except Exception:
+        return None
+
+
+def _try_product_value_spec(lhs: Any, rhs: Any):
+    try:
+        return TensorRuleEngine.plan_product_value_spec(lhs, rhs)
+    except Exception:
+        return None
+
+
+def _try_division_value_spec(lhs: Any, rhs: Any):
+    try:
+        return TensorRuleEngine.plan_division_value_spec(lhs, rhs)
+    except Exception:
+        return None
+
+
+def _try_tensor_rank(item: Any, *, spatial_dim: int = 2) -> int | None:
+    try:
+        return int(TensorRuleEngine.infer_signature(item, spatial_dim=spatial_dim).tensor_rank)
+    except Exception:
+        return None
+
+
+def _try_signature(item: Any, *, spatial_dim: int = 2):
+    try:
+        return TensorRuleEngine.infer_signature(item, spatial_dim=spatial_dim)
+    except Exception:
+        return None
+
+
+def _try_expression_meta(item: Any, *, spatial_dim: int = 2):
+    try:
+        return TensorRuleEngine.infer_expression_meta(item, spatial_dim=spatial_dim)
+    except Exception:
+        return None
+
+
+def _semantic_is_mixed_rank1(item: Any, *, spatial_dim: int = 2) -> bool:
+    sig = _try_signature(item, spatial_dim=spatial_dim)
+    return bool(sig is not None and sig.basis_rank == 2 and sig.tensor_rank == 1)
+
+
+def _semantic_is_value_rank1(item: Any, *, spatial_dim: int = 2) -> bool:
+    sig = _try_signature(item, spatial_dim=spatial_dim)
+    return bool(sig is not None and sig.basis_rank == 0 and sig.tensor_rank == 1)
+
+
+def _semantic_is_basis_rank1(item: Any, *, spatial_dim: int = 2) -> bool:
+    sig = _try_signature(item, spatial_dim=spatial_dim)
+    return bool(sig is not None and sig.basis_rank == 1 and sig.tensor_rank == 1)
+
+
+def _semantic_is_scalar_basis(item: Any, *, spatial_dim: int = 2) -> bool:
+    sig = _try_signature(item, spatial_dim=spatial_dim)
+    return bool(sig is not None and sig.basis_rank == 1 and sig.tensor_rank == 0)
+
+
+def _semantic_has_derivative_provenance(item: Any, *, spatial_dim: int = 2) -> bool:
+    meta = _try_expression_meta(item, spatial_dim=spatial_dim)
+    if meta is None:
+        return False
+    return any(int(src.derivative_depth) > 0 for src in meta.provenance.sources)
+
+
+def _semantic_is_gradient_rank1_basis(item: Any, *, spatial_dim: int = 2) -> bool:
+    return _semantic_is_basis_rank1(item, spatial_dim=spatial_dim) and _semantic_has_derivative_provenance(
+        item, spatial_dim=spatial_dim
+    )
+
+
+def _semantic_is_gradient_rank1_value(item: Any, *, spatial_dim: int = 2) -> bool:
+    return _semantic_is_value_rank1(item, spatial_dim=spatial_dim) and _semantic_has_derivative_provenance(
+        item, spatial_dim=spatial_dim
+    )
+
+
+def _semantic_is_rank1_matrix(item: Any, *, spatial_dim: int = 2) -> bool:
+    shape = tuple(int(v) for v in getattr(item, "shape", ()) or ())
+    if len(shape) != 2:
+        return False
+    return _semantic_is_basis_rank1(item, spatial_dim=spatial_dim) or _semantic_is_value_rank1(
+        item, spatial_dim=spatial_dim
+    )
+
+
+def _semantic_is_value_rank2(item: Any, *, spatial_dim: int = 2) -> bool:
+    sig = _try_signature(item, spatial_dim=spatial_dim)
+    return bool(sig is not None and sig.basis_rank == 0 and sig.tensor_rank == 2)
+
+
+def _semantic_is_basis_rank2(item: Any, *, spatial_dim: int = 2) -> bool:
+    sig = _try_signature(item, spatial_dim=spatial_dim)
+    return bool(sig is not None and sig.basis_rank == 1 and sig.tensor_rank == 2)
+
+
+def _mixed_rank1_layout(item: Any, *, spatial_dim: int = 2) -> str:
+    layout = str(getattr(item, "layout_tag", "") or "")
+    if layout:
+        return layout
+    sig = _try_signature(item, spatial_dim=spatial_dim)
+    if sig is None or sig.basis_rank != 2 or sig.tensor_rank != 1:
+        return ""
+    shape = tuple(int(v) for v in getattr(item, "shape", ()) or ())
+    if len(shape) == 3 and 0 < int(shape[0]) <= spatial_dim:
+        return MixedLayout.COMPONENT_FIRST.value
+    return MixedLayout.DEFAULT.value
+
+
+def _basis_dot_result_rows(dot_plan: Any, fallback_rows: int) -> int:
+    """
+    Return the carried free-axis size for a basis-carrying dot result.
+
+    For scalar results this returns 1, which keeps scalar basis rows scalar
+    instead of re-tagging them as vector-valued basis data.
+    """
+    if dot_plan is None:
+        return int(fallback_rows)
+    tensor = dot_plan.result
+    if tensor.basis_rank != 1:
+        return int(fallback_rows)
+    if tensor.tensor_rank == 0:
+        return 1
+    if tensor.tensor_rank == 1:
+        return int(tensor.free_axes[0].size)
+    return int(fallback_rows)
+
+
+def _planned_storage_shape(lowering: Any, fallback_shape: tuple[int, ...]) -> tuple[int, ...]:
+    if lowering is None:
+        return tuple(int(v) for v in fallback_shape)
+    planned = tuple(int(v) for v in lowering.result_storage.stored_shape)
+    return planned or tuple(int(v) for v in fallback_shape)
+
+
+def _normalize_cpp_storage_kind(kind: str, role: str, shape: tuple[int, ...]) -> str:
+    kind = str(kind or "")
+    role = str(role or "")
+    shape = tuple(int(v) for v in (shape or ()))
+    # Preserve semantic mixed carriers even when the stored layout is a plain
+    # 2D (n_test, n_trial) matrix. Downgrading them to "mat" hides the shared
+    # tensor-plan result and breaks downstream mixed product rules.
+    if kind == "mixed":
+        return "mixed"
+    if kind == "grad" and len(shape) <= 2:
+        if role in {"test", "trial", "test_n", "trial_n", "mixed"}:
+            return "grad"
+        return "scalar" if len(shape) == 0 else "mat"
+    if kind == "hess" and len(shape) <= 2:
+        return "scalar" if len(shape) == 0 else "mat"
+    if kind == "vec" and len(shape) == 0:
+        return "scalar"
+    return kind
+
+
+def _cpp_vector_input_expr(item: Any) -> str:
+    shape = tuple(int(v) for v in (getattr(item, "shape", ()) or ()))
+    name = str(getattr(item, "name", ""))
+    actual_kind = str(getattr(item, "tmp_kind", "") or getattr(item, "kind", "") or "")
+    if actual_kind == "mat":
+        if len(shape) == 2 and (int(shape[0]) == 1 or int(shape[1]) == 1):
+            return f"matrix_like_to_vector({name})"
+        return f"matrix_like_to_vector({name})"
+    return name
+
+
+def _cpp_sum_vector_expr(item: Any, *, spatial_dim: int = 2) -> str:
+    """
+    Return a VectorXd-compatible expression for semantic rank-1 values.
+
+    Some shared-planner results are logically vectors even when a legacy lowering
+    branch still emitted a row/column MatrixXd temporary. Normalizing through this
+    helper keeps downstream `dot`/`inner` branches aligned with the semantic plan.
+    """
+    if str(getattr(item, "kind", "") or "") == "vec":
+        return _cpp_vector_input_expr(item)
+    if _semantic_is_rank1_matrix(item, spatial_dim=spatial_dim):
+        return f"matrix_like_to_vector({_cpp_matrix_input_expr(item)})"
+    return _cpp_vector_input_expr(item)
+
+
+def _meta_is_scalar_basis_row(meta: Any) -> bool:
+    tensor = getattr(meta, "tensor", None)
+    return bool(
+        tensor is not None
+        and int(getattr(tensor, "basis_rank", -1)) == 1
+        and int(getattr(tensor, "tensor_rank", -1)) == 0
+    )
+
+
+def _value_spec_is_scalar_basis_row(spec: Any) -> bool:
+    if spec is None:
+        return False
+    return _meta_is_scalar_basis_row(getattr(spec, "meta", None))
+
+
+def _scalar_basis_row_shape(shape: tuple[int, ...]) -> tuple[int, int]:
+    shp = tuple(int(v) for v in shape)
+    if len(shp) == 2 and shp[0] == 1:
+        return (1, int(shp[1]))
+    if len(shp) == 1:
+        return (1, int(shp[0]))
+    if len(shp) >= 2:
+        return (1, int(shp[-1]))
+    return (1, -1)
+
+
+def _cpp_scalar_basis_row_expr(item: Any, *, spatial_dim: int = 2) -> str:
+    shape = tuple(int(v) for v in getattr(item, "shape", ()) or ())
+    if item.kind == "mat" and len(shape) == 2 and int(shape[0]) == 1:
+        return item.name
+    if item.kind == "vec":
+        return f"({item.name}).transpose().eval()"
+    if item.kind == "mat" and len(shape) == 1 and _semantic_is_scalar_basis(item, spatial_dim=spatial_dim):
+        return f"({item.name}).transpose().eval()"
+    return f"matrix_like_to_vector({_cpp_matrix_input_expr(item)}).transpose().eval()"
+
+
+def _cpp_matrix_input_expr(item: Any) -> str:
+    shape = tuple(int(v) for v in (getattr(item, "shape", ()) or ()))
+    name = str(getattr(item, "name", ""))
+    actual_kind = str(getattr(item, "tmp_kind", "") or getattr(item, "kind", "") or "")
+    if actual_kind == "mat":
+        return name
+    if actual_kind in {"grad", "mixed"}:
+        if len(shape) == 2:
+            # Planner-normalized rank-1 gradient/mixed values already carry as a
+            # direct Eigen matrix view. Only legacy stack-style storage uses [] access.
+            return name
+        if len(shape) == 3 and int(shape[0]) == 1:
+            # Legacy scalar-gradient stack storage still appears in a few
+            # bridge paths. Expose the semantic rank-1 matrix view instead of
+            # indexing it later as if it were always a GradStack.
+            return f"{name}[0].transpose().eval()"
+        if len(shape) == 0:
+            return name
+    return name
+
+
+def _cpp_dot_value_operand_expr(item: Any, tensor_rank: int | None) -> str:
+    """Return the storage view that matches the semantic tensor rank used by dot()."""
+    if tensor_rank == 1:
+        return _cpp_vector_input_expr(item)
+    if tensor_rank == 2:
+        return _cpp_matrix_input_expr(item)
+    return str(getattr(item, "name", ""))
+
+
+def _cpp_rank1_basis_free_last_expr(name: str, shape: tuple[int, ...]) -> str:
+    """
+    Reorder rank-1 basis storage so the free physical axis is last.
+
+    This is a storage-layout view used for compiled contractions. It is not a
+    semantic transpose of a rank-1 tensor. Canonical scalar-gradient basis
+    storage carries as ``(d, n)``; ``contract_last_first`` needs ``(n, d)`` on
+    the left operand, and legacy ``(1, n, d)`` storage maps to the same view.
+    """
+    if len(shape) == 3 and int(shape[0]) == 1:
+        return f"{name}[0]"
+    if len(shape) == 2:
+        return f"Eigen::MatrixXd(({name}.transpose()).eval())"
+    raise ValueError(f"Expected canonical scalar-gradient basis shape, got {shape!r}.")
 
 
 class CppCodeGen:
@@ -446,6 +813,7 @@ class CppCodeGen:
                 width = base_slice.stop - base_slice.start
                 field_slices[name] = slice(offset, offset + width)
                 offset += width
+        active_n_dofs = sum(int(sl.stop - sl.start) for sl in field_slices.values())
         functional_dim = 1  # number of output components for functionals
 
         def new_tmp(prefix="tmp", counter={"i": 0}):
@@ -525,6 +893,39 @@ class CppCodeGen:
             rbase = "r" + base[1:]  # d10 -> r10 etc.
             return f"{rbase}_{fn}_{tag}"
 
+        def concretize_known_shape(kind: str, role: str, shape):
+            dims = list(shape or ())
+
+            def replace(axis: int):
+                if 0 <= axis < len(dims) and int(dims[axis]) == -1:
+                    dims[axis] = int(active_n_dofs)
+
+            if role in {"test", "trial", "test_n", "trial_n"}:
+                if kind in {"basis_ref", "vec", "mat"}:
+                    replace(len(dims) - 1)
+                elif kind == "grad":
+                    replace(1)
+                elif kind == "hess":
+                    replace(1)
+            elif role == "mixed":
+                if kind in {"vec", "mat"}:
+                    replace(len(dims) - 1)
+                    replace(len(dims) - 2)
+                elif kind == "grad":
+                    replace(1)
+                    replace(2)
+                elif kind == "hess":
+                    replace(1)
+                    replace(2)
+            elif role == "value":
+                if kind == "vec" and len(dims) == 1 and int(dims[0]) == -1:
+                    dims[0] = int(active_n_dofs)
+                if kind == "mat" and len(dims) == 2 and int(dims[0]) == int(dims[1]) == -1:
+                    dims[0] = int(active_n_dofs)
+                    dims[1] = int(active_n_dofs)
+
+            return tuple(int(v) for v in dims)
+
         class StackItem:
             __slots__ = (
                 "name",
@@ -539,6 +940,8 @@ class CppCodeGen:
                 "tmp_kind",
                 "tmp_slot",
                 "tmp_pinned",
+                "layout_tag",
+                "expression_meta",
             )
 
             def __init__(
@@ -556,11 +959,13 @@ class CppCodeGen:
                 tmp_kind: str | None = None,
                 tmp_slot: int | None = None,
                 tmp_pinned: bool = False,
+                layout_tag: str = "",
+                expression_meta: Any = None,
             ):
                 self.name = name
                 self.kind = kind  # scalar | mat | grad | vec | const_arr
                 self.role = role
-                self.shape = shape
+                self.shape = concretize_known_shape(kind, role, shape)
                 self.field_names = field_names or []
                 self.parent = parent  # parent symbol name for functions
                 self.side = side or ""
@@ -569,6 +974,23 @@ class CppCodeGen:
                 self.tmp_kind = tmp_kind
                 self.tmp_slot = tmp_slot
                 self.tmp_pinned = bool(tmp_pinned)
+                self.layout_tag = layout_tag or ""
+                self.expression_meta = expression_meta
+
+            
+            @property
+            def is_vector(self):
+                return self.kind == "vec"
+
+            
+            @property
+            def is_gradient(self):
+                return self.kind == "grad"
+
+            
+            @property
+            def is_hessian(self):
+                return self.kind == "hess"
 
         # Hoist constant-array mapping out of the quadrature loop.
         # NOTE: calling pybind11 APIs (like .request()) inside an OpenMP region
@@ -839,19 +1261,18 @@ class CppCodeGen:
                 if dx.role in {"test", "trial"} or dy.role in {"test", "trial"}:
                     role = dx.role if dx.role in {"test", "trial"} else dy.role
                     if dx.kind == "mat" and dy.kind == "mat" and len(dx.shape) == 2 and dx.shape[0] == 1:
-                        ncols = dx.shape[1]
+                        ncols = -1 if (self.on_facet and side in ("+", "-")) else dx.shape[1]
                         ncols_expr = "n_union" if ncols == -1 else str(ncols)
                         nm = new_tmp("grad_pack")
-                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize(1);")
-                        emit_line(f"{nm}[0] = Eigen::MatrixXd({ncols_expr}, 2);")
-                        emit_line(f"{nm}[0].col(0) = {dx.name}.transpose();")
-                        emit_line(f"{nm}[0].col(1) = {dy.name}.transpose();")
+                        emit_line(f"Eigen::MatrixXd {nm}(2, {ncols_expr});")
+                        emit_line(f"{nm}.row(0) = {dx.name};")
+                        emit_line(f"{nm}.row(1) = {dy.name};")
                         stack.append(
                             StackItem(
                                 nm,
                                 "grad",
                                 role,
-                                (1, ncols, 2),
+                                (2, ncols),
                                 field_names,
                                 parent_name,
                                 side,
@@ -860,19 +1281,18 @@ class CppCodeGen:
                         )
                         continue
                     if dx.kind == "vec" and dy.kind == "vec" and len(dx.shape) == 1:
-                        ncols = dx.shape[0]
+                        ncols = -1 if (self.on_facet and side in ("+", "-")) else dx.shape[0]
                         ncols_expr = "n_union" if ncols == -1 else str(ncols)
                         nm = new_tmp("grad_pack")
-                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize(1);")
-                        emit_line(f"{nm}[0] = Eigen::MatrixXd({ncols_expr}, 2);")
-                        emit_line(f"{nm}[0].col(0) = {dx.name};")
-                        emit_line(f"{nm}[0].col(1) = {dy.name};")
+                        emit_line(f"Eigen::MatrixXd {nm}(2, {ncols_expr});")
+                        emit_line(f"{nm}.row(0) = {dx.name}.transpose();")
+                        emit_line(f"{nm}.row(1) = {dy.name}.transpose();")
                         stack.append(
                             StackItem(
                                 nm,
                                 "grad",
                                 role,
-                                (1, ncols, 2),
+                                (2, ncols),
                                 field_names,
                                 parent_name,
                                 side,
@@ -916,7 +1336,10 @@ class CppCodeGen:
                 elif a.kind in {"grad", "mixed"}:
                     emit_line(f"auto {nm} = {a.name};")
                     emit_line(f"if (!{flag}_view(e,q)) {{")
-                    emit_line(f"    for (size_t _i=0; _i<{nm}.size(); ++_i) {nm}[_i].setZero();")
+                    if a.kind == "grad" and len(a.shape) == 2:
+                        emit_line(f"    {nm}.setZero();")
+                    else:
+                        emit_line(f"    for (size_t _i=0; _i<{nm}.size(); ++_i) {nm}[_i].setZero();")
                     emit_line("}")
                 elif a.kind == "hess":
                     emit_line(f"auto {nm} = {a.name};")
@@ -1021,6 +1444,8 @@ class CppCodeGen:
                         if op.side in ("+", "-"):
                             raise NotImplementedError("Direct H(div) component loads are currently implemented for volume integrals only in the C++ backend.")
                         comp_idx = int(op.component_index)
+                        fld_slice = field_slices.get(hdiv_field, slice(0, 0))
+                        s0 = fld_slice.start
                         if op.deriv_order == (0, 0):
                             tbl = f"hval_{hdiv_field}"
                             row_expr = f"{tbl}_view(e,q,{comp_idx},j)"
@@ -1039,14 +1464,22 @@ class CppCodeGen:
                         required_args.add(tbl)
                         nm = new_tmp("hdiv_compv")
                         emit_line(f"double {nm} = 0.0;")
-                        emit_line("for (ssize_t j=0; j<n_union; ++j) {")
-                        emit_line(f"    {nm} += {coeff_name}_view(e,j) * {row_expr};")
+                        comp_cols = new_tmp("hdiv_comp_cols")
+                        coeff_len = new_tmp("coeff_len")
+                        coeff_start = new_tmp("coeff_start")
+                        emit_line(f"ssize_t {comp_cols} = {tbl}_view.shape(3);")
+                        emit_line(f"ssize_t {coeff_len} = {coeff_name}_view.shape(1);")
+                        emit_line(f"ssize_t {coeff_start} = ({coeff_len} == {comp_cols}) ? 0 : {s0};")
+                        emit_line(f"for (ssize_t j=0; j<{comp_cols}; ++j) {{")
+                        emit_line(f"    {nm} += {coeff_name}_view(e,{coeff_start} + j) * {row_expr};")
                         emit_line("}")
                         item = StackItem(nm, "scalar", "value", (), op.field_names, op.name, op.side, op.field_sides or [])
                         stack.append(item)
                         loadvar_cache[lv_key] = _pin_for_cache(item)
                         continue
                     if hdiv_field is not None:
+                        fld_slice = field_slices.get(hdiv_field, slice(0, 0))
+                        s0 = fld_slice.start
                         if op.side == "+":
                             required_args.add("J_inv_pos")
                         elif op.side == "-":
@@ -1060,18 +1493,28 @@ class CppCodeGen:
                         nm = new_tmp("hdiv_val")
                         emit_line(f"Eigen::VectorXd {nm}(2);")
                         emit_line(f"{nm}.setZero();")
+                        rt_cols = new_tmp("rt_cols")
+                        sign_len = new_tmp("sign_len")
+                        sign_start = new_tmp("sign_start")
+                        coeff_len = new_tmp("coeff_len")
+                        coeff_start = new_tmp("coeff_start")
+                        emit_line(f"ssize_t {rt_cols} = {bvec_name}_view.shape(3);")
+                        emit_line(f"ssize_t {sign_len} = {sign_name}_view.shape(1);")
+                        emit_line(f"ssize_t {sign_start} = ({sign_len} == {rt_cols}) ? 0 : {s0};")
+                        emit_line(f"ssize_t {coeff_len} = {coeff_name}_view.shape(1);")
+                        emit_line(f"ssize_t {coeff_start} = ({coeff_len} == {rt_cols}) ? 0 : {s0};")
                         adj = new_tmp("adj")
                         emit_line(f"Eigen::Matrix<double,2,2> {adj};")
                         jloc_var = "Jloc_pos" if op.side == "+" else "Jloc_neg" if op.side == "-" else "Jloc"
                         emit_line(f"{adj}(0,0)={jloc_var}(1,1); {adj}(0,1)=-{jloc_var}(0,1);")
                         emit_line(f"{adj}(1,0)=-{jloc_var}(1,0); {adj}(1,1)={jloc_var}(0,0);")
-                        emit_line("for (ssize_t j=0; j<n_union; ++j) {")
-                        emit_line(f"    double s = {sign_name}_view(e, j);")
+                        emit_line(f"for (ssize_t j=0; j<{rt_cols}; ++j) {{")
+                        emit_line(f"    double s = {sign_name}_view(e, {sign_start} + j);")
                         emit_line(f"    double bh0 = {bvec_name}_view(e, q, 0, j);")
                         emit_line(f"    double bh1 = {bvec_name}_view(e, q, 1, j);")
                         emit_line(f"    double b0 = {adj}(0,0)*bh0 + {adj}(0,1)*bh1;")
                         emit_line(f"    double b1 = {adj}(1,0)*bh0 + {adj}(1,1)*bh1;")
-                        emit_line(f"    double coeff = {coeff_name}_view(e, j);")
+                        emit_line(f"    double coeff = {coeff_name}_view(e, {coeff_start} + j);")
                         emit_line(f"    {nm}(0) += coeff * (b0 * s);")
                         emit_line(f"    {nm}(1) += coeff * (b1 * s);")
                         emit_line("}")
@@ -1217,14 +1660,16 @@ class CppCodeGen:
                         comp_idx = int(op.component_index)
                         tbl = f"hval_{hdiv_field}"
                         required_args.add(tbl)
+                        comp_cols = new_tmp("hdiv_comp_cols")
                         nm, tmp_kind, tmp_slot = alloc_tmp("mat", "hdiv_comp_basis")
+                        emit_line(f"ssize_t {comp_cols} = {tbl}_view.shape(3);")
                         if tmp_kind is not None:
-                            emit_line(f"{nm}.resize(1, n_union);")
+                            emit_line(f"{nm}.resize(1, {comp_cols});")
                             emit_line(f"{nm}.setZero();")
                         else:
-                            emit_line(f"Eigen::MatrixXd {nm}(1, n_union);")
+                            emit_line(f"Eigen::MatrixXd {nm}(1, {comp_cols});")
                             emit_line(f"{nm}.setZero();")
-                        emit_line(f"for (ssize_t j=0; j<n_union; ++j) {nm}(0, j) = {tbl}_view(e,q,{comp_idx},j);")
+                        emit_line(f"for (ssize_t j=0; j<{comp_cols}; ++j) {nm}(0, j) = {tbl}_view(e,q,{comp_idx},j);")
                         item = StackItem(
                             nm,
                             "mat",
@@ -1241,6 +1686,8 @@ class CppCodeGen:
                         loadvar_cache[lv_key] = _pin_for_cache(item)
                         continue
                     if hdiv_field is not None:
+                        fld_slice = field_slices.get(hdiv_field, slice(0, 0))
+                        s0 = fld_slice.start
                         # H(div) RT basis values are mapped via the (side-specific)
                         # inverse Jacobian on facet integrals.
                         if op.side == "+":
@@ -1254,19 +1701,25 @@ class CppCodeGen:
                         sign_name = f"sign_{hdiv_field}_{side_tag}" if side_tag else f"sign_{hdiv_field}"
                         required_args.update({bvec_name, sign_name})
                         nm, tmp_kind, tmp_slot = alloc_tmp("mat", "hdiv_basis")
+                        rt_cols = new_tmp("rt_cols")
+                        sign_len = new_tmp("sign_len")
+                        sign_start = new_tmp("sign_start")
+                        emit_line(f"ssize_t {rt_cols} = {bvec_name}_view.shape(3);")
+                        emit_line(f"ssize_t {sign_len} = {sign_name}_view.shape(1);")
+                        emit_line(f"ssize_t {sign_start} = ({sign_len} == {rt_cols}) ? 0 : {s0};")
                         if tmp_kind is not None:
-                            emit_line(f"{nm}.resize(2, n_union);")
+                            emit_line(f"{nm}.resize(2, {rt_cols});")
                             emit_line(f"{nm}.setZero();")
                         else:
-                            emit_line(f"Eigen::MatrixXd {nm}(2, n_union);")
+                            emit_line(f"Eigen::MatrixXd {nm}(2, {rt_cols});")
                             emit_line(f"{nm}.setZero();")
                         adj = new_tmp("adj")
                         emit_line(f"Eigen::Matrix<double,2,2> {adj};")
                         jloc_var = "Jloc_pos" if op.side == "+" else "Jloc_neg" if op.side == "-" else "Jloc"
                         emit_line(f"{adj}(0,0)={jloc_var}(1,1); {adj}(0,1)=-{jloc_var}(0,1);")
                         emit_line(f"{adj}(1,0)=-{jloc_var}(1,0); {adj}(1,1)={jloc_var}(0,0);")
-                        emit_line("for (ssize_t j=0; j<n_union; ++j) {")
-                        emit_line(f"    double s = {sign_name}_view(e, j);")
+                        emit_line(f"for (ssize_t j=0; j<{rt_cols}; ++j) {{")
+                        emit_line(f"    double s = {sign_name}_view(e, {sign_start} + j);")
                         emit_line(f"    double bh0 = {bvec_name}_view(e, q, 0, j);")
                         emit_line(f"    double bh1 = {bvec_name}_view(e, q, 1, j);")
                         emit_line(f"    double b0 = {adj}(0,0)*bh0 + {adj}(0,1)*bh1;")
@@ -1920,6 +2373,8 @@ class CppCodeGen:
                     fld = str(a.field_names[0])
                     if a.side in ("+", "-") and self.on_facet:
                         raise NotImplementedError("grad(H(div)) is currently implemented for volume integrals only in the C++ backend.")
+                    fld_slice = field_slices.get(fld, slice(0, 0))
+                    s0 = fld_slice.start
 
                     gvec_name = f"gvec_{fld}"
                     sign_name = f"sign_{fld}"
@@ -1929,10 +2384,16 @@ class CppCodeGen:
                     if a.role in {"test", "trial"}:
                         nm = new_tmp("hdiv_grad")
                         emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize(2);")
-                        emit_line(f"{nm}[0] = Eigen::MatrixXd::Zero(n_union, 2);")
-                        emit_line(f"{nm}[1] = Eigen::MatrixXd::Zero(n_union, 2);")
-                        emit_line("for (ssize_t j=0; j<n_union; ++j) {")
-                        emit_line(f"    double s = {sign_name}_view(e, j);")
+                        rt_cols = new_tmp("rt_cols")
+                        sign_len = new_tmp("sign_len")
+                        sign_start = new_tmp("sign_start")
+                        emit_line(f"ssize_t {rt_cols} = {gvec_name}_view.shape(3);")
+                        emit_line(f"ssize_t {sign_len} = {sign_name}_view.shape(1);")
+                        emit_line(f"ssize_t {sign_start} = ({sign_len} == {rt_cols}) ? 0 : {s0};")
+                        emit_line(f"{nm}[0] = Eigen::MatrixXd::Zero({rt_cols}, 2);")
+                        emit_line(f"{nm}[1] = Eigen::MatrixXd::Zero({rt_cols}, 2);")
+                        emit_line(f"for (ssize_t j=0; j<{rt_cols}; ++j) {{")
+                        emit_line(f"    double s = {sign_name}_view(e, {sign_start} + j);")
                         emit_line(f"    double g00 = {gvec_name}_view(e,q,0,j,0); double g01 = {gvec_name}_view(e,q,0,j,1);")
                         emit_line(f"    double g10 = {gvec_name}_view(e,q,1,j,0); double g11 = {gvec_name}_view(e,q,1,j,1);")
                         emit_line(f"    double adj00 =  {jloc_var}(1,1); double adj01 = -{jloc_var}(0,1);")
@@ -1953,6 +2414,16 @@ class CppCodeGen:
                         coeff_name = coeff_array_name(a.parent, a.side)
                         required_args.add(coeff_name)
                         nm = new_tmp("hdiv_gval")
+                        rt_cols = new_tmp("rt_cols")
+                        sign_len = new_tmp("sign_len")
+                        sign_start = new_tmp("sign_start")
+                        coeff_len = new_tmp("coeff_len")
+                        coeff_start = new_tmp("coeff_start")
+                        emit_line(f"ssize_t {rt_cols} = {gvec_name}_view.shape(3);")
+                        emit_line(f"ssize_t {sign_len} = {sign_name}_view.shape(1);")
+                        emit_line(f"ssize_t {sign_start} = ({sign_len} == {rt_cols}) ? 0 : {s0};")
+                        emit_line(f"ssize_t {coeff_len} = {coeff_name}_view.shape(1);")
+                        emit_line(f"ssize_t {coeff_start} = ({coeff_len} == {rt_cols}) ? 0 : {s0};")
                         # Use a dynamic 2x2 matrix here. This value participates in the
                         # generic matrix expression pipeline together with MatrixXd
                         # temporaries (for example grad(v_k) + grad(v_k).T inside
@@ -1962,9 +2433,9 @@ class CppCodeGen:
                         # 1x1 H(div) regression cases.
                         emit_line(f"Eigen::MatrixXd {nm}(2,2);")
                         emit_line(f"{nm}.setZero();")
-                        emit_line("for (ssize_t j=0; j<n_union; ++j) {")
-                        emit_line(f"    double coeff = {coeff_name}_view(e,j);")
-                        emit_line(f"    double s = {sign_name}_view(e, j);")
+                        emit_line(f"for (ssize_t j=0; j<{rt_cols}; ++j) {{")
+                        emit_line(f"    double coeff = {coeff_name}_view(e,{coeff_start} + j);")
+                        emit_line(f"    double s = {sign_name}_view(e, {sign_start} + j);")
                         emit_line(f"    double g00 = {gvec_name}_view(e,q,0,j,0); double g01 = {gvec_name}_view(e,q,0,j,1);")
                         emit_line(f"    double g10 = {gvec_name}_view(e,q,1,j,0); double g11 = {gvec_name}_view(e,q,1,j,1);")
                         emit_line(f"    double adj00 =  {jloc_var}(1,1); double adj01 = -{jloc_var}(0,1);")
@@ -2004,12 +2475,13 @@ class CppCodeGen:
                         required_args.add("J_inv")
                     k = len(a.field_names)
                     nm = new_tmp("grad")
-                    emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({k});")
-                    for idx, fn in enumerate(a.field_names):
-                        jloc_var = "Jloc_pos" if a.side == "+" else "Jloc_neg" if a.side == "-" else "Jloc"
-                        side_tag = component_side_tag(a.side, getattr(a, "field_sides", None), fn, idx)
+                    jloc_var = "Jloc_pos" if a.side == "+" else "Jloc_neg" if a.side == "-" else "Jloc"
+                    if k == 1:
+                        fn = a.field_names[0]
+                        side_tag = component_side_tag(a.side, getattr(a, "field_sides", None), fn, 0)
                         bool_sided = self.on_facet and side_tag in ("pos", "neg")
-                        emit_line(f"{nm}[{idx}] = Eigen::MatrixXd::Zero(n_union, 2);")
+                        emit_line(f"Eigen::MatrixXd {nm}(2, n_union);")
+                        emit_line(f"{nm}.setZero();")
                         if bool_sided:
                             s0 = field_slices.get(fn, slice(0, 0)).start
                             d10 = f"r10_{fn}_{side_tag}"
@@ -2028,23 +2500,55 @@ class CppCodeGen:
                             )
                             emit_line(f"    if (src >= {basis_len}) continue;")
                             emit_line(f"    double gx = {d10}_view(e,q,src); double gy = {d01}_view(e,q,src);")
-                            emit_line(f"    double px = gx*{jloc_var}(0,0) + gy*{jloc_var}(1,0);")
-                            emit_line(f"    double py = gx*{jloc_var}(0,1) + gy*{jloc_var}(1,1);")
-                            emit_line(f"    {nm}[{idx}](col,0)=px; {nm}[{idx}](col,1)=py;")
+                            emit_line(f"    {nm}(0,col) = gx*{jloc_var}(0,0) + gy*{jloc_var}(1,0);")
+                            emit_line(f"    {nm}(1,col) = gx*{jloc_var}(0,1) + gy*{jloc_var}(1,1);")
                             emit_line("}")
                         else:
                             gname = f"g_{fn}_view"
                             required_args.add(f"g_{fn}")
                             emit_line(f"for (ssize_t j=0; j<n_union; ++j) {{")
-                            emit_line(
-                                f"    double gx = {gname}(e,q,j,0); double gy = {gname}(e,q,j,1);"
-                            )
-                            emit_line(
-                                f"    double px = gx*{jloc_var}(0,0) + gy*{jloc_var}(1,0); double py = gx*{jloc_var}(0,1) + gy*{jloc_var}(1,1);"
-                            )
-                            emit_line(f"    {nm}[{idx}](j,0)=px; {nm}[{idx}](j,1)=py;")
+                            emit_line(f"    double gx = {gname}(e,q,j,0); double gy = {gname}(e,q,j,1);")
+                            emit_line(f"    {nm}(0,j) = gx*{jloc_var}(0,0) + gy*{jloc_var}(1,0);")
+                            emit_line(f"    {nm}(1,j) = gx*{jloc_var}(0,1) + gy*{jloc_var}(1,1);")
                             emit_line("}")
-                    item = StackItem(nm, "grad", a.role, (k, -1, 2), a.field_names, a.parent, a.side, a.field_sides)
+                        item = StackItem(nm, "grad", a.role, (2, -1), a.field_names, a.parent, a.side, a.field_sides)
+                    else:
+                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({k});")
+                        for idx, fn in enumerate(a.field_names):
+                            side_tag = component_side_tag(a.side, getattr(a, "field_sides", None), fn, idx)
+                            bool_sided = self.on_facet and side_tag in ("pos", "neg")
+                            emit_line(f"{nm}[{idx}] = Eigen::MatrixXd::Zero(n_union, 2);")
+                            if bool_sided:
+                                s0 = field_slices.get(fn, slice(0, 0)).start
+                                d10 = f"r10_{fn}_{side_tag}"
+                                d01 = f"r01_{fn}_{side_tag}"
+                                map_name = f"{side_tag}_map_{fn}"
+                                required_args.update({d10, d01, map_name})
+                                map_len = new_tmp("map_len")
+                                basis_len = new_tmp("basis_len")
+                                emit_line(f"ssize_t {map_len} = {map_name}_view.shape(1);")
+                                emit_line(f"ssize_t {basis_len} = {d10}_view.shape(2);")
+                                emit_line(f"for (ssize_t j=0; j<{map_len}; ++j) {{")
+                                emit_line(f"    int col = {map_name}_view(e, j);")
+                                emit_line(f"    if (col < 0 || col >= n_union) continue;")
+                                emit_line(
+                                    f"    ssize_t src = ({basis_len} == {map_len}) ? j : (({basis_len} == n_union) ? col : {s0} + j);"
+                                )
+                                emit_line(f"    if (src >= {basis_len}) continue;")
+                                emit_line(f"    double gx = {d10}_view(e,q,src); double gy = {d01}_view(e,q,src);")
+                                emit_line(f"    double px = gx*{jloc_var}(0,0) + gy*{jloc_var}(1,0);")
+                                emit_line(f"    double py = gx*{jloc_var}(0,1) + gy*{jloc_var}(1,1);")
+                                emit_line(f"    {nm}[{idx}](col,0)=px; {nm}[{idx}](col,1)=py;")
+                                emit_line("}")
+                            else:
+                                gname = f"g_{fn}_view"
+                                required_args.add(f"g_{fn}")
+                                emit_line(f"for (ssize_t j=0; j<n_union; ++j) {{")
+                                emit_line(f"    double gx = {gname}(e,q,j,0); double gy = {gname}(e,q,j,1);")
+                                emit_line(f"    double px = gx*{jloc_var}(0,0) + gy*{jloc_var}(1,0); double py = gx*{jloc_var}(0,1) + gy*{jloc_var}(1,1);")
+                                emit_line(f"    {nm}[{idx}](j,0)=px; {nm}[{idx}](j,1)=py;")
+                                emit_line("}")
+                        item = StackItem(nm, "grad", a.role, (k, -1, 2), a.field_names, a.parent, a.side, a.field_sides)
                     stack.append(item)
                     grad_cache[gv_key] = _pin_for_cache(item)
                 elif a.role == "value":
@@ -2086,9 +2590,13 @@ class CppCodeGen:
                             map_name = f"{side_tag}_map_{fn}"
                             required_args.update({d10, d01, map_name})
                             mask_name = None
-                            if apply_restrict_mask:
-                                mask_name = f"restrict_mask_{fn}_{side_tag}"
-                                required_args.add(mask_name)
+                            # For sided facet Function gradients, the coefficient
+                            # blocks are already gathered in the correct facet-side
+                            # union layout (`u_<name>__pos/_neg_loc`). Applying the
+                            # restriction mask again here double-clips residual-side
+                            # values on cut skeletons and breaks CIP parity, while the
+                            # test/trial path is already correct through sided basis
+                            # tables and domain-active compression.
                             gx_var = new_tmp("gx"); gy_var = new_tmp("gy")
                             emit_line(f"double {gx_var} = 0.0, {gy_var} = 0.0;")
                             map_len = new_tmp("map_len")
@@ -2106,8 +2614,6 @@ class CppCodeGen:
                             emit_line(f"    double px = gr0*{jloc_var}(0,0) + gr1*{jloc_var}(1,0);")
                             emit_line(f"    double py = gr0*{jloc_var}(0,1) + gr1*{jloc_var}(1,1);")
                             emit_line(f"    double coeff = {coeff_name}_view(e, col);")
-                            if mask_name is not None:
-                                emit_line(f"    coeff *= {mask_name}_view(e, col);")
                             emit_line(f"    {gx_var} += coeff * px; {gy_var} += coeff * py;")
                             emit_line("}")
                             emit_line(f"{nm}({idx},0) = {gx_var}; {nm}({idx},1) = {gy_var};")
@@ -2117,7 +2623,29 @@ class CppCodeGen:
                             emit_line(
                                 f"gradient_component({nm}, {idx}, {coeff_name}_view, g_{fn}_view, {jloc_var}, e, q, {s0_adj}, {s1_adj});"
                             )
-                    item = StackItem(nm, "mat", "value", (k, 2), a.field_names, a.parent, a.side, a.field_sides)
+                    grad_value_meta = TensorRuleEngine.infer_expression_meta(
+                        SimpleNamespace(
+                            role="value",
+                            kind="grad",
+                            shape=(k, self.spatial_dim),
+                            field_names=a.field_names,
+                            parent=a.parent,
+                            side=a.side,
+                            field_sides=a.field_sides,
+                        ),
+                        spatial_dim=self.spatial_dim,
+                    )
+                    item = StackItem(
+                        nm,
+                        "mat",
+                        "value",
+                        (k, self.spatial_dim),
+                        a.field_names,
+                        a.parent,
+                        a.side,
+                        a.field_sides,
+                        expression_meta=grad_value_meta,
+                    )
                     stack.append(item)
                     grad_cache[gv_key] = _pin_for_cache(item)
                 else:
@@ -2173,6 +2701,18 @@ class CppCodeGen:
                         emit_line(f"    double h11 = {jloc_var}(0,1)*tmp01 + {jloc_var}(1,1)*tmp11 + d10*{hx_var}(1,1) + d01*{hy_var}(1,1);")
                         emit_line(f"    {nm}[{idx}](j,0)=h00; {nm}[{idx}](j,1)=h01; {nm}[{idx}](j,2)=h10; {nm}[{idx}](j,3)=h11;");
                         emit_line("}")
+                    hess_basis_meta = TensorRuleEngine.infer_expression_meta(
+                        SimpleNamespace(
+                            role=a.role,
+                            kind="hess",
+                            shape=(k, -1, 2, 2),
+                            field_names=a.field_names,
+                            parent=a.parent,
+                            side=a.side,
+                            field_sides=a.field_sides,
+                        ),
+                        spatial_dim=self.spatial_dim,
+                    )
                     item = StackItem(
                         nm,
                         "hess",
@@ -2182,6 +2722,7 @@ class CppCodeGen:
                         a.parent,
                         a.side,
                         a.field_sides,
+                        expression_meta=hess_basis_meta,
                     )
                     stack.append(item)
                     hess_cache[hv_key] = _pin_for_cache(item)
@@ -2194,6 +2735,12 @@ class CppCodeGen:
                     required_args.add(coeff)
                     for idx, fn in enumerate(a.field_names):
                         side_tag = component_side_tag(a.side, getattr(a, "field_sides", None), fn, idx)
+                        d20n = deriv_name("d20", fn, a.side, a.field_sides, idx)
+                        d11n = deriv_name("d11", fn, a.side, a.field_sides, idx)
+                        d02n = deriv_name("d02", fn, a.side, a.field_sides, idx)
+                        d10n = deriv_name("d10", fn, a.side, a.field_sides, idx)
+                        d01n = deriv_name("d01", fn, a.side, a.field_sides, idx)
+                        required_args.update({d20n, d11n, d02n, d10n, d01n})
                         # IMPORTANT (facet unions):
                         # For ghost/interface edge kernels, the union DOF layout is built from the
                         # *sorted global DOF ids* of the two owner elements. This layout does not
@@ -2209,11 +2756,6 @@ class CppCodeGen:
                         jloc_var = "Jloc_pos" if a.side == "+" else "Jloc_neg" if a.side == "-" else "Jloc"
                         hx_var = "Hx_pos" if a.side == "+" else "Hx_neg" if a.side == "-" else "Hx"
                         hy_var = "Hy_pos" if a.side == "+" else "Hy_neg" if a.side == "-" else "Hy"
-                        d20n = deriv_name("d20", fn, a.side, a.field_sides, idx)
-                        d11n = deriv_name("d11", fn, a.side, a.field_sides, idx)
-                        d02n = deriv_name("d02", fn, a.side, a.field_sides, idx)
-                        d10n = deriv_name("d10", fn, a.side, a.field_sides, idx)
-                        d01n = deriv_name("d01", fn, a.side, a.field_sides, idx)
                         emit_line(f"    double d20 = {d20n}_view(e,q,j); double d11 = {d11n}_view(e,q,j); double d02 = {d02n}_view(e,q,j);")
                         emit_line(f"    double d10 = {d10n}_view(e,q,j); double d01 = {d01n}_view(e,q,j);")
                         emit_line(f"    double tmp00 = d20 * {jloc_var}(0,0) + d11 * {jloc_var}(1,0);")
@@ -2226,7 +2768,19 @@ class CppCodeGen:
                         emit_line(f"    double h11 = {jloc_var}(0,1)*tmp01 + {jloc_var}(1,1)*tmp11 + d10*{hx_var}(1,1) + d01*{hy_var}(1,1);")
                         emit_line(f"    {nm}({idx},0)+=coeff*h00; {nm}({idx},1)+=coeff*h01; {nm}({idx},2)+=coeff*h10; {nm}({idx},3)+=coeff*h11;");
                         emit_line("}")
-                    item = StackItem(nm, "hess", "value", (k, 2, 2), a.field_names, a.parent, a.side, a.field_sides)
+                    hess_value_meta = TensorRuleEngine.infer_expression_meta(
+                        SimpleNamespace(
+                            role="value",
+                            kind="hess",
+                            shape=(k, 2, 2),
+                            field_names=a.field_names,
+                            parent=a.parent,
+                            side=a.side,
+                            field_sides=a.field_sides,
+                        ),
+                        spatial_dim=self.spatial_dim,
+                    )
+                    item = StackItem(nm, "hess", "value", (k, 2, 2), a.field_names, a.parent, a.side, a.field_sides, expression_meta=hess_value_meta)
                     stack.append(item)
                     hess_cache[hv_key] = _pin_for_cache(item)
                 else:
@@ -2292,12 +2846,22 @@ class CppCodeGen:
                 elif a.role == "value":
                     k = len(a.field_names)
                     nm = new_tmp("lapv")
-                    emit_line(f"Eigen::VectorXd {nm}({k});")
-                    emit_line(f"{nm}.setZero();")
+                    scalar_laplacian = (not a.is_vector) and k == 1
+                    if scalar_laplacian:
+                        emit_line(f"double {nm} = 0.0;")
+                    else:
+                        emit_line(f"Eigen::VectorXd {nm}({k});")
+                        emit_line(f"{nm}.setZero();")
                     coeff = coeff_array_name(a.parent, a.side)
                     required_args.add(coeff)
                     for idx, fn in enumerate(a.field_names):
                         side_tag = component_side_tag(a.side, getattr(a, "field_sides", None), fn, idx)
+                        d20n = deriv_name("d20", fn, a.side, a.field_sides, idx)
+                        d11n = deriv_name("d11", fn, a.side, a.field_sides, idx)
+                        d02n = deriv_name("d02", fn, a.side, a.field_sides, idx)
+                        d10n = deriv_name("d10", fn, a.side, a.field_sides, idx)
+                        d01n = deriv_name("d01", fn, a.side, a.field_sides, idx)
+                        required_args.update({d20n, d11n, d02n, d10n, d01n})
                         if self.on_facet and side_tag in ("pos", "neg"):
                             emit_line("for (ssize_t j=0; j<n_union; ++j) {")
                         else:
@@ -2307,11 +2871,6 @@ class CppCodeGen:
                         jloc_var = "Jloc_pos" if a.side == "+" else "Jloc_neg" if a.side == "-" else "Jloc"
                         hx_var = "Hx_pos" if a.side == "+" else "Hx_neg" if a.side == "-" else "Hx"
                         hy_var = "Hy_pos" if a.side == "+" else "Hy_neg" if a.side == "-" else "Hy"
-                        d20n = deriv_name("d20", fn, a.side, a.field_sides, idx)
-                        d11n = deriv_name("d11", fn, a.side, a.field_sides, idx)
-                        d02n = deriv_name("d02", fn, a.side, a.field_sides, idx)
-                        d10n = deriv_name("d10", fn, a.side, a.field_sides, idx)
-                        d01n = deriv_name("d01", fn, a.side, a.field_sides, idx)
                         emit_line(f"    double d20 = {d20n}_view(e,q,j); double d11 = {d11n}_view(e,q,j); double d02 = {d02n}_view(e,q,j);")
                         emit_line(f"    double d10 = {d10n}_view(e,q,j); double d01 = {d01n}_view(e,q,j);")
                         emit_line(f"    double tmp00 = d20 * {jloc_var}(0,0) + d11 * {jloc_var}(1,0);")
@@ -2320,9 +2879,15 @@ class CppCodeGen:
                         emit_line(f"    double tmp11 = d11 * {jloc_var}(0,1) + d02 * {jloc_var}(1,1);")
                         emit_line(f"    double h00 = {jloc_var}(0,0)*tmp00 + {jloc_var}(1,0)*tmp10 + d10*{hx_var}(0,0) + d01*{hy_var}(0,0);")
                         emit_line(f"    double h11 = {jloc_var}(0,1)*tmp01 + {jloc_var}(1,1)*tmp11 + d10*{hx_var}(1,1) + d01*{hy_var}(1,1);")
-                        emit_line(f"    {nm}({idx}) += coeff * (h00 + h11);");
+                        if scalar_laplacian:
+                            emit_line(f"    {nm} += coeff * (h00 + h11);")
+                        else:
+                            emit_line(f"    {nm}({idx}) += coeff * (h00 + h11);")
                         emit_line("}")
-                    item = StackItem(nm, "mat", "value", (k,), a.field_names, a.parent, a.side, a.field_sides)
+                    if scalar_laplacian:
+                        item = StackItem(nm, "scalar", "value", (), a.field_names, a.parent, a.side, a.field_sides)
+                    else:
+                        item = StackItem(nm, "vec", "value", (k,), a.field_names, a.parent, a.side, a.field_sides)
                     stack.append(item)
                     lap_cache[lap_key] = _pin_for_cache(item)
                 else:
@@ -2340,10 +2905,18 @@ class CppCodeGen:
                 div_name = f"div_{fld}_{side_tag}" if side_tag else f"div_{fld}"
                 sign_name = f"sign_{fld}_{side_tag}" if side_tag else f"sign_{fld}"
                 required_args.update({div_name, sign_name})
+                fld_slice = field_slices.get(fld, slice(0, 0))
+                s0 = fld_slice.start
 
                 if a.role in {"test", "trial"}:
                     nm = new_tmp("hdiv_div")
-                    emit_line(f"Eigen::MatrixXd {nm}(1, n_union);")
+                    div_cols = new_tmp("div_cols")
+                    sign_len = new_tmp("sign_len")
+                    sign_start = new_tmp("sign_start")
+                    emit_line(f"ssize_t {div_cols} = {div_name}_view.shape(2);")
+                    emit_line(f"ssize_t {sign_len} = {sign_name}_view.shape(1);")
+                    emit_line(f"ssize_t {sign_start} = ({sign_len} == {div_cols}) ? 0 : {s0};")
+                    emit_line(f"Eigen::MatrixXd {nm}(1, {div_cols});")
                     emit_line(f"{nm}.setZero();")
                     det_var = new_tmp("det")
                     if a.side == "+":
@@ -2355,7 +2928,7 @@ class CppCodeGen:
                     else:
                         emit_line(f"double {det_var} = detJ_view(e,q);")
                     emit_line(
-                        f"for (ssize_t j=0; j<n_union; ++j) {nm}(0,j) = ({div_name}_view(e,q,j) * {sign_name}_view(e,j)) / {det_var};"
+                        f"for (ssize_t j=0; j<{div_cols}; ++j) {nm}(0,j) = ({div_name}_view(e,q,j) * {sign_name}_view(e,{sign_start} + j)) / {det_var};"
                     )
                     stack.append(StackItem(nm, "mat", a.role, (1, -1), a.field_names, a.parent, a.side, a.field_sides))
                     continue
@@ -2365,6 +2938,16 @@ class CppCodeGen:
                     required_args.add(coeff_name)
                     nm = new_tmp("hdiv_divv")
                     emit_line(f"double {nm} = 0.0;")
+                    div_cols = new_tmp("div_cols")
+                    sign_len = new_tmp("sign_len")
+                    sign_start = new_tmp("sign_start")
+                    coeff_len = new_tmp("coeff_len")
+                    coeff_start = new_tmp("coeff_start")
+                    emit_line(f"ssize_t {div_cols} = {div_name}_view.shape(2);")
+                    emit_line(f"ssize_t {sign_len} = {sign_name}_view.shape(1);")
+                    emit_line(f"ssize_t {sign_start} = ({sign_len} == {div_cols}) ? 0 : {s0};")
+                    emit_line(f"ssize_t {coeff_len} = {coeff_name}_view.shape(1);")
+                    emit_line(f"ssize_t {coeff_start} = ({coeff_len} == {div_cols}) ? 0 : {s0};")
                     det_var = new_tmp("det")
                     if a.side == "+":
                         required_args.add("detJ_pos")
@@ -2375,7 +2958,7 @@ class CppCodeGen:
                     else:
                         emit_line(f"double {det_var} = detJ_view(e,q);")
                     emit_line(
-                        f"for (ssize_t j=0; j<n_union; ++j) {nm} += {coeff_name}_view(e,j) * ({div_name}_view(e,q,j) * {sign_name}_view(e,j)) / {det_var};"
+                        f"for (ssize_t j=0; j<{div_cols}; ++j) {nm} += {coeff_name}_view(e,{coeff_start} + j) * ({div_name}_view(e,q,j) * {sign_name}_view(e,{sign_start} + j)) / {det_var};"
                     )
                     stack.append(StackItem(nm, "scalar", "value", (), a.field_names, a.parent, a.side, a.field_sides))
                     continue
@@ -2404,6 +2987,37 @@ class CppCodeGen:
                 b = stack.pop()
                 a = stack.pop()
                 nm = new_tmp("bin")
+                sum_plan = _try_sum_plan(a, b) if op.op_symbol in {"+", "-"} else None
+                sum_lowering = _try_sum_lowering(a, b) if op.op_symbol in {"+", "-"} else None
+                sum_value_spec = _try_sum_value_spec(a, b) if op.op_symbol in {"+", "-"} else None
+                product_lowering = _try_product_lowering(a, b) if op.op_symbol == "*" else None
+                product_kernel = _try_product_kernel(a, b) if op.op_symbol == "*" else None
+                product_value_spec = _try_product_value_spec(a, b) if op.op_symbol == "*" else None
+                division_value_spec = _try_division_value_spec(a, b) if op.op_symbol == "/" else None
+                product_case = product_kernel.case if product_kernel is not None else None
+                product_result_is_scalar_basis_row = bool(
+                    (product_lowering is not None and _meta_is_scalar_basis_row(product_lowering.meta))
+                    or _value_spec_is_scalar_basis_row(product_value_spec)
+                )
+                product_result_row_shape = _scalar_basis_row_shape(
+                    tuple(
+                        int(v)
+                        for v in (
+                            getattr(product_value_spec, "shape", ())
+                            or (
+                                tuple(int(v) for v in getattr(product_lowering.result_storage, "stored_shape", ()) or ())
+                                if product_lowering is not None
+                                else ()
+                            )
+                            or a.shape
+                            or b.shape
+                        )
+                    )
+                )
+                division_result_is_scalar_basis_row = _value_spec_is_scalar_basis_row(division_value_spec)
+                division_result_row_shape = _scalar_basis_row_shape(
+                    tuple(int(v) for v in (getattr(division_value_spec, "shape", ()) or a.shape or b.shape))
+                )
                 side = combine_side(a.side, b.side)
                 f_sides = choose_field_sides(a.field_sides, b.field_sides)
                 f_names = a.field_names or b.field_names
@@ -2419,7 +3033,63 @@ class CppCodeGen:
                     *,
                     tmp_kind: str | None = None,
                     tmp_slot: int | None = None,
+                    layout_tag: str | None = None,
+                    expression_meta: Any = None,
+                    respect_sum_specs: bool = True,
                 ):
+                    if product_lowering is not None:
+                        planned_shape = tuple(int(v) for v in product_lowering.result_storage.stored_shape)
+                        if planned_shape:
+                            shape = planned_shape
+                    if product_value_spec is not None:
+                        planned_shape = tuple(int(v) for v in product_value_spec.shape)
+                        if planned_shape:
+                            shape = planned_shape
+                    if respect_sum_specs and sum_lowering is not None:
+                        planned_shape = tuple(int(v) for v in sum_lowering.result_storage.stored_shape)
+                        if planned_shape:
+                            shape = planned_shape
+                    if respect_sum_specs and sum_value_spec is not None:
+                        planned_shape = tuple(int(v) for v in sum_value_spec.shape)
+                        if planned_shape:
+                            shape = planned_shape
+                    if respect_sum_specs and sum_plan is not None:
+                        planned_role = getattr(sum_plan.result.tensor, "role", "") or ""
+                        if planned_role not in {"", "none"}:
+                            role = planned_role
+                    if respect_sum_specs and sum_value_spec is not None:
+                        planned_kind = getattr(sum_value_spec, "kind", "") or ""
+                        if planned_kind not in {"", "none"}:
+                            kind = planned_kind
+                        planned_role = getattr(sum_value_spec, "role", "") or ""
+                        if planned_role not in {"", "none"}:
+                            role = planned_role
+                    if product_value_spec is not None:
+                        planned_kind = getattr(product_value_spec, "kind", "") or ""
+                        if planned_kind not in {"", "none"}:
+                            kind = planned_kind
+                        planned_role = getattr(product_value_spec, "role", "") or ""
+                        if planned_role not in {"", "none"}:
+                            role = planned_role
+                    elif product_lowering is not None:
+                        planned_role = getattr(product_lowering.result, "role", "") or ""
+                        if planned_role not in {"", "none"}:
+                            role = planned_role
+                    if division_value_spec is not None:
+                        planned_kind = getattr(division_value_spec, "kind", "") or ""
+                        if planned_kind not in {"", "none"}:
+                            kind = planned_kind
+                        planned_shape = tuple(int(v) for v in getattr(division_value_spec, "shape", ()) or ())
+                        if planned_shape:
+                            shape = planned_shape
+                        planned_role = getattr(division_value_spec, "role", "") or ""
+                        if planned_role not in {"", "none"}:
+                            role = planned_role
+                    if kind == "vec" and len(shape) == 2 and 1 in shape:
+                        vec_dim = max(int(shape[0]), int(shape[1]))
+                        if vec_dim > 1:
+                            shape = (vec_dim,)
+                    kind = _normalize_cpp_storage_kind(kind, role, shape)
                     stack.append(
                         StackItem(
                             nm,
@@ -2432,33 +3102,197 @@ class CppCodeGen:
                             field_sides if field_sides is not None else f_sides,
                             tmp_kind=tmp_kind,
                             tmp_slot=tmp_slot,
+                            layout_tag=(
+                                layout_tag
+                                if layout_tag is not None
+                                else (
+                                    sum_value_spec.layout.value
+                                    if sum_value_spec is not None
+                                    else (
+                                    product_lowering.result.layout.value
+                                    if product_lowering is not None
+                                    else ""
+                                    )
+                                )
+                            ),
+                            expression_meta=(
+                                expression_meta
+                                if expression_meta is not None
+                                else (
+                                    sum_value_spec.meta
+                                    if sum_value_spec is not None
+                                    else (
+                                    sum_plan.result
+                                    if sum_plan is not None
+                                    else (
+                                        division_value_spec.meta
+                                        if division_value_spec is not None
+                                        else (
+                                        product_lowering.meta
+                                        if product_lowering is not None
+                                        else None
+                                        )
+                                    )
+                                    )
+                                )
+                            ),
                         )
                     )
+                def apply_sum_transform(item, transform: OperandTransform):
+                    if transform == OperandTransform.NONE:
+                        return item
+                    tr_name, tmp_kind, tmp_slot = alloc_tmp("mat", "sum_align")
+                    if transform == OperandTransform.TRANSPOSE_2D:
+                        if len(item.shape) != 2:
+                            raise ValueError(
+                                f"transpose_2d sum transform expects rank-2 operand, got shape {item.shape!r}"
+                            )
+                        emit_mat(tr_name, f"{item.name}.transpose().eval()", tmp_kind=tmp_kind)
+                        tr_shape = (item.shape[1], item.shape[0])
+                    elif transform == OperandTransform.SCALAR_GRAD_TO_VECTOR:
+                        if len(item.shape) == 2:
+                            emit_mat(tr_name, _cpp_matrix_input_expr(item), tmp_kind=tmp_kind)
+                            tr_shape = item.shape
+                        elif len(item.shape) == 3 and int(item.shape[0]) == 1:
+                            emit_mat(tr_name, _cpp_matrix_input_expr(item), tmp_kind=tmp_kind)
+                            tr_shape = (item.shape[2], item.shape[1])
+                        else:
+                            raise ValueError(
+                                f"scalar_grad_to_vector sum transform expects shape (d,n) or (1,n,d), got {item.shape!r}"
+                            )
+                    else:
+                        raise ValueError(f"Unsupported sum transform {transform!r}")
+                    return StackItem(
+                        tr_name,
+                        "mat",
+                        item.role,
+                        tr_shape,
+                        item.field_names,
+                        item.parent,
+                        item.side,
+                        item.field_sides,
+                        tmp_kind=tmp_kind,
+                        tmp_slot=tmp_slot,
+                        layout_tag=item.layout_tag,
+                        expression_meta=item.expression_meta,
+                    )
+                if sum_lowering is not None:
+                    a = apply_sum_transform(a, sum_lowering.lhs_transform)
+                    b = apply_sum_transform(b, sum_lowering.rhs_transform)
+                a_rank1_matrix = _semantic_is_rank1_matrix(a, spatial_dim=self.spatial_dim)
+                b_rank1_matrix = _semantic_is_rank1_matrix(b, spatial_dim=self.spatial_dim)
+                a_mat_expr = _cpp_matrix_input_expr(a)
+                b_mat_expr = _cpp_matrix_input_expr(b)
+                sum_result_is_vec = bool(sum_value_spec is not None and getattr(sum_value_spec, "kind", "") == "vec")
+                sum_result_is_scalar_basis_row = bool(
+                    (sum_plan is not None and _meta_is_scalar_basis_row(sum_plan.result))
+                    or _value_spec_is_scalar_basis_row(sum_value_spec)
+                )
+                sum_result_row_shape = _scalar_basis_row_shape(
+                    tuple(
+                        int(v)
+                        for v in (
+                            getattr(sum_value_spec, "shape", ())
+                            or (
+                                tuple(int(v) for v in getattr(sum_lowering.result_storage, "stored_shape", ()) or ())
+                                if sum_lowering is not None
+                                else ()
+                            )
+                            or a.shape
+                            or b.shape
+                        )
+                    )
+                )
+                a_sum_vector_like = a.kind == "vec" or a_rank1_matrix
+                b_sum_vector_like = b.kind == "vec" or b_rank1_matrix
                 if op.op_symbol == "+":
+                    if sum_result_is_scalar_basis_row and a_sum_vector_like and b_sum_vector_like:
+                        nm, tmp_kind, tmp_slot = alloc_tmp("mat", "bin")
+                        emit_mat(
+                            nm,
+                            f"{_cpp_scalar_basis_row_expr(a, spatial_dim=self.spatial_dim)} + {_cpp_scalar_basis_row_expr(b, spatial_dim=self.spatial_dim)}",
+                            tmp_kind=tmp_kind,
+                        )
+                        push_bin(
+                            "mat",
+                            getattr(sum_value_spec, "role", "") or getattr(sum_plan.result.tensor, "role", "") or a.role,
+                            sum_result_row_shape,
+                            a.field_names or b.field_names,
+                            a.parent or b.parent,
+                            tmp_kind=tmp_kind,
+                            tmp_slot=tmp_slot,
+                            layout_tag=(sum_value_spec.layout.value if sum_value_spec is not None else ""),
+                            expression_meta=(sum_value_spec.meta if sum_value_spec is not None else (sum_plan.result if sum_plan is not None else None)),
+                            respect_sum_specs=False,
+                        )
+                        continue
+                    if sum_result_is_vec and a_sum_vector_like and b_sum_vector_like:
+                        nm, tmp_kind, tmp_slot = alloc_tmp("vec", "bin")
+                        emit_vec(
+                            nm,
+                            f"{_cpp_sum_vector_expr(a, spatial_dim=self.spatial_dim)} + {_cpp_sum_vector_expr(b, spatial_dim=self.spatial_dim)}",
+                            tmp_kind=tmp_kind,
+                        )
+                        push_bin(
+                            "vec",
+                            a.role,
+                            a.shape if a.kind == "vec" else b.shape,
+                            a.field_names or b.field_names,
+                            a.parent or b.parent,
+                            tmp_kind=tmp_kind,
+                            tmp_slot=tmp_slot,
+                        )
+                        continue
                     # Normalize (1,n) row-matrices used as scalar basis vectors to VectorXd
                     # so we can safely add/subtract with vec-kind basis vectors.
                     if a.kind == "vec" and b.kind == "mat" and len(b.shape) >= 2 and b.shape[0] == 1:
                         emit_line(f"Eigen::VectorXd {nm} = {a.name} + {b.name}.row(0).transpose();")
-                        push_bin("vec", a.role, a.shape, a.field_names or b.field_names, a.parent or b.parent)
+                        push_bin(
+                            "vec",
+                            a.role,
+                            ((int(b.shape[1]) if len(b.shape) >= 2 else int(max(b.shape))),),
+                            a.field_names or b.field_names,
+                            a.parent or b.parent,
+                            respect_sum_specs=False,
+                        )
                         continue
                     if b.kind == "vec" and a.kind == "mat" and len(a.shape) >= 2 and a.shape[0] == 1:
                         emit_line(f"Eigen::VectorXd {nm} = {a.name}.row(0).transpose() + {b.name};")
-                        push_bin("vec", b.role, b.shape, a.field_names or b.field_names, a.parent or b.parent)
+                        push_bin(
+                            "vec",
+                            b.role,
+                            ((int(a.shape[1]) if len(a.shape) >= 2 else int(max(a.shape))),),
+                            a.field_names or b.field_names,
+                            a.parent or b.parent,
+                            respect_sum_specs=False,
+                        )
                         continue
                     if a.kind == "grad" and b.kind == "grad":
-                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({a.name}.size());")
-                        emit_line(f"for (size_t _i=0; _i<{a.name}.size(); ++_i) {nm}[_i] = {a.name}[_i] + {b.name}[_i];")
+                        if a_rank1_matrix and b_rank1_matrix:
+                            emit_line(f"Eigen::MatrixXd {nm} = {a_mat_expr} + {b_mat_expr};")
+                        else:
+                            emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({a.name}.size());")
+                            emit_line(f"for (size_t _i=0; _i<{a.name}.size(); ++_i) {nm}[_i] = {a.name}[_i] + {b.name}[_i];")
                         push_bin("grad", a.role, a.shape, a.field_names, a.parent)
                     elif a.kind == "mixed" and b.kind == "mixed":
-                        emit_line(f"auto {nm} = add_mixed({a.name}, {b.name});")
+                        if len(a.shape) == 2 and len(b.shape) == 2:
+                            emit_line(f"Eigen::MatrixXd {nm} = {a.name} + {b.name};")
+                        else:
+                            emit_line(f"auto {nm} = add_mixed({a.name}, {b.name});")
                         push_bin("mixed", a.role, a.shape, a.field_names, a.parent)
                     elif a.kind == "mixed" and b.kind == "mat":
-                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({a.name}.size());")
-                        emit_line(f"for (size_t _i=0; _i<{a.name}.size(); ++_i) {nm}[_i] = {a.name}[_i] + {b.name};")
+                        if len(a.shape) == 2:
+                            emit_line(f"Eigen::MatrixXd {nm} = {a.name} + {b.name};")
+                        else:
+                            emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({a.name}.size());")
+                            emit_line(f"for (size_t _i=0; _i<{a.name}.size(); ++_i) {nm}[_i] = {a.name}[_i] + {b.name};")
                         push_bin("mixed", a.role, a.shape, a.field_names, a.parent)
                     elif a.kind == "mat" and b.kind == "mixed":
-                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({b.name}.size());")
-                        emit_line(f"for (size_t _i=0; _i<{b.name}.size(); ++_i) {nm}[_i] = {a.name} + {b.name}[_i];")
+                        if len(b.shape) == 2:
+                            emit_line(f"Eigen::MatrixXd {nm} = {a.name} + {b.name};")
+                        else:
+                            emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({b.name}.size());")
+                            emit_line(f"for (size_t _i=0; _i<{b.name}.size(); ++_i) {nm}[_i] = {a.name} + {b.name}[_i];")
                         push_bin("mixed", b.role, b.shape, b.field_names, b.parent)
                     elif a.kind == "mixed" and b.kind == "grad":
                         emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({a.name}.size());")
@@ -2469,10 +3303,16 @@ class CppCodeGen:
                         emit_line(f"for (size_t _i=0; _i<{b.name}.size(); ++_i) {nm}[_i] = {a.name}[_i] + {b.name}[_i];")
                         push_bin("mixed", b.role, b.shape, b.field_names, b.parent)
                     elif a.kind == "mat" and b.kind == "grad":
-                        emit_line(f"auto {nm} = add_grad_mat(GradStack{{{b.name}}}, {a.name}).comps;")
+                        if b_rank1_matrix:
+                            emit_line(f"Eigen::MatrixXd {nm} = {b_mat_expr} + {a_mat_expr};")
+                        else:
+                            emit_line(f"auto {nm} = add_grad_mat(GradStack{{{b.name}}}, {a.name}).comps;")
                         push_bin("grad", b.role, b.shape, b.field_names, b.parent)
                     elif a.kind == "grad" and b.kind == "mat":
-                        emit_line(f"auto {nm} = add_grad_mat(GradStack{{{a.name}}}, {b.name}).comps;")
+                        if a_rank1_matrix:
+                            emit_line(f"Eigen::MatrixXd {nm} = {a_mat_expr} + {b_mat_expr};")
+                        else:
+                            emit_line(f"auto {nm} = add_grad_mat(GradStack{{{a.name}}}, {b.name}).comps;")
                         push_bin("grad", a.role, a.shape, a.field_names, a.parent)
                     elif a.kind == "scalar" and b.kind == "vec":
                         emit_line(f"Eigen::VectorXd {nm} = ({b.name}.array() + {a.name}).matrix();")
@@ -2482,19 +3322,25 @@ class CppCodeGen:
                         push_bin("vec", a.role, a.shape, a.field_names, a.parent)
                     elif a.kind == "scalar" and b.kind == "mat":
                         nm, tmp_kind, tmp_slot = alloc_tmp("mat", "bin")
-                        emit_mat(nm, f"({b.name}.array() + {a.name}).matrix()", tmp_kind=tmp_kind)
+                        emit_mat(nm, f"(({b_mat_expr}).array() + {a.name}).matrix()", tmp_kind=tmp_kind)
                         push_bin("mat", b.role, b.shape, b.field_names, b.parent, tmp_kind=tmp_kind, tmp_slot=tmp_slot)
                     elif b.kind == "scalar" and a.kind == "mat":
                         nm, tmp_kind, tmp_slot = alloc_tmp("mat", "bin")
-                        emit_mat(nm, f"({a.name}.array() + {b.name}).matrix()", tmp_kind=tmp_kind)
+                        emit_mat(nm, f"(({a_mat_expr}).array() + {b.name}).matrix()", tmp_kind=tmp_kind)
                         push_bin("mat", a.role, a.shape, a.field_names, a.parent, tmp_kind=tmp_kind, tmp_slot=tmp_slot)
                     elif a.kind == "scalar" and b.kind == "grad":
-                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({b.name}.size());")
-                        emit_line(f"for (size_t _i=0; _i<{b.name}.size(); ++_i) {nm}[_i] = ({b.name}[_i].array() + {a.name}).matrix();")
+                        if b_rank1_matrix:
+                            emit_line(f"Eigen::MatrixXd {nm} = (({b_mat_expr}).array() + {a.name}).matrix();")
+                        else:
+                            emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({b.name}.size());")
+                            emit_line(f"for (size_t _i=0; _i<{b.name}.size(); ++_i) {nm}[_i] = ({b.name}[_i].array() + {a.name}).matrix();")
                         push_bin("grad", b.role, b.shape, b.field_names, b.parent)
                     elif b.kind == "scalar" and a.kind == "grad":
-                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({a.name}.size());")
-                        emit_line(f"for (size_t _i=0; _i<{a.name}.size(); ++_i) {nm}[_i] = ({a.name}[_i].array() + {b.name}).matrix();")
+                        if a_rank1_matrix:
+                            emit_line(f"Eigen::MatrixXd {nm} = (({a_mat_expr}).array() + {b.name}).matrix();")
+                        else:
+                            emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({a.name}.size());")
+                            emit_line(f"for (size_t _i=0; _i<{a.name}.size(); ++_i) {nm}[_i] = ({a.name}[_i].array() + {b.name}).matrix();")
                         push_bin("grad", a.role, a.shape, a.field_names, a.parent)
                     elif a.kind == "scalar" and b.kind == "hess":
                         if b.role in {"test", "trial"}:
@@ -2503,7 +3349,7 @@ class CppCodeGen:
                                 f"for (size_t _i=0; _i<{b.name}.size(); ++_i) {nm}[_i] = ({b.name}[_i].array() + {a.name}).matrix();"
                             )
                         else:
-                            emit_line(f"Eigen::MatrixXd {nm} = ({b.name}.array() + {a.name}).matrix();")
+                            emit_line(f"Eigen::MatrixXd {nm} = (({b_mat_expr}).array() + {a.name}).matrix();")
                         push_bin("hess", b.role, b.shape, b.field_names, b.parent)
                     elif b.kind == "scalar" and a.kind == "hess":
                         if a.role in {"test", "trial"}:
@@ -2512,15 +3358,21 @@ class CppCodeGen:
                                 f"for (size_t _i=0; _i<{a.name}.size(); ++_i) {nm}[_i] = ({a.name}[_i].array() + {b.name}).matrix();"
                             )
                         else:
-                            emit_line(f"Eigen::MatrixXd {nm} = ({a.name}.array() + {b.name}).matrix();")
+                            emit_line(f"Eigen::MatrixXd {nm} = (({a_mat_expr}).array() + {b.name}).matrix();")
                         push_bin("hess", a.role, a.shape, a.field_names, a.parent)
                     elif a.kind == "scalar" and b.kind == "mixed":
-                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({b.name}.size());")
-                        emit_line(f"for (size_t _i=0; _i<{b.name}.size(); ++_i) {nm}[_i] = ({b.name}[_i].array() + {a.name}).matrix();")
+                        if len(b.shape) == 2:
+                            emit_line(f"Eigen::MatrixXd {nm} = (({b.name}).array() + {a.name}).matrix();")
+                        else:
+                            emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({b.name}.size());")
+                            emit_line(f"for (size_t _i=0; _i<{b.name}.size(); ++_i) {nm}[_i] = ({b.name}[_i].array() + {a.name}).matrix();")
                         push_bin("mixed", b.role, b.shape, b.field_names, b.parent)
                     elif b.kind == "scalar" and a.kind == "mixed":
-                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({a.name}.size());")
-                        emit_line(f"for (size_t _i=0; _i<{a.name}.size(); ++_i) {nm}[_i] = ({a.name}[_i].array() + {b.name}).matrix();")
+                        if len(a.shape) == 2:
+                            emit_line(f"Eigen::MatrixXd {nm} = (({a.name}).array() + {b.name}).matrix();")
+                        else:
+                            emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({a.name}.size());")
+                            emit_line(f"for (size_t _i=0; _i<{a.name}.size(); ++_i) {nm}[_i] = ({a.name}[_i].array() + {b.name}).matrix();")
                         push_bin("mixed", a.role, a.shape, a.field_names, a.parent)
                     else:
                         if a.kind == "scalar":
@@ -2533,36 +3385,99 @@ class CppCodeGen:
                             push_bin("vec", a.role, a.shape, a.field_names or b.field_names, a.parent or b.parent, tmp_kind=tmp_kind, tmp_slot=tmp_slot)
                         elif a.kind == "mat":
                             nm, tmp_kind, tmp_slot = alloc_tmp("mat", "bin")
-                            emit_mat(nm, f"{a.name} + {b.name}", tmp_kind=tmp_kind)
+                            emit_mat(nm, f"{a_mat_expr} + {b_mat_expr}", tmp_kind=tmp_kind)
                             push_bin("mat", a.role, a.shape, a.field_names or b.field_names, a.parent or b.parent, tmp_kind=tmp_kind, tmp_slot=tmp_slot)
                         else:
                             emit_line(f"auto {nm} = {a.name} + {b.name};")
                             push_bin(a.kind, a.role, a.shape, a.field_names or b.field_names, a.parent or b.parent)
                 elif op.op_symbol == "-":
+                    if sum_result_is_scalar_basis_row and a_sum_vector_like and b_sum_vector_like:
+                        nm, tmp_kind, tmp_slot = alloc_tmp("mat", "bin")
+                        emit_mat(
+                            nm,
+                            f"{_cpp_scalar_basis_row_expr(a, spatial_dim=self.spatial_dim)} - {_cpp_scalar_basis_row_expr(b, spatial_dim=self.spatial_dim)}",
+                            tmp_kind=tmp_kind,
+                        )
+                        push_bin(
+                            "mat",
+                            getattr(sum_value_spec, "role", "") or getattr(sum_plan.result.tensor, "role", "") or a.role,
+                            sum_result_row_shape,
+                            a.field_names or b.field_names,
+                            a.parent or b.parent,
+                            tmp_kind=tmp_kind,
+                            tmp_slot=tmp_slot,
+                            layout_tag=(sum_value_spec.layout.value if sum_value_spec is not None else ""),
+                            expression_meta=(sum_value_spec.meta if sum_value_spec is not None else (sum_plan.result if sum_plan is not None else None)),
+                            respect_sum_specs=False,
+                        )
+                        continue
+                    if sum_result_is_vec and a_sum_vector_like and b_sum_vector_like:
+                        nm, tmp_kind, tmp_slot = alloc_tmp("vec", "bin")
+                        emit_vec(
+                            nm,
+                            f"{_cpp_sum_vector_expr(a, spatial_dim=self.spatial_dim)} - {_cpp_sum_vector_expr(b, spatial_dim=self.spatial_dim)}",
+                            tmp_kind=tmp_kind,
+                        )
+                        push_bin(
+                            "vec",
+                            a.role,
+                            a.shape if a.kind == "vec" else b.shape,
+                            a.field_names or b.field_names,
+                            a.parent or b.parent,
+                            tmp_kind=tmp_kind,
+                            tmp_slot=tmp_slot,
+                        )
+                        continue
                     # Normalize (1,n) row-matrices used as scalar basis vectors to VectorXd
                     # so we can safely add/subtract with vec-kind basis vectors.
                     if a.kind == "vec" and b.kind == "mat" and len(b.shape) >= 2 and b.shape[0] == 1:
                         emit_line(f"Eigen::VectorXd {nm} = {a.name} - {b.name}.row(0).transpose();")
-                        push_bin("vec", a.role, a.shape, a.field_names or b.field_names, a.parent or b.parent)
+                        push_bin(
+                            "vec",
+                            a.role,
+                            ((int(b.shape[1]) if len(b.shape) >= 2 else int(max(b.shape))),),
+                            a.field_names or b.field_names,
+                            a.parent or b.parent,
+                            respect_sum_specs=False,
+                        )
                         continue
                     if b.kind == "vec" and a.kind == "mat" and len(a.shape) >= 2 and a.shape[0] == 1:
                         emit_line(f"Eigen::VectorXd {nm} = {a.name}.row(0).transpose() - {b.name};")
-                        push_bin("vec", b.role, b.shape, a.field_names or b.field_names, a.parent or b.parent)
+                        push_bin(
+                            "vec",
+                            b.role,
+                            ((int(a.shape[1]) if len(a.shape) >= 2 else int(max(a.shape))),),
+                            a.field_names or b.field_names,
+                            a.parent or b.parent,
+                            respect_sum_specs=False,
+                        )
                         continue
                     if a.kind == "grad" and b.kind == "grad":
-                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({a.name}.size());")
-                        emit_line(f"for (size_t _i=0; _i<{a.name}.size(); ++_i) {nm}[_i] = {a.name}[_i] - {b.name}[_i];")
+                        if a_rank1_matrix and b_rank1_matrix:
+                            emit_line(f"Eigen::MatrixXd {nm} = {a_mat_expr} - {b_mat_expr};")
+                        else:
+                            emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({a.name}.size());")
+                            emit_line(f"for (size_t _i=0; _i<{a.name}.size(); ++_i) {nm}[_i] = {a.name}[_i] - {b.name}[_i];")
                         push_bin("grad", a.role, a.shape, a.field_names, a.parent)
                     elif a.kind == "mixed" and b.kind == "mixed":
-                        emit_line(f"auto {nm} = sub_mixed({a.name}, {b.name});")
+                        if len(a.shape) == 2 and len(b.shape) == 2:
+                            emit_line(f"Eigen::MatrixXd {nm} = {a.name} - {b.name};")
+                        else:
+                            emit_line(f"auto {nm} = sub_mixed({a.name}, {b.name});")
                         push_bin("mixed", a.role, a.shape, a.field_names, a.parent)
                     elif a.kind == "mixed" and b.kind == "mat":
-                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({a.name}.size());")
-                        emit_line(f"for (size_t _i=0; _i<{a.name}.size(); ++_i) {nm}[_i] = {a.name}[_i] - {b.name};")
+                        if len(a.shape) == 2:
+                            emit_line(f"Eigen::MatrixXd {nm} = {a.name} - {b.name};")
+                        else:
+                            emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({a.name}.size());")
+                            emit_line(f"for (size_t _i=0; _i<{a.name}.size(); ++_i) {nm}[_i] = {a.name}[_i] - {b.name};")
                         push_bin("mixed", a.role, a.shape, a.field_names, a.parent)
                     elif a.kind == "mat" and b.kind == "mixed":
-                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({b.name}.size());")
-                        emit_line(f"for (size_t _i=0; _i<{b.name}.size(); ++_i) {nm}[_i] = {a.name} - {b.name}[_i];")
+                        if len(b.shape) == 2:
+                            emit_line(f"Eigen::MatrixXd {nm} = {a.name} - {b.name};")
+                        else:
+                            emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({b.name}.size());")
+                            emit_line(f"for (size_t _i=0; _i<{b.name}.size(); ++_i) {nm}[_i] = {a.name} - {b.name}[_i];")
                         push_bin("mixed", b.role, b.shape, b.field_names, b.parent)
                     elif a.kind == "mixed" and b.kind == "grad":
                         emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({a.name}.size());")
@@ -2584,7 +3499,7 @@ class CppCodeGen:
                             )
                             emit_line(f"for (size_t _i=0; _i<{nm}.size(); ++_i) {nm}[_i] = {a.name}[_i] - {b.name}[_i];")
                         elif (not a_is_basis) and (not b_is_basis):
-                            emit_line(f"Eigen::MatrixXd {nm} = {a.name} - {b.name};")
+                            emit_line(f"Eigen::MatrixXd {nm} = {a_mat_expr} - {b_mat_expr};")
                         else:
                             raise NotImplementedError("Cannot subtract basis-Hessian from value-Hessian in C++ backend.")
                         push_bin(
@@ -2597,10 +3512,16 @@ class CppCodeGen:
                             choose_field_sides(a.field_sides, b.field_sides),
                         )
                     elif a.kind == "mat" and b.kind == "grad":
-                        emit_line(f"auto {nm} = mat_sub_grad({a.name}, GradStack{{{b.name}}}).comps;")
+                        if b_rank1_matrix:
+                            emit_line(f"Eigen::MatrixXd {nm} = {a_mat_expr} - {b_mat_expr};")
+                        else:
+                            emit_line(f"auto {nm} = mat_sub_grad({a.name}, GradStack{{{b.name}}}).comps;")
                         push_bin("grad", b.role, b.shape, b.field_names, b.parent)
                     elif a.kind == "grad" and b.kind == "mat":
-                        emit_line(f"auto {nm} = sub_grad_mat(GradStack{{{a.name}}}, {b.name}).comps;")
+                        if a_rank1_matrix:
+                            emit_line(f"Eigen::MatrixXd {nm} = {a_mat_expr} - {b_mat_expr};")
+                        else:
+                            emit_line(f"auto {nm} = sub_grad_mat(GradStack{{{a.name}}}, {b.name}).comps;")
                         push_bin("grad", a.role, a.shape, a.field_names, a.parent)
                     elif a.kind == "scalar" and b.kind == "vec":
                         emit_line(f"Eigen::VectorXd {nm} = (-{b.name}.array() + {a.name}).matrix();")
@@ -2610,19 +3531,25 @@ class CppCodeGen:
                         push_bin("vec", a.role, a.shape, a.field_names, a.parent)
                     elif a.kind == "scalar" and b.kind == "mat":
                         nm, tmp_kind, tmp_slot = alloc_tmp("mat", "bin")
-                        emit_mat(nm, f"(-{b.name}.array() + {a.name}).matrix()", tmp_kind=tmp_kind)
+                        emit_mat(nm, f"(-({b_mat_expr}).array() + {a.name}).matrix()", tmp_kind=tmp_kind)
                         push_bin("mat", b.role, b.shape, b.field_names, b.parent, tmp_kind=tmp_kind, tmp_slot=tmp_slot)
                     elif b.kind == "scalar" and a.kind == "mat":
                         nm, tmp_kind, tmp_slot = alloc_tmp("mat", "bin")
-                        emit_mat(nm, f"({a.name}.array() - {b.name}).matrix()", tmp_kind=tmp_kind)
+                        emit_mat(nm, f"(({a_mat_expr}).array() - {b.name}).matrix()", tmp_kind=tmp_kind)
                         push_bin("mat", a.role, a.shape, a.field_names, a.parent, tmp_kind=tmp_kind, tmp_slot=tmp_slot)
                     elif a.kind == "scalar" and b.kind == "grad":
-                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({b.name}.size());")
-                        emit_line(f"for (size_t _i=0; _i<{b.name}.size(); ++_i) {nm}[_i] = (-{b.name}[_i].array() + {a.name}).matrix();")
+                        if b_rank1_matrix:
+                            emit_line(f"Eigen::MatrixXd {nm} = (-({b_mat_expr}).array() + {a.name}).matrix();")
+                        else:
+                            emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({b.name}.size());")
+                            emit_line(f"for (size_t _i=0; _i<{b.name}.size(); ++_i) {nm}[_i] = (-{b.name}[_i].array() + {a.name}).matrix();")
                         push_bin("grad", b.role, b.shape, b.field_names, b.parent)
                     elif b.kind == "scalar" and a.kind == "grad":
-                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({a.name}.size());")
-                        emit_line(f"for (size_t _i=0; _i<{a.name}.size(); ++_i) {nm}[_i] = ({a.name}[_i].array() - {b.name}).matrix();")
+                        if a_rank1_matrix:
+                            emit_line(f"Eigen::MatrixXd {nm} = (({a_mat_expr}).array() - {b.name}).matrix();")
+                        else:
+                            emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({a.name}.size());")
+                            emit_line(f"for (size_t _i=0; _i<{a.name}.size(); ++_i) {nm}[_i] = ({a.name}[_i].array() - {b.name}).matrix();")
                         push_bin("grad", a.role, a.shape, a.field_names, a.parent)
                     elif a.kind == "scalar" and b.kind == "hess":
                         if b.role in {"test", "trial"}:
@@ -2631,7 +3558,7 @@ class CppCodeGen:
                                 f"for (size_t _i=0; _i<{b.name}.size(); ++_i) {nm}[_i] = (-{b.name}[_i].array() + {a.name}).matrix();"
                             )
                         else:
-                            emit_line(f"Eigen::MatrixXd {nm} = (-{b.name}.array() + {a.name}).matrix();")
+                            emit_line(f"Eigen::MatrixXd {nm} = (-({b_mat_expr}).array() + {a.name}).matrix();")
                         push_bin("hess", b.role, b.shape, b.field_names, b.parent)
                     elif b.kind == "scalar" and a.kind == "hess":
                         if a.role in {"test", "trial"}:
@@ -2640,15 +3567,21 @@ class CppCodeGen:
                                 f"for (size_t _i=0; _i<{a.name}.size(); ++_i) {nm}[_i] = ({a.name}[_i].array() - {b.name}).matrix();"
                             )
                         else:
-                            emit_line(f"Eigen::MatrixXd {nm} = ({a.name}.array() - {b.name}).matrix();")
+                            emit_line(f"Eigen::MatrixXd {nm} = (({a_mat_expr}).array() - {b.name}).matrix();")
                         push_bin("hess", a.role, a.shape, a.field_names, a.parent)
                     elif a.kind == "scalar" and b.kind == "mixed":
-                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({b.name}.size());")
-                        emit_line(f"for (size_t _i=0; _i<{b.name}.size(); ++_i) {nm}[_i] = (-{b.name}[_i].array() + {a.name}).matrix();")
+                        if len(b.shape) == 2:
+                            emit_line(f"Eigen::MatrixXd {nm} = (-({b.name}).array() + {a.name}).matrix();")
+                        else:
+                            emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({b.name}.size());")
+                            emit_line(f"for (size_t _i=0; _i<{b.name}.size(); ++_i) {nm}[_i] = (-{b.name}[_i].array() + {a.name}).matrix();")
                         push_bin("mixed", b.role, b.shape, b.field_names, b.parent)
                     elif b.kind == "scalar" and a.kind == "mixed":
-                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({a.name}.size());")
-                        emit_line(f"for (size_t _i=0; _i<{a.name}.size(); ++_i) {nm}[_i] = ({a.name}[_i].array() - {b.name}).matrix();")
+                        if len(a.shape) == 2:
+                            emit_line(f"Eigen::MatrixXd {nm} = (({a.name}).array() - {b.name}).matrix();")
+                        else:
+                            emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({a.name}.size());")
+                            emit_line(f"for (size_t _i=0; _i<{a.name}.size(); ++_i) {nm}[_i] = ({a.name}[_i].array() - {b.name}).matrix();")
                         push_bin("mixed", a.role, a.shape, a.field_names, a.parent)
                     else:
                         if a.kind == "scalar":
@@ -2661,7 +3594,7 @@ class CppCodeGen:
                             push_bin("vec", a.role, a.shape, a.field_names or b.field_names, a.parent or b.parent, tmp_kind=tmp_kind, tmp_slot=tmp_slot)
                         elif a.kind == "mat":
                             nm, tmp_kind, tmp_slot = alloc_tmp("mat", "bin")
-                            emit_mat(nm, f"{a.name} - {b.name}", tmp_kind=tmp_kind)
+                            emit_mat(nm, f"{a_mat_expr} - {b_mat_expr}", tmp_kind=tmp_kind)
                             push_bin("mat", a.role, a.shape, a.field_names or b.field_names, a.parent or b.parent, tmp_kind=tmp_kind, tmp_slot=tmp_slot)
                         else:
                             emit_line(f"auto {nm} = {a.name} - {b.name};")
@@ -2725,19 +3658,59 @@ class CppCodeGen:
                             emit_line('throw std::runtime_error("vec * mat basis multiplication requires one test and one trial operand");')
                         push_bin("mat", "value", (-1, -1), tmp_kind=tmp_kind, tmp_slot=tmp_slot)
                         continue
+                    if (
+                        a.kind == "mat"
+                        and a.role == "trial"
+                        and len(a.shape) == 2
+                        and a.shape[0] > 1
+                        and b.kind == "mat"
+                        and b.role == "test"
+                        and len(b.shape) == 2
+                        and b.shape[0] == 1
+                    ):
+                        emit_line(f"auto {nm} = vector_trial_times_scalar_test({a.name}, {b.name});")
+                        push_bin(
+                            "mixed",
+                            "mixed",
+                            (a.shape[0], b.shape[1], a.shape[1]),
+                            a.field_names or b.field_names,
+                            a.parent or b.parent,
+                            layout_tag=MixedLayout.COMPONENT_FIRST.value,
+                            expression_meta=product_lowering.meta if product_lowering is not None else None,
+                        )
+                        continue
+                    if (
+                        a.kind == "mat"
+                        and a.role == "test"
+                        and len(a.shape) == 2
+                        and a.shape[0] > 1
+                        and b.kind == "mat"
+                        and b.role == "trial"
+                        and len(b.shape) == 2
+                        and b.shape[0] == 1
+                    ):
+                        emit_line(f"auto {nm} = vector_test_times_scalar_trial({a.name}, {b.name});")
+                        push_bin(
+                            "mixed",
+                            "mixed",
+                            (a.shape[0], a.shape[1], b.shape[1]),
+                            a.field_names or b.field_names,
+                            a.parent or b.parent,
+                            layout_tag=MixedLayout.COMPONENT_FIRST.value,
+                            expression_meta=product_lowering.meta if product_lowering is not None else None,
+                        )
+                        continue
                         
                     if a.kind == "vec" and b.kind == "vec" and is_a_basis and not is_b_basis:
                         # a: basis vector (-1,) and b: value vector (k,) -> matrix (k, -1)
-                        emit_line(f"Eigen::MatrixXd {nm}({b.name}.size(), {a.name}.size());")
-                        emit_line(f"for (int _c=0; _c<{b.name}.size(); ++_c) {nm}.row(_c) = {a.name}.transpose() * {b.name}(_c);")
+                        emit_line(f"Eigen::MatrixXd {nm} = scalar_basis_times_vector({a.name}, {b.name});")
                         out_k = b.shape[0] if len(b.shape) > 0 and b.shape[0] not in (-1, 0) else -1
-                        push_bin("mat", a.role, (out_k, -1))
+                        push_bin("mat", a.role, (out_k, a.shape[0]), a.field_names or b.field_names, a.parent or b.parent, expression_meta=product_lowering.meta if product_lowering is not None else None)
                         continue
                     elif a.kind == "vec" and is_a_basis and is_b_row_vec_or_col_vec_2k:
                         # a: basis vector (-1,) and b: value row/col vector (1,2) or (2,1) -> matrix (2, -1)
-                        emit_line(f"Eigen::MatrixXd {nm}({b.name}.cols() == 1 ? {b.name}.rows() : {b.name}.cols(), {a.name}.size());")
-                        emit_line(f"for (int _c=0; _c<({b.name}.cols() == 1 ? {b.name}.rows() : {b.name}.cols()); ++_c) {nm}.row(_c) = {a.name}.transpose() * ({b.name}.cols() == 1 ? {b.name}(_c,0) : {b.name}(0,_c));")
-                        push_bin("mat", a.role, (2, -1))
+                        emit_line(f"Eigen::MatrixXd {nm} = scalar_basis_times_vector({a.name}, matrix_like_to_vector({b.name}));")
+                        push_bin("mat", a.role, (2, a.shape[0]), a.field_names or b.field_names, a.parent or b.parent, expression_meta=product_lowering.meta if product_lowering is not None else None)
                         continue
                     elif a.kind == "vec" and is_a_basis and is_b_2x2:
                         # a: basis vector (-1,) and b: value 2x2 matrix -> grad (2,-1,2)
@@ -2751,16 +3724,14 @@ class CppCodeGen:
                         continue
                     if a.kind == "vec" and b.kind == "vec" and is_b_basis and not is_a_basis:
                         # b: basis vector (-1,) and a: value vector (k,) -> matrix (k, -1)
-                        emit_line(f"Eigen::MatrixXd {nm}({a.name}.size(), {b.name}.size());")
-                        emit_line(f"for (int _c=0; _c<{a.name}.size(); ++_c) {nm}.row(_c) = {b.name}.transpose() * {a.name}(_c);")
+                        emit_line(f"Eigen::MatrixXd {nm} = scalar_basis_times_vector({b.name}, {a.name});")
                         out_k = a.shape[0] if len(a.shape) > 0 and a.shape[0] not in (-1, 0) else -1
-                        push_bin("mat", b.role, (out_k, -1))
+                        push_bin("mat", b.role, (out_k, b.shape[0]), a.field_names or b.field_names, a.parent or b.parent, expression_meta=product_lowering.meta if product_lowering is not None else None)
                         continue
                     elif b.kind == "vec" and is_b_basis and is_a_row_vec_or_col_vec_2k:
                         # b: basis vector (-1,) and a: value row/col vector (1,2) or (2,1) -> matrix (2, -1)
-                        emit_line(f"Eigen::MatrixXd {nm}({a.name}.cols() == 1 ? {a.name}.rows() : {a.name}.cols(), {b.name}.size());")
-                        emit_line(f"for (int _c=0; _c<({a.name}.cols() == 1 ? {a.name}.rows() : {a.name}.cols()); ++_c) {nm}.row(_c) = {b.name}.transpose() * ({a.name}.cols() == 1 ? {a.name}(_c,0) : {a.name}(0,_c));")
-                        push_bin("mat", b.role, (2, -1))
+                        emit_line(f"Eigen::MatrixXd {nm} = scalar_basis_times_vector({b.name}, matrix_like_to_vector({a.name}));")
+                        push_bin("mat", b.role, (2, b.shape[0]), a.field_names or b.field_names, a.parent or b.parent, expression_meta=product_lowering.meta if product_lowering is not None else None)
                         continue
                     elif b.kind == "vec" and is_b_basis and is_a_2x2:
                         # b: basis vector (-1,) and a: value 2x2 matrix -> grad (2,-1,2)
@@ -2780,13 +3751,8 @@ class CppCodeGen:
                         and len(b.shape) == 2
                         and b.shape[0] == 1
                     ):
-                        row_name = new_tmp("rowvec")
-                        emit_line(
-                            f"Eigen::MatrixXd {row_name} = ({a.name}.cols() == 1 ? {a.name}.transpose() : {a.name});"
-                        )
-                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize(1);")
-                        emit_line(f"{nm}[0] = {b.name}.transpose() * {row_name};")
-                        push_bin("grad", b.role, (1, b.shape[1], 2), b.field_names, b.parent, b.side, b.field_sides)
+                        emit_line(f"Eigen::MatrixXd {nm} = scalar_basis_times_vector({b.name}, matrix_like_to_vector({a.name}));")
+                        push_bin("grad", b.role, (2, b.shape[1]), b.field_names, b.parent, b.side, b.field_sides, expression_meta=product_lowering.meta if product_lowering is not None else None)
                         continue
                     if (
                         b.kind == "mat"
@@ -2797,24 +3763,107 @@ class CppCodeGen:
                         and len(a.shape) == 2
                         and a.shape[0] == 1
                     ):
-                        row_name = new_tmp("rowvec")
-                        emit_line(
-                            f"Eigen::MatrixXd {row_name} = ({b.name}.cols() == 1 ? {b.name}.transpose() : {b.name});"
-                        )
-                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize(1);")
-                        emit_line(f"{nm}[0] = {a.name}.transpose() * {row_name};")
-                        push_bin("grad", a.role, (1, a.shape[1], 2), a.field_names, a.parent, a.side, a.field_sides)
+                        emit_line(f"Eigen::MatrixXd {nm} = scalar_basis_times_vector({a.name}, matrix_like_to_vector({b.name}));")
+                        push_bin("grad", a.role, (2, a.shape[1]), a.field_names, a.parent, a.side, a.field_sides, expression_meta=product_lowering.meta if product_lowering is not None else None)
                         continue
                     if a.kind == "mixed" and b.kind == "mixed":
                         emit_line('throw std::runtime_error("Mixed * mixed not supported in C++ backend");')
                         continue
                     if a.kind == "scalar" and b.kind == "mixed":
-                        emit_line(f"auto {nm} = scale_mixed({b.name}, {a.name});")
-                        push_bin("mixed", b.role, b.shape, b.field_names, b.parent)
+                        if len(b.shape) == 2:
+                            emit_line(f"Eigen::MatrixXd {nm} = ({a.name} * {b.name}).eval();")
+                        else:
+                            emit_line(f"auto {nm} = scale_mixed({b.name}, {a.name});")
+                        push_bin("mixed", b.role, b.shape, b.field_names, b.parent, b.side, b.field_sides)
                         continue
                     if b.kind == "scalar" and a.kind == "mixed":
-                        emit_line(f"auto {nm} = scale_mixed({a.name}, {b.name});")
-                        push_bin("mixed", a.role, a.shape, a.field_names, a.parent)
+                        if len(a.shape) == 2:
+                            emit_line(f"Eigen::MatrixXd {nm} = ({b.name} * {a.name}).eval();")
+                        else:
+                            emit_line(f"auto {nm} = scale_mixed({a.name}, {b.name});")
+                        push_bin("mixed", a.role, a.shape, a.field_names, a.parent, a.side, a.field_sides)
+                        continue
+                    if (
+                        (
+                            product_case == ProductKernelCase.MIXED_SCALAR_TIMES_VALUE_MATRIX
+                            and a.role == "mixed"
+                            and len(a.shape) in {2, 3}
+                            and b.role in {"const", "value"}
+                            and b.kind in {"mat", "grad"}
+                            and len(b.shape) == 2
+                        )
+                        or (
+                            a.role == "mixed"
+                            and len(a.shape) in {2, 3}
+                            and b.role in {"const", "value"}
+                            and b.kind in {"mat", "grad"}
+                            and len(b.shape) == 2
+                            and product_lowering is not None
+                            and product_lowering.algebra.kind.name in {"PRODUCT_SCALE", "PRODUCT_PROMOTE"}
+                            and product_lowering.algebra.result.basis_rank == 2
+                            and product_lowering.algebra.result.tensor_rank == 2
+                        )
+                    ):
+                        if a.kind == "mixed" and len(a.shape) >= 3:
+                            emit_line(f"auto {nm} = scale_mixed_basis_with_coeffs({a.name}, {b_mat_expr});")
+                        else:
+                            emit_line(f"auto {nm} = identity_times_trace_matrix({b_mat_expr}, {a_mat_expr});")
+                        push_bin(
+                            "mixed",
+                            product_value_spec.role if product_value_spec is not None else a.role,
+                            tuple(int(v) for v in (
+                                product_value_spec.shape
+                                if product_value_spec is not None
+                                else product_lowering.result_storage.stored_shape
+                            )),
+                            a.field_names,
+                            a.parent,
+                            a.side,
+                            a.field_sides,
+                            layout_tag=(product_value_spec.layout.value if product_value_spec is not None else ""),
+                            expression_meta=(product_value_spec.meta if product_value_spec is not None else (product_lowering.meta if product_lowering is not None else None)),
+                        )
+                        continue
+                    if (
+                        (
+                            product_case == ProductKernelCase.VALUE_MATRIX_TIMES_MIXED_SCALAR
+                            and b.role == "mixed"
+                            and len(b.shape) in {2, 3}
+                            and a.role in {"const", "value"}
+                            and a.kind in {"mat", "grad"}
+                            and len(a.shape) == 2
+                        )
+                        or (
+                            b.role == "mixed"
+                            and len(b.shape) in {2, 3}
+                            and a.role in {"const", "value"}
+                            and a.kind in {"mat", "grad"}
+                            and len(a.shape) == 2
+                            and product_lowering is not None
+                            and product_lowering.algebra.kind.name in {"PRODUCT_SCALE", "PRODUCT_PROMOTE"}
+                            and product_lowering.algebra.result.basis_rank == 2
+                            and product_lowering.algebra.result.tensor_rank == 2
+                        )
+                    ):
+                        if b.kind == "mixed" and len(b.shape) >= 3:
+                            emit_line(f"auto {nm} = scale_mixed_basis_with_coeffs({b.name}, {a_mat_expr});")
+                        else:
+                            emit_line(f"auto {nm} = identity_times_trace_matrix({a_mat_expr}, {b_mat_expr});")
+                        push_bin(
+                            "mixed",
+                            product_value_spec.role if product_value_spec is not None else b.role,
+                            tuple(int(v) for v in (
+                                product_value_spec.shape
+                                if product_value_spec is not None
+                                else product_lowering.result_storage.stored_shape
+                            )),
+                            b.field_names,
+                            b.parent,
+                            b.side,
+                            b.field_sides,
+                            layout_tag=(product_value_spec.layout.value if product_value_spec is not None else ""),
+                            expression_meta=(product_value_spec.meta if product_value_spec is not None else (product_lowering.meta if product_lowering is not None else None)),
+                        )
                         continue
                     if (
                         a.kind == "mat"
@@ -2856,6 +3905,20 @@ class CppCodeGen:
                         emit_mat(nm, f"{b.name} * {a.name}", tmp_kind=tmp_kind)
                         push_bin("mat", a.role, a.shape, a.field_names, a.parent, tmp_kind=tmp_kind, tmp_slot=tmp_slot)
                         continue
+                    if a.kind in {"mat", "mixed"} and a.role == "mixed" and len(a.shape) == 2 and a.shape[0] == 1 and b.kind == "mat" and b.role in {"const", "value"} and len(b.shape) == 2:
+                        emit_line(f"auto {nm} = scalar_basis_times_matrix_tensor({a.name}, {b.name});")
+                        out_shape = tuple(int(v) for v in (product_value_spec.shape if product_value_spec is not None else (b.shape[0], a.shape[1], b.shape[1])))
+                        out_kind = product_value_spec.kind if product_value_spec is not None else "grad"
+                        out_role = product_value_spec.role if product_value_spec is not None else a.role
+                        push_bin(out_kind, out_role, out_shape, a.field_names, a.parent, a.side, a.field_sides, expression_meta=(product_value_spec.meta if product_value_spec is not None else (product_lowering.meta if product_lowering is not None else None)))
+                        continue
+                    if b.kind in {"mat", "mixed"} and b.role == "mixed" and len(b.shape) == 2 and b.shape[0] == 1 and a.kind == "mat" and a.role in {"const", "value"} and len(a.shape) == 2:
+                        emit_line(f"auto {nm} = scalar_basis_times_matrix_tensor({b.name}, {a.name});")
+                        out_shape = tuple(int(v) for v in (product_value_spec.shape if product_value_spec is not None else (a.shape[0], b.shape[1], a.shape[1])))
+                        out_kind = product_value_spec.kind if product_value_spec is not None else "grad"
+                        out_role = product_value_spec.role if product_value_spec is not None else b.role
+                        push_bin(out_kind, out_role, out_shape, b.field_names, b.parent, b.side, b.field_sides, expression_meta=(product_value_spec.meta if product_value_spec is not None else (product_lowering.meta if product_lowering is not None else None)))
+                        continue
                     if a.kind == "mixed" and len(a.shape) == 3 and b.kind == "mat":
                         emit_line(f"auto {nm} = scale_mixed_basis_with_coeffs({a.name}, {b.name});")
                         new_shape = (b.shape[0], a.shape[1], a.shape[2], b.shape[1])
@@ -2866,14 +3929,100 @@ class CppCodeGen:
                         new_shape = (a.shape[0], b.shape[1], b.shape[2], a.shape[1])
                         push_bin("mixed", b.role, new_shape, b.field_names, b.parent)
                         continue
+                    if (
+                        (
+                            product_case == ProductKernelCase.VALUE_MATRIX_TIMES_BASIS_SCALAR
+                            and a.kind in {"mat", "grad"}
+                            and a.role in {"const", "value"}
+                            and len(a.shape) == 2
+                            and b.kind == "mat"
+                            and b.role in {"test", "trial"}
+                            and len(b.shape) == 2
+                            and b.shape[0] == 1
+                        )
+                        or (
+                            a.kind in {"mat", "grad"}
+                            and a.role in {"const", "value"}
+                            and len(a.shape) == 2
+                            and b.kind == "mat"
+                            and b.role in {"test", "trial"}
+                            and len(b.shape) == 2
+                            and b.shape[0] == 1
+                            and product_lowering is not None
+                            and product_lowering.result.is_gradient
+                        )
+                    ):
+                        planned_shape = tuple(
+                            int(v) for v in (
+                                product_value_spec.shape
+                                if product_value_spec is not None
+                                else (
+                                    product_lowering.result_storage.stored_shape
+                                    if product_lowering is not None
+                                    else ()
+                                )
+                            )
+                        )
+                        if len(planned_shape) == 2:
+                            vec_name = new_tmp("vec")
+                            emit_line(f"Eigen::VectorXd {vec_name} = matrix_like_to_vector({a_mat_expr});")
+                            emit_line(f"Eigen::MatrixXd {nm} = {vec_name} * {b.name};")
+                            push_bin("mat", b.role, planned_shape, b.field_names, b.parent, b.side, b.field_sides, expression_meta=product_lowering.meta if product_lowering is not None else None)
+                        else:
+                            emit_line(f"auto {nm} = scalar_basis_times_matrix_tensor({b.name}, {a.name});")
+                            push_bin("grad", b.role, product_lowering.result_storage.stored_shape, b.field_names, b.parent, b.side, b.field_sides, expression_meta=product_lowering.meta if product_lowering is not None else None)
+                        continue
+                    if (
+                        (
+                            product_case == ProductKernelCase.BASIS_SCALAR_TIMES_VALUE_MATRIX
+                            and b.kind in {"mat", "grad"}
+                            and b.role in {"const", "value"}
+                            and len(b.shape) == 2
+                            and a.kind == "mat"
+                            and a.role in {"test", "trial"}
+                            and len(a.shape) == 2
+                            and a.shape[0] == 1
+                        )
+                        or (
+                            b.kind in {"mat", "grad"}
+                            and b.role in {"const", "value"}
+                            and len(b.shape) == 2
+                            and a.kind == "mat"
+                            and a.role in {"test", "trial"}
+                            and len(a.shape) == 2
+                            and a.shape[0] == 1
+                            and product_lowering is not None
+                            and product_lowering.result.is_gradient
+                        )
+                    ):
+                        planned_shape = tuple(
+                            int(v) for v in (
+                                product_value_spec.shape
+                                if product_value_spec is not None
+                                else (
+                                    product_lowering.result_storage.stored_shape
+                                    if product_lowering is not None
+                                    else ()
+                                )
+                            )
+                        )
+                        if len(planned_shape) == 2:
+                            vec_name = new_tmp("vec")
+                            emit_line(f"Eigen::VectorXd {vec_name} = matrix_like_to_vector({b_mat_expr});")
+                            emit_line(f"Eigen::MatrixXd {nm} = {vec_name} * {a.name};")
+                            push_bin("mat", a.role, planned_shape, a.field_names, a.parent, a.side, a.field_sides, expression_meta=product_lowering.meta if product_lowering is not None else None)
+                        else:
+                            emit_line(f"auto {nm} = scalar_basis_times_matrix_tensor({a.name}, {b.name});")
+                            push_bin("grad", a.role, product_lowering.result_storage.stored_shape, a.field_names, a.parent, a.side, a.field_sides, expression_meta=product_lowering.meta if product_lowering is not None else None)
+                        continue
                     # Multiplication of basis with Identity matrix
                     if a.kind == "mat" and b.kind == "mat" \
-                        and a.role in {"test", "trial"} and b.role in {"const"} and b.shape == (2, 2):
+                        and a.role in {"test", "trial"} and b.role in {"const", "value"} and len(b.shape) == 2 and a.shape[0] == 1:
                         emit_line(f"auto {nm} = trace_times_identity({a.name}, {b.name});")
                         push_bin("grad", a.role, (b.shape[0], -1, b.shape[1]), a.field_names, a.parent)
                         continue
                     if a.kind == "mat" and b.kind == "mat" \
-                        and b.role in {"test", "trial"} and a.role in {"const"} and a.shape == (2, 2):
+                        and b.role in {"test", "trial"} and a.role in {"const", "value"} and len(a.shape) == 2 and b.shape[0] == 1:
                         emit_line(f"auto {nm} = trace_times_identity({b.name}, {a.name});")
                         push_bin("grad", b.role, (a.shape[0], -1, a.shape[1]), b.field_names, b.parent)
                         continue
@@ -2909,27 +4058,23 @@ class CppCodeGen:
                         continue
                     # Outer product for scalar test/trial factors (e.g., pressure · div(velocity))
                     if a.kind == "mat" and b.kind == "mat" and a.role == "test" and b.role == "trial" and a.shape[0] == 1 and b.shape[0] == 1:
-                        emit_line(f"Eigen::MatrixXd {nm} = {a.name}.transpose() * {b.name};")
-                        push_bin("mat", "value", (-1, -1))
+                        emit_line(f"Eigen::MatrixXd {nm} = dot_mass_test_trial({a.name}, {b.name});")
+                        push_bin("mixed", "mixed", (a.shape[1], b.shape[1]), a.field_names or b.field_names, a.parent or b.parent, a.side or b.side, a.field_sides or b.field_sides, expression_meta=None)
                         continue
                     if a.kind == "mat" and b.kind == "mat" and a.role == "trial" and b.role == "test" and a.shape[0] == 1 and b.shape[0] == 1:
-                        emit_line(f"Eigen::MatrixXd {nm} = {b.name}.transpose() * {a.name};")
-                        push_bin("mat", "value", (-1, -1))
+                        emit_line(f"Eigen::MatrixXd {nm} = dot_mass_test_trial({b.name}, {a.name});")
+                        push_bin("mixed", "mixed", (b.shape[1], a.shape[1]), a.field_names or b.field_names, a.parent or b.parent, a.side or b.side, a.field_sides or b.field_sides, expression_meta=None)
                         continue
                     # Scalar test/trial basis (1,n) multiplied by value vector (k,) -> k x n matrix
                     if a.kind == "vec" and b.kind == "mat" and b.role in {"test", "trial"} and b.shape[0] == 1:
-                        emit_line(f"int {nm}_vdim = static_cast<int>({a.name}.size());")
-                        emit_line(f"Eigen::MatrixXd {nm}({nm}_vdim, n_union);")
-                        emit_line(f"for (int _c=0; _c<{nm}_vdim; ++_c) {nm}.row(_c) = {b.name}.row(0) * {a.name}(_c);")
+                        emit_line(f"Eigen::MatrixXd {nm} = scalar_basis_times_vector({b.name}, {a.name});")
                         out_k = a.shape[0] if len(a.shape) > 0 and a.shape[0] not in (-1, 0) else -1
-                        push_bin("mat", b.role, (out_k, -1), b.field_names, b.parent)
+                        push_bin("mat", b.role, (out_k, b.shape[1]), b.field_names, b.parent, expression_meta=product_lowering.meta if product_lowering is not None else None)
                         continue
                     if a.kind == "mat" and a.role in {"test", "trial"} and a.shape[0] == 1 and b.kind == "vec":
-                        emit_line(f"int {nm}_vdim = static_cast<int>({b.name}.size());")
-                        emit_line(f"Eigen::MatrixXd {nm}({nm}_vdim, n_union);")
-                        emit_line(f"for (int _c=0; _c<{nm}_vdim; ++_c) {nm}.row(_c) = {a.name}.row(0) * {b.name}(_c);")
+                        emit_line(f"Eigen::MatrixXd {nm} = scalar_basis_times_vector({a.name}, {b.name});")
                         out_k = b.shape[0] if len(b.shape) > 0 and b.shape[0] not in (-1, 0) else -1
-                        push_bin("mat", a.role, (out_k, -1), a.field_names, a.parent)
+                        push_bin("mat", a.role, (out_k, a.shape[1]), a.field_names, a.parent, expression_meta=product_lowering.meta if product_lowering is not None else None)
                         continue
 
                     # Scalar test/trial basis (1,n_union) multiplied by a value row/col vector (dim=2)
@@ -2953,47 +4098,65 @@ class CppCodeGen:
                         push_bin("mat", a.role, (-1, 2), a.field_names, a.parent)
                         continue
                     # Mixed gradients: scalar basis × grad basis
-                    if a.kind == "mat" and a.role == "trial" and len(a.shape) >= 2 and a.shape[0] == 1 and b.kind == "grad" and b.role == "test":
+                    if a.kind == "mat" and a.role == "trial" and len(a.shape) >= 2 and a.shape[0] == 1 and b.kind == "grad" and b.role == "test" and len(b.shape) >= 3:
                         emit_line(f"Eigen::VectorXd _scalar_{nm} = {a.name}.transpose();")
                         emit_line(f"auto {nm} = scalar_trial_times_grad_test({b.name}, _scalar_{nm});")
                         push_bin("mixed", "mixed", (b.shape[0], b.shape[1], a.shape[1], b.shape[2]), a.field_names or b.field_names, a.parent or b.parent)
                         continue
-                    if a.kind == "grad" and a.role == "test" and b.kind == "mat" and b.role == "trial" and len(b.shape) >= 2 and b.shape[0] == 1:
+                    if a.kind == "grad" and a.role == "test" and len(a.shape) >= 3 and b.kind == "mat" and b.role == "trial" and len(b.shape) >= 2 and b.shape[0] == 1:
                         emit_line(f"Eigen::VectorXd _scalar_{nm} = {b.name}.transpose();")
                         emit_line(f"auto {nm} = scalar_trial_times_grad_test({a.name}, _scalar_{nm});")
                         push_bin("mixed", "mixed", (a.shape[0], a.shape[1], b.shape[1], a.shape[2]), a.field_names or b.field_names, a.parent or b.parent)
                         continue
-                    if a.kind == "mat" and a.role == "test" and len(a.shape) >= 2 and a.shape[0] == 1 and b.kind == "grad" and b.role == "trial":
+                    if a.kind == "mat" and a.role == "test" and len(a.shape) >= 2 and a.shape[0] == 1 and b.kind == "grad" and b.role == "trial" and len(b.shape) >= 3:
                         emit_line(f"Eigen::VectorXd _scalar_{nm} = {a.name}.transpose();")
                         emit_line(f"auto {nm} = grad_trial_times_scalar_test({b.name}, _scalar_{nm});")
                         push_bin("mixed", "mixed", (b.shape[0], a.shape[1], b.shape[1], b.shape[2]), a.field_names or b.field_names, a.parent or b.parent)
                         continue
-                    if a.kind == "grad" and a.role == "trial" and b.kind == "mat" and b.role == "test" and len(b.shape) >= 2 and b.shape[0] == 1:
+                    if a.kind == "grad" and a.role == "trial" and len(a.shape) >= 3 and b.kind == "mat" and b.role == "test" and len(b.shape) >= 2 and b.shape[0] == 1:
                         emit_line(f"Eigen::VectorXd _scalar_{nm} = {b.name}.transpose();")
                         emit_line(f"auto {nm} = grad_trial_times_scalar_test({a.name}, _scalar_{nm});")
                         push_bin("mixed", "mixed", (a.shape[0], b.shape[1], a.shape[1], a.shape[2]), a.field_names or b.field_names, a.parent or b.parent)
                         continue
-                    if a.kind == "grad" and b.kind == "mat" and b.role in {"const", "value"} and len(b.shape) == 2 and a.shape[2] == b.shape[0]:
+                    if a.kind == "grad" and len(a.shape) >= 3 and b.kind == "mat" and b.role in {"const", "value"} and len(b.shape) == 2 and a.shape[2] == b.shape[0]:
                         emit_line(f"auto {nm} = contract_last_first({a.name}, {b.name});")
                         push_bin("grad", a.role, (a.shape[0], a.shape[1], b.shape[1]), a.field_names, a.parent)
                         continue
                     if a.kind == "mat" and a.role in {"const", "value"} and len(a.shape) == 2 and b.kind == "grad":
-                        if b.shape[0] == 1 and a.shape[1] == b.shape[2]:
+                        if len(b.shape) >= 3 and b.shape[0] == 1 and a.shape[1] == b.shape[2]:
                             emit_line(f"auto {nm} = contract_last_first({b.name}, {a.name}.transpose());")
                             push_bin("grad", b.role, (1, b.shape[1], a.shape[0]), b.field_names, b.parent)
                             continue
-                        if a.shape[1] == b.shape[0]:
+                        if len(b.shape) >= 3 and a.shape[1] == b.shape[0]:
                             emit_line(f"auto {nm} = contract_component_matrix_grad({a.name}, {b.name});")
                             push_bin("grad", b.role, (a.shape[0], b.shape[1], b.shape[2]), b.field_names, b.parent)
                             continue
                     if a.kind == "scalar" and b.kind == "grad":
-                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({b.name}.size());")
-                        emit_line(f"for (size_t _i=0; _i<{b.name}.size(); ++_i) {nm}[_i] = {b.name}[_i] * {a.name};")
-                        push_bin("grad", b.role, b.shape, b.field_names, b.parent)
+                        if len(b.shape) == 2:
+                            nm, tmp_kind, tmp_slot = alloc_tmp("mat", "bin")
+                            emit_mat(nm, f"{b.name} * {a.name}", tmp_kind=tmp_kind)
+                            push_bin("mat", b.role, product_lowering.result_storage.stored_shape if product_lowering is not None else b.shape, b.field_names, b.parent, tmp_kind=tmp_kind, tmp_slot=tmp_slot, expression_meta=product_lowering.meta if product_lowering is not None else None)
+                        elif product_lowering is not None and len(product_lowering.result_storage.stored_shape) == 2:
+                            nm, tmp_kind, tmp_slot = alloc_tmp("mat", "bin")
+                            emit_mat(nm, f"{_cpp_matrix_input_expr(b)} * {a.name}", tmp_kind=tmp_kind)
+                            push_bin("mat", b.role, product_lowering.result_storage.stored_shape, b.field_names, b.parent, tmp_kind=tmp_kind, tmp_slot=tmp_slot, expression_meta=product_lowering.meta if product_lowering is not None else None)
+                        else:
+                            emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({b.name}.size());")
+                            emit_line(f"for (size_t _i=0; _i<{b.name}.size(); ++_i) {nm}[_i] = {b.name}[_i] * {a.name};")
+                            push_bin("grad", b.role, b.shape, b.field_names, b.parent)
                     elif b.kind == "scalar" and a.kind == "grad":
-                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({a.name}.size());")
-                        emit_line(f"for (size_t _i=0; _i<{a.name}.size(); ++_i) {nm}[_i] = {a.name}[_i] * {b.name};")
-                        push_bin("grad", a.role, a.shape, a.field_names, a.parent)
+                        if len(a.shape) == 2:
+                            nm, tmp_kind, tmp_slot = alloc_tmp("mat", "bin")
+                            emit_mat(nm, f"{a.name} * {b.name}", tmp_kind=tmp_kind)
+                            push_bin("mat", a.role, product_lowering.result_storage.stored_shape if product_lowering is not None else a.shape, a.field_names, a.parent, tmp_kind=tmp_kind, tmp_slot=tmp_slot, expression_meta=product_lowering.meta if product_lowering is not None else None)
+                        elif product_lowering is not None and len(product_lowering.result_storage.stored_shape) == 2:
+                            nm, tmp_kind, tmp_slot = alloc_tmp("mat", "bin")
+                            emit_mat(nm, f"{_cpp_matrix_input_expr(a)} * {b.name}", tmp_kind=tmp_kind)
+                            push_bin("mat", a.role, product_lowering.result_storage.stored_shape, a.field_names, a.parent, tmp_kind=tmp_kind, tmp_slot=tmp_slot, expression_meta=product_lowering.meta if product_lowering is not None else None)
+                        else:
+                            emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({a.name}.size());")
+                            emit_line(f"for (size_t _i=0; _i<{a.name}.size(); ++_i) {nm}[_i] = {a.name}[_i] * {b.name};")
+                            push_bin("grad", a.role, a.shape, a.field_names, a.parent)
                     elif a.kind == "grad" and b.kind == "grad":
                         emit_line(f"auto {nm} = cwise_grad_grad(GradStack{{{a.name}}}, GradStack{{{b.name}}}).comps;")
                         push_bin("grad", a.role, a.shape, a.field_names, a.parent)
@@ -3013,9 +4176,14 @@ class CppCodeGen:
                             emit_mat(nm, f"{b.name} * {a.name}", tmp_kind=tmp_kind)
                             push_bin("mat", b.role, b.shape, b.field_names, b.parent, tmp_kind=tmp_kind, tmp_slot=tmp_slot)
                         elif b.kind == "vec":
-                            nm, tmp_kind, tmp_slot = alloc_tmp("vec", "bin")
-                            emit_vec(nm, f"{b.name} * {a.name}", tmp_kind=tmp_kind)
-                            push_bin("vec", b.role, b.shape, b.field_names, b.parent, tmp_kind=tmp_kind, tmp_slot=tmp_slot)
+                            if product_result_is_scalar_basis_row:
+                                nm, tmp_kind, tmp_slot = alloc_tmp("mat", "bin")
+                                emit_mat(nm, f"({b.name} * {a.name}).transpose().eval()", tmp_kind=tmp_kind)
+                                push_bin("mat", b.role, product_result_row_shape, b.field_names, b.parent, tmp_kind=tmp_kind, tmp_slot=tmp_slot)
+                            else:
+                                nm, tmp_kind, tmp_slot = alloc_tmp("vec", "bin")
+                                emit_vec(nm, f"{b.name} * {a.name}", tmp_kind=tmp_kind)
+                                push_bin("vec", b.role, b.shape, b.field_names, b.parent, tmp_kind=tmp_kind, tmp_slot=tmp_slot)
                         else:
                             emit_line(f"auto {nm} = {b.name} * {a.name};")
                             push_bin(b.kind, b.role, b.shape, b.field_names, b.parent)
@@ -3025,9 +4193,14 @@ class CppCodeGen:
                             emit_mat(nm, f"{a.name} * {b.name}", tmp_kind=tmp_kind)
                             push_bin("mat", a.role, a.shape, a.field_names, a.parent, tmp_kind=tmp_kind, tmp_slot=tmp_slot)
                         elif a.kind == "vec":
-                            nm, tmp_kind, tmp_slot = alloc_tmp("vec", "bin")
-                            emit_vec(nm, f"{a.name} * {b.name}", tmp_kind=tmp_kind)
-                            push_bin("vec", a.role, a.shape, a.field_names, a.parent, tmp_kind=tmp_kind, tmp_slot=tmp_slot)
+                            if product_result_is_scalar_basis_row:
+                                nm, tmp_kind, tmp_slot = alloc_tmp("mat", "bin")
+                                emit_mat(nm, f"({a.name} * {b.name}).transpose().eval()", tmp_kind=tmp_kind)
+                                push_bin("mat", a.role, product_result_row_shape, a.field_names, a.parent, tmp_kind=tmp_kind, tmp_slot=tmp_slot)
+                            else:
+                                nm, tmp_kind, tmp_slot = alloc_tmp("vec", "bin")
+                                emit_vec(nm, f"{a.name} * {b.name}", tmp_kind=tmp_kind)
+                                push_bin("vec", a.role, a.shape, a.field_names, a.parent, tmp_kind=tmp_kind, tmp_slot=tmp_slot)
                         else:
                             emit_line(f"auto {nm} = {a.name} * {b.name};")
                             push_bin(a.kind, a.role, a.shape, a.field_names, a.parent)
@@ -3085,27 +4258,67 @@ class CppCodeGen:
                 ############################################################################
                 elif op.op_symbol == "/":
                     if b.kind == "scalar" and a.kind == "grad":
-                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({a.name}.size());")
-                        emit_line(f"for (size_t _i=0; _i<{a.name}.size(); ++_i) {nm}[_i] = {a.name}[_i] / {b.name};")
-                        push_bin("grad", a.role, a.shape, a.field_names, a.parent)
+                        if len(a.shape) == 2:
+                            nm, tmp_kind, tmp_slot = alloc_tmp("mat", "bin")
+                            emit_mat(nm, f"{a_mat_expr} / {b.name}", tmp_kind=tmp_kind)
+                            push_bin("grad", a.role, a.shape, a.field_names, a.parent, tmp_kind=tmp_kind, tmp_slot=tmp_slot)
+                        else:
+                            emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({a.name}.size());")
+                            emit_line(f"for (size_t _i=0; _i<{a.name}.size(); ++_i) {nm}[_i] = {a.name}[_i] / {b.name};")
+                            push_bin("grad", a.role, a.shape, a.field_names, a.parent)
                     elif b.kind == "scalar":
                         if a.kind == "scalar":
                             nm, tmp_kind, tmp_slot = alloc_tmp("scalar", "bin")
                             emit_scalar(nm, f"{a.name} / {b.name}", tmp_kind=tmp_kind)
                             push_bin("scalar", a.role, (), a.field_names or b.field_names, a.parent or b.parent, tmp_kind=tmp_kind, tmp_slot=tmp_slot)
                         elif a.kind == "vec":
-                            nm, tmp_kind, tmp_slot = alloc_tmp("vec", "bin")
-                            emit_vec(nm, f"{a.name} / {b.name}", tmp_kind=tmp_kind)
-                            push_bin("vec", a.role, a.shape, a.field_names or b.field_names, a.parent or b.parent, tmp_kind=tmp_kind, tmp_slot=tmp_slot)
-                        elif a.kind == "mat":
+                            if division_result_is_scalar_basis_row:
+                                nm, tmp_kind, tmp_slot = alloc_tmp("mat", "bin")
+                                emit_mat(nm, f"({a.name} / {b.name}).transpose().eval()", tmp_kind=tmp_kind)
+                                push_bin("mat", a.role, division_result_row_shape, a.field_names or b.field_names, a.parent or b.parent, tmp_kind=tmp_kind, tmp_slot=tmp_slot)
+                            else:
+                                nm, tmp_kind, tmp_slot = alloc_tmp("vec", "bin")
+                                emit_vec(nm, f"{a.name} / {b.name}", tmp_kind=tmp_kind)
+                                push_bin("vec", a.role, a.shape, a.field_names or b.field_names, a.parent or b.parent, tmp_kind=tmp_kind, tmp_slot=tmp_slot)
+                        elif a.kind == "mat" or (a.kind == "mixed" and len(a.shape) == 2):
                             nm, tmp_kind, tmp_slot = alloc_tmp("mat", "bin")
                             emit_mat(nm, f"{a.name} / {b.name}", tmp_kind=tmp_kind)
-                            push_bin("mat", a.role, a.shape, a.field_names or b.field_names, a.parent or b.parent, tmp_kind=tmp_kind, tmp_slot=tmp_slot)
+                            out_kind = "mixed" if a.kind == "mixed" else "mat"
+                            push_bin(out_kind, a.role, a.shape, a.field_names or b.field_names, a.parent or b.parent, a.side, a.field_sides, tmp_kind=tmp_kind, tmp_slot=tmp_slot)
                         else:
                             emit_line(f"auto {nm} = {a.name} / {b.name};")
                             push_bin(a.kind, a.role, a.shape, a.field_names or b.field_names, a.parent or b.parent)
+                    elif a.kind == "scalar":
+                        if b.kind == "scalar":
+                            nm, tmp_kind, tmp_slot = alloc_tmp("scalar", "bin")
+                            emit_scalar(nm, f"{a.name} / {b.name}", tmp_kind=tmp_kind)
+                            push_bin("scalar", "value", (), a.field_names or b.field_names, a.parent or b.parent, tmp_kind=tmp_kind, tmp_slot=tmp_slot)
+                        elif b.kind == "vec":
+                            if division_result_is_scalar_basis_row:
+                                nm, tmp_kind, tmp_slot = alloc_tmp("mat", "bin")
+                                emit_mat(nm, f"(({a.name} * {b.name}.array().inverse()).matrix()).transpose().eval()", tmp_kind=tmp_kind)
+                                push_bin("mat", b.role, division_result_row_shape, a.field_names or b.field_names, a.parent or b.parent, b.side, b.field_sides, tmp_kind=tmp_kind, tmp_slot=tmp_slot)
+                            else:
+                                nm, tmp_kind, tmp_slot = alloc_tmp("vec", "bin")
+                                emit_vec(nm, f"({a.name} * {b.name}.array().inverse()).matrix()", tmp_kind=tmp_kind)
+                                push_bin("vec", b.role, b.shape, a.field_names or b.field_names, a.parent or b.parent, b.side, b.field_sides, tmp_kind=tmp_kind, tmp_slot=tmp_slot)
+                        elif b.kind == "mat" or (b.kind == "mixed" and len(b.shape) == 2):
+                            nm, tmp_kind, tmp_slot = alloc_tmp("mat", "bin")
+                            emit_mat(nm, f"({a.name} * {b.name}.array().inverse()).matrix()", tmp_kind=tmp_kind)
+                            out_kind = "mixed" if b.kind == "mixed" else "mat"
+                            push_bin(out_kind, b.role, b.shape, a.field_names or b.field_names, a.parent or b.parent, b.side, b.field_sides, tmp_kind=tmp_kind, tmp_slot=tmp_slot)
+                        elif b.kind in {"grad", "hess"}:
+                            emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({b.name}.size());")
+                            emit_line(f"for (size_t _i=0; _i<{b.name}.size(); ++_i) {{")
+                            emit_line(f"    {nm}[_i] = ({a.name} * {b.name}[_i].array().inverse()).matrix();")
+                            emit_line("}")
+                            push_bin(b.kind, b.role, b.shape, a.field_names or b.field_names, a.parent or b.parent, b.side, b.field_sides)
+                        else:
+                            raise NotImplementedError(
+                                f"Scalar numerator division not supported for kind '{b.kind}'"
+                            )
                     else:
-                        raise NotImplementedError("Only scalar denominator supported")
+                        raise NotImplementedError("Division is supported for scalar denominator or scalar numerator only")
                 elif op.op_symbol == "**":
                     if b.kind == "scalar":
                         if a.kind == "scalar":
@@ -3331,11 +4544,21 @@ class CppCodeGen:
                 nm = new_tmp("dot")
                 tmp_kind: str | None = None
                 tmp_slot: int | None = None
+                dot_kernel = _try_dot_kernel(a, b)
+                dot_plan = dot_kernel.lowering.algebra if dot_kernel is not None else _try_dot_plan(a, b)
+                dot_lowering = dot_kernel.lowering if dot_kernel is not None else _try_dot_lowering(a, b)
+                dot_value_spec = _try_dot_value_spec(a, b)
+                dot_meta = dot_lowering.meta if dot_lowering is not None else None
+                dot_case = dot_kernel.case if dot_kernel is not None else None
                 side = combine_side(a.side, b.side)
                 f_sides = choose_field_sides(a.field_sides, b.field_sides)
                 f_names = a.field_names or b.field_names
                 parent = a.parent or b.parent
                 def dot_role(role_in: str) -> str:
+                    if dot_lowering is not None:
+                        planned = getattr(dot_lowering.result, "role", "") or ""
+                        if planned not in {"", "none"}:
+                            return planned
                     # Preserve mixed role if either operand is mixed
                     if a.kind == "mixed" or b.kind == "mixed" or a.role == "mixed" or b.role == "mixed":
                         return "mixed"
@@ -3359,7 +4582,16 @@ class CppCodeGen:
                     *,
                     tmp_kind: str | None = None,
                     tmp_slot: int | None = None,
+                    layout_tag: str | None = None,
+                    expression_meta: Any = None,
                 ):
+                    if dot_lowering is not None:
+                        planned_shape = tuple(int(v) for v in dot_lowering.result_storage.stored_shape)
+                        if planned_shape:
+                            shape = planned_shape
+                        planned_role = getattr(dot_lowering.result, "role", "") or ""
+                        if planned_role == "mixed" and kind == "mat":
+                            kind = "mixed"
                     role = dot_role(role)
                     # Merge metadata, preferring basis operands when applicable
                     meta_fnames, meta_parent, meta_side, meta_fsides = resolve_metadata(a, b, prefer="basis")
@@ -3371,6 +4603,7 @@ class CppCodeGen:
                         meta_side = side_override
                     if field_sides is not None:
                         meta_fsides = field_sides
+                    kind = _normalize_cpp_storage_kind(kind, role, shape)
                     stack.append(
                         StackItem(
                             nm,
@@ -3383,25 +4616,323 @@ class CppCodeGen:
                             meta_fsides,
                             tmp_kind=tmp_kind,
                             tmp_slot=tmp_slot,
+                            layout_tag=(
+                                layout_tag
+                                if layout_tag is not None
+                                else (
+                                    dot_lowering.result.layout.value
+                                    if dot_lowering is not None
+                                    else ""
+                                )
+                            ),
+                            expression_meta=(
+                                expression_meta
+                                if expression_meta is not None
+                                else (
+                                    dot_lowering.meta
+                                    if dot_lowering is not None
+                                    else None
+                                )
+                            ),
                         )
+                    )
+                def push_dot_result(
+                    kind_fallback,
+                    role_fallback,
+                    shape_fallback,
+                    field_names=None,
+                    parent_name=None,
+                    side_override=None,
+                    field_sides=None,
+                    *,
+                    tmp_kind: str | None = None,
+                    tmp_slot: int | None = None,
+                    layout_tag: str | None = None,
+                    expression_meta: Any = None,
+                ):
+                    push(
+                        dot_value_spec.kind if dot_value_spec is not None else kind_fallback,
+                        dot_value_spec.role if dot_value_spec is not None else role_fallback,
+                        tuple(int(v) for v in (dot_value_spec.shape if dot_value_spec is not None else shape_fallback)),
+                        field_names,
+                        parent_name,
+                        side_override,
+                        field_sides,
+                        tmp_kind=tmp_kind,
+                        tmp_slot=tmp_slot,
+                        layout_tag=(dot_value_spec.layout.value if dot_value_spec is not None else layout_tag),
+                        expression_meta=(dot_value_spec.meta if dot_value_spec is not None else expression_meta),
                     )
                 a_union_mat = a.kind == "mat" and len(a.shape) >= 2 and a.shape[1] == -1
                 b_union_mat = b.kind == "mat" and len(b.shape) >= 2 and b.shape[1] == -1
                 is_a_2x2 = a.kind == "mat" and a.shape == (2,2)
                 is_b_2x2 = b.kind == "mat" and b.shape == (2,2)
-                is_a_1d = a.kind == "vec" and a.shape[0] > 1
-                is_b_1d = b.kind == "vec" and b.shape[0] > 1
-                is_a_row_vec = a.kind == "mat" and a.shape[0] == 1 and (a.shape[1] > 1 or a.shape[1] <0)
-                is_b_row_vec = b.kind == "mat" and b.shape[0] == 1 and (b.shape[1] > 1 or b.shape[1] <0)
-                is_a_col_vec = a.kind == "mat" and a.shape[1] == 1 and (a.shape[0] > 1 or a.shape[0] <0)
-                is_b_col_vec = b.kind == "mat" and b.shape[1] == 1 and (b.shape[0] > 1 or b.shape[0] <0)
+                is_a_1d = a.kind in {"vec", "mat"} and len(a.shape) == 1 and a.shape[0] > 1
+                is_b_1d = b.kind in {"vec", "mat"} and len(b.shape) == 1 and b.shape[0] > 1
+                is_a_row_vec = a.kind == "mat" and len(a.shape) == 2 and a.shape[0] == 1 and (a.shape[1] > 1 or a.shape[1] < 0)
+                is_b_row_vec = b.kind == "mat" and len(b.shape) == 2 and b.shape[0] == 1 and (b.shape[1] > 1 or b.shape[1] < 0)
+                is_a_col_vec = a.kind == "mat" and len(a.shape) == 2 and a.shape[1] == 1 and (a.shape[0] > 1 or a.shape[0] < 0)
+                is_b_col_vec = b.kind == "mat" and len(b.shape) == 2 and b.shape[1] == 1 and (b.shape[0] > 1 or b.shape[0] < 0)
                 if CODEGEN_DEBUG:
                     print(
                         f"[dot] kind ({a.kind}, {b.kind}), roles ({a.role}, {b.role}), shapes ({a.shape}, {b.shape})"
                         f", sides ({a.side}, {b.side}), field_sides ({a.field_sides}, {b.field_sides})"
                         f", union ({a_union_mat}, {b_union_mat})"
                         f", is_2x2 ({is_a_2x2}, {is_b_2x2}), is_1d ({is_a_1d}, {is_b_1d})"
+                        f", dot_case ({dot_case.value if dot_case is not None else ''})"
+                        f", planned_shape ({tuple(int(v) for v in dot_value_spec.shape) if dot_value_spec is not None else None})"
                     )
+                if dot_case == DotKernelCase.BASIS_BASIS_MASS and a.role in {"trial", "test"} and b.role in {"trial", "test"}:
+                    nm, tmp_kind, tmp_slot = alloc_tmp("mat", "dot")
+                    if a.role == "trial" and b.role == "test":
+                        emit_mat(nm, f"dot_mass_test_trial({b.name}, {a.name})", tmp_kind=tmp_kind)
+                    elif a.role == "test" and b.role == "trial":
+                        emit_mat(nm, f"dot_mass_test_trial({a.name}, {b.name})", tmp_kind=tmp_kind)
+                    else:
+                        raise NotImplementedError(f"Unsupported basis-basis dot orientation: {a.role}, {b.role}")
+                    push(
+                        (dot_value_spec.kind if dot_value_spec is not None else "mixed"),
+                        (dot_value_spec.role if dot_value_spec is not None else "mixed"),
+                        tuple(int(v) for v in (
+                            dot_value_spec.shape
+                            if dot_value_spec is not None
+                            else _planned_storage_shape(dot_lowering, (a.shape[-1], b.shape[-1]))
+                        )),
+                        a.field_names or b.field_names,
+                        a.parent or b.parent,
+                        side,
+                        a.field_sides or b.field_sides,
+                        tmp_kind=tmp_kind,
+                        tmp_slot=tmp_slot,
+                        layout_tag=(dot_value_spec.layout.value if dot_value_spec is not None else ""),
+                        expression_meta=(dot_value_spec.meta if dot_value_spec is not None else dot_meta),
+                    )
+                    continue
+
+                if dot_case == DotKernelCase.BASIS_GRAD_DOT_VALUE_VECTOR and a.role in {"trial", "test"}:
+                    lhs_is_rank1_grad = (
+                        dot_lowering is not None and dot_lowering.algebra.lhs.tensor_rank == 1
+                    )
+                    if lhs_is_rank1_grad:
+                        wants_1d = dot_value_spec is not None and len(dot_value_spec.shape) == 1
+                        nm, tmp_kind, tmp_slot = alloc_tmp("vec" if wants_1d else "mat", "dot")
+                        rank1_expr = (
+                            f"contract_last_first({_cpp_rank1_basis_free_last_expr(a.name, a.shape)}, "
+                            f"{_cpp_vector_input_expr(b)})"
+                        )
+                        if wants_1d:
+                            emit_vec(nm, rank1_expr, tmp_kind=tmp_kind)
+                            fallback_shape = (a.shape[1],)
+                        else:
+                            emit_mat(nm, f"({rank1_expr}).transpose()", tmp_kind=tmp_kind)
+                            fallback_shape = (1, a.shape[1])
+                    else:
+                        nm, tmp_kind, tmp_slot = alloc_tmp("mat", "dot")
+                        emit_mat(nm, f"dot_grad_basis_vector({a.name}, {b.name})", tmp_kind=tmp_kind)
+                        fallback_shape = a.shape[:2]
+                    push(
+                        (dot_value_spec.kind if dot_value_spec is not None else ("vec" if len(fallback_shape) == 1 else "mat")),
+                        (dot_value_spec.role if dot_value_spec is not None else a.role),
+                        tuple(int(v) for v in (
+                            dot_value_spec.shape if dot_value_spec is not None else _planned_storage_shape(dot_lowering, fallback_shape)
+                        )),
+                        a.field_names,
+                        a.parent,
+                        side,
+                        a.field_sides,
+                        tmp_kind=tmp_kind,
+                        tmp_slot=tmp_slot,
+                        layout_tag=(dot_value_spec.layout.value if dot_value_spec is not None else ""),
+                        expression_meta=(dot_value_spec.meta if dot_value_spec is not None else dot_meta),
+                    )
+                    continue
+
+                if dot_case == DotKernelCase.VALUE_VECTOR_DOT_BASIS_GRAD and b.role in {"trial", "test"}:
+                    rhs_is_rank1_grad = (
+                        dot_lowering is not None and dot_lowering.algebra.rhs.tensor_rank == 1
+                    )
+                    if rhs_is_rank1_grad:
+                        wants_1d = dot_value_spec is not None and len(dot_value_spec.shape) == 1
+                        nm, tmp_kind, tmp_slot = alloc_tmp("vec" if wants_1d else "mat", "dot")
+                        rank1_expr = (
+                            f"contract_last_first({_cpp_rank1_basis_free_last_expr(b.name, b.shape)}, "
+                            f"{_cpp_vector_input_expr(a)})"
+                        )
+                        if wants_1d:
+                            emit_vec(nm, rank1_expr, tmp_kind=tmp_kind)
+                            fallback_shape = (b.shape[1],)
+                        else:
+                            emit_mat(nm, f"({rank1_expr}).transpose()", tmp_kind=tmp_kind)
+                            fallback_shape = (1, b.shape[1])
+                    else:
+                        nm, tmp_kind, tmp_slot = alloc_tmp("mat", "dot")
+                        emit_mat(nm, f"vector_dot_grad_basis({a.name}, {b.name})", tmp_kind=tmp_kind)
+                        fallback_shape = (b.shape[-1], b.shape[1])
+                    push(
+                        (dot_value_spec.kind if dot_value_spec is not None else ("vec" if len(fallback_shape) == 1 else "mat")),
+                        (dot_value_spec.role if dot_value_spec is not None else b.role),
+                        tuple(int(v) for v in (
+                            dot_value_spec.shape if dot_value_spec is not None else _planned_storage_shape(dot_lowering, fallback_shape)
+                        )),
+                        b.field_names,
+                        b.parent,
+                        side,
+                        b.field_sides,
+                        tmp_kind=tmp_kind,
+                        tmp_slot=tmp_slot,
+                        layout_tag=(dot_value_spec.layout.value if dot_value_spec is not None else ""),
+                        expression_meta=(dot_value_spec.meta if dot_value_spec is not None else dot_meta),
+                    )
+                    continue
+
+                if dot_case == DotKernelCase.VALUE_GRAD_DOT_BASIS_VECTOR and b.role in {"trial", "test"}:
+                    lhs_is_rank1_grad = (
+                        dot_lowering is not None and dot_lowering.algebra.lhs.tensor_rank == 1
+                    )
+                    if lhs_is_rank1_grad:
+                        wants_1d = dot_value_spec is not None and len(dot_value_spec.shape) == 1
+                        nm, tmp_kind, tmp_slot = alloc_tmp("vec" if wants_1d else "mat", "dot")
+                        if wants_1d:
+                            emit_vec(nm, f"const_vector_dot_basis_1d({_cpp_vector_input_expr(a)}, {b.name})", tmp_kind=tmp_kind)
+                            fallback_shape = (b.shape[1],)
+                        else:
+                            emit_mat(nm, f"basis_dot_const_vector({b.name}, {_cpp_vector_input_expr(a)})", tmp_kind=tmp_kind)
+                            fallback_shape = (1, b.shape[1])
+                    else:
+                        nm, tmp_kind, tmp_slot = alloc_tmp("mat", "dot")
+                        emit_mat(nm, f"dot_grad_func_trial_vec({a.name}, {b.name})", tmp_kind=tmp_kind)
+                        fallback_shape = (a.shape[0] if len(a.shape) > 0 else -1, b.shape[1])
+                    push(
+                        (dot_value_spec.kind if dot_value_spec is not None else ("vec" if len(fallback_shape) == 1 else "mat")),
+                        (dot_value_spec.role if dot_value_spec is not None else b.role),
+                        tuple(int(v) for v in (
+                            dot_value_spec.shape if dot_value_spec is not None else _planned_storage_shape(dot_lowering, fallback_shape)
+                        )),
+                        b.field_names,
+                        b.parent,
+                        side,
+                        b.field_sides,
+                        tmp_kind=tmp_kind,
+                        tmp_slot=tmp_slot,
+                        layout_tag=(dot_value_spec.layout.value if dot_value_spec is not None else ""),
+                        expression_meta=(dot_value_spec.meta if dot_value_spec is not None else dot_meta),
+                    )
+                    continue
+
+                if dot_case == DotKernelCase.BASIS_VECTOR_DOT_VALUE_GRAD and a.role in {"trial", "test"}:
+                    rhs_is_rank1_grad = (
+                        dot_lowering is not None and dot_lowering.algebra.rhs.tensor_rank == 1
+                    )
+                    if rhs_is_rank1_grad:
+                        wants_1d = dot_value_spec is not None and len(dot_value_spec.shape) == 1
+                        nm, tmp_kind, tmp_slot = alloc_tmp("vec" if wants_1d else "mat", "dot")
+                        if wants_1d:
+                            emit_vec(nm, f"const_vector_dot_basis_1d({_cpp_vector_input_expr(b)}, {a.name})", tmp_kind=tmp_kind)
+                            fallback_shape = (a.shape[1],)
+                        else:
+                            emit_mat(nm, f"basis_dot_const_vector({a.name}, {_cpp_vector_input_expr(b)})", tmp_kind=tmp_kind)
+                            fallback_shape = (1, a.shape[1])
+                    else:
+                        nm, tmp_kind, tmp_slot = alloc_tmp("mat", "dot")
+                        emit_mat(nm, f"contract_last_first(Eigen::MatrixXd(({b.name}.transpose()).eval()), {a.name})", tmp_kind=tmp_kind)
+                        fallback_shape = (b.shape[1], a.shape[1])
+                    push(
+                        (dot_value_spec.kind if dot_value_spec is not None else ("vec" if len(fallback_shape) == 1 else "mat")),
+                        (dot_value_spec.role if dot_value_spec is not None else a.role),
+                        tuple(int(v) for v in (
+                            dot_value_spec.shape if dot_value_spec is not None else _planned_storage_shape(dot_lowering, fallback_shape)
+                        )),
+                        a.field_names,
+                        a.parent,
+                        side,
+                        a.field_sides,
+                        tmp_kind=tmp_kind,
+                        tmp_slot=tmp_slot,
+                        layout_tag=(dot_value_spec.layout.value if dot_value_spec is not None else ""),
+                        expression_meta=(dot_value_spec.meta if dot_value_spec is not None else dot_meta),
+                    )
+                    continue
+
+                if dot_case == DotKernelCase.BASIS_GRAD_DOT_BASIS_VECTOR and a.role in {"trial", "test"} and b.role in {"trial", "test"}:
+                    if dot_lowering is not None and dot_lowering.algebra.lhs.tensor_rank == 1:
+                        nm, tmp_kind, tmp_slot = alloc_tmp("mat", "dot")
+                        emit_mat(
+                            nm,
+                            f"contract_last_first({_cpp_rank1_basis_free_last_expr(a.name, a.shape)}, {b.name})",
+                            tmp_kind=tmp_kind,
+                        )
+                        if dot_lowering is not None and getattr(dot_lowering, "swap_mixed_basis_axes", False):
+                            emit_mat(nm, f"{nm}.transpose().eval()", tmp_kind=tmp_kind)
+                        push_dot_result(
+                            "mat",
+                            (getattr(dot_lowering.result, "role", "mixed") if dot_lowering is not None else "mixed"),
+                            tuple(int(v) for v in _planned_storage_shape(dot_lowering, (a.shape[-1], b.shape[-1]))),
+                            a.field_names or b.field_names,
+                            a.parent or b.parent,
+                            side,
+                            a.field_sides or b.field_sides,
+                            tmp_kind=tmp_kind,
+                            tmp_slot=tmp_slot,
+                            layout_tag=(dot_lowering.result.layout.value if dot_lowering is not None else ""),
+                            expression_meta=dot_meta,
+                        )
+                    else:
+                        emit_line(f"auto {nm} = contract_last_first({a.name}, {b.name});")
+                        if dot_lowering is not None and getattr(dot_lowering, "swap_mixed_basis_axes", False):
+                            emit_line(f"for (auto& _m : {nm}) _m.transposeInPlace();")
+                        push_dot_result(
+                            "mixed",
+                            (getattr(dot_lowering.result, "role", "mixed") if dot_lowering is not None else "mixed"),
+                            tuple(int(v) for v in _planned_storage_shape(dot_lowering, (a.shape[-1], b.shape[-1]))),
+                            a.field_names or b.field_names,
+                            a.parent or b.parent,
+                            side,
+                            a.field_sides or b.field_sides,
+                            layout_tag=(dot_lowering.result.layout.value if dot_lowering is not None else ""),
+                            expression_meta=dot_meta,
+                        )
+                    continue
+
+                if dot_case == DotKernelCase.BASIS_VECTOR_DOT_BASIS_GRAD and a.role in {"trial", "test"} and b.role in {"trial", "test"}:
+                    if dot_lowering is not None and dot_lowering.algebra.rhs.tensor_rank == 1:
+                        nm, tmp_kind, tmp_slot = alloc_tmp("mat", "dot")
+                        emit_mat(
+                            nm,
+                            f"contract_last_first({_cpp_rank1_basis_free_last_expr(b.name, b.shape)}, {a.name})",
+                            tmp_kind=tmp_kind,
+                        )
+                        if b.role == "trial":
+                            emit_mat(nm, f"{nm}.transpose().eval()", tmp_kind=tmp_kind)
+                        push_dot_result(
+                            "mat",
+                            (getattr(dot_lowering.result, "role", "mixed") if dot_lowering is not None else "mixed"),
+                            tuple(int(v) for v in _planned_storage_shape(dot_lowering, (a.shape[-1], b.shape[-1]))),
+                            a.field_names or b.field_names,
+                            a.parent or b.parent,
+                            side,
+                            a.field_sides or b.field_sides,
+                            tmp_kind=tmp_kind,
+                            tmp_slot=tmp_slot,
+                            layout_tag=(dot_lowering.result.layout.value if dot_lowering is not None else ""),
+                            expression_meta=dot_meta,
+                        )
+                    else:
+                        emit_line(
+                            f"auto {nm} = dot_vec_grad_components({a.name}, {b.name}, {str(a.role == 'test' and b.role == 'trial').lower()});"
+                        )
+                        push_dot_result(
+                            "mixed",
+                            (getattr(dot_lowering.result, "role", "mixed") if dot_lowering is not None else "mixed"),
+                            tuple(int(v) for v in _planned_storage_shape(dot_lowering, (a.shape[-1], b.shape[-1]))),
+                            a.field_names or b.field_names,
+                            a.parent or b.parent,
+                            side,
+                            a.field_sides or b.field_sides,
+                            layout_tag=(dot_lowering.result.layout.value if dot_lowering is not None else ""),
+                            expression_meta=dot_meta,
+                        )
+                    continue
+
                 # trial/test mass
                 # Gradient advection combinations: grad(Function) · Trial  or Trial · grad(Function)
                 if a.kind == "grad" and b.kind == "grad" and a.role in {"test", "trial"} and b.role in {"test", "trial"}:
@@ -3411,71 +4942,160 @@ class CppCodeGen:
                     emit_line(f"auto {nm} = dot_grad_grad_mixed({a.name}, {b.name}, {flag});")
                     rows = b.shape[1] if flag == 1 else a.shape[1]
                     cols = a.shape[1] if flag == 1 else b.shape[1]
-                    push("mixed", "mixed", (a.shape[0], rows, cols, a.shape[2]))
+                    fallback_shape = (a.shape[0], rows, cols, a.shape[2])
+                    push(
+                        (dot_value_spec.kind if dot_value_spec is not None else "mixed"),
+                        (dot_value_spec.role if dot_value_spec is not None else "mixed"),
+                        tuple(int(v) for v in (
+                            dot_value_spec.shape
+                            if dot_value_spec is not None
+                            else _planned_storage_shape(dot_lowering, fallback_shape)
+                        )),
+                        a.field_names or b.field_names,
+                        a.parent or b.parent,
+                        side,
+                        a.field_sides or b.field_sides,
+                        layout_tag=(dot_value_spec.layout.value if dot_value_spec is not None else ""),
+                        expression_meta=(dot_value_spec.meta if dot_value_spec is not None else dot_meta),
+                    )
                 elif a.kind == "mat" and b.kind == "mat" and a.role == "value" and b.role == "trial":
                     nm, tmp_kind, tmp_slot = alloc_tmp("mat", "dot")
                     emit_mat(nm, f"dot_grad_func_trial_vec({a.name}, {b.name})", tmp_kind=tmp_kind)
                     # grad_func: (k,d), trial_vec: (d,n) -> (k,n)
                     push(
                         "mat",
-                        "trial",
-                        (a.shape[0] if len(a.shape) > 0 else -1, -1),
+                        (dot_value_spec.kind if dot_value_spec is not None else "mat"),
+                        (dot_value_spec.role if dot_value_spec is not None else "trial"),
+                        tuple(int(v) for v in (
+                            dot_value_spec.shape
+                            if dot_value_spec is not None
+                            else _planned_storage_shape(dot_lowering, (a.shape[0] if len(a.shape) > 0 else -1, b.shape[1]))
+                        )),
                         b.field_names,
                         b.parent,
                         tmp_kind=tmp_kind,
                         tmp_slot=tmp_slot,
+                        layout_tag=(dot_value_spec.layout.value if dot_value_spec is not None else ""),
+                        expression_meta=(dot_value_spec.meta if dot_value_spec is not None else None),
                     )
-                elif a.kind == "mat" and b.kind == "mat" and a.role == "trial" and b.role == "value":
+                elif (
+                    a.role == "trial"
+                    and _semantic_is_basis_rank1(a, spatial_dim=self.spatial_dim)
+                    and b.role in {"value", "const"}
+                    and (_semantic_is_value_rank1(b, spatial_dim=self.spatial_dim) or _semantic_is_value_rank2(b, spatial_dim=self.spatial_dim))
+                ):
                     nm, tmp_kind, tmp_slot = alloc_tmp("mat", "dot")
-                    if b.shape[0] == 1 and a.shape[0] == b.shape[1]:
-                        emit_mat(nm, f"basis_dot_const_vector({a.name}, {b.name}.row(0).transpose())", tmp_kind=tmp_kind)
-                        out_rows = 1
+                    rhs_rank = dot_plan.rhs.tensor_rank if dot_plan is not None else _try_tensor_rank(b, spatial_dim=self.spatial_dim)
+                    if rhs_rank == 1:
+                        emit_mat(nm, f"basis_dot_const_vector({a.name}, {_cpp_dot_value_operand_expr(b, rhs_rank)})", tmp_kind=tmp_kind)
+                        fallback_shape = (1, a.shape[1])
                     else:
-                        emit_mat(nm, f"dot_trial_vec_grad_func({a.name}, {b.name})", tmp_kind=tmp_kind)
-                        out_rows = b.shape[0] if len(b.shape) > 0 else -1
-                    push(
+                        emit_mat(nm, f"dot_trial_vec_grad_func({a.name}, {_cpp_dot_value_operand_expr(b, rhs_rank)})", tmp_kind=tmp_kind)
+                        if dot_plan is not None and dot_plan.result.tensor_rank > 0:
+                            fallback_shape = tuple(int(axis.size) for axis in dot_plan.result.free_axes)
+                        else:
+                            fallback_shape = (b.shape[0] if len(b.shape) > 0 else -1, a.shape[1])
+                    push_dot_result(
                         "mat",
                         "trial",
-                        (out_rows, -1),
+                        tuple(int(v) for v in _planned_storage_shape(dot_lowering, fallback_shape)),
                         a.field_names,
                         a.parent,
+                        side,
+                        a.field_sides,
                         tmp_kind=tmp_kind,
                         tmp_slot=tmp_slot,
+                        expression_meta=dot_meta,
                     )
-                elif a.kind == "mat" and b.kind == "mat" and a.role == "test" and b.role == "value":
-                    # Vector test basis dotted with grad(value): (k,n)·(k,d) -> (n,d)
-                    if (len(a.shape) > 1 and len(b.shape) > 1) and (
-                        (a.shape[0] == b.shape[0]) or (b.shape[0] == 1 and a.shape[0] == b.shape[1])
-                    ):
-                        nm, tmp_kind, tmp_slot = alloc_tmp("mat", "dot")
-                        if b.shape[0] == 1 and a.shape[0] == b.shape[1]:
-                            emit_mat(nm, f"basis_dot_const_vector({a.name}, {b.name}.row(0).transpose())", tmp_kind=tmp_kind)
-                            out_shape = (1, a.shape[1])
+                elif (
+                    a.role == "test"
+                    and _semantic_is_basis_rank1(a, spatial_dim=self.spatial_dim)
+                    and b.role in {"value", "const"}
+                    and (_semantic_is_value_rank1(b, spatial_dim=self.spatial_dim) or _semantic_is_value_rank2(b, spatial_dim=self.spatial_dim))
+                ):
+                    nm, tmp_kind, tmp_slot = alloc_tmp("mat", "dot")
+                    rhs_rank = dot_plan.rhs.tensor_rank if dot_plan is not None else _try_tensor_rank(b, spatial_dim=self.spatial_dim)
+                    if rhs_rank == 1:
+                        emit_mat(nm, f"basis_dot_const_vector({a.name}, {_cpp_dot_value_operand_expr(b, rhs_rank)})", tmp_kind=tmp_kind)
+                        fallback_shape = (1, a.shape[1])
+                    else:
+                        emit_mat(nm, f"contract_last_first({_cpp_dot_value_operand_expr(b, rhs_rank)}.transpose().eval(), {a.name})", tmp_kind=tmp_kind)
+                        if dot_plan is not None and dot_plan.result.tensor_rank > 0:
+                            fallback_shape = tuple(int(axis.size) for axis in dot_plan.result.free_axes)
                         else:
-                            emit_mat(nm, f"vector_dot_grad_value({a.name}, {b.name})", tmp_kind=tmp_kind)
-                            out_shape = (a.shape[1], b.shape[1])
-                        push(
-                            "mat",
-                            "test",
-                            out_shape,
-                            a.field_names,
-                            a.parent,
-                            tmp_kind=tmp_kind,
-                            tmp_slot=tmp_slot,
-                        )
+                            fallback_shape = (b.shape[1], a.shape[1])
+                    push_dot_result(
+                        "mat",
+                        "test",
+                        tuple(int(v) for v in _planned_storage_shape(dot_lowering, fallback_shape)),
+                        a.field_names,
+                        a.parent,
+                        side,
+                        a.field_sides,
+                        tmp_kind=tmp_kind,
+                        tmp_slot=tmp_slot,
+                        expression_meta=dot_meta,
+                    )
                 # Explicit Test/Trial mass-like dot even when shapes are concrete (not -1 flagged)
                 elif a.kind == "mat" and b.kind == "mat" and a.role == "trial" and b.role == "test":
                     nm, tmp_kind, tmp_slot = alloc_tmp("mat", "dot")
                     emit_mat(nm, f"dot_mass_test_trial({b.name}, {a.name})", tmp_kind=tmp_kind)
-                    push("mat", "value", (-1, -1), tmp_kind=tmp_kind, tmp_slot=tmp_slot)
+                    push(
+                        (dot_value_spec.kind if dot_value_spec is not None else "mixed"),
+                        (dot_value_spec.role if dot_value_spec is not None else "mixed"),
+                        tuple(int(v) for v in (
+                            dot_value_spec.shape
+                            if dot_value_spec is not None
+                            else _planned_storage_shape(dot_lowering, (a.shape[-1], b.shape[-1]))
+                        )),
+                        a.field_names or b.field_names,
+                        a.parent or b.parent,
+                        side,
+                        a.field_sides or b.field_sides,
+                        tmp_kind=tmp_kind,
+                        tmp_slot=tmp_slot,
+                        layout_tag=(dot_value_spec.layout.value if dot_value_spec is not None else ""),
+                        expression_meta=(dot_value_spec.meta if dot_value_spec is not None else dot_meta),
+                    )
                 elif a.kind == "mat" and b.kind == "mat" and a.role == "test" and b.role == "trial":
                     nm, tmp_kind, tmp_slot = alloc_tmp("mat", "dot")
                     emit_mat(nm, f"dot_mass_test_trial({a.name}, {b.name})", tmp_kind=tmp_kind)
-                    push("mat", "value", (-1, -1), tmp_kind=tmp_kind, tmp_slot=tmp_slot)
+                    push(
+                        (dot_value_spec.kind if dot_value_spec is not None else "mixed"),
+                        (dot_value_spec.role if dot_value_spec is not None else "mixed"),
+                        tuple(int(v) for v in (
+                            dot_value_spec.shape
+                            if dot_value_spec is not None
+                            else _planned_storage_shape(dot_lowering, (a.shape[-1], b.shape[-1]))
+                        )),
+                        a.field_names or b.field_names,
+                        a.parent or b.parent,
+                        side,
+                        a.field_sides or b.field_sides,
+                        tmp_kind=tmp_kind,
+                        tmp_slot=tmp_slot,
+                        layout_tag=(dot_value_spec.layout.value if dot_value_spec is not None else ""),
+                        expression_meta=(dot_value_spec.meta if dot_value_spec is not None else dot_meta),
+                    )
                 elif a.kind == "mat" and b.kind == "mat" and is_a_2x2 and is_b_2x2:
                     nm, tmp_kind, tmp_slot = alloc_tmp("mat", "dot")
-                    emit_mat(nm, f"dot_grad_grad_value({a.name}, {b.name})", tmp_kind=tmp_kind)
-                    push("mat", "const", a.shape, tmp_kind=tmp_kind, tmp_slot=tmp_slot)
+                    emit_mat(nm, f"contract_last_first({a.name}, {b.name})", tmp_kind=tmp_kind)
+                    fallback_shape = (
+                        tuple(int(axis.size) for axis in dot_plan.result.free_axes)
+                        if dot_plan is not None and dot_plan.result.tensor_rank > 0
+                        else a.shape
+                    )
+                    push(
+                        (dot_value_spec.kind if dot_value_spec is not None else "mat"),
+                        (dot_value_spec.role if dot_value_spec is not None else "const"),
+                        tuple(int(v) for v in (
+                            dot_value_spec.shape if dot_value_spec is not None else _planned_storage_shape(dot_lowering, fallback_shape)
+                        )),
+                        tmp_kind=tmp_kind,
+                        tmp_slot=tmp_slot,
+                        layout_tag=(dot_value_spec.layout.value if dot_value_spec is not None else ""),
+                        expression_meta=(dot_value_spec.meta if dot_value_spec is not None else None),
+                    )
                 elif a.kind == "mat" and b.kind == "mat" and (a_union_mat or b_union_mat):
                     # Preserve Test/Trial orientation (test^T @ trial)
                     role = "value"
@@ -3509,18 +5129,75 @@ class CppCodeGen:
                                                   f" (got roles {a.role}, {b.role})"
                                                   f" (shapes {a.shape}, {b.shape})"
                                                   f", union ({a_union_mat}, {b_union_mat})")
-                    push("mat", role, shape, tmp_kind=tmp_kind, tmp_slot=tmp_slot)
+                    push(
+                        (dot_value_spec.kind if dot_value_spec is not None else "mat"),
+                        (dot_value_spec.role if dot_value_spec is not None else role),
+                        tuple(int(v) for v in (
+                            dot_value_spec.shape
+                            if dot_value_spec is not None
+                            else _planned_storage_shape(dot_lowering, shape)
+                        )),
+                        tmp_kind=tmp_kind,
+                        tmp_slot=tmp_slot,
+                        layout_tag=(dot_value_spec.layout.value if dot_value_spec is not None else ""),
+                        expression_meta=(dot_value_spec.meta if dot_value_spec is not None else None),
+                    )
                 elif a.kind == "mat" and b.kind == "grad" :
                     if a.role in {"const", "value"} and b.role in {"test", "trial"}:
-                        emit_line(f"auto {nm} = dot_grad_value_with_grad_basis({a.name}, {b.name});")
-                        push("grad", b.role, b.shape, b.field_names, b.parent, side, b.field_sides)
+                        if len(b.shape) == 2 and a.shape[1] == b.shape[0]:
+                            emit_line(f"Eigen::MatrixXd {nm} = {a.name} * {b.name};")
+                            push(
+                                "grad",
+                                b.role,
+                                _planned_storage_shape(dot_lowering, (a.shape[0], b.shape[1])),
+                                b.field_names,
+                                b.parent,
+                                side,
+                                b.field_sides,
+                            )
+                        elif len(b.shape) >= 3 and b.shape[0] == 1 and a.shape[1] == b.shape[2]:
+                            # Scalar gradients are rank-1 spatial vectors. Left matrix action
+                            # therefore contracts the spatial axis, which is equivalent to
+                            # right-multiplying each basis row by A^T.
+                            emit_line(f"auto {nm} = contract_last_first({b.name}, {a.name}.transpose().eval());")
+                            push(
+                                "grad",
+                                b.role,
+                                _planned_storage_shape(dot_lowering, (1, b.shape[1], a.shape[0])),
+                                b.field_names,
+                                b.parent,
+                                side,
+                                b.field_sides,
+                            )
+                        elif len(b.shape) >= 3 and a.shape[1] == b.shape[0]:
+                            emit_line(f"auto {nm} = contract_component_matrix_grad({a.name}, {b.name});")
+                            push(
+                                "grad",
+                                b.role,
+                                _planned_storage_shape(dot_lowering, (a.shape[0], b.shape[1], b.shape[2])),
+                                b.field_names,
+                                b.parent,
+                                side,
+                                b.field_sides,
+                            )
+                        else:
+                            raise NotImplementedError(
+                                "dot(mat, grad) value/test-trial contraction requires either "
+                                "scalar-gradient spatial match or vector-gradient component match "
+                                f"(got shapes {a.shape}, {b.shape})"
+                            )
                     elif  a.role in {"trial", "test"} and b.role in {"trial", "test"} and a.shape[0] == b.shape[0]:
                         # Contract vector basis (components) with grad basis -> collapse component axis, keep spatial
                         swap_roles = a.role == "test" and b.role == "trial"
                         emit_line(f"auto {nm} = dot_vec_grad_components({a.name}, {b.name}, {str(swap_roles).lower()});")
                         rows = a.shape[1] if swap_roles else b.shape[1]
                         cols = b.shape[1] if swap_roles else a.shape[1]
-                        push("mixed", "mixed", (1, rows, cols, b.shape[2]))
+                        push(
+                            "mixed",
+                            "mixed",
+                            (b.shape[2], rows, cols),
+                            layout_tag=MixedLayout.COMPONENT_FIRST.value,
+                        )
                     else:
                         raise NotImplementedError("dot(mat, grad) only supported for value · test/trial"
                                                   f" or test/trial · test/trial with matching component counts in C++ backend"
@@ -3529,28 +5206,86 @@ class CppCodeGen:
                 elif a.kind == "grad" and b.kind == "mat":
                     # grad(test/trial) with basis matrix -> standard assembly helper
                     if a.role in {"test", "trial"} and b.role in {"value", "const"}:
-                        emit_line(f"auto {nm} = dot_grad_basis_with_grad_value({a.name}, {b.name});")
-                        push("grad", a.role, a.shape, a.field_names, a.parent, side, a.field_sides)
+                        if len(a.shape) == 2 and a.shape[0] == b.shape[0]:
+                            emit_line(f"Eigen::MatrixXd {nm} = {b.name}.transpose() * {a.name};")
+                            push(
+                                "grad",
+                                a.role,
+                                _planned_storage_shape(dot_lowering, (b.shape[1], a.shape[1])),
+                                a.field_names,
+                                a.parent,
+                                side,
+                                a.field_sides,
+                            )
+                        elif len(a.shape) >= 3 and a.shape[2] == b.shape[0]:
+                            emit_line(f"auto {nm} = contract_last_first({a.name}, {b.name});")
+                            push(
+                                "grad",
+                                a.role,
+                                _planned_storage_shape(dot_lowering, (a.shape[0], a.shape[1], b.shape[1])),
+                                a.field_names,
+                                a.parent,
+                                side,
+                                a.field_sides,
+                            )
+                        else:
+                            raise NotImplementedError(
+                                "dot(grad, mat) basis/value contraction requires gradient spatial "
+                                f"dimension to match matrix rows (got shapes {a.shape}, {b.shape})"
+                            )
                     elif a.role in {"value"} and b.role in {"test", "trial"}:
                         emit_line(f"auto {nm} = dot_grad_value_with_basis({a.name}, {b.name});")
-                        push("grad", b.role, b.shape, b.field_names, b.parent, side, b.field_sides)
-                    elif len(b.shape) >= 2 and b.shape[1] == -1:
-                        if a.role in {"test", "trial"} and b.role in {"test", "trial"}:
-                            emit_line(f"auto {nm} = contract_last_first({a.name}, {b.name});")
-                            # contract_last_first(A, B) returns rows from A and cols from B.
-                            # For bilinear forms we need rows=test and cols=trial. When the
-                            # gradient basis is the trial operand and the vector basis is the
-                            # test operand, transpose each component block back to test-by-trial.
-                            if a.role == "trial" and b.role == "test":
-                                emit_line(f"for (auto& _m : {nm}) _m.transposeInPlace();")
-                                res_shape = (a.shape[0], b.shape[1], a.shape[1])
+                        push(
+                            "grad",
+                            b.role,
+                            _planned_storage_shape(dot_lowering, b.shape),
+                            b.field_names,
+                            b.parent,
+                            side,
+                            b.field_sides,
+                        )
+                    elif b.role in {"test", "trial"} and len(b.shape) >= 2:
+                        if a.role in {"test", "trial"}:
+                            if len(a.shape) >= 3 and a.shape[2] == b.shape[0]:
+                                emit_line(f"auto {nm} = contract_last_first({a.name}, {b.name});")
+                                swap_mixed_axes = (
+                                    dot_lowering is not None
+                                    and getattr(dot_lowering, "swap_mixed_basis_axes", False)
+                                )
+                                if swap_mixed_axes:
+                                    emit_line(f"for (auto& _m : {nm}) _m.transposeInPlace();")
+                                    rows = b.shape[1]
+                                    cols = a.shape[1]
+                                else:
+                                    rows = a.shape[1]
+                                    cols = b.shape[1]
+                                push(
+                                    "mixed",
+                                    "mixed",
+                                    (a.shape[0], rows, cols),
+                                    layout_tag=MixedLayout.COMPONENT_FIRST.value,
+                                )
                             else:
-                                res_shape = a.shape[:-1] + b.shape[1:]
-                            push("grad", "mixed", res_shape)
-                        else:    
+                                raise NotImplementedError(
+                                    "dot(grad, basis-mat) currently requires gradient spatial "
+                                    f"dimension to match basis rows (got shapes {a.shape}, {b.shape})"
+                                )
+                        else:
                             nm, tmp_kind, tmp_slot = alloc_tmp("mat", "dot")
                             emit_mat(nm, f"dot_grad_trial({a.name}, {b.name})", tmp_kind=tmp_kind)
-                            push("mat", "value", (-1, -1), tmp_kind=tmp_kind, tmp_slot=tmp_slot)
+                            push(
+                                (dot_value_spec.kind if dot_value_spec is not None else "mat"),
+                                (dot_value_spec.role if dot_value_spec is not None else "value"),
+                                tuple(int(v) for v in (
+                                    dot_value_spec.shape
+                                    if dot_value_spec is not None
+                                    else _planned_storage_shape(dot_lowering, (a.shape[0], b.shape[1]))
+                                )),
+                                tmp_kind=tmp_kind,
+                                tmp_slot=tmp_slot,
+                                layout_tag=(dot_value_spec.layout.value if dot_value_spec is not None else ""),
+                                expression_meta=(dot_value_spec.meta if dot_value_spec is not None else None),
+                            )
                     else:
                         emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({a.name}.size());")
                         emit_line(f"for (size_t _c=0; _c<{a.name}.size(); ++_c) {{")
@@ -3563,10 +5298,40 @@ class CppCodeGen:
                             b.shape[1] if len(b.shape) > 1 else 0,
                         )
                         push("grad", a.role, out_shape, a.field_names, a.parent, side, a.field_sides)
+                elif (
+                    _semantic_is_basis_rank1(a, spatial_dim=self.spatial_dim)
+                    and _semantic_is_value_rank1(b, spatial_dim=self.spatial_dim)
+                    and a.role in {"test", "trial"}
+                    and b.role in {"const", "value"}
+                    and len(a.shape) >= 2
+                    and (is_b_1d or is_b_col_vec or is_b_row_vec)
+                ):
+                    b_dim = b.shape[0] if len(b.shape) == 1 else (b.shape[1] if is_b_row_vec else (b.shape[0] if is_b_col_vec else -1))
+                    component_first = getattr(a, "layout_tag", "") == MixedLayout.COMPONENT_FIRST.value
+                    if not component_first and b_dim not in (-1, 0):
+                        component_first = a.shape[0] == b_dim
+                    nm, tmp_kind, tmp_slot = alloc_tmp("mat", "dot")
+                    emit_mat(nm, f"basis_dot_const_vector({a.name}, {_cpp_vector_input_expr(b)})", tmp_kind=tmp_kind)
+                    fallback_shape = (1, a.shape[1] if component_first else a.shape[0])
+                    push(
+                        (dot_value_spec.kind if dot_value_spec is not None else "mat"),
+                        (dot_value_spec.role if dot_value_spec is not None else a.role),
+                        tuple(int(v) for v in (
+                            dot_value_spec.shape if dot_value_spec is not None else _planned_storage_shape(dot_lowering, fallback_shape)
+                        )),
+                        a.field_names,
+                        a.parent,
+                        side,
+                        a.field_sides,
+                        tmp_kind=tmp_kind,
+                        tmp_slot=tmp_slot,
+                        layout_tag=(dot_value_spec.layout.value if dot_value_spec is not None else ""),
+                        expression_meta=(dot_value_spec.meta if dot_value_spec is not None else None),
+                    )
                 elif a.kind == "mat" and b.kind == "vec":
                     vec_dim = b.shape[0] if len(b.shape) > 0 and b.shape[0] not in (-1, 0) else -1
                     if a.role in {"test", "trial"} and a.shape[0] == b.shape[0] and (is_b_1d or is_b_col_vec or is_b_row_vec):
-                        emit_mat(nm, f"basis_dot_const_vector({a.name}, {b.name})")
+                        emit_mat(nm, f"basis_dot_const_vector({a.name}, {_cpp_vector_input_expr(b)})")
                         res_shape = (1, a.shape[1])
                     elif a.role in {"test", "trial"} and a_union_mat \
                           and a.shape[0] == b.shape[0] \
@@ -3576,6 +5341,15 @@ class CppCodeGen:
 
                         # Result is a row vector with length equal to basis dof count (A.cols).
                         res_shape = (1, a.shape[1])
+                    elif a.role in {"test", "trial"} \
+                          and len(a.shape) >= 2 \
+                          and a.shape[1] == b.shape[0] \
+                          and (is_b_1d or is_b_col_vec or is_b_row_vec):
+                        # Intermediate basis-owned matrices such as dot(Test, grad(value))
+                        # are stored as (n_union, d). Contract the trailing free axis with
+                        # the spatial vector and keep a row-vector basis result.
+                        emit_mat(nm, f"contract_matrix_vector({a.name}, {b.name})")
+                        res_shape = (1, a.shape[0])
                     elif is_a_2x2 and (is_b_1d or is_b_col_vec or is_b_row_vec):
                         # Value/const matrix-vector dot: return a true 1D vector (Eigen::VectorXd),
                         # not a (1,d) row matrix. Keeping it as vec prevents downstream dot(...) from
@@ -3589,11 +5363,13 @@ class CppCodeGen:
                             emit_line(f"double {nm} = {a.name}.row(0).dot({b.name});")
                         elif is_a_col_vec:
                             emit_line(f"double {nm} = {a.name}.col(0).dot({b.name});")
+                        elif a.kind == "mat":
+                            emit_line(f"double {nm} = dot_matrix_like_vector({a.name}, {b.name});")
                         else:
                             emit_line(f"double {nm} = {a.name}.dot({b.name});")
                         push("scalar", a.role if a.role in {"test", "trial"} else "value", (), a.field_names, a.parent, side, a.field_sides)
                         continue
-                    elif a.role == "value" and a.shape[0] == 1 and a.shape[1] == b.shape[0]:
+                    elif a.role == "value" and len(a.shape) == 2 and a.shape[0] == 1 and a.shape[1] == b.shape[0]:
                         emit_line(f"double {nm} = {a.name}.row(0).dot({b.name});")
                         push("scalar", "value", (), a.field_names, a.parent, side, a.field_sides)
                         continue
@@ -3604,7 +5380,49 @@ class CppCodeGen:
                                                   f", is_2x2 ({is_a_2x2}, {is_b_2x2}), is_1d ({is_a_1d}, {is_b_1d}), is_col_vec ({is_a_col_vec}, {is_b_col_vec}), is_row_vec ({is_a_row_vec}, {is_b_row_vec})"
                                                   f", vec_dim {vec_dim}")
 
-                    push("mat", a.role if a.role in {"test", "trial"} else "value", res_shape, a.field_names, a.parent, side, a.field_sides)
+                    push(
+                        (dot_value_spec.kind if dot_value_spec is not None else "mat"),
+                        (dot_value_spec.role if dot_value_spec is not None else (a.role if a.role in {"test", "trial"} else "value")),
+                        tuple(int(v) for v in (
+                            dot_value_spec.shape if dot_value_spec is not None else res_shape
+                        )),
+                        a.field_names,
+                        a.parent,
+                        side,
+                        a.field_sides,
+                        layout_tag=(dot_value_spec.layout.value if dot_value_spec is not None else ""),
+                        expression_meta=(dot_value_spec.meta if dot_value_spec is not None else None),
+                    )
+                elif (
+                    _semantic_is_value_rank1(a, spatial_dim=self.spatial_dim)
+                    and _semantic_is_basis_rank1(b, spatial_dim=self.spatial_dim)
+                    and a.role in {"const", "value"}
+                    and b.role in {"test", "trial"}
+                    and len(b.shape) >= 2
+                    and (is_a_1d or is_a_col_vec or is_a_row_vec)
+                ):
+                    a_dim = a.shape[0] if len(a.shape) == 1 else (a.shape[1] if is_a_row_vec else (a.shape[0] if is_a_col_vec else -1))
+                    component_first = getattr(b, "layout_tag", "") == MixedLayout.COMPONENT_FIRST.value
+                    if not component_first and a_dim not in (-1, 0):
+                        component_first = b.shape[0] == a_dim
+                    nm, tmp_kind, tmp_slot = alloc_tmp("mat", "dot")
+                    emit_mat(nm, f"basis_dot_const_vector({b.name}, {_cpp_vector_input_expr(a)})", tmp_kind=tmp_kind)
+                    fallback_shape = (1, b.shape[1] if component_first else b.shape[0])
+                    push(
+                        (dot_value_spec.kind if dot_value_spec is not None else "mat"),
+                        (dot_value_spec.role if dot_value_spec is not None else b.role),
+                        tuple(int(v) for v in (
+                            dot_value_spec.shape if dot_value_spec is not None else _planned_storage_shape(dot_lowering, fallback_shape)
+                        )),
+                        b.field_names,
+                        b.parent,
+                        side,
+                        b.field_sides,
+                        tmp_kind=tmp_kind,
+                        tmp_slot=tmp_slot,
+                        layout_tag=(dot_value_spec.layout.value if dot_value_spec is not None else ""),
+                        expression_meta=(dot_value_spec.meta if dot_value_spec is not None else None),
+                    )
                 elif a.kind == "vec" and b.kind == "mat":
                     mat_rows = b.shape[0] if len(b.shape) > 0 and b.shape[0] not in (-1, 0) else -1
                     res_shape = (
@@ -3617,7 +5435,7 @@ class CppCodeGen:
                         push("vec", b.role, (b.shape[1] if len(b.shape) > 1 else -1,), b.field_names, b.parent, side, b.field_sides)
                         continue
                     if b.role in {"test", "trial"} and b.shape[0] == a.shape[0]:
-                        emit_mat(nm, f"basis_dot_const_vector({b.name}, {a.name})")
+                        emit_mat(nm, f"basis_dot_const_vector({b.name}, {_cpp_vector_input_expr(a)})")
                         mat_rows = -1
                         res_shape = (1, b.shape[1])
                     elif b.role in {"test", "trial"}:
@@ -3628,6 +5446,10 @@ class CppCodeGen:
                         res_shape = (1, b.shape[1])
                     elif b.role == "value" and b.shape[0] == 1 and b.shape[1] == a.shape[0]:
                         emit_line(f"double {nm} = {b.name}.row(0).dot({a.name});")
+                        push("scalar", "value", (), b.field_names, b.parent, side, b.field_sides)
+                        continue
+                    elif b.role == "value" and len(b.shape) == 1 and b.shape[0] == a.shape[0]:
+                        emit_line(f"double {nm} = dot_vector_matrix_like({a.name}, {b.name});")
                         push("scalar", "value", (), b.field_names, b.parent, side, b.field_sides)
                         continue
                     elif is_a_1d and is_b_2x2:
@@ -3643,7 +5465,19 @@ class CppCodeGen:
                                                   f", mat_rows {mat_rows}")
 
                     
-                    push("mat", b.role if b.role in {"test", "trial"} else "value", res_shape, b.field_names, b.parent, side, b.field_sides)
+                    push(
+                        (dot_value_spec.kind if dot_value_spec is not None else "mat"),
+                        (dot_value_spec.role if dot_value_spec is not None else (b.role if b.role in {"test", "trial"} else "value")),
+                        tuple(int(v) for v in (
+                            dot_value_spec.shape if dot_value_spec is not None else res_shape
+                        )),
+                        b.field_names,
+                        b.parent,
+                        side,
+                        b.field_sides,
+                        layout_tag=(dot_value_spec.layout.value if dot_value_spec is not None else ""),
+                        expression_meta=(dot_value_spec.meta if dot_value_spec is not None else None),
+                    )
                 elif a.kind == "vec" and b.kind == "grad":
                     nm, tmp_kind, tmp_slot = alloc_tmp("mat", "dot")
                     if b.parent == "hess_dot_vec":
@@ -3651,14 +5485,50 @@ class CppCodeGen:
                         emit_mat(nm, f"vector_dot_grad_basis({a.name}, {b.name})", tmp_kind=tmp_kind)
                         out_shape = (b.shape[2] if len(b.shape) > 2 else -1, b.shape[1] if len(b.shape) > 1 else -1)
                     else:
-                        # Prefer spatial-axis contraction when vector length matches spatial dimension.
+                        # Shared tensor rules decide whether this contraction collapses to
+                        # a scalar basis row or leaves one free physical axis.
                         emit_mat(nm, f"vector_dot_grad_basis({a.name}, {b.name})", tmp_kind=tmp_kind)
-                        vec_dim = a.shape[0] if len(a.shape) > 0 and a.shape[0] not in (-1, 0) else -1
-                        spatial_dim = b.shape[2] if len(b.shape) > 2 else -1
-                        use_spatial = (spatial_dim > 0 and vec_dim == spatial_dim) or b.shape[0] == 1
-                        out_rows = b.shape[0] if use_spatial else (spatial_dim if spatial_dim > 0 else -1)
+                        if dot_plan is not None:
+                            out_rows = 1 if dot_plan.result.tensor_rank == 0 else int(dot_plan.result.free_axes[0].size)
+                        else:
+                            vec_dim = a.shape[0] if len(a.shape) > 0 and a.shape[0] not in (-1, 0) else -1
+                            spatial_dim = b.shape[2] if len(b.shape) > 2 else -1
+                            use_spatial = (spatial_dim > 0 and vec_dim == spatial_dim) or b.shape[0] == 1
+                            out_rows = b.shape[0] if use_spatial else (spatial_dim if spatial_dim > 0 else -1)
                         out_shape = (out_rows, b.shape[1] if len(b.shape) > 1 else -1)
-                    push("mat", b.role, out_shape, b.field_names, b.parent, side, b.field_sides, tmp_kind=tmp_kind, tmp_slot=tmp_slot)
+                    push_dot_result(
+                        "mat",
+                        b.role,
+                        _planned_storage_shape(dot_lowering, out_shape),
+                        b.field_names,
+                        b.parent,
+                        side,
+                        b.field_sides,
+                        tmp_kind=tmp_kind,
+                        tmp_slot=tmp_slot,
+                        expression_meta=dot_meta,
+                    )
+                elif (
+                    _semantic_is_mixed_rank1(a, spatial_dim=self.spatial_dim)
+                    and _semantic_is_value_rank1(b, spatial_dim=self.spatial_dim)
+                    and b.role in {"const", "value"}
+                ):
+                    nm, tmp_kind, tmp_slot = alloc_tmp("mat", "dot")
+                    emit_mat(nm, f"contract_first_first({a.name}, {b.name})", tmp_kind=tmp_kind)
+                    fallback_shape = (a.shape[1], a.shape[2]) if len(a.shape) == 3 else a.shape[1:]
+                    push(
+                        (dot_value_spec.kind if dot_value_spec is not None else "mat"),
+                        (dot_value_spec.role if dot_value_spec is not None else "value"),
+                        tuple(int(v) for v in (dot_value_spec.shape if dot_value_spec is not None else _planned_storage_shape(dot_lowering, fallback_shape))),
+                        a.field_names,
+                        a.parent,
+                        side,
+                        a.field_sides,
+                        tmp_kind=tmp_kind,
+                        tmp_slot=tmp_slot,
+                        layout_tag=(dot_value_spec.layout.value if dot_value_spec is not None else ""),
+                        expression_meta=(dot_value_spec.meta if dot_value_spec is not None else None),
+                    )
                 elif a.kind == "grad" and b.kind == "vec":
                     meta_fn, meta_parent, meta_side, meta_fsides = resolve_metadata(a, b, prefer="basis")
                     # Keep basis field ordering/parent when present
@@ -3672,10 +5542,14 @@ class CppCodeGen:
                     # it represents a stack of (n_test x n_trial) matrices over the component axis.
                     # The subsequent dot with a value/const vector must contract that *component*
                     # axis (linear combination), not do a spatial matrix-vector product.
-                    if a.role in {"mixed"} and b.role in {"const", "value"}:
+                    if (
+                        a.role in {"mixed"}
+                        and b.role in {"const", "value"}
+                        and getattr(a, "layout_tag", "") == MixedLayout.COMPONENT_FIRST.value
+                    ):
                         nm, tmp_kind, tmp_slot = alloc_tmp("mat", "dot")
                         emit_mat(nm, f"contract_first_first({a.name}, {b.name})", tmp_kind=tmp_kind)
-                        push(
+                        push_dot_result(
                             "mat",
                             role_out,
                             (-1, -1),
@@ -3685,53 +5559,197 @@ class CppCodeGen:
                             meta_fsides,
                             tmp_kind=tmp_kind,
                             tmp_slot=tmp_slot,
+                            expression_meta=dot_meta,
                         )
                     else:
                         nm, tmp_kind, tmp_slot = alloc_tmp("mat", "dot")
                         emit_mat(nm, f"dot_grad_basis_vector({a.name}, {b.name})", tmp_kind=tmp_kind)
-                        push(
+                        out_rows = a.shape[0]
+                        if dot_plan is not None:
+                            out_rows = 1 if dot_plan.result.tensor_rank == 0 else int(dot_plan.result.free_axes[0].size)
+                        push_dot_result(
                             "mat",
                             role_out,
-                            (a.shape[0], a.shape[1]),
+                            _planned_storage_shape(dot_lowering, (out_rows, a.shape[1])),
                             meta_fn,
                             meta_parent,
                             meta_side,
                             meta_fsides,
                             tmp_kind=tmp_kind,
                             tmp_slot=tmp_slot,
+                            expression_meta=dot_meta,
                         )
                 elif a.kind == "mixed" and b.kind == "vec":
                     nm, tmp_kind, tmp_slot = alloc_tmp("mat", "dot")
-                    emit_mat(
-                        nm,
-                        f"dot_mixed_with_vec({a.name}, {b.name}, {a.shape[0]}, {a.shape[3] if len(a.shape)>3 else 1})",
+                    if getattr(a, "layout_tag", "") == MixedLayout.COMPONENT_FIRST.value or len(a.shape) == 3:
+                        emit_mat(nm, f"contract_first_first({a.name}, {b.name})", tmp_kind=tmp_kind)
+                    else:
+                        emit_mat(
+                            nm,
+                            f"dot_mixed_with_vec({a.name}, {b.name}, {a.shape[0]}, {a.shape[3] if len(a.shape)>3 else 1})",
+                            tmp_kind=tmp_kind,
+                        )
+                    fallback_shape = (a.shape[1], a.shape[2]) if len(a.shape) >= 3 else (-1, -1)
+                    push(
+                        (dot_value_spec.kind if dot_value_spec is not None else "mat"),
+                        (dot_value_spec.role if dot_value_spec is not None else a.role),
+                        tuple(int(v) for v in (
+                            dot_value_spec.shape
+                            if dot_value_spec is not None
+                            else _planned_storage_shape(dot_lowering, fallback_shape)
+                        )),
                         tmp_kind=tmp_kind,
+                        tmp_slot=tmp_slot,
+                        layout_tag=(dot_value_spec.layout.value if dot_value_spec is not None else ""),
+                        expression_meta=(dot_value_spec.meta if dot_value_spec is not None else None),
                     )
-                    push("mat", a.role, (-1, -1), tmp_kind=tmp_kind, tmp_slot=tmp_slot)
+                elif (
+                    _semantic_is_value_rank1(a, spatial_dim=self.spatial_dim)
+                    and _semantic_is_mixed_rank1(b, spatial_dim=self.spatial_dim)
+                    and a.role in {"const", "value"}
+                ):
+                    nm, tmp_kind, tmp_slot = alloc_tmp("mat", "dot")
+                    emit_mat(nm, f"contract_first_first({b.name}, {a.name})", tmp_kind=tmp_kind)
+                    fallback_shape = (b.shape[1], b.shape[2]) if len(b.shape) == 3 else b.shape[1:]
+                    push(
+                        (dot_value_spec.kind if dot_value_spec is not None else "mat"),
+                        (dot_value_spec.role if dot_value_spec is not None else "value"),
+                        tuple(int(v) for v in (dot_value_spec.shape if dot_value_spec is not None else _planned_storage_shape(dot_lowering, fallback_shape))),
+                        b.field_names,
+                        b.parent,
+                        side,
+                        b.field_sides,
+                        tmp_kind=tmp_kind,
+                        tmp_slot=tmp_slot,
+                        layout_tag=(dot_value_spec.layout.value if dot_value_spec is not None else ""),
+                        expression_meta=(dot_value_spec.meta if dot_value_spec is not None else None),
+                    )
                 elif a.kind == "hess" and b.kind == "vec":
+                    scalar_hess_value = a.role not in {"test", "trial"} and len(a.shape) == 3 and a.shape[0] == 1 and b.shape[0] == 2
                     if a.role in {"test", "trial"}:
                         emit_line(f"auto {nm} = hessian_dot_vector_basis({a.name}, {b.name});")
-                        push("grad", a.role, (a.shape[0], a.shape[1], 2), a.field_names, "hess_dot_vec", side, a.field_sides)
+                        if len(a.shape) == 4 and a.shape[0] == 1:
+                            fallback_shape = (a.shape[2], a.shape[1])
+                        else:
+                            fallback_shape = (a.shape[0], a.shape[1], a.shape[-2])
                     else:
-                        emit_line(f"auto {nm} = hessian_dot_vector_value({a.name}, {b.name});")
-                        push("mat", a.role, (a.shape[0], 2), a.field_names, "hess_dot_vec", side, a.field_sides)
+                        if scalar_hess_value:
+                            emit_line(f"Eigen::VectorXd {nm} = matrix_like_to_vector(hessian_dot_vector_value({a.name}, {b.name}));")
+                            fallback_shape = (2,)
+                        else:
+                            emit_line(f"auto {nm} = hessian_dot_vector_value({a.name}, {b.name});")
+                            fallback_shape = (a.shape[0], 2)
+                    push(
+                        (dot_value_spec.kind if dot_value_spec is not None else ("grad" if a.role in {"test", "trial"} else ("vec" if scalar_hess_value else "mat"))),
+                        (dot_value_spec.role if dot_value_spec is not None else a.role),
+                        tuple(int(v) for v in (
+                            dot_value_spec.shape if dot_value_spec is not None else _planned_storage_shape(dot_lowering, fallback_shape)
+                        )),
+                        a.field_names,
+                        (a.parent if a.parent is not None else "hess_dot_vec"),
+                        side,
+                        a.field_sides,
+                        layout_tag=(dot_value_spec.layout.value if dot_value_spec is not None else ""),
+                        expression_meta=(dot_value_spec.meta if dot_value_spec is not None else dot_meta),
+                    )
                 elif a.kind == "vec" and b.kind == "hess":
+                    scalar_hess_value = b.role not in {"test", "trial"} and len(b.shape) == 3 and b.shape[0] == 1 and a.shape[0] == 2
                     if b.role in {"test", "trial"}:
                         emit_line(f"auto {nm} = vector_dot_hessian_basis({a.name}, {b.name});")
-                        push("grad", b.role, (2, b.shape[1], 2), b.field_names, b.parent, side, b.field_sides)
+                        if len(b.shape) == 4 and b.shape[0] == 1:
+                            fallback_shape = (b.shape[2], b.shape[1])
+                        else:
+                            fallback_shape = (b.shape[0], b.shape[1], b.shape[-1])
                     else:
-                        emit_line(f"auto {nm} = vector_dot_hessian_value({a.name}, {b.name});")
-                        push("mat", "value", (2, 2))
+                        if scalar_hess_value:
+                            emit_line(f"Eigen::VectorXd {nm} = matrix_like_to_vector(vector_dot_hessian_value({a.name}, {b.name}));")
+                            fallback_shape = (2,)
+                        else:
+                            emit_line(f"auto {nm} = vector_dot_hessian_value({a.name}, {b.name});")
+                            if dot_plan is not None and dot_plan.result.tensor_rank > 0:
+                                fallback_shape = tuple(int(axis.size) for axis in dot_plan.result.free_axes)
+                            else:
+                                fallback_shape = (2, 2)
+                    push_kind = (dot_value_spec.kind if dot_value_spec is not None else ("grad" if b.role in {"test", "trial"} else ("vec" if scalar_hess_value else "mat")))
+                    push_role = (dot_value_spec.role if dot_value_spec is not None else (b.role if b.role in {"test", "trial"} else "value"))
+                    push_shape = tuple(int(v) for v in (
+                        dot_value_spec.shape if dot_value_spec is not None else _planned_storage_shape(dot_lowering, fallback_shape)
+                    ))
+                    push(
+                        push_kind,
+                        push_role,
+                        push_shape,
+                        b.field_names,
+                        b.parent,
+                        side,
+                        b.field_sides,
+                        layout_tag=(dot_value_spec.layout.value if dot_value_spec is not None else ""),
+                        expression_meta=(dot_value_spec.meta if dot_value_spec is not None else dot_meta),
+                    )
                 elif a.kind == "mixed" and b.kind == "mat":
                     emit_line(f"auto {nm} = dot_mixed_mat({a.name}, {b.name}, {a.shape[0]}, {a.shape[3] if len(a.shape)>3 else 1});")
-                    push("mixed", "mixed", (a.shape[0], a.shape[1], a.shape[2], b.shape[1]))
+                    fallback_shape = (a.shape[0], a.shape[1], a.shape[2], b.shape[1])
+                    push(
+                        (dot_value_spec.kind if dot_value_spec is not None else "mixed"),
+                        (dot_value_spec.role if dot_value_spec is not None else "mixed"),
+                        tuple(int(v) for v in (
+                            dot_value_spec.shape if dot_value_spec is not None else _planned_storage_shape(dot_lowering, fallback_shape)
+                        )),
+                        a.field_names,
+                        a.parent,
+                        side,
+                        a.field_sides,
+                        layout_tag=(dot_value_spec.layout.value if dot_value_spec is not None else ""),
+                        expression_meta=(dot_value_spec.meta if dot_value_spec is not None else None),
+                    )
                 elif a.kind == "mat" and b.kind == "mixed":
                     emit_line(f"auto {nm} = dot_mat_mixed({a.name}, {b.name}, {b.shape[0]}, {b.shape[3] if len(b.shape)>3 else 1});")
-                    push("mixed", "mixed", (a.shape[0], b.shape[1], b.shape[2], b.shape[3] if len(b.shape)>3 else 1), b.field_names, b.parent, side, b.field_sides)
+                    fallback_shape = (a.shape[0], b.shape[1], b.shape[2], b.shape[3] if len(b.shape)>3 else 1)
+                    push(
+                        (dot_value_spec.kind if dot_value_spec is not None else "mixed"),
+                        (dot_value_spec.role if dot_value_spec is not None else "mixed"),
+                        tuple(int(v) for v in (
+                            dot_value_spec.shape if dot_value_spec is not None else _planned_storage_shape(dot_lowering, fallback_shape)
+                        )),
+                        b.field_names,
+                        b.parent,
+                        side,
+                        b.field_sides,
+                        layout_tag=(dot_value_spec.layout.value if dot_value_spec is not None else ""),
+                        expression_meta=(dot_value_spec.meta if dot_value_spec is not None else None),
+                    )
                 elif a.kind == "grad" and b.kind == "grad":
-                    nm, tmp_kind, tmp_slot = alloc_tmp("mat", "dot")
-                    emit_mat(nm, f"inner_grad_grad({a.name}, {b.name})", tmp_kind=tmp_kind)
-                    push("mat", "value", (-1, -1), tmp_kind=tmp_kind, tmp_slot=tmp_slot)
+                    lhs_rank = dot_plan.lhs.tensor_rank if dot_plan is not None else _try_tensor_rank(a, spatial_dim=self.spatial_dim)
+                    rhs_rank = dot_plan.rhs.tensor_rank if dot_plan is not None else _try_tensor_rank(b, spatial_dim=self.spatial_dim)
+                    lhs_expr = _cpp_dot_value_operand_expr(a, lhs_rank)
+                    rhs_expr = _cpp_dot_value_operand_expr(b, rhs_rank)
+                    if dot_plan is not None and dot_plan.result.tensor_rank == 0:
+                        nm, tmp_kind, tmp_slot = alloc_tmp("scalar", "dot")
+                        emit_scalar(nm, f"({lhs_expr}).dot({rhs_expr})", tmp_kind=tmp_kind)
+                        fallback_shape = ()
+                    else:
+                        result_rank = dot_plan.result.tensor_rank if dot_plan is not None else None
+                        nm, tmp_kind, tmp_slot = alloc_tmp("vec" if result_rank == 1 else "mat", "dot")
+                        if result_rank == 1:
+                            emit_vec(nm, f"contract_last_first({lhs_expr}, {rhs_expr})", tmp_kind=tmp_kind)
+                        else:
+                            emit_mat(nm, f"contract_last_first({lhs_expr}, {rhs_expr})", tmp_kind=tmp_kind)
+                        if dot_plan is not None and dot_plan.result.tensor_rank > 0:
+                            fallback_shape = tuple(int(axis.size) for axis in dot_plan.result.free_axes)
+                        else:
+                            fallback_shape = a.shape[:-1] + b.shape[1:] if len(a.shape) >= 1 and len(b.shape) >= 1 else (-1, -1)
+                    push_dot_result(
+                        ("scalar" if fallback_shape == () else ("vec" if len(fallback_shape) == 1 else "mat")),
+                        "value",
+                        tuple(int(v) for v in (_planned_storage_shape(dot_lowering, fallback_shape) if fallback_shape else ())),
+                        None,
+                        None,
+                        side,
+                        None,
+                        tmp_kind=tmp_kind,
+                        tmp_slot=tmp_slot,
+                        expression_meta=dot_meta,
+                    )
                 elif (
                     a.kind == "mat"
                     and b.kind == "mat"
@@ -3750,12 +5768,79 @@ class CppCodeGen:
                     a_vec = f"{a.name}.row(0).transpose()" if is_a_row_vec else f"{a.name}.col(0)"
                     b_vec = f"{b.name}.row(0).transpose()" if is_b_row_vec else f"{b.name}.col(0)"
                     emit_scalar(nm, f"({a_vec}).dot({b_vec})", tmp_kind=tmp_kind)
-                    push("scalar", "value", (), tmp_kind=tmp_kind, tmp_slot=tmp_slot)
+                    push(
+                        (dot_value_spec.kind if dot_value_spec is not None else "scalar"),
+                        (dot_value_spec.role if dot_value_spec is not None else "value"),
+                        tuple(int(v) for v in (dot_value_spec.shape if dot_value_spec is not None else ())),
+                        tmp_kind=tmp_kind,
+                        tmp_slot=tmp_slot,
+                        layout_tag=(dot_value_spec.layout.value if dot_value_spec is not None else ""),
+                        expression_meta=(dot_value_spec.meta if dot_value_spec is not None else None),
+                    )
                     continue
+                elif (
+                    a.kind == "mat"
+                    and b.kind == "mat"
+                    and a.role in {"value", "const"}
+                    and b.role in {"value", "const"}
+                    and is_a_2x2
+                    and is_b_row_vec
+                    and a.shape[1] == b.shape[1]
+                ):
+                    nm, tmp_kind, tmp_slot = alloc_tmp("mat", "dot")
+                    # Scalar gradients stored as (1,d) row-matrices behave as vectors.
+                    # dot(A, g) contracts A's last axis with the vector axis of g.
+                    emit_mat(nm, f"{b.name} * {a.name}.transpose()", tmp_kind=tmp_kind)
+                    push(
+                        (dot_value_spec.kind if dot_value_spec is not None else "mat"),
+                        (dot_value_spec.role if dot_value_spec is not None else "value"),
+                        tuple(int(v) for v in (
+                            dot_value_spec.shape if dot_value_spec is not None else _planned_storage_shape(dot_lowering, (1, a.shape[0]))
+                        )),
+                        tmp_kind=tmp_kind,
+                        tmp_slot=tmp_slot,
+                        layout_tag=(dot_value_spec.layout.value if dot_value_spec is not None else ""),
+                        expression_meta=(dot_value_spec.meta if dot_value_spec is not None else None),
+                    )
+                elif (
+                    a.kind == "mat"
+                    and b.kind == "mat"
+                    and a.role in {"value", "const"}
+                    and b.role in {"value", "const"}
+                    and is_a_row_vec
+                    and is_b_2x2
+                    and a.shape[1] == b.shape[0]
+                ):
+                    nm, tmp_kind, tmp_slot = alloc_tmp("mat", "dot")
+                    emit_mat(nm, f"{a.name} * {b.name}", tmp_kind=tmp_kind)
+                    push(
+                        (dot_value_spec.kind if dot_value_spec is not None else "mat"),
+                        (dot_value_spec.role if dot_value_spec is not None else "value"),
+                        tuple(int(v) for v in (
+                            dot_value_spec.shape if dot_value_spec is not None else _planned_storage_shape(dot_lowering, (1, b.shape[1]))
+                        )),
+                        tmp_kind=tmp_kind,
+                        tmp_slot=tmp_slot,
+                        layout_tag=(dot_value_spec.layout.value if dot_value_spec is not None else ""),
+                        expression_meta=(dot_value_spec.meta if dot_value_spec is not None else None),
+                    )
                 elif a.kind == "mat" and b.kind == "mat":
                     nm, tmp_kind, tmp_slot = alloc_tmp("mat", "dot")
                     emit_mat(nm, f"{a.name} * {b.name}", tmp_kind=tmp_kind)
-                    push("mat", "value", (-1, -1), tmp_kind=tmp_kind, tmp_slot=tmp_slot)
+                    fallback_shape = a.shape[:-1] + b.shape[1:] if len(a.shape) >= 1 and len(b.shape) >= 1 else (-1, -1)
+                    push(
+                        (dot_value_spec.kind if dot_value_spec is not None else "mat"),
+                        (dot_value_spec.role if dot_value_spec is not None else "value"),
+                        tuple(int(v) for v in (
+                            dot_value_spec.shape
+                            if dot_value_spec is not None
+                            else _planned_storage_shape(dot_lowering, fallback_shape)
+                        )),
+                        tmp_kind=tmp_kind,
+                        tmp_slot=tmp_slot,
+                        layout_tag=(dot_value_spec.layout.value if dot_value_spec is not None else ""),
+                        expression_meta=(dot_value_spec.meta if dot_value_spec is not None else None),
+                    )
                 elif a.kind == "mat" and b.kind == "grad":
                     kname = new_tmp("k")
                     dname = new_tmp("d")
@@ -3777,11 +5862,36 @@ class CppCodeGen:
                     emit_line(f"        for (int _c=0; _c<{dname}; ++_c) {nm}[_r](_j, _c) = {prod}(_r, _j * {dname} + _c);")
                     emit_line("    }")
                     emit_line("}")
-                    push("grad", b.role, (a.shape[0], b.shape[1], b.shape[2]), b.field_names, b.parent, side, b.field_sides)
+                    fallback_shape = (a.shape[0], b.shape[1], b.shape[2])
+                    push(
+                        (dot_value_spec.kind if dot_value_spec is not None else "grad"),
+                        (dot_value_spec.role if dot_value_spec is not None else b.role),
+                        tuple(int(v) for v in (
+                            dot_value_spec.shape if dot_value_spec is not None else _planned_storage_shape(dot_lowering, fallback_shape)
+                        )),
+                        b.field_names,
+                        b.parent,
+                        side,
+                        b.field_sides,
+                        layout_tag=(dot_value_spec.layout.value if dot_value_spec is not None else ""),
+                        expression_meta=(dot_value_spec.meta if dot_value_spec is not None else None),
+                    )
                 elif a.kind == "vec" and b.kind == "vec":
                     nm, tmp_kind, tmp_slot = alloc_tmp("scalar", "dot")
-                    emit_scalar(nm, f"{a.name}.dot({b.name})", tmp_kind=tmp_kind)
-                    push("scalar", "value", (), tmp_kind=tmp_kind, tmp_slot=tmp_slot)
+                    emit_scalar(
+                        nm,
+                        f"({_cpp_vector_input_expr(a)}).dot({_cpp_vector_input_expr(b)})",
+                        tmp_kind=tmp_kind,
+                    )
+                    push(
+                        (dot_value_spec.kind if dot_value_spec is not None else "scalar"),
+                        (dot_value_spec.role if dot_value_spec is not None else "value"),
+                        tuple(int(v) for v in (dot_value_spec.shape if dot_value_spec is not None else ())),
+                        tmp_kind=tmp_kind,
+                        tmp_slot=tmp_slot,
+                        layout_tag=(dot_value_spec.layout.value if dot_value_spec is not None else ""),
+                        expression_meta=(dot_value_spec.meta if dot_value_spec is not None else None),
+                    )
                 else:
                     raise NotImplementedError(
                         f"Dot combination unsupported: a={a.kind}/{a.role}/{a.shape}, "
@@ -3791,11 +5901,30 @@ class CppCodeGen:
                 b = stack.pop()
                 a = stack.pop()
                 nm = new_tmp("inner")
+                inner_plan = _try_inner_plan(a, b)
+                inner_value_spec = _try_inner_value_spec(a, b)
                 side = combine_side(a.side, b.side)
                 f_sides = choose_field_sides(a.field_sides, b.field_sides)
                 f_names = a.field_names or b.field_names
                 parent = a.parent or b.parent
                 def push_inner(kind, role, shape, field_names=None, parent_name=None, side_override=None, field_sides=None):
+                    inner_scalar_basis_row = bool(
+                        (inner_plan is not None and _meta_is_scalar_basis_row(inner_plan.result))
+                        or _value_spec_is_scalar_basis_row(inner_value_spec)
+                    )
+                    if inner_value_spec is not None:
+                        planned_kind = getattr(inner_value_spec, "kind", "") or ""
+                        if planned_kind not in {"", "none"}:
+                            kind = planned_kind
+                        planned_role = getattr(inner_value_spec, "role", "") or ""
+                        if planned_role not in {"", "none"}:
+                            role = planned_role
+                        planned_shape = tuple(int(v) for v in getattr(inner_value_spec, "shape", ()) or ())
+                        if planned_shape:
+                            shape = planned_shape
+                    if inner_scalar_basis_row:
+                        kind = "mat"
+                        shape = _scalar_basis_row_shape(shape)
                     stack.append(
                         StackItem(
                             nm,
@@ -3806,8 +5935,36 @@ class CppCodeGen:
                             parent_name if parent_name is not None else parent,
                             side_override if side_override is not None else side,
                             field_sides if field_sides is not None else f_sides,
+                            layout_tag=(
+                                inner_value_spec.layout.value
+                                if inner_value_spec is not None
+                                else ""
+                            ),
+                            expression_meta=(
+                                inner_value_spec.meta
+                                if inner_value_spec is not None
+                                else (
+                                    inner_plan.result
+                                    if inner_plan is not None
+                                    else None
+                                )
+                            ),
                         )
                     )
+                inner_result_is_scalar_basis_row = bool(
+                    (inner_plan is not None and _meta_is_scalar_basis_row(inner_plan.result))
+                    or _value_spec_is_scalar_basis_row(inner_value_spec)
+                )
+                inner_result_row_shape = _scalar_basis_row_shape(
+                    tuple(
+                        int(v)
+                        for v in (
+                            getattr(inner_value_spec, "shape", ())
+                            or a.shape
+                            or b.shape
+                        )
+                    )
+                )
                 is_a_2x2 = a.kind == "mat" and a.shape == (2,2)
                 is_b_2x2 = b.kind == "mat" and b.shape == (2,2)
                 is_a_1d = a.kind in {"vec", "mat"} and a.shape[0] > 1 and len(a.shape) == 1
@@ -3818,6 +5975,10 @@ class CppCodeGen:
                 is_b_scalar = b.kind in {"scalar", "vec", "mat"} and (b.shape == () or b.shape == (1,))
                 is_a_grad_basis = a.kind == "grad" and a.role in {"test", "trial"} and len(a.shape) == 3
                 is_b_grad_basis = b.kind == "grad" and b.role in {"test", "trial"} and len(b.shape) == 3
+                is_a_grad_rank1_basis = _semantic_is_gradient_rank1_basis(a, spatial_dim=self.spatial_dim)
+                is_b_grad_rank1_basis = _semantic_is_gradient_rank1_basis(b, spatial_dim=self.spatial_dim)
+                is_a_grad_rank1_value = _semantic_is_gradient_rank1_value(a, spatial_dim=self.spatial_dim)
+                is_b_grad_rank1_value = _semantic_is_gradient_rank1_value(b, spatial_dim=self.spatial_dim)
                 is_a_trial_test = a.role in {"test", "trial"}
                 is_b_trial_test = b.role in {"test", "trial"}
                 is_a_mixed = a.kind == "mixed"
@@ -3840,12 +6001,74 @@ class CppCodeGen:
                         f", sides ({a.side}, {b.side}), field_sides ({a.field_sides}, {b.field_sides})"
                         f", is_2x2 ({is_a_2x2}, {is_b_2x2}), is_1d ({is_a_1d}, {is_b_1d}), is_grad_basis ({is_a_grad_basis}, {is_b_grad_basis})"
                     )
-                if a.kind == "mixed" and b.kind == "mat" and len(a.shape) == 4:
-                    emit_line(f"Eigen::MatrixXd {nm} = inner_mixed_grad_const({a.name}, {b.name}, {a.shape[0]}, {a.shape[3]}, {a.shape[1]}, {a.shape[2]});")
+                if a.kind == "mixed" and b.kind == "mat" and len(a.shape) >= 3:
+                    if len(a.shape) == 4:
+                        emit_line(f"Eigen::MatrixXd {nm} = inner_mixed_grad_const({a.name}, {b.name}, {a.shape[0]}, {a.shape[3]}, {a.shape[1]}, {a.shape[2]});")
+                    else:
+                        emit_line(f"Eigen::MatrixXd {nm} = inner_mixed_grad_const({a.name}, {b.name}, {a.shape[0]}, {a.shape[2]});")
                     push_inner("mat", "value", (-1, -1))
-                elif a.kind == "mat" and b.kind == "mixed" and len(b.shape) == 4:
-                    emit_line(f"Eigen::MatrixXd {nm} = inner_grad_const_mixed({a.name}, {b.name}, {b.shape[0]}, {b.shape[3]}, {b.shape[1]}, {b.shape[2]});")
+                elif a.kind == "mat" and b.kind == "mixed" and len(b.shape) >= 3:
+                    if len(b.shape) == 4:
+                        emit_line(f"Eigen::MatrixXd {nm} = inner_grad_const_mixed({a.name}, {b.name}, {b.shape[0]}, {b.shape[3]}, {b.shape[1]}, {b.shape[2]});")
+                    else:
+                        emit_line(f"Eigen::MatrixXd {nm} = inner_grad_const_mixed({a.name}, {b.name}, {b.shape[0]}, {b.shape[2]});")
                     push_inner("mat", "value", (-1, -1))
+                elif (
+                    is_a_grad_rank1_basis
+                    and is_b_grad_rank1_basis
+                    and a.role in {"test", "trial"}
+                    and b.role in {"test", "trial"}
+                ):
+                    test_var = a.name if a.role == "test" else b.name
+                    trial_var = a.name if a.role == "trial" else b.name
+                    emit_line(f"Eigen::MatrixXd {nm} = inner_grad_grad({test_var}, {trial_var});")
+                    push_inner("mat", "value", (-1, -1))
+                elif (_semantic_is_basis_rank2(a, spatial_dim=self.spatial_dim)
+                      and _semantic_is_value_rank2(b, spatial_dim=self.spatial_dim)
+                      and not (a.is_hessian or b.is_hessian)):
+                    if inner_result_is_scalar_basis_row:
+                        emit_line(f"Eigen::MatrixXd {nm} = inner_rank2_basis_rank2_value({a.name}, {b.name}).transpose().eval();")
+                        push_inner("mat", a.role if a.role in {'test', 'trial'} else role, inner_result_row_shape)
+                    else:
+                        emit_line(f"Eigen::VectorXd {nm} = inner_rank2_basis_rank2_value({a.name}, {b.name});")
+                        push_inner("vec", a.role if a.role in {'test', 'trial'} else role, (a.shape[1] if len(a.shape) > 1 else -1,))
+                elif (_semantic_is_basis_rank2(b, spatial_dim=self.spatial_dim)
+                      and _semantic_is_value_rank2(a, spatial_dim=self.spatial_dim)
+                      and not (a.is_hessian or b.is_hessian)):
+                    if inner_result_is_scalar_basis_row:
+                        emit_line(f"Eigen::MatrixXd {nm} = inner_rank2_value_rank2_basis({a.name}, {b.name}).transpose().eval();")
+                        push_inner("mat", b.role if b.role in {'test', 'trial'} else role, inner_result_row_shape)
+                    else:
+                        emit_line(f"Eigen::VectorXd {nm} = inner_rank2_value_rank2_basis({a.name}, {b.name});")
+                        push_inner("vec", b.role if b.role in {'test', 'trial'} else role, (b.shape[1] if len(b.shape) > 1 else -1,))
+                elif _semantic_is_basis_rank1(a, spatial_dim=self.spatial_dim) and _semantic_is_value_rank1(b, spatial_dim=self.spatial_dim):
+                    if inner_result_is_scalar_basis_row:
+                        emit_line(f"Eigen::MatrixXd {nm} = basis_dot_const_vector({a.name}, {_cpp_vector_input_expr(b)});")
+                        push_inner("mat", a.role if a.role in {'test', 'trial'} else role, inner_result_row_shape)
+                    else:
+                        emit_line(f"Eigen::VectorXd {nm} = const_vector_dot_basis_1d({_cpp_vector_input_expr(b)}, {a.name});")
+                        push_inner("vec", a.role if a.role in {'test', 'trial'} else role, (a.shape[1] if len(a.shape) > 1 else a.shape[0] if len(a.shape) == 1 else -1,))
+                elif _semantic_is_basis_rank1(b, spatial_dim=self.spatial_dim) and _semantic_is_value_rank1(a, spatial_dim=self.spatial_dim):
+                    if inner_result_is_scalar_basis_row:
+                        emit_line(f"Eigen::MatrixXd {nm} = basis_dot_const_vector({b.name}, {_cpp_vector_input_expr(a)});")
+                        push_inner("mat", b.role if b.role in {'test', 'trial'} else role, inner_result_row_shape)
+                    else:
+                        emit_line(f"Eigen::VectorXd {nm} = const_vector_dot_basis_1d({_cpp_vector_input_expr(a)}, {b.name});")
+                        push_inner("vec", b.role if b.role in {'test', 'trial'} else role, (b.shape[1] if len(b.shape) > 1 else b.shape[0] if len(b.shape) == 1 else -1,))
+                elif is_a_grad_rank1_basis and is_b_grad_rank1_value:
+                    if inner_result_is_scalar_basis_row:
+                        emit_line(f"Eigen::MatrixXd {nm} = inner_grad_const({a.name}, {b.name}).transpose().eval();")
+                        push_inner("mat", a.role if a.role in {'test', 'trial'} else role, inner_result_row_shape)
+                    else:
+                        emit_line(f"Eigen::VectorXd {nm} = inner_grad_const({a.name}, {b.name});")
+                        push_inner("vec", a.role if a.role in {'test', 'trial'} else role, (-1,))
+                elif is_b_grad_rank1_basis and is_a_grad_rank1_value:
+                    if inner_result_is_scalar_basis_row:
+                        emit_line(f"Eigen::MatrixXd {nm} = inner_const_grad({a.name}, {b.name}).transpose().eval();")
+                        push_inner("mat", b.role if b.role in {'test', 'trial'} else role, inner_result_row_shape)
+                    else:
+                        emit_line(f"Eigen::VectorXd {nm} = inner_const_grad({a.name}, {b.name});")
+                        push_inner("vec", b.role if b.role in {'test', 'trial'} else role, (-1,))
                 elif a.kind == "grad" and b.kind == "grad":
                     if a.role in {"test", "trial"} and b.role in {"test", "trial"}:
                         test_var  = a.name if a.role == "test" else b.name
@@ -3853,25 +6076,39 @@ class CppCodeGen:
                         emit_line(f"Eigen::MatrixXd {nm} = inner_grad_grad({test_var}, {trial_var});")
                         push_inner("mat", "value", (-1, -1))
                     elif a.role in {"value", "const"} and b.role == "test":
-                        emit_line(f"Eigen::VectorXd {nm} = inner_grad_const({b.name}, {a.name});")
-                        push_inner("vec", "test", (b.shape[1] if len(b.shape)>1 else -1,))
+                        if inner_result_is_scalar_basis_row:
+                            emit_line(f"Eigen::MatrixXd {nm} = inner_grad_const({b.name}, {a.name}).transpose().eval();")
+                            push_inner("mat", "test", inner_result_row_shape)
+                        else:
+                            emit_line(f"Eigen::VectorXd {nm} = inner_grad_const({b.name}, {a.name});")
+                            push_inner("vec", "test", (b.shape[1] if len(b.shape)>1 else -1,))
                     elif b.role in {"value", "const"} and a.role == "test":
-                        emit_line(f"Eigen::VectorXd {nm} = inner_grad_const({a.name}, {b.name});")
-                        push_inner("vec", "test", (a.shape[1] if len(a.shape)>1 else -1,))
+                        if inner_result_is_scalar_basis_row:
+                            emit_line(f"Eigen::MatrixXd {nm} = inner_grad_const({a.name}, {b.name}).transpose().eval();")
+                            push_inner("mat", "test", inner_result_row_shape)
+                        else:
+                            emit_line(f"Eigen::VectorXd {nm} = inner_grad_const({a.name}, {b.name});")
+                            push_inner("vec", "test", (a.shape[1] if len(a.shape)>1 else -1,))
                     else:
                         raise NotImplementedError(f"inner(grad, grad) unsupported for roles {a.role}/{b.role}")
                 elif a.kind == "scalar" and b.kind == "mat" and len(b.shape) >= 2 and b.shape[0] == 1:
-                    # Scalar * (1 x n) basis/value row: return (n,) vector.
-                    emit_line(f"Eigen::VectorXd {nm} = {b.name}.row(0).transpose() * {a.name};")
-                    out_len = b.shape[1] if len(b.shape) > 1 else -1
                     out_role = b.role if b.role in {"test", "trial"} else "value"
-                    push_inner("vec", out_role, (out_len,))
+                    if inner_result_is_scalar_basis_row:
+                        emit_line(f"Eigen::MatrixXd {nm} = ({b.name} * {a.name}).eval();")
+                        push_inner("mat", out_role, inner_result_row_shape)
+                    else:
+                        emit_line(f"Eigen::VectorXd {nm} = {b.name}.row(0).transpose() * {a.name};")
+                        out_len = b.shape[1] if len(b.shape) > 1 else -1
+                        push_inner("vec", out_role, (out_len,))
                 elif b.kind == "scalar" and a.kind == "mat" and len(a.shape) >= 2 and a.shape[0] == 1:
-                    # (1 x n) basis/value row * scalar: return (n,) vector.
-                    emit_line(f"Eigen::VectorXd {nm} = {a.name}.row(0).transpose() * {b.name};")
-                    out_len = a.shape[1] if len(a.shape) > 1 else -1
                     out_role = a.role if a.role in {"test", "trial"} else "value"
-                    push_inner("vec", out_role, (out_len,))
+                    if inner_result_is_scalar_basis_row:
+                        emit_line(f"Eigen::MatrixXd {nm} = ({a.name} * {b.name}).eval();")
+                        push_inner("mat", out_role, inner_result_row_shape)
+                    else:
+                        emit_line(f"Eigen::VectorXd {nm} = {a.name}.row(0).transpose() * {b.name};")
+                        out_len = a.shape[1] if len(a.shape) > 1 else -1
+                        push_inner("vec", out_role, (out_len,))
                 elif a.kind == "mat" and b.kind == "mat":
                     if a.role in {"test", "trial"} and b.role in {"test", "trial"}:
                         test_var = a.name if a.role == "test" else b.name
@@ -3885,29 +6122,51 @@ class CppCodeGen:
                         emit_line(f"double {nm} = ({a.name}.cwiseProduct({b.name})).sum();")
                         push_inner("scalar", "value", ())
                     elif is_a_1d and is_b_basis:
-                        emit_line(f"auto {nm} = const_vector_dot_basis_1d({a.name}, {b.name});")
-                        push_inner("vec", b.role, (-1,))
+                        if inner_result_is_scalar_basis_row:
+                            emit_line(f"Eigen::MatrixXd {nm} = basis_dot_const_vector({b.name}, {a.name});")
+                            push_inner("mat", b.role, inner_result_row_shape)
+                        else:
+                            emit_line(f"auto {nm} = const_vector_dot_basis_1d({a.name}, {b.name});")
+                            push_inner("vec", b.role, (-1,))
                     elif is_b_1d and is_a_basis:
-                        emit_line(f"auto {nm} = const_vector_dot_basis_1d({b.name}, {a.name});")
-                        push_inner("vec", a.role, (-1,))
+                        if inner_result_is_scalar_basis_row:
+                            emit_line(f"Eigen::MatrixXd {nm} = basis_dot_const_vector({a.name}, {b.name});")
+                            push_inner("mat", a.role, inner_result_row_shape)
+                        else:
+                            emit_line(f"auto {nm} = const_vector_dot_basis_1d({b.name}, {a.name});")
+                            push_inner("vec", a.role, (-1,))
                     elif is_a_scalar and is_b_basis:
-                        emit_line(f"auto {nm} = ({a.name}* {b.name}).transpose();")
-                        push_inner("vec", b.role, (-1,))
+                        if inner_result_is_scalar_basis_row:
+                            emit_line(f"Eigen::MatrixXd {nm} = ({a.name} * {b.name}).transpose().eval();")
+                            push_inner("mat", b.role, inner_result_row_shape)
+                        else:
+                            emit_line(f"auto {nm} = ({a.name}* {b.name}).transpose();")
+                            push_inner("vec", b.role, (-1,))
                     elif is_b_scalar and is_a_basis:
-                        emit_line(f"auto {nm} = ({b.name}* {a.name}).transpose();")
-                        push_inner("vec", a.role, (-1,))
+                        if inner_result_is_scalar_basis_row:
+                            emit_line(f"Eigen::MatrixXd {nm} = ({b.name} * {a.name}).transpose().eval();")
+                            push_inner("mat", a.role, inner_result_row_shape)
+                        else:
+                            emit_line(f"auto {nm} = ({b.name}* {a.name}).transpose();")
+                            push_inner("vec", a.role, (-1,))
                     else:
                         raise NotImplementedError("Inner(mat, mat) supports only test/trial or 2x2 value combinations"
                                                   f" (got roles {a.role}, {b.role})"
                                                   f" (shapes {a.shape}, {b.shape})")
                 elif a.kind == "vec" and b.kind == "vec":
-                    emit_line(f"double {nm} = {a.name}.dot({b.name});")
+                    emit_line(
+                        f"double {nm} = ({_cpp_vector_input_expr(a)}).dot({_cpp_vector_input_expr(b)});"
+                    )
                     push_inner("scalar", "value", ())
                 elif a.kind == "vec" and b.kind == "mat":
-                    emit_line(f"Eigen::VectorXd {nm} = {b.name}.transpose() * {a.name};")
+                    emit_line(
+                        f"Eigen::VectorXd {nm} = ({_cpp_matrix_input_expr(b)}).transpose() * {_cpp_vector_input_expr(a)};"
+                    )
                     push_inner("vec", "value", (-1,))
                 elif a.kind == "mat" and b.kind == "vec":
-                    emit_line(f"Eigen::VectorXd {nm} = {a.name}.transpose() * {b.name};")
+                    emit_line(
+                        f"Eigen::VectorXd {nm} = ({_cpp_matrix_input_expr(a)}).transpose() * {_cpp_vector_input_expr(b)};"
+                    )
                     push_inner("vec", "value", (-1,))
                 elif a.kind == "hess" and b.kind == "hess":
                     if a.role in {"test", "trial"} and b.role in {"test", "trial"}:
@@ -3972,7 +6231,18 @@ class CppCodeGen:
                     push_inner("scalar", "value", ())
             elif isinstance(op, Transpose):
                 a = stack.pop()
-                if a.kind == "mat":
+                tensor_rank = _try_tensor_rank(a, spatial_dim=self.mixed_element.mesh.spatial_dim)
+                transpose_meta = _try_transpose_meta(a, spatial_dim=self.mixed_element.mesh.spatial_dim)
+                if a.kind == "scalar" or (a.shape == () and tensor_rank in {None, 0}):
+                    stack.append(StackItem(a.name, a.kind, a.role, a.shape, a.field_names, a.parent, a.side, a.field_sides,
+                                           tmp_kind=a.tmp_kind, tmp_slot=a.tmp_slot, tmp_pinned=a.tmp_pinned,
+                                           layout_tag=a.layout_tag, expression_meta=transpose_meta or a.expression_meta))
+                elif tensor_rank not in {None, 2}:
+                    raise NotImplementedError(
+                        f"Transpose is only defined for rank-2 tensors; got kind={a.kind}, shape={a.shape}, "
+                        f"semantic tensor rank={tensor_rank}."
+                    )
+                elif a.kind == "mat":
                     nm, tmp_kind, tmp_slot = alloc_tmp("mat", "tr")
                     emit_mat(nm, f"{a.name}.transpose()", tmp_kind=tmp_kind)
                     stack.append(
@@ -3988,19 +6258,20 @@ class CppCodeGen:
                 elif a.kind == "grad":
                     nm = new_tmp("tr")
                     emit_line(f"auto {nm} = transpose_grad_stack({a.name});")
-                    stack.append(StackItem(nm, "grad", a.role, a.shape, a.field_names))
+                    stack.append(StackItem(nm, "grad", a.role, a.shape, a.field_names, expression_meta=transpose_meta))
                 elif a.kind == "mixed" and len(a.shape) == 4:
                     nm = new_tmp("tr")
                     emit_line(f"auto {nm} = transpose_mixed_grad_tensor({a.name}, {a.shape[0]}, {a.shape[3]});")
-                    stack.append(StackItem(nm, "mixed", a.role, a.shape, a.field_names, a.parent))
+                    stack.append(StackItem(nm, "mixed", a.role, a.shape, a.field_names, a.parent, expression_meta=transpose_meta))
                 else:
                     raise NotImplementedError("Transpose only implemented for matrices/grad stacks")
             elif isinstance(op, Determinant):
                 a = stack.pop()
                 nm = new_tmp("det")
+                det_meta = _try_determinant_meta(a, spatial_dim=self.mixed_element.mesh.spatial_dim)
                 if a.kind in {"mat", "grad"}:
                     emit_line(f"double {nm} = {a.name}.determinant();")
-                    stack.append(StackItem(nm, "scalar", a.role, ()))
+                    stack.append(StackItem(nm, "scalar", a.role, (), expression_meta=det_meta))
                 else:
                     raise NotImplementedError("Determinant only implemented for matrices")
             elif isinstance(op, Cofactor):
@@ -4043,6 +6314,7 @@ class CppCodeGen:
             elif isinstance(op, Trace):
                 a = stack.pop()
                 nm = new_tmp("trace")
+                trace_meta = _try_trace_meta(a, spatial_dim=self.mixed_element.mesh.spatial_dim)
                 if a.kind == "mat":
                     emit_line(f"double {nm} = {a.name}.trace();")
                     stack.append(StackItem(nm, "scalar", a.role, ()))
@@ -4056,10 +6328,10 @@ class CppCodeGen:
                     emit_line("    }")
                     emit_line(f"    {nm}(0, _j) = _acc;")
                     emit_line("}")
-                    stack.append(StackItem(nm, "mat", a.role, (1, a.shape[1]), a.field_names, a.parent))
+                    stack.append(StackItem(nm, "mat", a.role, (1, a.shape[1]), a.field_names, a.parent, expression_meta=trace_meta))
                 elif a.kind == "mixed" and len(a.shape) == 4:
                     emit_line(f"auto {nm} = trace_mixed_tensor({a.name}, {a.shape[0]}, {a.shape[3]});")
-                    stack.append(StackItem(nm, "mixed", a.role, (1, a.shape[1], a.shape[2]), a.field_names, a.parent))
+                    stack.append(StackItem(nm, "mixed", a.role, (1, a.shape[1], a.shape[2]), a.field_names, a.parent, expression_meta=trace_meta))
                 else:
                     raise NotImplementedError("Trace only implemented for matrices")
             elif isinstance(op, PositivePartOp):

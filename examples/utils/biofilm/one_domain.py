@@ -89,6 +89,25 @@ def _epsilon(v):
     return _c(0.5) * (grad(v) + grad(v).T)
 
 
+def _num_components(expr, default: int = 2) -> int:
+    if hasattr(expr, "num_components"):
+        try:
+            ncomp = int(getattr(expr, "num_components", 0))
+            if ncomp > 0:
+                return ncomp
+        except Exception:
+            pass
+    shape = getattr(expr, "shape", None)
+    if isinstance(shape, tuple) and len(shape) == 1:
+        try:
+            ncomp = int(shape[0])
+            if ncomp > 0:
+                return ncomp
+        except Exception:
+            pass
+    return int(default)
+
+
 def _is_hdiv_expr(expr) -> bool:
     return isinstance(expr, (HdivFunction, HdivTrialFunction, HdivTestFunction))
 
@@ -134,8 +153,15 @@ def _grad_inner_jump(u, v, n):
 
 
 def _linear_elastic_term(u, eta, *, mu_s, lambda_s):
-    # For symmetric stress, σ(u):∇η = 2μ ε(u):ε(η) + λ div(u) div(η).
-    return _c(2.0) * mu_s * inner(_epsilon(u), _epsilon(eta)) + lambda_s * div(u) * div(eta)
+    # Keep the elastic contraction on the explicit component path. This avoids
+    # relying on matrix-valued grad/transpose lowering in the assembled
+    # benchmark blocks and matches the audited `grad(component)` semantics.
+    dim = min(_num_components(u), _num_components(eta))
+    sym_inner = _c(0.0)
+    for i in range(int(dim)):
+        for j in range(int(dim)):
+            sym_inner += _epsilon_component(u, i, j) * _epsilon_component(eta, i, j)
+    return _c(2.0) * mu_s * sym_inner + lambda_s * div(u) * div(eta)
 
 
 def _deviatoric_tensor(A, *, dim: int):
@@ -143,12 +169,21 @@ def _deviatoric_tensor(A, *, dim: int):
 
 
 def _linear_deviatoric_elastic_term(u, eta, *, mu_s, dim: int):
-    eps_u = _epsilon(u)
-    eps_eta = _epsilon(eta)
-    return _c(2.0) * mu_s * inner(
-        _deviatoric_tensor(eps_u, dim=int(dim)),
-        _deviatoric_tensor(eps_eta, dim=int(dim)),
-    )
+    dim_i = int(dim)
+    tr_u = _c(0.0)
+    tr_eta = _c(0.0)
+    for i in range(dim_i):
+        tr_u += _epsilon_component(u, i, i)
+        tr_eta += _epsilon_component(eta, i, i)
+    dev_inner = _c(0.0)
+    inv_dim = _c(1.0 / float(dim_i))
+    for i in range(dim_i):
+        for j in range(dim_i):
+            delta_ij = _c(1.0) if i == j else _c(0.0)
+            dev_u_ij = _epsilon_component(u, i, j) - (tr_u * inv_dim * delta_ij)
+            dev_eta_ij = _epsilon_component(eta, i, j) - (tr_eta * inv_dim * delta_ij)
+            dev_inner += dev_u_ij * dev_eta_ij
+    return _c(2.0) * mu_s * dev_inner
 
 
 def _vector_component(vec_expr, idx: int):

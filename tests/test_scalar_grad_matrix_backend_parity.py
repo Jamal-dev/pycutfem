@@ -4,7 +4,7 @@ import pytest
 from pycutfem.core.dofhandler import DofHandler
 from pycutfem.core.mesh import Mesh
 from pycutfem.fem.mixedelement import MixedElement
-from pycutfem.ufl.expressions import Constant, Function, TestFunction, TrialFunction, grad, inner
+from pycutfem.ufl.expressions import Constant, Function, TestFunction, TrialFunction, dot, grad, inner
 from pycutfem.ufl.forms import Equation, assemble_form
 from pycutfem.ufl.measures import dx
 from pycutfem.utils.meshgen import structured_quad
@@ -51,8 +51,8 @@ def test_scalar_grad_matrix_bilinear_matches_python(backend, tmp_path, monkeypat
 
     dh, p_trial, q_test, _, B, dΩ = _build_scalar_problem()
 
-    left_form = inner(B * grad(p_trial), grad(q_test)) * dΩ
-    right_form = inner(grad(p_trial) * B, grad(q_test)) * dΩ
+    left_form = inner(dot(B, grad(p_trial)), grad(q_test)) * dΩ
+    right_form = inner(dot(grad(p_trial), B), grad(q_test)) * dΩ
 
     K_left_py, _ = assemble_form(Equation(left_form, None), dof_handler=dh, bcs=[], backend="python")
     K_right_py, _ = assemble_form(Equation(right_form, None), dof_handler=dh, bcs=[], backend="python")
@@ -69,8 +69,8 @@ def test_scalar_grad_matrix_residual_matches_python(backend, tmp_path, monkeypat
 
     dh, _, q_test, p_k, B, dΩ = _build_scalar_problem()
 
-    left_form = inner(B * grad(p_k), grad(q_test)) * dΩ
-    right_form = inner(grad(p_k) * B, grad(q_test)) * dΩ
+    left_form = inner(dot(B, grad(p_k)), grad(q_test)) * dΩ
+    right_form = inner(dot(grad(p_k), B), grad(q_test)) * dΩ
 
     _, rhs_left_py = assemble_form(Equation(None, left_form), dof_handler=dh, bcs=[], backend="python")
     _, rhs_right_py = assemble_form(Equation(None, right_form), dof_handler=dh, bcs=[], backend="python")

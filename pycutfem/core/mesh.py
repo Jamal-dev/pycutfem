@@ -1639,7 +1639,11 @@ class Mesh:
             corner_coords = self.nodes_x_y_pos[list(elem.corner_nodes)]
             if self.element_type == 'tri':
                 v0, v1, v2 = corner_coords[0], corner_coords[1], corner_coords[2]
-                element_areas[elem.id] = 0.5 * np.abs(np.cross(v1 - v0, v2 - v0))
+                # Avoid NumPy's deprecated 2D-vector cross-product path.
+                edge0 = v1 - v0
+                edge1 = v2 - v0
+                det2 = edge0[0] * edge1[1] - edge0[1] * edge1[0]
+                element_areas[elem.id] = 0.5 * np.abs(det2)
             elif self.element_type == 'quad':
                 x, y = corner_coords[:, 0], corner_coords[:, 1]
                 element_areas[elem.id] = 0.5 * np.abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))

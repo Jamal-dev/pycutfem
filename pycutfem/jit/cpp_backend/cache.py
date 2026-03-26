@@ -42,7 +42,9 @@ except ImportError:  # pragma: no cover - platform dependent.
 # - v33 invalidates kernels after adding direct H(div) component physical-table
 #   views (hval/hgrad/hhess) to the C++ kernel prologue for higher-order RT
 #   whole-domain assembly.
-CODEGEN_ABI_CPP = "2026-03-16-cpp-v33-pybind11-no-subinterp"
+# - v34 invalidates kernels after fixing scalar-times-gradient products with
+#   2D stored layouts to keep `StackItem.kind` aligned with emitted storage.
+CODEGEN_ABI_CPP = "2026-03-26-cpp-v52-facet-restricted-grad-value-fix"
 
 
 @contextmanager

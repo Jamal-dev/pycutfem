@@ -27,8 +27,9 @@ logger = logging.getLogger(__name__)
 # stacks during JIT warm-up. Keys include element signature, quadrature order,
 # target element count and derivative kind.
 _REF_TABLE_CACHE: dict[tuple, np.ndarray] = {}
-_REF_TABLE_CACHE_ABI = "2026-03-14-ref-tables-v1"
+_REF_TABLE_CACHE_ABI = "2026-03-26-ref-tables-v2"
 _REF_TABLE_CACHE_DIR: Path | None = None
+_REF_TABLE_CACHE_DIR_TOKEN: tuple[str, ...] | None = None
 
 
 def _array_token(arr) -> str:
@@ -55,22 +56,39 @@ def _ref_table_cache_max_bytes() -> int:
 
 
 def _resolve_ref_table_cache_dir() -> Path | None:
-    global _REF_TABLE_CACHE_DIR
+    global _REF_TABLE_CACHE_DIR, _REF_TABLE_CACHE_DIR_TOKEN
     if not _ref_table_cache_enabled():
+        _REF_TABLE_CACHE_DIR = None
+        _REF_TABLE_CACHE_DIR_TOKEN = None
         return None
     if _REF_TABLE_CACHE_DIR is not None:
-        return _REF_TABLE_CACHE_DIR
+        override = os.getenv("PYCUTFEM_REF_TABLE_CACHE_DIR", "").strip()
+        if override:
+            token = ("override", str(Path(override).expanduser()))
+        else:
+            cache_root = os.getenv("PYCUTFEM_CACHE_DIR", "").strip()
+            xdg_root = os.getenv("XDG_CACHE_HOME", "").strip()
+            token = ("root", cache_root, xdg_root)
+        if token == _REF_TABLE_CACHE_DIR_TOKEN:
+            return _REF_TABLE_CACHE_DIR
     override = os.getenv("PYCUTFEM_REF_TABLE_CACHE_DIR", "").strip()
     try:
         if override:
             base = Path(override).expanduser().resolve()
+            token = ("override", str(base))
         else:
             from pycutfem.jit.cache import _resolve_cache_dir
             base = (_resolve_cache_dir() / "ref_tables").resolve()
+            token = (
+                "root",
+                os.getenv("PYCUTFEM_CACHE_DIR", "").strip(),
+                os.getenv("XDG_CACHE_HOME", "").strip(),
+            )
         base.mkdir(parents=True, exist_ok=True)
     except Exception:
         return None
     _REF_TABLE_CACHE_DIR = base
+    _REF_TABLE_CACHE_DIR_TOKEN = token
     return base
 
 
@@ -367,12 +385,56 @@ def _build_jit_kernel_args(       # ← signature unchanged
         Cache element-physical tables (basis/grad) keyed by a lightweight
         token that tracks the underlying qref/eids arrays for this kernel.
         """
-        key = (mixed_element.signature(), q_order, n_elem, kind, field, token)
+        key = (
+            mixed_element.signature(),
+            q_order,
+            n_elem,
+            kind,
+            field,
+            token,
+            _active_layout_token,
+        )
         hit = _cache_array_get(key)
         if hit is not None:
             return hit
         arr = builder()
         return _cache_array_put(key, arr)
+
+    def _pad_prebuilt_hdiv_table(field: str, arr: np.ndarray, *, dof_axis: int) -> np.ndarray:
+        """
+        Promote a field-local RT prebuilt table to the active mixed union layout.
+
+        Prebuilt RT geometry tables are often emitted in the field-local layout
+        `(n_loc_rt)` while mixed kernels expect every H(div) table to use the
+        same active-union DOF axis as scalar/vector basis tables and sign maps.
+        """
+        arr = np.asarray(arr, dtype=np.float64)
+        axis = int(dof_axis)
+        if axis < 0:
+            axis += arr.ndim
+        if axis < 0 or axis >= arr.ndim:
+            raise ValueError(
+                f"_pad_prebuilt_hdiv_table: invalid dof axis {dof_axis} for shape {arr.shape}."
+            )
+
+        n_union = int(_active_n)
+        axis_len = int(arr.shape[axis])
+        if axis_len == n_union:
+            return np.ascontiguousarray(arr)
+
+        sl_full = mixed_element.component_dof_slices[field]
+        nloc = int(sl_full.stop) - int(sl_full.start)
+        if axis_len != nloc:
+            return np.ascontiguousarray(arr)
+
+        sl = _field_new_slice(field)
+        out_shape = list(arr.shape)
+        out_shape[axis] = n_union
+        out = np.zeros(tuple(out_shape), dtype=np.float64)
+        idx = [slice(None)] * arr.ndim
+        idx[axis] = sl
+        out[tuple(idx)] = arr
+        return np.ascontiguousarray(out)
 
     # Reference-element quadrature (ξ-space) for table builders
     qp_ref, _ = volume(mixed_element.mesh.element_type, q_order)
@@ -489,7 +551,7 @@ def _build_jit_kernel_args(       # ← signature unchanged
             raise ValueError(f"Requested bvec_{field} for non-RT field family {fam!r}.")
         key = f"bvec_{field}"
         if pre_built is not None and key in pre_built:
-            return np.asarray(pre_built[key], dtype=np.float64)
+            return _pad_prebuilt_hdiv_table(field, pre_built[key], dof_axis=-1)
 
         qref_mode = _prebuilt_qref_mode()
         if qref_mode is not None:
@@ -554,7 +616,7 @@ def _build_jit_kernel_args(       # ← signature unchanged
             raise ValueError(f"Requested div_{field} for non-RT field family {fam!r}.")
         key = f"div_{field}"
         if pre_built is not None and key in pre_built:
-            return np.asarray(pre_built[key], dtype=np.float64)
+            return _pad_prebuilt_hdiv_table(field, pre_built[key], dof_axis=-1)
 
         qref_mode = _prebuilt_qref_mode()
         if qref_mode is not None:
@@ -620,7 +682,7 @@ def _build_jit_kernel_args(       # ← signature unchanged
             raise ValueError(f"Requested gvec_{field} for non-RT field family {fam!r}.")
         key = f"gvec_{field}"
         if pre_built is not None and key in pre_built:
-            return np.asarray(pre_built[key], dtype=np.float64)
+            return _pad_prebuilt_hdiv_table(field, pre_built[key], dof_axis=-2)
 
         qref_mode = _prebuilt_qref_mode()
         if qref_mode is not None:
@@ -689,7 +751,8 @@ def _build_jit_kernel_args(       # ← signature unchanged
         key_map = {"val": f"hval_{field}", "grad": f"hgrad_{field}", "hess": f"hhess_{field}"}
         key = key_map[str(kind)]
         if pre_built is not None and key in pre_built:
-            return np.asarray(pre_built[key], dtype=np.float64)
+            axis_map = {"val": -1, "grad": -2, "hess": -3}
+            return _pad_prebuilt_hdiv_table(field, pre_built[key], dof_axis=axis_map[str(kind)])
 
         qref_mode = _prebuilt_qref_mode()
         sl = _field_new_slice(field)

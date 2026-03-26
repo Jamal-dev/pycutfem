@@ -130,6 +130,21 @@ def _collapsed_grad(g: Union["GradOpInfo", np.ndarray]) -> np.ndarray:
     G = np.asarray(g)
     if G.ndim == 2: return G
     raise ValueError(f"_collapsed_grad: unexpected ndarray shape {G.shape}")
+
+
+def _scalar_grad_basis_matrix(g: Union["GradOpInfo", np.ndarray]) -> np.ndarray:
+    """
+    Return scalar basis gradients in canonical carried form ``(d, n)``.
+
+    Accepts both the legacy ``(1, n, d)`` storage and the refactored ``(d, n)``
+    storage so the algebra layer can migrate without breaking older paths.
+    """
+    G = np.asarray(g.data if isinstance(g, GradOpInfo) else g)
+    if G.ndim == 2:
+        return G if G.shape[0] <= G.shape[1] else G.T
+    if G.ndim == 3 and G.shape[0] == 1:
+        return np.ascontiguousarray(G[0].T)
+    raise ValueError(f"_scalar_grad_basis_matrix: unexpected gradient basis shape {G.shape}")
 def _collapsed_hess(h: Union["HessOpInfo", np.ndarray]) -> np.ndarray:
     """(k,n,d,d)+coeffs -> (k,d,d); pass-through (k,d,d)."""
     if isinstance(h, VecOpInfo) or isinstance(h, GradOpInfo):
@@ -192,7 +207,7 @@ def _is_scalar_field(a) -> bool:
     if isinstance(a, GradOpInfo):
         # print(f"GradOpInfo detected: a.role: {a.role}, a.shape: {a.shape}")
         if a.role in {"trial", "test"}:
-            return a.data.shape[0] == 1
+            return a.data.ndim == 2 or a.data.shape[0] == 1
         elif a.role == "function":
             grad_collapsed = _collapsed_grad(a.data)
             return grad_collapsed.shape[0] == 1
@@ -228,6 +243,44 @@ def lhs_num(value: Any) -> np.ndarray:
             view = view[0]
         return view
     return np.asarray(value)
+
+
+def _apply_storage_transform_opinfo(item: Any, transform: Any):
+    from pycutfem.ufl.tensor_algebra import OperandTransform
+
+    if transform == OperandTransform.NONE or not isinstance(item, BaseOpInfo):
+        return item
+
+    data = np.asarray(item.data)
+    if transform == OperandTransform.TRANSPOSE_2D:
+        if data.ndim != 2:
+            raise ValueError(f"transpose_2d storage transform expects rank-2 data, got {data.shape!r}.")
+        new_data = np.ascontiguousarray(data.T)
+    elif transform == OperandTransform.SCALAR_GRAD_TO_VECTOR:
+        if data.ndim != 3 or int(data.shape[0]) != 1:
+            raise ValueError(
+                f"scalar_grad_to_vector storage transform expects shape (1,n,d), got {data.shape!r}."
+            )
+        new_data = np.ascontiguousarray(data[0].T)
+    else:
+        raise ValueError(f"Unsupported storage transform {transform!r}.")
+
+    if isinstance(item, GradOpInfo):
+        return item._with(new_data, role=item.role, coeffs=item.coeffs)
+    if isinstance(item, HessOpInfo):
+        return item._with(new_data, role=item.role, coeffs=item.coeffs)
+    if isinstance(item, VecOpInfo):
+        return item._with(new_data, role=item.role)
+    return item
+
+
+def _tensor_rank_of_opinfo(item: Any, *, spatial_dim: int = 2) -> int | None:
+    try:
+        from pycutfem.ufl.tensor_algebra import TensorRuleEngine
+
+        return int(TensorRuleEngine.infer_signature(item, spatial_dim=spatial_dim).tensor_rank)
+    except Exception:
+        return None
 
 @dataclass(frozen=True, slots=True)
 class BaseOpInfo:
@@ -546,6 +599,16 @@ class VecOpInfo(BaseOpInfo):
                 u_val = _collapsed_function(self)  # shape (k,)  —   u_k(ξ)
             else:
                 u_val = np.asarray(self.data, dtype=float)
+            if _is_scalar_field(grad):
+                grad_basis = _scalar_grad_basis_matrix(grad)  # (d, n)
+                meta = _resolve_meta(self.meta(), meta_grad, prefer='b')
+                if _is_1d_vector(u_val) and u_val.shape[0] == grad_basis.shape[0]:
+                    data = np.einsum("d,dn->n", u_val, grad_basis, optimize=True)
+                    return VecOpInfo(data[np.newaxis, :], role=grad.role, **self.update_meta(meta))
+                if u_val.shape[0] == 1:
+                    data = u_val[0] * grad_basis
+                    return GradOpInfo(data, role=grad.role, **self.update_meta(meta))
+                raise NotImplementedError(self._error_msg(grad, "dot_grad"))
             if _is_1d_vector(u_val):
                 if grad.shape[0] == 1:
                     # Special case: single component gradient
@@ -605,6 +668,12 @@ class VecOpInfo(BaseOpInfo):
                 return VecOpInfo(data, role="vector",
                                 **self.update_meta(meta))
             else: raise NotImplementedError(self._error_msg(grad, "dot_grad"))
+        elif self.role in {"trial", "test", "trial_n", "test_n"} and grad.role in {"trial", "test", "trial_n", "test_n"}:
+            # Use the gradient-side contraction as the single source of truth
+            # for mixed basis vector · basis gradient. This keeps the carried
+            # result in canonical test, trial order and avoids duplicating the
+            # mixed-basis layout logic in two helpers.
+            return grad.left_dot(self)
         raise NotImplementedError(f"VecOpInfo.dot_grad not implemented for role {self.role} and GradOpInfo role {grad.role}.")
     
     def dot_vec(self, other_vec: "VecOpInfo") -> "VecOpInfo":
@@ -641,13 +710,17 @@ class VecOpInfo(BaseOpInfo):
             
         # case 2 trial dot test and test dot trial
         if self.role == "trial" and other_vec.role == "test":
-            # lhs mass matrix term
-            # If self is trial and vec is test, we return a VecOpInfo with shape (m, n)
+            # Bilinear mass-like contraction: keep a semantic mixed scalar carrier
+            # in canonical (n_test, n_trial) storage. Mixed scalar carriers are
+            # rank-0 tensors over two basis axes, not fake rank-1 objects with a
+            # leading singleton component axis.
             meta = _resolve_meta(self.meta(), other_vec.meta())
-            return np.einsum("km,kn->mn", other_vec.data , self.data, optimize=True)
+            data = np.einsum("km,kn->mn", other_vec.data, self.data, optimize=True)
+            return VecOpInfo(data, role="mixed", **self.update_meta(meta))
         elif self.role == "test" and other_vec.role == "trial":
             meta = _resolve_meta(self.meta(), other_vec.meta())
-            return np.einsum("km,kn->mn", self.data, other_vec.data, optimize=True)
+            data = np.einsum("km,kn->mn", self.data, other_vec.data, optimize=True)
+            return VecOpInfo(data, role="mixed", **self.update_meta(meta))
         
         # case 3 trial and function
         if self.role in {"trial", "test"} and other_vec.role in {"function", "vector"}:
@@ -669,10 +742,9 @@ class VecOpInfo(BaseOpInfo):
         if self.role == "mixed" and other_vec.role == "function":
             meta = _resolve_meta(self.meta(), other_vec.meta(), prefer='a')
             v_values = _collapsed_function(other_vec)  # shape (k,)
-            # (k,m,n) dot (k,) -> (1,m,n)
+            # (k,m,n) dot (k,) -> (m,n)
             if self.shape[0] == v_values.shape[0] and v_values.ndim == 1:
                 data = np.einsum("kmn,k->mn", self.data, v_values, optimize=True)
-                data = data[np.newaxis,:,:] # (1,m,n)
                 return VecOpInfo(data, role=self.role, **self.update_meta(meta))
             else:
                 raise NotImplementedError(self._error_msg(other_vec, "dot_vec"))
@@ -700,7 +772,7 @@ class VecOpInfo(BaseOpInfo):
         if self.role == "function":
             vals = _collapsed_function(self)  # shape (k,)
             return vals.shape[0] == 1
-        elif self.role in {"trial", "test"}:
+        elif self.role in {"trial", "test", "trial_n", "test_n"}:
             return self.data.shape[0] == 1
         return False
 
@@ -754,14 +826,17 @@ class VecOpInfo(BaseOpInfo):
                                           parent_name=self.parent_name, side=self.side,
                                           field_sides=self.field_sides, is_rhs=self.is_rhs)
                     return grad_obj
-                elif self.role in {"mixed"} and other.shape == (2,2) and self.shape[0] == 1:
-                    # Case: Mixed * with identity matrix the result will be HessOpInfo
-                    _,m,n = self.data.shape
+                elif self.role in {"mixed"} and other.shape == (2,2) and (
+                    self.data.ndim == 2 or (self.data.ndim == 3 and self.shape[0] == 1)
+                ):
+                    # Mixed scalar carrier * matrix -> mixed rank-2 basis tensor.
+                    base = self.data if self.data.ndim == 2 else self.data[0]
+                    m, n = base.shape
                     k,d = other.shape
                     res = np.zeros((k,m,n,d), dtype=self.data.dtype)
                     for i in range(k):
                         for j in range(d):
-                            res[i,:, :,j] = self.data[0, :, :] * other[i,j]
+                            res[i,:, :,j] = base * other[i,j]
                     grad_obj = GradOpInfo(res, role=self.role,
                                           field_names=self.field_names,
                                           parent_name=self.parent_name, side=self.side,
@@ -961,15 +1036,23 @@ class VecOpInfo(BaseOpInfo):
                 meta = _resolve_meta(self.meta(), other.meta(), prefer="a")
                 data = u_vals[0] * _collapsed_grad(other)
                 return GradOpInfo(data, role="function", **self.update_meta(meta))
-            elif self.role == "mixed" and other.role in {"function", "identity"} \
-                and other.shape==(2,2) and self.shape[0]==1:
-                # Case: mixed dot with identity matrix
-                _,m,n = self.data.shape
+            elif (
+                self.role == "mixed"
+                and other.role in {"function", "identity"}
+                and other.shape == (2, 2)
+                and (
+                    self.data.ndim == 2
+                    or (self.data.ndim == 3 and self.data.shape[0] == 1)
+                )
+            ):
+                # Mixed scalar carrier * matrix -> mixed rank-2 tensor.
+                base = self.data if self.data.ndim == 2 else self.data[0]
+                m, n = base.shape
                 k,d = other.shape
                 data = np.zeros((k,m,n,d), dtype=self.data.dtype)
                 for i in range(k):
                     for j in range(d):
-                        data[i,:, :,j] += self.data[0,:, :] * other.data[i,j]
+                        data[i, :, :, j] = base * other.data[i, j]
                 role = "mixed"
                 meta = _resolve_meta(self.meta(), other.meta(), prefer='a')
                 return GradOpInfo(data, role=role, **self.update_meta(meta))
@@ -1018,7 +1101,12 @@ class VecOpInfo(BaseOpInfo):
                 # so it stays gradient-valued with the basis role.
                 grad_vals = _collapsed_grad(other)  # shape (k, d)
                 meta = _resolve_meta(self.meta(), other.meta(), prefer="a")
-                data = grad_vals[:, np.newaxis, :] * self.data[:, :, np.newaxis]
+                if grad_vals.shape[0] != 1:
+                    raise NotImplementedError("Only scalar gradient values are supported in scalar basis promotion.")
+                basis_vals = np.asarray(self.data)
+                if basis_vals.ndim == 2:
+                    basis_vals = basis_vals[0]
+                data = np.ascontiguousarray(grad_vals[0])[:, np.newaxis] * np.ascontiguousarray(basis_vals)[None, :]
                 return GradOpInfo(data, role=self.role, **self.update_meta(meta))
 
 
@@ -1066,6 +1154,18 @@ class VecOpInfo(BaseOpInfo):
     def __add__(self, other: "VecOpInfo") -> "VecOpInfo":
         """Element-wise addition with another VecOpInfo/np.ndarray."""
         import numbers as _numbers
+        if isinstance(other, BaseOpInfo):
+            try:
+                from pycutfem.ufl.tensor_algebra import TensorRuleEngine
+
+                sum_lowering = TensorRuleEngine.plan_sum_lowering(self, other)
+            except Exception:
+                sum_lowering = None
+            if sum_lowering is not None:
+                lhs = _apply_storage_transform_opinfo(self, sum_lowering.lhs_transform)
+                rhs = _apply_storage_transform_opinfo(other, sum_lowering.rhs_transform)
+                if lhs is not self or rhs is not other:
+                    return lhs.__add__(rhs)
 
         # Allow adding scalar constants (float/int/0d arrays) to vector-like ops.
         if isinstance(other, (_numbers.Number, np.number)):
@@ -1194,6 +1294,12 @@ class GradOpInfo(BaseOpInfo):
     __array_priority__ = 1000
     coeffs: np.ndarray = field(default=None)  # (k, n) when role == "function" and data.ndim == 3
 
+    def __post_init__(self):
+        data = np.asarray(self.data)
+        if self.role in {"trial", "test", "trial_n", "test_n"} and data.ndim == 3 and int(data.shape[0]) == 1:
+            # Canonical scalar basis gradients as rank-1 spatial tensors carried over basis columns: (d, n).
+            object.__setattr__(self, "data", np.ascontiguousarray(data[0].T))
+
     def _with(self, data: np.ndarray, role: str | None = None, coeffs: np.ndarray | None = None) -> "GradOpInfo":
         return GradOpInfo(
             np.asarray(data),
@@ -1214,6 +1320,12 @@ class GradOpInfo(BaseOpInfo):
 
         (k, d)     -> (d, k)
         """
+        tensor_rank = _tensor_rank_of_opinfo(self)
+        if tensor_rank is not None and tensor_rank != 2:
+            raise ValueError(
+                f"Transpose is only defined for rank-2 tensors; GradOpInfo with shape {self.data.shape} "
+                f"has semantic tensor rank {tensor_rank}."
+            )
         if self.data.ndim == 4:      # (k, n, m, d)
             if self.role == "mixed":
                 G = self.data                        # (k, n, m, d)
@@ -1230,7 +1342,7 @@ class GradOpInfo(BaseOpInfo):
                 # swap the coefficents to match the new shape
                 grad_vals = _collapsed_grad(self)  # (k, d)
                 return self._with(grad_vals.T, role=self.role, coeffs=None)
-            elif self.role in {"trial", "test"}: # trial and test
+            elif self.role in {"trial", "test", "trial_n", "test_n"}: # trial and test
                 G = self.data                        # (k, n, d)
                 k, n, d = G.shape
                 Gswap = np.empty_like(G)
@@ -1272,12 +1384,16 @@ class GradOpInfo(BaseOpInfo):
             if self.role in {"function", "identity"} and other.role in {"trial", "test"}:
                 # Case: Function · Grad(Trial) or Grad(Test)  -> (n,)
                 kd = _collapsed_grad(self)  # shape (k, d)  —   ∇u_k(ξ)
+                if _is_scalar_field(other) and kd.shape[0] == 1:
+                    return np.einsum("d,dn->n", kd[0], _scalar_grad_basis_matrix(other), optimize=True)
                 if kd.shape[0] == other.shape[0]:
                     return  np.einsum("kd,knd->n", kd, other.data, optimize=True)
                 else: raise NotImplementedError(self._error_msg(other, "inner between gradients"))
             elif self.role in {"trial", "test"} and other.role in {"function", "identity"}:
                 # Case: Grad(Trial) or Grad(Test) · Function  -> (n,)
                 kd = _collapsed_grad(other)  # shape (k, d)  —   ∇u_k(ξ)
+                if _is_scalar_field(self) and kd.shape[0] == 1:
+                    return np.einsum("dn,d->n", _scalar_grad_basis_matrix(self), kd[0], optimize=True)
                 if kd.shape[0] == self.shape[0]:
                     return np.einsum("knd,kd->n", self.data, kd, optimize=True)
                 else: raise NotImplementedError(self._error_msg(other, "inner between gradients"))
@@ -1299,20 +1415,28 @@ class GradOpInfo(BaseOpInfo):
 
         if self.role == "test" and other.role == "trial":
             # standard order: rows=test, cols=trial
+            if _is_scalar_field(self) and _is_scalar_field(other):
+                return np.einsum("dn,dm->nm", _scalar_grad_basis_matrix(self), _scalar_grad_basis_matrix(other), optimize=True)
             return np.einsum("knd,kmd->nm", self.data, other.data, optimize=True)
 
         elif self.role == "trial" and other.role == "test":
             # reversed inputs: build rows=test, cols=trial anyway
+            if _is_scalar_field(self) and _is_scalar_field(other):
+                return np.einsum("dn,dm->mn", _scalar_grad_basis_matrix(self), _scalar_grad_basis_matrix(other), optimize=True)
             return np.einsum("knd,kmd->mn", self.data, other.data, optimize=True)
         elif self.role in {"function", "identity"} and other.role in {"trial", "test"}:
             # Case: Function · Grad(Trial) or Grad(Test)  -> (n,)
             kd = _collapsed_grad(self)  # shape (k, d)  —   ∇u_k(ξ)
+            if _is_scalar_field(other) and kd.shape[0] == 1:
+                return np.einsum("d,dn->n", kd[0], _scalar_grad_basis_matrix(other), optimize=True)
             if kd.shape[0] == other.shape[0]:
                 return np.einsum("kd,knd->n", kd, other.data, optimize=True)
             else: raise NotImplementedError(self._error_msg(other, "inner between gradients"))
         elif self.role in {"trial", "test"} and other.role in {"function", "identity"}:
             # Case: Grad(Trial) or Grad(Test) · Function  -> (n,)
             kd = _collapsed_grad(other)  # shape (k, d)  —   ∇u_k(ξ)
+            if _is_scalar_field(self) and kd.shape[0] == 1:
+                return np.einsum("dn,d->n", _scalar_grad_basis_matrix(self), kd[0], optimize=True)
             if kd.shape[0] == self.shape[0]:
                 return np.einsum("knd,kd->n", self.data, kd, optimize=True)
             else: raise NotImplementedError(self._error_msg(other, "inner between gradients"))
@@ -1440,7 +1564,7 @@ class GradOpInfo(BaseOpInfo):
                 # (1)  value of ∇u_k at this quad-point
                 grad_val = _collapsed_grad(self)  # shape (k, d)  —   ∇u_k(ξ)
                 # (2)  dot product
-                if left_vec.role in {"trial", "test"}:
+                if left_vec.role in {"trial", "test", "trial_n", "test_n"}:
                     meta = _resolve_meta(self.meta(), left_vec.meta(), prefer='b')
                     if grad_val.shape[0] == left_vec.shape[0]:
                         data = np.einsum("kn,kd->dn", left_vec.data, grad_val, optimize=True)
@@ -1456,8 +1580,26 @@ class GradOpInfo(BaseOpInfo):
                     data = np.dot(u_vals, grad_val)  # (d,) result
                     role = "vector" if data.ndim == 1 else "scalar"
                     return VecOpInfo(data, role=role, **self.update_meta(meta))
-            elif self.role in {"trial", "test"}:
-                if left_vec.role in {"trial", "test"} and self.role in {"trial", "test"}:
+            elif self.role in {"trial", "test", "trial_n", "test_n"}:
+                if _is_scalar_field(self):
+                    g_basis = _scalar_grad_basis_matrix(self)  # (d, n)
+                    if left_vec.role in {"trial", "test", "trial_n", "test_n"}:
+                        meta = _resolve_meta(self.meta(), left_vec.meta(), prefer='a')
+                        if left_vec.role.startswith("trial") and self.role.startswith("test"):
+                            data = np.einsum("dm,dn->nm", left_vec.data, g_basis, optimize=True)
+                        elif left_vec.role.startswith("test") and self.role.startswith("trial"):
+                            data = np.einsum("dn,dm->nm", left_vec.data, g_basis, optimize=True)
+                        else:
+                            data = np.einsum("dn,dm->nm", left_vec.data, g_basis, optimize=True)
+                        return VecOpInfo(data, role="mixed", **self.update_meta(meta))
+                    if left_vec.role == "function":
+                        u_vals = _collapsed_function(left_vec)
+                        if _is_1d_vector(u_vals) and u_vals.shape[0] == g_basis.shape[0]:
+                            data = np.einsum("d,dn->n", u_vals, g_basis, optimize=True)
+                            meta = _resolve_meta(self.meta(), left_vec.meta(), prefer='a')
+                            return VecOpInfo(data[np.newaxis, :], role=self.role, **self.update_meta(meta))
+                        raise NotImplementedError(self._error_msg(left_vec, "left_dot with vector"))
+                if left_vec.role in {"trial", "test", "trial_n", "test_n"} and self.role in {"trial", "test", "trial_n", "test_n"}:
                     if self.data.shape[0] != left_vec.data.shape[0]:
                         raise NotImplementedError(self._error_msg(left_vec, "left_dot with vector"))
                     meta = _resolve_meta(self.meta(), left_vec.meta(), prefer='a')
@@ -1494,6 +1636,11 @@ class GradOpInfo(BaseOpInfo):
                                      f" with roles {self.role} and {getattr(left_vec, 'role', None)}.")
             elif self.role in {"trial", "test"}:
                 if left_vec.shape[0] >1:
+                    if _is_scalar_field(self):
+                        g_basis = _scalar_grad_basis_matrix(self)
+                        data = np.einsum("d,dn->n", left_vec, g_basis, optimize=True)
+                        meta = _resolve_meta(self.meta(), {}, prefer='a')
+                        return VecOpInfo(data[np.newaxis, :], role=self.role, **self.update_meta(meta))
                     if self.data.shape[0] == 1:
                         # Special case: single component gradient
                         data = np.einsum("d,kld->kl", left_vec, self.data, optimize=True)
@@ -1555,6 +1702,13 @@ class GradOpInfo(BaseOpInfo):
             elif self.role == "trial" and other_vec.role == "function": # introducing a new branch
                 # Case:  Grad(Trial) · Vec(Function)      (∇u_trial) · u_k
                 v_val = _collapsed_function(other_vec)  # shape (k,)  —   u_k(ξ)
+                if _is_scalar_field(self):
+                    g_basis = _scalar_grad_basis_matrix(self)
+                    if g_basis.shape[0] != v_val.shape[0]:
+                        raise NotImplementedError(self._error_msg(other_vec, "dot_vec"))
+                    data = np.einsum("dn,d->n", g_basis, v_val, optimize=True)
+                    meta = _resolve_meta(self.meta(), other_vec.meta(), prefer='a')
+                    return VecOpInfo(data[np.newaxis, :], role=self.role, **other_vec.update_meta(meta))
                 if self.data.shape[-1] != v_val.shape[0]:
                     raise NotImplementedError(self._error_msg(other_vec, "dot_vec"))
                 data = np.einsum("kld,d->kl", self.data, v_val, optimize=True)
@@ -1564,6 +1718,13 @@ class GradOpInfo(BaseOpInfo):
                 # Case:  Grad(Test) · Vec(Function)      (∇v_test) · u_k
                 # Needed for skew-symmetric convection forms.
                 v_val = _collapsed_function(other_vec)  # shape (k,)  —   u_k(ξ)
+                if _is_scalar_field(self):
+                    g_basis = _scalar_grad_basis_matrix(self)
+                    if g_basis.shape[0] != v_val.shape[0]:
+                        raise NotImplementedError(self._error_msg(other_vec, "dot_vec"))
+                    data = np.einsum("dn,d->n", g_basis, v_val, optimize=True)
+                    meta = _resolve_meta(self.meta(), other_vec.meta(), prefer="a")
+                    return VecOpInfo(data[np.newaxis, :], role=self.role, **self.update_meta(meta))
                 if self.data.shape[-1] != v_val.shape[0]:
                     raise NotImplementedError(self._error_msg(other_vec, "dot_vec"))
                 data = np.einsum("knd,d->kn", self.data, v_val, optimize=True)
@@ -1582,6 +1743,16 @@ class GradOpInfo(BaseOpInfo):
                 role = "scalar" if data.ndim == 0 else "vector"
                 return VecOpInfo(data, role=role, **self.update_meta(self.meta()))
             elif self.role in {"trial", "test"} and other_vec.role in {"trial", "test"}:
+                if _is_scalar_field(self):
+                    g_basis = _scalar_grad_basis_matrix(self)
+                    if other_vec.role == "trial" and self.role == "test":
+                        data = np.einsum("dm,dn->nm", other_vec.data, g_basis, optimize=True)
+                    elif other_vec.role == "test" and self.role == "trial":
+                        data = np.einsum("dn,dm->nm", other_vec.data, g_basis, optimize=True)
+                    else:
+                        data = np.einsum("dn,dm->nm", other_vec.data, g_basis, optimize=True)
+                    meta = _resolve_meta(self.meta(), other_vec.meta(), prefer='a')
+                    return VecOpInfo(data, role="mixed", **self.update_meta(meta))
                 if self.data.shape[-1] != other_vec.data.shape[0]:
                     raise NotImplementedError(self._error_msg(other_vec, "dot_vec"))
                 # Keep a consistent mixed orientation: rows=test, cols=trial.
@@ -1597,6 +1768,13 @@ class GradOpInfo(BaseOpInfo):
                 return VecOpInfo(data, role="mixed", **self.update_meta(meta))
             elif self.role in {"trial", "test"} and other_vec.role == "vector":
                 vec_vals = np.asarray(other_vec.data)
+                if _is_scalar_field(self):
+                    g_basis = _scalar_grad_basis_matrix(self)
+                    if vec_vals.ndim == 1 and vec_vals.shape[0] == g_basis.shape[0]:
+                        contracted = np.einsum("dn,d->n", g_basis, vec_vals, optimize=True)
+                        meta = _resolve_meta(self.meta(), other_vec.meta(), prefer='a')
+                        return VecOpInfo(contracted[np.newaxis, :], role=self.role, **self.update_meta(meta))
+                    raise NotImplementedError(self._error_msg(other_vec, "dot_vec with vector data"))
                 if vec_vals.ndim == 1 and self.data.shape[0] == 1 and vec_vals.shape[0] == self.data.shape[-1]:
                     contracted = np.einsum("knd,d->kn", self.data, vec_vals, optimize=True)
                     meta = _resolve_meta(self.meta(), other_vec.meta(), prefer='a')
@@ -1631,9 +1809,18 @@ class GradOpInfo(BaseOpInfo):
                     return VecOpInfo(np.asarray(data[0]), role="scalar", **self.update_meta(self.meta()))
                 role = "scalar" if np.ndim(data) == 0 else "vector"
                 return VecOpInfo(data, role=role, **self.update_meta(self.meta()))
-            if self.data.shape[-1] != other_vec.shape[0]:
-                raise ValueError(f"Cannot dot(∇w, n) GradOpInfo {self.shape} with vector of shape {other_vec.shape}.")
-            if self.role in {"trial", "test"}:
+            if self.role in {"trial", "test", "trial_n", "test_n"}:
+                if _is_scalar_field(self):
+                    g_basis = _scalar_grad_basis_matrix(self)
+                    if g_basis.shape[0] != other_vec.shape[0]:
+                        raise ValueError(
+                            f"Cannot dot(∇w, n) scalar GradOpInfo {self.shape} with vector of shape {other_vec.shape}."
+                        )
+                    result_data = np.einsum("dn,d->n", g_basis, other_vec, optimize=True)
+                    meta = _resolve_meta(self.meta(), {}, prefer='a')
+                    return VecOpInfo(result_data[np.newaxis, :], role=self.role, **self.update_meta(meta))
+                if self.data.shape[-1] != other_vec.shape[0]:
+                    raise ValueError(f"Cannot dot(∇w, n) GradOpInfo {self.shape} with vector of shape {other_vec.shape}.")
                 result_data = np.einsum("knd,d->kn", self.data, other_vec, optimize=True)
                 meta = _resolve_meta(self.meta(), {}, prefer='a')
                 return VecOpInfo(result_data, role=self.role, **self.update_meta(meta))
@@ -1643,6 +1830,12 @@ class GradOpInfo(BaseOpInfo):
                 return VecOpInfo(result_data, role=self.role, **self.update_meta(meta))
         if isinstance(other_vec, np.ndarray) and other_vec.ndim == 2:
             if self.role in {"trial", "test"}:
+                if _is_scalar_field(self):
+                    g_basis = _scalar_grad_basis_matrix(self)
+                    if other_vec.shape[0] != g_basis.shape[0]:
+                        raise NotImplementedError(self._error_msg(other_vec, "dot_vec"))
+                    data = g_basis.T @ other_vec
+                    return self._with(data[np.newaxis, ...], role=self.role, coeffs=self.coeffs)
                 if other_vec.shape[0] != self.data.shape[-1]:
                     raise NotImplementedError(self._error_msg(other_vec, "dot_vec"))
                 data = np.einsum("knd,dm->knm", self.data, other_vec, optimize=True)
@@ -1696,11 +1889,18 @@ class GradOpInfo(BaseOpInfo):
                         )
                     new_data = np.einsum("...d,dm->...m", self.data, other, optimize=True)
                 elif self.data.ndim == 2:
-                    if other.shape[0] != self.data.shape[-1]:
-                        raise ValueError(
-                            f"Cannot right-contract GradOpInfo(shape={self.shape}) with matrix of shape {other.shape}."
-                        )
-                    new_data = self.data @ other
+                    if self.role in {"trial", "test"} and _is_scalar_field(self):
+                        if other.shape[0] != self.data.shape[0]:
+                            raise ValueError(
+                                f"Cannot right-contract scalar GradOpInfo(shape={self.shape}) with matrix of shape {other.shape}."
+                            )
+                        new_data = other.T @ self.data
+                    else:
+                        if other.shape[0] != self.data.shape[-1]:
+                            raise ValueError(
+                                f"Cannot right-contract GradOpInfo(shape={self.shape}) with matrix of shape {other.shape}."
+                            )
+                        new_data = self.data @ other
                 else:
                     raise ValueError(f"Cannot right-contract GradOpInfo(shape={self.shape}) with matrix of shape {other.shape}.")
             else:
@@ -1774,6 +1974,13 @@ class GradOpInfo(BaseOpInfo):
                     new_data = np.einsum("mk,knd->mnd", other, self.data, optimize=True)
                     return self._with(new_data, role=self.role)
                 if self.data.ndim == 2:
+                    if self.role in {"trial", "test"} and _is_scalar_field(self):
+                        if other.shape[1] != self.data.shape[0]:
+                            raise ValueError(
+                                f"Cannot left-contract matrix of shape {other.shape} with scalar gradient basis of shape {self.shape}."
+                            )
+                        new_data = other @ self.data
+                        return self._with(new_data, role=self.role)
                     if self.data.shape[0] == 1:
                         if other.shape[1] != self.data.shape[-1]:
                             raise ValueError(
@@ -1892,6 +2099,18 @@ class GradOpInfo(BaseOpInfo):
         raise NotImplementedError(f"Array addition not implemented for role {self.role}.")
 
     def __add__(self, other) -> "GradOpInfo":
+        if isinstance(other, BaseOpInfo):
+            try:
+                from pycutfem.ufl.tensor_algebra import TensorRuleEngine
+
+                sum_lowering = TensorRuleEngine.plan_sum_lowering(self, other)
+            except Exception:
+                sum_lowering = None
+            if sum_lowering is not None:
+                lhs = _apply_storage_transform_opinfo(self, sum_lowering.lhs_transform)
+                rhs = _apply_storage_transform_opinfo(other, sum_lowering.rhs_transform)
+                if lhs is not self or rhs is not other:
+                    return lhs.__add__(rhs)
         if isinstance(other, GradOpInfo):
             if self.role != other.role:
                 if self.data.ndim < other.data.ndim:

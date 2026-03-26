@@ -25,7 +25,10 @@ def _get_kernel_cache() -> KernelCache:
     directory is changed (tests often patch `KernelCache._CACHE_DIR`).
     """
     global _KERNEL_CACHE_SINGLETON, _KERNEL_CACHE_DIR_TOKEN
-    cache_dir = getattr(KernelCache, "_CACHE_DIR", None)
+    from .cache import _resolve_cache_dir
+
+    override = getattr(KernelCache, "_CACHE_DIR", None)
+    cache_dir = _resolve_cache_dir(override)
     if _KERNEL_CACHE_SINGLETON is None or cache_dir != _KERNEL_CACHE_DIR_TOKEN:
         _KERNEL_CACHE_SINGLETON = KernelCache()
         _KERNEL_CACHE_DIR_TOKEN = cache_dir
@@ -211,6 +214,90 @@ def _compress_static_for_active(static: dict[str, Any],
         idx[ax] = active_cols
         return arr[tuple(idx)]
 
+    def _field_new_slice(field: str) -> slice | np.ndarray:
+        sl_full = getattr(me, "component_dof_slices", {}).get(field, None)
+        if sl_full is None:
+            return slice(0, 0)
+        new_idx = col_map[int(sl_full.start): int(sl_full.stop)]
+        if new_idx.size == 0:
+            return slice(0, 0)
+        new_idx = np.asarray(new_idx, dtype=np.int32)
+        if np.any(new_idx < 0):
+            raise ValueError(
+                f"[jit] active_cols dropped DOFs needed for field {field!r} "
+                f"(slice={sl_full}, full_n={full_n}, active_n={int(active_cols.size)})."
+            )
+        start = int(new_idx[0])
+        if np.array_equal(new_idx, np.arange(start, start + int(new_idx.size), dtype=np.int32)):
+            return slice(start, start + int(new_idx.size))
+        return new_idx
+
+    def _hdiv_field_axis(key: str, arr: np.ndarray) -> tuple[str, int] | None:
+        axis_map = {
+            "bvec_": -1,
+            "div_": -1,
+            "gvec_": -2,
+            "hval_": -1,
+            "hgrad_": -2,
+            "hhess_": -3,
+        }
+        for prefix, axis in axis_map.items():
+            if not key.startswith(prefix):
+                continue
+            field = key[len(prefix):]
+            for suf in ("_pos", "_neg"):
+                if field.endswith(suf):
+                    field = field[: -len(suf)]
+                    break
+            if field in getattr(me, "component_dof_slices", {}):
+                return field, axis
+        return None
+
+    def _promote_field_local_hdiv(arr: np.ndarray, key: str) -> np.ndarray:
+        info = _hdiv_field_axis(key, arr)
+        if info is None:
+            return arr
+        field, axis = info
+        axis = axis if axis >= 0 else arr.ndim + axis
+        if axis < 0 or axis >= arr.ndim:
+            return arr
+        if int(arr.shape[axis]) == int(active_cols.size):
+            return arr
+        sl_full = getattr(me, "component_dof_slices", {}).get(field, None)
+        if sl_full is None:
+            return arr
+        nloc = int(sl_full.stop) - int(sl_full.start)
+        if int(arr.shape[axis]) == nloc:
+            local_arr = arr
+        else:
+            moved = np.moveaxis(np.asarray(arr), axis, -1)
+            reduce_axes = tuple(range(moved.ndim - 1))
+            if key.startswith("sign_"):
+                mask = np.any(np.abs(moved - 1.0) > 1.0e-14, axis=reduce_axes)
+                nz = np.flatnonzero(mask)
+                if nz.size == 0 and int(arr.shape[axis]) >= nloc:
+                    local_idx = np.arange(nloc, dtype=np.int32)
+                elif nz.size == nloc:
+                    local_idx = nz.astype(np.int32, copy=False)
+                else:
+                    return arr
+            else:
+                mask = np.any(np.abs(moved) > 1.0e-14, axis=reduce_axes)
+                nz = np.flatnonzero(mask)
+                if nz.size != nloc:
+                    return arr
+                local_idx = nz.astype(np.int32, copy=False)
+            local_arr = np.take(arr, local_idx, axis=axis)
+        new_slice = _field_new_slice(field)
+        out_shape = list(arr.shape)
+        out_shape[axis] = int(active_cols.size)
+        fill_value = 1.0 if key.startswith("sign_") else 0.0
+        out = np.full(tuple(out_shape), fill_value, dtype=arr.dtype)
+        idx = [slice(None)] * arr.ndim
+        idx[axis] = new_slice
+        out[tuple(idx)] = local_arr
+        return out
+
     def _remap_map(arr: np.ndarray) -> np.ndarray:
         out = -np.ones_like(arr)
         m = (arr >= 0) & (arr < full_n)
@@ -235,8 +322,13 @@ def _compress_static_for_active(static: dict[str, Any],
                     "b_",
                     "bvec_",
                     "g_",
+                    "gvec_",
                     "d",
                     "r",
+                    "div_",
+                    "hval_",
+                    "hgrad_",
+                    "hhess_",
                     "sign_",
                     "pos_map",
                     "neg_map",
@@ -263,6 +355,8 @@ def _compress_static_for_active(static: dict[str, Any],
                 compressed[k] = hit
                 continue
             arr = v
+            if arr.ndim >= 1:
+                arr = _promote_field_local_hdiv(arr, k)
             if (
                 arr.ndim >= 2
                 and arr.dtype.kind != "O"
@@ -653,6 +747,7 @@ class KernelRunner:
             # Debug aid: surface argument shapes/types when a compiled kernel fails.
             import os
             import sys
+            import traceback
             try:
                 mod = getattr(getattr(self.kernel, "py_func", None), "__module__", None) or getattr(self.kernel, "__module__", None)
             except Exception:
@@ -667,6 +762,13 @@ class KernelRunner:
                         print(f"    {tag:<20} shape={arr.shape} dtype={arr.dtype}", file=sys.stderr)
                     else:
                         print(f"    {tag:<20} type={type(arr).__name__}", file=sys.stderr)
+                py_kernel = getattr(self.kernel, "py_func", None)
+                if callable(py_kernel):
+                    print("[KernelRunner] replaying failing kernel via python fallback for traceback...", file=sys.stderr)
+                    try:
+                        py_kernel(*final_args)
+                    except Exception:
+                        traceback.print_exc(file=sys.stderr)
             # Default: stay quiet here. Higher-level assemblers may fall back to a
             # Python path, and users can enable detailed dumps via
             # PYCUTFEM_JIT_DEBUG or PYCUTFEM_JIT_DEBUG_FAIL.
@@ -1006,6 +1108,18 @@ def compile_multi(form, *, dof_handler, mixed_element,
     # Fusion is disabled for functional (rank-0) integrals because callers
     # may rely on per-integral `integral_id` bookkeeping to separate totals.
     fuse = os.getenv("PYCUTFEM_FUSE_INTEGRALS", "1").lower() not in {"0", "false", "no"}
+    # Keep C++ on the per-integral path by default.
+    #
+    # The fused-kernel optimization is beneficial for setup time, but large mixed
+    # H(div) solver forms still hit brittle Eigen/value-category lowering in the
+    # monolithic generated kernels. Standalone assembly already uses the stable
+    # per-integral lowering and matches Python/FEniCSx there, so the robust
+    # default for C++ is to compile the same unfused kernels in solver paths too.
+    #
+    # Opt back in explicitly when auditing fused-kernel codegen:
+    #   PYCUTFEM_CPP_FUSE_INTEGRALS=1
+    if backend in {"cpp", "c++"}:
+        fuse = os.getenv("PYCUTFEM_CPP_FUSE_INTEGRALS", "0").lower() in {"1", "true", "yes"}
 
     def _meta_sig(md: dict) -> tuple:
         items = []
