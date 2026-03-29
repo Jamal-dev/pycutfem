@@ -1552,6 +1552,21 @@ def _build_jit_kernel_args(       # ← signature unchanged
                 args[name] = tab
                 continue
 
+            if pre_built is not None:
+                g_raw = gdofs_map if gdofs_map is not None else pre_built.get("gdofs_map", None)
+                g_arr = None if g_raw is None else np.asarray(g_raw)
+                nE_empty = 0
+                n_union_empty = int(_union_size_from_prebuilt())
+                if g_arr is not None and g_arr.ndim >= 1:
+                    nE_empty = int(g_arr.shape[0])
+                    if g_arr.ndim == 2:
+                        n_union_empty = int(g_arr.shape[1])
+                elif "eids" in pre_built:
+                    nE_empty = int(np.asarray(pre_built.get("eids", np.empty((0,), dtype=np.int32))).shape[0])
+                if nE_empty == 0:
+                    args[name] = np.empty((0, 0, n_union_empty), dtype=np.float64)
+                    continue
+
             # 2) INTERFACE fallback (entity_kind == 'element' or 'edge'):
             #    Build at interface physical QPs. Return *owner-mixed* length
             #    so the kernel’s fixed block slices [0:9],[9:18],[18:22] stay valid.
@@ -1581,12 +1596,15 @@ def _build_jit_kernel_args(       # ← signature unchanged
                 args[name] = tab
                 continue
 
-            # 2b) Aligned-interface edge kernel placeholders:
+            # 2b) Aligned-interface edge kernels:
             # compile_multi always registers an aligned-interface kernel so newly-aligned
-            # edges can appear during refresh. When there are no interface-aligned edges,
-            # the "edge" precompute is empty and does not carry r** tables. Create
-            # correctly-shaped empty tables so kernel arg building succeeds.
-            if pre_built is not None and pre_built.get("entity_kind") == "edge":
+            # edges can appear during refresh. Some precompute paths do not materialize
+            # sided r** tables eagerly, so synthesize them here directly at the edge
+            # quadrature points in the active union layout.
+            if pre_built is not None and (
+                pre_built.get("entity_kind") == "edge"
+                or ("qp_phys" in pre_built and "eids" in pre_built)
+            ):
                 qp_phys_raw = pre_built.get("qp_phys", None)
                 nQ = 0
                 if qp_phys_raw is not None:
@@ -1624,6 +1642,12 @@ def _build_jit_kernel_args(       # ← signature unchanged
                     args[name] = np.empty((0, nQ, n_union), dtype=np.float64)
                     continue
 
+                if d0 == 0 and d1 == 0:
+                    args[name] = _basis_table_phys_union(fld)
+                else:
+                    args[name] = _deriv_table_phys_union(fld, d0, d1)
+                continue
+
             # 3) Otherwise (GHOST with no precompute): must be provided via metadata['derivs']
             if _is_ghost(pre_built):
                 raise KeyError(
@@ -1631,7 +1655,15 @@ def _build_jit_kernel_args(       # ← signature unchanged
                     "For ghost integrals, include metadata['derivs'] (e.g. {(1,0),(0,1)}) so r10/r01 are emitted."
                 )
             # If not ghost and not interface (shouldn’t happen), fail clearly
-            raise KeyError(f"_build_jit_kernel_args: kernel requests '{name}', but it wasn't provided.")
+            pb_keys = tuple(sorted(str(k) for k in (pre_built or {}).keys()))
+            raise KeyError(
+                "_build_jit_kernel_args: kernel requests "
+                f"'{name}', but it wasn't provided. "
+                f"entity_kind={pre_built.get('entity_kind') if isinstance(pre_built, dict) else None!r}, "
+                f"has_qp_phys={bool(isinstance(pre_built, dict) and ('qp_phys' in pre_built))}, "
+                f"has_eids={bool(isinstance(pre_built, dict) and ('eids' in pre_built))}, "
+                f"pre_built_keys={pb_keys[:24]}"
+            )
 
         if name in args:
             continue

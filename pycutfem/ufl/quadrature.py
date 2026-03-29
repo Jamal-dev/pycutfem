@@ -9,7 +9,8 @@ from pycutfem.ufl.expressions import (
     Expression, Constant, TestFunction, TrialFunction, VectorTestFunction,
     VectorTrialFunction, Function, VectorFunction, HdivTestFunction, HdivTrialFunction, Grad, DivOperation, Inner,
     Dot, Sum, Sub, Prod, Pos, Neg, Div, FacetNormal, ElementWiseConstant, Jump,
-    Derivative, Transpose, Trace, Determinant, Cofactor, Inverse, PositivePart, Heaviside, Log, Exp
+    Derivative, Transpose, Trace, Determinant, Cofactor, Inverse, PositivePart, Heaviside, Log, Exp, Tanh,
+    Sin, Cos, Tan, Asin, Acos, Atan, Sinh, Cosh, Asinh, Acosh, Atanh
 )
 
 if TYPE_CHECKING:
@@ -78,8 +79,8 @@ class PolynomialDegreeEstimator:
         elif isinstance(expr, (PositivePart, Heaviside)):
             # Non-smooth unary wrappers; treat as degree of operand.
             result = self._get_degree(expr.operand)
-        elif isinstance(expr, (Log, Exp)):
-            # log(x) / exp(x) are non-polynomial; reuse the operand degree as a conservative proxy.
+        elif isinstance(expr, (Log, Exp, Tanh, Sin, Cos, Tan, Asin, Acos, Atan, Sinh, Cosh, Asinh, Acosh, Atanh)):
+            # Smooth unary non-polynomial wrappers reuse the operand degree as a conservative proxy.
             result = self._get_degree(expr.operand)
         elif isinstance(expr, Transpose):
             # Transpose does not change polynomial degree.

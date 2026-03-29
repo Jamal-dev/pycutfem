@@ -162,6 +162,7 @@ def _create_problem(nx: int) -> dict[str, object]:
             "u_x": 2,
             "u_y": 2,
             "alpha": 1,
+            "B": 1,
             "mu_alpha": 1,
         },
     )
@@ -180,24 +181,28 @@ def _create_problem(nx: int) -> dict[str, object]:
         "du": VectorTrialFunction(space=U, dof_handler=dh),
         "dp": TrialFunction("p", dof_handler=dh),
         "dalpha": TrialFunction("alpha", dof_handler=dh),
+        "dB": TrialFunction("B", dof_handler=dh),
         "dmu": TrialFunction("mu_alpha", dof_handler=dh),
         "v_test": VectorTestFunction(space=V, dof_handler=dh),
         "vS_test": VectorTestFunction(space=VS, dof_handler=dh),
         "u_test": VectorTestFunction(space=U, dof_handler=dh),
         "q_test": TestFunction("p", dof_handler=dh),
         "alpha_test": TestFunction("alpha", dof_handler=dh),
+        "B_test": TestFunction("B", dof_handler=dh),
         "mu_test": TestFunction("mu_alpha", dof_handler=dh),
         "v_k": VectorFunction("v_k", ["v_x", "v_y"], dof_handler=dh),
         "p_k": Function("p_k", "p", dof_handler=dh),
         "vS_k": VectorFunction("vS_k", ["vS_x", "vS_y"], dof_handler=dh),
         "u_k": VectorFunction("u_k", ["u_x", "u_y"], dof_handler=dh),
         "alpha_k": Function("alpha_k", "alpha", dof_handler=dh),
+        "B_k": Function("B_k", "B", dof_handler=dh),
         "mu_k": Function("mu_k", "mu_alpha", dof_handler=dh),
         "v_n": VectorFunction("v_n", ["v_x", "v_y"], dof_handler=dh),
         "p_n": Function("p_n", "p", dof_handler=dh),
         "vS_n": VectorFunction("vS_n", ["vS_x", "vS_y"], dof_handler=dh),
         "u_n": VectorFunction("u_n", ["u_x", "u_y"], dof_handler=dh),
         "alpha_n": Function("alpha_n", "alpha", dof_handler=dh),
+        "B_n": Function("B_n", "B", dof_handler=dh),
         "mu_n": Function("mu_n", "mu_alpha", dof_handler=dh),
     }
 
@@ -208,6 +213,7 @@ def _set_snapshots(problem: dict[str, object], bench: JonasShearBenchmark) -> No
     problem["vS_n"].set_values_from_function(lambda x, y: bench.vS_n(x, y))
     problem["u_n"].set_values_from_function(lambda x, y: bench.u_n(x, y))
     problem["alpha_n"].set_values_from_function(lambda x, y: float(bench.alpha_n(x, y)))
+    problem["B_n"].set_values_from_function(lambda x, y: float(bench.B_n(x, y)))
     problem["mu_n"].set_values_from_function(lambda x, y: float(bench.mu_alpha_n(x, y)))
 
     problem["v_k"].set_values_from_function(lambda x, y: bench.v_k(x, y))
@@ -215,6 +221,7 @@ def _set_snapshots(problem: dict[str, object], bench: JonasShearBenchmark) -> No
     problem["vS_k"].set_values_from_function(lambda x, y: bench.vS_k(x, y))
     problem["u_k"].set_values_from_function(lambda x, y: bench.u_k(x, y))
     problem["alpha_k"].set_values_from_function(lambda x, y: float(bench.alpha_k(x, y)))
+    problem["B_k"].set_values_from_function(lambda x, y: float(bench.B_k(x, y)))
     problem["mu_k"].set_values_from_function(lambda x, y: float(bench.mu_alpha_k(x, y)))
 
 
@@ -226,24 +233,28 @@ def _build_forms(problem: dict[str, object], bench: JonasShearBenchmark, *, qdeg
         vS_k=problem["vS_k"],
         u_k=problem["u_k"],
         alpha_k=problem["alpha_k"],
+        B_k=problem["B_k"],
         mu_alpha_k=problem["mu_k"],
         v_n=problem["v_n"],
         p_n=problem["p_n"],
         vS_n=problem["vS_n"],
         u_n=problem["u_n"],
         alpha_n=problem["alpha_n"],
+        B_n=problem["B_n"],
         mu_alpha_n=problem["mu_n"],
         dv=problem["dv"],
         dp=problem["dp"],
         dvS=problem["dvS"],
         du=problem["du"],
         dalpha=problem["dalpha"],
+        dB=problem["dB"],
         dmu_alpha=problem["dmu"],
         v_test=problem["v_test"],
         q_test=problem["q_test"],
         vS_test=problem["vS_test"],
         u_test=problem["u_test"],
         alpha_test=problem["alpha_test"],
+        B_test=problem["B_test"],
         mu_alpha_test=problem["mu_test"],
         dx=dx(metadata={"q": int(qdeg)}),
         dt=Constant(float(bench.dt)),
@@ -268,6 +279,7 @@ def _build_forms(problem: dict[str, object], bench: JonasShearBenchmark, *, qdeg
         f_v=Analytic(lambda x, y: bench.f_v(x, y), degree=10),
         f_u=Analytic(lambda x, y: bench.f_u(x, y), degree=10),
         f_alpha=Analytic(lambda x, y: bench.f_alpha(x, y), degree=10),
+        f_B=Analytic(lambda x, y: bench.f_B(x, y), degree=10),
     )
 
 
@@ -284,6 +296,7 @@ def _build_bcs(bench: JonasShearBenchmark):
                 BoundaryCondition("u_x", "dirichlet", tag, _as_float_time(lambda x, y: bench.u(x, y)[..., 0])),
                 BoundaryCondition("u_y", "dirichlet", tag, _as_float_time(lambda x, y: bench.u(x, y)[..., 1])),
                 BoundaryCondition("alpha", "dirichlet", tag, _as_float_time(bench.alpha)),
+                BoundaryCondition("B", "dirichlet", tag, _as_float_time(bench.B)),
                 BoundaryCondition("mu_alpha", "dirichlet", tag, _as_float_time(bench.mu_alpha)),
             ]
         )
@@ -297,14 +310,17 @@ def _sample_profiles(problem: dict[str, object], bench: JonasShearBenchmark, *, 
     v_num = np.asarray([_eval_vector_at_point(problem["dh"], problem["mesh"], problem["v_k"], (x0, float(yy)))[0] for yy in y], dtype=float)
     u_num = np.asarray([_eval_vector_at_point(problem["dh"], problem["mesh"], problem["u_k"], (x0, float(yy)))[0] for yy in y], dtype=float)
     alpha_num = np.asarray([_eval_scalar_at_point(problem["dh"], problem["mesh"], problem["alpha_k"], (x0, float(yy))) for yy in y], dtype=float)
+    B_num = np.asarray([_eval_scalar_at_point(problem["dh"], problem["mesh"], problem["B_k"], (x0, float(yy))) for yy in y], dtype=float)
     return {
         "y": y,
         "v_num": v_num,
         "u_num": u_num,
         "alpha_num": alpha_num,
+        "B_num": B_num,
         "v_exact": np.asarray(bench.v(x0 * np.ones_like(y), y), dtype=float)[:, 0],
         "u_exact": np.asarray(bench.u(x0 * np.ones_like(y), y), dtype=float)[:, 0],
         "alpha_exact": np.asarray(bench.alpha(x0 * np.ones_like(y), y), dtype=float),
+        "B_exact": np.asarray(bench.B(x0 * np.ones_like(y), y), dtype=float),
     }
 
 
@@ -349,10 +365,19 @@ def _solve_one(
     solver._current_dt = float(bench.dt)
     aux_functions = {"dt": Constant(float(bench.dt))}
     bcs_now = solver._freeze_bcs(solver.bcs, float(bench.dt))
-    problem["dh"].apply_bcs(bcs_now, problem["v_k"], problem["p_k"], problem["vS_k"], problem["u_k"], problem["alpha_k"], problem["mu_k"])
+    problem["dh"].apply_bcs(
+        bcs_now,
+        problem["v_k"],
+        problem["p_k"],
+        problem["vS_k"],
+        problem["u_k"],
+        problem["alpha_k"],
+        problem["B_k"],
+        problem["mu_k"],
+    )
     _, converged, n_iters = solver._newton_loop(
-        [problem["v_k"], problem["p_k"], problem["vS_k"], problem["u_k"], problem["alpha_k"], problem["mu_k"]],
-        [problem["v_n"], problem["p_n"], problem["vS_n"], problem["u_n"], problem["alpha_n"], problem["mu_n"]],
+        [problem["v_k"], problem["p_k"], problem["vS_k"], problem["u_k"], problem["alpha_k"], problem["B_k"], problem["mu_k"]],
+        [problem["v_n"], problem["p_n"], problem["vS_n"], problem["u_n"], problem["alpha_n"], problem["B_n"], problem["mu_n"]],
         aux_functions,
         bcs_now,
     )
@@ -395,6 +420,15 @@ def _solve_one(
                 problem["alpha_k"],
                 exact={"alpha": lambda x, y: bench.alpha(x, y)},
                 fields=["alpha"],
+                quad_order=int(qerr),
+                relative=False,
+            )
+        ),
+        "B_l2": float(
+            dh.l2_error(
+                problem["B_k"],
+                exact={"B": lambda x, y: bench.B(x, y)},
+                fields=["B"],
                 quad_order=int(qerr),
                 relative=False,
             )
@@ -453,6 +487,18 @@ def _solve_one(
                 backend=error_backend_key,
             )
         )
+        err["B_h1"] = float(
+            dh.h1_error_scalar_on_side_compiled(
+                problem["B_k"],
+                lambda x, y: bench.grad_B(x, y),
+                FULL_DOMAIN_LS,
+                side="-",
+                field="B",
+                relative=False,
+                quad_order=int(qerr),
+                backend=error_backend_key,
+            )
+        )
         err["mu_alpha_h1"] = float(
             dh.h1_error_scalar_on_side_compiled(
                 problem["mu_k"],
@@ -498,6 +544,16 @@ def _solve_one(
                 relative=False,
             )
         )
+        err["B_h1"] = float(
+            dh.h1_error_scalar_on_side(
+                problem["B_k"],
+                lambda x, y: bench.grad_B(x, y),
+                FULL_DOMAIN_LS,
+                side="-",
+                field="B",
+                relative=False,
+            )
+        )
         err["mu_alpha_h1"] = float(
             dh.h1_error_scalar_on_side(
                 problem["mu_k"],
@@ -514,6 +570,8 @@ def _solve_one(
     u_interface_exact = float(np.asarray(bench.u(*interface_point), dtype=float).reshape(2)[0])
     alpha_interface_num = float(_eval_scalar_at_point(dh, problem["mesh"], problem["alpha_k"], interface_point))
     alpha_interface_exact = float(np.asarray(bench.alpha(*interface_point), dtype=float).reshape(()))
+    B_interface_num = float(_eval_scalar_at_point(dh, problem["mesh"], problem["B_k"], interface_point))
+    B_interface_exact = float(np.asarray(bench.B(*interface_point), dtype=float).reshape(()))
 
     row = {
         "nx": int(nx),
@@ -524,8 +582,10 @@ def _solve_one(
         "solve_seconds": float(elapsed),
         "alpha_transport_velocity": ALPHA_TRANSPORT_VELOCITY,
         "alpha_transport_form": ALPHA_TRANSPORT_FORM,
+        "reduced_support_state": "alpha-B",
         "u_interface_error": abs(u_interface_num - u_interface_exact),
         "alpha_interface_error": abs(alpha_interface_num - alpha_interface_exact),
+        "B_interface_error": abs(B_interface_num - B_interface_exact),
         "tau_interface_exact": float(np.asarray(bench.g_t(*interface_point), dtype=float).reshape(2)[0]),
     }
     row.update(err)
@@ -543,6 +603,7 @@ def _solve_one(
                 "v": problem["v_k"],
                 "u": problem["u_k"],
                 "alpha": problem["alpha_k"],
+                "B": problem["B_k"],
                 "mu_alpha": problem["mu_k"],
             },
         )
@@ -561,13 +622,16 @@ def _add_eocs(rows: list[dict[str, float]]) -> list[dict[str, float]]:
         "vS_l2",
         "u_l2",
         "alpha_l2",
+        "B_l2",
         "mu_alpha_l2",
         "v_h1",
         "u_h1",
         "alpha_h1",
+        "B_h1",
         "mu_alpha_h1",
         "u_interface_error",
         "alpha_interface_error",
+        "B_interface_error",
     ]
     out: list[dict[str, float]] = []
     prev = None
@@ -581,7 +645,7 @@ def _add_eocs(rows: list[dict[str, float]]) -> list[dict[str, float]]:
 
 
 def _write_profiles_csv(path: Path, samples: dict[str, np.ndarray]) -> None:
-    keys = ["y", "v_num", "v_exact", "u_num", "u_exact", "alpha_num", "alpha_exact"]
+    keys = ["y", "v_num", "v_exact", "u_num", "u_exact", "alpha_num", "alpha_exact", "B_num", "B_exact"]
     with path.open("w", newline="", encoding="utf-8") as fh:
         writer = csv.writer(fh)
         writer.writerow(keys)
@@ -623,6 +687,7 @@ def _write_outputs(results: list[CaseResult], *, outdir: Path, save_plot: bool, 
                 "",
                 f"- alpha transport velocity: `{ALPHA_TRANSPORT_VELOCITY}`",
                 f"- alpha transport form: `{ALPHA_TRANSPORT_FORM}`",
+                "- reduced support state: `alpha-B`",
                 "",
                 _markdown_table(df),
             ]
@@ -647,6 +712,7 @@ def _write_outputs(results: list[CaseResult], *, outdir: Path, save_plot: bool, 
         ("v_l2", r"$\|e_v\|_{L^2}$"),
         ("u_l2", r"$\|e_u\|_{L^2}$"),
         ("alpha_l2", r"$\|e_\alpha\|_{L^2}$"),
+        ("B_l2", r"$\|e_B\|_{L^2}$"),
         ("u_interface_error", r"$|e_{u,\Gamma}|$"),
     ):
         ax.loglog(h, df[key].to_numpy(dtype=float), marker="o", linewidth=1.7, label=label)
@@ -660,7 +726,7 @@ def _write_outputs(results: list[CaseResult], *, outdir: Path, save_plot: bool, 
     plt.close(fig)
 
     prof = results[-1].profile_samples
-    fig, axes = plt.subplots(1, 3, figsize=(13.5, 4.2), constrained_layout=True)
+    fig, axes = plt.subplots(1, 4, figsize=(17.2, 4.2), constrained_layout=True)
     axes[0].plot(prof["v_exact"], prof["y"], color="#111827", lw=2.0, label="exact")
     axes[0].plot(prof["v_num"], prof["y"], color="#1D4ED8", lw=1.7, linestyle="--", label="numerical")
     axes[0].set_xlabel(r"$v_x$")
@@ -683,11 +749,18 @@ def _write_outputs(results: list[CaseResult], *, outdir: Path, save_plot: bool, 
     axes[2].set_title("Conserved CH profile")
     axes[2].grid(True, linestyle=":", linewidth=0.5)
 
+    axes[3].plot(prof["B_exact"], prof["y"], color="#111827", lw=2.0, label="exact")
+    axes[3].plot(prof["B_num"], prof["y"], color="#7C3AED", lw=1.7, linestyle="--", label="numerical")
+    axes[3].set_xlabel(r"$B$")
+    axes[3].set_ylabel(r"$y$")
+    axes[3].set_title("Solid support fraction")
+    axes[3].grid(True, linestyle=":", linewidth=0.5)
+
     profiles_png = outdir / "benchmark5_jonas_shear_profiles.png"
     fig.savefig(profiles_png, dpi=int(png_dpi))
     plt.close(fig)
 
-    fig, axes = plt.subplots(1, 3, figsize=(13.5, 4.2), constrained_layout=True)
+    fig, axes = plt.subplots(1, 4, figsize=(17.2, 4.2), constrained_layout=True)
     extent = [0.0, 1.0, 0.0, 1.0]
     y = prof["y"]
     X = np.linspace(0.0, 1.0, 48, dtype=float)
@@ -695,10 +768,12 @@ def _write_outputs(results: list[CaseResult], *, outdir: Path, save_plot: bool, 
     VV = np.tile(prof["v_num"].reshape(1, -1), (X.size, 1))
     UU = np.tile(prof["u_num"].reshape(1, -1), (X.size, 1))
     AA = np.tile(prof["alpha_num"].reshape(1, -1), (X.size, 1))
+    BB = np.tile(prof["B_num"].reshape(1, -1), (X.size, 1))
     for ax, field, title, cmap in (
         (axes[0], VV, r"$v_x$", "coolwarm"),
         (axes[1], UU, r"$u_x$", "cividis"),
         (axes[2], AA, r"$\alpha$", "viridis"),
+        (axes[3], BB, r"$B$", "magma"),
     ):
         im = ax.imshow(field.T, origin="lower", extent=extent, aspect="auto", cmap=cmap)
         ax.axhline(0.5, color="white", lw=1.4, linestyle="--")

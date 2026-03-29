@@ -56,6 +56,7 @@ from pycutfem.core.mesh import Mesh
 from pycutfem.fem.mixedelement import MixedElement
 from pycutfem.io.vtk import export_vtk
 from pycutfem.solvers.nonlinear_solver import (
+    InteriorPointNewtonSolver,
     LinearEqualityConstraint,
     LinearSolverParameters,
     NewtonParameters,
@@ -76,6 +77,7 @@ from pycutfem.ufl.expressions import (
     VectorTestFunction,
     VectorTrialFunction,
     exp,
+    tanh,
 )
 from pycutfem.ufl.forms import BoundaryCondition, Equation, assemble_form
 from pycutfem.ufl.helpers import analyze_active_dofs
@@ -83,9 +85,17 @@ from pycutfem.ufl.measures import dS, ds, dx
 from pycutfem.ufl.spaces import FunctionSpace
 from pycutfem.utils.meshgen import structured_quad
 from pycutfem.utils.functionals import NamedFunctionalEvaluator
+from pycutfem.utils.mpi import barrier, get_mpi_context
 
 from examples.utils.biofilm.deformation_only import build_deformation_only_forms
 from examples.utils.biofilm.one_domain import build_biofilm_one_domain_forms
+
+
+MPI_CTX = get_mpi_context()
+
+
+def _mpi_io_root() -> bool:
+    return (not MPI_CTX.enabled) or MPI_CTX.is_root
 
 
 @dataclass(frozen=True)
@@ -114,6 +124,34 @@ class CaseResult:
     fixed_metrics: ProfileMetrics | None
 
 
+def _named_constant(name: str, value, *, dim: int | None = None) -> Constant:
+    const = value if isinstance(value, Constant) else Constant(value, dim=dim)
+    setattr(const, "_jit_name", str(name))
+    return const
+
+
+def _pc_path_tangent_euler_step(
+    *,
+    x_red: np.ndarray,
+    jacobian_red,
+    dH_dlambda_red: np.ndarray,
+    delta_lambda: float,
+    solve_linear_system,
+) -> tuple[np.ndarray, np.ndarray]:
+    x_now = np.asarray(x_red, dtype=float).ravel()
+    dH = np.asarray(dH_dlambda_red, dtype=float).ravel()
+    z_dot = np.asarray(
+        solve_linear_system(jacobian_red, -dH),
+        dtype=float,
+    ).ravel()
+    if x_now.shape != z_dot.shape:
+        raise ValueError(
+            f"Tangent solve returned shape {z_dot.shape}, expected {x_now.shape}."
+        )
+    x_pred = x_now + float(delta_lambda) * z_dot
+    return np.asarray(x_pred, dtype=float), np.asarray(z_dot, dtype=float)
+
+
 def _parse_float_list(raw: str) -> list[float]:
     out: list[float] = []
     for item in str(raw).split(","):
@@ -132,11 +170,20 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument("--outdir", type=str, default="out/benchmark7_seboldt")
     ap.add_argument("--backend", type=str, default="cpp", choices=("python", "jit", "cpp"))
     ap.add_argument(
+        "--cpp-fuse-integrals",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "For backend=cpp, fuse same-measure integrals during kernel compilation. "
+            "Defaults to on for Benchmark 7 unless PYCUTFEM_CPP_FUSE_INTEGRALS is already set."
+        ),
+    )
+    ap.add_argument(
         "--nonlinear-solver",
         type=str,
         default="pdas",
-        choices=("pdas", "newton"),
-        help="Nonlinear solver for Benchmark 7. PDAS enforces box constraints on alpha/phi.",
+        choices=("pdas", "ipm", "newton"),
+        help="Nonlinear solver for Benchmark 7. PDAS and IPM enforce box constraints on alpha/phi.",
     )
     ap.add_argument(
         "--linear-backend",
@@ -144,6 +191,12 @@ def _parse_args() -> argparse.Namespace:
         default="scipy",
         choices=("scipy", "petsc", "pardiso"),
         help="Linear algebra backend used inside the Newton/PDAS solve.",
+    )
+    ap.add_argument(
+        "--petsc-distributed",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use PETSc COMM_WORLD distributed linear solves when --linear-backend=petsc under mpirun.",
     )
     ap.add_argument("--poly-order", type=int, default=2, help="Primary polynomial order for velocity and solid fields.")
     ap.add_argument(
@@ -389,6 +442,16 @@ def _parse_args() -> argparse.Namespace:
         help="Alpha transport form: advective strong form, conservative strong form, conservative weak/IBP form, or interface-band conservative transport.",
     )
     ap.add_argument(
+        "--alpha-from-refmap",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Do not solve the alpha transport PDE. Instead, treat alpha as a dependent field "
+            "recomputed from the Eulerian reference map u via alpha(x,t)=alpha0(x-u(x,t)) "
+            "while keeping phi enabled and solved monolithically."
+        ),
+    )
+    ap.add_argument(
         "--support-physics",
         type=str,
         default="internal_conversion",
@@ -486,6 +549,15 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     ap.add_argument(
+        "--alpha-mass-constraint",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Add a global scalar Lagrange-multiplier row enforcing "
+            "int_Omega alpha^{n+1} dx = int_Omega alpha^n dx in the direct-alpha monolithic solve."
+        ),
+    )
+    ap.add_argument(
         "--top-drainage-transport",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -502,11 +574,12 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--condition-balanced-solid-cut-fix",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help=(
-            "For mechanics_nondim_mode=condition_balanced, deactivate free-fluid solid DOFs "
-            "(u, vS) above the biofilm top so the reduced operator does not carry the "
-            "extension-only y>y_interface mode."
+            "Optional debugging aid for mechanics_nondim_mode=condition_balanced: "
+            "deactivate solid u/vS DOFs above --solid-dof-y-cut. Disabled by default "
+            "because Seboldt's porous block lies above y_interface, so using y_interface "
+            "as an implicit cutoff would remove the entire deforming solid."
         ),
     )
     ap.add_argument(
@@ -515,7 +588,7 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Deactivate u/vS DOFs with y strictly above this cutoff. "
-            "If omitted, condition_balanced defaults to y_interface."
+            "No cutoff is applied unless this is set explicitly."
         ),
     )
     ap.add_argument(
@@ -582,8 +655,8 @@ def _parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=False,
         help=(
-            "Introduce latent transport unknowns and algebraic relations alpha=sigmoid(alpha_latent) "
-            "and phi=sigmoid(phi_latent). The benchmark then uses plain monolithic Newton without PDAS "
+            "Introduce latent transport unknowns and algebraic relations alpha=map(alpha_latent) "
+            "and phi=map(phi_latent). The benchmark then uses plain monolithic Newton without PDAS "
             "or solver-coordinate transform hacks."
         ),
     )
@@ -601,7 +674,7 @@ def _parse_args() -> argparse.Namespace:
         "--latent-bounded-map",
         type=str,
         default="sigmoid",
-        choices=("sigmoid", "algebraic"),
+        choices=("sigmoid", "tanh", "algebraic"),
         help="Bounded latent map used for alpha/phi when --latent-bounded-transport is enabled.",
     )
     ap.add_argument(
@@ -726,8 +799,9 @@ def _parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "Enable the step-1 latent predictor-corrector startup path: P0 frozen-transport mechanics, "
-            "P1 alpha-released monolithic predictor, then the exact monolithic corrector."
+            "Enable the step-1 predictor-corrector startup guess builder: P0 frozen-transport mechanics, "
+            "P1 alpha-released monolithic predictor, then the exact monolithic corrector used only to construct "
+            "the first restart state."
         ),
     )
     ap.add_argument(
@@ -747,6 +821,15 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=12,
         help="Maximum Newton iterations used in predictor stage P2.",
+    )
+    ap.add_argument(
+        "--pc-exact-probe-max-it",
+        type=int,
+        default=1,
+        help=(
+            "Before stage P2, try this many exact monolithic Newton iterations from the current P1 basin. "
+            "If the exact branch already decreases |R_raw|_inf materially, skip P2."
+        ),
     )
     ap.add_argument(
         "--pc-p2-lambda-steps",
@@ -793,6 +876,30 @@ def _parse_args() -> argparse.Namespace:
         help="Skeleton inertia / convection model used in full-field predictor stage P2.",
     )
     ap.add_argument(
+        "--pc-p2-easy-dt-divisor",
+        type=float,
+        default=100.0,
+        help=(
+            "Pseudo-time-step divisor used for the easy P2 homotopy model G. "
+            "The easy model uses dt_easy = dt / this divisor."
+        ),
+    )
+    ap.add_argument(
+        "--pc-p2-staggered-anchor",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Before the full P2 homotopy, build an anchor state with one staggered micro-step "
+            "using dt/pc_p2_easy_dt_divisor."
+        ),
+    )
+    ap.add_argument(
+        "--pc-p2-staggered-anchor-outer-it",
+        type=int,
+        default=1,
+        help="Number of staggered outer sweeps used to build the P2 micro-step anchor.",
+    )
+    ap.add_argument(
         "--pc-projection-trials",
         type=int,
         default=5,
@@ -803,6 +910,15 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=12,
         help="Number of geometric segment-projection trials used inside predictor stage P2.",
+    )
+    ap.add_argument(
+        "--pc-p2-max-exact-worsen-rel",
+        type=float,
+        default=5.0e-2,
+        help=(
+            "Maximum relative worsening in the exact raw residual allowed during intermediate P2 "
+            "homotopy stages, measured against the P2 entry state."
+        ),
     )
     ap.add_argument(
         "--pc-min-rel-improve",
@@ -837,8 +953,11 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--pc-p2-reentry-max-retries",
         type=int,
-        default=4,
-        help="Maximum number of P2 re-entry retries allowed after the exact corrector stalls on the same step.",
+        default=0,
+        help=(
+            "Maximum number of legacy P2 re-entry retries allowed after the exact corrector stalls on the same step. "
+            "Default 0 disables P2 re-entry so the monolithic SQP/globalization recovery path remains primary."
+        ),
     )
     ap.add_argument(
         "--pc-p2-reentry-lambda0",
@@ -1043,6 +1162,16 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument("--vi-lm-accept-ratio", type=float, default=1.0e-3, help="Semismooth LM accept threshold.")
     ap.add_argument("--vi-lm-good-ratio", type=float, default=5.0e-2, help="Semismooth LM good-step threshold.")
     ap.add_argument("--vi-lm-max-tries", type=int, default=6, help="Maximum semismooth LM trial solves per Newton step.")
+    ap.add_argument("--vi-ipm-mu0", type=float, default=1.0e-2, help="Initial barrier parameter for the interior-point constrained solver.")
+    ap.add_argument("--vi-ipm-mu-min", type=float, default=1.0e-10, help="Terminal barrier parameter for the interior-point constrained solver.")
+    ap.add_argument("--vi-ipm-mu-decay", type=float, default=0.2, help="Barrier decay factor between interior-point homotopy stages.")
+    ap.add_argument("--vi-ipm-max-barrier-steps", type=int, default=12, help="Maximum number of interior-point barrier stages per nonlinear solve.")
+    ap.add_argument("--vi-ipm-fraction-to-boundary", type=float, default=0.995, help="Fraction-to-the-boundary safeguard used by the interior-point solver.")
+    ap.add_argument("--vi-ipm-armijo-c1", type=float, default=1.0e-4, help="Armijo decrease constant for the interior-point residual line search.")
+    ap.add_argument("--vi-ipm-step-reduction", type=float, default=0.5, help="Backtracking factor used by the interior-point line search.")
+    ap.add_argument("--vi-ipm-step-min", type=float, default=1.0e-10, help="Minimum admissible backtracking step for the interior-point solver.")
+    ap.add_argument("--vi-ipm-initial-push", type=float, default=1.0e-8, help="Strict-interior push used when initializing the interior-point slacks.")
+    ap.add_argument("--vi-ipm-stage-tol-factor", type=float, default=0.25, help="Barrier-stage stopping tolerance factor relative to the current mu.")
     ap.add_argument(
         "--ls-mode",
         type=str,
@@ -1184,6 +1313,17 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     ap.add_argument(
+        "--startup-transport-solver",
+        type=str,
+        default="auto",
+        choices=("auto", "newton", "pdas", "ipm"),
+        help=(
+            "Nonlinear solver used only for the staggered startup transport stage. "
+            "'auto' follows the monolithic solver; 'pdas' is useful when the main solve uses ipm "
+            "but the startup transport preload should use a more robust active-set predictor."
+        ),
+    )
+    ap.add_argument(
         "--later-step-staggered-outer-it",
         type=int,
         default=1,
@@ -1291,6 +1431,18 @@ def _parse_args() -> argparse.Namespace:
     return ap.parse_args()
 
 
+def _configure_benchmark7_cpp_fuse_integrals(*, backend: str, enabled: bool | None) -> str | None:
+    backend_key = str(backend).strip().lower()
+    if backend_key not in {"cpp", "c++"}:
+        return os.environ.get("PYCUTFEM_CPP_FUSE_INTEGRALS")
+    prev = os.environ.get("PYCUTFEM_CPP_FUSE_INTEGRALS")
+    if enabled is None:
+        os.environ.setdefault("PYCUTFEM_CPP_FUSE_INTEGRALS", "1")
+    else:
+        os.environ["PYCUTFEM_CPP_FUSE_INTEGRALS"] = "1" if bool(enabled) else "0"
+    return prev
+
+
 def _characteristic_h(*, Lx: float, Ly: float, nx: int, ny: int) -> float:
     return max(float(Lx) / float(nx), float(Ly) / float(ny))
 
@@ -1309,8 +1461,6 @@ def _resolved_orders(args: argparse.Namespace) -> tuple[int, int, int]:
 
 
 def _effective_eps_alpha(args: argparse.Namespace) -> float:
-    if bool(getattr(args, "predictor_corrector_startup", False)) and args.eps_alpha_over_h is not None:
-        return float(args.eps_alpha)
     if args.eps_alpha_over_h is None:
         return float(args.eps_alpha)
     h_char = _characteristic_h(Lx=float(args.Lx), Ly=float(args.Ly), nx=int(args.nx), ny=int(args.ny))
@@ -1321,11 +1471,33 @@ def _full_top_drainage_transport_enabled(*, enable_phi_evolution: bool, top_drai
     return bool(enable_phi_evolution) and bool(top_drainage_transport)
 
 
-def _startup_stage_solver_kind(*, main_solver_kind: str, active_fields: list[str]) -> str:
+def _predictor_corrector_startup_enabled(
+    args: argparse.Namespace,
+    problem: dict | None = None,
+) -> bool:
+    if not bool(getattr(args, "predictor_corrector_startup", False)):
+        return False
+    if not bool(getattr(args, "enable_phi_evolution", False)):
+        return False
+    if problem is not None and problem.get("phi_k") is None:
+        return False
+    return True
+
+
+def _startup_stage_solver_kind(
+    *,
+    main_solver_kind: str,
+    active_fields: list[str],
+    stage_name: str | None = None,
+    transport_solver_kind_override: str | None = None,
+) -> str:
+    override_key = str(transport_solver_kind_override or "auto").strip().lower()
+    if str(stage_name or "").strip().lower() == "transport" and override_key in {"newton", "pdas", "ipm"}:
+        return override_key
     solver_key = str(main_solver_kind).strip().lower()
     active = {str(name) for name in list(active_fields or [])}
-    if solver_key == "pdas" and bool(active & {"alpha", "phi"}):
-        return "pdas"
+    if solver_key in {"pdas", "ipm"} and bool(active & {"alpha", "phi"}):
+        return solver_key
     return "newton"
 
 
@@ -1350,6 +1522,199 @@ def _startup_stage_relaxed_accept_ginf(args: argparse.Namespace) -> float:
     return max(1.0e3 * tol, 1.0e-6)
 
 
+def _pc_p2_lambda_schedule(n_steps: int, *, include_zero: bool = False) -> list[float]:
+    n = max(1, int(n_steps))
+    out: list[float] = [0.0] if bool(include_zero) else []
+    if n <= 1:
+        out.append(1.0)
+        return out
+    for i in range(1, n + 1):
+        out.append(float(i * i) / float(n * n))
+    return out
+
+
+def _pc_p2_easy_dt_value(args: argparse.Namespace, dt_now: float) -> float:
+    dt_val = max(abs(float(dt_now)), 1.0e-12)
+    divisor = max(1.0, float(getattr(args, "pc_p2_easy_dt_divisor", 100.0) or 100.0))
+    return float(dt_val / divisor)
+
+
+def _pc_fluid_convection_selectors(mode: str) -> dict[str, float]:
+    key = str(mode).strip().lower()
+    if key == "explicit":
+        key = "imex"
+    if key not in {"full", "lagged", "imex", "off"}:
+        raise ValueError(
+            f"Unsupported predictor-corrector fluid_convection={mode!r}. "
+            "Use 'full', 'lagged', 'imex', or 'off'."
+        )
+    return {
+        "full": 1.0 if key == "full" else 0.0,
+        "lagged": 1.0 if key == "lagged" else 0.0,
+        "imex": 1.0 if key == "imex" else 0.0,
+    }
+
+
+def _pc_skeleton_inertia_selectors(mode: str) -> dict[str, float]:
+    key = str(mode).strip().lower()
+    if key in {"conservative", "nonlinear"}:
+        key = "full"
+    if key in {"picard", "semi", "semi_implicit", "linear"}:
+        key = "lagged"
+    if key not in {"full", "lagged"}:
+        raise ValueError(
+            f"Unsupported predictor-corrector skeleton_inertia_convection={mode!r}. "
+            "Use 'full' or 'lagged'."
+        )
+    return {
+        "full": 1.0 if key == "full" else 0.0,
+        "lagged": 1.0 if key == "lagged" else 0.0,
+    }
+
+
+def _pc_required_drop(
+    raw_before: float,
+    *,
+    min_abs_decrease: float = 1.0e-10,
+    min_rel_improve: float = 0.0,
+) -> float:
+    abs_floor = max(0.0, float(min_abs_decrease))
+    rel_floor = max(0.0, float(min_rel_improve))
+    if not np.isfinite(float(raw_before)) or float(raw_before) <= 0.0:
+        return float(abs_floor)
+    return float(max(abs_floor, rel_floor * float(raw_before)))
+
+
+def _pc_progress(
+    before_stats: dict[str, float],
+    after_stats: dict[str, float],
+    *,
+    key: str = "raw_inf",
+    min_abs_decrease: float = 1.0e-10,
+    min_rel_improve: float = 0.0,
+) -> dict[str, float | bool]:
+    raw_before = float(before_stats.get(key, float("nan")))
+    raw_after = float(after_stats.get(key, float("nan")))
+    drop = float(raw_before - raw_after) if np.isfinite(raw_before) and np.isfinite(raw_after) else float("nan")
+    required = _pc_required_drop(
+        raw_before,
+        min_abs_decrease=float(min_abs_decrease),
+        min_rel_improve=float(min_rel_improve),
+    )
+    improved = bool(
+        np.isfinite(raw_before)
+        and np.isfinite(raw_after)
+        and raw_after < raw_before
+        and np.isfinite(drop)
+        and drop >= required
+    )
+    return {
+        "key": str(key),
+        "before": float(raw_before),
+        "after": float(raw_after),
+        "improved": bool(improved),
+        "drop": float(drop),
+        "required": float(required),
+    }
+
+
+def _pc_should_keep_lambda_stage(
+    *,
+    lam: float,
+    before_stats: dict[str, float],
+    after_stats: dict[str, float],
+    exact_reference_stats: dict[str, float] | None = None,
+    alpha_mass_ok: bool,
+    min_abs_decrease: float = 1.0e-10,
+    min_rel_improve: float = 0.0,
+    max_exact_worsen_rel: float = 5.0e-2,
+    homotopy_tol: float = 1.0e-6,
+) -> tuple[bool, dict[str, object]]:
+    exact_progress = _pc_progress(
+        before_stats,
+        after_stats,
+        key="raw_inf",
+        min_abs_decrease=float(min_abs_decrease),
+        min_rel_improve=float(min_rel_improve),
+    )
+    homotopy_progress = _pc_progress(
+        before_stats,
+        after_stats,
+        key="homotopy_raw_inf",
+        min_abs_decrease=float(min_abs_decrease),
+        min_rel_improve=float(min_rel_improve),
+    )
+    homotopy_after = float(after_stats.get("homotopy_raw_inf", after_stats.get("raw_inf", float("nan"))))
+    homotopy_converged = bool(np.isfinite(homotopy_after) and homotopy_after <= max(float(homotopy_tol), 1.0e-16))
+    ref_stats = before_stats if exact_reference_stats is None else exact_reference_stats
+    exact_ref = float(ref_stats.get("raw_inf", float("nan")))
+    exact_after = float(after_stats.get("raw_inf", float("nan")))
+    rel_worsen_cap = max(0.0, float(max_exact_worsen_rel))
+    exact_guard_limit = (
+        float(exact_ref) * (1.0 + rel_worsen_cap)
+        if np.isfinite(exact_ref)
+        else float("nan")
+    )
+    exact_within_guard = bool(
+        np.isfinite(exact_after)
+        and (
+            not np.isfinite(exact_guard_limit)
+            or exact_after <= exact_guard_limit
+        )
+    )
+    if float(lam) >= 1.0 - 1.0e-14:
+        keep = bool(alpha_mass_ok) and bool(exact_progress["improved"] or homotopy_converged) and bool(exact_within_guard)
+    else:
+        keep = bool(alpha_mass_ok) and bool(homotopy_progress["improved"] or homotopy_converged) and bool(exact_within_guard)
+    return bool(keep), {
+        "lambda": float(lam),
+        "exact": dict(exact_progress),
+        "homotopy": dict(homotopy_progress),
+        "homotopy_converged": bool(homotopy_converged),
+        "alpha_mass_ok": bool(alpha_mass_ok),
+        "exact_reference": float(exact_ref),
+        "exact_guard_limit": float(exact_guard_limit),
+        "exact_within_guard": bool(exact_within_guard),
+    }
+
+
+def _pc_should_prefer_exact_probe(
+    *,
+    before_stats: dict[str, float],
+    after_stats: dict[str, float],
+    alpha_mass_ok: bool,
+    min_abs_decrease: float = 1.0e-10,
+    min_rel_improve: float = 0.0,
+    strong_min_abs_decrease: float = 0.0,
+    strong_min_rel_improve: float = 0.0,
+) -> tuple[bool, dict[str, object]]:
+    exact_progress = _pc_progress(
+        before_stats,
+        after_stats,
+        key="raw_inf",
+        min_abs_decrease=float(min_abs_decrease),
+        min_rel_improve=float(min_rel_improve),
+    )
+    strong_exact_progress = _pc_progress(
+        before_stats,
+        after_stats,
+        key="raw_inf",
+        min_abs_decrease=max(float(min_abs_decrease), float(strong_min_abs_decrease)),
+        min_rel_improve=max(float(min_rel_improve), float(strong_min_rel_improve)),
+    )
+    require_strong_progress = bool(
+        float(strong_min_abs_decrease) > 0.0 or float(strong_min_rel_improve) > 0.0
+    )
+    keep = bool(alpha_mass_ok) and bool(exact_progress["improved"])
+    if require_strong_progress:
+        keep = bool(keep) and bool(strong_exact_progress["improved"])
+    return bool(keep), {
+        "exact": dict(exact_progress),
+        "strong_exact": dict(strong_exact_progress),
+        "alpha_mass_ok": bool(alpha_mass_ok),
+    }
+
+
 def _parse_csv_fields(raw: str | None) -> tuple[str, ...]:
     parts = []
     for tok in str(raw or "").replace(";", ",").split(","):
@@ -1357,6 +1722,52 @@ def _parse_csv_fields(raw: str | None) -> tuple[str, ...]:
         if item:
             parts.append(item)
     return tuple(parts)
+
+
+def _effective_logistic_bounded_fields(args: argparse.Namespace) -> tuple[str, ...]:
+    requested = _parse_csv_fields(getattr(args, "logistic_bounded_fields", ""))
+    keep: list[str] = []
+    for name in requested:
+        key = str(name).strip()
+        if not key or key in keep:
+            continue
+        if key == "alpha" and bool(getattr(args, "alpha_from_refmap", False)):
+            continue
+        if key == "phi" and not bool(getattr(args, "enable_phi_evolution", False)):
+            continue
+        keep.append(key)
+    return tuple(keep)
+
+
+def _effective_latent_bounded_fields(args: argparse.Namespace, *, enable_phi_evolution: bool) -> tuple[str, ...]:
+    requested = _parse_csv_fields(getattr(args, "latent_bounded_fields", ""))
+    formulation = _latent_bounded_formulation_key(args)
+    active: list[str] = []
+    for name in requested:
+        key = str(name).strip()
+        if not key or key in active:
+            continue
+        if key == "alpha":
+            if bool(getattr(args, "alpha_from_refmap", False)):
+                continue
+            active.append("alpha")
+        elif key == "phi" and bool(enable_phi_evolution):
+            if formulation != "transformed":
+                print(
+                    "[info] disabling embedded latent phi: the current embedded phi/phi_latent pair creates "
+                    "a near-null algebraic mode near convergence. Keeping phi as a direct field."
+                )
+                continue
+            active.append("phi")
+    return tuple(active)
+
+
+def _logistic_refmap_phi_only_mode(args: argparse.Namespace) -> bool:
+    if not bool(getattr(args, "logistic_bounded_transform", False)):
+        return False
+    if not bool(getattr(args, "alpha_from_refmap", False)):
+        return False
+    return _effective_logistic_bounded_fields(args) == ("phi",)
 
 
 def _condition_balanced_field_scales(
@@ -1495,7 +1906,7 @@ def _condition_balanced_solid_cutoff_y(
         return None
     if solid_dof_y_cut is not None:
         return float(solid_dof_y_cut)
-    return float(y_interface)
+    return None
 
 
 def _function_global_values(func, *, total_dofs: int) -> np.ndarray:
@@ -1667,6 +2078,22 @@ def _tag_inactive_solid_dofs_above_y(problem: dict[str, object], *, y_cut: float
     problem["_inactive_solid_alpha_phase"] = "static_y_cut"
     problem["_inactive_solid_alpha_band_halfwidth"] = float("nan")
     problem["_inactive_solid_reference_y"] = None
+    return counts
+
+
+def _tag_inactive_fields(problem: dict[str, object], *field_names: str) -> dict[str, int]:
+    dh = problem["dh"]
+    inactive = set(int(d) for d in list(getattr(dh, "dof_tags", {}).get("inactive", set()) or set()))
+    counts: dict[str, int] = {}
+    for field in field_names:
+        name = str(field).strip()
+        if not name or name not in getattr(dh, "field_names", ()):
+            counts[name] = 0
+            continue
+        sl = np.asarray(dh.get_field_slice(name), dtype=int).ravel()
+        counts[name] = int(sl.size)
+        inactive.update(int(g) for g in sl.tolist())
+    dh.dof_tags["inactive"] = inactive
     return counts
 
 
@@ -1859,7 +2286,11 @@ def _benchmark7_requires_constrained_solver(args: argparse.Namespace) -> bool:
     alpha_bc_mode_key = str(getattr(args, "alpha_bc_mode", "natural")).strip().lower()
     if alpha_bc_mode_key == "auto":
         alpha_bc_mode_key = "natural"
-    if bool(getattr(args, "alpha_box_constraints", False)) and alpha_bc_mode_key == "natural":
+    if (
+        not bool(getattr(args, "alpha_from_refmap", False))
+        and bool(getattr(args, "alpha_box_constraints", False))
+        and alpha_bc_mode_key == "natural"
+    ):
         return True
     if bool(getattr(args, "enable_phi_evolution", False)) and bool(getattr(args, "phi_box_constraints", False)):
         return True
@@ -1868,6 +2299,84 @@ def _benchmark7_requires_constrained_solver(args: argparse.Namespace) -> bool:
 
 def _normalize_benchmark7_solver_choice(args: argparse.Namespace) -> argparse.Namespace:
     solver_key = str(getattr(args, "nonlinear_solver", "pdas")).strip().lower()
+    if bool(getattr(args, "alpha_from_refmap", False)):
+        if bool(getattr(args, "alpha_mass_constraint", False)):
+            print(
+                "[info] disabling the exact alpha-mass equality because --alpha-from-refmap does not solve alpha as an independent unknown."
+            )
+            args.alpha_mass_constraint = False
+    if bool(getattr(args, "logistic_bounded_transform", False)):
+        requested_logistic_fields = _parse_csv_fields(getattr(args, "logistic_bounded_fields", ""))
+        effective_logistic_fields = _effective_logistic_bounded_fields(args)
+        dropped_logistic_fields = tuple(
+            name for name in requested_logistic_fields if str(name).strip() not in set(effective_logistic_fields)
+        )
+        if dropped_logistic_fields:
+            print(
+                "[info] filtering solver-coordinate logistic fields "
+                f"{dropped_logistic_fields}; effective bounded Newton fields are {effective_logistic_fields or ('<none>',)}."
+            )
+        args.logistic_bounded_fields = ",".join(effective_logistic_fields)
+        if not effective_logistic_fields:
+            print(
+                "[info] disabling solver-coordinate logistic transform because no active bounded fields remain "
+                "after the benchmark-local filtering."
+            )
+            args.logistic_bounded_transform = False
+    if _predictor_corrector_startup_enabled(args) and not bool(getattr(args, "startup_bootstrap", False)):
+        print(
+            "[info] enabling startup bootstrap because --predictor-corrector-startup uses the startup initial-guess hook."
+        )
+        args.startup_bootstrap = True
+    if bool(getattr(args, "latent_bounded_transport", False)):
+        effective_latent_fields = _effective_latent_bounded_fields(
+            args,
+            enable_phi_evolution=bool(getattr(args, "enable_phi_evolution", False)),
+        )
+        requested_latent_fields = _parse_csv_fields(getattr(args, "latent_bounded_fields", ""))
+        dropped_latent_fields = tuple(
+            name for name in requested_latent_fields if str(name).strip() not in set(effective_latent_fields)
+        )
+        if dropped_latent_fields:
+            print(
+                "[info] filtering latent bounded fields "
+                f"{dropped_latent_fields}; effective latent fields are {effective_latent_fields or ('<none>',)}."
+            )
+        args.latent_bounded_fields = ",".join(effective_latent_fields)
+        if not effective_latent_fields:
+            print(
+                "[info] disabling latent bounded transport because no active latent fields remain "
+                "after the benchmark-local filtering."
+            )
+            args.latent_bounded_transport = False
+            solver_key = str(getattr(args, "nonlinear_solver", "pdas")).strip().lower()
+        else:
+            if solver_key != "newton":
+                print(
+                    "[info] forcing nonlinear-solver=newton because --latent-bounded-transport "
+                    "uses the unconstrained monolithic Newton path."
+                )
+                args.nonlinear_solver = "newton"
+            if (
+                bool(getattr(args, "startup_bootstrap", False))
+                and not bool(getattr(args, "latent_block_preconditioner", False))
+                and not _predictor_corrector_startup_enabled(args)
+            ):
+                print(
+                    "[info] disabling startup bootstrap for the latent bounded-transport experiment so step 1 "
+                    "starts from the raw monolithic initial guess."
+                )
+                args.startup_bootstrap = False
+            if bool(getattr(args, "stall_frozen_transport_restart", False)) and not bool(getattr(args, "latent_block_preconditioner", False)):
+                print(
+                    "[info] disabling frozen-transport restart for the latent bounded-transport experiment."
+                )
+                args.stall_frozen_transport_restart = False
+            globalization = str(getattr(args, "newton_globalization", "line_search") or "line_search").strip().lower()
+            if _predictor_corrector_startup_enabled(args) and globalization == "line_search":
+                print("[info] using trust-region globalization for the predictor-corrector exact solves.")
+                args.newton_globalization = "trust_region"
+            return args
     if bool(getattr(args, "latent_bounded_transport", False)):
         if bool(getattr(args, "logistic_bounded_transform", False)):
             print(
@@ -1875,39 +2384,6 @@ def _normalize_benchmark7_solver_choice(args: argparse.Namespace) -> argparse.Na
                 "moves the bounded mapping into the formulation itself."
             )
             args.logistic_bounded_transform = False
-        if solver_key != "newton":
-            print(
-                "[info] forcing nonlinear-solver=newton because --latent-bounded-transport "
-                "uses the unconstrained monolithic Newton path."
-            )
-            args.nonlinear_solver = "newton"
-        if bool(getattr(args, "predictor_corrector_startup", False)) and not bool(getattr(args, "startup_bootstrap", False)):
-            print(
-                "[info] enabling startup bootstrap because --predictor-corrector-startup uses the startup initial-guess hook."
-            )
-            args.startup_bootstrap = True
-        if (
-            bool(getattr(args, "startup_bootstrap", False))
-            and not bool(getattr(args, "latent_block_preconditioner", False))
-            and not bool(getattr(args, "predictor_corrector_startup", False))
-        ):
-            print(
-                "[info] disabling startup bootstrap for the latent bounded-transport experiment so step 1 "
-                "starts from the raw monolithic initial guess."
-            )
-            args.startup_bootstrap = False
-        if bool(getattr(args, "stall_frozen_transport_restart", False)) and not bool(getattr(args, "latent_block_preconditioner", False)):
-            print(
-                "[info] disabling frozen-transport restart for the latent bounded-transport experiment."
-            )
-            args.stall_frozen_transport_restart = False
-        globalization = str(getattr(args, "newton_globalization", "line_search") or "line_search").strip().lower()
-        if bool(getattr(args, "predictor_corrector_startup", False)) and globalization == "line_search":
-            print(
-                "[info] using trust-region globalization for the latent predictor-corrector exact solves."
-            )
-            args.newton_globalization = "trust_region"
-        return args
     if bool(getattr(args, "logistic_bounded_transform", False)):
         if solver_key != "newton":
             print(
@@ -1916,11 +2392,32 @@ def _normalize_benchmark7_solver_choice(args: argparse.Namespace) -> argparse.Na
             )
             args.nonlinear_solver = "newton"
         if bool(getattr(args, "startup_bootstrap", False)):
-            print(
-                "[info] disabling startup bootstrap for the logistic-transform experiment so step 1 "
-                "starts from the raw monolithic initial guess."
-            )
-            args.startup_bootstrap = False
+            if _logistic_refmap_phi_only_mode(args):
+                print(
+                    "[info] keeping startup bootstrap enabled for the logistic-transform experiment because "
+                    "--alpha-from-refmap leaves only phi in solver coordinates."
+                )
+                probe_budget = max(0, int(getattr(args, "pc_exact_probe_max_it", 1) or 0))
+                if _predictor_corrector_startup_enabled(args) and probe_budget < 2:
+                    print(
+                        "[info] raising pc-exact-probe-max-it to 2 so the kept G-anchor state gets a "
+                        "meaningful exact monolithic probe before the frozen-transport predictor."
+                    )
+                    args.pc_exact_probe_max_it = 2
+                globalization = str(getattr(args, "newton_globalization", "line_search") or "line_search").strip().lower()
+                if _predictor_corrector_startup_enabled(args) and globalization == "line_search":
+                    print(
+                        "[info] using line-search-then-trust globalization for the refmap phi-only logistic startup branch "
+                        "so the exact corrector can keep a good Armijo step but still compare against trust region "
+                        "when line search only finds a best-effort decrease."
+                    )
+                    args.newton_globalization = "line_search_then_trust"
+            else:
+                print(
+                    "[info] disabling startup bootstrap for the logistic-transform experiment so step 1 "
+                    "starts from the raw monolithic initial guess."
+                )
+                args.startup_bootstrap = False
         if bool(getattr(args, "stall_frozen_transport_restart", False)):
             print(
                 "[info] disabling frozen-transport restart for the logistic-transform experiment."
@@ -1969,22 +2466,7 @@ def _alpha_equilibrium(y: np.ndarray, *, y_interface: float, eps_alpha: float) -
 
 
 def _latent_bounded_fields(args: argparse.Namespace, *, enable_phi_evolution: bool) -> tuple[str, ...]:
-    requested = tuple(dict.fromkeys(_parse_csv_fields(getattr(args, "latent_bounded_fields", ""))))
-    formulation = _latent_bounded_formulation_key(args)
-    active: list[str] = []
-    for name in requested:
-        key = str(name).strip()
-        if key == "alpha":
-            active.append("alpha")
-        elif key == "phi" and bool(enable_phi_evolution):
-            if formulation != "transformed":
-                print(
-                    "[info] disabling embedded latent phi: the current embedded phi/phi_latent pair creates "
-                    "a near-null algebraic mode near convergence. Keeping phi as a direct field."
-                )
-                continue
-            active.append("phi")
-    return tuple(active)
+    return _effective_latent_bounded_fields(args, enable_phi_evolution=enable_phi_evolution)
 
 
 def _latent_bounded_map_key(obj) -> str:
@@ -2002,6 +2484,8 @@ def _latent_map_expr(z, *, map_kind: str):
     one = Constant(1.0)
     if key == "algebraic":
         return Constant(0.5) * (one + z / ((one + z * z) ** Constant(0.5)))
+    if key == "tanh":
+        return Constant(0.5) * (one + tanh(z))
     if key != "sigmoid":
         raise ValueError(f"Unsupported latent bounded map '{map_kind}'.")
     exp_neg = exp(-z)
@@ -2012,6 +2496,9 @@ def _latent_map_prime_expr(z, *, map_kind: str):
     key = str(map_kind).strip().lower()
     if key == "algebraic":
         return Constant(0.5) * ((Constant(1.0) + z * z) ** Constant(-1.5))
+    if key == "tanh":
+        th = tanh(z)
+        return Constant(0.5) * (Constant(1.0) - th * th)
     sig = _latent_map_expr(z, map_kind=key)
     return sig * (Constant(1.0) - sig)
 
@@ -2023,6 +2510,8 @@ def _latent_inverse_array(values, *, eps: float, map_kind: str) -> np.ndarray:
         numer = (2.0 * clipped) - 1.0
         denom = 2.0 * np.sqrt(np.maximum(clipped * (1.0 - clipped), float(np.finfo(float).tiny)))
         return numer / denom
+    if key == "tanh":
+        return np.arctanh((2.0 * clipped) - 1.0)
     if key != "sigmoid":
         raise ValueError(f"Unsupported latent bounded map '{map_kind}'.")
     return np.log(clipped) - np.log1p(-clipped)
@@ -2034,6 +2523,9 @@ def _latent_forward_array(values, *, map_kind: str) -> np.ndarray:
     key = str(map_kind).strip().lower()
     if key == "algebraic":
         out[:] = 0.5 * (1.0 + (zz / np.sqrt(1.0 + zz * zz)))
+        return out
+    if key == "tanh":
+        out[:] = 0.5 * (1.0 + np.tanh(zz))
         return out
     if key != "sigmoid":
         raise ValueError(f"Unsupported latent bounded map '{map_kind}'.")
@@ -2367,6 +2859,7 @@ def _create_problem(
     latent_bounded_fields: tuple[str, ...] | None = None,
     latent_bounded_map: str = "sigmoid",
     latent_bounded_formulation: str = "embedded",
+    alpha_mass_constraint: bool = False,
     pressure_mean_constraint: bool = False,
     solid_volumetric_split: bool = False,
     drag_formulation: str = "direct",
@@ -2397,6 +2890,7 @@ def _create_problem(
     field_specs = {
         "p": int(pressure_order),
         **({"p_mean": ":number:"} if bool(pressure_mean_constraint) else {}),
+        **({"alpha_mass_lm": ":number:"} if bool(alpha_mass_constraint) and not bool(latent_bounded_transport) else {}),
         **({"pi_s": int(pressure_order)} if bool(solid_volumetric_split) else {}),
         "vS_x": int(poly_order),
         "vS_y": int(poly_order),
@@ -2455,6 +2949,7 @@ def _create_problem(
         "dlambda_drag": (None if lambda_drag_space is None else VectorTrialFunction(space=lambda_drag_space, dof_handler=dh)),
         "dp": TrialFunction("p", dof_handler=dh),
         "dp_mean": (TrialFunction("p_mean", dof_handler=dh) if bool(pressure_mean_constraint) else None),
+        "dalpha_mass_lm": (TrialFunction("alpha_mass_lm", dof_handler=dh) if "alpha_mass_lm" in field_specs else None),
         "dpi_s": (TrialFunction("pi_s", dof_handler=dh) if bool(solid_volumetric_split) else None),
         "dalpha": TrialFunction("alpha", dof_handler=dh),
         "dmu": TrialFunction("mu_alpha", dof_handler=dh),
@@ -2464,12 +2959,14 @@ def _create_problem(
         "lambda_drag_test": (None if lambda_drag_space is None else VectorTestFunction(space=lambda_drag_space, dof_handler=dh)),
         "q_test": TestFunction("p", dof_handler=dh),
         "p_mean_test": (TestFunction("p_mean", dof_handler=dh) if bool(pressure_mean_constraint) else None),
+        "alpha_mass_lm_test": (TestFunction("alpha_mass_lm", dof_handler=dh) if "alpha_mass_lm" in field_specs else None),
         "pi_s_test": (TestFunction("pi_s", dof_handler=dh) if bool(solid_volumetric_split) else None),
         "alpha_test": TestFunction("alpha", dof_handler=dh),
         "mu_test": TestFunction("mu_alpha", dof_handler=dh),
         "v_k": v_k,
         "p_k": Function("p_k", "p", dof_handler=dh),
         "p_mean_k": (Function("p_mean_k", "p_mean", dof_handler=dh) if bool(pressure_mean_constraint) else None),
+        "alpha_mass_lm_k": (Function("alpha_mass_lm_k", "alpha_mass_lm", dof_handler=dh) if "alpha_mass_lm" in field_specs else None),
         "pi_s_k": (Function("pi_s_k", "pi_s", dof_handler=dh) if bool(solid_volumetric_split) else None),
         "vS_k": VectorFunction("vS_k", ["vS_x", "vS_y"], dof_handler=dh),
         "u_k": VectorFunction("u_k", ["u_x", "u_y"], dof_handler=dh),
@@ -2483,6 +2980,7 @@ def _create_problem(
         "v_n": v_n,
         "p_n": Function("p_n", "p", dof_handler=dh),
         "p_mean_n": (Function("p_mean_n", "p_mean", dof_handler=dh) if bool(pressure_mean_constraint) else None),
+        "alpha_mass_lm_n": (Function("alpha_mass_lm_n", "alpha_mass_lm", dof_handler=dh) if "alpha_mass_lm" in field_specs else None),
         "pi_s_n": (Function("pi_s_n", "pi_s", dof_handler=dh) if bool(solid_volumetric_split) else None),
         "vS_n": VectorFunction("vS_n", ["vS_x", "vS_y"], dof_handler=dh),
         "u_n": VectorFunction("u_n", ["u_x", "u_y"], dof_handler=dh),
@@ -2497,9 +2995,12 @@ def _create_problem(
         "latent_bounded_fields": tuple(latent_field_set),
         "latent_bounded_map": str(latent_bounded_map),
         "latent_bounded_formulation": str(latent_bounded_formulation),
+        "alpha_mass_constraint": bool(bool(alpha_mass_constraint) and not bool(latent_bounded_transport)),
         "pressure_mean_constraint": bool(pressure_mean_constraint),
         "solid_volumetric_split": bool(solid_volumetric_split),
         "drag_formulation": str(drag_formulation),
+        "_alpha_mass_constraint_residual_form": None,
+        "_alpha_mass_constraint_jacobian_form": None,
         "_pressure_mean_residual_form": None,
         "_pressure_mean_jacobian_form": None,
     }
@@ -2657,6 +3158,9 @@ def _build_forms(
     hdiv_tangential_gamma: float = 20.0,
     hdiv_tangential_method: str = "penalty",
     fluid_convection: str = "full",
+    fluid_convection_full_weight=None,
+    fluid_convection_lagged_weight=None,
+    fluid_convection_imex_weight=None,
     support_physics: str = "legacy_exchange",
     ds_alpha_transport=None,
     ds_B_transport=None,
@@ -2667,6 +3171,9 @@ def _build_forms(
     traction_weight_k=None,
     traction_weight_n=None,
     drag_formulation: str = "direct",
+    skeleton_acceleration_weight=None,
+    skeleton_inertia_full_weight=None,
+    skeleton_inertia_lagged_weight=None,
 ):
     solid_model_key = str(solid_model).strip().lower().replace("-", "_")
     latent_fields = tuple(problem.get("latent_bounded_fields", tuple()) or tuple())
@@ -2702,22 +3209,30 @@ def _build_forms(
             phi_k_eff = _latent_map_expr(problem["phi_latent_k"], map_kind=latent_map_kind)
             phi_n_eff = _latent_map_expr(problem["phi_latent_n"], map_kind=latent_map_kind)
             dphi_eff = _latent_map_prime_expr(problem["phi_latent_k"], map_kind=latent_map_kind) * problem["dphi_latent"]
+    theta_c = _named_constant("b7_theta", float(theta))
+    rho_f_c = _named_constant("b7_rho_f", float(rho_f))
+    mu_f_c = _named_constant("b7_mu_f", float(mu_f))
+    mu_b_c = _named_constant("b7_mu_b", float(mu_b))
+    kappa_inv_c = _named_constant("b7_kappa_inv", float(kappa_inv))
+    mu_s_c = _named_constant("b7_mu_s", float(mu_s))
+    lambda_s_c = _named_constant("b7_lambda_s", float(lambda_s))
+    rho_s0_tilde_c = _named_constant("b7_rho_s0_tilde", float(rho_s0_tilde))
     common_kwargs = {
         "dt": dt_c,
-        "theta": float(theta),
-        "rho_f": Constant(float(rho_f)),
-        "mu_f": Constant(float(mu_f)),
-        "mu_b": Constant(float(mu_b)),
-        "kappa_inv": Constant(float(kappa_inv)),
-        "mu_s": Constant(float(mu_s)),
-        "lambda_s": Constant(float(lambda_s)),
+        "theta": theta_c,
+        "rho_f": rho_f_c,
+        "mu_f": mu_f_c,
+        "mu_b": mu_b_c,
+        "kappa_inv": kappa_inv_c,
+        "mu_s": mu_s_c,
+        "lambda_s": lambda_s_c,
         "solid_visco_eta": float(solid_visco_eta),
         "gamma_div": float(gamma_div),
         "solid_model": solid_model_key,
         "kappa_inv_model": str(kappa_inv_model),
         "drag_formulation": str(drag_formulation),
         "include_skeleton_acceleration": bool(include_skeleton_acceleration),
-        "rho_s0_tilde": Constant(float(rho_s0_tilde)),
+        "rho_s0_tilde": rho_s0_tilde_c,
         "skeleton_inertia_convection": str(skeleton_inertia_convection),
     }
     mechanics_nondim_key = str(mechanics_nondim_mode).strip().lower()
@@ -2777,10 +3292,13 @@ def _build_forms(
     problem["_condition_balanced_field_scales"] = dict(condition_balance_field_scales)
     one_domain_kwargs = {
         **common_kwargs,
-        "gamma_u": float(gamma_u),
+        "gamma_u": _named_constant("b7_gamma_u", float(gamma_u)),
         "u_extension_mode": str(u_extension_mode),
-        "gamma_u_pin": float(gamma_u_pin),
+        "gamma_u_pin": _named_constant("b7_gamma_u_pin", float(gamma_u_pin)),
         "fluid_convection": str(fluid_convection),
+        "fluid_convection_full_weight": fluid_convection_full_weight,
+        "fluid_convection_lagged_weight": fluid_convection_lagged_weight,
+        "fluid_convection_imex_weight": fluid_convection_imex_weight,
         "kinematics_scale": kinematics_scale,
         "fluid_momentum_scale": fluid_momentum_scale,
         "skeleton_momentum_scale": skeleton_momentum_scale,
@@ -2791,6 +3309,9 @@ def _build_forms(
         "solid_volumetric_split": bool(solid_volumetric_split),
         "solid_volumetric_penalty": float(solid_volumetric_penalty),
         "pressure_block_lift_scale": float(pressure_block_lift_scale),
+        "skeleton_acceleration_weight": skeleton_acceleration_weight,
+        "skeleton_inertia_full_weight": skeleton_inertia_full_weight,
+        "skeleton_inertia_lagged_weight": skeleton_inertia_lagged_weight,
     }
     if not bool(enable_phi_evolution):
         forms = build_deformation_only_forms(
@@ -2825,10 +3346,10 @@ def _build_forms(
             alpha_test=alpha_transport_test,
             mu_alpha_test=problem["mu_test"],
             dx=dx(metadata={"q": int(qdeg)}),
-            phi_b=float(phi_b),
-            M_alpha=float(M_alpha),
-            gamma_alpha=float(gamma_alpha),
-            eps_alpha=float(eps_alpha),
+            phi_b=_named_constant("b7_phi_b", float(phi_b)),
+            M_alpha=_named_constant("b7_M_alpha", float(M_alpha)),
+            gamma_alpha=_named_constant("b7_gamma_alpha", float(gamma_alpha)),
+            eps_alpha=_named_constant("b7_eps_alpha", float(eps_alpha)),
             support_physics=str(support_physics),
             alpha_advect_with=str(alpha_advect_with),
             alpha_advection_form=str(alpha_advection_form),
@@ -2887,9 +3408,9 @@ def _build_forms(
             dx=dx(metadata={"q": int(qdeg)}),
             ds_cip=ds(metadata={"q": int(qdeg)}),
             mu_b_model=str(mu_b_model),
-            D_phi=float(D_phi),
+            D_phi=_named_constant("b7_D_phi", float(D_phi)),
             phi_diffusion_weight=str(phi_diffusion_weight),
-            gamma_phi=float(gamma_phi),
+            gamma_phi=_named_constant("b7_gamma_phi", float(gamma_phi)),
             phi_supg=float(phi_supg),
             phi_cip=float(phi_cip),
             alpha_supg=float(alpha_supg),
@@ -2903,9 +3424,17 @@ def _build_forms(
             u_cip=float(u_cip),
             u_cip_weight=str(u_cip_weight),
             vS_cip=float(vS_cip),
-            gamma_vS=gamma_vS,
+            gamma_vS=(
+                None
+                if gamma_vS is None
+                else _named_constant("b7_gamma_vS", float(gamma_vS))
+            ),
             vS_extension_mode=vS_extension_mode,
-            gamma_vS_pin=gamma_vS_pin,
+            gamma_vS_pin=(
+                None
+                if gamma_vS_pin is None
+                else _named_constant("b7_gamma_vS_pin", float(gamma_vS_pin))
+            ),
             ds_hdiv_tangential=ds_hdiv_tangential,
             hdiv_tangential_gamma=float(hdiv_tangential_gamma),
             hdiv_tangential_method=str(hdiv_tangential_method),
@@ -2915,10 +3444,10 @@ def _build_forms(
                 if str(alpha_regularization).strip().lower() == "olsson_nt"
                 else "none"
             ),
-            alpha_interface_reg_gamma=float(alpha_reg_gamma),
-            alpha_interface_reg_eps_normal=float(alpha_reg_eps_normal),
-            alpha_interface_reg_eps_tangent=float(alpha_reg_eps_tangent),
-            alpha_interface_reg_eta=float(alpha_reg_eta),
+            alpha_interface_reg_gamma=_named_constant("b7_alpha_reg_gamma", float(alpha_reg_gamma)),
+            alpha_interface_reg_eps_normal=_named_constant("b7_alpha_reg_eps_normal", float(alpha_reg_eps_normal)),
+            alpha_interface_reg_eps_tangent=_named_constant("b7_alpha_reg_eps_tangent", float(alpha_reg_eps_tangent)),
+            alpha_interface_reg_eta=_named_constant("b7_alpha_reg_eta", float(alpha_reg_eta)),
             alpha_mu_aux_pin=1.0,
             alpha_advect_with=str(alpha_advect_with),
             alpha_advection_form=str(alpha_advection_form),
@@ -2931,9 +3460,15 @@ def _build_forms(
             traction_weight_n=traction_weight_n,
             skeleton_pressure_mode=str(skeleton_pressure_mode),
             alpha_biot=alpha_biot,
-            alpha_ch_M=float(M_alpha if str(alpha_regularization).strip().lower() == "ch" else 0.0),
-            alpha_ch_gamma=float(gamma_alpha if str(alpha_regularization).strip().lower() == "ch" else 0.0),
-            alpha_ch_eps=float(eps_alpha),
+            alpha_ch_M=_named_constant(
+                "b7_alpha_ch_M",
+                float(M_alpha if str(alpha_regularization).strip().lower() == "ch" else 0.0),
+            ),
+            alpha_ch_gamma=_named_constant(
+                "b7_alpha_ch_gamma",
+                float(gamma_alpha if str(alpha_regularization).strip().lower() == "ch" else 0.0),
+            ),
+            alpha_ch_eps=_named_constant("b7_alpha_ch_eps", float(eps_alpha)),
             D_S=0.0,
             mu_max=0.0,
             K_S=1.0,
@@ -2948,6 +3483,8 @@ def _build_forms(
     residual_form = forms.residual_form
     jacobian_form = forms.jacobian_form
     dx_q = dx(metadata={"q": int(qdeg)})
+    problem["_alpha_mass_constraint_residual_form"] = None
+    problem["_alpha_mass_constraint_jacobian_form"] = None
     problem["_pressure_mean_residual_form"] = None
     problem["_pressure_mean_jacobian_form"] = None
     if use_alpha_latent and latent_formulation_key != "transformed":
@@ -2975,6 +3512,29 @@ def _build_forms(
             jacobian_form=jacobian_form,
             r_phi=(forms.r_phi + r_phi_embed),
             a_phi=((forms.a_phi + a_phi_embed) if forms.a_phi is not None else a_phi_embed),
+        )
+    if (
+        bool(problem.get("alpha_mass_constraint", False))
+        and problem.get("alpha_mass_lm_k") is not None
+        and problem.get("alpha_mass_lm_test") is not None
+        and problem.get("dalpha_mass_lm") is not None
+    ):
+        r_alpha_mass = (
+            problem["alpha_mass_lm_k"] * problem["alpha_test"]
+            + (alpha_k_eff - alpha_n_eff) * problem["alpha_mass_lm_test"]
+        ) * dx_q
+        a_alpha_mass = (
+            problem["dalpha_mass_lm"] * problem["alpha_test"]
+            + dalpha_eff * problem["alpha_mass_lm_test"]
+        ) * dx_q
+        residual_form = residual_form + r_alpha_mass
+        jacobian_form = jacobian_form + a_alpha_mass
+        problem["_alpha_mass_constraint_residual_form"] = r_alpha_mass
+        problem["_alpha_mass_constraint_jacobian_form"] = a_alpha_mass
+        forms = replace(
+            forms,
+            residual_form=residual_form,
+            jacobian_form=jacobian_form,
         )
     if (
         bool(problem.get("pressure_mean_constraint", False))
@@ -3377,15 +3937,20 @@ def _build_vi_linear_equalities(
         alpha_prev = find_named_function(prev_funcs, problem["alpha_n"])
         return float(alpha_weights_full @ _function_to_full_vector(problem["dh"], alpha_prev))
 
-    equalities = [
-        LinearEqualityConstraint(
-            name="alpha_mass",
-            weights_full=alpha_weights_full,
-            target_callback=_alpha_mass_target,
-            field_name="alpha",
-            project_feasible=True,
+    equalities: list[LinearEqualityConstraint] = []
+    if (
+        not bool(problem.get("alpha_mass_constraint", False))
+        and not bool(getattr(args, "alpha_from_refmap", False))
+    ):
+        equalities.append(
+            LinearEqualityConstraint(
+                name="alpha_mass",
+                weights_full=alpha_weights_full,
+                target_callback=_alpha_mass_target,
+                field_name="alpha",
+                project_feasible=True,
+            )
         )
-    ]
 
     if (
         bool(args.enable_phi_evolution)
@@ -3551,15 +4116,16 @@ def _write_combined_profiles_plot(path: Path, results: list[CaseResult], *, refe
 
 
 def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseResult:
+    io_root = _mpi_io_root()
     poly_order, pressure_order, scalar_order = _resolved_orders(args)
     qdeg = int(args.quad_order) if args.quad_order is not None else max(6, 2 * int(poly_order) + 2)
     if qdeg < 1:
         raise ValueError("quad_order must be positive.")
     eps_alpha_eff = _effective_eps_alpha(args)
-    if bool(getattr(args, "predictor_corrector_startup", False)) and args.eps_alpha_over_h is not None:
+    if args.eps_alpha_over_h is not None:
         print(
-            "[info] predictor-corrector globalization keeps the physical interface width fixed: "
-            f"using eps_alpha={float(eps_alpha_eff):.3e} and ignoring eps_alpha_over_h={float(args.eps_alpha_over_h):.3e}."
+            "[info] using mesh-scaled interface width: "
+            f"eps_alpha={float(eps_alpha_eff):.3e} from eps_alpha_over_h={float(args.eps_alpha_over_h):.3e}."
         )
     alpha_reg_eps_normal = float(args.alpha_reg_eps_normal) if args.alpha_reg_eps_normal is not None else float(eps_alpha_eff)
     alpha_reg_eps_tangent = float(args.alpha_reg_eps_tangent) if args.alpha_reg_eps_tangent is not None else float(0.25 * eps_alpha_eff)
@@ -3597,6 +4163,7 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         ),
         latent_bounded_map=str(args.latent_bounded_map),
         latent_bounded_formulation=str(args.latent_bounded_formulation),
+        alpha_mass_constraint=bool(args.alpha_mass_constraint),
         pressure_mean_constraint=bool(args.pressure_mean_constraint),
         solid_volumetric_split=bool(args.solid_volumetric_split),
         drag_formulation=str(args.drag_formulation),
@@ -3681,6 +4248,71 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             problem["phi_latent_n"].nodal_values[:] = phi_latent_init
             problem["phi_latent_k"].nodal_values[:] = phi_latent_init
         _sync_latent_bounded_problem_fields(problem=problem)
+    if problem.get("alpha_mass_lm_n") is not None:
+        problem["alpha_mass_lm_n"].nodal_values[:] = 0.0
+        problem["alpha_mass_lm_k"].nodal_values[:] = 0.0
+    alpha_from_refmap_enabled = bool(getattr(args, "alpha_from_refmap", False))
+    alpha_from_refmap_perm = None
+    alpha_xy = None
+    if alpha_from_refmap_enabled:
+        alpha_from_refmap_perm = _field_coordinate_permutation(
+            problem,
+            source_field="u_x",
+            target_field="alpha",
+        )
+        alpha_xy = np.asarray(problem["dh"].get_dof_coords("alpha"), dtype=float)
+
+        def _alpha_from_refmap_values(displacement) -> np.ndarray:
+            ux_vals = _vector_component_values(displacement, 0)
+            uy_vals = _vector_component_values(displacement, 1)
+            u_at_alpha = np.column_stack(
+                [
+                    np.asarray(ux_vals[alpha_from_refmap_perm], dtype=float),
+                    np.asarray(uy_vals[alpha_from_refmap_perm], dtype=float),
+                ]
+            )
+            chi = np.asarray(alpha_xy, dtype=float) - u_at_alpha
+            alpha_vals = np.clip(
+                np.asarray(
+                    _alpha_equilibrium(
+                        chi[:, 1],
+                        y_interface=float(args.y_interface),
+                        eps_alpha=float(eps_alpha_eff),
+                    ),
+                    dtype=float,
+                ).ravel(),
+                0.0,
+                1.0,
+            )
+            return alpha_vals
+
+        def _sync_alpha_from_refmap(*, sync_previous: bool = False) -> None:
+            problem["alpha_k"].nodal_values[:] = _alpha_from_refmap_values(problem["u_k"])
+            if problem.get("mu_k") is not None:
+                problem["mu_k"].nodal_values[:] = 0.0
+            if problem.get("alpha_mass_lm_k") is not None:
+                problem["alpha_mass_lm_k"].nodal_values[:] = 0.0
+            if sync_previous:
+                problem["alpha_n"].nodal_values[:] = _alpha_from_refmap_values(problem["u_n"])
+                if problem.get("mu_n") is not None:
+                    problem["mu_n"].nodal_values[:] = 0.0
+                if problem.get("alpha_mass_lm_n") is not None:
+                    problem["alpha_mass_lm_n"].nodal_values[:] = 0.0
+
+        _sync_alpha_from_refmap(sync_previous=True)
+        inactive_alpha_counts = _tag_inactive_fields(
+            problem,
+            "alpha",
+            "mu_alpha",
+            "alpha_mass_lm",
+        )
+        print(
+            "[setup] enabling alpha-from-refmap mode: alpha and its auxiliary transport unknowns are frozen "
+            f"and alpha is rebuilt from u before assembly (inactive counts={inactive_alpha_counts})."
+        )
+    else:
+        def _sync_alpha_from_refmap() -> None:
+            return
     if solid_dof_y_cut is not None:
         solid_inactive_counts = _tag_inactive_solid_dofs_above_y(
             problem,
@@ -3702,7 +4334,7 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         problem["_inactive_solid_alpha_band_halfwidth"] = float("nan")
         solid_inactive_counts = {}
 
-    dt_c = Constant(float(args.dt))
+    dt_c = _named_constant("b7_dt", float(args.dt))
     forms = _build_forms(
         problem,
         qdeg=qdeg,
@@ -3783,9 +4415,11 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
     )
     bcs_homog = [BoundaryCondition(b.field, b.method, b.domain_tag, (lambda x, y: 0.0)) for b in bcs]
 
-    outdir.mkdir(parents=True, exist_ok=True)
+    if io_root:
+        outdir.mkdir(parents=True, exist_ok=True)
+    barrier(MPI_CTX)
     vtk_dir = outdir / "vtk"
-    dt_c = Constant(float(args.dt))
+    dt_c = _named_constant("b7_dt", float(args.dt))
     timeseries_rows: list[dict[str, float]] = []
     alpha_diagnostics = _build_alpha_diagnostics(problem, quad_order=int(qdeg), backend=str(args.backend))
     alpha_coeffs = {problem["alpha_k"].name: problem["alpha_k"]}
@@ -3881,6 +4515,12 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
     base_vi_field_proximal_recovery_eq_abs = float(
         getattr(getattr(solver, "vi_params", None), "field_proximal_recovery_eq_abs", 1.0e-10) or 1.0e-10
     ) if "solver" in locals() else 1.0e-10
+    base_vi_field_proximal_recovery_identified_window = bool(
+        getattr(getattr(solver, "vi_params", None), "field_proximal_recovery_identified_window", False)
+    ) if "solver" in locals() else False
+    base_vi_field_proximal_recovery_ginf_max = float(
+        getattr(getattr(solver, "vi_params", None), "field_proximal_recovery_ginf_max", 0.0) or 0.0
+    ) if "solver" in locals() else 0.0
     base_vi_ptc_recovery = bool(
         getattr(getattr(solver, "vi_params", None), "ptc_recovery", bool(args.vi_ptc_recovery))
     ) if "solver" in locals() else bool(args.vi_ptc_recovery)
@@ -4049,7 +4689,7 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             row["phi_min"] = float(np.min(problem["phi_k"].nodal_values))
             row["phi_max"] = float(np.max(problem["phi_k"].nodal_values))
         timeseries_rows.append(row)
-        if int(args.vtk_every) > 0 and (step_no % int(args.vtk_every) == 0):
+        if io_root and int(args.vtk_every) > 0 and (step_no % int(args.vtk_every) == 0):
             vtk_dir.mkdir(parents=True, exist_ok=True)
             vtk_functions = {
                 "v": problem["v_k"],
@@ -4130,13 +4770,13 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         )
 
     def _configure_vi_box_bounds(target_solver, *, funcs_in=None) -> None:
-        if solver_key != "pdas":
+        if solver_key not in {"pdas", "ipm"}:
             return
         if hasattr(target_solver, "set_box_bounds"):
             lower_full = np.full(int(problem["dh"].total_dofs), -np.inf, dtype=float)
             upper_full = np.full(int(problem["dh"].total_dofs), np.inf, dtype=float)
             any_box_bounds = False
-            if bool(args.alpha_box_constraints):
+            if bool(args.alpha_box_constraints) and not bool(getattr(args, "alpha_from_refmap", False)):
                 _apply_field_box_bounds(
                     lower_full,
                     upper_full,
@@ -4258,13 +4898,19 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                 backend=str(args.linear_backend),
                 tol=float(args.lin_tol),
                 maxit=int(args.lin_maxit),
+                distributed=bool(
+                    MPI_CTX.enabled
+                    and bool(getattr(args, "petsc_distributed", True))
+                    and str(args.linear_backend).strip().lower() == "petsc"
+                ),
             ),
             quad_order=int(qdeg),
             backend=str(args.backend),
             postproc_timeloop_cb=postproc_cb,
         )
-        if solver_kind_key == "pdas":
-            target_solver = PdasNewtonSolver(
+        if solver_kind_key in {"pdas", "ipm"}:
+            solver_cls = PdasNewtonSolver if solver_kind_key == "pdas" else InteriorPointNewtonSolver
+            target_solver = solver_cls(
                 forms_obj.residual_form,
                 forms_obj.jacobian_form,
                 vi_params=VIParameters(
@@ -4292,7 +4938,7 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                     relaxed_filter_accept_ginf=(
                         float(relaxed_accept_ginf)
                         if relaxed_accept_ginf is not None
-                        else 1.0e-2
+                        else (0.0 if solver_kind_key == "ipm" else 1.0e-2)
                     ),
                     relaxed_filter_merit_growth=1.05,
                     unconstrained_lm=bool(args.vi_unconstrained_lm),
@@ -4325,6 +4971,16 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                     anderson_history=int(args.vi_anderson_history),
                     anderson_regularization=float(args.vi_anderson_regularization),
                     anderson_damping=float(args.vi_anderson_damping),
+                    interior_point_mu0=float(getattr(args, "vi_ipm_mu0", 1.0e-2)),
+                    interior_point_mu_min=float(getattr(args, "vi_ipm_mu_min", 1.0e-10)),
+                    interior_point_mu_decay=float(getattr(args, "vi_ipm_mu_decay", 0.2)),
+                    interior_point_max_barrier_steps=int(getattr(args, "vi_ipm_max_barrier_steps", 12)),
+                    interior_point_fraction_to_boundary=float(getattr(args, "vi_ipm_fraction_to_boundary", 0.995)),
+                    interior_point_armijo_c1=float(getattr(args, "vi_ipm_armijo_c1", 1.0e-4)),
+                    interior_point_step_reduction=float(getattr(args, "vi_ipm_step_reduction", 0.5)),
+                    interior_point_step_min=float(getattr(args, "vi_ipm_step_min", 1.0e-10)),
+                    interior_point_initial_push=float(getattr(args, "vi_ipm_initial_push", 1.0e-8)),
+                    interior_point_stage_tol_factor=float(getattr(args, "vi_ipm_stage_tol_factor", 0.25)),
                 ),
                 **common_solver_kwargs,
             )
@@ -4430,7 +5086,7 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                         f"with strength={float(args.pressure_mean_gauge_strength):.3e}."
                     )
             if bool(getattr(args, "logistic_bounded_transform", False)):
-                requested_logistic_fields = _parse_csv_fields(args.logistic_bounded_fields)
+                requested_logistic_fields = _effective_logistic_bounded_fields(args)
                 available_fields = {str(name) for name in getattr(problem["dh"], "field_names", [])}
                 logistic_fields = [name for name in requested_logistic_fields if name in available_fields]
                 skipped_logistic_fields = [name for name in requested_logistic_fields if name not in available_fields]
@@ -4457,6 +5113,15 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                 and _latent_bounded_formulation_key(problem) == "transformed"
             ):
                 target_solver.pre_cb = _sync_latent_transformed_fields
+        if alpha_from_refmap_enabled:
+            prev_pre_cb = getattr(target_solver, "pre_cb", None)
+
+            def _refmap_pre_cb(funcs) -> None:
+                _sync_alpha_from_refmap()
+                if callable(prev_pre_cb):
+                    prev_pre_cb(funcs)
+
+            target_solver.pre_cb = _refmap_pre_cb
         _bind_solver_inactive_solid_interface_retagging(
             problem=problem,
             target_solver=target_solver,
@@ -4508,6 +5173,8 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                 funcs=funcs,
                 find_named_function=_find_named_function,
             )
+            if alpha_from_refmap_enabled:
+                _sync_alpha_from_refmap()
             if getattr(target_solver, "constraints", None) is not None:
                 target_solver._enforce_constraints_on_functions(funcs)
             reset_bounds_cb = getattr(target_solver, "_reset_benchmark7_vi_bounds_freeze", None)
@@ -4515,14 +5182,31 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                 reset_bounds_cb()
 
         target_solver.post_accept_cb = _postprocess_physical_bounds
+        if alpha_from_refmap_enabled:
+            prev_preassemble_cb = getattr(target_solver, "preassemble_cb", None)
+
+            def _refmap_preassemble(coeffs) -> None:
+                if callable(prev_preassemble_cb):
+                    prev_preassemble_cb(coeffs)
+                _sync_alpha_from_refmap()
+
+            target_solver.preassemble_cb = _refmap_preassemble
         _configure_vi_constraints(target_solver)
         return target_solver
+
+    main_accept_factor = 10.0
+    if _logistic_refmap_phi_only_mode(args) and _predictor_corrector_startup_enabled(args):
+        main_accept_factor = max(float(main_accept_factor), 150.0)
+        print(
+            "    [solver] allowing nonconverged exact accepts up to "
+            f"{float(main_accept_factor):.0f}·atol on the refmap phi-only logistic startup branch."
+        )
 
     solver = _make_solver(
         forms,
         postproc_cb=_record_step,
         max_newton_iter=int(args.max_it),
-        accept_factor=10.0,
+        accept_factor=float(main_accept_factor),
         freeze_support_phi_bounds=True,
     )
     if (
@@ -4551,14 +5235,16 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                 f"after {reason}."
             )
         if getattr(solver, "vi_params", None) is not None:
-            relaxed_boost = max(float(base_solver_relaxed_accept_ginf), 2.0e-2)
-            relaxed_now = float(getattr(solver.vi_params, "relaxed_filter_accept_ginf", 0.0) or 0.0)
-            if relaxed_now < relaxed_boost:
-                solver.vi_params.relaxed_filter_accept_ginf = float(relaxed_boost)
-                print(
-                    "    [startup] relaxing first-step semismooth accept threshold to "
-                    f"|G|_∞<={relaxed_boost:.3e} after {reason}."
-                )
+            is_ipm_solver = isinstance(solver, InteriorPointNewtonSolver)
+            if not is_ipm_solver:
+                relaxed_boost = max(float(base_solver_relaxed_accept_ginf), 2.0e-2)
+                relaxed_now = float(getattr(solver.vi_params, "relaxed_filter_accept_ginf", 0.0) or 0.0)
+                if relaxed_now < relaxed_boost:
+                    solver.vi_params.relaxed_filter_accept_ginf = float(relaxed_boost)
+                    print(
+                        "    [startup] relaxing first-step semismooth accept threshold to "
+                        f"|G|_∞<={relaxed_boost:.3e} after {reason}."
+                    )
             # First-step-only PDAS tuning for the stiff monolithic restart:
             # keep the model fixed, but reduce active-set chatter and let the
             # bounded fields choose field-wise c from the current Jacobian.
@@ -4598,6 +5284,49 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             # past the default six shifts.
             solver.vi_params.unconstrained_lm_max_tries = max(int(base_vi_lm_max_tries), 12)
             solver.vi_params.unconstrained_lm_lambda_max = max(float(base_vi_lm_lambda_max), 1.0e10)
+            if is_ipm_solver:
+                # The interior-point path benefits from the larger first-step LM
+                # window, but the semismooth rescue package below is counter-
+                # productive here: it pre-arms mechanics-only PTC/prox phases
+                # that were designed for PDAS working-set recovery and can
+                # override user choices such as --no-vi-ptc-recovery.
+                solver.vi_params.ptc_recovery = bool(base_vi_ptc_recovery)
+                solver.vi_params.ptc_fields = tuple(base_vi_ptc_fields)
+                solver.vi_params.ptc_sigma0 = float(base_vi_ptc_sigma0)
+                solver.vi_params.ptc_sigma_max = float(base_vi_ptc_sigma_max)
+                solver.vi_params.ptc_growth = float(base_vi_ptc_growth)
+                solver.vi_params.ptc_decay = float(base_vi_ptc_decay)
+                solver.vi_params.ptc_stable_iters = int(base_vi_ptc_stable_iters)
+                solver.vi_params.ptc_ginf_trigger = float(base_vi_ptc_ginf_trigger)
+                solver.vi_params.ptc_gap_ratio = float(base_vi_ptc_gap_ratio)
+                solver.vi_params.ptc_eq_abs = float(base_vi_ptc_eq_abs)
+                solver.vi_params.ptc_ginf_max = float(base_vi_ptc_ginf_max)
+                solver.vi_params.ptc_identified_window = bool(base_vi_ptc_identified_window)
+                solver.vi_params.ptc_freeze_complement = bool(base_vi_ptc_freeze_complement)
+                solver.vi_params.field_proximal_recovery = bool(base_vi_field_proximal_recovery)
+                solver.vi_params.field_proximal_recovery_fields = tuple(base_vi_field_proximal_recovery_fields)
+                solver.vi_params.field_proximal_recovery_lambda0 = float(base_vi_field_proximal_recovery_lambda0)
+                solver.vi_params.field_proximal_recovery_lambda_max = float(base_vi_field_proximal_recovery_lambda_max)
+                solver.vi_params.field_proximal_recovery_growth = float(base_vi_field_proximal_recovery_growth)
+                solver.vi_params.field_proximal_recovery_max_tries = int(base_vi_field_proximal_recovery_max_tries)
+                solver.vi_params.field_proximal_recovery_stable_iters = int(base_vi_field_proximal_recovery_stable_iters)
+                solver.vi_params.field_proximal_recovery_ginf_trigger = float(base_vi_field_proximal_recovery_ginf_trigger)
+                solver.vi_params.field_proximal_recovery_gap_ratio = float(base_vi_field_proximal_recovery_gap_ratio)
+                solver.vi_params.field_proximal_recovery_eq_abs = float(base_vi_field_proximal_recovery_eq_abs)
+                solver.vi_params.field_proximal_recovery_identified_window = bool(base_vi_field_proximal_recovery_identified_window)
+                solver.vi_params.field_proximal_recovery_ginf_max = float(base_vi_field_proximal_recovery_ginf_max)
+                solver.vi_params.anderson_acceleration = bool(base_vi_anderson_acceleration)
+                solver.vi_params.anderson_history = int(base_vi_anderson_history)
+                solver.vi_params.anderson_regularization = float(base_vi_anderson_regularization)
+                solver.vi_params.anderson_damping = float(base_vi_anderson_damping)
+                solver.vi_params.anderson_stable_iters = int(base_vi_anderson_stable_iters)
+                solver.vi_params.anderson_ginf_trigger = float(base_vi_anderson_ginf_trigger)
+                solver.vi_params.anderson_gap_ratio = float(base_vi_anderson_gap_ratio)
+                solver.vi_params.anderson_eq_abs = float(base_vi_anderson_eq_abs)
+                solver.vi_params.anderson_ginf_max = float(base_vi_anderson_ginf_max)
+                solver._vi_force_initial_field_prox_lambda = 0.0
+                solver._vi_force_initial_ptc_sigma = 0.0
+                return
             # The staggered startup already imports a constrained transport
             # active set into the first monolithic retry. Requiring two extra
             # stable semismooth iterations and |G|<=5e-2 before trying the
@@ -4750,9 +5479,12 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
     if problem.get("p_mean_k") is not None:
         current_functions.insert(2, problem["p_mean_k"])
         previous_functions.insert(2, problem["p_mean_n"])
+    if problem.get("alpha_mass_lm_k") is not None:
+        current_functions.insert(3, problem["alpha_mass_lm_k"])
+        previous_functions.insert(3, problem["alpha_mass_lm_n"])
     if problem.get("pi_s_k") is not None:
-        current_functions.insert(3, problem["pi_s_k"])
-        previous_functions.insert(3, problem["pi_s_n"])
+        current_functions.insert(4, problem["pi_s_k"])
+        previous_functions.insert(4, problem["pi_s_n"])
     if problem.get("lambda_drag_k") is not None:
         drag_insert = current_functions.index(problem["alpha_k"])
         prev_drag_insert = previous_functions.index(problem["alpha_n"])
@@ -5057,6 +5789,8 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
 
     def _startup_transport_stage_fields() -> list[str]:
         fields = ["alpha", "mu_alpha"]
+        if problem.get("alpha_mass_lm_k") is not None:
+            fields.append("alpha_mass_lm")
         if problem.get("alpha_latent_k") is not None:
             fields.append("alpha_latent")
         if problem["phi_k"] is not None:
@@ -5088,6 +5822,7 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         field_keys = {
             "alpha": "alpha_k",
             "mu_alpha": "mu_k",
+            "alpha_mass_lm": "alpha_mass_lm_k",
             "alpha_latent": "alpha_latent_k",
         }
         for name, key in field_keys.items():
@@ -5102,6 +5837,7 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             ("v_y", "v_k"),
             ("p", "p_k"),
             ("p_mean", "p_mean_k"),
+            ("alpha_mass_lm", "alpha_mass_lm_k"),
             ("pi_s", "pi_s_k"),
             ("vS_x", "vS_k"),
             ("vS_y", "vS_k"),
@@ -5134,6 +5870,10 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             total = total + part
         return total
 
+    startup_stage_accept_factor = 0.0
+    if _logistic_refmap_phi_only_mode(args) and _predictor_corrector_startup_enabled(args):
+        startup_stage_accept_factor = max(float(startup_stage_accept_factor), 150.0)
+
     def _make_startup_stage_solver(
         *,
         stage_name: str,
@@ -5151,9 +5891,11 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         stage_solver_kind = _startup_stage_solver_kind(
             main_solver_kind=str(solver_key),
             active_fields=active_fields,
+            stage_name=stage_name,
+            transport_solver_kind_override=str(getattr(args, "startup_transport_solver", "auto")),
         )
         stage_relaxed_accept_ginf = float(startup_stage_relaxed_ginf)
-        if stage_name == "transport" and stage_solver_kind == "pdas":
+        if stage_name == "transport" and stage_solver_kind in {"pdas", "ipm"}:
             # The staged transport solve is only a predictor for the monolithic
             # retry. If it already reaches a tightly identified bounded state
             # with |G| around 1e-4..1e-3, we should keep that state and export
@@ -5176,7 +5918,7 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             # Keep this relaxed, but cap it tightly enough that obviously
             # nonconverged PDAS states (|G|=O(1..10)) are not accepted as
             # startup guesses in the stiff low-kappa cases.
-            accept_factor=0.0,
+            accept_factor=float(startup_stage_accept_factor),
             relaxed_accept_ginf=float(stage_relaxed_accept_ginf),
             solver_kind=stage_solver_kind,
             bcs_in=stage_bcs,
@@ -5222,12 +5964,14 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             residual_form=_sum_stage_forms(
                 getattr(forms, "r_alpha", None),
                 getattr(forms, "r_mu_alpha", None),
+                problem.get("_alpha_mass_constraint_residual_form"),
                 getattr(forms, "r_phi", None),
                 getattr(forms, "r_substrate", None),
             ),
             jacobian_form=_sum_stage_forms(
                 getattr(forms, "a_alpha", None),
                 getattr(forms, "a_mu_alpha", None),
+                problem.get("_alpha_mass_constraint_jacobian_form"),
                 getattr(forms, "a_phi", None),
                 getattr(forms, "a_substrate", None),
             ),
@@ -5282,11 +6026,23 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         solid_hist: list[int] = []
         transport_vi_state = None
         last_good_snapshot = _snapshot_function_values(funcs)
+        best_snapshot = last_good_snapshot
+        best_exact_norm = _current_monolithic_raw_residual_inf(
+            funcs=funcs,
+            prev_funcs=prev_funcs,
+            aux_funcs=aux_funcs,
+            bcs_now=bcs_now,
+        )
         completed_outer = 0
         partial_reason: str | None = None
         try:
             for outer_it in range(n_outer):
                 try:
+                    _set_solver_newton_trace_context(
+                        flow_solver,
+                        label=f"startup-staggered:flow[o{int(outer_it) + 1}]",
+                        global_bcs_now=bcs_now,
+                    )
                     problem["dh"].apply_bcs(flow_bcs_now, *funcs)
                     _, flow_converged, flow_iters = flow_solver._newton_loop(
                         funcs,
@@ -5299,6 +6055,11 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                             f"staggered startup flow solve did not converge on outer sweep {int(outer_it) + 1}"
                         )
                     flow_hist.append(int(flow_iters))
+                    _set_solver_newton_trace_context(
+                        transport_solver,
+                        label=f"startup-staggered:transport[o{int(outer_it) + 1}]",
+                        global_bcs_now=bcs_now,
+                    )
                     problem["dh"].apply_bcs(transport_bcs_now, *funcs)
                     _, transport_converged, transport_iters = transport_solver._newton_loop(
                         funcs,
@@ -5314,6 +6075,11 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                     export_vi_state = getattr(transport_solver, "export_vi_state", None)
                     if callable(export_vi_state):
                         transport_vi_state = export_vi_state()
+                    _set_solver_newton_trace_context(
+                        solid_solver,
+                        label=f"startup-staggered:solid[o{int(outer_it) + 1}]",
+                        global_bcs_now=bcs_now,
+                    )
                     problem["dh"].apply_bcs(solid_bcs_now, *funcs)
                     _, solid_converged, solid_iters = solid_solver._newton_loop(
                         funcs,
@@ -5327,6 +6093,22 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                         )
                     solid_hist.append(int(solid_iters))
                 except Exception as stage_exc:
+                    candidate_snapshot = _snapshot_function_values(funcs)
+                    candidate_norm = _current_monolithic_raw_residual_inf(
+                        funcs=funcs,
+                        prev_funcs=prev_funcs,
+                        aux_funcs=aux_funcs,
+                        bcs_now=bcs_now,
+                    )
+                    if (
+                        np.isfinite(candidate_norm)
+                        and (not np.isfinite(best_exact_norm) or float(candidate_norm) < float(best_exact_norm))
+                    ):
+                        best_exact_norm = float(candidate_norm)
+                        best_snapshot = candidate_snapshot
+                        partial_reason = str(stage_exc)
+                        _restore_function_values(funcs, best_snapshot)
+                        break
                     _restore_function_values(funcs, last_good_snapshot)
                     if completed_outer > 0:
                         partial_reason = str(stage_exc)
@@ -5334,11 +6116,19 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                     raise
                 completed_outer += 1
                 last_good_snapshot = _snapshot_function_values(funcs)
+                best_snapshot = last_good_snapshot
+                best_exact_norm = _current_monolithic_raw_residual_inf(
+                    funcs=funcs,
+                    prev_funcs=prev_funcs,
+                    aux_funcs=aux_funcs,
+                    bcs_now=bcs_now,
+                )
         finally:
             if prev_accept is None:
                 os.environ.pop(accept_key, None)
             else:
                 os.environ[accept_key] = prev_accept
+        _restore_function_values(funcs, best_snapshot)
         preload_relaxed = _relax_staggered_preload_toward_previous(
             funcs,
             prev_funcs,
@@ -5384,50 +6174,117 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         except Exception:
             return float("nan")
 
-    def _current_predictor_corrector_energy(*, funcs, prev_funcs, aux_funcs, bcs_now) -> dict[str, float]:
-        raw_inf = _current_monolithic_raw_residual_inf(
+    def _set_solver_newton_trace_context(
+        target_solver,
+        *,
+        label,
+        global_bcs_now=None,
+        global_label: str = "|R_raw|_∞",
+    ) -> None:
+        if target_solver is None:
+            return
+        target_solver._newton_trace_label = label
+
+        def _global_residual(funcs_now, prev_funcs_now, aux_funcs_now, bcs_stage_now):
+            return _current_monolithic_raw_residual_inf(
+                funcs=funcs_now,
+                prev_funcs=prev_funcs_now,
+                aux_funcs=aux_funcs_now,
+                bcs_now=(bcs_stage_now if global_bcs_now is None else global_bcs_now),
+            )
+
+        target_solver._newton_trace_global_residual_cb = _global_residual
+        target_solver._newton_trace_global_residual_label = str(global_label)
+
+    def _current_stage_raw_residual_inf(*, stage_solver, funcs, prev_funcs, aux_funcs, bcs_now) -> float:
+        if stage_solver is None:
+            return _current_monolithic_raw_residual_inf(
+                funcs=funcs,
+                prev_funcs=prev_funcs,
+                aux_funcs=aux_funcs,
+                bcs_now=bcs_now,
+            )
+        try:
+            problem["dh"].apply_bcs(bcs_now, *funcs)
+            if getattr(stage_solver, "constraints", None) is not None:
+                stage_solver._enforce_constraints_on_functions(funcs)
+            current = {f.name: f for f in funcs}
+            current.update({f.name: f for f in prev_funcs})
+            if aux_funcs:
+                current.update(aux_funcs)
+            _, r_red = stage_solver._assemble_system_reduced(current, need_matrix=False)
+            return float(np.linalg.norm(np.asarray(r_red, dtype=float), ord=np.inf))
+        except Exception:
+            return float("nan")
+
+    def _current_predictor_corrector_energy(
+        *,
+        funcs,
+        prev_funcs,
+        aux_funcs,
+        bcs_now,
+        stage_solver=None,
+        stage_bcs_now=None,
+    ) -> dict[str, float]:
+        exact_raw_inf = _current_monolithic_raw_residual_inf(
             funcs=funcs,
             prev_funcs=prev_funcs,
             aux_funcs=aux_funcs,
             bcs_now=bcs_now,
         )
+        homotopy_raw_inf = _current_stage_raw_residual_inf(
+            stage_solver=stage_solver,
+            funcs=funcs,
+            prev_funcs=prev_funcs,
+            aux_funcs=aux_funcs,
+            bcs_now=(bcs_now if stage_bcs_now is None else stage_bcs_now),
+        )
         alpha_mass_rel = _current_alpha_mass_relative_defect(funcs=funcs, prev_funcs=prev_funcs)
         mass_weight = max(0.0, float(getattr(args, "pc_energy_mass_weight", 1.0) or 0.0))
-        energy = float("nan")
-        if np.isfinite(raw_inf):
-            energy = float(raw_inf * raw_inf)
+        exact_energy = float("nan")
+        if np.isfinite(exact_raw_inf):
+            exact_energy = float(exact_raw_inf * exact_raw_inf)
             if np.isfinite(alpha_mass_rel) and mass_weight > 0.0:
-                energy += float(mass_weight) * float(alpha_mass_rel * alpha_mass_rel)
+                exact_energy += float(mass_weight) * float(alpha_mass_rel * alpha_mass_rel)
+        homotopy_energy = float("nan")
+        if np.isfinite(homotopy_raw_inf):
+            homotopy_energy = float(homotopy_raw_inf * homotopy_raw_inf)
+            if np.isfinite(alpha_mass_rel) and mass_weight > 0.0:
+                homotopy_energy += float(mass_weight) * float(alpha_mass_rel * alpha_mass_rel)
         return {
-            "raw_inf": float(raw_inf),
+            "raw_inf": float(exact_raw_inf),
+            "exact_raw_inf": float(exact_raw_inf),
             "alpha_mass_rel": float(alpha_mass_rel),
-            "energy": float(energy),
+            "energy": float(exact_energy),
+            "exact_energy": float(exact_energy),
+            "homotopy_raw_inf": float(homotopy_raw_inf),
+            "homotopy_energy": float(homotopy_energy),
         }
 
     def _pc_required_exact_drop(raw_before: float) -> float:
-        abs_floor = max(0.0, float(getattr(args, "pc_min_abs_decrease", 1.0e-10) or 0.0))
-        rel_floor = max(0.0, float(getattr(args, "pc_min_rel_improve", 0.0) or 0.0))
-        if not np.isfinite(float(raw_before)) or float(raw_before) <= 0.0:
-            return float(abs_floor)
-        return float(max(abs_floor, rel_floor * float(raw_before)))
+        return _pc_required_drop(
+            raw_before,
+            min_abs_decrease=float(getattr(args, "pc_min_abs_decrease", 1.0e-10) or 0.0),
+            min_rel_improve=float(getattr(args, "pc_min_rel_improve", 0.0) or 0.0),
+        )
 
     def _pc_exact_progress(before_stats: dict[str, float], after_stats: dict[str, float]) -> dict[str, float | bool]:
-        raw_before = float(before_stats.get("raw_inf", float("nan")))
-        raw_after = float(after_stats.get("raw_inf", float("nan")))
-        drop = float(raw_before - raw_after) if np.isfinite(raw_before) and np.isfinite(raw_after) else float("nan")
-        required = _pc_required_exact_drop(raw_before)
-        improved = bool(
-            np.isfinite(raw_before)
-            and np.isfinite(raw_after)
-            and raw_after < raw_before
-            and np.isfinite(drop)
-            and drop >= required
+        return _pc_progress(
+            before_stats,
+            after_stats,
+            key="raw_inf",
+            min_abs_decrease=float(getattr(args, "pc_min_abs_decrease", 1.0e-10) or 0.0),
+            min_rel_improve=float(getattr(args, "pc_min_rel_improve", 0.0) or 0.0),
         )
-        return {
-            "improved": bool(improved),
-            "drop": float(drop),
-            "required": float(required),
-        }
+
+    def _pc_homotopy_progress(before_stats: dict[str, float], after_stats: dict[str, float]) -> dict[str, float | bool]:
+        return _pc_progress(
+            before_stats,
+            after_stats,
+            key="homotopy_raw_inf",
+            min_abs_decrease=float(getattr(args, "pc_min_abs_decrease", 1.0e-10) or 0.0),
+            min_rel_improve=float(getattr(args, "pc_min_rel_improve", 0.0) or 0.0),
+        )
 
     def _blend_snapshots(snapshot_a, snapshot_b, theta: float) -> tuple[np.ndarray, ...]:
         blend = float(theta)
@@ -5437,13 +6294,13 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         )
 
     def _predictor_p2_lambda_schedule() -> list[float]:
-        n_steps = max(1, int(getattr(args, "pc_p2_lambda_steps", 4)))
-        if n_steps <= 1:
-            return [1.0]
-        # Start cautiously: the first continuation jump should be much smaller
-        # than the final jump so P2 can accept partial progress on the real
-        # PDE before the exact corrector takes over.
-        return [float(i * i) / float(n_steps * n_steps) for i in range(1, n_steps + 1)]
+        # Start cautiously: the first positive continuation jump should be much
+        # smaller than the final jump so P2 can accept partial homotopy progress
+        # before the exact corrector takes over.
+        return _pc_p2_lambda_schedule(
+            max(1, int(getattr(args, "pc_p2_lambda_steps", 4))),
+            include_zero=False,
+        )
 
     def _predictor_p2_initial_lambda_step() -> float:
         schedule = _predictor_p2_lambda_schedule()
@@ -5460,10 +6317,14 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         anchor_snapshot,
         trial_snapshot,
         stage_label: str,
+        stage_solver=None,
+        stage_bcs_now=None,
+        primary_key: str = "raw_inf",
     ) -> dict[str, object]:
         max_trials = max(1, int(getattr(args, "pc_projection_trials", 5)))
         if str(stage_label).startswith("P2"):
             max_trials = max(max_trials, int(getattr(args, "pc_p2_projection_trials", 12)))
+        primary_energy_key = "homotopy_energy" if str(primary_key) == "homotopy_raw_inf" else "energy"
         thetas = [1.0]
         theta = 1.0
         for _ in range(max_trials - 1):
@@ -5491,6 +6352,8 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                 prev_funcs=prev_funcs,
                 aux_funcs=aux_funcs,
                 bcs_now=bcs_now,
+                stage_solver=stage_solver,
+                stage_bcs_now=stage_bcs_now,
             )
             cand_mass_ok = _predictor_alpha_mass_ok(stats)
             if best_stats is None:
@@ -5499,11 +6362,14 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                 best_theta = float(theta)
                 best_mass_ok = bool(cand_mass_ok)
                 continue
-            cand_energy = float(stats.get("energy", float("nan")))
-            best_energy = float(best_stats.get("energy", float("nan")))
-            cand_raw = float(stats.get("raw_inf", float("nan")))
-            best_raw = float(best_stats.get("raw_inf", float("nan")))
+            cand_energy = float(stats.get(primary_energy_key, float("nan")))
+            best_energy = float(best_stats.get(primary_energy_key, float("nan")))
+            cand_raw = float(stats.get(primary_key, float("nan")))
+            best_raw = float(best_stats.get(primary_key, float("nan")))
             raw_tol = 1.0e-15 * max(1.0, abs(cand_raw), abs(best_raw))
+            cand_exact = float(stats.get("raw_inf", float("nan")))
+            best_exact = float(best_stats.get("raw_inf", float("nan")))
+            exact_tol = 1.0e-15 * max(1.0, abs(cand_exact), abs(best_exact))
             if (
                 (cand_mass_ok and not best_mass_ok)
                 or (
@@ -5522,6 +6388,26 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                     and np.isfinite(cand_raw)
                     and np.isfinite(best_raw)
                     and abs(cand_raw - best_raw) <= raw_tol
+                    and np.isfinite(cand_exact)
+                    and not np.isfinite(best_exact)
+                )
+                or (
+                    cand_mass_ok == best_mass_ok
+                    and np.isfinite(cand_raw)
+                    and np.isfinite(best_raw)
+                    and abs(cand_raw - best_raw) <= raw_tol
+                    and np.isfinite(cand_exact)
+                    and np.isfinite(best_exact)
+                    and cand_exact < best_exact - exact_tol
+                )
+                or (
+                    cand_mass_ok == best_mass_ok
+                    and np.isfinite(cand_raw)
+                    and np.isfinite(best_raw)
+                    and abs(cand_raw - best_raw) <= raw_tol
+                    and np.isfinite(cand_exact)
+                    and np.isfinite(best_exact)
+                    and abs(cand_exact - best_exact) <= exact_tol
                     and np.isfinite(cand_energy)
                     and not np.isfinite(best_energy)
                 )
@@ -5530,6 +6416,9 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                     and np.isfinite(cand_raw)
                     and np.isfinite(best_raw)
                     and abs(cand_raw - best_raw) <= raw_tol
+                    and np.isfinite(cand_exact)
+                    and np.isfinite(best_exact)
+                    and abs(cand_exact - best_exact) <= exact_tol
                     and np.isfinite(cand_energy)
                     and np.isfinite(best_energy)
                     and cand_energy < best_energy
@@ -5564,12 +6453,242 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         print(
             f"    [pc] {stage_label} segment projection kept theta={best_theta:.3f} "
             f"with |R_raw|_∞={float(best_stats['raw_inf']):.3e}, "
+            f"|H|_∞={float(best_stats.get('homotopy_raw_inf', best_stats['raw_inf'])):.3e}, "
             f"alpha_mass_rel={float(best_stats['alpha_mass_rel']):.3e}, "
-            f"E={float(best_stats['energy']):.3e}."
+            f"E_exact={float(best_stats['energy']):.3e}, "
+            f"E_h={float(best_stats.get('homotopy_energy', best_stats['energy'])):.3e}."
         )
         return {
             "theta": float(best_theta),
             "stats": dict(best_stats),
+        }
+
+    def _stage_reduced_iterate(stage_solver, funcs) -> np.ndarray:
+        pack_cb = getattr(stage_solver, "_pack_reduced_iterate", None)
+        if callable(pack_cb):
+            return np.asarray(pack_cb(funcs), dtype=float).ravel()
+        current_cb = getattr(stage_solver, "_current_reduced_iterate", None)
+        if callable(current_cb):
+            return np.asarray(current_cb(funcs), dtype=float).ravel()
+        gather_cb = getattr(stage_solver, "_gather_full_iterate", None)
+        restrictor = getattr(stage_solver, "restrictor", None)
+        if callable(gather_cb) and restrictor is not None and hasattr(restrictor, "restrict_vec"):
+            x_full = np.asarray(gather_cb(funcs), dtype=float).ravel()
+            return np.asarray(restrictor.restrict_vec(x_full), dtype=float).ravel()
+        raise AttributeError(
+            f"{type(stage_solver).__name__} does not provide a reduced-iterate packer."
+        )
+
+    def _write_stage_reduced_iterate(
+        *,
+        stage_solver,
+        funcs,
+        prev_funcs,
+        aux_funcs,
+        bcs_now,
+        x_target_red,
+        project_to_bounds: bool = True,
+    ) -> None:
+        x_curr_red = _stage_reduced_iterate(stage_solver, funcs)
+        x_target = np.asarray(x_target_red, dtype=float).ravel()
+        if x_curr_red.shape != x_target.shape:
+            raise ValueError(
+                f"Reduced iterate shape mismatch: current={x_curr_red.shape}, target={x_target.shape}."
+            )
+        d_red = x_target - x_curr_red
+        if np.any(d_red):
+            d_full = stage_solver.restrictor.expand_vec(d_red)
+            stage_solver.dh.add_to_functions(d_full, funcs)
+            stage_solver.dh.apply_bcs(bcs_now, *funcs)
+            if getattr(stage_solver, "constraints", None) is not None:
+                stage_solver._enforce_constraints_on_functions(funcs)
+        if not bool(project_to_bounds) or not hasattr(stage_solver, "_project_funcs_to_bounds"):
+            return
+        try:
+            lo_red, hi_red = stage_solver._bounds_reduced()
+        except Exception:
+            return
+        eq_prepare_callback = None
+        if hasattr(stage_solver, "_vi_prepare_linear_equalities"):
+            eq_prepare_callback = lambda: stage_solver._vi_prepare_linear_equalities(
+                funcs,
+                prev_funcs,
+                aux_funcs,
+                bcs_now,
+            )
+        stage_solver._project_funcs_to_bounds(
+            funcs,
+            bcs_now,
+            lo_red,
+            hi_red,
+            eq_prepare_callback=eq_prepare_callback,
+        )
+
+    def _run_predictor_corrector_p2_path_predictor(
+        *,
+        funcs,
+        prev_funcs,
+        aux_funcs,
+        bcs_now,
+        p2_solver,
+        p2_bcs_now,
+        p2_lambda,
+        lam_from: float,
+        lam_to: float,
+        stage_label: str,
+    ) -> dict[str, object] | None:
+        lam0 = float(lam_from)
+        lam1 = float(lam_to)
+        if p2_lambda is None or not np.isfinite(lam0) or not np.isfinite(lam1):
+            return None
+        delta_lambda = float(lam1 - lam0)
+        if abs(delta_lambda) <= 1.0e-15:
+            return None
+        predictor_snapshot = _snapshot_function_values(funcs)
+        try:
+            p2_lambda.value = float(lam0)
+            problem["dh"].apply_bcs(p2_bcs_now, *funcs)
+            if getattr(p2_solver, "constraints", None) is not None:
+                p2_solver._enforce_constraints_on_functions(funcs)
+            current = {f.name: f for f in funcs}
+            current.update({f.name: f for f in prev_funcs})
+            if aux_funcs:
+                current.update(aux_funcs)
+            x_curr_red = _stage_reduced_iterate(p2_solver, funcs)
+            A_red, _ = p2_solver._assemble_system_reduced(current, need_matrix=True)
+            p2_lambda.value = 0.0
+            _, r_easy_red = p2_solver._assemble_system_reduced(current, need_matrix=False)
+            p2_lambda.value = 1.0
+            _, r_exact_red = p2_solver._assemble_system_reduced(current, need_matrix=False)
+            dH_dlambda_red = (
+                np.asarray(r_exact_red, dtype=float).ravel()
+                - np.asarray(r_easy_red, dtype=float).ravel()
+            )
+            easy_inf = float(np.linalg.norm(np.asarray(r_easy_red, dtype=float).ravel(), ord=np.inf))
+            exact_inf = float(np.linalg.norm(np.asarray(r_exact_red, dtype=float).ravel(), ord=np.inf))
+            forcing_inf = float(np.linalg.norm(dH_dlambda_red, ord=np.inf))
+            forcing_rel = float(forcing_inf / max(1.0, easy_inf, exact_inf))
+            p2_lambda.value = float(lam0)
+            x_pred_red, z_dot_red = _pc_path_tangent_euler_step(
+                x_red=x_curr_red,
+                jacobian_red=A_red,
+                dH_dlambda_red=dH_dlambda_red,
+                delta_lambda=delta_lambda,
+                solve_linear_system=lambda A, rhs: p2_solver._solve_linear_system_with_context(
+                    A,
+                    np.asarray(rhs, dtype=float).ravel(),
+                    context="homotopy_predictor",
+                ),
+            )
+        except Exception as exc:
+            _restore_function_values(funcs, predictor_snapshot)
+            p2_lambda.value = float(lam1)
+            print(
+                f"    [pc] {stage_label} tangent predictor failed; falling back to the anchor state: {exc}"
+            )
+            return {
+                "used": False,
+                "exception": str(exc),
+            }
+
+        candidate_alphas = [1.0, 0.5, 0.25, 0.1, 0.0]
+        best_snapshot = predictor_snapshot
+        best_stats = None
+        best_alpha = 0.0
+        best_mass_ok = False
+        raw_step = np.asarray(x_pred_red, dtype=float) - np.asarray(x_curr_red, dtype=float)
+        for alpha in candidate_alphas:
+            cand_red = np.asarray(x_curr_red, dtype=float) + float(alpha) * raw_step
+            _restore_function_values(funcs, predictor_snapshot)
+            p2_lambda.value = float(lam1)
+            try:
+                _write_stage_reduced_iterate(
+                    stage_solver=p2_solver,
+                    funcs=funcs,
+                    prev_funcs=prev_funcs,
+                    aux_funcs=aux_funcs,
+                    bcs_now=p2_bcs_now,
+                    x_target_red=cand_red,
+                    project_to_bounds=True,
+                )
+                cand_snapshot = _snapshot_function_values(funcs)
+                cand_stats = _current_predictor_corrector_energy(
+                    funcs=funcs,
+                    prev_funcs=prev_funcs,
+                    aux_funcs=aux_funcs,
+                    bcs_now=bcs_now,
+                    stage_solver=p2_solver,
+                    stage_bcs_now=p2_bcs_now,
+                )
+                cand_mass_ok = _predictor_alpha_mass_ok(cand_stats)
+            except Exception:
+                continue
+            if best_stats is None:
+                best_snapshot = cand_snapshot
+                best_stats = dict(cand_stats)
+                best_alpha = float(alpha)
+                best_mass_ok = bool(cand_mass_ok)
+                continue
+            cand_h = float(cand_stats.get("homotopy_raw_inf", float("nan")))
+            best_h = float(best_stats.get("homotopy_raw_inf", float("nan")))
+            cand_r = float(cand_stats.get("raw_inf", float("nan")))
+            best_r = float(best_stats.get("raw_inf", float("nan")))
+            if (
+                (cand_mass_ok and not best_mass_ok)
+                or (
+                    cand_mass_ok == best_mass_ok
+                    and np.isfinite(cand_h)
+                    and not np.isfinite(best_h)
+                )
+                or (
+                    cand_mass_ok == best_mass_ok
+                    and np.isfinite(cand_h)
+                    and np.isfinite(best_h)
+                    and cand_h < best_h - 1.0e-15 * max(1.0, abs(cand_h), abs(best_h))
+                )
+                or (
+                    cand_mass_ok == best_mass_ok
+                    and np.isfinite(cand_h)
+                    and np.isfinite(best_h)
+                    and abs(cand_h - best_h) <= 1.0e-15 * max(1.0, abs(cand_h), abs(best_h))
+                    and np.isfinite(cand_r)
+                    and (not np.isfinite(best_r) or cand_r < best_r)
+                )
+            ):
+                best_snapshot = cand_snapshot
+                best_stats = dict(cand_stats)
+                best_alpha = float(alpha)
+                best_mass_ok = bool(cand_mass_ok)
+        _restore_function_values(funcs, best_snapshot)
+        p2_lambda.value = float(lam1)
+        if best_stats is None:
+            return {
+                "used": False,
+                "exception": "no_finite_candidate",
+            }
+        print(
+            f"    [pc] {stage_label} tangent predictor solved H_z z_dot + H_lambda = 0 "
+            f"for delta_lambda={delta_lambda:.3f} and kept alpha={best_alpha:.3f} "
+            f"with |dH/dlambda|_∞={forcing_inf:.3e} (rel={forcing_rel:.3e}), "
+            f"with |H|_∞={float(best_stats['homotopy_raw_inf']):.3e}, "
+            f"|R_raw|_∞={float(best_stats['raw_inf']):.3e}, "
+            f"alpha_mass_rel={float(best_stats['alpha_mass_rel']):.3e}."
+        )
+        if forcing_rel <= 1.0e-8:
+            print(
+                f"    [pc] {stage_label} warning: easy and exact residuals are nearly identical at this anchor, "
+                "so the continuation ODE has almost no forcing."
+            )
+        return {
+            "used": bool(best_alpha > 0.0),
+            "alpha": float(best_alpha),
+            "stats": dict(best_stats),
+            "state": _snapshot_function_values(funcs),
+            "tangent_inf": float(np.linalg.norm(np.asarray(z_dot_red, dtype=float), ord=np.inf)),
+            "delta_lambda": float(delta_lambda),
+            "forcing_inf": float(forcing_inf),
+            "forcing_rel": float(forcing_rel),
+            "exception": None,
         }
 
     def _get_predictor_corrector_p1_solver():
@@ -5586,6 +6705,7 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             forms.r_kinematics,
             getattr(forms, "r_alpha", None),
             getattr(forms, "r_mu_alpha", None),
+            problem.get("_alpha_mass_constraint_residual_form"),
         )
         p1_jacobian = _sum_stage_forms(
             forms.a_momentum,
@@ -5595,6 +6715,7 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             forms.a_kinematics,
             getattr(forms, "a_alpha", None),
             getattr(forms, "a_mu_alpha", None),
+            problem.get("_alpha_mass_constraint_jacobian_form"),
         )
         target_solver = _make_startup_stage_solver(
             stage_name="predictor_p1",
@@ -5607,19 +6728,32 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         return target_solver
 
     def _get_predictor_corrector_p2_solver():
-        cache_key = (
-            "predictor_corrector_p2:"
-            f"{str(getattr(args, 'pc_p2_fluid_convection', 'lagged'))}:"
-            f"{str(getattr(args, 'pc_p2_skeleton_inertia_convection', 'lagged'))}"
-        )
+        cache_key = "predictor_corrector_p2"
         target_solver = startup_stage_solver_cache.get(cache_key)
         if target_solver is not None:
             return target_solver
-        exact_residual_form = forms.residual_form
-        exact_jacobian_form = forms.jacobian_form
+        saved_alpha_mass_res = problem.get("_alpha_mass_constraint_residual_form")
+        saved_alpha_mass_jac = problem.get("_alpha_mass_constraint_jacobian_form")
         saved_pm_res = problem.get("_pressure_mean_residual_form")
         saved_pm_jac = problem.get("_pressure_mean_jacobian_form")
-        easy_forms = _build_forms(
+        p2_lambda = _named_constant("pc_p2_lambda", 0.0)
+        one_minus_p2_lambda = _named_constant("pc_p2_one", 1.0) - p2_lambda
+        p2_easy_fluid_full = _named_constant("pc_p2_easy_fluid_full", 0.0)
+        p2_easy_fluid_lagged = _named_constant("pc_p2_easy_fluid_lagged", 0.0)
+        p2_easy_fluid_imex = _named_constant("pc_p2_easy_fluid_imex", 0.0)
+        p2_exact_fluid_full = _named_constant("pc_p2_exact_fluid_full", 0.0)
+        p2_exact_fluid_lagged = _named_constant("pc_p2_exact_fluid_lagged", 0.0)
+        p2_exact_fluid_imex = _named_constant("pc_p2_exact_fluid_imex", 0.0)
+        p2_easy_skeleton_accel = _named_constant("pc_p2_easy_skeleton_accel", 0.0)
+        p2_exact_skeleton_accel = _named_constant(
+            "pc_p2_exact_skeleton_accel",
+            1.0 if bool(args.include_skeleton_acceleration) else 0.0,
+        )
+        p2_easy_skeleton_full = _named_constant("pc_p2_easy_skeleton_full", 0.0)
+        p2_easy_skeleton_lagged = _named_constant("pc_p2_easy_skeleton_lagged", 0.0)
+        p2_exact_skeleton_full = _named_constant("pc_p2_exact_skeleton_full", 0.0)
+        p2_exact_skeleton_lagged = _named_constant("pc_p2_exact_skeleton_lagged", 0.0)
+        p2_forms = _build_forms(
             problem,
             qdeg=int(qdeg),
             dt_c=dt_c,
@@ -5668,27 +6802,49 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             kappa_inv_model=str(args.kappa_inv_model),
             drag_formulation=str(args.drag_formulation),
             fluid_convection=str(getattr(args, "pc_p2_fluid_convection", "lagged")),
+            fluid_convection_full_weight=(
+                one_minus_p2_lambda * p2_easy_fluid_full
+                + p2_lambda * p2_exact_fluid_full
+            ),
+            fluid_convection_lagged_weight=(
+                one_minus_p2_lambda * p2_easy_fluid_lagged
+                + p2_lambda * p2_exact_fluid_lagged
+            ),
+            fluid_convection_imex_weight=(
+                one_minus_p2_lambda * p2_easy_fluid_imex
+                + p2_lambda * p2_exact_fluid_imex
+            ),
             enable_phi_evolution=bool(args.enable_phi_evolution),
             include_skeleton_acceleration=bool(args.include_skeleton_acceleration),
+            skeleton_acceleration_weight=(
+                one_minus_p2_lambda * p2_easy_skeleton_accel
+                + p2_lambda * p2_exact_skeleton_accel
+            ),
             rho_s0_tilde=float(args.rho_s0_tilde),
             skeleton_inertia_convection=str(getattr(args, "pc_p2_skeleton_inertia_convection", "lagged")),
+            skeleton_inertia_full_weight=(
+                one_minus_p2_lambda * p2_easy_skeleton_full
+                + p2_lambda * p2_exact_skeleton_full
+            ),
+            skeleton_inertia_lagged_weight=(
+                one_minus_p2_lambda * p2_easy_skeleton_lagged
+                + p2_lambda * p2_exact_skeleton_lagged
+            ),
             ds_hdiv_tangential=hdiv_tangential_bc_measure,
             ds_alpha_transport=ds_alpha_transport,
             ds_B_transport=ds_B_transport,
             hdiv_tangential_gamma=float(args.hdiv_tangential_gamma),
             hdiv_tangential_method=str(args.hdiv_tangential_method),
         )
+        problem["_alpha_mass_constraint_residual_form"] = saved_alpha_mass_res
+        problem["_alpha_mass_constraint_jacobian_form"] = saved_alpha_mass_jac
         problem["_pressure_mean_residual_form"] = saved_pm_res
         problem["_pressure_mean_jacobian_form"] = saved_pm_jac
-        p2_lambda = Constant(0.0)
-        one_minus_p2_lambda = Constant(1.0) - p2_lambda
-        blended_residual = (easy_forms.residual_form * one_minus_p2_lambda) + (exact_residual_form * p2_lambda)
-        blended_jacobian = (easy_forms.jacobian_form * one_minus_p2_lambda) + (exact_jacobian_form * p2_lambda)
         p2_fields = _startup_predictor_p2_fields()
         target_solver = _make_startup_stage_solver(
             stage_name="predictor_p2",
-            residual_form=blended_residual,
-            jacobian_form=blended_jacobian,
+            residual_form=p2_forms.residual_form,
+            jacobian_form=p2_forms.jacobian_form,
             active_fields=p2_fields,
             max_newton_iter_override=max(1, int(getattr(args, "pc_p2_max_it", 8))),
         )
@@ -5701,8 +6857,57 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                 target_solver.np.tr_radius_init = min(float(getattr(target_solver.np, "tr_radius_init", 1.0)), 2.5e-1)
                 target_solver.np.tr_radius_max = min(float(getattr(target_solver.np, "tr_radius_max", 1.0e3)), 2.0)
         target_solver._pc_p2_lambda = p2_lambda
+        target_solver._pc_p2_mode_constants = {
+            "easy_fluid_full": p2_easy_fluid_full,
+            "easy_fluid_lagged": p2_easy_fluid_lagged,
+            "easy_fluid_imex": p2_easy_fluid_imex,
+            "exact_fluid_full": p2_exact_fluid_full,
+            "exact_fluid_lagged": p2_exact_fluid_lagged,
+            "exact_fluid_imex": p2_exact_fluid_imex,
+            "easy_skeleton_accel": p2_easy_skeleton_accel,
+            "exact_skeleton_accel": p2_exact_skeleton_accel,
+            "easy_skeleton_full": p2_easy_skeleton_full,
+            "easy_skeleton_lagged": p2_easy_skeleton_lagged,
+            "exact_skeleton_full": p2_exact_skeleton_full,
+            "exact_skeleton_lagged": p2_exact_skeleton_lagged,
+        }
         startup_stage_solver_cache[cache_key] = target_solver
         return target_solver
+
+    def _configure_predictor_corrector_p2_solver(
+        *,
+        p2_solver,
+        dt_now: float,
+    ) -> dict[str, float | str]:
+        mode_constants = getattr(p2_solver, "_pc_p2_mode_constants", None)
+        if isinstance(mode_constants, dict):
+            easy_fluid = _pc_fluid_convection_selectors(str(getattr(args, "startup_bootstrap_fluid_convection", "off")))
+            exact_fluid = _pc_fluid_convection_selectors(str(getattr(args, "pc_p2_fluid_convection", "lagged")))
+            easy_skeleton = _pc_skeleton_inertia_selectors("lagged")
+            exact_skeleton = _pc_skeleton_inertia_selectors(str(getattr(args, "pc_p2_skeleton_inertia_convection", "lagged")))
+            mode_constants["easy_fluid_full"].value = float(easy_fluid["full"])
+            mode_constants["easy_fluid_lagged"].value = float(easy_fluid["lagged"])
+            mode_constants["easy_fluid_imex"].value = float(easy_fluid["imex"])
+            mode_constants["exact_fluid_full"].value = float(exact_fluid["full"])
+            mode_constants["exact_fluid_lagged"].value = float(exact_fluid["lagged"])
+            mode_constants["exact_fluid_imex"].value = float(exact_fluid["imex"])
+            mode_constants["easy_skeleton_accel"].value = float(
+                1.0 if bool(getattr(args, "startup_bootstrap_include_skeleton_acceleration", False)) else 0.0
+            )
+            mode_constants["exact_skeleton_accel"].value = float(
+                1.0 if bool(args.include_skeleton_acceleration) else 0.0
+            )
+            mode_constants["easy_skeleton_full"].value = float(easy_skeleton["full"])
+            mode_constants["easy_skeleton_lagged"].value = float(easy_skeleton["lagged"])
+            mode_constants["exact_skeleton_full"].value = float(exact_skeleton["full"])
+            mode_constants["exact_skeleton_lagged"].value = float(exact_skeleton["lagged"])
+        return {
+            "anchor_dt": float(_pc_p2_easy_dt_value(args, float(dt_now))),
+            "fluid_convection": str(getattr(args, "startup_bootstrap_fluid_convection", "off")),
+            "include_skeleton_acceleration": float(
+                1.0 if bool(getattr(args, "startup_bootstrap_include_skeleton_acceleration", False)) else 0.0
+            ),
+        }
 
     def _prime_predictor_corrector_p2_solver():
         if not (
@@ -5717,6 +6922,189 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             print("    [pc] P2 globalization solver cached and kernels prebuilt for reuse.")
         return target_solver
 
+    def _run_predictor_corrector_exact_probe(
+        *,
+        funcs,
+        prev_funcs,
+        aux_funcs,
+        bcs_now,
+        before_snapshot,
+        before_stats: dict[str, float],
+        stage_label: str = "P-exact",
+    ) -> dict[str, object]:
+        probe_budget = max(0, int(getattr(args, "pc_exact_probe_max_it", 1) or 0))
+        if probe_budget <= 0:
+            return {
+                "used": False,
+                "keep": False,
+                "snapshot": before_snapshot,
+                "after": dict(before_stats),
+                "iters": 0,
+                "converged": False,
+                "exception": None,
+                "decision": {
+                    "exact": _pc_exact_progress(before_stats, before_stats),
+                    "alpha_mass_ok": bool(_predictor_alpha_mass_ok(before_stats)),
+                },
+            }
+        budget_saved = int(
+            getattr(getattr(solver, "np", None), "max_newton_iter", base_solver_max_newton_iter)
+            or base_solver_max_newton_iter
+        )
+        trace_label_saved = getattr(solver, "_newton_trace_label", None)
+        trace_cb_saved = getattr(solver, "_newton_trace_global_residual_cb", None)
+        trace_global_label_saved = getattr(solver, "_newton_trace_global_residual_label", None)
+        _restore_function_values(funcs, before_snapshot)
+        problem["dh"].apply_bcs(bcs_now, *funcs)
+        probe_exception = None
+        strong_probe_abs = 0.0
+        strong_probe_rel = 0.0
+        if _logistic_refmap_phi_only_mode(args) and str(stage_label).strip().lower() == "g-exact":
+            # On the refmap phi-only branch the G-anchor can already be much
+            # better than the raw initial state, so a tiny exact decrease from
+            # that basin is not enough reason to skip P0/P1/P2 entirely.
+            strong_probe_rel = 0.25
+        try:
+            if hasattr(solver, "np"):
+                solver.np.max_newton_iter = int(probe_budget)
+            _set_solver_newton_trace_context(
+                solver,
+                label=f"pc:{str(stage_label)}",
+            )
+            try:
+                _, probe_converged, probe_iters = solver._newton_loop(
+                    funcs,
+                    prev_funcs,
+                    aux_funcs,
+                    bcs_now,
+                )
+            except Exception as exc:
+                probe_exception = exc
+                probe_converged = False
+                probe_iters = max(1, int(probe_budget))
+            probe_after = _current_predictor_corrector_energy(
+                funcs=funcs,
+                prev_funcs=prev_funcs,
+                aux_funcs=aux_funcs,
+                bcs_now=bcs_now,
+            )
+            probe_snapshot = _snapshot_function_values(funcs)
+            probe_keep, probe_decision = _pc_should_prefer_exact_probe(
+                before_stats=before_stats,
+                after_stats=probe_after,
+                alpha_mass_ok=_predictor_alpha_mass_ok(probe_after),
+                min_abs_decrease=float(getattr(args, "pc_min_abs_decrease", 1.0e-10) or 0.0),
+                min_rel_improve=float(getattr(args, "pc_min_rel_improve", 0.0) or 0.0),
+                strong_min_abs_decrease=float(strong_probe_abs),
+                strong_min_rel_improve=float(strong_probe_rel),
+            )
+        finally:
+            if hasattr(solver, "np"):
+                solver.np.max_newton_iter = int(budget_saved)
+            solver._newton_trace_label = trace_label_saved
+            solver._newton_trace_global_residual_cb = trace_cb_saved
+            solver._newton_trace_global_residual_label = trace_global_label_saved
+        if not bool(probe_keep):
+            _restore_function_values(funcs, before_snapshot)
+            probe_snapshot = before_snapshot
+            probe_after = dict(before_stats)
+        exact_progress = dict(probe_decision.get("exact", {}))
+        print(
+            f"    [pc] {stage_label} monolithic probe "
+            f"|R_raw|_∞ {float(before_stats['raw_inf']):.3e} -> {float(probe_after['raw_inf']):.3e}, "
+            f"alpha_mass_rel {float(probe_after['alpha_mass_rel']):.3e}, "
+            f"R_drop={float(exact_progress.get('drop', float('nan'))):.3e}, "
+            f"R_req={float(exact_progress.get('required', float('nan'))):.3e}, "
+            f"strong_req={float(dict(probe_decision.get('strong_exact', {})).get('required', float('nan'))):.3e}, "
+            f"iters={int(probe_iters)}, converged={int(bool(probe_converged))}, kept={int(bool(probe_keep))}."
+        )
+        if probe_exception is not None:
+            print(f"    [pc] {stage_label} monolithic probe stopped before full convergence: {probe_exception}")
+        return {
+            "used": True,
+            "keep": bool(probe_keep),
+            "snapshot": probe_snapshot,
+            "after": dict(probe_after),
+            "iters": int(probe_iters),
+            "converged": bool(probe_converged),
+            "exception": (None if probe_exception is None else str(probe_exception)),
+            "decision": dict(probe_decision),
+        }
+
+    def _run_predictor_corrector_p2_staggered_anchor(
+        *,
+        funcs,
+        prev_funcs,
+        aux_funcs,
+        bcs_now,
+        step_no: int,
+        t_fail: float,
+        dt_fail: float,
+        best_snapshot,
+        best_stats,
+    ) -> dict[str, object] | None:
+        if not bool(getattr(args, "pc_p2_staggered_anchor", True)):
+            return None
+        dt_micro = _pc_p2_easy_dt_value(args, float(dt_fail))
+        if not np.isfinite(dt_micro) or dt_micro <= 0.0:
+            return None
+        print(
+            "    [pc] building G-anchor with a staggered micro-step "
+            f"(dt={float(dt_micro):.3e}, outer={int(max(1, int(getattr(args, 'pc_p2_staggered_anchor_outer_it', 1))))})."
+        )
+        snapshot_in = _snapshot_function_values(funcs)
+        dt_saved = float(dt_c.value)
+        try:
+            dt_c.value = float(dt_micro)
+            startup_stats = _run_startup_staggered_guess(
+                funcs=funcs,
+                prev_funcs=prev_funcs,
+                aux_funcs=aux_funcs,
+                bcs_now=bcs_now,
+                step_no=int(step_no),
+                t_fail=float(t_fail),
+                dt_fail=float(dt_micro),
+                outer_it_override=max(1, int(getattr(args, "pc_p2_staggered_anchor_outer_it", 1))),
+            )
+        except Exception as exc:
+            _restore_function_values(funcs, snapshot_in)
+            print(f"    [pc] G-anchor staggered micro-step failed at dt={float(dt_micro):.3e}: {exc}")
+            return {
+                "used": False,
+                "dt_micro": float(dt_micro),
+                "exception": str(exc),
+            }
+        finally:
+            dt_c.value = float(dt_saved)
+        staged_snapshot = _snapshot_function_values(funcs)
+        staged_stats = _current_predictor_corrector_energy(
+            funcs=funcs,
+            prev_funcs=prev_funcs,
+            aux_funcs=aux_funcs,
+            bcs_now=bcs_now,
+        )
+        progress = _pc_exact_progress(best_stats, staged_stats)
+        keep = bool(progress["improved"]) and _predictor_alpha_mass_ok(staged_stats)
+        if not keep:
+            _restore_function_values(funcs, snapshot_in)
+            staged_snapshot = snapshot_in
+            staged_stats = dict(best_stats)
+        print(
+            "    [pc] G-anchor staggered micro-step "
+            f"(dt={float(dt_micro):.3e}) |R_raw|_∞ {float(best_stats['raw_inf']):.3e} "
+            f"-> {float(staged_stats['raw_inf']):.3e}, "
+            f"alpha_mass_rel={float(staged_stats['alpha_mass_rel']):.3e}, "
+            f"kept={int(bool(keep))}, sweeps={int(startup_stats.get('outer_it', 0) if 'startup_stats' in locals() else 0)}."
+        )
+        return {
+            "used": bool(keep),
+            "dt_micro": float(dt_micro),
+            "startup_stats": dict(startup_stats),
+            "snapshot": staged_snapshot,
+            "stats": dict(staged_stats),
+            "exception": None,
+        }
+
     def _run_predictor_corrector_p2_lambda_attempt(
         *,
         funcs,
@@ -5726,10 +7114,27 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         p2_solver,
         p2_bcs_now,
         p2_lambda,
+        lam_from: float | None,
         lam: float,
         stage_label: str,
         anchor_snapshot,
+        exact_reference_stats: dict[str, float] | None = None,
     ) -> dict[str, object]:
+        predictor_info = None
+        lam_from_eff = None if lam_from is None else float(lam_from)
+        if lam_from_eff is not None and abs(float(lam) - lam_from_eff) > 1.0e-15:
+            predictor_info = _run_predictor_corrector_p2_path_predictor(
+                funcs=funcs,
+                prev_funcs=prev_funcs,
+                aux_funcs=aux_funcs,
+                bcs_now=bcs_now,
+                p2_solver=p2_solver,
+                p2_bcs_now=p2_bcs_now,
+                p2_lambda=p2_lambda,
+                lam_from=float(lam_from_eff),
+                lam_to=float(lam),
+                stage_label=stage_label,
+            )
         if p2_lambda is not None:
             p2_lambda.value = float(lam)
         lam_before_snapshot = _snapshot_function_values(funcs)
@@ -5738,15 +7143,23 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             prev_funcs=prev_funcs,
             aux_funcs=aux_funcs,
             bcs_now=bcs_now,
+            stage_solver=p2_solver,
+            stage_bcs_now=p2_bcs_now,
         )
         print(
             f"    [pc] {stage_label} solve at lambda={float(lam):.3f} "
-            f"from |R_raw|_∞={float(lam_before['raw_inf']):.3e}."
+            f"from |H|_∞={float(lam_before['homotopy_raw_inf']):.3e}, "
+            f"|R_raw|_∞={float(lam_before['raw_inf']):.3e}."
         )
         lam_converged = False
         lam_exception = None
         lam_iters = 0
         try:
+            _set_solver_newton_trace_context(
+                p2_solver,
+                label=f"pc:{str(stage_label)}(lambda={float(lam):.3f})",
+                global_bcs_now=bcs_now,
+            )
             _, lam_converged, lam_iters = p2_solver._newton_loop(
                 funcs,
                 prev_funcs,
@@ -5769,6 +7182,8 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             prev_funcs=prev_funcs,
             aux_funcs=aux_funcs,
             bcs_now=bcs_now,
+            stage_solver=p2_solver,
+            stage_bcs_now=p2_bcs_now,
         )
         _project_predictor_segment(
             funcs=funcs,
@@ -5778,6 +7193,9 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             anchor_snapshot=anchor_snapshot,
             trial_snapshot=lam_trial_snapshot,
             stage_label=f"{stage_label}(lambda={float(lam):.3f})",
+            stage_solver=p2_solver,
+            stage_bcs_now=p2_bcs_now,
+            primary_key="homotopy_raw_inf",
         )
         lam_projected_snapshot = _snapshot_function_values(funcs)
         lam_projected = _current_predictor_corrector_energy(
@@ -5785,15 +7203,33 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             prev_funcs=prev_funcs,
             aux_funcs=aux_funcs,
             bcs_now=bcs_now,
+            stage_solver=p2_solver,
+            stage_bcs_now=p2_bcs_now,
         )
-        lam_progress = _pc_exact_progress(lam_before, lam_projected)
-        lam_keep = bool(lam_progress["improved"]) and _predictor_alpha_mass_ok(lam_projected)
+        lam_keep, lam_decision = _pc_should_keep_lambda_stage(
+            lam=float(lam),
+            before_stats=lam_before,
+            after_stats=lam_projected,
+            exact_reference_stats=exact_reference_stats,
+            alpha_mass_ok=_predictor_alpha_mass_ok(lam_projected),
+            min_abs_decrease=float(getattr(args, "pc_min_abs_decrease", 1.0e-10) or 0.0),
+            min_rel_improve=float(getattr(args, "pc_min_rel_improve", 0.0) or 0.0),
+            max_exact_worsen_rel=float(getattr(args, "pc_p2_max_exact_worsen_rel", 5.0e-2) or 0.0),
+            homotopy_tol=max(float(getattr(args, "newton_tol", 1.0e-6) or 1.0e-6), 1.0e-12),
+        )
+        exact_progress = dict(lam_decision.get("exact", {}))
+        homotopy_progress = dict(lam_decision.get("homotopy", {}))
         print(
             f"    [pc] {stage_label} lambda result "
-            f"{float(lam_before['raw_inf']):.3e} -> {float(lam_projected['raw_inf']):.3e}, "
+            f"|H|_∞ {float(lam_before['homotopy_raw_inf']):.3e} -> {float(lam_projected['homotopy_raw_inf']):.3e}, "
+            f"|R_raw|_∞ {float(lam_before['raw_inf']):.3e} -> {float(lam_projected['raw_inf']):.3e}, "
             f"alpha_mass_rel={float(lam_projected['alpha_mass_rel']):.3e}, "
-            f"drop={float(lam_progress['drop']):.3e}, "
-            f"drop_req={float(lam_progress['required']):.3e}, "
+            f"H_drop={float(homotopy_progress.get('drop', float('nan'))):.3e}, "
+            f"H_req={float(homotopy_progress.get('required', float('nan'))):.3e}, "
+            f"R_drop={float(exact_progress.get('drop', float('nan'))):.3e}, "
+            f"R_req={float(exact_progress.get('required', float('nan'))):.3e}, "
+            f"R_ref={float(lam_decision.get('exact_reference', float('nan'))):.3e}, "
+            f"R_cap={float(lam_decision.get('exact_guard_limit', float('nan'))):.3e}, "
             f"iters={int(lam_iters)}, converged={int(bool(lam_converged))}, kept={int(bool(lam_keep))}."
         )
         if not lam_keep:
@@ -5808,7 +7244,9 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             "converged": bool(lam_converged),
             "exception": lam_exception,
             "return_map": dict(lam_return),
-            "progress": dict(lam_progress),
+            "progress": dict(homotopy_progress),
+            "decision": dict(lam_decision),
+            "predictor": predictor_info,
         }
 
     def _attempt_predictor_corrector_p2_reentry(
@@ -5822,15 +7260,15 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         dt_fail: float,
         reason: str,
     ) -> dict[str, object] | None:
-        if not (
-            bool(getattr(args, "predictor_corrector_startup", False))
-            and bool(args.enable_phi_evolution)
-            and problem.get("phi_k") is not None
-        ):
+        if not _predictor_corrector_startup_enabled(args, problem):
             return None
         p2_solver = _prime_predictor_corrector_p2_solver()
         if p2_solver is None:
             p2_solver = _get_predictor_corrector_p2_solver()
+        _configure_predictor_corrector_p2_solver(
+            p2_solver=p2_solver,
+            dt_now=float(dt_fail),
+        )
         p2_lambda = getattr(p2_solver, "_pc_p2_lambda", None)
         p2_fields = _startup_predictor_p2_fields()
         p2_bcs_now = _filter_bcs_by_fields(bcs_now, p2_fields)
@@ -5844,6 +7282,25 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             aux_funcs=aux_funcs,
             bcs_now=bcs_now,
         )
+        exact_reference_stats = dict(base_stats)
+        anchor_attempt = _run_predictor_corrector_p2_lambda_attempt(
+            funcs=funcs,
+            prev_funcs=prev_funcs,
+            aux_funcs=aux_funcs,
+            bcs_now=bcs_now,
+            p2_solver=p2_solver,
+            p2_bcs_now=p2_bcs_now,
+            p2_lambda=p2_lambda,
+            lam_from=None,
+            lam=0.0,
+            stage_label="P2-reentry-anchor",
+            anchor_snapshot=base_snapshot,
+            exact_reference_stats=exact_reference_stats,
+        )
+        anchor_kept = bool(anchor_attempt["keep"])
+        if anchor_kept:
+            base_snapshot = anchor_attempt["projected_snapshot"]
+            base_stats = dict(anchor_attempt["projected_after"])
         lam0_raw = float(getattr(args, "pc_p2_reentry_lambda0", 0.0) or 0.0)
         if not np.isfinite(lam0_raw) or lam0_raw <= 0.0:
             lam0_raw = float(_predictor_p2_initial_lambda_step())
@@ -5869,9 +7326,11 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                 p2_solver=p2_solver,
                 p2_bcs_now=p2_bcs_now,
                 p2_lambda=p2_lambda,
+                lam_from=(0.0 if anchor_kept else None),
                 lam=float(lam),
                 stage_label="P2-reentry",
                 anchor_snapshot=base_snapshot,
+                exact_reference_stats=exact_reference_stats,
             )
             if bool(attempt["keep"]):
                 if p2_lambda is not None:
@@ -5879,8 +7338,9 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                 startup_retry_state["pc_last_successful_lambda"] = float(lam)
                 improved_stats = dict(attempt["projected_after"])
                 print(
-                    "    [pc] exact-corrector stall handed control back to P2 and recovered a better exact state "
-                    f"({reason}; lambda={float(lam):.3f}, |R_raw|_∞ {float(base_stats['raw_inf']):.3e} -> "
+                    "    [pc] exact-corrector stall handed control back to P2 and recovered a new homotopy state "
+                    f"({reason}; lambda={float(lam):.3f}, |H|_∞ {float(base_stats['homotopy_raw_inf']):.3e} -> "
+                    f"{float(improved_stats['homotopy_raw_inf']):.3e}, |R_raw|_∞ {float(base_stats['raw_inf']):.3e} -> "
                     f"{float(improved_stats['raw_inf']):.3e})."
                 )
                 return {
@@ -5895,11 +7355,30 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                     "exception": (None if attempt["exception"] is None else str(attempt["exception"])),
                 }
             lam *= 0.5
+        if anchor_kept:
+            if p2_lambda is not None:
+                p2_lambda.value = 1.0
+            _restore_function_values(funcs, base_snapshot)
+            print(
+                "    [pc] exact-corrector stall re-entered P2 and kept the lambda=0 anchor state "
+                f"({reason}; |H|_∞={float(base_stats['homotopy_raw_inf']):.3e}, |R_raw|_∞={float(base_stats['raw_inf']):.3e})."
+            )
+            return {
+                "mode": "reentry_anchor",
+                "reason": str(reason),
+                "lambda": 0.0,
+                "attempts": int(attempt_no),
+                "before": dict(base_stats),
+                "after": dict(base_stats),
+                "iters": int(anchor_attempt["iters"]),
+                "converged": bool(anchor_attempt["converged"]),
+                "exception": (None if anchor_attempt["exception"] is None else str(anchor_attempt["exception"])),
+            }
         if p2_lambda is not None:
             p2_lambda.value = 1.0
         _restore_function_values(funcs, base_snapshot)
         print(
-            "    [pc] exact-corrector stall re-entered P2 but no lambda stage produced a meaningful exact-residual decrease; "
+            "    [pc] exact-corrector stall re-entered P2 but no lambda stage produced a meaningful homotopy improvement; "
             f"reason={reason}."
         )
         return None
@@ -5916,7 +7395,6 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
     ) -> dict[str, object]:
         if int(step_no) != 1:
             raise RuntimeError("predictor-corrector startup is only defined for step 1.")
-        _prime_predictor_corrector_p2_solver()
         _copy_prev_into_current(funcs, prev_funcs)
         initial_snapshot = _snapshot_function_values(funcs)
         initial_stats = _current_predictor_corrector_energy(
@@ -5928,39 +7406,136 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         best_snapshot = initial_snapshot
         best_stats = dict(initial_stats)
         stage_log: list[dict[str, object]] = []
+        if bool(args.enable_phi_evolution) and problem.get("phi_k") is not None:
+            anchor_info = _run_predictor_corrector_p2_staggered_anchor(
+                funcs=funcs,
+                prev_funcs=prev_funcs,
+                aux_funcs=aux_funcs,
+                bcs_now=bcs_now,
+                step_no=int(step_no),
+                t_fail=float(t_fail),
+                dt_fail=float(dt_fail),
+                best_snapshot=best_snapshot,
+                best_stats=best_stats,
+            )
+            if anchor_info is not None:
+                if bool(anchor_info.get("used", False)):
+                    best_snapshot = anchor_info["snapshot"]
+                    best_stats = dict(anchor_info["stats"])
+                else:
+                    _restore_function_values(funcs, best_snapshot)
+                stage_log.append(
+                    {
+                        "stage": "G0",
+                        "before": dict(initial_stats),
+                        "after": dict(anchor_info.get("stats", best_stats)),
+                        "kept": bool(anchor_info.get("used", False)),
+                        "detail": dict(anchor_info.get("startup_stats", {})),
+                        "dt_micro": float(anchor_info.get("dt_micro", float("nan"))),
+                        "exception": anchor_info.get("exception", None),
+                    }
+                )
+                if bool(anchor_info.get("used", False)):
+                    _restore_function_values(funcs, best_snapshot)
+                    g_exact_before_snapshot = _snapshot_function_values(funcs)
+                    g_exact_before = dict(best_stats)
+                    g_exact_probe = _run_predictor_corrector_exact_probe(
+                        funcs=funcs,
+                        prev_funcs=prev_funcs,
+                        aux_funcs=aux_funcs,
+                        bcs_now=bcs_now,
+                        before_snapshot=g_exact_before_snapshot,
+                        before_stats=g_exact_before,
+                        stage_label="G-exact",
+                    )
+                    stage_log.append(
+                        {
+                            "stage": "G-exact",
+                            "before": dict(g_exact_before),
+                            "after": dict(g_exact_probe.get("after", g_exact_before)),
+                            "converged": bool(g_exact_probe.get("converged", False)),
+                            "iters": int(g_exact_probe.get("iters", 0)),
+                            "exception": g_exact_probe.get("exception", None),
+                            "kept": bool(g_exact_probe.get("keep", False)),
+                            "decision": dict(g_exact_probe.get("decision", {})),
+                        }
+                    )
+                    if bool(g_exact_probe.get("keep", False)):
+                        best_snapshot = g_exact_probe["snapshot"]
+                        best_stats = dict(g_exact_probe["after"])
+                        _restore_function_values(funcs, best_snapshot)
+                        print(
+                            "    [pc] G-exact already reduced the exact monolithic residual from the kept "
+                            "G-anchor basin; skipping P0/P1/P2 continuation on this startup pass."
+                        )
+                        return {
+                            "initial": dict(initial_stats),
+                            "final": dict(best_stats),
+                            "stages": stage_log,
+                        }
+                    _restore_function_values(funcs, best_snapshot)
+                    if _logistic_refmap_phi_only_mode(args):
+                        print(
+                            "    [pc] keeping the best kept G-anchor basin on the refmap phi-only logistic "
+                            "branch and continuing into P0/P1/P2 because G-exact did not improve enough to "
+                            "replace the continuation stages."
+                        )
 
         p0_before = dict(best_stats)
         p0_snapshot_in = _snapshot_function_values(funcs)
-        p0_stats = _run_frozen_transport_restart(
-            funcs=funcs,
-            prev_funcs=prev_funcs,
-            aux_funcs=aux_funcs,
-            bcs_now=bcs_now,
-            step_no=int(step_no),
-            t_fail=float(t_fail),
-            dt_fail=float(dt_fail),
-            outer_it_override=max(1, int(getattr(args, "pc_p0_outer_it", 2))),
-        )
-        p0_return = _apply_predictor_alpha_mass_return_map(
-            funcs=funcs,
-            prev_funcs=prev_funcs,
-            bcs_now=bcs_now,
-            stage_label="P0",
-            verbose=True,
-        )
-        p0_after = _current_predictor_corrector_energy(
-            funcs=funcs,
-            prev_funcs=prev_funcs,
-            aux_funcs=aux_funcs,
-            bcs_now=bcs_now,
-        )
-        p0_progress = _pc_exact_progress(p0_before, p0_after)
-        if bool(p0_progress["improved"]) and _predictor_alpha_mass_ok(p0_after):
-            best_snapshot = _snapshot_function_values(funcs)
-            best_stats = dict(p0_after)
-            kept_p0 = True
-        else:
+        p0_exception = None
+        try:
+            p0_stats = _run_frozen_transport_restart(
+                funcs=funcs,
+                prev_funcs=prev_funcs,
+                aux_funcs=aux_funcs,
+                bcs_now=bcs_now,
+                step_no=int(step_no),
+                t_fail=float(t_fail),
+                dt_fail=float(dt_fail),
+                outer_it_override=max(1, int(getattr(args, "pc_p0_outer_it", 2))),
+            )
+            p0_return = _apply_predictor_alpha_mass_return_map(
+                funcs=funcs,
+                prev_funcs=prev_funcs,
+                bcs_now=bcs_now,
+                stage_label="P0",
+                verbose=True,
+            )
+            p0_after = _current_predictor_corrector_energy(
+                funcs=funcs,
+                prev_funcs=prev_funcs,
+                aux_funcs=aux_funcs,
+                bcs_now=bcs_now,
+            )
+            p0_progress = _pc_exact_progress(p0_before, p0_after)
+            if bool(p0_progress["improved"]) and _predictor_alpha_mass_ok(p0_after):
+                best_snapshot = _snapshot_function_values(funcs)
+                best_stats = dict(p0_after)
+                kept_p0 = True
+            else:
+                _restore_function_values(funcs, p0_snapshot_in)
+                kept_p0 = False
+        except Exception as exc:
+            p0_exception = exc
             _restore_function_values(funcs, p0_snapshot_in)
+            p0_stats = {
+                "outer_it": 0,
+                "requested_outer_it": max(1, int(getattr(args, "pc_p0_outer_it", 2))),
+                "flow_iters_total": 0,
+                "solid_iters_total": 0,
+                "flow_iters_hist": tuple(),
+                "solid_iters_hist": tuple(),
+                "partial_success": False,
+                "partial_reason": str(exc),
+                "residual_before": float(p0_before["raw_inf"]),
+                "residual_after": float(p0_before["raw_inf"]),
+            }
+            p0_return = {
+                "applied": False,
+                "reason": f"P0 predictor failed before return mapping: {exc}",
+            }
+            p0_after = dict(p0_before)
             kept_p0 = False
         stage_log.append(
             {
@@ -5970,6 +7545,7 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                 "kept": bool(kept_p0),
                 "detail": dict(p0_stats),
                 "return_map": dict(p0_return),
+                "exception": (None if p0_exception is None else str(p0_exception)),
             }
         )
         print(
@@ -5977,6 +7553,8 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             f"|R_raw|_∞ {float(p0_before['raw_inf']):.3e} -> {float(p0_after['raw_inf']):.3e}, "
             f"alpha_mass_rel {float(p0_after['alpha_mass_rel']):.3e}, kept={int(bool(kept_p0))}."
         )
+        if p0_exception is not None:
+            print(f"    [pc] P0 predictor stopped before full convergence: {p0_exception}")
 
         _restore_function_values(funcs, best_snapshot)
         p1_solver = _get_predictor_corrector_p1_solver()
@@ -5990,6 +7568,11 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         problem["dh"].apply_bcs(p1_bcs_now, *funcs)
         p1_exception = None
         try:
+            _set_solver_newton_trace_context(
+                p1_solver,
+                label="pc:P1",
+                global_bcs_now=bcs_now,
+            )
             _, p1_converged, p1_iters = p1_solver._newton_loop(
                 funcs,
                 prev_funcs,
@@ -6064,7 +7647,49 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
 
         if bool(args.enable_phi_evolution) and problem.get("phi_k") is not None:
             _restore_function_values(funcs, best_snapshot)
+            p_exact_before_snapshot = _snapshot_function_values(funcs)
+            p_exact_before = dict(best_stats)
+            exact_probe = _run_predictor_corrector_exact_probe(
+                funcs=funcs,
+                prev_funcs=prev_funcs,
+                aux_funcs=aux_funcs,
+                bcs_now=bcs_now,
+                before_snapshot=p_exact_before_snapshot,
+                before_stats=p_exact_before,
+                stage_label="P-exact",
+            )
+            stage_log.append(
+                {
+                    "stage": "P-exact",
+                    "before": dict(p_exact_before),
+                    "after": dict(exact_probe.get("after", p_exact_before)),
+                    "converged": bool(exact_probe.get("converged", False)),
+                    "iters": int(exact_probe.get("iters", 0)),
+                    "exception": exact_probe.get("exception", None),
+                    "kept": bool(exact_probe.get("keep", False)),
+                    "decision": dict(exact_probe.get("decision", {})),
+                }
+            )
+            if bool(exact_probe.get("keep", False)):
+                best_snapshot = exact_probe["snapshot"]
+                best_stats = dict(exact_probe["after"])
+                _restore_function_values(funcs, best_snapshot)
+                print(
+                    "    [pc] P-exact already reduced the exact monolithic residual from the P1 basin; "
+                    "skipping P2 continuation on this startup pass."
+                )
+                return {
+                    "initial": dict(initial_stats),
+                    "final": dict(best_stats),
+                    "stages": stage_log,
+                }
+            _restore_function_values(funcs, best_snapshot)
+            _prime_predictor_corrector_p2_solver()
             p2_solver = _get_predictor_corrector_p2_solver()
+            p2_easy_info = _configure_predictor_corrector_p2_solver(
+                p2_solver=p2_solver,
+                dt_now=float(dt_fail),
+            )
             p2_lambda = getattr(p2_solver, "_pc_p2_lambda", None)
             p2_fields = _startup_predictor_p2_fields()
             p2_bcs_now = _filter_bcs_by_fields(bcs_now, p2_fields)
@@ -6077,12 +7702,36 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             p2_exception = None
             p2_converged = True
             p2_iters = 0
+            anchor_kept = False
             completed_lambdas = 0
             p2_best_snapshot = p2_before_snapshot
             p2_best_stats = dict(p2_before)
+            p2_reference_stats = dict(p2_before)
             p2_lambda_attempts: list[float] = []
             p2_lambda_kept: list[float] = []
             lam_curr = 0.0
+            anchor_attempt = _run_predictor_corrector_p2_lambda_attempt(
+                funcs=funcs,
+                prev_funcs=prev_funcs,
+                aux_funcs=aux_funcs,
+                bcs_now=bcs_now,
+                p2_solver=p2_solver,
+                p2_bcs_now=p2_bcs_now,
+                p2_lambda=p2_lambda,
+                lam_from=0.0,
+                lam=0.0,
+                stage_label="P2-anchor",
+                anchor_snapshot=p2_before_snapshot,
+                exact_reference_stats=p2_reference_stats,
+            )
+            p2_iters += int(anchor_attempt["iters"])
+            if bool(anchor_attempt["keep"]):
+                anchor_kept = True
+                p2_best_snapshot = anchor_attempt["projected_snapshot"]
+                p2_best_stats = dict(anchor_attempt["projected_after"])
+                _restore_function_values(funcs, p2_best_snapshot)
+            else:
+                _restore_function_values(funcs, p2_before_snapshot)
             lam_step = float(_predictor_p2_initial_lambda_step())
             lam_step = min(max(lam_step, 1.0e-8), 1.0)
             lam_growth = max(1.0, float(getattr(args, "pc_p2_lambda_growth", 1.5) or 1.5))
@@ -6092,95 +7741,42 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             while lam_curr < 1.0 - 1.0e-14 and completed_lambdas < lam_max_substeps:
                 lam = min(1.0, lam_curr + lam_step)
                 p2_lambda_attempts.append(float(lam))
-                if p2_lambda is not None:
-                    p2_lambda.value = float(lam)
-                lam_before_snapshot = _snapshot_function_values(funcs)
-                lam_before = _current_predictor_corrector_energy(
+                attempt = _run_predictor_corrector_p2_lambda_attempt(
                     funcs=funcs,
                     prev_funcs=prev_funcs,
                     aux_funcs=aux_funcs,
                     bcs_now=bcs_now,
+                    p2_solver=p2_solver,
+                    p2_bcs_now=p2_bcs_now,
+                    p2_lambda=p2_lambda,
+                    lam_from=float(lam_curr),
+                    lam=float(lam),
+                    stage_label="P2",
+                    anchor_snapshot=p2_best_snapshot,
+                    exact_reference_stats=p2_reference_stats,
                 )
-                print(
-                    f"    [pc] P2 continuation solve at lambda={float(lam):.3f} "
-                    f"(step={float(lam - lam_curr):.3e}) from |R_raw|_∞={float(lam_before['raw_inf']):.3e}."
-                )
-                lam_converged = False
-                lam_exception = None
-                try:
-                    _, lam_converged, lam_iters = p2_solver._newton_loop(
-                        funcs,
-                        prev_funcs,
-                        aux_funcs,
-                        p2_bcs_now,
-                    )
-                    p2_iters += int(lam_iters)
-                except Exception as exc:
-                    lam_exception = exc
-                    p2_iters += max(1, int(getattr(args, "pc_p2_max_it", 8)))
-                lam_return = _apply_predictor_alpha_mass_return_map(
-                    funcs=funcs,
-                    prev_funcs=prev_funcs,
-                    bcs_now=bcs_now,
-                    stage_label=f"P2(lambda={float(lam):.3f})",
-                    verbose=True,
-                )
-                lam_trial_snapshot = _snapshot_function_values(funcs)
-                lam_trial = _current_predictor_corrector_energy(
-                    funcs=funcs,
-                    prev_funcs=prev_funcs,
-                    aux_funcs=aux_funcs,
-                    bcs_now=bcs_now,
-                )
-                _project_predictor_segment(
-                    funcs=funcs,
-                    prev_funcs=prev_funcs,
-                    aux_funcs=aux_funcs,
-                    bcs_now=bcs_now,
-                    anchor_snapshot=lam_before_snapshot,
-                    trial_snapshot=lam_trial_snapshot,
-                    stage_label=f"P2(lambda={float(lam):.3f})",
-                )
-                lam_projected_snapshot = _snapshot_function_values(funcs)
-                lam_projected = _current_predictor_corrector_energy(
-                    funcs=funcs,
-                    prev_funcs=prev_funcs,
-                    aux_funcs=aux_funcs,
-                    bcs_now=bcs_now,
-                )
-                lam_progress = _pc_exact_progress(lam_before, lam_projected)
-                lam_keep = (
-                    bool(lam_progress["improved"])
-                    and _predictor_alpha_mass_ok(lam_projected)
-                )
-                print(
-                    "    [pc] P2 lambda result "
-                    f"{float(lam_before['raw_inf']):.3e} -> {float(lam_projected['raw_inf']):.3e}, "
-                    f"alpha_mass_rel={float(lam_projected['alpha_mass_rel']):.3e}, "
-                    f"drop={float(lam_progress['drop']):.3e}, "
-                    f"drop_req={float(lam_progress['required']):.3e}, "
-                    f"iters={int(p2_iters)}, converged={int(bool(lam_converged))}, kept={int(bool(lam_keep))}."
-                )
+                p2_iters += int(attempt["iters"])
+                lam_keep = bool(attempt["keep"])
                 if lam_keep:
-                    p2_best_snapshot = lam_projected_snapshot
-                    p2_best_stats = dict(lam_projected)
+                    p2_best_snapshot = attempt["projected_snapshot"]
+                    p2_best_stats = dict(attempt["projected_after"])
                     p2_lambda_kept.append(float(lam))
                     startup_retry_state["pc_last_successful_lambda"] = float(lam)
                     lam_curr = float(lam)
                     completed_lambdas += 1
-                    if lam_exception is not None:
-                        p2_exception = lam_exception
+                    if attempt["exception"] is not None:
+                        p2_exception = attempt["exception"]
                         p2_converged = False
                         print(
-                            f"    [pc] P2 lambda={float(lam):.3f} improved the exact residual but stopped early; "
+                            f"    [pc] P2 lambda={float(lam):.3f} improved the homotopy state but stopped early; "
                             "continuing the homotopy from the improved state."
                         )
                         lam_step = min(lam_step, max(1.0 - lam_curr, lam_min_step))
-                    elif not lam_converged:
+                    elif not bool(attempt["converged"]):
                         p2_exception = RuntimeError(f"P2 lambda={float(lam):.3f} stopped before convergence.")
                         p2_converged = False
                         print(
-                            f"    [pc] P2 lambda={float(lam):.3f} improved the exact residual without full convergence; "
+                            f"    [pc] P2 lambda={float(lam):.3f} improved the homotopy state without full convergence; "
                             "continuing the homotopy from the improved state."
                         )
                         lam_step = min(lam_step, max(1.0 - lam_curr, lam_min_step))
@@ -6189,17 +7785,16 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                     if lam_curr >= 1.0 - 1.0e-14:
                         break
                     continue
-                _restore_function_values(funcs, lam_before_snapshot)
                 next_step = float(lam_step * lam_shrink)
                 if not np.isfinite(next_step) or next_step < lam_min_step:
-                    p2_exception = lam_exception if lam_exception is not None else RuntimeError(
-                        f"P2 lambda={float(lam):.3f} did not improve the exact residual."
+                    p2_exception = attempt["exception"] if attempt["exception"] is not None else RuntimeError(
+                        f"P2 lambda={float(lam):.3f} did not improve the homotopy residual."
                     )
                     p2_converged = False
                     break
                 lam_step = min(next_step, max(1.0 - lam_curr, lam_min_step))
-                p2_exception = lam_exception if lam_exception is not None else RuntimeError(
-                    f"P2 lambda={float(lam):.3f} did not improve the exact residual; shrinking the homotopy step."
+                p2_exception = attempt["exception"] if attempt["exception"] is not None else RuntimeError(
+                    f"P2 lambda={float(lam):.3f} did not improve the homotopy residual; shrinking the homotopy step."
                 )
             if p2_lambda is not None:
                 p2_lambda.value = 1.0
@@ -6221,9 +7816,14 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             p2_projected_snapshot = p2_trial_snapshot
             p2_projected = dict(p2_after)
             p2_progress = _pc_exact_progress(p2_before, p2_projected)
-            keep_p2 = (
-                bool(p2_progress["improved"])
-                and _predictor_alpha_mass_ok(p2_projected)
+            p2_exact_cap = float(p2_reference_stats["raw_inf"]) * (
+                1.0 + max(0.0, float(getattr(args, "pc_p2_max_exact_worsen_rel", 5.0e-2) or 0.0))
+            )
+            p2_stage_advanced = bool(anchor_kept or completed_lambdas > 0)
+            keep_p2 = bool(_predictor_alpha_mass_ok(p2_projected)) and bool(
+                (p2_stage_advanced or p2_progress["improved"])
+                and np.isfinite(float(p2_projected["raw_inf"]))
+                and float(p2_projected["raw_inf"]) <= float(p2_exact_cap)
             )
             if keep_p2:
                 best_snapshot = p2_projected_snapshot
@@ -6240,9 +7840,13 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                     "iters": int(p2_iters),
                     "exception": (None if p2_exception is None else str(p2_exception)),
                     "kept": bool(keep_p2),
+                    "anchor_kept": bool(anchor_kept),
                     "completed_lambdas": int(completed_lambdas),
                     "lambda_attempts": tuple(float(v) for v in p2_lambda_attempts),
                     "lambda_kept": tuple(float(v) for v in p2_lambda_kept),
+                    "anchor_dt": float(p2_easy_info["anchor_dt"]),
+                    "easy_fluid_convection": str(p2_easy_info["fluid_convection"]),
+                    "easy_include_skeleton_acceleration": float(p2_easy_info["include_skeleton_acceleration"]),
                     "fluid_convection": str(getattr(args, "pc_p2_fluid_convection", "lagged")),
                     "skeleton_inertia_convection": str(getattr(args, "pc_p2_skeleton_inertia_convection", "lagged")),
                     "return_map": dict(p2_return),
@@ -6251,11 +7855,17 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             print(
                 "    [pc] P2 full-field continuation predictor "
                 f"|R_raw|_∞ {float(p2_before['raw_inf']):.3e} -> {float(p2_projected['raw_inf']):.3e}, "
+                f"|H|_∞ {float(p2_before.get('homotopy_raw_inf', p2_before['raw_inf'])):.3e} -> "
+                f"{float(p2_projected.get('homotopy_raw_inf', p2_projected['raw_inf'])):.3e}, "
                 f"alpha_mass_rel {float(p2_projected['alpha_mass_rel']):.3e}, "
                 f"iters={int(p2_iters)}, converged={int(bool(p2_converged))}, kept={int(bool(keep_p2))}, "
+                f"anchor_kept={int(bool(anchor_kept))}, "
                 f"lambdas_kept={int(completed_lambdas)}, "
-                f"fluid={str(getattr(args, 'pc_p2_fluid_convection', 'lagged'))}, "
-                f"skeleton={str(getattr(args, 'pc_p2_skeleton_inertia_convection', 'lagged'))}."
+                f"G0_dt={float(p2_easy_info['anchor_dt']):.3e}, "
+                f"G_fluid={str(p2_easy_info['fluid_convection'])}, "
+                f"G_skel_accel={int(bool(p2_easy_info['include_skeleton_acceleration']))}, "
+                f"F_fluid={str(getattr(args, 'pc_p2_fluid_convection', 'lagged'))}, "
+                f"F_skeleton={str(getattr(args, 'pc_p2_skeleton_inertia_convection', 'lagged'))}."
             )
             if p2_exception is not None:
                 print(f"    [pc] P2 predictor stopped before full convergence: {p2_exception}")
@@ -6327,6 +7937,11 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             for outer_it in range(n_outer):
                 input_snapshot = _snapshot_function_values(funcs)
                 try:
+                    _set_solver_newton_trace_context(
+                        flow_solver,
+                        label=f"frozen-transport:flow[o{int(outer_it) + 1}]",
+                        global_bcs_now=bcs_now,
+                    )
                     problem["dh"].apply_bcs(flow_bcs_now, *funcs)
                     _, flow_converged, flow_iters = flow_solver._newton_loop(
                         funcs,
@@ -6339,6 +7954,11 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                             f"frozen-transport flow solve did not converge on outer sweep {int(outer_it) + 1}"
                         )
                     flow_hist.append(int(flow_iters))
+                    _set_solver_newton_trace_context(
+                        solid_solver,
+                        label=f"frozen-transport:solid[o{int(outer_it) + 1}]",
+                        global_bcs_now=bcs_now,
+                    )
                     problem["dh"].apply_bcs(solid_bcs_now, *funcs)
                     _, solid_converged, solid_iters = solid_solver._newton_loop(
                         funcs,
@@ -6352,6 +7972,22 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                         )
                     solid_hist.append(int(solid_iters))
                 except Exception as stage_exc:
+                    candidate_snapshot = _snapshot_function_values(funcs)
+                    candidate_norm = _current_monolithic_raw_residual_inf(
+                        funcs=funcs,
+                        prev_funcs=prev_funcs,
+                        aux_funcs=aux_funcs,
+                        bcs_now=bcs_now,
+                    )
+                    if (
+                        np.isfinite(candidate_norm)
+                        and (not np.isfinite(best_norm) or float(candidate_norm) < float(best_norm))
+                    ):
+                        best_norm = float(candidate_norm)
+                        best_snapshot = candidate_snapshot
+                        partial_reason = str(stage_exc)
+                        _restore_function_values(funcs, best_snapshot)
+                        break
                     _restore_function_values(funcs, best_snapshot)
                     if completed_outer > 0:
                         partial_reason = str(stage_exc)
@@ -6717,7 +8353,7 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             bootstrap_forms,
             postproc_cb=None,
             max_newton_iter=int(args.startup_bootstrap_max_it),
-            accept_factor=0.0,
+            accept_factor=float(startup_stage_accept_factor),
         )
         bootstrap_solver_cache["solver"] = target_solver
         return target_solver
@@ -6751,10 +8387,7 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         exact_pc_failure = bool(
             solver_key == "newton"
             and last_label == "|R|_∞"
-            and bool(getattr(args, "predictor_corrector_startup", False))
-            and bool(getattr(args, "latent_bounded_transport", False))
-            and bool(args.enable_phi_evolution)
-            and problem.get("phi_k") is not None
+            and _predictor_corrector_startup_enabled(args, problem)
         )
         if (
             last_label == "|G|_∞"
@@ -6790,6 +8423,11 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                 int(step_no) > 1 or startup_guess_applied_step_no == int(step_no)
             )
             max_reentries = max(0, int(getattr(args, "pc_p2_reentry_max_retries", 0) or 0))
+            if p2_reentry_allowed and max_reentries <= 0:
+                print(
+                    "    [retry] exact corrector stalled; skipping legacy P2 re-entry and keeping the "
+                    "identified-manifold monolithic recovery path primary."
+                )
             if (
                 p2_reentry_allowed
                 and int(startup_retry_state.get("pc_p2_reentry_retry_attempts", 0)) < max_reentries
@@ -6942,8 +8580,9 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                 )
                 print(
                     "    [retry] later-step staggered refresh converged "
-                    f"({int(startup_stats['outer_it'])} sweep(s), fluid {int(startup_stats['fluid_iters_total'])} it "
-                    f"{list(startup_stats['fluid_iters_hist'])}, solid {int(startup_stats['solid_iters_total'])} it "
+                    f"({int(startup_stats['outer_it'])} sweep(s), flow {int(startup_stats['flow_iters_total'])} it "
+                    f"{list(startup_stats['flow_iters_hist'])}, transport {int(startup_stats['transport_iters_total'])} it "
+                    f"{list(startup_stats['transport_iters_hist'])}, solid {int(startup_stats['solid_iters_total'])} it "
                     f"{list(startup_stats['solid_iters_hist'])}); retrying the same full step with the staged state."
                 )
                 solver._ls_alpha_prev = 1.0
@@ -6985,9 +8624,7 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         bcs_now = info.get("bcs", [])
         aux_funcs = info.get("aux_functions", aux_solver_functions)
         startup_retry_state["bootstrap_attempts"] = int(startup_retry_state.get("bootstrap_attempts", 0)) + 1
-        use_pc_startup = bool(getattr(args, "predictor_corrector_startup", False)) and bool(
-            getattr(args, "latent_bounded_transport", False)
-        )
+        use_pc_startup = _predictor_corrector_startup_enabled(args, problem)
         if use_pc_startup:
             print(
                 "    [retry] first-step solve stalled; rebuilding the same step with the predictor-corrector "
@@ -7047,6 +8684,10 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                     bootstrap_solver._current_t = float(t_fail)
                     bootstrap_solver._current_dt = float(dt_fail)
                     bootstrap_solver._current_step_no = int(step_no)
+                    _set_solver_newton_trace_context(
+                        bootstrap_solver,
+                        label="startup-bootstrap",
+                    )
                     _, bootstrap_converged, bootstrap_iters = bootstrap_solver._newton_loop(
                         funcs,
                         prev_funcs,
@@ -7125,7 +8766,7 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         bcs_now = info.get("bcs", [])
         aux_funcs = info.get("aux_functions", aux_solver_functions)
         dt_now = float(info.get("dt", float(args.dt)))
-        if bool(getattr(args, "predictor_corrector_startup", False)) and bool(getattr(args, "latent_bounded_transport", False)):
+        if _predictor_corrector_startup_enabled(args, problem):
             print(
                 "    [startup] building first-step predictor-corrector initial guess "
                 f"(P0 frozen-transport with {int(max(1, int(getattr(args, 'pc_p0_outer_it', 2))))} sweep(s), "
@@ -7231,7 +8872,7 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         print(
             (
                 "    [startup] predictor-corrector initial guess armed for the exact monolithic corrector."
-                if bool(getattr(args, "predictor_corrector_startup", False)) and bool(getattr(args, "latent_bounded_transport", False))
+                if _predictor_corrector_startup_enabled(args, problem)
                 else "    [startup] staggered initial guess converged "
                 f"{_format_startup_stats(startup_stats)}."
             )
@@ -7240,6 +8881,11 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
 
     solve_error: str = ""
     t_start = time.perf_counter()
+
+    def _post_step_refiner(step, bcs_now, functions, prev_functions) -> None:
+        if alpha_from_refmap_enabled:
+            _sync_alpha_from_refmap()
+
     try:
         solver.solve_time_interval(
             functions=current_functions,
@@ -7269,6 +8915,7 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                 predictor_damping=float(args.predictor_damping),
                 predictor_clip_01=False,
             ),
+            post_step_refiner=_post_step_refiner,
         )
     except Exception as exc:
         solve_error = str(exc)
@@ -7276,6 +8923,20 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         for f, f_prev in zip(current_functions, previous_functions):
             f.nodal_values[:] = f_prev.nodal_values[:]
     solve_seconds = time.perf_counter() - t_start
+    final_raw_residual_inf = _current_monolithic_raw_residual_inf(
+        funcs=current_functions,
+        prev_funcs=previous_functions,
+        aux_funcs=aux_solver_functions,
+        bcs_now=bcs,
+    )
+    final_residual_source = "assembled_raw_residual"
+    if not np.isfinite(final_raw_residual_inf):
+        fallback_norm = float(getattr(solver, "_last_nonlinear_norm", float("nan")) or float("nan"))
+        if np.isfinite(fallback_norm):
+            final_raw_residual_inf = float(fallback_norm)
+            final_residual_source = str(
+                getattr(solver, "_last_nonlinear_norm_label", "solver_last_nonlinear_norm") or "solver_last_nonlinear_norm"
+            )
     alpha_diag_final = alpha_diagnostics.evaluate(alpha_coeffs)
     alpha_area_final = float(alpha_diag_final.get("alpha_area", float("nan")))
     alpha_band_final = float(alpha_diag_final.get("alpha_band", float("nan")))
@@ -7286,8 +8947,9 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         y_profile=float(args.y_profile),
         n_samples=int(args.profile_samples),
     )
-    _write_profile_csv(outdir / "profile_final.csv", x=profile_x, u_y=profile_uy)
-    _write_timeseries_csv(outdir / "timeseries.csv", timeseries_rows)
+    if io_root:
+        _write_profile_csv(outdir / "profile_final.csv", x=profile_x, u_y=profile_uy)
+        _write_timeseries_csv(outdir / "timeseries.csv", timeseries_rows)
 
     vtk_final = {
         "v": problem["v_k"],
@@ -7302,7 +8964,8 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         vtk_final["S"] = problem["S_k"]
     if problem.get("reg_weight") is not None:
         vtk_final["reg_weight"] = problem["reg_weight"]
-    export_vtk(str(outdir / "final_state.vtu"), mesh=problem["mesh"], dof_handler=problem["dh"], functions=vtk_final)
+    if io_root:
+        export_vtk(str(outdir / "final_state.vtu"), mesh=problem["mesh"], dof_handler=problem["dh"], functions=vtk_final)
 
     reference_csv = Path(args.reference_csv).resolve()
     moving_ref = _load_reference_curve(reference_csv=reference_csv, kappa=float(kappa), curve_label="partitioned_moving_linear")
@@ -7337,6 +9000,8 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         "logistic_bounded_transform": float(1.0 if bool(args.logistic_bounded_transform) else 0.0),
         "logistic_bounded_fields": str(args.logistic_bounded_fields),
         "logistic_bounded_eps": float(args.logistic_bounded_eps),
+        "alpha_from_refmap": float(1.0 if bool(getattr(args, "alpha_from_refmap", False)) else 0.0),
+        "alpha_mass_constraint": float(1.0 if bool(getattr(args, "alpha_mass_constraint", False)) else 0.0),
         "alpha_box_constraints": float(1.0 if bool(args.alpha_box_constraints) else 0.0),
         "phi_box_constraints": float(1.0 if bool(args.enable_phi_evolution and args.phi_box_constraints) else 0.0),
         "vi_c": float(args.vi_c),
@@ -7420,12 +9085,16 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         "predictor_damping": float(args.predictor_damping),
         "solve_seconds": float(solve_seconds),
         "steps_recorded": float(len(timeseries_rows)),
+        "final_raw_residual_inf": float(final_raw_residual_inf),
+        "final_residual_source": str(final_residual_source),
         "alpha_area0": float(alpha_area0),
         "alpha_area_final": float(alpha_area_final),
         "alpha_area_rel_drift": float((alpha_area_final - alpha_area0) / max(abs(alpha_area0), 1.0e-30)),
         "alpha_band0": float(alpha_band0),
         "alpha_band_final": float(alpha_band_final),
         "alpha_band_rel_drift": float((alpha_band_final - alpha_band0) / max(abs(alpha_band0), 1.0e-30)),
+        "alpha_min": float(np.min(problem["alpha_k"].nodal_values)),
+        "alpha_max": float(np.max(problem["alpha_k"].nodal_values)),
         "u_y_max": float(np.max(profile_uy)),
         "u_y_min": float(np.min(profile_uy)),
         "u_y_peak_x": float(profile_x[int(np.argmax(profile_uy))]),
@@ -7471,16 +9140,18 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         "timeseries_csv": str(outdir / "timeseries.csv"),
         "vtk_final": str(outdir / "final_state.vtu"),
     }
-    (outdir / "summary.json").write_text(json.dumps(summary_payload, indent=2), encoding="utf-8")
-    _write_case_plot(
-        outdir / "profile_compare.png",
-        kappa=float(kappa),
-        x_num=profile_x,
-        y_num=profile_uy,
-        moving_ref=moving_ref,
-        fixed_ref=fixed_ref,
-        nonlinear_ref=nonlinear_ref,
-    )
+    if io_root:
+        (outdir / "summary.json").write_text(json.dumps(summary_payload, indent=2), encoding="utf-8")
+        _write_case_plot(
+            outdir / "profile_compare.png",
+            kappa=float(kappa),
+            x_num=profile_x,
+            y_num=profile_uy,
+            moving_ref=moving_ref,
+            fixed_ref=fixed_ref,
+            nonlinear_ref=nonlinear_ref,
+        )
+    barrier(MPI_CTX)
     return CaseResult(
         kappa=float(kappa),
         outdir=outdir,
@@ -7495,6 +9166,30 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
 def main() -> None:
     args = _parse_args()
     args = _normalize_benchmark7_solver_choice(args)
+    prev_cpp_fuse = _configure_benchmark7_cpp_fuse_integrals(
+        backend=str(args.backend),
+        enabled=getattr(args, "cpp_fuse_integrals", None),
+    )
+    if (
+        str(getattr(args, "backend", "")).strip().lower() in {"cpp", "c++"}
+        and MPI_CTX.is_root
+    ):
+        cpp_fuse_value = os.environ.get("PYCUTFEM_CPP_FUSE_INTEGRALS", prev_cpp_fuse)
+        if cpp_fuse_value is not None:
+            print(
+                f"[setup] Benchmark 7 cpp integral fusion: PYCUTFEM_CPP_FUSE_INTEGRALS={cpp_fuse_value}",
+                flush=True,
+            )
+    if (
+        MPI_CTX.enabled
+        and bool(getattr(args, "petsc_distributed", True))
+        and str(getattr(args, "linear_backend", "")).strip().lower() == "petsc"
+        and MPI_CTX.is_root
+    ):
+        print(
+            f"[mpi] COMM_WORLD size={MPI_CTX.size}; enabling collective PETSc linear solves for Benchmark 7.",
+            flush=True,
+        )
     if bool(getattr(args, "newton_pressure_schur_solve", False)) and bool(getattr(args, "solid_volumetric_split", False)):
         print(
             "[solver] disabling solid_volumetric_split for the reduced Newton pressure-Schur solve, "
@@ -7513,28 +9208,30 @@ def main() -> None:
         results.append(result)
 
     summary_csv = outdir / "benchmark7_summary.csv"
-    summary_csv.parent.mkdir(parents=True, exist_ok=True)
-    if results:
-        with summary_csv.open("w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=list(results[0].summary_row.keys()))
-            writer.writeheader()
-            for result in results:
-                writer.writerow(result.summary_row)
+    if _mpi_io_root():
+        summary_csv.parent.mkdir(parents=True, exist_ok=True)
+        if results:
+            with summary_csv.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=list(results[0].summary_row.keys()))
+                writer.writeheader()
+                for result in results:
+                    writer.writerow(result.summary_row)
 
-    combined = {
-        "cases": [result.summary_row for result in results],
-        "reference_csv": str(Path(args.reference_csv).resolve()),
-    }
-    (outdir / "benchmark7_summary.json").write_text(json.dumps(combined, indent=2), encoding="utf-8")
-    _write_combined_profiles_plot(
-        outdir / "benchmark7_seboldt_profiles.png",
-        results,
-        reference_csv=Path(args.reference_csv).resolve(),
-    )
-    print(f"[done] wrote {summary_csv}")
-    print(f"[done] wrote {outdir / 'benchmark7_summary.json'}")
-    if (outdir / "benchmark7_seboldt_profiles.png").exists():
-        print(f"[done] wrote {outdir / 'benchmark7_seboldt_profiles.png'}")
+        combined = {
+            "cases": [result.summary_row for result in results],
+            "reference_csv": str(Path(args.reference_csv).resolve()),
+        }
+        (outdir / "benchmark7_summary.json").write_text(json.dumps(combined, indent=2), encoding="utf-8")
+        _write_combined_profiles_plot(
+            outdir / "benchmark7_seboldt_profiles.png",
+            results,
+            reference_csv=Path(args.reference_csv).resolve(),
+        )
+        print(f"[done] wrote {summary_csv}")
+        print(f"[done] wrote {outdir / 'benchmark7_summary.json'}")
+        if (outdir / "benchmark7_seboldt_profiles.png").exists():
+            print(f"[done] wrote {outdir / 'benchmark7_seboldt_profiles.png'}")
+    barrier(MPI_CTX)
 
 
 if __name__ == "__main__":

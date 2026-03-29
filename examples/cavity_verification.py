@@ -15,19 +15,12 @@ from pathlib import Path
 import numba
 import os
 
-# Get the number of available CPU cores
-num_cores = os.cpu_count()
-print(f"This machine has {num_cores} cores.")
-
-# Set Numba to use all of them
-numba.set_num_threads(num_cores)
-print(f"Numba is set to use {numba.get_num_threads()} threads.")
-
 # --- Core imports ---
 from pycutfem.core.mesh import Mesh
 from pycutfem.core.dofhandler import DofHandler
 from pycutfem.utils.meshgen import structured_quad
 from pycutfem.utils.gmsh_loader import mesh_from_gmsh
+from pycutfem.utils.mpi import barrier, configure_numba_threads, get_mpi_context
 from examples.gmsh_cavity_mesh import build_caity_quad_mesh
 
 # --- UFL-like imports ---
@@ -39,6 +32,13 @@ from pycutfem.ufl.expressions import (
 from pycutfem.ufl.measures import dx
 from pycutfem.ufl.forms import BoundaryCondition, assemble_form
 from pycutfem.fem.mixedelement import MixedElement
+
+mpi_ctx = get_mpi_context()
+num_cores = int(os.cpu_count() or 1)
+numba_threads = configure_numba_threads(numba, ctx=mpi_ctx)
+if mpi_ctx.is_root or not mpi_ctx.enabled:
+    print(f"This machine has {num_cores} cores.")
+    print(f"Numba is set to use {numba_threads} threads per active rank.")
 
 
 
@@ -72,10 +72,23 @@ parser.add_argument("--rebuild-msh", action="store_true",
                     help="Rebuild the gmsh mesh if the file is missing or --rebuild-msh is passed.")
 parser.add_argument("--nx", type=int, default=30, help="Number of cells in x for the structured mesh.")
 parser.add_argument("--ny", type=int, default=30, help="Number of cells in y for the structured mesh.")
-parser.add_argument("--backend", type=str, default="jit", help="Assembly backend to use: 'jit' or 'python'.")
+parser.add_argument("--backend", type=str, default="jit", choices=("python", "jit", "cpp"),
+                    help="Assembly backend to use.")
+parser.add_argument("--linear-backend", type=str, default="petsc", choices=("scipy", "petsc"),
+                    help="Linear solver backend used inside Newton.")
+parser.add_argument("--petsc-distributed", action=argparse.BooleanOptionalAction, default=True,
+                    help="Use collective PETSc linear solves on COMM_WORLD under mpirun.")
 parser.add_argument("--max-time-steps", type=int, default=200, help="Maximum number of time steps to run.")
 parser.add_argument("--show-plots", action="store_true", help="Show verification plots after the simulation.")
+parser.add_argument("--mpi-mode", type=str, default="replicated", choices=("root", "replicated"),
+                    help="Under mpirun, execute the full case on every rank ('replicated', verified) or run only on rank 0 ('root').")
 args, _ = parser.parse_known_args()
+run_replicated = (not mpi_ctx.enabled) or str(args.mpi_mode).lower() == "replicated"
+if mpi_ctx.enabled and not run_replicated and not mpi_ctx.is_root:
+    barrier(mpi_ctx)
+    raise SystemExit(0)
+if mpi_ctx.enabled and not run_replicated and mpi_ctx.is_root:
+    print(f"[mpi] COMM_WORLD size={mpi_ctx.size}; executing the cavity solve on rank 0 only.")
 
 # 1. ============================================================================
 #    SETUP (Meshes, DofHandler, BCs)
@@ -94,9 +107,18 @@ print("="*60)
 
 if args.use_gmsh:
     gmsh_path = args.gmsh_file
+    mesh_comm = mpi_ctx.comm if (mpi_ctx.enabled and run_replicated) else None
     if args.rebuild_msh or not gmsh_path.exists():
-        build_caity_quad_mesh(gmsh_path, L=L, H=H, nx=NX, ny=NY, element_order=mesh_geometric_order)
-    mesh_q2 = mesh_from_gmsh(gmsh_path)
+        build_caity_quad_mesh(
+            gmsh_path,
+            L=L,
+            H=H,
+            nx=NX,
+            ny=NY,
+            element_order=mesh_geometric_order,
+            comm=mesh_comm,
+        )
+    mesh_q2 = mesh_from_gmsh(gmsh_path, comm=mesh_comm)
     if mesh_q2.element_type != "quad":
         raise RuntimeError("Expected a quadrilateral gmsh mesh for the cavity test.")
 else:
@@ -225,6 +247,7 @@ len(dof_handler.get_dirichlet_data(bcs))
 
 
 from pycutfem.solvers.nonlinear_solver import (
+    LinearSolverParameters,
     NewtonSolver,
     NewtonParameters,
     TimeStepperParameters,
@@ -244,6 +267,14 @@ solver = NewtonSolver(
     mixed_element=mixed_element,
     bcs=bcs, bcs_homog=bcs_homog,
     backend=args.backend,
+    lin_params=LinearSolverParameters(
+        backend=str(args.linear_backend),
+        distributed=bool(
+            mpi_ctx.enabled
+            and bool(getattr(args, "petsc_distributed", True))
+            and str(args.linear_backend).strip().lower() == "petsc"
+        ),
+    ),
     newton_params=NewtonParameters(newton_tol=1e-6, line_search=True,
                                    ),
 )
@@ -442,3 +473,5 @@ def create_verification_plot(dh, u_vec, reference_data, *,
 
 
 create_verification_plot(dof_handler, u_n, ghia_data_re100)
+if mpi_ctx.enabled and not run_replicated:
+    barrier(mpi_ctx)

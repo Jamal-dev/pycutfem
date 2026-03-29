@@ -695,18 +695,21 @@ def _summary_metric(spec: CaseSpec, finest: dict[str, str]) -> str:
             return (
                 f"EOC(v_L2)={_fmt_float(finest.get('eoc_v_l2'))}, "
                 f"EOC(p_L2)={_fmt_float(finest.get('eoc_p_l2'))}, "
-                f"EOC(alpha_L2)={_fmt_float(finest.get('eoc_alpha_l2'))}"
+                f"EOC(alpha_L2)={_fmt_float(finest.get('eoc_alpha_l2'))}, "
+                f"EOC(B_L2)={_fmt_float(finest.get('eoc_B_l2'))}"
             )
         if spec.output_key == "translation":
             return (
                 f"EOC(alpha_L2)={_fmt_float(finest.get('eoc_alpha_l2'))}, "
+                f"EOC(B_L2)={_fmt_float(finest.get('eoc_B_l2'))}, "
                 f"EOC(mu_L2)={_fmt_float(finest.get('eoc_mu_alpha_l2'))}, "
                 f"EOC(alpha_H1)={_fmt_float(finest.get('eoc_alpha_h1'))}"
             )
         return (
             f"EOC(v_L2)={_fmt_float(finest.get('eoc_v_l2'))}, "
             f"EOC(vS_L2)={_fmt_float(finest.get('eoc_vS_l2'))}, "
-            f"EOC(alpha_L2)={_fmt_float(finest.get('eoc_alpha_l2'))}"
+            f"EOC(alpha_L2)={_fmt_float(finest.get('eoc_alpha_l2'))}, "
+            f"EOC(B_L2)={_fmt_float(finest.get('eoc_B_l2'))}"
         )
     if spec.family == "benchmark3":
         if spec.output_key == "wang2014_staircase":
@@ -738,6 +741,7 @@ def _summary_metric(spec: CaseSpec, finest: dict[str, str]) -> str:
             f"EOC(v_L2)={_fmt_float(finest.get('eoc_v_l2'))}, "
             f"EOC(u_L2)={_fmt_float(finest.get('eoc_u_l2'))}, "
             f"EOC(alpha_L2)={_fmt_float(finest.get('eoc_alpha_l2'))}, "
+            f"EOC(B_L2)={_fmt_float(finest.get('eoc_B_l2'))}, "
             f"|e_u(\\Gamma)|={_fmt_float(finest.get('u_interface_error'))}"
         )
     if spec.family == "benchmark6":
@@ -758,11 +762,14 @@ def _summary_metric(spec: CaseSpec, finest: dict[str, str]) -> str:
 def _summary_note(spec: CaseSpec, finest: dict[str, str]) -> str:
     if spec.family == "mms":
         if spec.output_key == "static":
-            return "Smooth-reference MMS; vector fields recover Q2 rates and scalar fields recover Q1 rates."
+            return "Smooth-reference reduced alpha-B MMS; vector fields recover Q2 rates and scalar support fields recover Q1 rates."
         if spec.output_key == "translation":
             nx = _fmt_int(finest.get("nx"))
-            return f"Transport-only MMS; alpha and mu_alpha reach the asymptotic regime by nx={nx}."
-        return "Fully coupled reduced MMS; fluid, skeleton, reference-map, and phase fields are all active."
+            return (
+                "Reduced alpha-B transport MMS; the reported convergence targets are "
+                f"alpha, B, and mu_alpha only, and they reach the asymptotic regime by nx={nx}."
+            )
+        return "Fully coupled reduced alpha-B MMS; fluid, skeleton, reference-map, and support fields are all active."
     if spec.family == "benchmark3":
         if spec.output_key == "wang2014_staircase":
             return (
@@ -782,9 +789,10 @@ def _summary_note(spec: CaseSpec, finest: dict[str, str]) -> str:
         )
     if spec.family == "benchmark5":
         return (
-            "Jonas-inspired exact shear benchmark; tangential traction is localized on the "
-            "conserved diffuse interface and the numerical solution is compared against a "
-            "closed-form deformation-only reference state with active CH transport."
+            "Jonas-inspired exact shear benchmark for the reduced alpha-B mechanics block; "
+            "tangential traction is localized on the conserved diffuse interface and the "
+            "numerical solution is compared against a closed-form reference state with active "
+            "support transport and explicit solid-fraction evolution."
         )
     if spec.family == "benchmark6":
         return (
@@ -809,6 +817,7 @@ def _table_spec(spec: CaseSpec) -> dict[str, list[tuple[str, str]]]:
                     ("v_l2", r"$\|e_{\bm v}\|_{L^2}$"),
                     ("p_l2", r"$\|e_p\|_{L^2}$"),
                     ("alpha_l2", r"$\|e_\alpha\|_{L^2}$"),
+                    ("B_l2", r"$\|e_B\|_{L^2}$"),
                     ("mu_alpha_l2", r"$\|e_{\mu_\alpha}\|_{L^2}$"),
                     ("newton_iters", "Newton"),
                 ],
@@ -816,6 +825,7 @@ def _table_spec(spec: CaseSpec) -> dict[str, list[tuple[str, str]]]:
                     ("nx", r"$n_x$"),
                     ("v_h1", r"$\|e_{\bm v}\|_{H^1}$"),
                     ("alpha_h1", r"$\|e_\alpha\|_{H^1}$"),
+                    ("B_h1", r"$\|e_B\|_{H^1}$"),
                     ("mu_alpha_h1", r"$\|e_{\mu_\alpha}\|_{H^1}$"),
                     ("newton_iters", "Newton"),
                 ],
@@ -825,12 +835,14 @@ def _table_spec(spec: CaseSpec) -> dict[str, list[tuple[str, str]]]:
                 "l2": [
                     ("nx", r"$n_x$"),
                     ("alpha_l2", r"$\|e_\alpha\|_{L^2}$"),
+                    ("B_l2", r"$\|e_B\|_{L^2}$"),
                     ("mu_alpha_l2", r"$\|e_{\mu_\alpha}\|_{L^2}$"),
                     ("newton_iters", "Newton"),
                 ],
                 "h1": [
                     ("nx", r"$n_x$"),
                     ("alpha_h1", r"$\|e_\alpha\|_{H^1}$"),
+                    ("B_h1", r"$\|e_B\|_{H^1}$"),
                     ("mu_alpha_h1", r"$\|e_{\mu_\alpha}\|_{H^1}$"),
                     ("newton_iters", "Newton"),
                 ],
@@ -843,6 +855,7 @@ def _table_spec(spec: CaseSpec) -> dict[str, list[tuple[str, str]]]:
                 ("vS_l2", r"$\|e_{\bm v^S}\|_{L^2}$"),
                 ("u_l2", r"$\|e_{\bm u}\|_{L^2}$"),
                 ("alpha_l2", r"$\|e_\alpha\|_{L^2}$"),
+                ("B_l2", r"$\|e_B\|_{L^2}$"),
                 ("mu_alpha_l2", r"$\|e_{\mu_\alpha}\|_{L^2}$"),
                 ("newton_iters", "Newton"),
             ],
@@ -852,6 +865,7 @@ def _table_spec(spec: CaseSpec) -> dict[str, list[tuple[str, str]]]:
                 ("vS_h1", r"$\|e_{\bm v^S}\|_{H^1}$"),
                 ("u_h1", r"$\|e_{\bm u}\|_{H^1}$"),
                 ("alpha_h1", r"$\|e_\alpha\|_{H^1}$"),
+                ("B_h1", r"$\|e_B\|_{H^1}$"),
                 ("mu_alpha_h1", r"$\|e_{\mu_\alpha}\|_{H^1}$"),
                 ("newton_iters", "Newton"),
             ],
@@ -913,6 +927,7 @@ def _table_spec(spec: CaseSpec) -> dict[str, list[tuple[str, str]]]:
                 ("p_l2", r"$\|e_p\|_{L^2}$"),
                 ("u_l2", r"$\|e_{\bm u}\|_{L^2}$"),
                 ("alpha_l2", r"$\|e_\alpha\|_{L^2}$"),
+                ("B_l2", r"$\|e_B\|_{L^2}$"),
                 ("mu_alpha_l2", r"$\|e_{\mu_\alpha}\|_{L^2}$"),
                 ("u_interface_error", r"$|e_{u,\Gamma}|$"),
                 ("newton_iters", "Newton"),
@@ -922,6 +937,7 @@ def _table_spec(spec: CaseSpec) -> dict[str, list[tuple[str, str]]]:
                 ("v_h1", r"$\|e_{\bm v}\|_{H^1}$"),
                 ("u_h1", r"$\|e_{\bm u}\|_{H^1}$"),
                 ("alpha_h1", r"$\|e_\alpha\|_{H^1}$"),
+                ("B_h1", r"$\|e_B\|_{H^1}$"),
                 ("mu_alpha_h1", r"$\|e_{\mu_\alpha}\|_{H^1}$"),
                 ("newton_iters", "Newton"),
             ],

@@ -7,6 +7,16 @@ import tempfile
 from pathlib import Path
 
 
+def _subprocess_cache_parent() -> Path:
+    override = os.environ.get("PYCUTFEM_SUBPROCESS_TMPDIR", "").strip()
+    if override:
+        root = Path(override).expanduser().resolve()
+    else:
+        root = (Path.home() / ".cache" / "pycutfem_subprocess_tmp").resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
 def run_module_func_in_subprocess(module: str, func: str) -> None:
     """
     Run `module.func()` in a fresh Python process.
@@ -18,7 +28,11 @@ def run_module_func_in_subprocess(module: str, func: str) -> None:
     repo_root = Path(__file__).resolve().parents[1]
     code = f"from {module} import {func} as _f; _f()"
 
-    with tempfile.TemporaryDirectory(prefix="pycutfem_subproc_cache_") as tmpdir:
+    tmp_parent = _subprocess_cache_parent()
+    with tempfile.TemporaryDirectory(
+        prefix="pycutfem_subproc_cache_",
+        dir=str(tmp_parent),
+    ) as tmpdir:
         cache_root = Path(tmpdir).resolve()
         env = os.environ.copy()
         # Subprocess-based C++ tests run alongside xdist workers. Give each
@@ -27,6 +41,13 @@ def run_module_func_in_subprocess(module: str, func: str) -> None:
         # worker.
         env["PYCUTFEM_CACHE_DIR"] = str(cache_root)
         env["PYCUTFEM_REF_TABLE_CACHE_DIR"] = str(cache_root / "ref_tables")
+        env.setdefault("TMPDIR", str(tmp_parent))
+        env.setdefault("TMP", str(tmp_parent))
+        env.setdefault("TEMP", str(tmp_parent))
+        env.setdefault("OMP_NUM_THREADS", "1")
+        env.setdefault("OPENBLAS_NUM_THREADS", "1")
+        env.setdefault("MKL_NUM_THREADS", "1")
+        env.setdefault("NUMEXPR_NUM_THREADS", "1")
         # Headless tmux/CI sessions often have no DISPLAY. Force a non-GUI
         # backend so tests importing matplotlib helpers do not try to open Tk.
         env.setdefault("MPLBACKEND", "Agg")

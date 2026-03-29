@@ -96,6 +96,8 @@ def _latent_map_expr_ufl(z, *, map_kind: str):
     key = str(map_kind or "sigmoid").strip().lower()
     if key == "sigmoid":
         return 1.0 / (1.0 + ufl.exp(-z))
+    if key == "tanh":
+        return 0.5 * (1.0 + ufl.tanh(z))
     if key == "algebraic":
         return 0.5 * (1.0 + z / ufl.sqrt(1.0 + z * z))
     raise ValueError(f"Unsupported latent_bounded_map={map_kind!r}.")
@@ -106,6 +108,9 @@ def _latent_map_prime_expr_ufl(z, *, map_kind: str):
     if key == "sigmoid":
         sig = _latent_map_expr_ufl(z, map_kind=key)
         return sig * (1.0 - sig)
+    if key == "tanh":
+        th = ufl.tanh(z)
+        return 0.5 * (1.0 - th * th)
     if key == "algebraic":
         return 0.5 / ((1.0 + z * z) ** 1.5)
     raise ValueError(f"Unsupported latent_bounded_map={map_kind!r}.")
@@ -537,9 +542,10 @@ def _directional_fd_audit(
     backend: str,
     n_random: int = 1,
     seed: int = 1234,
+    fd_eps: float = 1.0e-6,
 ) -> tuple[float, dict[str, float]]:
     dh = problem["dh"]
-    K, R0 = assemble_form(
+    K, _ = assemble_form(
         Equation(forms.jacobian_form, forms.residual_form),
         dof_handler=dh,
         bcs=[],
@@ -547,7 +553,6 @@ def _directional_fd_audit(
         backend=str(backend),
     )
     K = K.tocsr()
-    R0 = np.asarray(R0, dtype=float)
     ndofs = int(K.shape[1])
     probe_fields = ["v_x", "v_y", "p", "vS_x", "vS_y", "u_x", "u_y", "alpha", "mu_alpha"]
     if problem.get("p_mean_k") is not None:
@@ -586,26 +591,35 @@ def _directional_fd_audit(
     for i in range(int(n_random) - 1):
         _field_direction(f"random_all_{i + 2}", probe_fields)
 
-    eps = 1.0e-8
+    eps = float(fd_eps)
     per_case: dict[str, float] = {}
     max_rel = 0.0
     for name, z in directions:
-        touched: list[tuple[object, np.ndarray, np.ndarray]] = []
-        for fld, func in field_to_func.items():
-            sl = np.asarray(dh.get_field_slice(fld), dtype=int)
-            if sl.size == 0:
-                continue
-            dz = z[sl]
-            if np.allclose(dz, 0.0):
-                continue
-            old = np.asarray(func.get_nodal_values(sl), dtype=float).copy()
-            func.set_nodal_values(sl, old + eps * dz)
-            touched.append((func, sl, old))
-        R1 = _assemble_residual(forms, dh, int(qdeg), backend=str(backend))
-        for func, sl, old in touched:
+        def _apply(sign: float) -> list[tuple[object, np.ndarray, np.ndarray]]:
+            touched: list[tuple[object, np.ndarray, np.ndarray]] = []
+            for fld, func in field_to_func.items():
+                sl = np.asarray(dh.get_field_slice(fld), dtype=int)
+                if sl.size == 0:
+                    continue
+                dz = z[sl]
+                if np.allclose(dz, 0.0):
+                    continue
+                old = np.asarray(func.get_nodal_values(sl), dtype=float).copy()
+                func.set_nodal_values(sl, old + sign * eps * dz)
+                touched.append((func, sl, old))
+            return touched
+
+        touched_p = _apply(+1.0)
+        Rp = _assemble_residual(forms, dh, int(qdeg), backend=str(backend))
+        for func, sl, old in touched_p:
             func.set_nodal_values(sl, old)
 
-        fd = (R1 - R0) / eps
+        touched_m = _apply(-1.0)
+        Rm = _assemble_residual(forms, dh, int(qdeg), backend=str(backend))
+        for func, sl, old in touched_m:
+            func.set_nodal_values(sl, old)
+
+        fd = (Rp - Rm) / (2.0 * eps)
         lin = K @ z
         denom = max(1.0, float(np.linalg.norm(fd, ord=np.inf)), float(np.linalg.norm(lin, ord=np.inf)))
         rel = float(np.linalg.norm(fd - lin, ord=np.inf)) / denom
@@ -922,7 +936,23 @@ def _pycutfem_alpha_compare(
     alpha_advection_form: str,
     phi_b: float,
     backend: str,
+    full_compare: dict[str, object] | None = None,
 ) -> tuple[float, float, float, float]:
+    alpha_reg_key = str(problem.get("_audit_form_params", {}).get("alpha_regularization", "none")).strip().lower()
+    if alpha_reg_key == "ch":
+        # The reduced alpha-only helper does not include mu_alpha as an unknown,
+        # so it cannot represent the Cahn-Hilliard coupling in the alpha row.
+        # Reuse the full-system FEniCSx comparison for CH cases instead.
+        if full_compare is None:
+            full_compare = _pycutfem_full_system_compare(problem, forms, qdeg=int(qdeg), backend=str(backend))
+        alpha_block = dict(full_compare["full_blocks"]["alpha"])
+        return (
+            float(alpha_block["res_max_abs"]),
+            float(alpha_block["res_rel"]),
+            float(alpha_block["jac_max_abs"]),
+            float(alpha_block["jac_rel"]),
+        )
+
     enable_phi_evolution = bool(problem["_audit_enable_phi_evolution"])
     mesh_fx, W_fx = _build_fenics_alpha_system(
         Lx=float(problem["_audit_Lx"]),
@@ -1709,11 +1739,25 @@ def _fenics_full_forms(
     if support_key == "internal_conversion":
         drag_occ_k_fx = alpha_k_fx * (1.0 - phi_state_k)
         drag_occ_n_fx = alpha_n_fx * (1.0 - phi_state_n)
+        drag_phi_factor_k_fx = phi_state_k * phi_state_k
+        drag_phi_factor_n_fx = phi_state_n * phi_state_n
     else:
         drag_occ_k_fx = alpha_k_fx
         drag_occ_n_fx = alpha_n_fx
-    beta_coeff_k_fx = drag_occ_k_fx * mu_f_fx * phi_state_k * phi_state_k
-    beta_coeff_n_fx = drag_occ_n_fx * mu_f_fx * phi_state_n * phi_state_n
+        # The reduced fixed-phi audit path is built through
+        # `deformation_only.py`, whose legacy drag law omits the extra
+        # `phi_b**2` factor used by the full evolving-phi one-domain model.
+        # Mirror that reduced-model law here so `enable_phi_evolution=False`
+        # compares against the actual pycutfem branch rather than the full
+        # one-domain system with phi frozen by hand.
+        if bool(enable_phi_evolution):
+            drag_phi_factor_k_fx = phi_state_k * phi_state_k
+            drag_phi_factor_n_fx = phi_state_n * phi_state_n
+        else:
+            drag_phi_factor_k_fx = 1.0
+            drag_phi_factor_n_fx = 1.0
+    beta_coeff_k_fx = drag_occ_k_fx * mu_f_fx * drag_phi_factor_k_fx
+    beta_coeff_n_fx = drag_occ_n_fx * mu_f_fx * drag_phi_factor_n_fx
     kappa_key = str(params["kappa_inv_model"]).strip().lower()
     if kappa_key in {"refmap", "eulerian_refmap", "eulerian", "reference_map", "reference-map"}:
         K_inv_ref_fx = kappa_inv_fx * I_fx
@@ -2399,7 +2443,7 @@ def main() -> None:
     ap.add_argument("--latent-bounded-transport", action=argparse.BooleanOptionalAction, default=False)
     ap.add_argument("--latent-bounded-fields", type=str, default="alpha,phi")
     ap.add_argument("--latent-bounded-eps", type=float, default=1.0e-8)
-    ap.add_argument("--latent-bounded-map", type=str, default="sigmoid", choices=("sigmoid", "algebraic"))
+    ap.add_argument("--latent-bounded-map", type=str, default="sigmoid", choices=("sigmoid", "tanh", "algebraic"))
     ap.add_argument("--latent-bounded-formulation", type=str, default="embedded", choices=("embedded", "transformed"))
     ap.add_argument("--pressure-mean-constraint", action=argparse.BooleanOptionalAction, default=False)
     ap.add_argument("--solid-volumetric-split", action=argparse.BooleanOptionalAction, default=False)
@@ -2412,6 +2456,7 @@ def main() -> None:
     )
     ap.add_argument("--pycutfem-backend", type=str, default="cpp", choices=("python", "jit", "cpp"))
     ap.add_argument("--n-random-directions", type=int, default=1)
+    ap.add_argument("--fd-eps", type=float, default=1.0e-6)
     ap.add_argument("--gamma-div", type=float, default=0.0)
     ap.add_argument("--gamma-u", type=float, default=0.0)
     ap.add_argument("--u-extension", type=str, default="l2", choices=("l2", "mass", "grad", "h1"))
@@ -2581,6 +2626,7 @@ def main() -> None:
             enable_phi_evolution=bool(args.enable_phi_evolution),
             backend=str(args.pycutfem_backend),
             n_random=int(args.n_random_directions),
+            fd_eps=float(args.fd_eps),
         )
         full_compare = _pycutfem_full_system_compare(
             problem,
@@ -2596,6 +2642,7 @@ def main() -> None:
             alpha_advection_form=str(adv_form),
             phi_b=float(problem["_audit_phi_b"]),
             backend=str(args.pycutfem_backend),
+            full_compare=full_compare,
         ) if not bool(args.latent_bounded_transport) else (None, None, None, None)
         phi_res_max_abs, phi_res_rel, phi_jac_max_abs, phi_jac_rel = _pycutfem_phi_compare(
             problem,

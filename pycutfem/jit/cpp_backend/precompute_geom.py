@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Tuple
 
 from .compiler import compile_extension
+from .cache import _looks_like_incomplete_binary_import, _module_build_lock
 
 
 def _cache_dir() -> Path:
@@ -43,10 +44,19 @@ def module() -> Any:
     cache = _cache_dir()
     modname = "_pycutfem_cpp_precompute_geom"
     built = cache / f"{modname}{_ext_suffix()}"
+    lock = cache / f"{modname}.lock"
     src = Path(__file__).with_suffix(".cpp")
-    if not built.exists():
-        compile_extension(modname, src, cache)
-    _MODULE = _import_module(modname, built)
+    with _module_build_lock(lock):
+        if not built.exists():
+            compile_extension(modname, src, cache)
+        try:
+            _MODULE = _import_module(modname, built)
+        except Exception as exc:
+            if not _looks_like_incomplete_binary_import(exc):
+                raise
+            built.unlink(missing_ok=True)
+            compile_extension(modname, src, cache)
+            _MODULE = _import_module(modname, built)
     return _MODULE
 
 
@@ -61,4 +71,3 @@ def quad_jacobian_det_inv(coords, xi, eta, poly_order: int):
     """
     m = module()
     return m.quad_jacobian_det_inv(coords, xi, eta, int(poly_order))
-

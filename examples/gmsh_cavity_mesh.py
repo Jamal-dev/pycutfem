@@ -35,6 +35,7 @@ def build_caity_quad_mesh(
     ny: int = 30,
     element_order: int = 2,
     visualize: bool = False,
+    comm=None,
 ) -> Path:
     """
     Generate a structured quadrilateral lid-driven cavity mesh.
@@ -47,6 +48,30 @@ def build_caity_quad_mesh(
         visualize: Launch the Gmsh GUI before writing the mesh when True.
     """
     output = Path(output)
+    if comm is not None:
+        rank = int(comm.Get_rank())
+        payload = (str(output), None)
+        if rank == 0:
+            try:
+                built = build_caity_quad_mesh(
+                    output,
+                    L=L,
+                    H=H,
+                    nx=nx,
+                    ny=ny,
+                    element_order=element_order,
+                    visualize=visualize,
+                    comm=None,
+                )
+                payload = (str(built), None)
+            except Exception as exc:
+                payload = (str(output), f"{type(exc).__name__}: {exc}")
+        payload = comm.bcast(payload, root=0)
+        if payload[1]:
+            raise RuntimeError(f"Rank-0 Gmsh mesh generation failed: {payload[1]}")
+        comm.Barrier()
+        return Path(payload[0])
+
     gmsh.initialize()
     try:
         gmsh.model.add("lid_driven_cavity")

@@ -7,7 +7,8 @@ from types import SimpleNamespace
 from pycutfem.jit.ir import (
     LoadVariable, LoadConstant, LoadConstantArray, LoadElementWiseConstant,
     LoadAnalytic, LoadFacetNormal, Grad, PackGradient, Div, HdivDiv, PosOp, NegOp,
-    PositivePartOp, HeavisideOp, LogOp, ExpOp,
+    PositivePartOp, HeavisideOp, LogOp, ExpOp, TanhOp, SinOp, CosOp, TanOp, AsinOp, AcosOp, AtanOp,
+    SinhOp, CoshOp, AsinhOp, AcoshOp, AtanhOp,
     BinaryOp, Inner, Dot, Outer, Store, Transpose, CellDiameter, LoadFacetNormalComponent, CheckDomain,
     MeshSize,
     Trace, Determinant, Inverse, Cofactor, Hessian as IRHessian, Laplacian as IRLaplacian
@@ -1407,6 +1408,7 @@ class NumbaCodeGen:
 
                     coeff_sym = op.name if op.name.startswith("u_") else f"u_{op.name}_loc"
                     required_args.add(coeff_sym)
+                    solution_func_names.add(coeff_sym)
                     if deriv_order == (0, 0):
                         tbl = f"hval_{fld}"
                         row_expr = f"{tbl}[e, q, {comp_idx}]"
@@ -3047,6 +3049,79 @@ class NumbaCodeGen:
                 res_var = new_var("exp")
                 body_lines.append("# Exp: natural exponential")
                 body_lines.append(f"{res_var} = np.exp({a.var_name})")
+                stack.append(a._replace(var_name=res_var))
+
+            elif isinstance(op, TanhOp):
+                a = stack.pop()
+                res_var = new_var("tanh")
+                body_lines.append("# Tanh: hyperbolic tangent")
+                body_lines.append(f"{res_var} = np.tanh({a.var_name})")
+                stack.append(a._replace(var_name=res_var))
+            elif isinstance(op, SinOp):
+                a = stack.pop()
+                res_var = new_var("sin")
+                body_lines.append("# Sin: trigonometric sine")
+                body_lines.append(f"{res_var} = np.sin({a.var_name})")
+                stack.append(a._replace(var_name=res_var))
+            elif isinstance(op, CosOp):
+                a = stack.pop()
+                res_var = new_var("cos")
+                body_lines.append("# Cos: trigonometric cosine")
+                body_lines.append(f"{res_var} = np.cos({a.var_name})")
+                stack.append(a._replace(var_name=res_var))
+            elif isinstance(op, TanOp):
+                a = stack.pop()
+                res_var = new_var("tan")
+                body_lines.append("# Tan: trigonometric tangent")
+                body_lines.append(f"{res_var} = np.tan({a.var_name})")
+                stack.append(a._replace(var_name=res_var))
+            elif isinstance(op, AsinOp):
+                a = stack.pop()
+                res_var = new_var("asin")
+                body_lines.append("# Asin: inverse sine")
+                body_lines.append(f"{res_var} = np.arcsin({a.var_name})")
+                stack.append(a._replace(var_name=res_var))
+            elif isinstance(op, AcosOp):
+                a = stack.pop()
+                res_var = new_var("acos")
+                body_lines.append("# Acos: inverse cosine")
+                body_lines.append(f"{res_var} = np.arccos({a.var_name})")
+                stack.append(a._replace(var_name=res_var))
+            elif isinstance(op, AtanOp):
+                a = stack.pop()
+                res_var = new_var("atan")
+                body_lines.append("# Atan: inverse tangent")
+                body_lines.append(f"{res_var} = np.arctan({a.var_name})")
+                stack.append(a._replace(var_name=res_var))
+            elif isinstance(op, SinhOp):
+                a = stack.pop()
+                res_var = new_var("sinh")
+                body_lines.append("# Sinh: hyperbolic sine")
+                body_lines.append(f"{res_var} = np.sinh({a.var_name})")
+                stack.append(a._replace(var_name=res_var))
+            elif isinstance(op, CoshOp):
+                a = stack.pop()
+                res_var = new_var("cosh")
+                body_lines.append("# Cosh: hyperbolic cosine")
+                body_lines.append(f"{res_var} = np.cosh({a.var_name})")
+                stack.append(a._replace(var_name=res_var))
+            elif isinstance(op, AsinhOp):
+                a = stack.pop()
+                res_var = new_var("asinh")
+                body_lines.append("# Asinh: inverse hyperbolic sine")
+                body_lines.append(f"{res_var} = np.arcsinh({a.var_name})")
+                stack.append(a._replace(var_name=res_var))
+            elif isinstance(op, AcoshOp):
+                a = stack.pop()
+                res_var = new_var("acosh")
+                body_lines.append("# Acosh: inverse hyperbolic cosine")
+                body_lines.append(f"{res_var} = np.arccosh({a.var_name})")
+                stack.append(a._replace(var_name=res_var))
+            elif isinstance(op, AtanhOp):
+                a = stack.pop()
+                res_var = new_var("atanh")
+                body_lines.append("# Atanh: inverse hyperbolic tangent")
+                body_lines.append(f"{res_var} = np.arctanh({a.var_name})")
                 stack.append(a._replace(var_name=res_var))
 
             # --- Inner OPERATORS ---

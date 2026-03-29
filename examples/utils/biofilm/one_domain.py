@@ -75,6 +75,15 @@ def _as_constant(val) -> Constant:
     return val if isinstance(val, Constant) else _c(float(val))
 
 
+def _as_scalar_expr(val):
+    if isinstance(val, Constant):
+        return val
+    try:
+        return _c(float(val))
+    except Exception:
+        return val
+
+
 def _sqrt(expr):
     return expr ** _c(0.5)
 
@@ -486,11 +495,13 @@ class BiofilmOneDomainForms:
     r_substrate: object
     r_momentum_terms: dict[str, object] | None = None
     r_kinematics_terms: dict[str, object] | None = None
+    r_skeleton_terms: dict[str, object] | None = None
     # Optional per-block Jacobian contributions (useful for debugging/verification)
     a_momentum: object | None = None
     a_mass: object | None = None
     a_kinematics: object | None = None
     a_skeleton: object | None = None
+    a_skeleton_terms: dict[str, object] | None = None
     a_phi: object | None = None
     a_alpha: object | None = None
     a_mu_alpha: object | None = None
@@ -583,11 +594,23 @@ def build_biofilm_one_domain_forms(
     # optional solid inertia (Eulerian skeleton acceleration)
     rho_s0_tilde=None,
     include_skeleton_acceleration: bool = False,
+    # Optional runtime coefficient for the skeleton inertia block. When
+    # provided, the inertia terms are assembled once and scaled with this
+    # coefficient rather than being structurally gated by
+    # `include_skeleton_acceleration`.
+    skeleton_acceleration_weight=None,
     # How to treat the convective part of the Eulerian skeleton inertia
     # div(ρ_S v^S ⊗ v^S). "lagged" (default) uses a Picard-like linearization
     # div(ρ_S^n v^{S,n} ⊗ v^{S,k}) for robustness; "full" keeps the nonlinear
     # term.
     skeleton_inertia_convection: str = "lagged",
+    # Optional parametric blend weights for the skeleton inertia-convection
+    # variants. When any of these are provided, the builder assembles the
+    # requested variants once and scales them with the supplied runtime
+    # coefficients instead of branching structurally on
+    # `skeleton_inertia_convection`.
+    skeleton_inertia_full_weight=None,
+    skeleton_inertia_lagged_weight=None,
     # How to treat the convective part of the fluid momentum.
     #
     # The conservative convection in this one-domain formulation includes both
@@ -599,6 +622,13 @@ def build_biofilm_one_domain_forms(
     # - "lagged": Picard/IMEX-like linearization using n-level coefficients/advectors
     # - "off": omit convection entirely (Stokes/Brinkman limit)
     fluid_convection: str = "full",
+    # Optional parametric blend weights for the fluid-convection variants.
+    # When any of these are provided, the builder assembles the corresponding
+    # terms once and scales them with the supplied runtime coefficients instead
+    # of branching structurally on `fluid_convection`.
+    fluid_convection_full_weight=None,
+    fluid_convection_lagged_weight=None,
+    fluid_convection_imex_weight=None,
     # solid/permeability modelling toggles
     solid_model: str = "linear",
     c_nh=None,
@@ -653,7 +683,10 @@ def build_biofilm_one_domain_forms(
     # `support_physics="internal_conversion"`, the physically consistent choice
     # is `alpha_advect_with="biofilm_volume"` together with
     # `alpha_advection_form="conservative_weak"`.
-    alpha_advect_with: str = "mix",
+    #
+    # When omitted/None, the builder selects the support-aware default:
+    # `biofilm_volume` for `internal_conversion`, `mix` for `legacy_exchange`.
+    alpha_advect_with: str | None = None,
     # Parameters used by alpha_advect_with="mix_biofilm":
     # gate C by  g(α) = α^m / (α^m + α0^m). For α≫α0, g≈1; for α≪α0, g≈0.
     alpha_mix_gate_alpha0: float = 0.1,
@@ -953,7 +986,7 @@ def build_biofilm_one_domain_forms(
                     "scalar/Constant."
                 ) from exc
 
-    th = _c(float(theta))
+    th = _as_constant(theta)
     one_m_th = _c(1.0) - th
     inv_dt = _c(1.0) / dt
 
@@ -965,10 +998,9 @@ def build_biofilm_one_domain_forms(
     s_v = s_v if s_v is not None else zero_scalar
     # NOTE: `ds_v` is the Gateaux derivative of the volumetric source `s_v`.
     # When no derivative is provided (or a Picard/frozen linearization is used),
-    # we must still keep the Jacobian term `-alpha_k * ds_v` in the *trial* role.
-    # Using a bare scalar `0` here can leave `alpha_k*0` tagged as a function-like
-    # operand in the symbolic pipeline, which then breaks assembly when combined
-    # with other trial-family contributions. Use an explicit zero-trial instead.
+    # we must still keep the Jacobian term `-ds_v` in the *trial* role.
+    # Using a bare scalar `0` here can leave mixed trial/function metadata in
+    # the symbolic pipeline, so use an explicit zero-trial instead.
     if ds_v is None:
         ds_v = zero_scalar * dS
     else:
@@ -1362,6 +1394,24 @@ def build_biofilm_one_domain_forms(
         raise ValueError(
             f"Unknown fluid_convection={fluid_convection!r}. Use 'full' (default), 'lagged', 'imex', or 'off'."
         )
+    use_parametric_fluid_convection = any(
+        weight is not None
+        for weight in (
+            fluid_convection_full_weight,
+            fluid_convection_lagged_weight,
+            fluid_convection_imex_weight,
+        )
+    )
+    if use_parametric_fluid_convection:
+        fluid_conv_full_w = _as_scalar_expr(0.0 if fluid_convection_full_weight is None else fluid_convection_full_weight)
+        fluid_conv_lagged_w = _as_scalar_expr(
+            0.0 if fluid_convection_lagged_weight is None else fluid_convection_lagged_weight
+        )
+        fluid_conv_imex_w = _as_scalar_expr(0.0 if fluid_convection_imex_weight is None else fluid_convection_imex_weight)
+    else:
+        fluid_conv_full_w = _c(1.0 if fluid_conv_key == "full" else 0.0)
+        fluid_conv_lagged_w = _c(1.0 if fluid_conv_key == "lagged" else 0.0)
+        fluid_conv_imex_w = _c(1.0 if fluid_conv_key == "imex" else 0.0)
     hdiv_tangential_method_key = str(hdiv_tangential_method).strip().lower()
     if hdiv_tangential_method_key in {
         "nitsche",
@@ -1396,34 +1446,24 @@ def build_biofilm_one_domain_forms(
         "cip": momentum_zero,
     }
     r_mom = momentum_terms["transient"]
-    if fluid_conv_key == "full":
-        conv_k = dot(dot(grad(v_k), v_k), v_test)
-        conv_n = dot(dot(grad(v_n), v_n), v_test)
-        momentum_terms["convection"] = (
-            th * (rho_k * conv_k + div_rhov_k * dot(v_k, v_test)) * dx
-            + one_m_th * (rho_n * conv_n + div_rhov_n * dot(v_n, v_test)) * dx
-        )
-        r_mom += momentum_terms["convection"]
-    elif fluid_conv_key == "lagged":
-        # Picard/IMEX-like linearization:
-        #   div(ρ^n v^n ⊗ v^k) = ρ^n (v^n·∇)v^k + v^k div(ρ^n v^n)
-        conv_k = dot(dot(grad(v_k), v_n), v_test)
-        conv_n = dot(dot(grad(v_n), v_n), v_test)
-        momentum_terms["convection"] = (
-            th * (rho_n * conv_k + div_rhov_n * dot(v_k, v_test)) * dx
-            + one_m_th * (rho_n * conv_n + div_rhov_n * dot(v_n, v_test)) * dx
-        )
-        r_mom += momentum_terms["convection"]
-    elif fluid_conv_key == "imex":
-        # IMEX-style explicit convection: treat the convective term fully at the n-level
-        # (no v^k dependence). This removes the non-symmetric convection block from the
-        # Jacobian and can significantly improve robustness for long transient runs.
-        conv_k = None
-        conv_n = dot(dot(grad(v_n), v_n), v_test)
-        momentum_terms["convection"] = (rho_n * conv_n + div_rhov_n * dot(v_n, v_test)) * dx
-        r_mom += momentum_terms["convection"]
-    else:
-        conv_k = None
+    conv_full_k = dot(dot(grad(v_k), v_k), v_test)
+    conv_full_n = dot(dot(grad(v_n), v_n), v_test)
+    # Picard/IMEX-like linearization:
+    #   div(ρ^n v^n ⊗ v^k) = ρ^n (v^n·∇)v^k + v^k div(ρ^n v^n)
+    conv_lagged_k = dot(dot(grad(v_k), v_n), v_test)
+    conv_lagged_n = dot(dot(grad(v_n), v_n), v_test)
+    # IMEX-style explicit convection: treat the convective term fully at the n-level
+    # (no v^k dependence). This removes the non-symmetric convection block from the
+    # Jacobian and can significantly improve robustness for long transient runs.
+    conv_imex_n = conv_full_n
+    momentum_terms["convection"] = (
+        fluid_conv_full_w * th * (rho_k * conv_full_k + div_rhov_k * dot(v_k, v_test)) * dx
+        + fluid_conv_full_w * one_m_th * (rho_n * conv_full_n + div_rhov_n * dot(v_n, v_test)) * dx
+        + fluid_conv_lagged_w * th * (rho_n * conv_lagged_k + div_rhov_n * dot(v_k, v_test)) * dx
+        + fluid_conv_lagged_w * one_m_th * (rho_n * conv_lagged_n + div_rhov_n * dot(v_n, v_test)) * dx
+        + fluid_conv_imex_w * (rho_n * conv_imex_n + div_rhov_n * dot(v_n, v_test)) * dx
+    )
+    r_mom += momentum_terms["convection"]
     momentum_terms["viscous"] = (
         _c(2.0) * th * mu_k * inner(_epsilon(v_k), _epsilon(v_test)) * dx
         + _c(2.0) * one_m_th * mu_n * inner(_epsilon(v_n), _epsilon(v_test)) * dx
@@ -1494,26 +1534,21 @@ def build_biofilm_one_domain_forms(
 
     a_mom = inv_dt * (drho * dot(v_k, v_test) + rho_k * dot(dv, v_test)) * dx
 
-    if fluid_conv_key == "full":
-        a_mom += th * (
-            drho * conv_k
-            + rho_k * dot(dot(grad(dv), v_k), v_test)
-            + rho_k * dot(dot(grad(v_k), dv), v_test)
-        ) * dx
-        # Jacobian of the conservative correction v div(ρ v).
-        # Keep trial-family contributions separated to avoid mixed-role metadata
-        # leakage in the assembler (v-trial vs alpha/phi-trial pieces).
-        d_divCv_k_ap = dC_k * div(v_k) + dot(dgradC_k, v_k)
-        d_divCv_k_v = C_k * div(dv) + dot(gradC_k, dv)
-        a_mom += th * (rho_f * d_divCv_k_ap * dot(v_k, v_test)) * dx
-        a_mom += th * (rho_f * d_divCv_k_v * dot(v_k, v_test)) * dx
-        a_mom += th * (div_rhov_k * dot(dv, v_test)) * dx
-    elif fluid_conv_key == "lagged":
-        a_mom += th * (rho_n * dot(dot(grad(dv), v_n), v_test)) * dx
-        a_mom += th * (div_rhov_n * dot(dv, v_test)) * dx
-    elif fluid_conv_key == "imex":
-        # Explicit convection contributes no Jacobian terms.
-        pass
+    d_divCv_k_ap = dC_k * div(v_k) + dot(dgradC_k, v_k)
+    d_divCv_k_v = C_k * div(dv) + dot(gradC_k, dv)
+    a_mom += fluid_conv_full_w * th * (
+        drho * conv_full_k
+        + rho_k * dot(dot(grad(dv), v_k), v_test)
+        + rho_k * dot(dot(grad(v_k), dv), v_test)
+    ) * dx
+    # Jacobian of the conservative correction v div(ρ v).
+    # Keep trial-family contributions separated to avoid mixed-role metadata
+    # leakage in the assembler (v-trial vs alpha/phi-trial pieces).
+    a_mom += fluid_conv_full_w * th * (rho_f * d_divCv_k_ap * dot(v_k, v_test)) * dx
+    a_mom += fluid_conv_full_w * th * (rho_f * d_divCv_k_v * dot(v_k, v_test)) * dx
+    a_mom += fluid_conv_full_w * th * (div_rhov_k * dot(dv, v_test)) * dx
+    a_mom += fluid_conv_lagged_w * th * (rho_n * dot(dot(grad(dv), v_n), v_test)) * dx
+    a_mom += fluid_conv_lagged_w * th * (div_rhov_n * dot(dv, v_test)) * dx
     a_mom += _c(2.0) * th * (dmu * inner(_epsilon(v_k), _epsilon(v_test)) + mu_k * inner(_epsilon(dv), _epsilon(v_test))) * dx
 
     # δ[-p div(C w)] = -(δp) div(C w) - p δ(div(C w)),
@@ -1730,7 +1765,16 @@ def build_biofilm_one_domain_forms(
                     comp_k += C_k * grad(p_k)[i]
                     dcomp_k += dC * grad(p_k)[i] + C_k * grad(dp)[i]
 
-                    if drag_mode == "scalar":
+                    if drag_form_key == "mixed_lm":
+                        # Keep the residual-based SUPG strong form consistent with the
+                        # mixed drag formulation used in the main momentum residual.
+                        # The stabilization time scale may still use the equivalent
+                        # drag-rate coefficient above, but the projected strong residual
+                        # itself must carry lambda_drag rather than a direct Brinkman
+                        # force beta*(v-vS).
+                        comp_k += _vector_component(lambda_drag_k, i)
+                        dcomp_k += _vector_component(dlambda_drag, i)
+                    elif drag_mode == "scalar":
                         comp_k += beta_k * (v_k_comp[i] - vS_k[i])
                         dcomp_k += dbeta * (v_k_comp[i] - vS_k[i]) + beta_k * (dv_comp[i] - dvS[i])
                     else:
@@ -2046,8 +2090,10 @@ def build_biofilm_one_domain_forms(
                 + vol_pen_c * ((-dalpha) * pi_s_k * q_test + _one_minus(alpha_k) * dpi_s * q_test)
             ) * dx
         if skel_press_key == "seboldt":
-            r_skel_press_k = _c(0.0)
-            r_skel_press_n = _c(0.0)
+            # Keep a test-function factor so the python backend does not see a
+            # pure-functional `0 * dx` residual block.
+            r_skel_press_k = _c(0.0) * dot(vS_k, vS_test)
+            r_skel_press_n = _c(0.0) * dot(vS_n, vS_test)
         else:
             r_skel_press_k = -(p_k * dot(gradB_k, vS_test))
             r_skel_press_n = -(p_n * dot(gradB_n, vS_test))
@@ -2080,24 +2126,32 @@ def build_biofilm_one_domain_forms(
     sk_th = th if bool(include_skeleton_acceleration) else _c(1.0)
     sk_one_m_th = one_m_th if bool(include_skeleton_acceleration) else _c(0.0)
 
+    skeleton_terms: dict[str, object] = {}
+    skeleton_terms["elastic_k"] = sk_th * alpha_k * (g_stiff_k * r_el_plus_k + r_el_minus_k) * dx
+    skeleton_terms["elastic_n"] = sk_one_m_th * alpha_n * (g_stiff_n * r_el_plus_n + r_el_minus_n) * dx
+    skeleton_terms["pressure"] = (sk_th * r_skel_press_k + sk_one_m_th * r_skel_press_n) * dx
+    skeleton_terms["drag"] = (sk_th * r_skel_drag_k + sk_one_m_th * r_skel_drag_n) * dx
     r_skeleton = (
-        sk_th * alpha_k * (g_stiff_k * r_el_plus_k + r_el_minus_k)
-        + sk_one_m_th * alpha_n * (g_stiff_n * r_el_plus_n + r_el_minus_n)
-        + sk_th * r_skel_press_k
-        + sk_one_m_th * r_skel_press_n
-        + sk_th * r_skel_drag_k
-        + sk_one_m_th * r_skel_drag_n
-    ) * dx
-    r_skeleton_pressure = (sk_th * r_skel_press_k + sk_one_m_th * r_skel_press_n) * dx
+        skeleton_terms["elastic_k"]
+        + skeleton_terms["elastic_n"]
+        + skeleton_terms["pressure"]
+        + skeleton_terms["drag"]
+    )
+    r_skeleton_pressure = skeleton_terms["pressure"]
     # External body force is weighted by biofilm presence α, but not degraded by g_stiff(d).
-    r_skeleton += -dot(alpha_k * f_u, vS_test) * dx
+    skeleton_terms["body"] = -dot(alpha_k * f_u, vS_test) * dx
+    r_skeleton += skeleton_terms["body"]
     if dGamma is not None:
-        r_skeleton += (th * _dot_2d_components(g_t_k, vS_test) + one_m_th * _dot_2d_components(g_t_n, vS_test)) * dGamma
+        skeleton_terms["traction_boundary"] = (
+            th * _dot_2d_components(g_t_k, vS_test) + one_m_th * _dot_2d_components(g_t_n, vS_test)
+        ) * dGamma
+        r_skeleton += skeleton_terms["traction_boundary"]
     if traction_weight_k is not None or traction_weight_n is not None:
-        r_skeleton += (
+        skeleton_terms["traction_volume"] = (
             th * traction_weight_k * _dot_2d_components(g_t_k, vS_test)
             + one_m_th * traction_weight_n * _dot_2d_components(g_t_n, vS_test)
         ) * dx
+        r_skeleton += skeleton_terms["traction_volume"]
 
     # Extension / stabilization coefficients.
     # - `gamma_u` controls u-extension in the kinematic constraint below.
@@ -2113,24 +2167,27 @@ def build_biofilm_one_domain_forms(
         except Exception:
             reg_weight_k = regularization_weight
     reg_weight_cip = avg(reg_weight_k) if ds_cip is not None else None
-    gamma_vS_eff = float(gamma_u) if gamma_vS is None else float(gamma_vS)
+    gamma_vS_input = gamma_u if gamma_vS is None else gamma_vS
+    gamma_vS_eff = float(gamma_vS_input)
     vS_ext_mode = str(u_extension_mode if vS_extension_mode is None else vS_extension_mode).strip().lower()
-    gamma_vS_c = _c(float(gamma_vS_eff))
+    gamma_vS_c = _as_constant(gamma_vS_input)
     # Mirror u-extension pinning by default: both u-extension (grad-mode) and the
     # vS-extension (grad-mode) have a global-translation nullspace in a one-domain
     # CG setting. A tiny L2 pin in the fluid region breaks the nullspace and
     # materially improves Newton robustness without affecting the biofilm region
     # (the pin weight scales like (1-α)^2).
     if gamma_vS_pin is None and vS_ext_mode in {"grad", "h1"} and float(gamma_u_pin) != 0.0:
-        gamma_vS_pin_eff = float(gamma_u_pin)
+        gamma_vS_pin_input = gamma_u_pin
     else:
-        gamma_vS_pin_eff = 0.0 if gamma_vS_pin is None else float(gamma_vS_pin)
-    gamma_vS_pin_c = _c(float(gamma_vS_pin_eff))
+        gamma_vS_pin_input = 0.0 if gamma_vS_pin is None else gamma_vS_pin
+    gamma_vS_pin_eff = float(gamma_vS_pin_input)
+    gamma_vS_pin_c = _as_constant(gamma_vS_pin_input)
     vS_pin_pow = int(gamma_vS_pin_power)
     if vS_pin_pow < 1:
         raise ValueError(f"gamma_vS_pin_power must be >= 1; got {gamma_vS_pin_power}.")
     a_skel_visco_alpha = None
     a_skel_visco_vS = None
+    skeleton_jac_terms: dict[str, object] = {}
     if float(solid_visco_eta) != 0.0:
         eta_s_c = _c(float(solid_visco_eta))
         # grad_vS_k = (grad(u_k) - grad(u_n))/dt
@@ -2141,7 +2198,8 @@ def build_biofilm_one_domain_forms(
         r_visc_n = inner(sig_visc_n, grad(vS_test))
         # Treat viscosity as part of the skeleton response: localize by α and apply the same stiffness
         # degradation g_stiff(d) used for elasticity.
-        r_skeleton += (th * alpha_k * g_stiff_k * r_visc_k + one_m_th * alpha_n * g_stiff_n * r_visc_n) * dx
+        skeleton_terms["viscosity"] = (th * alpha_k * g_stiff_k * r_visc_k + one_m_th * alpha_n * g_stiff_n * r_visc_n) * dx
+        r_skeleton += skeleton_terms["viscosity"]
 
         # Consistent k-part Jacobian: δ[α g σ_visc(vS)] = δ(α g) r_visc + α g a_visc.
         #
@@ -2165,10 +2223,12 @@ def build_biofilm_one_domain_forms(
         if vS_ext_mode in {"l2", "mass"}:
             h_u = MeshSize()
             inv_h2 = _c(1.0) / (h_u * h_u)
-            r_skeleton += reg_weight_k * gamma_vS_c * inv_h2 * _one_minus(alpha_k) * dot(vS_k, vS_test) * dx
+            skeleton_terms["extension"] = reg_weight_k * gamma_vS_c * inv_h2 * _one_minus(alpha_k) * dot(vS_k, vS_test) * dx
+            r_skeleton += skeleton_terms["extension"]
         elif vS_ext_mode in {"grad", "h1"}:
             # Gradient penalty does not fight rigid translations (∇vS≈0).
-            r_skeleton += reg_weight_k * gamma_vS_c * _one_minus(alpha_k) * inner(grad(vS_k), grad(vS_test)) * dx
+            skeleton_terms["extension"] = reg_weight_k * gamma_vS_c * _one_minus(alpha_k) * inner(grad(vS_k), grad(vS_test)) * dx
+            r_skeleton += skeleton_terms["extension"]
             if float(gamma_vS_pin_eff) != 0.0:
                 h_u = MeshSize()
                 inv_h2 = _c(1.0) / (h_u * h_u)
@@ -2176,7 +2236,8 @@ def build_biofilm_one_domain_forms(
                 w_pin_pow = w_pin
                 for _ in range(vS_pin_pow - 1):
                     w_pin_pow = w_pin_pow * w_pin
-                r_skeleton += reg_weight_k * gamma_vS_pin_c * inv_h2 * w_pin_pow * dot(vS_k, vS_test) * dx
+                skeleton_terms["extension_pin"] = reg_weight_k * gamma_vS_pin_c * inv_h2 * w_pin_pow * dot(vS_k, vS_test) * dx
+                r_skeleton += skeleton_terms["extension_pin"]
         else:
             raise ValueError(f"Unknown vS_extension_mode {vS_extension_mode!r}.")
 
@@ -2209,15 +2270,20 @@ def build_biofilm_one_domain_forms(
         # (0·test) and break matrix assembly in the python backend.
         elastic_jac_k += dg_stiff_k * r_el_plus_k
 
-    a_skel = sk_th * (alpha_k * elastic_jac_k + dalpha * (g_stiff_k * r_el_plus_k + r_el_minus_k)) * dx
+    skeleton_jac_terms["elastic"] = sk_th * (alpha_k * elastic_jac_k + dalpha * (g_stiff_k * r_el_plus_k + r_el_minus_k)) * dx
+    a_skel = skeleton_jac_terms["elastic"]
     if a_skel_visco_alpha is not None:
+        skeleton_jac_terms["viscosity_alpha"] = a_skel_visco_alpha
         a_skel += a_skel_visco_alpha
     if a_skel_visco_vS is not None:
+        skeleton_jac_terms["viscosity_vS"] = a_skel_visco_vS
         a_skel += a_skel_visco_vS
     # Jacobian of the pressure coupling.
     if bool(solid_volumetric_split) and solid_model_key in {"linear", "small_strain", "linear_elastic"}:
         if skel_press_key == "seboldt":
-            a_skel_pressure = _c(0.0) * dx
+            # Preserve both trial and test roles for the identically-zero
+            # split-Seboldt remainder so the python backend can assemble it.
+            a_skel_pressure = _c(0.0) * dot(dvS, vS_test) * dx
         else:
             a_skel_pressure = sk_th * (-(dp * dot(gradB_k, vS_test) + p_k * dot(dgradB_k, vS_test))) * dx
     elif skel_press_key == "seboldt":
@@ -2230,10 +2296,13 @@ def build_biofilm_one_domain_forms(
         gamma_div_c = _as_constant(gamma_div)
         d_divF_k = d_divCv_k + d_divBvS_k
         a_skel_pressure += sk_th * gamma_div_c * (d_divF_k * div_B_vStest_k + divF_k * d_div_B_vStest_k) * dx
+    skeleton_jac_terms["pressure"] = a_skel_pressure
     a_skel += a_skel_pressure
     # Drag term is *not* multiplied by alpha again: beta already contains alpha (one-domain blend).
-    a_skel += sk_th * d_drag_term_k * dx
-    a_skel += -dot(dalpha * f_u, vS_test) * dx
+    skeleton_jac_terms["drag"] = sk_th * d_drag_term_k * dx
+    a_skel += skeleton_jac_terms["drag"]
+    skeleton_jac_terms["body"] = -dot(dalpha * f_u, vS_test) * dx
+    a_skel += skeleton_jac_terms["body"]
     if drag_form_key == "mixed_lm":
         if drag_mode == "scalar":
             if kappa_inv_key in kc_keys and getattr(kappa_inv, "dim", None) == 0:
@@ -2292,14 +2361,16 @@ def build_biofilm_one_domain_forms(
         if vS_ext_mode in {"l2", "mass"}:
             h_u = MeshSize()
             inv_h2 = _c(1.0) / (h_u * h_u)
-            a_skel += reg_weight_k * gamma_vS_c * inv_h2 * (
+            skeleton_jac_terms["extension"] = reg_weight_k * gamma_vS_c * inv_h2 * (
                 (-_c(1.0) * dalpha) * dot(vS_k, vS_test) + _one_minus(alpha_k) * dot(dvS, vS_test)
             ) * dx
+            a_skel += skeleton_jac_terms["extension"]
         elif vS_ext_mode in {"grad", "h1"}:
-            a_skel += reg_weight_k * gamma_vS_c * (
+            skeleton_jac_terms["extension"] = reg_weight_k * gamma_vS_c * (
                 (-_c(1.0) * dalpha) * inner(grad(vS_k), grad(vS_test))
                 + _one_minus(alpha_k) * inner(grad(dvS), grad(vS_test))
             ) * dx
+            a_skel += skeleton_jac_terms["extension"]
 
             if float(gamma_vS_pin_eff) != 0.0:
                 h_u = MeshSize()
@@ -2316,9 +2387,10 @@ def build_biofilm_one_domain_forms(
                     for _ in range(vS_pin_pow - 2):
                         w_pin_pow_m1 = w_pin_pow_m1 * w_pin
                 dw_pin_pow = (-_c(float(vS_pin_pow)) * w_pin_pow_m1) * dalpha
-                a_skel += reg_weight_k * gamma_vS_pin_c * inv_h2 * (
+                skeleton_jac_terms["extension_pin"] = reg_weight_k * gamma_vS_pin_c * inv_h2 * (
                     dw_pin_pow * dot(vS_k, vS_test) + w_pin_pow * dot(dvS, vS_test)
                 ) * dx
+                a_skel += skeleton_jac_terms["extension_pin"]
         else:
             raise ValueError(f"Unknown vS_extension_mode {vS_extension_mode!r}.")
 
@@ -2331,7 +2403,15 @@ def build_biofilm_one_domain_forms(
     # For robustness in monolithic solves, the default is a Picard-like lagging
     # of the convective part:
     #   div(ρ_S v^S ⊗ v^S) ≈ div(ρ_S^n v^{S,n} ⊗ v^{S,k}).
-    if bool(include_skeleton_acceleration) and float(rho_s0_tilde) != 0.0:
+    use_parametric_skeleton_inertia = any(
+        weight is not None
+        for weight in (
+            skeleton_acceleration_weight,
+            skeleton_inertia_full_weight,
+            skeleton_inertia_lagged_weight,
+        )
+    )
+    if (bool(include_skeleton_acceleration) or use_parametric_skeleton_inertia) and float(rho_s0_tilde) != 0.0:
         inertia_conv_key = str(skeleton_inertia_convection).strip().lower() if skeleton_inertia_convection is not None else "lagged"
         if inertia_conv_key in {"conservative", "nonlinear"}:
             inertia_conv_key = "full"
@@ -2343,10 +2423,28 @@ def build_biofilm_one_domain_forms(
         rhoS_k = rho_s0_c * B_k
         rhoS_n = rho_s0_c * B_n
 
+        if use_parametric_skeleton_inertia:
+            skel_accel_w = _as_scalar_expr(
+                1.0 if skeleton_acceleration_weight is None else skeleton_acceleration_weight
+            )
+            skel_inertia_full_w = _as_scalar_expr(
+                0.0 if skeleton_inertia_full_weight is None else skeleton_inertia_full_weight
+            )
+            skel_inertia_lagged_w = _as_scalar_expr(
+                0.0 if skeleton_inertia_lagged_weight is None else skeleton_inertia_lagged_weight
+            )
+        else:
+            skel_accel_w = _c(1.0)
+            skel_inertia_full_w = _c(1.0 if inertia_conv_key == "full" else 0.0)
+            skel_inertia_lagged_w = _c(1.0 if inertia_conv_key == "lagged" else 0.0)
+        skel_accel_full_w = skel_accel_w * skel_inertia_full_w
+        skel_accel_lagged_w = skel_accel_w * skel_inertia_lagged_w
+
         # Conservative-in-time momentum term.
         momS_dot = (rhoS_k * vS_k - rhoS_n * vS_n) * inv_dt
 
-        r_skeleton += inner(momS_dot, vS_test) * dx
+        skeleton_terms["inertia_transient"] = skel_accel_w * inner(momS_dot, vS_test) * dx
+        r_skeleton += skeleton_terms["inertia_transient"]
 
         # Conservative convection (two modes):
         # - full:    div(ρ_S^k v^{S,k} ⊗ v^{S,k}) (nonlinear)
@@ -2361,27 +2459,27 @@ def build_biofilm_one_domain_forms(
         grad_vS_n = grad(vS_n)
 
         div_rhoS_vS_n = rho_s0_c * divBvS_n
+        advS_full_k = dot(grad_vS_k, vS_k)
+        advS_full_n = dot(grad_vS_n, vS_n)
+        convS_full_k = dot(advS_full_k, vS_test)
+        convS_full_n = dot(advS_full_n, vS_test)
+        div_rhoS_vS_k = rho_s0_c * divBvS_k
+        # Lagged/Picard form: div(ρ^n v^n ⊗ v^k) = ρ^n (v^n·∇)v^k + v^k div(ρ^n v^n).
+        advS_lagged_k = dot(grad_vS_k, vS_n)
+        convS_lagged_k = dot(advS_lagged_k, vS_test)
+        advS_lagged_n = dot(grad_vS_n, vS_n)
+        convS_lagged_n = dot(advS_lagged_n, vS_test)
 
-        if inertia_conv_key == "full":
-            advS_k = dot(grad_vS_k, vS_k)
-            advS_n = dot(grad_vS_n, vS_n)
-            convS_k = dot(advS_k, vS_test)
-            convS_n = dot(advS_n, vS_test)
-
-            div_rhoS_vS_k = rho_s0_c * divBvS_k
-
-            r_skeleton += th * (rhoS_k * convS_k + div_rhoS_vS_k * dot(vS_k, vS_test)) * dx
-            r_skeleton += one_m_th * (rhoS_n * convS_n + div_rhoS_vS_n * dot(vS_n, vS_test)) * dx
-        else:
-            # Lagged/Picard form: div(ρ^n v^n ⊗ v^k) = ρ^n (v^n·∇)v^k + v^k div(ρ^n v^n).
-            advS_k = dot(grad_vS_k, vS_n)
-            convS_k = dot(advS_k, vS_test)
-
-            advS_n = dot(grad_vS_n, vS_n)
-            convS_n = dot(advS_n, vS_test)
-
-            r_skeleton += th * (rhoS_n * convS_k + div_rhoS_vS_n * dot(vS_k, vS_test)) * dx
-            r_skeleton += one_m_th * (rhoS_n * convS_n + div_rhoS_vS_n * dot(vS_n, vS_test)) * dx
+        skeleton_terms["inertia_convection_k"] = (
+            skel_accel_full_w * th * (rhoS_k * convS_full_k + div_rhoS_vS_k * dot(vS_k, vS_test)) * dx
+            + skel_accel_lagged_w * th * (rhoS_n * convS_lagged_k + div_rhoS_vS_n * dot(vS_k, vS_test)) * dx
+        )
+        skeleton_terms["inertia_convection_n"] = (
+            skel_accel_full_w * one_m_th * (rhoS_n * convS_full_n + div_rhoS_vS_n * dot(vS_n, vS_test)) * dx
+            + skel_accel_lagged_w * one_m_th * (rhoS_n * convS_lagged_n + div_rhoS_vS_n * dot(vS_n, vS_test)) * dx
+        )
+        r_skeleton += skeleton_terms["inertia_convection_k"]
+        r_skeleton += skeleton_terms["inertia_convection_n"]
 
         # Jacobian (k-part only): always include δ[ (ρ_S v^S)/dt ].
         d_rhoS_k = rho_s0_c * dB_k
@@ -2390,27 +2488,28 @@ def build_biofilm_one_domain_forms(
             d_momS_dot_vtest += (
                 d_rhoS_k * _vector_component(vS_k, i) + rhoS_k * _vector_component(dvS, i)
             ) * _vector_component(vS_test, i)
-        a_skel += inv_dt * d_momS_dot_vtest * dx
+        skeleton_jac_terms["inertia_transient"] = skel_accel_w * inv_dt * d_momS_dot_vtest * dx
+        a_skel += skeleton_jac_terms["inertia_transient"]
 
-        if inertia_conv_key == "full":
-            # δ[ ρ_S (v^S·∇)v^S + v^S div(ρ_S v^S) ] at k-level.
-            grad_dvS = grad(dvS)
-            d_advS_k = dot(grad_dvS, vS_k) + dot(grad_vS_k, dvS)
-            d_convS_k = dot(d_advS_k, vS_test)
-            a_skel += th * (d_rhoS_k * convS_k + rhoS_k * d_convS_k) * dx
+        grad_dvS = grad(dvS)
+        d_advS_full_k = dot(grad_dvS, vS_k) + dot(grad_vS_k, dvS)
+        d_convS_full_k = dot(d_advS_full_k, vS_test)
+        d_div_rhoS_vS_k = rho_s0_c * d_divBvS_k
+        d_advS_lagged_k = dot(grad_dvS, vS_n)
+        d_convS_lagged_k = dot(d_advS_lagged_k, vS_test)
+        skeleton_jac_terms["inertia_convection_density"] = (
+            skel_accel_full_w * th * (d_rhoS_k * convS_full_k + rhoS_k * d_convS_full_k) * dx
+            + skel_accel_lagged_w * th * (rhoS_n * d_convS_lagged_k) * dx
+        )
+        a_skel += skeleton_jac_terms["inertia_convection_density"]
 
-            div_rhoS_vS_k = rho_s0_c * divBvS_k
-            d_div_rhoS_vS_k = rho_s0_c * d_divBvS_k
-            a_skel += th * (d_div_rhoS_vS_k * dot(vS_k, vS_test) + div_rhoS_vS_k * dot(dvS, vS_test)) * dx
-        elif inertia_conv_key == "lagged":
-            # δ[ ρ_S^n (v^{S,n}·∇)v^{S} + v^{S} div(ρ_S^n v^{S,n}) ] at k-level.
-            grad_dvS = grad(dvS)
-            d_advS_k = dot(grad_dvS, vS_n)
-            d_convS_k = dot(d_advS_k, vS_test)
-            a_skel += th * (rhoS_n * d_convS_k) * dx
-
-            div_rhoS_vS_n = rho_s0_c * divBvS_n
-            a_skel += th * (div_rhoS_vS_n * dot(dvS, vS_test)) * dx
+        skeleton_jac_terms["inertia_convection_divergence"] = (
+            skel_accel_full_w * th * (
+                d_div_rhoS_vS_k * dot(vS_k, vS_test) + div_rhoS_vS_k * dot(dvS, vS_test)
+            ) * dx
+            + skel_accel_lagged_w * th * (div_rhoS_vS_n * dot(dvS, vS_test)) * dx
+        )
+        a_skel += skeleton_jac_terms["inertia_convection_divergence"]
 
     # NOTE: u-CIP stabilization is applied to the *kinematic constraint* for u
     # (see below), not to the vS momentum balance.
@@ -2453,10 +2552,11 @@ def build_biofilm_one_domain_forms(
         t_adh_k = k_n_c * u_nvec_k + k_t_c * u_tvec_k + g_n_c * vS_nvec_k + g_t_c * vS_tvec_k
         t_adh_n = k_n_c * u_nvec_n + k_t_c * u_tvec_n + g_n_c * vS_nvec_n + g_t_c * vS_tvec_n
 
-        r_skeleton += (
+        skeleton_terms["adhesion"] = (
             sk_th * alpha_k * a_prev * dot(t_adh_k, vS_test)
             + sk_one_m_th * alpha_n * a_prev * dot(t_adh_n, vS_test)
         ) * ds_adh
+        r_skeleton += skeleton_terms["adhesion"]
 
         # Jacobian (k-part only): δ[ α a_prev t_adh(u,vS) ].
         du_nvec = _proj_n(du)
@@ -2465,7 +2565,10 @@ def build_biofilm_one_domain_forms(
         dvS_tvec = dvS - dvS_nvec
         dt_adh = k_n_c * du_nvec + k_t_c * du_tvec + g_n_c * dvS_nvec + g_t_c * dvS_tvec
 
-        a_skel += sk_th * (dalpha * a_prev * dot(t_adh_k, vS_test) + alpha_k * a_prev * dot(dt_adh, vS_test)) * ds_adh
+        skeleton_jac_terms["adhesion"] = sk_th * (
+            dalpha * a_prev * dot(t_adh_k, vS_test) + alpha_k * a_prev * dot(dt_adh, vS_test)
+        ) * ds_adh
+        a_skel += skeleton_jac_terms["adhesion"]
 
     # Optional CIP (continuous interior penalty) stabilization for vS.
     # Regularizes vS in the diffuse interface / near-zero-α region without changing the continuous limit.
@@ -2475,8 +2578,10 @@ def build_biofilm_one_domain_forms(
         h_F = avg(MeshSize())
         tau_cip = vS_cip_c * (h_F * h_F * h_F) * inv_dt
         w_s = avg(alpha_n)
-        r_skeleton += tau_cip * reg_weight_cip * w_s * _grad_inner_jump(vS_k, vS_test, n_int) * ds_cip
-        a_skel += tau_cip * reg_weight_cip * w_s * _grad_inner_jump(dvS, vS_test, n_int) * ds_cip
+        skeleton_terms["cip"] = tau_cip * reg_weight_cip * w_s * _grad_inner_jump(vS_k, vS_test, n_int) * ds_cip
+        r_skeleton += skeleton_terms["cip"]
+        skeleton_jac_terms["cip"] = tau_cip * reg_weight_cip * w_s * _grad_inner_jump(dvS, vS_test, n_int) * ds_cip
+        a_skel += skeleton_jac_terms["cip"]
 
     # ------------------------------------------------------------------
     # (iii-c) Solid kinematics (Eulerian reference-map constraint)
@@ -3921,6 +4026,10 @@ def build_biofilm_one_domain_forms(
         a_mom = a_mom * fluid_momentum_scale_c
 
     if float(skeleton_momentum_scale_c) != 1.0:
+        for key, term in tuple(skeleton_terms.items()):
+            skeleton_terms[key] = term * skeleton_momentum_scale_c
+        for key, term in tuple(skeleton_jac_terms.items()):
+            skeleton_jac_terms[key] = term * skeleton_momentum_scale_c
         r_skeleton = r_skeleton * skeleton_momentum_scale_c
         if r_skeleton_pressure is not None:
             r_skeleton_pressure = r_skeleton_pressure * skeleton_momentum_scale_c
@@ -3964,6 +4073,7 @@ def build_biofilm_one_domain_forms(
         r_kinematics=r_kinematics,
         r_kinematics_terms=kinematics_terms,
         r_skeleton=r_skeleton,
+        r_skeleton_terms=skeleton_terms,
         r_phi=r_phi,
         r_alpha=r_alpha,
         r_mu_alpha=r_mu_alpha,
@@ -3973,6 +4083,7 @@ def build_biofilm_one_domain_forms(
         a_mass=a_mass,
         a_kinematics=a_kinematics,
         a_skeleton=a_skel,
+        a_skeleton_terms=skeleton_jac_terms,
         a_phi=a_phi,
         a_alpha=a_alpha,
         a_mu_alpha=a_mu_alpha,

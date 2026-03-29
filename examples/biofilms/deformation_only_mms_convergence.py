@@ -42,6 +42,79 @@ FULL_DOMAIN_LS = AffineLevelSet(1.0, 0.0, -2.0)
 ALPHA_TRANSPORT_VELOCITY = "biofilm_volume"
 ALPHA_TRANSPORT_FORM = "conservative_weak"
 
+_BASE_ROW_KEYS = (
+    "case",
+    "nx",
+    "h",
+    "dt",
+    "theta",
+    "newton_iters",
+    "solve_seconds",
+    "alpha_transport_velocity",
+    "alpha_transport_form",
+)
+
+_ALL_ERROR_METRICS = (
+    "v_l2",
+    "p_l2",
+    "vS_l2",
+    "u_l2",
+    "alpha_l2",
+    "B_l2",
+    "mu_alpha_l2",
+    "v_h1",
+    "vS_h1",
+    "u_h1",
+    "alpha_h1",
+    "B_h1",
+    "mu_alpha_h1",
+)
+
+_TRANSLATION_REPORTED_METRICS = (
+    "alpha_l2",
+    "B_l2",
+    "mu_alpha_l2",
+    "alpha_h1",
+    "B_h1",
+    "mu_alpha_h1",
+)
+
+
+def _reported_error_metrics(case: str) -> tuple[str, ...]:
+    case_key = str(case).strip().lower()
+    if case_key == "translation":
+        # The rigid-translation MMS is meant to isolate the support transport
+        # block. The auxiliary mechanics fields live in exact discrete spaces
+        # but can still pick up small coupled corrections while alpha/B/mu
+        # relax to the discrete transport solution, so they are not reported as
+        # convergence targets in the paper-ready outputs.
+        return _TRANSLATION_REPORTED_METRICS
+    return _ALL_ERROR_METRICS
+
+
+def _plot_metrics(case: str) -> tuple[tuple[str, str], ...]:
+    case_key = str(case).strip().lower()
+    if case_key == "translation":
+        return (
+            ("alpha_l2", r"$\|e_\alpha\|_{L^2}$"),
+            ("B_l2", r"$\|e_B\|_{L^2}$"),
+            ("mu_alpha_l2", r"$\|e_{\mu_\alpha}\|_{L^2}$"),
+        )
+    return (
+        ("v_l2", r"$\|e_v\|_{L^2}$"),
+        ("u_l2", r"$\|e_u\|_{L^2}$"),
+        ("alpha_l2", r"$\|e_\alpha\|_{L^2}$"),
+        ("B_l2", r"$\|e_B\|_{L^2}$"),
+        ("mu_alpha_l2", r"$\|e_{\mu_\alpha}\|_{L^2}$"),
+    )
+
+
+def _prune_report_row(case: str, row: dict[str, float]) -> dict[str, float]:
+    keep = set(_BASE_ROW_KEYS)
+    keep.update(_reported_error_metrics(case))
+    keep.update(k for k in row if str(k).startswith("param_"))
+    return {key: row[key] for key in row if key in keep}
+
 
 def _serialize_param(value):
     try:
@@ -104,6 +177,7 @@ def _create_problem(nx: int):
             "u_x": 2,
             "u_y": 2,
             "alpha": 1,
+            "B": 1,
             "mu_alpha": 1,
         },
     )
@@ -122,24 +196,28 @@ def _create_problem(nx: int):
         "du": VectorTrialFunction(space=U, dof_handler=dh),
         "dp": TrialFunction("p", dof_handler=dh),
         "dalpha": TrialFunction("alpha", dof_handler=dh),
+        "dB": TrialFunction("B", dof_handler=dh),
         "dmu": TrialFunction("mu_alpha", dof_handler=dh),
         "v_test": VectorTestFunction(space=V, dof_handler=dh),
         "vS_test": VectorTestFunction(space=VS, dof_handler=dh),
         "u_test": VectorTestFunction(space=U, dof_handler=dh),
         "q_test": TestFunction("p", dof_handler=dh),
         "alpha_test": TestFunction("alpha", dof_handler=dh),
+        "B_test": TestFunction("B", dof_handler=dh),
         "mu_test": TestFunction("mu_alpha", dof_handler=dh),
         "v_k": VectorFunction("v_k", ["v_x", "v_y"], dof_handler=dh),
         "p_k": Function("p_k", "p", dof_handler=dh),
         "vS_k": VectorFunction("vS_k", ["vS_x", "vS_y"], dof_handler=dh),
         "u_k": VectorFunction("u_k", ["u_x", "u_y"], dof_handler=dh),
         "alpha_k": Function("alpha_k", "alpha", dof_handler=dh),
+        "B_k": Function("B_k", "B", dof_handler=dh),
         "mu_k": Function("mu_k", "mu_alpha", dof_handler=dh),
         "v_n": VectorFunction("v_n", ["v_x", "v_y"], dof_handler=dh),
         "p_n": Function("p_n", "p", dof_handler=dh),
         "vS_n": VectorFunction("vS_n", ["vS_x", "vS_y"], dof_handler=dh),
         "u_n": VectorFunction("u_n", ["u_x", "u_y"], dof_handler=dh),
         "alpha_n": Function("alpha_n", "alpha", dof_handler=dh),
+        "B_n": Function("B_n", "B", dof_handler=dh),
         "mu_n": Function("mu_n", "mu_alpha", dof_handler=dh),
     }
     return problem
@@ -151,6 +229,7 @@ def _set_snapshots(problem, mms: DeformationOnlyMMS) -> None:
     problem["vS_n"].set_values_from_function(lambda x, y: mms.vS_n(x, y))
     problem["u_n"].set_values_from_function(lambda x, y: mms.u_n(x, y))
     problem["alpha_n"].set_values_from_function(lambda x, y: float(mms.alpha_n(x, y)))
+    problem["B_n"].set_values_from_function(lambda x, y: float(mms.B_n(x, y)))
     problem["mu_n"].set_values_from_function(lambda x, y: float(mms.mu_alpha_n(x, y)))
 
     # Use the exact end-of-step state as the Newton initial guess for robustness.
@@ -159,6 +238,7 @@ def _set_snapshots(problem, mms: DeformationOnlyMMS) -> None:
     problem["vS_k"].set_values_from_function(lambda x, y: mms.vS_k(x, y))
     problem["u_k"].set_values_from_function(lambda x, y: mms.u_k(x, y))
     problem["alpha_k"].set_values_from_function(lambda x, y: float(mms.alpha_k(x, y)))
+    problem["B_k"].set_values_from_function(lambda x, y: float(mms.B_k(x, y)))
     problem["mu_k"].set_values_from_function(lambda x, y: float(mms.mu_alpha_k(x, y)))
 
 
@@ -170,24 +250,28 @@ def _build_forms(problem, mms: DeformationOnlyMMS, *, qdeg: int):
         vS_k=problem["vS_k"],
         u_k=problem["u_k"],
         alpha_k=problem["alpha_k"],
+        B_k=problem["B_k"],
         mu_alpha_k=problem["mu_k"],
         v_n=problem["v_n"],
         p_n=problem["p_n"],
         vS_n=problem["vS_n"],
         u_n=problem["u_n"],
         alpha_n=problem["alpha_n"],
+        B_n=problem["B_n"],
         mu_alpha_n=problem["mu_n"],
         dv=problem["dv"],
         dp=problem["dp"],
         dvS=problem["dvS"],
         du=problem["du"],
         dalpha=problem["dalpha"],
+        dB=problem["dB"],
         dmu_alpha=problem["dmu"],
         v_test=problem["v_test"],
         q_test=problem["q_test"],
         vS_test=problem["vS_test"],
         u_test=problem["u_test"],
         alpha_test=problem["alpha_test"],
+        B_test=problem["B_test"],
         mu_alpha_test=problem["mu_test"],
         dx=dx(metadata={"q": int(qdeg)}),
         dt=Constant(float(mms.dt)),
@@ -208,6 +292,7 @@ def _build_forms(problem, mms: DeformationOnlyMMS, *, qdeg: int):
         f_v=Analytic(lambda x, y: mms.f_v(x, y), degree=10),
         f_u=Analytic(lambda x, y: mms.f_u(x, y), degree=10),
         f_alpha=Analytic(lambda x, y: mms.f_alpha(x, y), degree=10),
+        f_B=Analytic(lambda x, y: mms.f_B(x, y), degree=10),
     )
 
 
@@ -224,6 +309,7 @@ def _build_bcs(mms: DeformationOnlyMMS):
                 BoundaryCondition("u_x", "dirichlet", tag, _as_float_time(lambda x, y, t: mms.u(x, y, t)[..., 0])),
                 BoundaryCondition("u_y", "dirichlet", tag, _as_float_time(lambda x, y, t: mms.u(x, y, t)[..., 1])),
                 BoundaryCondition("alpha", "dirichlet", tag, _as_float_time(mms.alpha)),
+                BoundaryCondition("B", "dirichlet", tag, _as_float_time(mms.B)),
                 BoundaryCondition("mu_alpha", "dirichlet", tag, _as_float_time(mms.mu_alpha)),
             ]
         )
@@ -273,10 +359,19 @@ def _solve_one(
     solver._current_dt = float(mms.dt)
     aux_functions = {"dt": Constant(float(mms.dt))}
     bcs_now = solver._freeze_bcs(solver.bcs, float(mms.t_k))
-    problem["dh"].apply_bcs(bcs_now, problem["v_k"], problem["p_k"], problem["vS_k"], problem["u_k"], problem["alpha_k"], problem["mu_k"])
+    problem["dh"].apply_bcs(
+        bcs_now,
+        problem["v_k"],
+        problem["p_k"],
+        problem["vS_k"],
+        problem["u_k"],
+        problem["alpha_k"],
+        problem["B_k"],
+        problem["mu_k"],
+    )
     _, converged, n_iters = solver._newton_loop(
-        [problem["v_k"], problem["p_k"], problem["vS_k"], problem["u_k"], problem["alpha_k"], problem["mu_k"]],
-        [problem["v_n"], problem["p_n"], problem["vS_n"], problem["u_n"], problem["alpha_n"], problem["mu_n"]],
+        [problem["v_k"], problem["p_k"], problem["vS_k"], problem["u_k"], problem["alpha_k"], problem["B_k"], problem["mu_k"]],
+        [problem["v_n"], problem["p_n"], problem["vS_n"], problem["u_n"], problem["alpha_n"], problem["B_n"], problem["mu_n"]],
         aux_functions,
         bcs_now,
     )
@@ -320,6 +415,15 @@ def _solve_one(
                 problem["alpha_k"],
                 exact={"alpha": lambda x, y: mms.alpha(x, y, t_err)},
                 fields=["alpha"],
+                quad_order=int(qerr),
+                relative=False,
+            )
+        ),
+        "B_l2": float(
+            dh.l2_error(
+                problem["B_k"],
+                exact={"B": lambda x, y: mms.B(x, y, t_err)},
+                fields=["B"],
                 quad_order=int(qerr),
                 relative=False,
             )
@@ -390,6 +494,18 @@ def _solve_one(
                 backend=error_backend_key,
             )
         )
+        err["B_h1"] = float(
+            dh.h1_error_scalar_on_side_compiled(
+                problem["B_k"],
+                lambda x, y: mms.grad_B(x, y, t_err),
+                FULL_DOMAIN_LS,
+                side="-",
+                field="B",
+                relative=False,
+                quad_order=int(qerr),
+                backend=error_backend_key,
+            )
+        )
         err["mu_alpha_h1"] = float(
             dh.h1_error_scalar_on_side_compiled(
                 problem["mu_k"],
@@ -446,6 +562,16 @@ def _solve_one(
                 relative=False,
             )
         )
+        err["B_h1"] = float(
+            dh.h1_error_scalar_on_side(
+                problem["B_k"],
+                lambda x, y: mms.grad_B(x, y, t_err),
+                FULL_DOMAIN_LS,
+                side="-",
+                field="B",
+                relative=False,
+            )
+        )
         err["mu_alpha_h1"] = float(
             dh.h1_error_scalar_on_side(
                 problem["mu_k"],
@@ -470,23 +596,11 @@ def _solve_one(
     }
     row.update(err)
     row.update({f"param_{k}": _serialize_param(v) for k, v in mms.params.items()})
-    return row
+    return _prune_report_row(case, row)
 
 
-def _add_eocs(rows: list[dict[str, float]]) -> list[dict[str, float]]:
-    metrics = [
-        "v_l2",
-        "p_l2",
-        "vS_l2",
-        "u_l2",
-        "alpha_l2",
-        "mu_alpha_l2",
-        "v_h1",
-        "vS_h1",
-        "u_h1",
-        "alpha_h1",
-        "mu_alpha_h1",
-    ]
+def _add_eocs(rows: list[dict[str, float]], *, case: str) -> list[dict[str, float]]:
+    metrics = _reported_error_metrics(case)
     out = []
     prev = None
     for row in rows:
@@ -526,6 +640,13 @@ def _write_outputs(case: str, rows: list[dict[str, float]], *, outdir: Path, sav
         "",
         f"- alpha transport velocity: `{ALPHA_TRANSPORT_VELOCITY}`",
         f"- alpha transport form: `{ALPHA_TRANSPORT_FORM}`",
+        "- reduced support state: `alpha-B`",
+        "- reported convergence targets: "
+        + (
+            "`alpha`, `B`, `mu_alpha` only (translation transport-isolation case)"
+            if case_key == "translation"
+            else "`v`, `p`, `vS`, `u`, `alpha`, `B`, `mu_alpha`"
+        ),
         f"- rows: {len(rows)}",
         f"- finest nx: {rows[-1]['nx'] if rows else '-'}",
         f"- finest Newton iterations: {rows[-1]['newton_iters'] if rows else '-'}",
@@ -550,12 +671,9 @@ def _write_outputs(case: str, rows: list[dict[str, float]], *, outdir: Path, sav
 
     fig, ax = plt.subplots(figsize=(7.0, 5.0), constrained_layout=True)
     h = df["h"].to_numpy(dtype=float)
-    for key, label in (
-        ("v_l2", r"$\|e_v\|_{L^2}$"),
-        ("u_l2", r"$\|e_u\|_{L^2}$"),
-        ("alpha_l2", r"$\|e_\alpha\|_{L^2}$"),
-        ("mu_alpha_l2", r"$\|e_{\mu_\alpha}\|_{L^2}$"),
-    ):
+    for key, label in _plot_metrics(case_key):
+        if key not in df.columns:
+            continue
         ax.loglog(h, df[key].to_numpy(dtype=float), marker="o", linewidth=1.5, label=label)
     ax.set_xlabel(r"$h$")
     ax.set_ylabel("error")
@@ -604,7 +722,7 @@ def main() -> None:
         )
         for nx in nx_list
     ]
-    rows = _add_eocs(rows)
+    rows = _add_eocs(rows, case=str(args.case))
 
     pd.set_option("display.max_columns", None)
     df = pd.DataFrame(rows)

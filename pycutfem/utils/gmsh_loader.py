@@ -281,7 +281,7 @@ def _collect_boundary_tags(
     return node_tags, edge_tags
 
 
-def load_gmsh_mesh(
+def _load_gmsh_mesh_local(
     filepath: Union[str, Path],
     *,
     surface_dim: int = 2,
@@ -412,12 +412,49 @@ def load_gmsh_mesh(
         )
 
 
+def load_gmsh_mesh(
+    filepath: Union[str, Path],
+    *,
+    surface_dim: int = 2,
+    surface_physical_names: Optional[Sequence[str]] = None,
+    include_boundary_tags: bool = True,
+    comm=None,
+) -> GmshMeshData:
+    """
+    Read a 2D mesh from a ``.msh`` file and convert it into PyCutFEM data.
+
+    When ``comm`` is provided, rank 0 performs the Gmsh I/O and the resulting
+    mesh data are broadcast to the remaining ranks. This avoids repeated Gmsh
+    initialization and file reads under ``mpirun`` while keeping PyCutFEM's
+    replicated in-memory mesh layout unchanged.
+    """
+    if comm is None:
+        return _load_gmsh_mesh_local(
+            filepath,
+            surface_dim=surface_dim,
+            surface_physical_names=surface_physical_names,
+            include_boundary_tags=include_boundary_tags,
+        )
+
+    rank = int(comm.Get_rank())
+    data = None
+    if rank == 0:
+        data = _load_gmsh_mesh_local(
+            filepath,
+            surface_dim=surface_dim,
+            surface_physical_names=surface_physical_names,
+            include_boundary_tags=include_boundary_tags,
+        )
+    return comm.bcast(data, root=0)
+
+
 def mesh_from_gmsh(
     filepath: Union[str, Path],
     *,
     surface_dim: int = 2,
     surface_physical_names: Optional[Sequence[str]] = None,
     apply_boundary_tags: bool = True,
+    comm=None,
 ) -> Mesh:
     """
     Convenience wrapper that reads a ``.msh`` file and instantiates ``Mesh``.
@@ -427,6 +464,7 @@ def mesh_from_gmsh(
         surface_dim=surface_dim,
         surface_physical_names=surface_physical_names,
         include_boundary_tags=apply_boundary_tags,
+        comm=comm,
     )
     mesh = Mesh(
         nodes=data.nodes,

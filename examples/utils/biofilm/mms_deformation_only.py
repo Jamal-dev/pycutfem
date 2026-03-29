@@ -178,28 +178,33 @@ class DeformationOnlyMMS:
     vS: callable
     u: callable
     alpha: callable
+    B: callable
     mu_alpha: callable
     grad_v: callable
     grad_p: callable
     grad_vS: callable
     grad_u: callable
     grad_alpha: callable
+    grad_B: callable
     grad_mu_alpha: callable
     v_n: callable
     p_n: callable
     vS_n: callable
     u_n: callable
     alpha_n: callable
+    B_n: callable
     mu_alpha_n: callable
     v_k: callable
     p_k: callable
     vS_k: callable
     u_k: callable
     alpha_k: callable
+    B_k: callable
     mu_alpha_k: callable
     f_v: callable
     f_u: callable
     f_alpha: callable
+    f_B: callable
 
 
 def _double_well_prime(alpha):
@@ -272,8 +277,10 @@ def _build_case(
     u_th_expr = sp.simplify(th * u_k_expr + one_m_th * u_n_expr)
     alpha_th_expr = sp.simplify(th * alpha_k_expr + one_m_th * alpha_n_expr)
 
-    C_n_expr = sp.simplify(1.0 - alpha_n_expr * (1.0 - float(phi_b)))
-    B_n_expr = sp.simplify(alpha_n_expr * (1.0 - float(phi_b)))
+    B_expr = sp.simplify(alpha_expr * (1.0 - float(phi_b)))
+    B_n_expr = sp.simplify(B_expr.subs(subs_n))
+    B_k_expr = sp.simplify(B_expr.subs(subs_k))
+    C_n_expr = sp.simplify(1.0 - B_n_expr)
     rho_n_expr = sp.simplify(float(rho_f) * C_n_expr)
     mu_mix_n_expr = sp.simplify((1.0 - alpha_n_expr) * float(mu_f) + alpha_n_expr * float(mu_b))
     support_key = str(support_physics or "legacy_exchange").strip().lower()
@@ -307,19 +314,25 @@ def _build_case(
     f_u_expr = sp.simplify(skel_expr / alpha_n_expr)
 
     if support_key in {"internal_conversion", "internal-conversion", "conservative_support", "support_preserving"}:
-        adv_u_n_expr = sp.simplify(float(phi_b) * v_n_expr + (1.0 - float(phi_b)) * vS_n_expr)
-        div_adv_u_n_expr = sp.simplify(float(phi_b) * _sym_div_vec(v_n_expr, x, y) + (1.0 - float(phi_b)) * _sym_div_vec(vS_n_expr, x, y))
-        alpha_adv_k = sp.simplify(_sym_grad_scalar(alpha_k_expr, x, y).dot(adv_u_n_expr) + alpha_k_expr * div_adv_u_n_expr)
-        alpha_adv_n = sp.simplify(_sym_grad_scalar(alpha_n_expr, x, y).dot(adv_u_n_expr) + alpha_n_expr * div_adv_u_n_expr)
+        P_n_expr = sp.simplify(alpha_n_expr - B_n_expr)
+        P_k_expr = sp.simplify(alpha_k_expr - B_k_expr)
+        alpha_flux_k_expr = sp.simplify(P_k_expr * v_k_expr + B_k_expr * vS_k_expr)
+        alpha_flux_n_expr = sp.simplify(P_n_expr * v_n_expr + B_n_expr * vS_n_expr)
+        alpha_adv_k = sp.simplify(_sym_div_vec(alpha_flux_k_expr, x, y))
+        alpha_adv_n = sp.simplify(_sym_div_vec(alpha_flux_n_expr, x, y))
         f_alpha_expr = sp.simplify(
             ((alpha_k_expr - alpha_n_expr) / dt)
             + th * alpha_adv_k
             + one_m_th * alpha_adv_n
             - float(M_alpha) * _sym_laplacian(mu_k_expr, x, y)
         )
+        B_adv_k = sp.simplify(_sym_div_vec(B_k_expr * vS_k_expr, x, y))
+        B_adv_n = sp.simplify(_sym_div_vec(B_n_expr * vS_n_expr, x, y))
+        f_B_expr = sp.simplify(((B_k_expr - B_n_expr) / dt) + th * B_adv_k + one_m_th * B_adv_n)
     else:
         alpha_adv = (_sym_grad_scalar(alpha_th_expr, x, y).dot(vS_n_expr)) + alpha_th_expr * _sym_div_vec(vS_n_expr, x, y)
         f_alpha_expr = sp.simplify(((alpha_k_expr - alpha_n_expr) / dt) + alpha_adv - float(M_alpha) * _sym_laplacian(mu_k_expr, x, y))
+        f_B_expr = sp.Integer(0)
 
     mu_residual_expr = sp.simplify(mu_k_expr - float(gamma_alpha) * ((-float(eps_alpha)) * _sym_laplacian(alpha_k_expr, x, y) + (_double_well_prime(alpha_k_expr) / float(eps_alpha))))
     mass_components = list(mass_expr) if isinstance(mass_expr, sp.MatrixBase) else [mass_expr]
@@ -335,6 +348,7 @@ def _build_case(
     grad_vS_expr = _sym_grad_vec(vS_expr, x, y)
     grad_u_expr = _sym_grad_vec(u_expr, x, y)
     grad_alpha_expr = _sym_grad_scalar(alpha_expr, x, y)
+    grad_B_expr = _sym_grad_scalar(B_expr, x, y)
     grad_mu_expr = _sym_grad_scalar(mu_expr, x, y)
 
     params = {
@@ -365,28 +379,33 @@ def _build_case(
         vS=_lambdify_vec_xyt(vS_expr, x, y, t),
         u=_lambdify_vec_xyt(u_expr, x, y, t),
         alpha=_lambdify_scalar_xyt(alpha_expr, x, y, t),
+        B=_lambdify_scalar_xyt(B_expr, x, y, t),
         mu_alpha=_lambdify_scalar_xyt(mu_expr, x, y, t),
         grad_v=_lambdify_mat_xyt(grad_v_expr, x, y, t),
         grad_p=_lambdify_vec_xyt(grad_p_expr, x, y, t),
         grad_vS=_lambdify_mat_xyt(grad_vS_expr, x, y, t),
         grad_u=_lambdify_mat_xyt(grad_u_expr, x, y, t),
         grad_alpha=_lambdify_vec_xyt(grad_alpha_expr, x, y, t),
+        grad_B=_lambdify_vec_xyt(grad_B_expr, x, y, t),
         grad_mu_alpha=_lambdify_vec_xyt(grad_mu_expr, x, y, t),
         v_n=_lambdify_vec_xy(v_n_expr, x, y),
         p_n=_lambdify_scalar_xy(p_n_expr, x, y),
         vS_n=_lambdify_vec_xy(vS_n_expr, x, y),
         u_n=_lambdify_vec_xy(u_n_expr, x, y),
         alpha_n=_lambdify_scalar_xy(alpha_n_expr, x, y),
+        B_n=_lambdify_scalar_xy(B_n_expr, x, y),
         mu_alpha_n=_lambdify_scalar_xy(mu_n_expr, x, y),
         v_k=_lambdify_vec_xy(v_k_expr, x, y),
         p_k=_lambdify_scalar_xy(p_k_expr, x, y),
         vS_k=_lambdify_vec_xy(vS_k_expr, x, y),
         u_k=_lambdify_vec_xy(u_k_expr, x, y),
         alpha_k=_lambdify_scalar_xy(alpha_k_expr, x, y),
+        B_k=_lambdify_scalar_xy(B_k_expr, x, y),
         mu_alpha_k=_lambdify_scalar_xy(mu_k_expr, x, y),
         f_v=_lambdify_vec_xy(f_v_expr, x, y),
         f_u=_lambdify_vec_xy(f_u_expr, x, y),
         f_alpha=_lambdify_scalar_xy(f_alpha_expr, x, y),
+        f_B=_lambdify_scalar_xy(f_B_expr, x, y),
     )
 
 

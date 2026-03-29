@@ -49,3 +49,24 @@ def test_latent_mass_return_shift_respects_free_mask():
     assert z_new[3] == z0[3]
     mass_new = float(weights @ _latent_forward_array(z_new, map_kind="algebraic"))
     assert abs(mass_new - target_mass) <= 1.0e-10 * max(abs(target_mass), 1.0)
+
+
+def test_latent_mass_return_shift_hits_target_mass_tanh():
+    z0 = np.asarray([-3.0, -0.75, 0.0, 1.25, 2.5], dtype=float)
+    weights = np.asarray([0.3, 0.4, 0.8, 0.7, 0.6], dtype=float)
+    base_mass = float(weights @ _latent_forward_array(z0, map_kind="tanh"))
+    target_mass = 1.08 * base_mass
+
+    result = _latent_mass_return_shift(
+        z0,
+        local_weights=weights,
+        target_mass=target_mass,
+        map_kind="tanh",
+        tol_rel=1.0e-12,
+        max_it=80,
+    )
+
+    assert bool(result["converged"])
+    z_new = np.asarray(result["latent_values"], dtype=float)
+    mass_new = float(weights @ _latent_forward_array(z_new, map_kind="tanh"))
+    assert abs(mass_new - target_mass) <= 1.0e-10 * max(abs(target_mass), 1.0)

@@ -1,5 +1,7 @@
+import argparse
 import os
 import numpy as np
+import scipy.sparse as sps
 import scipy.sparse.linalg as spla
 import sympy as sp
 
@@ -7,6 +9,7 @@ import sympy as sp
 from pycutfem.core.mesh import Mesh
 from pycutfem.core.dofhandler import DofHandler
 from pycutfem.utils.meshgen import structured_quad
+from pycutfem.utils.mpi import barrier, get_mpi_context
 from pycutfem.io.vtk import export_vtk
 from pycutfem.ufl.spaces import FunctionSpace
 
@@ -144,7 +147,113 @@ def exact_solution(mu, R, gammaf):
             p_exact_neg_xy, p_exact_pos_xy)
 
 
-def test_stokes_interface_corrected(with_deformation: bool = False, backend: str = 'python'):
+def _solve_sparse_system(A, rhs, *, backend: str = "scipy", distributed: bool = False) -> np.ndarray:
+    backend = str(backend).lower()
+    if backend == "scipy":
+        return np.asarray(spla.spsolve(A, rhs), dtype=float).ravel()
+    if backend != "petsc":
+        raise ValueError(f"Unsupported linear backend '{backend}'.")
+
+    from petsc4py import PETSc  # type: ignore
+
+    if not sps.isspmatrix_csr(A):
+        A = A.tocsr()
+    n = int(A.shape[0])
+    distributed = bool(distributed) and int(PETSc.COMM_WORLD.getSize()) > 1
+    comm = PETSc.COMM_WORLD if distributed else PETSc.COMM_SELF
+    mat = PETSc.Mat().createAIJ(size=(n, n), comm=comm)
+    if distributed:
+        probe = PETSc.Vec().createMPI(n, comm=comm)
+        row_lo, row_hi = probe.getOwnershipRange()
+        try:
+            probe.destroy()
+        except Exception:
+            pass
+        try:
+            local_nnz = np.diff(np.asarray(A.indptr[int(row_lo) : int(row_hi) + 1], dtype=np.int64))
+            mat.setPreallocationNNZ(np.asarray(local_nnz, dtype=PETSc.IntType))
+        except Exception:
+            pass
+    else:
+        ia = np.asarray(A.indptr, dtype=PETSc.IntType)
+        ja = np.asarray(A.indices, dtype=PETSc.IntType)
+        try:
+            mat.setPreallocationCSR((ia, ja))
+        except Exception:
+            pass
+    try:
+        mat.setOption(PETSc.Mat.Option.NEW_NONZERO_ALLOCATION_ERR, False)
+    except Exception:
+        pass
+    mat.setUp()
+    row_lo, row_hi = mat.getOwnershipRange()
+    if distributed:
+        ia_full = np.asarray(A.indptr, dtype=PETSc.IntType)
+        base = int(ia_full[int(row_lo)])
+        end = int(ia_full[int(row_hi)])
+        ia = np.asarray(ia_full[int(row_lo) : int(row_hi) + 1] - base, dtype=PETSc.IntType)
+        ja = np.asarray(A.indices[base:end], dtype=PETSc.IntType)
+        a_vals = np.asarray(A.data[base:end], dtype=float)
+    else:
+        ia = np.asarray(A.indptr, dtype=PETSc.IntType)
+        ja = np.asarray(A.indices, dtype=PETSc.IntType)
+        a_vals = np.asarray(A.data, dtype=float)
+    try:
+        mat.setValuesCSR(ia, ja, a_vals)
+    except TypeError:
+        mat.setValuesCSR((ia, ja), a_vals)
+    mat.assemblyBegin()
+    mat.assemblyEnd()
+
+    ksp = PETSc.KSP().create(comm=comm)
+    ksp.setOperators(mat)
+    ksp.setType("preonly")
+    pc = ksp.getPC()
+    pc.setType("lu")
+    try:
+        pc.setFactorSolverType("mumps")
+    except Exception:
+        pass
+    ksp.setFromOptions()
+
+    if distributed:
+        b = PETSc.Vec().createMPI(n, comm=comm)
+        x = PETSc.Vec().createMPI(n, comm=comm)
+    else:
+        b = PETSc.Vec().createSeq(n, comm=comm)
+        x = PETSc.Vec().createSeq(n, comm=comm)
+    b_arr = b.getArray()
+    rhs_arr = np.asarray(rhs, dtype=float).ravel()
+    if distributed:
+        b_arr[:] = rhs_arr[int(row_lo) : int(row_hi)]
+    else:
+        b_arr[:] = rhs_arr
+    del b_arr
+    x.set(0.0)
+    ksp.solve(b, x)
+    reason = int(ksp.getConvergedReason())
+    if reason <= 0:
+        raise RuntimeError(f"PETSc KSP failed to converge (reason={reason}).")
+    x_arr = x.getArray(readonly=True)
+    local = np.asarray(x_arr, dtype=float).copy()
+    del x_arr
+    if distributed:
+        out = np.concatenate(comm.tompi4py().allgather(local)).astype(float, copy=False)
+    else:
+        out = local
+    return out.ravel()
+
+
+def test_stokes_interface_corrected(
+    with_deformation: bool = False,
+    backend: str = 'python',
+    *,
+    maxh: float = 0.125,
+    linear_backend: str = "scipy",
+    output_dir: str = "stokes_interface_results",
+    petsc_distributed: bool = False,
+    mpi_ctx=None,
+):
     """
     Unfitted Stokes interface (NGSolve-style): Hansbo averaging, Nitsche coupling,
     ghost penalties, SymPy-manufactured RHS, and piecewise L2/H1 errors.
@@ -158,7 +267,6 @@ def test_stokes_interface_corrected(with_deformation: bool = False, backend: str
     geom_order = (2 if with_deformation else 1)
     qvol   = (2*poly_order + 4) if with_deformation else (2*poly_order + 2)
     print(f'Using backend: {backend}, polynomial order: {poly_order}, with_deformation={with_deformation}, with geometric poly order: {geom_order}')
-    maxh = 0.125
     L,H = 2.0, 2.0
     mesh_size = int(L / maxh)
 
@@ -415,7 +523,12 @@ def test_stokes_interface_corrected(with_deformation: bool = False, backend: str
     # Solve on the kept set
     K_rr = K_ff[np.ix_(keep_red, keep_red)].tocsc()
     F_r  = F_f[keep_red]
-    u_r  = spla.spsolve(K_rr, F_r)
+    u_r  = _solve_sparse_system(
+        K_rr,
+        F_r,
+        backend=linear_backend,
+        distributed=bool(petsc_distributed),
+    )
 
     # Re-expand to the full 'free' vector
     u_free = np.zeros_like(F_f)
@@ -545,9 +658,11 @@ def test_stokes_interface_corrected(with_deformation: bool = False, backend: str
     vel_H1m = np.sqrt(vel_H1m_neg**2 + vel_H1m_pos**2)   # piecewise |·|_{H1}
     vel_H1 = np.sqrt(vel_L2**2 + vel_H1m**2)
 
-    print(f"L2 Error (velocity): {vel_L2:10.8e}")
-    print(f"L2 Error (pressure): {p_L2:10.8e}")
-    print(f"H1 norm      (velocity): {vel_H1:10.8e}")
+    is_io_root = (mpi_ctx is None) or (not getattr(mpi_ctx, "enabled", False)) or getattr(mpi_ctx, "is_root", True) or (not petsc_distributed)
+    if is_io_root:
+        print(f"L2 Error (velocity): {vel_L2:10.8e}")
+        print(f"L2 Error (pressure): {p_L2:10.8e}")
+        print(f"H1 norm      (velocity): {vel_H1:10.8e}")
 
     if bench:
         # Warm-cache timings (compiled kernels + static args cached in the DofHandler instance).
@@ -650,19 +765,67 @@ def test_stokes_interface_corrected(with_deformation: bool = False, backend: str
         )
 
     # ---------------- 8) Export ----------------
-    outdir = "stokes_interface_results"
-    os.makedirs(outdir, exist_ok=True)
+    outdir = str(output_dir)
     vtk_path = os.path.join(outdir, "solution.vtu")
     phi_vals = level_set.evaluate_on_nodes(mesh)
-    export_vtk(vtk_path, mesh=mesh, dof_handler=dh,
-               functions={"velocity_pos": U_pos, "pressure_pos": P_pos, "velocity_neg": U_neg, "pressure_neg": P_neg, "phi": phi_vals})
-    print(f"Solution exported to {vtk_path}")
-    print(f"Total elapsed time: {(_time.perf_counter()-t0):.2f} seconds")
+    if is_io_root:
+        os.makedirs(outdir, exist_ok=True)
+        export_vtk(vtk_path, mesh=mesh, dof_handler=dh,
+                   functions={"velocity_pos": U_pos, "pressure_pos": P_pos, "velocity_neg": U_neg, "pressure_neg": P_neg, "phi": phi_vals})
+        print(f"Solution exported to {vtk_path}")
+        print(f"Total elapsed time: {(_time.perf_counter()-t0):.2f} seconds")
+    return {
+        "velocity_l2": float(vel_L2),
+        "pressure_l2": float(p_L2),
+        "velocity_h1": float(vel_H1),
+        "vtk_path": str(vtk_path),
+    }
 
 if __name__ == "__main__":
-    # Allow quick toggling via env or simple edit
-    use_def = os.getenv('WITH_DEF', '0').lower() in {'1','true','yes'}
-    backend = os.getenv('BACKEND', 'python').lower()
+    parser = argparse.ArgumentParser(description="Unfitted Stokes interface benchmark")
+    parser.add_argument("--backend", type=str, default=os.getenv("BACKEND", "python"), choices=("python", "jit", "cpp"))
+    parser.add_argument("--linear-backend", type=str, default=os.getenv("LINEAR_BACKEND", "scipy"), choices=("scipy", "petsc"))
+    parser.add_argument("--with-deformation", action=argparse.BooleanOptionalAction,
+                        default=os.getenv('WITH_DEF', '0').lower() in {'1','true','yes'})
+    parser.add_argument("--maxh", type=float, default=float(os.getenv("MAXH", "0.125")),
+                        help="Background mesh size. Larger values make the run smaller/faster.")
+    parser.add_argument("--output-dir", type=str, default=os.getenv("OUTPUT_DIR", "stokes_interface_results"))
+    parser.add_argument("--petsc-distributed", action=argparse.BooleanOptionalAction,
+                        default=os.getenv("PYCUTFEM_PETSC_DISTRIBUTED", "1").lower() not in {"0", "false", "no", "off"},
+                        help="Use collective PETSc linear solves on COMM_WORLD under mpirun.")
+    parser.add_argument("--mpi-mode", type=str, default="replicated", choices=("root", "replicated"),
+                        help="Under mpirun, execute the full case on every rank ('replicated', verified) or run only on rank 0 ('root').")
+    args = parser.parse_args()
+
+    mpi_ctx = get_mpi_context()
+    run_replicated = (not mpi_ctx.enabled) or str(args.mpi_mode).lower() == "replicated"
+    if mpi_ctx.enabled and not run_replicated and not mpi_ctx.is_root:
+        barrier(mpi_ctx)
+        raise SystemExit(0)
+    if mpi_ctx.enabled and not run_replicated and mpi_ctx.is_root:
+        print(f"[mpi] COMM_WORLD size={mpi_ctx.size}; executing the Stokes solve on rank 0 only.")
+
+    output_dir = str(args.output_dir)
+    distributed_linear = bool(
+        mpi_ctx.enabled
+        and run_replicated
+        and bool(getattr(args, "petsc_distributed", True))
+        and str(args.linear_backend).strip().lower() == "petsc"
+    )
+    if mpi_ctx.enabled and run_replicated and not distributed_linear:
+        output_dir = f"{output_dir}_rank{mpi_ctx.rank}"
+
     t0 = time.time()
-    test_stokes_interface_corrected(with_deformation=use_def, backend=backend)
-    print(f"Total elapsed time: {time.time() - t0:.2f} seconds")
+    test_stokes_interface_corrected(
+        with_deformation=bool(args.with_deformation),
+        backend=str(args.backend).lower(),
+        maxh=float(args.maxh),
+        linear_backend=str(args.linear_backend).lower(),
+        output_dir=output_dir,
+        petsc_distributed=distributed_linear,
+        mpi_ctx=mpi_ctx,
+    )
+    if mpi_ctx.enabled and (distributed_linear or not run_replicated):
+        barrier(mpi_ctx)
+    if (not mpi_ctx.enabled) or mpi_ctx.is_root or not distributed_linear:
+        print(f"Total elapsed time: {time.time() - t0:.2f} seconds")

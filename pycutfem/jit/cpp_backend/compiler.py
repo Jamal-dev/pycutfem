@@ -230,6 +230,10 @@ def compile_extension(
         compile_args.extend(extra_compile_args)
     if extra_link_args:
         link_args.extend(extra_link_args)
+    print(
+        f"[pycutfem][cpp] compiling kernel {module_name} ({compile_mode_resolved})",
+        flush=True,
+    )
     if _bool_env("PYCUTFEM_CPP_VERBOSE", default=False):
         print(
             f"[pycutfem][cpp] build {module_name} ({compile_mode_resolved}) "

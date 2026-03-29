@@ -202,7 +202,7 @@ def _expr_shape(expr) -> tuple[int, ...]:
         if len(base_shape) == 1:
             return (base_shape[0], 2, 2)
         raise TypeError(f"Hessian shape not supported for operand shape {base_shape!r}.")
-    if isinstance(expr, (PositivePart, Heaviside, Log, Exp)):
+    if isinstance(expr, (PositivePart, Heaviside, Log, Exp, Tanh, Sin, Cos, Tan, Asin, Acos, Atan, Sinh, Cosh, Asinh, Acosh, Atanh)):
         return _expr_shape(expr.operand)
     if isinstance(expr, (Sum, Sub)):
         shape_a = _expr_shape(expr.a)
@@ -1632,6 +1632,114 @@ class Exp(Expression):
     def __repr__(self):
         return f"Exp({self.operand!r})"
 
+
+class Tanh(Expression):
+    """Hyperbolic tangent tanh(x)."""
+    def __init__(self, operand):
+        super().__init__()
+        self.operand = operand
+    def __repr__(self):
+        return f"Tanh({self.operand!r})"
+
+
+class Sin(Expression):
+    """Trigonometric sine sin(x)."""
+    def __init__(self, operand):
+        super().__init__()
+        self.operand = operand
+    def __repr__(self):
+        return f"Sin({self.operand!r})"
+
+
+class Cos(Expression):
+    """Trigonometric cosine cos(x)."""
+    def __init__(self, operand):
+        super().__init__()
+        self.operand = operand
+    def __repr__(self):
+        return f"Cos({self.operand!r})"
+
+
+class Tan(Expression):
+    """Trigonometric tangent tan(x)."""
+    def __init__(self, operand):
+        super().__init__()
+        self.operand = operand
+    def __repr__(self):
+        return f"Tan({self.operand!r})"
+
+
+class Asin(Expression):
+    """Inverse sine asin(x)."""
+    def __init__(self, operand):
+        super().__init__()
+        self.operand = operand
+    def __repr__(self):
+        return f"Asin({self.operand!r})"
+
+
+class Acos(Expression):
+    """Inverse cosine acos(x)."""
+    def __init__(self, operand):
+        super().__init__()
+        self.operand = operand
+    def __repr__(self):
+        return f"Acos({self.operand!r})"
+
+
+class Atan(Expression):
+    """Inverse tangent atan(x)."""
+    def __init__(self, operand):
+        super().__init__()
+        self.operand = operand
+    def __repr__(self):
+        return f"Atan({self.operand!r})"
+
+
+class Sinh(Expression):
+    """Hyperbolic sine sinh(x)."""
+    def __init__(self, operand):
+        super().__init__()
+        self.operand = operand
+    def __repr__(self):
+        return f"Sinh({self.operand!r})"
+
+
+class Cosh(Expression):
+    """Hyperbolic cosine cosh(x)."""
+    def __init__(self, operand):
+        super().__init__()
+        self.operand = operand
+    def __repr__(self):
+        return f"Cosh({self.operand!r})"
+
+
+class Asinh(Expression):
+    """Inverse hyperbolic sine asinh(x)."""
+    def __init__(self, operand):
+        super().__init__()
+        self.operand = operand
+    def __repr__(self):
+        return f"Asinh({self.operand!r})"
+
+
+class Acosh(Expression):
+    """Inverse hyperbolic cosine acosh(x)."""
+    def __init__(self, operand):
+        super().__init__()
+        self.operand = operand
+    def __repr__(self):
+        return f"Acosh({self.operand!r})"
+
+
+class Atanh(Expression):
+    """Inverse hyperbolic tangent atanh(x)."""
+    def __init__(self, operand):
+        super().__init__()
+        self.operand = operand
+    def __repr__(self):
+        return f"Atanh({self.operand!r})"
+
 class Inner(Expression):
     def __init__(self, a, b): self.a, self.b = a, b
     def __repr__(self): return f"Inner({self.a!r}, {self.b!r})"
@@ -1837,6 +1945,18 @@ def pos_part(x): return PositivePart(x)
 def heaviside(x): return Heaviside(x)
 def log(x): return Log(x)
 def exp(x): return Exp(x)
+def tanh(x): return Tanh(x)
+def sin(x): return Sin(x)
+def cos(x): return Cos(x)
+def tan(x): return Tan(x)
+def asin(x): return Asin(x)
+def acos(x): return Acos(x)
+def atan(x): return Atan(x)
+def sinh(x): return Sinh(x)
+def cosh(x): return Cosh(x)
+def asinh(x): return Asinh(x)
+def acosh(x): return Acosh(x)
+def atanh(x): return Atanh(x)
 def jump(v, n=None):
     """
     Jump operator.

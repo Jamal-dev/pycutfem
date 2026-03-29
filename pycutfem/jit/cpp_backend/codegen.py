@@ -498,6 +498,18 @@ class CppCodeGen:
             HeavisideOp,
             LogOp,
             ExpOp,
+            TanhOp,
+            SinOp,
+            CosOp,
+            TanOp,
+            AsinOp,
+            AcosOp,
+            AtanOp,
+            SinhOp,
+            CoshOp,
+            AsinhOp,
+            AcoshOp,
+            AtanhOp,
         )
         needs_phis = any(isinstance(op, (PosOp, NegOp)) for op in ir_sequence)
         families = getattr(self.mixed_element, "_field_families", {}) if self.mixed_element is not None else {}
@@ -729,7 +741,20 @@ class CppCodeGen:
             Inner,
             Store,
             Trace,
+            LogOp,
             ExpOp,
+            TanhOp,
+            SinOp,
+            CosOp,
+            TanOp,
+            AsinOp,
+            AcosOp,
+            AtanOp,
+            SinhOp,
+            CoshOp,
+            AsinhOp,
+            AcoshOp,
+            AtanhOp,
         )
 
         # local helpers ----------------------------------------------------
@@ -6390,6 +6415,174 @@ class CppCodeGen:
                     stack.append(StackItem(nm, "mat", a.role, a.shape, a.field_names, a.parent, a.side, a.field_sides))
                 else:
                     raise NotImplementedError(f"ExpOp not implemented for kind={a.kind!r}.")
+            elif isinstance(op, TanhOp):
+                a = stack.pop()
+                nm = new_tmp("tanh")
+                if a.kind == "scalar":
+                    emit_line(f"double {nm} = std::tanh({a.name});")
+                    stack.append(StackItem(nm, "scalar", a.role, (), a.field_names, a.parent, a.side, a.field_sides))
+                elif a.kind == "vec":
+                    emit_line(f"Eigen::VectorXd {nm} = {a.name}.unaryExpr([](double _v) {{ return std::tanh(_v); }});")
+                    stack.append(StackItem(nm, "vec", a.role, a.shape, a.field_names, a.parent, a.side, a.field_sides))
+                elif a.kind == "mat":
+                    emit_line(f"Eigen::MatrixXd {nm} = {a.name}.unaryExpr([](double _v) {{ return std::tanh(_v); }});")
+                    stack.append(StackItem(nm, "mat", a.role, a.shape, a.field_names, a.parent, a.side, a.field_sides))
+                else:
+                    raise NotImplementedError(f"TanhOp not implemented for kind={a.kind!r}.")
+            elif isinstance(op, SinOp):
+                a = stack.pop()
+                nm = new_tmp("sin")
+                if a.kind == "scalar":
+                    emit_line(f"double {nm} = std::sin({a.name});")
+                    stack.append(StackItem(nm, "scalar", a.role, (), a.field_names, a.parent, a.side, a.field_sides))
+                elif a.kind == "vec":
+                    emit_line(f"Eigen::VectorXd {nm} = {a.name}.unaryExpr([](double _v) {{ return std::sin(_v); }});")
+                    stack.append(StackItem(nm, "vec", a.role, a.shape, a.field_names, a.parent, a.side, a.field_sides))
+                elif a.kind == "mat":
+                    emit_line(f"Eigen::MatrixXd {nm} = {a.name}.unaryExpr([](double _v) {{ return std::sin(_v); }});")
+                    stack.append(StackItem(nm, "mat", a.role, a.shape, a.field_names, a.parent, a.side, a.field_sides))
+                else:
+                    raise NotImplementedError(f"SinOp not implemented for kind={a.kind!r}.")
+            elif isinstance(op, CosOp):
+                a = stack.pop()
+                nm = new_tmp("cos")
+                if a.kind == "scalar":
+                    emit_line(f"double {nm} = std::cos({a.name});")
+                    stack.append(StackItem(nm, "scalar", a.role, (), a.field_names, a.parent, a.side, a.field_sides))
+                elif a.kind == "vec":
+                    emit_line(f"Eigen::VectorXd {nm} = {a.name}.unaryExpr([](double _v) {{ return std::cos(_v); }});")
+                    stack.append(StackItem(nm, "vec", a.role, a.shape, a.field_names, a.parent, a.side, a.field_sides))
+                elif a.kind == "mat":
+                    emit_line(f"Eigen::MatrixXd {nm} = {a.name}.unaryExpr([](double _v) {{ return std::cos(_v); }});")
+                    stack.append(StackItem(nm, "mat", a.role, a.shape, a.field_names, a.parent, a.side, a.field_sides))
+                else:
+                    raise NotImplementedError(f"CosOp not implemented for kind={a.kind!r}.")
+            elif isinstance(op, TanOp):
+                a = stack.pop()
+                nm = new_tmp("tan")
+                if a.kind == "scalar":
+                    emit_line(f"double {nm} = std::tan({a.name});")
+                    stack.append(StackItem(nm, "scalar", a.role, (), a.field_names, a.parent, a.side, a.field_sides))
+                elif a.kind == "vec":
+                    emit_line(f"Eigen::VectorXd {nm} = {a.name}.unaryExpr([](double _v) {{ return std::tan(_v); }});")
+                    stack.append(StackItem(nm, "vec", a.role, a.shape, a.field_names, a.parent, a.side, a.field_sides))
+                elif a.kind == "mat":
+                    emit_line(f"Eigen::MatrixXd {nm} = {a.name}.unaryExpr([](double _v) {{ return std::tan(_v); }});")
+                    stack.append(StackItem(nm, "mat", a.role, a.shape, a.field_names, a.parent, a.side, a.field_sides))
+                else:
+                    raise NotImplementedError(f"TanOp not implemented for kind={a.kind!r}.")
+            elif isinstance(op, AsinOp):
+                a = stack.pop()
+                nm = new_tmp("asin")
+                if a.kind == "scalar":
+                    emit_line(f"double {nm} = std::asin({a.name});")
+                    stack.append(StackItem(nm, "scalar", a.role, (), a.field_names, a.parent, a.side, a.field_sides))
+                elif a.kind == "vec":
+                    emit_line(f"Eigen::VectorXd {nm} = {a.name}.unaryExpr([](double _v) {{ return std::asin(_v); }});")
+                    stack.append(StackItem(nm, "vec", a.role, a.shape, a.field_names, a.parent, a.side, a.field_sides))
+                elif a.kind == "mat":
+                    emit_line(f"Eigen::MatrixXd {nm} = {a.name}.unaryExpr([](double _v) {{ return std::asin(_v); }});")
+                    stack.append(StackItem(nm, "mat", a.role, a.shape, a.field_names, a.parent, a.side, a.field_sides))
+                else:
+                    raise NotImplementedError(f"AsinOp not implemented for kind={a.kind!r}.")
+            elif isinstance(op, AcosOp):
+                a = stack.pop()
+                nm = new_tmp("acos")
+                if a.kind == "scalar":
+                    emit_line(f"double {nm} = std::acos({a.name});")
+                    stack.append(StackItem(nm, "scalar", a.role, (), a.field_names, a.parent, a.side, a.field_sides))
+                elif a.kind == "vec":
+                    emit_line(f"Eigen::VectorXd {nm} = {a.name}.unaryExpr([](double _v) {{ return std::acos(_v); }});")
+                    stack.append(StackItem(nm, "vec", a.role, a.shape, a.field_names, a.parent, a.side, a.field_sides))
+                elif a.kind == "mat":
+                    emit_line(f"Eigen::MatrixXd {nm} = {a.name}.unaryExpr([](double _v) {{ return std::acos(_v); }});")
+                    stack.append(StackItem(nm, "mat", a.role, a.shape, a.field_names, a.parent, a.side, a.field_sides))
+                else:
+                    raise NotImplementedError(f"AcosOp not implemented for kind={a.kind!r}.")
+            elif isinstance(op, AtanOp):
+                a = stack.pop()
+                nm = new_tmp("atan")
+                if a.kind == "scalar":
+                    emit_line(f"double {nm} = std::atan({a.name});")
+                    stack.append(StackItem(nm, "scalar", a.role, (), a.field_names, a.parent, a.side, a.field_sides))
+                elif a.kind == "vec":
+                    emit_line(f"Eigen::VectorXd {nm} = {a.name}.unaryExpr([](double _v) {{ return std::atan(_v); }});")
+                    stack.append(StackItem(nm, "vec", a.role, a.shape, a.field_names, a.parent, a.side, a.field_sides))
+                elif a.kind == "mat":
+                    emit_line(f"Eigen::MatrixXd {nm} = {a.name}.unaryExpr([](double _v) {{ return std::atan(_v); }});")
+                    stack.append(StackItem(nm, "mat", a.role, a.shape, a.field_names, a.parent, a.side, a.field_sides))
+                else:
+                    raise NotImplementedError(f"AtanOp not implemented for kind={a.kind!r}.")
+            elif isinstance(op, SinhOp):
+                a = stack.pop()
+                nm = new_tmp("sinh")
+                if a.kind == "scalar":
+                    emit_line(f"double {nm} = std::sinh({a.name});")
+                    stack.append(StackItem(nm, "scalar", a.role, (), a.field_names, a.parent, a.side, a.field_sides))
+                elif a.kind == "vec":
+                    emit_line(f"Eigen::VectorXd {nm} = {a.name}.unaryExpr([](double _v) {{ return std::sinh(_v); }});")
+                    stack.append(StackItem(nm, "vec", a.role, a.shape, a.field_names, a.parent, a.side, a.field_sides))
+                elif a.kind == "mat":
+                    emit_line(f"Eigen::MatrixXd {nm} = {a.name}.unaryExpr([](double _v) {{ return std::sinh(_v); }});")
+                    stack.append(StackItem(nm, "mat", a.role, a.shape, a.field_names, a.parent, a.side, a.field_sides))
+                else:
+                    raise NotImplementedError(f"SinhOp not implemented for kind={a.kind!r}.")
+            elif isinstance(op, CoshOp):
+                a = stack.pop()
+                nm = new_tmp("cosh")
+                if a.kind == "scalar":
+                    emit_line(f"double {nm} = std::cosh({a.name});")
+                    stack.append(StackItem(nm, "scalar", a.role, (), a.field_names, a.parent, a.side, a.field_sides))
+                elif a.kind == "vec":
+                    emit_line(f"Eigen::VectorXd {nm} = {a.name}.unaryExpr([](double _v) {{ return std::cosh(_v); }});")
+                    stack.append(StackItem(nm, "vec", a.role, a.shape, a.field_names, a.parent, a.side, a.field_sides))
+                elif a.kind == "mat":
+                    emit_line(f"Eigen::MatrixXd {nm} = {a.name}.unaryExpr([](double _v) {{ return std::cosh(_v); }});")
+                    stack.append(StackItem(nm, "mat", a.role, a.shape, a.field_names, a.parent, a.side, a.field_sides))
+                else:
+                    raise NotImplementedError(f"CoshOp not implemented for kind={a.kind!r}.")
+            elif isinstance(op, AsinhOp):
+                a = stack.pop()
+                nm = new_tmp("asinh")
+                if a.kind == "scalar":
+                    emit_line(f"double {nm} = std::asinh({a.name});")
+                    stack.append(StackItem(nm, "scalar", a.role, (), a.field_names, a.parent, a.side, a.field_sides))
+                elif a.kind == "vec":
+                    emit_line(f"Eigen::VectorXd {nm} = {a.name}.unaryExpr([](double _v) {{ return std::asinh(_v); }});")
+                    stack.append(StackItem(nm, "vec", a.role, a.shape, a.field_names, a.parent, a.side, a.field_sides))
+                elif a.kind == "mat":
+                    emit_line(f"Eigen::MatrixXd {nm} = {a.name}.unaryExpr([](double _v) {{ return std::asinh(_v); }});")
+                    stack.append(StackItem(nm, "mat", a.role, a.shape, a.field_names, a.parent, a.side, a.field_sides))
+                else:
+                    raise NotImplementedError(f"AsinhOp not implemented for kind={a.kind!r}.")
+            elif isinstance(op, AcoshOp):
+                a = stack.pop()
+                nm = new_tmp("acosh")
+                if a.kind == "scalar":
+                    emit_line(f"double {nm} = std::acosh({a.name});")
+                    stack.append(StackItem(nm, "scalar", a.role, (), a.field_names, a.parent, a.side, a.field_sides))
+                elif a.kind == "vec":
+                    emit_line(f"Eigen::VectorXd {nm} = {a.name}.unaryExpr([](double _v) {{ return std::acosh(_v); }});")
+                    stack.append(StackItem(nm, "vec", a.role, a.shape, a.field_names, a.parent, a.side, a.field_sides))
+                elif a.kind == "mat":
+                    emit_line(f"Eigen::MatrixXd {nm} = {a.name}.unaryExpr([](double _v) {{ return std::acosh(_v); }});")
+                    stack.append(StackItem(nm, "mat", a.role, a.shape, a.field_names, a.parent, a.side, a.field_sides))
+                else:
+                    raise NotImplementedError(f"AcoshOp not implemented for kind={a.kind!r}.")
+            elif isinstance(op, AtanhOp):
+                a = stack.pop()
+                nm = new_tmp("atanh")
+                if a.kind == "scalar":
+                    emit_line(f"double {nm} = std::atanh({a.name});")
+                    stack.append(StackItem(nm, "scalar", a.role, (), a.field_names, a.parent, a.side, a.field_sides))
+                elif a.kind == "vec":
+                    emit_line(f"Eigen::VectorXd {nm} = {a.name}.unaryExpr([](double _v) {{ return std::atanh(_v); }});")
+                    stack.append(StackItem(nm, "vec", a.role, a.shape, a.field_names, a.parent, a.side, a.field_sides))
+                elif a.kind == "mat":
+                    emit_line(f"Eigen::MatrixXd {nm} = {a.name}.unaryExpr([](double _v) {{ return std::atanh(_v); }});")
+                    stack.append(StackItem(nm, "mat", a.role, a.shape, a.field_names, a.parent, a.side, a.field_sides))
+                else:
+                    raise NotImplementedError(f"AtanhOp not implemented for kind={a.kind!r}.")
             elif isinstance(op, Store):
                 a = stack.pop()
                 if op.store_type == "matrix":

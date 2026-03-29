@@ -52,28 +52,33 @@ class JonasShearBenchmark:
     vS: callable
     u: callable
     alpha: callable
+    B: callable
     mu_alpha: callable
     grad_v: callable
     grad_p: callable
     grad_vS: callable
     grad_u: callable
     grad_alpha: callable
+    grad_B: callable
     grad_mu_alpha: callable
     v_n: callable
     p_n: callable
     vS_n: callable
     u_n: callable
     alpha_n: callable
+    B_n: callable
     mu_alpha_n: callable
     v_k: callable
     p_k: callable
     vS_k: callable
     u_k: callable
     alpha_k: callable
+    B_k: callable
     mu_alpha_k: callable
     f_v: callable
     f_u: callable
     f_alpha: callable
+    f_B: callable
     traction_weight: callable
     g_t: callable
     traction_fluid: callable
@@ -113,6 +118,7 @@ def build_jonas_shear_benchmark(
     x, y = sp.symbols("x y", real=True)
 
     alpha_expr = sp.Rational(1, 2) * (1 + sp.tanh((y - sp.Float(yi)) / (sp.sqrt(2) * sp.Float(eps_alpha))))
+    B_expr = sp.simplify(alpha_expr * (1.0 - float(phi_b)))
     mu_expr = sp.Integer(0)
 
     alpha_fluid_expr = sp.simplify(1.0 - alpha_expr)
@@ -126,8 +132,7 @@ def build_jonas_shear_benchmark(
     u_x_expr = sp.simplify(u_amplitude * ((1 - y) / sp.Float(1.0 - yi)) * alpha_expr)
     u_expr = sp.Matrix([u_x_expr, sp.Integer(0)])
 
-    C_expr = sp.simplify(1.0 - alpha_expr * (1.0 - float(phi_b)))
-    B_expr = sp.simplify(alpha_expr * (1.0 - float(phi_b)))
+    C_expr = sp.simplify(1.0 - B_expr)
     rho_expr = sp.simplify(float(rho_f) * C_expr)
     mu_mix_expr = sp.simplify((1.0 - alpha_expr) * float(mu_f) + alpha_expr * float(mu_b))
     support_key = str(support_physics or "legacy_exchange").strip().lower()
@@ -159,6 +164,7 @@ def build_jonas_shear_benchmark(
 
     alpha_adv = sp.Integer(0)
     f_alpha_expr = sp.simplify(alpha_adv - float(M_alpha) * _sym_laplacian(mu_expr, x, y))
+    f_B_expr = sp.Integer(0)
     mu_residual_expr = sp.simplify(mu_expr - float(gamma_alpha) * ((-float(eps_alpha)) * _sym_laplacian(alpha_expr, x, y) + (_double_well_prime(alpha_expr) / float(eps_alpha))))
 
     mass_expr = sp.simplify(_sym_div_vec(C_expr * v_expr + B_expr * vS_expr, x, y))
@@ -195,6 +201,7 @@ def build_jonas_shear_benchmark(
     grad_vS_expr = _sym_grad_vec(vS_expr, x, y)
     grad_u_expr = _sym_grad_vec(u_expr, x, y)
     grad_alpha_expr = _sym_grad_scalar(alpha_expr, x, y)
+    grad_B_expr = _sym_grad_scalar(B_expr, x, y)
     grad_mu_expr = _sym_grad_scalar(mu_expr, x, y)
 
     return JonasShearBenchmark(
@@ -210,28 +217,33 @@ def build_jonas_shear_benchmark(
         vS=lambda xx, yy, _fn=_lambdify_vec_xy(vS_expr, x, y): _fn(xx, yy),
         u=lambda xx, yy, _fn=_lambdify_vec_xy(u_expr, x, y): _fn(xx, yy),
         alpha=lambda xx, yy, _fn=_lambdify_scalar_xy(alpha_expr, x, y): _fn(xx, yy),
+        B=lambda xx, yy, _fn=_lambdify_scalar_xy(B_expr, x, y): _fn(xx, yy),
         mu_alpha=lambda xx, yy, _fn=_lambdify_scalar_xy(mu_expr, x, y): _fn(xx, yy),
         grad_v=lambda xx, yy, _fn=_lambdify_mat_xy(grad_v_expr, x, y): _fn(xx, yy),
         grad_p=lambda xx, yy, _fn=_lambdify_vec_xy(grad_p_expr, x, y): _fn(xx, yy),
         grad_vS=lambda xx, yy, _fn=_lambdify_mat_xy(grad_vS_expr, x, y): _fn(xx, yy),
         grad_u=lambda xx, yy, _fn=_lambdify_mat_xy(grad_u_expr, x, y): _fn(xx, yy),
         grad_alpha=lambda xx, yy, _fn=_lambdify_vec_xy(grad_alpha_expr, x, y): _fn(xx, yy),
+        grad_B=lambda xx, yy, _fn=_lambdify_vec_xy(grad_B_expr, x, y): _fn(xx, yy),
         grad_mu_alpha=lambda xx, yy, _fn=_lambdify_vec_xy(grad_mu_expr, x, y): _fn(xx, yy),
         v_n=lambda xx, yy, _fn=_lambdify_vec_xy(v_expr, x, y): _fn(xx, yy),
         p_n=lambda xx, yy, _fn=_lambdify_scalar_xy(p_expr, x, y): _fn(xx, yy),
         vS_n=lambda xx, yy, _fn=_lambdify_vec_xy(vS_expr, x, y): _fn(xx, yy),
         u_n=lambda xx, yy, _fn=_lambdify_vec_xy(u_expr, x, y): _fn(xx, yy),
         alpha_n=lambda xx, yy, _fn=_lambdify_scalar_xy(alpha_expr, x, y): _fn(xx, yy),
+        B_n=lambda xx, yy, _fn=_lambdify_scalar_xy(B_expr, x, y): _fn(xx, yy),
         mu_alpha_n=lambda xx, yy, _fn=_lambdify_scalar_xy(mu_expr, x, y): _fn(xx, yy),
         v_k=lambda xx, yy, _fn=_lambdify_vec_xy(v_expr, x, y): _fn(xx, yy),
         p_k=lambda xx, yy, _fn=_lambdify_scalar_xy(p_expr, x, y): _fn(xx, yy),
         vS_k=lambda xx, yy, _fn=_lambdify_vec_xy(vS_expr, x, y): _fn(xx, yy),
         u_k=lambda xx, yy, _fn=_lambdify_vec_xy(u_expr, x, y): _fn(xx, yy),
         alpha_k=lambda xx, yy, _fn=_lambdify_scalar_xy(alpha_expr, x, y): _fn(xx, yy),
+        B_k=lambda xx, yy, _fn=_lambdify_scalar_xy(B_expr, x, y): _fn(xx, yy),
         mu_alpha_k=lambda xx, yy, _fn=_lambdify_scalar_xy(mu_expr, x, y): _fn(xx, yy),
         f_v=lambda xx, yy, _fn=_lambdify_vec_xy(f_v_expr, x, y): _fn(xx, yy),
         f_u=lambda xx, yy, _fn=_lambdify_vec_xy(f_u_expr, x, y): _fn(xx, yy),
         f_alpha=lambda xx, yy, _fn=_lambdify_scalar_xy(f_alpha_expr, x, y): _fn(xx, yy),
+        f_B=lambda xx, yy, _fn=_lambdify_scalar_xy(f_B_expr, x, y): _fn(xx, yy),
         traction_weight=lambda xx, yy, _fn=_lambdify_scalar_xy(traction_weight_expr, x, y): _fn(xx, yy),
         g_t=lambda xx, yy, _fn=_lambdify_vec_xy(traction_vec_expr, x, y): _fn(xx, yy),
         traction_fluid=lambda xx, yy, _fn=_lambdify_vec_xy(traction_fluid_expr, x, y): _fn(xx, yy),

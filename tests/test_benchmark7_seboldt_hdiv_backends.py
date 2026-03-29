@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from examples.biofilms.benchmarks.seboldt.paper1_benchmark7_seboldt import _build_forms, _create_problem
+from examples.biofilms.benchmarks.seboldt.paper1_benchmark7_seboldt import _build_forms, _create_problem, _latent_inverse_array
 from pycutfem.ufl.expressions import Constant, HdivTrialFunction, TestFunction, div, dot, grad, TrialFunction
 from pycutfem.ufl.forms import Equation, assemble_form
 from pycutfem.ufl.measures import dx
@@ -115,6 +115,100 @@ def _assemble_benchmark7_full_hdiv_terms(backend: str):
         enable_phi_evolution=True,
     )
     _initialize_benchmark7_state(problem)
+
+    forms = _build_forms(
+        problem,
+        qdeg=6,
+        dt_c=Constant(0.1),
+        theta=1.0,
+        rho_f=1.0,
+        mu_f=0.035,
+        mu_b=0.035,
+        mu_b_model="mu",
+        kappa_inv=1.0e5,
+        mu_s=1.67785e5,
+        lambda_s=8.22148e6,
+        phi_b=0.18,
+        M_alpha=1.0,
+        gamma_alpha=1.0,
+        eps_alpha=0.05,
+        solid_visco_eta=0.0,
+        gamma_div=0.0,
+        gamma_u=1.0,
+        u_extension_mode="l2",
+        gamma_u_pin=0.0,
+        u_cip=0.0,
+        u_cip_weight="fluid",
+        vS_cip=1.0,
+        gamma_vS=1.0,
+        vS_extension_mode="grad",
+        gamma_vS_pin=1.0e-6,
+        D_phi=0.0,
+        phi_diffusion_weight="fluid",
+        gamma_phi=5.0,
+        phi_supg=0.0,
+        phi_cip=0.0,
+        alpha_supg=0.0,
+        alpha_cip=0.0,
+        alpha_regularization="ch",
+        alpha_reg_gamma=1.0,
+        alpha_reg_eps_normal=0.05,
+        alpha_reg_eps_tangent=0.0125,
+        alpha_reg_eta=1.0e-12,
+        alpha_advect_with="vS",
+        alpha_advection_form="conservative",
+        solid_model="linear",
+        kappa_inv_model="refmap",
+        enable_phi_evolution=True,
+        include_skeleton_acceleration=True,
+        rho_s0_tilde=1.1,
+        skeleton_inertia_convection="lagged",
+    )
+
+    jacobian, _ = assemble_form(Equation(forms.jacobian_form, None), dof_handler=problem["dh"], bcs=[], backend=backend)
+    _, residual = assemble_form(Equation(None, forms.residual_form), dof_handler=problem["dh"], bcs=[], backend=backend)
+    return jacobian.toarray(), np.asarray(residual, dtype=float)
+
+
+def _assemble_benchmark7_full_hdiv_tanh_latent_terms(backend: str):
+    problem = _create_problem(
+        Lx=1.0,
+        Ly=1.5,
+        nx=1,
+        ny=1,
+        poly_order=2,
+        pressure_order=1,
+        scalar_order=1,
+        fluid_space="hdiv",
+        fluid_hdiv_order=0,
+        enable_phi_evolution=True,
+        latent_bounded_transport=True,
+        latent_bounded_fields=("alpha", "phi"),
+        latent_bounded_map="tanh",
+        latent_bounded_formulation="transformed",
+    )
+    _initialize_benchmark7_state(problem)
+
+    problem["alpha_latent_k"].nodal_values[:] = _latent_inverse_array(
+        problem["alpha_k"].nodal_values,
+        eps=1.0e-8,
+        map_kind="tanh",
+    )
+    problem["alpha_latent_n"].nodal_values[:] = _latent_inverse_array(
+        problem["alpha_n"].nodal_values,
+        eps=1.0e-8,
+        map_kind="tanh",
+    )
+    problem["phi_latent_k"].nodal_values[:] = _latent_inverse_array(
+        problem["phi_k"].nodal_values,
+        eps=1.0e-8,
+        map_kind="tanh",
+    )
+    problem["phi_latent_n"].nodal_values[:] = _latent_inverse_array(
+        problem["phi_n"].nodal_values,
+        eps=1.0e-8,
+        map_kind="tanh",
+    )
 
     forms = _build_forms(
         problem,
@@ -300,6 +394,24 @@ def test_benchmark7_seboldt_full_hdiv_refmap_grad_backend_matches_python_on_1x1(
 
     jac_ref, res_ref = _assemble_benchmark7_full_hdiv_terms("python")
     jac, res = _assemble_benchmark7_full_hdiv_terms(backend)
+
+    np.testing.assert_allclose(jac, jac_ref, rtol=1.0e-9, atol=1.0e-9)
+    np.testing.assert_allclose(res, res_ref, rtol=1.0e-9, atol=1.0e-9)
+
+
+@pytest.mark.parametrize("backend", ("jit", "cpp"))
+def test_benchmark7_seboldt_full_hdiv_tanh_latent_backend_matches_python_on_1x1(backend, monkeypatch, tmp_path):
+    monkeypatch.setenv("PYCUTFEM_CACHE_DIR", str(tmp_path / f"jit_cache_tanh_latent_{backend}"))
+    if backend == "cpp":
+        monkeypatch.setenv("PYCUTFEM_JIT_BACKEND", "cpp")
+        monkeypatch.setenv("PYCUTFEM_CPP_FAST_COMPILE", "1")
+        monkeypatch.setenv("PYCUTFEM_CPP_FAST_OPT_LEVEL", "0")
+        monkeypatch.setenv("PYCUTFEM_CPP_FAST_MARCH_NATIVE", "0")
+    else:
+        monkeypatch.delenv("PYCUTFEM_JIT_BACKEND", raising=False)
+
+    jac_ref, res_ref = _assemble_benchmark7_full_hdiv_tanh_latent_terms("python")
+    jac, res = _assemble_benchmark7_full_hdiv_tanh_latent_terms(backend)
 
     np.testing.assert_allclose(jac, jac_ref, rtol=1.0e-9, atol=1.0e-9)
     np.testing.assert_allclose(res, res_ref, rtol=1.0e-9, atol=1.0e-9)

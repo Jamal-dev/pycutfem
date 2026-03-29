@@ -51,7 +51,8 @@ from pycutfem.ufl.expressions import (
     ElementWiseConstant, Derivative, Transpose,
     CellDiameter, MeshSize, NormalComponent,
     Restriction, Power, Trace, Determinant, Inverse, Hessian, Laplacian,
-    Identity, Cofactor, PositivePart, Heaviside, Log, Exp
+    Identity, Cofactor, PositivePart, Heaviside, Log, Exp, Tanh,
+    Sin, Cos, Tan, Asin, Acos, Atan, Sinh, Cosh, Asinh, Acosh, Atanh
 )
 from pycutfem.ufl.forms import Equation
 from pycutfem.ufl.measures import Integral
@@ -214,6 +215,18 @@ class FormCompiler:
             Heaviside: self._visit_Heaviside,
             Log: self._visit_Log,
             Exp: self._visit_Exp,
+            Tanh: self._visit_Tanh,
+            Sin: self._visit_Sin,
+            Cos: self._visit_Cos,
+            Tan: self._visit_Tan,
+            Asin: self._visit_Asin,
+            Acos: self._visit_Acos,
+            Atan: self._visit_Atan,
+            Sinh: self._visit_Sinh,
+            Cosh: self._visit_Cosh,
+            Asinh: self._visit_Asinh,
+            Acosh: self._visit_Acosh,
+            Atanh: self._visit_Atanh,
         }
     
     @contextmanager
@@ -1122,6 +1135,11 @@ class FormCompiler:
         def _is_scalar_leaf(expr):
             return isinstance(expr, (Function, TrialFunction, TestFunction))
 
+        def _scale_derivative_value(darg, factor):
+            if isinstance(darg, (VecOpInfo, GradOpInfo, HessOpInfo)):
+                return darg._with(factor * darg.data, role=darg.role)
+            return factor * darg
+
         def _derivative_of_scalar_expr(expr, order):
             ox, oy = order
             if (ox + oy) > 1 and not _is_scalar_leaf(expr):
@@ -1190,10 +1208,142 @@ class FormCompiler:
                 darg = self._visit(Derivative(expr.operand, *order))
                 arg = self._visit(expr.operand)
                 if isinstance(arg, (VecOpInfo, GradOpInfo, HessOpInfo)):
-                    return arg._with(np.exp(arg.data)) * darg
-                if isinstance(arg, np.ndarray):
-                    return np.exp(arg) * darg
-                return math.exp(float(arg)) * darg
+                    factor = np.exp(arg.data)
+                elif isinstance(arg, np.ndarray):
+                    factor = np.exp(arg)
+                else:
+                    factor = math.exp(float(arg))
+                return _scale_derivative_value(darg, factor)
+            if isinstance(expr, Tanh):
+                darg = self._visit(Derivative(expr.operand, *order))
+                arg = self._visit(expr.operand)
+                if isinstance(arg, (VecOpInfo, GradOpInfo, HessOpInfo)):
+                    sech_sq = 1.0 - np.square(np.tanh(arg.data))
+                elif isinstance(arg, np.ndarray):
+                    sech_sq = 1.0 - np.square(np.tanh(arg))
+                else:
+                    tanh_arg = math.tanh(float(arg))
+                    sech_sq = 1.0 - tanh_arg * tanh_arg
+                return _scale_derivative_value(darg, sech_sq)
+            if isinstance(expr, Sin):
+                darg = self._visit(Derivative(expr.operand, *order))
+                arg = self._visit(expr.operand)
+                if isinstance(arg, (VecOpInfo, GradOpInfo, HessOpInfo)):
+                    factor = np.cos(arg.data)
+                elif isinstance(arg, np.ndarray):
+                    factor = np.cos(arg)
+                else:
+                    factor = math.cos(float(arg))
+                return _scale_derivative_value(darg, factor)
+            if isinstance(expr, Cos):
+                darg = self._visit(Derivative(expr.operand, *order))
+                arg = self._visit(expr.operand)
+                if isinstance(arg, (VecOpInfo, GradOpInfo, HessOpInfo)):
+                    factor = -np.sin(arg.data)
+                elif isinstance(arg, np.ndarray):
+                    factor = -np.sin(arg)
+                else:
+                    factor = -math.sin(float(arg))
+                return _scale_derivative_value(darg, factor)
+            if isinstance(expr, Tan):
+                darg = self._visit(Derivative(expr.operand, *order))
+                arg = self._visit(expr.operand)
+                if isinstance(arg, (VecOpInfo, GradOpInfo, HessOpInfo)):
+                    tan_arg = np.tan(arg.data)
+                    factor = 1.0 + np.square(tan_arg)
+                elif isinstance(arg, np.ndarray):
+                    tan_arg = np.tan(arg)
+                    factor = 1.0 + np.square(tan_arg)
+                else:
+                    tan_arg = math.tan(float(arg))
+                    factor = 1.0 + tan_arg * tan_arg
+                return _scale_derivative_value(darg, factor)
+            if isinstance(expr, Asin):
+                darg = self._visit(Derivative(expr.operand, *order))
+                arg = self._visit(expr.operand)
+                if isinstance(arg, (VecOpInfo, GradOpInfo, HessOpInfo)):
+                    factor = 1.0 / np.sqrt(1.0 - np.square(arg.data))
+                elif isinstance(arg, np.ndarray):
+                    factor = 1.0 / np.sqrt(1.0 - np.square(arg))
+                else:
+                    arg_f = float(arg)
+                    factor = 1.0 / math.sqrt(1.0 - arg_f * arg_f)
+                return _scale_derivative_value(darg, factor)
+            if isinstance(expr, Acos):
+                darg = self._visit(Derivative(expr.operand, *order))
+                arg = self._visit(expr.operand)
+                if isinstance(arg, (VecOpInfo, GradOpInfo, HessOpInfo)):
+                    factor = -1.0 / np.sqrt(1.0 - np.square(arg.data))
+                elif isinstance(arg, np.ndarray):
+                    factor = -1.0 / np.sqrt(1.0 - np.square(arg))
+                else:
+                    arg_f = float(arg)
+                    factor = -1.0 / math.sqrt(1.0 - arg_f * arg_f)
+                return _scale_derivative_value(darg, factor)
+            if isinstance(expr, Atan):
+                darg = self._visit(Derivative(expr.operand, *order))
+                arg = self._visit(expr.operand)
+                if isinstance(arg, (VecOpInfo, GradOpInfo, HessOpInfo)):
+                    factor = 1.0 / (1.0 + np.square(arg.data))
+                elif isinstance(arg, np.ndarray):
+                    factor = 1.0 / (1.0 + np.square(arg))
+                else:
+                    arg_f = float(arg)
+                    factor = 1.0 / (1.0 + arg_f * arg_f)
+                return _scale_derivative_value(darg, factor)
+            if isinstance(expr, Sinh):
+                darg = self._visit(Derivative(expr.operand, *order))
+                arg = self._visit(expr.operand)
+                if isinstance(arg, (VecOpInfo, GradOpInfo, HessOpInfo)):
+                    factor = np.cosh(arg.data)
+                elif isinstance(arg, np.ndarray):
+                    factor = np.cosh(arg)
+                else:
+                    factor = math.cosh(float(arg))
+                return _scale_derivative_value(darg, factor)
+            if isinstance(expr, Cosh):
+                darg = self._visit(Derivative(expr.operand, *order))
+                arg = self._visit(expr.operand)
+                if isinstance(arg, (VecOpInfo, GradOpInfo, HessOpInfo)):
+                    factor = np.sinh(arg.data)
+                elif isinstance(arg, np.ndarray):
+                    factor = np.sinh(arg)
+                else:
+                    factor = math.sinh(float(arg))
+                return _scale_derivative_value(darg, factor)
+            if isinstance(expr, Asinh):
+                darg = self._visit(Derivative(expr.operand, *order))
+                arg = self._visit(expr.operand)
+                if isinstance(arg, (VecOpInfo, GradOpInfo, HessOpInfo)):
+                    factor = 1.0 / np.sqrt(1.0 + np.square(arg.data))
+                elif isinstance(arg, np.ndarray):
+                    factor = 1.0 / np.sqrt(1.0 + np.square(arg))
+                else:
+                    arg_f = float(arg)
+                    factor = 1.0 / math.sqrt(1.0 + arg_f * arg_f)
+                return _scale_derivative_value(darg, factor)
+            if isinstance(expr, Acosh):
+                darg = self._visit(Derivative(expr.operand, *order))
+                arg = self._visit(expr.operand)
+                if isinstance(arg, (VecOpInfo, GradOpInfo, HessOpInfo)):
+                    factor = 1.0 / (np.sqrt(arg.data - 1.0) * np.sqrt(arg.data + 1.0))
+                elif isinstance(arg, np.ndarray):
+                    factor = 1.0 / (np.sqrt(arg - 1.0) * np.sqrt(arg + 1.0))
+                else:
+                    arg_f = float(arg)
+                    factor = 1.0 / (math.sqrt(arg_f - 1.0) * math.sqrt(arg_f + 1.0))
+                return _scale_derivative_value(darg, factor)
+            if isinstance(expr, Atanh):
+                darg = self._visit(Derivative(expr.operand, *order))
+                arg = self._visit(expr.operand)
+                if isinstance(arg, (VecOpInfo, GradOpInfo, HessOpInfo)):
+                    factor = 1.0 / (1.0 - np.square(arg.data))
+                elif isinstance(arg, np.ndarray):
+                    factor = 1.0 / (1.0 - np.square(arg))
+                else:
+                    arg_f = float(arg)
+                    factor = 1.0 / (1.0 - arg_f * arg_f)
+                return _scale_derivative_value(darg, factor)
             if isinstance(expr, (PositivePart, Heaviside)):
                 raise NotImplementedError("Derivative of PositivePart/Heaviside is not supported in the Python backend.")
             if not _is_scalar_leaf(expr):
@@ -1470,29 +1620,59 @@ class FormCompiler:
         x = float(val)
         return 1.0 if x > 0.0 else 0.0
 
-    def _visit_Log(self, node: Log):
-        val = self._visit(node.operand)
+    def _visit_smooth_unary_numpy(self, operand, *, name: str, np_func, scalar_func):
+        val = self._visit(operand)
         if val is None:
             return None
         if isinstance(val, (VecOpInfo, GradOpInfo, HessOpInfo)):
             if getattr(val, "role", None) in {"trial", "test", "mixed"}:
-                raise NotImplementedError("Log is only supported for coefficient/value expressions.")
-            return val._with(np.log(val.data))
+                raise NotImplementedError(f"{name} is only supported for coefficient/value expressions.")
+            return val._with(np_func(val.data))
         if isinstance(val, np.ndarray):
-            return np.log(val)
-        return math.log(float(val))
+            return np_func(val)
+        return scalar_func(float(val))
+
+    def _visit_Log(self, node: Log):
+        return self._visit_smooth_unary_numpy(node.operand, name="Log", np_func=np.log, scalar_func=math.log)
 
     def _visit_Exp(self, node: Exp):
-        val = self._visit(node.operand)
-        if val is None:
-            return None
-        if isinstance(val, (VecOpInfo, GradOpInfo, HessOpInfo)):
-            if getattr(val, "role", None) in {"trial", "test", "mixed"}:
-                raise NotImplementedError("Exp is only supported for coefficient/value expressions.")
-            return val._with(np.exp(val.data))
-        if isinstance(val, np.ndarray):
-            return np.exp(val)
-        return math.exp(float(val))
+        return self._visit_smooth_unary_numpy(node.operand, name="Exp", np_func=np.exp, scalar_func=math.exp)
+
+    def _visit_Tanh(self, node: Tanh):
+        return self._visit_smooth_unary_numpy(node.operand, name="Tanh", np_func=np.tanh, scalar_func=math.tanh)
+
+    def _visit_Sin(self, node: Sin):
+        return self._visit_smooth_unary_numpy(node.operand, name="Sin", np_func=np.sin, scalar_func=math.sin)
+
+    def _visit_Cos(self, node: Cos):
+        return self._visit_smooth_unary_numpy(node.operand, name="Cos", np_func=np.cos, scalar_func=math.cos)
+
+    def _visit_Tan(self, node: Tan):
+        return self._visit_smooth_unary_numpy(node.operand, name="Tan", np_func=np.tan, scalar_func=math.tan)
+
+    def _visit_Asin(self, node: Asin):
+        return self._visit_smooth_unary_numpy(node.operand, name="Asin", np_func=np.arcsin, scalar_func=math.asin)
+
+    def _visit_Acos(self, node: Acos):
+        return self._visit_smooth_unary_numpy(node.operand, name="Acos", np_func=np.arccos, scalar_func=math.acos)
+
+    def _visit_Atan(self, node: Atan):
+        return self._visit_smooth_unary_numpy(node.operand, name="Atan", np_func=np.arctan, scalar_func=math.atan)
+
+    def _visit_Sinh(self, node: Sinh):
+        return self._visit_smooth_unary_numpy(node.operand, name="Sinh", np_func=np.sinh, scalar_func=math.sinh)
+
+    def _visit_Cosh(self, node: Cosh):
+        return self._visit_smooth_unary_numpy(node.operand, name="Cosh", np_func=np.cosh, scalar_func=math.cosh)
+
+    def _visit_Asinh(self, node: Asinh):
+        return self._visit_smooth_unary_numpy(node.operand, name="Asinh", np_func=np.arcsinh, scalar_func=math.asinh)
+
+    def _visit_Acosh(self, node: Acosh):
+        return self._visit_smooth_unary_numpy(node.operand, name="Acosh", np_func=np.arccosh, scalar_func=math.acosh)
+
+    def _visit_Atanh(self, node: Atanh):
+        return self._visit_smooth_unary_numpy(node.operand, name="Atanh", np_func=np.arctanh, scalar_func=math.atanh)
 
     def _visit_Jump(self, n: Jump):
         phi_old  = self.ctx.get('phi_val', None)

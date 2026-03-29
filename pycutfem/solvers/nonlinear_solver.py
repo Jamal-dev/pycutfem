@@ -366,6 +366,14 @@ class NewtonParameters:
     # reduced residual infinity norm. Defaults keep the old behavior.
     tr_min_abs_decrease_inf: float = 0.0
     tr_min_rel_decrease_inf: float = 0.0
+    # Optional reduced-space Gauss-Newton / LM fallback for the unconstrained
+    # Newton path. This is mainly useful when the raw reduced Newton direction
+    # stops being productive for the least-squares merit near bounded/logit
+    # coordinate saturation.
+    reduced_gn_fallback: bool = True
+    reduced_gn_lambda0: float = 1.0e-6
+    reduced_gn_lambda_growth: float = 10.0
+    reduced_gn_max_tries: int = 4
     # Optional early-stall detector for exact Newton solves. When enabled, the
     # solver aborts once a full residual window fails to deliver a meaningful
     # |R|_inf decrease, so benchmark-local recovery layers can take over.
@@ -467,6 +475,7 @@ class LinearSolverParameters:
     backend: str = ("petsc" if HAS_PETSC else "scipy")
     tol: float = 1e-12
     maxit: int = 10_000
+    distributed: bool = False
 
 
 @dataclass
@@ -601,6 +610,31 @@ class VIParameters:
     anderson_gap_ratio: float = 1.0
     anderson_eq_abs: float = 1.0e-10
     anderson_ginf_max: float = 0.0
+    interior_point_mu0: float = 1.0e-2
+    interior_point_mu_min: float = 1.0e-10
+    interior_point_mu_decay: float = 0.2
+    interior_point_max_barrier_steps: int = 12
+    interior_point_fraction_to_boundary: float = 0.995
+    interior_point_armijo_c1: float = 1.0e-4
+    interior_point_step_reduction: float = 0.5
+    interior_point_step_min: float = 1.0e-10
+    interior_point_initial_push: float = 1.0e-8
+    interior_point_stage_tol_factor: float = 0.25
+    interior_point_stage_dual_factor: float = 1.5
+    interior_point_stage_cent_factor: float = 1.5
+    interior_point_stage_gap_factor: float = 1.0
+    interior_point_stage_eq_factor: float = 1.0e-4
+    interior_point_project_each_iteration: bool = False
+    interior_point_filter_margin: float = 1.0e-4
+    interior_point_filter_max_feas_growth: float = 1.25
+    interior_point_filter_max_entries: int = 16
+    interior_point_mehrotra_predictor_corrector: bool = True
+    interior_point_mehrotra_sigma_min: float = 0.0
+    interior_point_mehrotra_sigma_max: float = 1.0
+    interior_point_transition_recenter_ratio_max: float = 2.5
+    interior_point_transition_dual_growth_max: float = 2.0
+    interior_point_second_order_correction: bool = False
+    interior_point_soc_alpha_trigger: float = 0.25
 
 
 @dataclass(frozen=True)
@@ -3103,6 +3137,38 @@ class NewtonSolver:
         dh = self.dh
         ndof_eff = getattr(self.restrictor, "full_size", dh.total_dofs)
 
+        def _trace_label_text() -> str:
+            raw = getattr(self, "_newton_trace_label", None)
+            if callable(raw):
+                try:
+                    raw = raw(self)
+                except TypeError:
+                    raw = raw()
+                except Exception:
+                    raw = None
+            return str(raw or "").strip()
+
+        def _trace_prefix() -> str:
+            text = _trace_label_text()
+            return f"[{text}] " if text else ""
+
+        def _trace_global_residual() -> tuple[float | None, str | None]:
+            cb = getattr(self, "_newton_trace_global_residual_cb", None)
+            if not callable(cb):
+                return None, None
+            try:
+                value = cb(funcs, prev_funcs, aux_funcs, bcs_now)
+                value = float(value)
+            except Exception:
+                return None, None
+            if not np.isfinite(value):
+                return None, None
+            label = str(
+                getattr(self, "_newton_trace_global_residual_label", "|R_global|_∞")
+                or "|R_global|_∞"
+            ).strip()
+            return value, label
+
         # Quick safety: make sure we actually have a reduced set
         # (This is only for logging; we still run the reduced pipeline.)
         nfree = len(self.active_dofs)
@@ -3401,7 +3467,15 @@ class NewtonSolver:
             t_iteration = t_current - temp_t0
             temp_t0 = t_current
             if int(getattr(self.np, "print_level", 2) or 0) >= 2:
-                print(f"        Newton {it+1}: |R|_∞ = {norm_R:.2e}, time = {t_iteration}s")
+                prefix = _trace_prefix()
+                global_norm, global_label = _trace_global_residual()
+                global_msg = ""
+                if global_label and global_norm is not None:
+                    global_msg = f", {str(global_label)} = {float(global_norm):.2e}"
+                print(
+                    f"        {prefix}Newton {it+1}: |R|_∞ = {norm_R:.2e}{global_msg}, "
+                    f"time = {t_iteration}s"
+                )
             self._current_newton_it = int(it + 1)
             self._current_newton_residual_norm = float(norm_R)
             if os.getenv("PYCUTFEM_NEWTON_TRACE_RES_FIELDS", "").lower() in {"1", "true", "yes"}:
@@ -3469,10 +3543,12 @@ class NewtonSolver:
                 except Exception:
                     stag_accept_factor = 0.0
             else:
-                try:
-                    stag_accept_factor = float(os.getenv("PYCUTFEM_LS_FAIL_ACCEPT_FACTOR", "20.0"))
-                except Exception:
-                    stag_accept_factor = 0.0
+                stag_accept_factor = float(getattr(self.np, "accept_nonconverged_atol_factor", 0.0) or 0.0)
+                if stag_accept_factor <= 0.0:
+                    try:
+                        stag_accept_factor = float(os.getenv("PYCUTFEM_LS_FAIL_ACCEPT_FACTOR", "20.0"))
+                    except Exception:
+                        stag_accept_factor = 0.0
 
             if stag_accept_factor > 0.0 and tol_eff > 0.0 and norm_R <= stag_accept_factor * tol_eff:
                 win_raw = os.getenv("PYCUTFEM_NEWTON_STAGNATION_WINDOW", "8").strip()
@@ -3525,8 +3601,10 @@ class NewtonSolver:
                         )
                         self._last_iteration_totals = totals
                         if int(getattr(self.np, "print_level", 2) or 0) >= 2:
+                            prefix = _trace_prefix()
                             print(
-                                "          timings: assembly={:.3e}s, solve={:.3e}s, line-search={:.3e}s".format(
+                                f"          {prefix}"
+                                + "timings: assembly={:.3e}s, solve={:.3e}s, line-search={:.3e}s".format(
                                     assembly_time, 0.0, 0.0
                                 )
                             )
@@ -3551,8 +3629,10 @@ class NewtonSolver:
                 )
                 self._last_iteration_totals = totals
                 if int(getattr(self.np, "print_level", 2) or 0) >= 2:
+                    prefix = _trace_prefix()
                     print(
-                        "          timings: assembly={:.3e}s, solve={:.3e}s, line-search={:.3e}s".format(
+                        f"          {prefix}"
+                        + "timings: assembly={:.3e}s, solve={:.3e}s, line-search={:.3e}s".format(
                             assembly_time, 0.0, 0.0
                         )
                     )
@@ -3809,15 +3889,70 @@ class NewtonSolver:
 
             # 3) Optional step globalization in reduced space (no BC re-application inside)
             try:
+                newton_step_red = np.asarray(dU_red, dtype=float).copy()
                 if use_line_search:
                     t_ls = time.perf_counter()
                     try:
-                        dU_red = self._line_search_reduced(A_model, R_model, dU_red, funcs, current, bcs_now)
+                        dU_red = self._line_search_reduced(A_model, R_model, newton_step_red, funcs, current, bcs_now)
                         line_search_time = time.perf_counter() - t_ls
+                        if globalization_mode == "line_search_then_trust" and bool(getattr(self, "_ls_last_best_effort", False)):
+                            ls_step = np.asarray(dU_red, dtype=float).copy()
+                            ls_residual = getattr(self, "_ls_last_residual_red", None)
+                            if isinstance(ls_residual, np.ndarray):
+                                ls_residual = np.asarray(ls_residual, dtype=float).copy()
+                            ls_norm = (
+                                float(np.linalg.norm(ls_residual, ord=np.inf))
+                                if isinstance(ls_residual, np.ndarray) and ls_residual.size > 0
+                                else float("inf")
+                            )
+                            if int(getattr(self.np, "print_level", 2) or 0) >= 2:
+                                print(
+                                    "        Line search found only a best-effort step; "
+                                    "comparing with trust region."
+                                )
+                            try:
+                                dU_red_tr = self._trust_region_reduced(
+                                    A_model, R_model, newton_step_red, funcs, current, bcs_now
+                                )
+                                line_search_time = time.perf_counter() - t_ls
+                                tr_residual = getattr(self, "_ls_last_residual_red", None)
+                                tr_norm = (
+                                    float(np.linalg.norm(tr_residual, ord=np.inf))
+                                    if isinstance(tr_residual, np.ndarray) and tr_residual.size > 0
+                                    else float("inf")
+                                )
+                                use_trust_step = (not np.isfinite(ls_norm)) or (
+                                    np.isfinite(tr_norm) and tr_norm < ls_norm
+                                )
+                                if use_trust_step:
+                                    dU_red = np.asarray(dU_red_tr, dtype=float)
+                                else:
+                                    dU_red = ls_step
+                                    self._ls_last_residual_red = (
+                                        None if ls_residual is None else np.asarray(ls_residual, dtype=float)
+                                    )
+                                    if int(getattr(self.np, "print_level", 2) or 0) >= 2:
+                                        print(
+                                            "        Keeping line-search best-effort step "
+                                            f"(‖R‖∞={ls_norm:.3e}) over trust region (‖R‖∞={tr_norm:.3e})."
+                                        )
+                            except RuntimeError as exc_tr:
+                                line_search_time = time.perf_counter() - t_ls
+                                dU_red = ls_step
+                                self._ls_last_residual_red = (
+                                    None if ls_residual is None else np.asarray(ls_residual, dtype=float)
+                                )
+                                if int(getattr(self.np, "print_level", 2) or 0) >= 2:
+                                    print(
+                                        "        Trust-region comparison failed after line-search best effort; "
+                                        f"keeping the line-search step ({exc_tr})."
+                                    )
                     except RuntimeError as exc:
                         msg = str(exc)
                         if "Line search failed" in msg:
-                            accept_factor = float(os.getenv("PYCUTFEM_LS_FAIL_ACCEPT_FACTOR", "20.0"))
+                            accept_factor = float(getattr(self.np, "accept_nonconverged_atol_factor", 0.0) or 0.0)
+                            if accept_factor <= 0.0:
+                                accept_factor = float(os.getenv("PYCUTFEM_LS_FAIL_ACCEPT_FACTOR", "20.0"))
                             tol_accept = float(tol_eff) if "tol_eff" in locals() else float(getattr(self.np, "newton_tol", 0.0))
                             if accept_factor > 0.0 and tol_accept > 0.0 and norm_R <= accept_factor * tol_accept:
                                 line_search_time = time.perf_counter() - t_ls
@@ -3848,8 +3983,10 @@ class NewtonSolver:
                                 )
                                 self._last_iteration_totals = totals
                                 if int(getattr(self.np, "print_level", 2) or 0) >= 2:
+                                    prefix = _trace_prefix()
                                     print(
-                                        "          timings: assembly={:.3e}s, solve={:.3e}s, line-search={:.3e}s".format(
+                                        f"          {prefix}"
+                                        + "timings: assembly={:.3e}s, solve={:.3e}s, line-search={:.3e}s".format(
                                             assembly_time, linear_time, line_search_time
                                         )
                                     )
@@ -3875,18 +4012,62 @@ class NewtonSolver:
                         elif use_trust_region and "Line search failed" in msg:
                             if int(getattr(self.np, "print_level", 2) or 0) >= 2:
                                 print("        Line search failed; retrying with trust region.")
-                            dU_red = self._trust_region_reduced(A_model, R_model, dU_red, funcs, current, bcs_now)
+                            dU_red = self._trust_region_reduced(A_model, R_model, newton_step_red, funcs, current, bcs_now)
                             line_search_time = time.perf_counter() - t_ls
                         else:
                             line_search_time = time.perf_counter() - t_ls
                             raise
                 elif use_trust_region:
                     t_ls = time.perf_counter()
-                    dU_red = self._trust_region_reduced(A_model, R_model, dU_red, funcs, current, bcs_now)
+                    dU_red = self._trust_region_reduced(A_model, R_model, newton_step_red, funcs, current, bcs_now)
                     line_search_time = time.perf_counter() - t_ls
                 else:
                     line_search_time = 0.0
             except RuntimeError as exc:
+                accept_factor = float(getattr(self.np, "accept_nonconverged_atol_factor", 0.0) or 0.0)
+                if accept_factor <= 0.0:
+                    try:
+                        accept_factor = float(os.getenv("PYCUTFEM_LS_FAIL_ACCEPT_FACTOR", "20.0"))
+                    except Exception:
+                        accept_factor = 0.0
+                tol_accept = float(tol_eff) if "tol_eff" in locals() else float(getattr(self.np, "newton_tol", 0.0))
+                if accept_factor > 0.0 and tol_accept > 0.0 and norm_R <= accept_factor * tol_accept:
+                    if int(getattr(self.np, "print_level", 2) or 0) >= 2:
+                        print(
+                            "        Globalization failed near convergence "
+                            f"(|R|_∞={norm_R:.2e}, tol={tol_accept:.2e}, factor={accept_factor:.2g}); "
+                            "accepting iterate."
+                        )
+                    converged = True
+                    delta = np.hstack(
+                        [
+                            f.nodal_values - f_prev.nodal_values
+                            for f, f_prev in zip(funcs, prev_funcs)
+                        ]
+                    )
+                    totals["assembly"] += assembly_time
+                    totals["linear_solve"] += linear_time
+                    totals["line_search"] += line_search_time
+                    self._last_iter_timings.append(
+                        {
+                            "iteration": it + 1,
+                            "assembly": assembly_time,
+                            "linear_solve": linear_time,
+                            "line_search": line_search_time,
+                            "residual_norm": norm_R,
+                            "converged": True,
+                        }
+                    )
+                    self._last_iteration_totals = totals
+                    if int(getattr(self.np, "print_level", 2) or 0) >= 2:
+                        prefix = _trace_prefix()
+                        print(
+                            f"          {prefix}"
+                            + "timings: assembly={:.3e}s, solve={:.3e}s, line-search={:.3e}s".format(
+                                assembly_time, linear_time, line_search_time
+                            )
+                        )
+                    return delta, converged, it + 1
                 if np.any(ptc_mask) and self._newton_try_grow_ptc_sigma(reason=str(exc)):
                     continue
                 raise
@@ -3912,6 +4093,12 @@ class NewtonSolver:
             # without a second full assembly on the updated iterate.
             norm_after: float | None = None
             globalization_mode = self._newton_globalization_mode(self.np)
+            accept_factor_after = float(getattr(self.np, "accept_nonconverged_atol_factor", 0.0) or 0.0)
+            if accept_factor_after <= 0.0:
+                try:
+                    accept_factor_after = float(os.getenv("PYCUTFEM_LS_FAIL_ACCEPT_FACTOR", "20.0"))
+                except Exception:
+                    accept_factor_after = 0.0
             use_ls_cache = (
                 (
                     bool(getattr(self.np, "line_search", False))
@@ -3926,13 +4113,37 @@ class NewtonSolver:
                     norm_after = float(np.linalg.norm(R_after, ord=np.inf))
                     if not np.isfinite(norm_after):
                         norm_after = None
+            elif (
+                bool(getattr(self, "_ls_last_best_effort", False))
+                and accept_factor_after > 0.0
+            ):
+                try:
+                    _, R_after = self._assemble_system_reduced(current, need_matrix=False)
+                    norm_after = float(np.linalg.norm(np.asarray(R_after, dtype=float), ord=np.inf))
+                    if not np.isfinite(norm_after):
+                        norm_after = None
+                except Exception:
+                    norm_after = None
             if norm_after is not None:
                 self._newton_decay_ptc_sigma(
                     norm_before=float(norm_R),
                     norm_after=float(norm_after),
                     tol_eff=float(tol_eff),
                 )
-            converged_after = bool(norm_after is not None and float(norm_after) <= float(tol_eff))
+            near_accept_after = bool(
+                norm_after is not None
+                and bool(getattr(self, "_ls_last_best_effort", False))
+                and accept_factor_after > 0.0
+                and float(tol_eff) > 0.0
+                and float(norm_after) <= accept_factor_after * float(tol_eff)
+            )
+            converged_after = bool(
+                norm_after is not None
+                and (
+                    float(norm_after) <= float(tol_eff)
+                    or near_accept_after
+                )
+            )
 
             totals["assembly"] += assembly_time
             totals["linear_solve"] += linear_time
@@ -3948,13 +4159,21 @@ class NewtonSolver:
                 }
             )
             if int(getattr(self.np, "print_level", 2) or 0) >= 2:
+                prefix = _trace_prefix()
                 print(
-                    "          timings: assembly={:.3e}s, solve={:.3e}s, line-search={:.3e}s".format(
+                    f"          {prefix}"
+                    + "timings: assembly={:.3e}s, solve={:.3e}s, line-search={:.3e}s".format(
                         assembly_time, linear_time, line_search_time
                     )
                 )
 
             if converged_after:
+                if near_accept_after and int(getattr(self.np, "print_level", 2) or 0) >= 2:
+                    print(
+                        "        Best-effort globalization step reached the relaxed acceptance band "
+                        f"(|R|_∞={float(norm_after):.2e}, tol={float(tol_eff):.2e}, factor={accept_factor_after:.2g}); "
+                        "accepting iterate."
+                    )
                 converged = True
                 delta = np.hstack(
                     [f.nodal_values - f_prev.nodal_values for f, f_prev in zip(funcs, prev_funcs)]
@@ -3970,12 +4189,14 @@ class NewtonSolver:
             except Exception:
                 accept_factor = 0.0
         else:
-            # Default: mirror the line-search "near convergence" accept factor so stiff, penalty-dominated
-            # problems can make progress even when the raw residual hits a floating-point floor.
-            try:
-                accept_factor = float(os.getenv("PYCUTFEM_LS_FAIL_ACCEPT_FACTOR", "20.0"))
-            except Exception:
-                accept_factor = 0.0
+            accept_factor = float(getattr(self.np, "accept_nonconverged_atol_factor", 0.0) or 0.0)
+            if accept_factor <= 0.0:
+                # Default: mirror the line-search "near convergence" accept factor so stiff, penalty-dominated
+                # problems can make progress even when the raw residual hits a floating-point floor.
+                try:
+                    accept_factor = float(os.getenv("PYCUTFEM_LS_FAIL_ACCEPT_FACTOR", "20.0"))
+                except Exception:
+                    accept_factor = 0.0
         if accept_factor > 0.0:
             tol_eff_last = float(tol_eff) if "tol_eff" in locals() else float(getattr(self.np, "newton_tol", 0.0))
             if tol_eff_last > 0.0 and float(norm_R) <= accept_factor * tol_eff_last:
@@ -4147,6 +4368,63 @@ class NewtonSolver:
         quad_term = 0.5 * float(np.dot(Ap, Ap))
         return -(linear_term + quad_term)
 
+    def _reduced_gauss_newton_lm_direction(self, A_red: sp.spmatrix, R_red: np.ndarray) -> np.ndarray | None:
+        np_ = self.np
+        if not bool(getattr(np_, "reduced_gn_fallback", True)):
+            return None
+        if not sp.isspmatrix_csr(A_red):
+            A_red = A_red.tocsr()
+        g = np.asarray(A_red.T @ np.asarray(R_red, dtype=float), dtype=float).ravel()
+        if g.size == 0 or (not np.all(np.isfinite(g))):
+            return None
+        g_inf = float(np.linalg.norm(g, ord=np.inf))
+        if (not np.isfinite(g_inf)) or g_inf <= 0.0:
+            return None
+
+        H = self._canonicalize_direct_solve_matrix((A_red.T @ A_red).tocsr())
+        metric_diag = self._trust_region_metric_diag(A_red)
+        diag = np.asarray(metric_diag, dtype=float).ravel() ** 2
+        diag_floor = 1.0e-12
+        diag = np.where(np.isfinite(diag) & (diag > diag_floor), diag, diag_floor)
+        lam = max(float(getattr(np_, "reduced_gn_lambda0", 1.0e-6) or 1.0e-6), 0.0)
+        growth = max(float(getattr(np_, "reduced_gn_lambda_growth", 10.0) or 10.0), 1.0)
+        max_tries = max(int(getattr(np_, "reduced_gn_max_tries", 4) or 4), 1)
+        trace = int(getattr(np_, "print_level", 2) or 0) >= 3 or os.getenv("PYCUTFEM_LS_TRACE", "").lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+
+        for _ in range(max_tries):
+            H_work = H
+            if lam > 0.0:
+                H_work = self._canonicalize_direct_solve_matrix(H + sp.diags(lam * diag, format="csr"))
+            try:
+                H_solve, g_solve, _, col_scale = self._apply_reduced_system_scaling(H_work, g)
+                step_solve = self._solve_linear_system_with_context(
+                    H_solve,
+                    -g_solve,
+                    context="reduced_gauss_newton_lm",
+                )
+                step_red = np.asarray(col_scale, dtype=float) * np.asarray(step_solve, dtype=float)
+            except Exception:
+                lam = max(lam * growth, 1.0e-16) if lam > 0.0 else 1.0e-16
+                continue
+            if not np.all(np.isfinite(step_red)):
+                lam = max(lam * growth, 1.0e-16) if lam > 0.0 else 1.0e-16
+                continue
+            g_ts = float(np.dot(g, step_red))
+            step_inf = float(np.linalg.norm(step_red, ord=np.inf))
+            if trace:
+                print(
+                    f"        [ls-gn] lambda={lam:.3e}  gTs={g_ts:.3e}  ‖g‖∞={g_inf:.3e}  ‖S‖∞={step_inf:.3e}",
+                    flush=True,
+                )
+            if np.isfinite(g_ts) and g_ts < 0.0 and np.isfinite(step_inf) and step_inf > 0.0:
+                return np.asarray(step_red, dtype=float)
+            lam = max(lam * growth, 1.0e-16) if lam > 0.0 else 1.0e-16
+        return None
+
     def _trust_region_reduced(self, A_red, R_red, S_red, funcs, coeffs, bcs_now):
         np_ = self.np
         phi0 = 0.5 * float(R_red @ R_red)
@@ -4261,6 +4539,7 @@ class NewtonSolver:
         # Cache the reduced residual at the *accepted* line-search iterate so the
         # Newton loop can reuse it (avoid an extra assembly just to detect convergence).
         self._ls_last_residual_red = None
+        self._ls_last_best_effort = False
 
         if mode not in {"armijo", "dealii"}:
             raise ValueError(f"Unknown line-search mode '{mode}'.")
@@ -4328,6 +4607,7 @@ class NewtonSolver:
                     print("        Line search accepted α = 1.00e+00 (‖R‖∞ decreased)")
                 self._ls_last_residual_red = np.asarray(R_try, dtype=float)
                 self._ls_alpha_prev = 1.0
+                self._ls_last_best_effort = False
                 return 1.0 * S_red
 
             # Backtracking sequence after the full-step trial.
@@ -4351,6 +4631,7 @@ class NewtonSolver:
                         print(f"        Line search accepted α = {alpha:.2e} (‖R‖∞ decreased)")
                     self._ls_last_residual_red = np.asarray(R_try, dtype=float)
                     self._ls_alpha_prev = alpha
+                    self._ls_last_best_effort = False
                     return alpha * S_red
 
                 alpha *= np_.ls_reduction
@@ -4366,6 +4647,7 @@ class NewtonSolver:
                 if best_R is not None:
                     self._ls_last_residual_red = np.asarray(best_R, dtype=float)
                 self._ls_alpha_prev = best_alpha
+                self._ls_last_best_effort = True
                 return best_alpha * S_red
             min_alpha = alpha
             if int(getattr(self.np, "print_level", 2) or 0) >= 2:
@@ -4373,6 +4655,7 @@ class NewtonSolver:
             if os.getenv("PYCUTFEM_LS_FAIL_HARD", "1").lower() not in {"0", "false", "no"}:
                 raise RuntimeError("Line search failed: no residual decrease.")
             self._ls_alpha_prev = min_alpha
+            self._ls_last_best_effort = True
             return min_alpha * S_red
 
         # Gradient g_f = J_ff^T R_f  (reduced variables only)
@@ -4404,6 +4687,45 @@ class NewtonSolver:
         # Snapshot the *full* iterate
         snap = [f.nodal_values.copy() for f in funcs]
 
+        def _best_effort_direction(direction_red: np.ndarray, label: str):
+            direction = np.asarray(direction_red, dtype=float).ravel()
+            if direction.size != int(np.asarray(S_red, dtype=float).size):
+                return None, phi0, 0.0, None
+            if not np.all(np.isfinite(direction)):
+                return None, phi0, 0.0, None
+            dir_inf = float(np.linalg.norm(direction, ord=np.inf))
+            if (not np.isfinite(dir_inf)) or dir_inf <= 0.0:
+                return None, phi0, 0.0, None
+            alpha_dir = float(getattr(self, "_ls_alpha_prev", 1.0))
+            alpha_dir = min(1.0, alpha_dir / float(np_.ls_reduction))
+            best_alpha_dir = 0.0
+            best_phi_dir = phi0
+            best_R_dir = None
+            for _ in range(np_.ls_max_iter):
+                for f, buf in zip(funcs, snap):
+                    f.nodal_values[:] = buf
+                self._apply_solver_coordinate_step(alpha_dir * direction, funcs, bcs_now)
+                _, R_try_dir = self._assemble_system_reduced(coeffs, need_matrix=False)
+                phi_dir = 0.5 * float(R_try_dir @ R_try_dir)
+                if phi_dir < best_phi_dir:
+                    best_phi_dir = phi_dir
+                    best_alpha_dir = alpha_dir
+                    best_R_dir = np.asarray(R_try_dir, dtype=float)
+                if phi_dir < phi0:
+                    for f, buf in zip(funcs, snap):
+                        f.nodal_values[:] = buf
+                    if int(getattr(self.np, "print_level", 2) or 0) >= 3:
+                        print(f"        {label} accepted α = {alpha_dir:.2e}")
+                    return alpha_dir * direction, best_phi_dir, best_alpha_dir, best_R_dir
+                alpha_dir *= np_.ls_reduction
+            for f, buf in zip(funcs, snap):
+                f.nodal_values[:] = buf
+            if best_alpha_dir > 0.0:
+                if int(getattr(self.np, "print_level", 2) or 0) >= 2:
+                    print(f"        {label} best-effort α = {best_alpha_dir:.2e}.")
+                return best_alpha_dir * direction, best_phi_dir, best_alpha_dir, best_R_dir
+            return None, phi0, 0.0, None
+
         for _ in range(np_.ls_max_iter):
             # Trial update: expand to full, apply, and re-impose BCs
             for f, buf in zip(funcs, snap):
@@ -4425,18 +4747,31 @@ class NewtonSolver:
                 if int(getattr(self.np, "print_level", 2) or 0) >= 3:
                     print(f"        Armijo search accepted α = {alpha:.2e}")
                 self._ls_alpha_prev = alpha
+                self._ls_last_best_effort = False
                 return alpha * S_red
 
             alpha *= np_.ls_reduction
 
         # Fallback (best effort seen)
         for f, buf in zip(funcs, snap): f.nodal_values[:] = buf
+        gn_dir = self._reduced_gauss_newton_lm_direction(A_red, R_red)
+        if gn_dir is not None:
+            gn_step, gn_phi, gn_alpha, gn_R = _best_effort_direction(gn_dir, "        Armijo GN/LM")
+            if gn_step is not None:
+                better_than_newton = (best_alpha <= 0.0) or (gn_phi < best_phi)
+                if better_than_newton:
+                    if gn_R is not None:
+                        self._ls_last_residual_red = np.asarray(gn_R, dtype=float)
+                    self._ls_alpha_prev = float(gn_alpha)
+                    self._ls_last_best_effort = True
+                    return np.asarray(gn_step, dtype=float)
         if best_alpha > 0.0:
             if int(getattr(self.np, "print_level", 2) or 0) >= 2:
                 print(f"        Armijo failed, using best-effort α = {best_alpha:.2e}.")
             if best_R is not None:
                 self._ls_last_residual_red = np.asarray(best_R, dtype=float)
             self._ls_alpha_prev = best_alpha
+            self._ls_last_best_effort = True
             return best_alpha * S_red
 
         # As a last resort, try a simple residual-direction backtracking step.
@@ -4445,39 +4780,13 @@ class NewtonSolver:
         try_alt = os.getenv("PYCUTFEM_LS_ALT_RESIDUAL", "1").lower() in {"1", "true", "yes"}
         if try_alt:
             S_alt = -np.asarray(R_red, dtype=float)
-            alt_norm = float(np.linalg.norm(S_alt, ord=np.inf))
-            if np.isfinite(alt_norm) and alt_norm > 0.0:
-                alpha_alt = float(getattr(self, "_ls_alpha_prev", 1.0))
-                alpha_alt = min(1.0, alpha_alt / float(np_.ls_reduction))
-                best_alpha_alt = 0.0
-                best_phi_alt = phi0
-                best_R_alt = None
-                for _ in range(np_.ls_max_iter):
-                    for f, buf in zip(funcs, snap):
-                        f.nodal_values[:] = buf
-                    self._apply_solver_coordinate_step(alpha_alt * S_alt, funcs, bcs_now)
-                    _, R_try = self._assemble_system_reduced(coeffs, need_matrix=False)
-                    phi = 0.5 * float(R_try @ R_try)
-                    if phi < best_phi_alt:
-                        best_phi_alt, best_alpha_alt, best_R_alt = phi, alpha_alt, R_try
-                    if phi < phi0:
-                        for f, buf in zip(funcs, snap):
-                            f.nodal_values[:] = buf
-                        if int(getattr(self.np, "print_level", 2) or 0) >= 3:
-                            print(f"        Armijo alt (S=-R) accepted α = {alpha_alt:.2e}")
-                        self._ls_last_residual_red = np.asarray(R_try, dtype=float)
-                        self._ls_alpha_prev = alpha_alt
-                        return alpha_alt * S_alt
-                    alpha_alt *= np_.ls_reduction
-                if best_alpha_alt > 0.0:
-                    for f, buf in zip(funcs, snap):
-                        f.nodal_values[:] = buf
-                    if int(getattr(self.np, "print_level", 2) or 0) >= 2:
-                        print(f"        Armijo alt (S=-R) best-effort α = {best_alpha_alt:.2e}.")
-                    if best_R_alt is not None:
-                        self._ls_last_residual_red = np.asarray(best_R_alt, dtype=float)
-                    self._ls_alpha_prev = best_alpha_alt
-                    return best_alpha_alt * S_alt
+            step_alt, _, alpha_alt, best_R_alt = _best_effort_direction(S_alt, "        Armijo alt (S=-R)")
+            if step_alt is not None:
+                if best_R_alt is not None:
+                    self._ls_last_residual_red = np.asarray(best_R_alt, dtype=float)
+                self._ls_alpha_prev = float(alpha_alt)
+                self._ls_last_best_effort = True
+                return np.asarray(step_alt, dtype=float)
         # No decrease found; still take the smallest tried step to avoid stagnation.
         min_alpha = alpha
         if int(getattr(self.np, "print_level", 2) or 0) >= 2:
@@ -4485,6 +4794,7 @@ class NewtonSolver:
         if os.getenv("PYCUTFEM_LS_FAIL_HARD", "1").lower() not in {"0", "false", "no"}:
             raise RuntimeError("Line search failed: no residual decrease.")
         self._ls_alpha_prev = min_alpha
+        self._ls_last_best_effort = True
         return min_alpha * S_red
 
     def _assemble_residual_reduced_fast(self, coeffs) -> np.ndarray:
@@ -5689,6 +5999,52 @@ class NewtonSolver:
             return np.empty((0,), dtype=int)
         return np.unique(red_idx)
 
+    def _petsc_distributed_enabled(self) -> bool:
+        if not HAS_PETSC:
+            return False
+        requested = bool(getattr(getattr(self, "lp", None), "distributed", False))
+        raw = str(os.getenv("PYCUTFEM_PETSC_DISTRIBUTED", "") or "").strip().lower()
+        if raw:
+            requested = raw not in {"0", "false", "no", "off"}
+        if not requested:
+            return False
+        try:
+            return int(PETSc.COMM_WORLD.getSize()) > 1
+        except Exception:
+            return False
+
+    def _petsc_linear_comm(self):
+        return PETSc.COMM_WORLD if self._petsc_distributed_enabled() else PETSc.COMM_SELF
+
+    @staticmethod
+    def _petsc_local_csr_block(
+        A: sp.csr_matrix,
+        *,
+        row_start: int,
+        row_stop: int,
+        petsc_int_type,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        ia_full = np.asarray(A.indptr, dtype=petsc_int_type)
+        base = int(ia_full[int(row_start)])
+        end = int(ia_full[int(row_stop)])
+        ia_local = np.asarray(ia_full[int(row_start) : int(row_stop) + 1] - base, dtype=petsc_int_type)
+        ja_local = np.asarray(A.indices[base:end], dtype=petsc_int_type)
+        a_local = np.asarray(A.data[base:end], dtype=np.float64)
+        return ia_local, ja_local, a_local
+
+    @staticmethod
+    def _petsc_vec_to_numpy_full(x, *, distributed: bool) -> np.ndarray:
+        x_arr = x.getArray(readonly=True)
+        local = np.asarray(x_arr, dtype=np.float64).copy()
+        del x_arr
+        if not distributed:
+            return local
+        mpi_comm = x.getComm().tompi4py()
+        parts = mpi_comm.allgather(local)
+        if not parts:
+            return np.empty((0,), dtype=np.float64)
+        return np.concatenate(parts).astype(np.float64, copy=False)
+
     def _apply_linear_schur_fieldsplit(self, ksp, n: int) -> bool:
         from petsc4py import PETSc  # type: ignore
 
@@ -5711,8 +6067,12 @@ class NewtonSolver:
         pc.setType(str(cfg.get("outer_pc", "fieldsplit") or "fieldsplit"))
         pc.setFieldSplitType(PETSc.PC.CompositeType.SCHUR)
 
-        rest_is = PETSc.IS().createGeneral(rest_red.astype(PETSc.IntType), comm=PETSc.COMM_SELF)
-        p_is = PETSc.IS().createGeneral(p_red.astype(PETSc.IntType), comm=PETSc.COMM_SELF)
+        try:
+            comm = ksp.getComm()
+        except Exception:
+            comm = PETSc.COMM_SELF
+        rest_is = PETSc.IS().createGeneral(rest_red.astype(PETSc.IntType), comm=comm)
+        p_is = PETSc.IS().createGeneral(p_red.astype(PETSc.IntType), comm=comm)
         pc.setFieldSplitIS(("rest", rest_is), ("p", p_is))
 
         opts = PETSc.Options()
@@ -5739,8 +6099,13 @@ class NewtonSolver:
 
     def _solve_linear_system_petsc_core(self, A: sp.csr_matrix, rhs: np.ndarray) -> np.ndarray:
         """
-        Solve A x = rhs using PETSc KSP on COMM_SELF (serial) while reusing
-        the matrix sparsity pattern across Newton iterations.
+        Solve A x = rhs using PETSc KSP while reusing the matrix sparsity
+        pattern across Newton iterations.
+
+        In distributed mode, each rank contributes only its owned row block to
+        a COMM_WORLD AIJ matrix and PETSc performs a collective solve. The
+        assembled SciPy matrix is still available on every rank, but the linear
+        algebra itself is truly MPI collective.
         """
         from petsc4py import PETSc  # type: ignore
 
@@ -5751,17 +6116,39 @@ class NewtonSolver:
         if int(A.shape[1]) != n:
             raise ValueError("PETSc linear solve expects a square matrix.")
 
+        distributed = self._petsc_distributed_enabled()
+        comm = self._petsc_linear_comm()
+        try:
+            comm_size = int(comm.getSize())
+        except Exception:
+            comm_size = 1
         cache = getattr(self, "_petsc_linear_cache", None)
-        if cache is None or cache.get("n") != n:
-            comm = PETSc.COMM_SELF
+        if (
+            cache is None
+            or cache.get("n") != n
+            or bool(cache.get("distributed", False)) != bool(distributed)
+            or int(cache.get("comm_size", 1)) != int(comm_size)
+        ):
             mat = PETSc.Mat().createAIJ(size=(n, n), comm=comm)
-            # Preallocate once using the CSR pattern (indices/indptr).
-            ia = np.asarray(A.indptr, dtype=PETSc.IntType)
-            ja = np.asarray(A.indices, dtype=PETSc.IntType)
-            try:
-                mat.setPreallocationCSR((ia, ja))
-            except Exception:
-                pass
+            if distributed:
+                probe = PETSc.Vec().createMPI(n, comm=comm)
+                row_lo, row_hi = probe.getOwnershipRange()
+                try:
+                    probe.destroy()
+                except Exception:
+                    pass
+                try:
+                    local_nnz = np.diff(np.asarray(A.indptr[int(row_lo) : int(row_hi) + 1], dtype=np.int64))
+                    mat.setPreallocationNNZ(np.asarray(local_nnz, dtype=PETSc.IntType))
+                except Exception:
+                    pass
+            else:
+                ia = np.asarray(A.indptr, dtype=PETSc.IntType)
+                ja = np.asarray(A.indices, dtype=PETSc.IntType)
+                try:
+                    mat.setPreallocationCSR((ia, ja))
+                except Exception:
+                    pass
             try:
                 # When the interface moves or the active set changes, the CSR
                 # pattern can legitimately change; do not hard-fail on new nonzeros.
@@ -5769,6 +6156,7 @@ class NewtonSolver:
             except Exception:
                 pass
             mat.setUp()
+            row_lo, row_hi = mat.getOwnershipRange()
 
             ksp = PETSc.KSP().create(comm=comm)
             ksp.setOperators(mat)
@@ -5838,23 +6226,47 @@ class NewtonSolver:
                 except Exception:
                     pass
 
-            b = PETSc.Vec().createSeq(n, comm=comm)
-            x = PETSc.Vec().createSeq(n, comm=comm)
+            if distributed:
+                b = PETSc.Vec().createMPI(n, comm=comm)
+                x = PETSc.Vec().createMPI(n, comm=comm)
+            else:
+                b = PETSc.Vec().createSeq(n, comm=comm)
+                x = PETSc.Vec().createSeq(n, comm=comm)
 
-            cache = {"n": n, "mat": mat, "ksp": ksp, "b": b, "x": x}
+            cache = {
+                "n": n,
+                "mat": mat,
+                "ksp": ksp,
+                "b": b,
+                "x": x,
+                "distributed": bool(distributed),
+                "comm_size": int(comm_size),
+                "row_lo": int(row_lo),
+                "row_hi": int(row_hi),
+            }
             self._petsc_linear_cache = cache
 
         mat: PETSc.Mat = cache["mat"]
         ksp: PETSc.KSP = cache["ksp"]
         b: PETSc.Vec = cache["b"]
         x: PETSc.Vec = cache["x"]
+        row_lo = int(cache.get("row_lo", 0))
+        row_hi = int(cache.get("row_hi", n))
 
         # Update numeric values (pattern is the same).
         mat.zeroEntries()
-        ia = np.asarray(A.indptr, dtype=PETSc.IntType)
-        ja = np.asarray(A.indices, dtype=PETSc.IntType)
-        a = np.asarray(A.data, dtype=np.float64)
         rhs = np.asarray(rhs, dtype=np.float64)
+        if distributed:
+            ia, ja, a = self._petsc_local_csr_block(
+                A,
+                row_start=row_lo,
+                row_stop=row_hi,
+                petsc_int_type=PETSc.IntType,
+            )
+        else:
+            ia = np.asarray(A.indptr, dtype=PETSc.IntType)
+            ja = np.asarray(A.indices, dtype=PETSc.IntType)
+            a = np.asarray(A.data, dtype=np.float64)
         if (not np.all(np.isfinite(a))) or (not np.all(np.isfinite(rhs))):
             # Non-finite values can corrupt direct solvers (e.g. MUMPS) and even
             # leave cached PETSc objects in a bad internal state. Clear the cache
@@ -5878,7 +6290,10 @@ class NewtonSolver:
         # If a PETSc solve throws an exception while such a view is live, the lock
         # can persist and break subsequent solves (e.g. during adaptive-Δt retries).
         b_arr = b.getArray()
-        b_arr[:] = rhs
+        if distributed:
+            b_arr[:] = rhs[row_lo:row_hi]
+        else:
+            b_arr[:] = rhs
         del b_arr
 
         x.set(0.0)
@@ -5905,7 +6320,15 @@ class NewtonSolver:
                 rnorm = float(ksp.getResidualNorm())
             except Exception:
                 rnorm = float("nan")
-            print(f"        [ksp] type={ksp.getType()} pc={ksp.getPC().getType()} reason={reason} its={its} rnorm={rnorm:.3e}")
+            try:
+                rank = int(comm.getRank())
+            except Exception:
+                rank = 0
+            if rank == 0:
+                print(
+                    f"        [ksp] type={ksp.getType()} pc={ksp.getPC().getType()} "
+                    f"reason={reason} its={its} rnorm={rnorm:.3e} distributed={int(bool(distributed))}"
+                )
         if reason <= 0:
             try:
                 self._petsc_linear_cache = None
@@ -5922,9 +6345,7 @@ class NewtonSolver:
                 + ")."
             )
 
-        x_arr = x.getArray(readonly=True)
-        out = x_arr.copy()
-        del x_arr
+        out = self._petsc_vec_to_numpy_full(x, distributed=distributed)
         if not np.all(np.isfinite(out)):
             try:
                 self._petsc_linear_cache = None
@@ -7951,31 +8372,61 @@ class PdasNewtonSolver(NewtonSolver):
 
     def export_vi_state(self) -> dict[str, np.ndarray] | None:
         prev_state = getattr(self, "_vi_prev_state", None)
-        if prev_state is None:
+        active_dofs = np.asarray(getattr(self, "active_dofs", np.array([], dtype=int)), dtype=int).ravel()
+        if active_dofs.size == 0:
             return None
         state: dict[str, np.ndarray] = {
-            "active_dofs": np.asarray(self.active_dofs, dtype=int).copy(),
-            "prev_state": np.asarray(prev_state, dtype=np.int8).copy(),
+            "active_dofs": active_dofs.copy(),
         }
+        exported_any = False
+        if prev_state is not None:
+            state["prev_state"] = np.asarray(prev_state, dtype=np.int8).copy()
+            exported_any = True
         pending_state = getattr(self, "_vi_pending_state", None)
         pending_count = getattr(self, "_vi_pending_count", None)
         forced_state = getattr(self, "_vi_forced_state", None)
         guard_state = getattr(self, "_vi_working_set_guard_state", None)
         guard_active = getattr(self, "_vi_working_set_guard_active", None)
         guard_remaining = int(getattr(self, "_vi_working_set_guard_remaining", 0) or 0)
-        if pending_state is not None and np.asarray(pending_state).shape == np.asarray(prev_state).shape:
+        if prev_state is not None and pending_state is not None and np.asarray(pending_state).shape == np.asarray(prev_state).shape:
             state["pending_state"] = np.asarray(pending_state, dtype=np.int8).copy()
-        if pending_count is not None and np.asarray(pending_count).shape == np.asarray(prev_state).shape:
+            exported_any = True
+        if prev_state is not None and pending_count is not None and np.asarray(pending_count).shape == np.asarray(prev_state).shape:
             state["pending_count"] = np.asarray(pending_count, dtype=np.int16).copy()
-        if forced_state is not None and np.asarray(forced_state).shape == np.asarray(prev_state).shape:
+            exported_any = True
+        if prev_state is not None and forced_state is not None and np.asarray(forced_state).shape == np.asarray(prev_state).shape:
             state["forced_state"] = np.asarray(forced_state, dtype=np.int8).copy()
-        if guard_state is None and guard_active is not None and np.asarray(guard_active).shape == np.asarray(prev_state).shape:
+            exported_any = True
+        if prev_state is not None and guard_state is None and guard_active is not None and np.asarray(guard_active).shape == np.asarray(prev_state).shape:
             guard_state = np.asarray(guard_active, dtype=np.int8).copy()
             guard_remaining = max(guard_remaining, 1)
-        if guard_state is not None and np.asarray(guard_state).shape == np.asarray(prev_state).shape:
+        if prev_state is not None and guard_state is not None and np.asarray(guard_state).shape == np.asarray(prev_state).shape:
             state["guard_state"] = np.asarray(guard_state, dtype=np.int8).copy()
             state["guard_remaining"] = np.asarray([max(guard_remaining, 0)], dtype=np.int32)
-        return state
+            exported_any = True
+
+        eq_lambda_accepted = np.asarray(getattr(self, "_vi_eq_lambda_accepted", np.array([], dtype=float)), dtype=float).ravel()
+        if eq_lambda_accepted.size > 0:
+            state["vi_eq_lambda_accepted"] = eq_lambda_accepted.copy()
+            exported_any = True
+
+        ipm_z_lo = getattr(self, "_ipm_z_lo_current", None)
+        ipm_z_hi = getattr(self, "_ipm_z_hi_current", None)
+        if (
+            ipm_z_lo is not None
+            and ipm_z_hi is not None
+            and np.asarray(ipm_z_lo).shape == active_dofs.shape
+            and np.asarray(ipm_z_hi).shape == active_dofs.shape
+        ):
+            state["ipm_z_lo"] = np.asarray(ipm_z_lo, dtype=float).copy()
+            state["ipm_z_hi"] = np.asarray(ipm_z_hi, dtype=float).copy()
+            state["ipm_mu"] = np.asarray(
+                [float(getattr(self, "_ipm_mu_current", 0.0) or 0.0)],
+                dtype=float,
+            )
+            exported_any = True
+
+        return state if exported_any else None
 
     def import_vi_state(
         self,
@@ -7986,27 +8437,42 @@ class PdasNewtonSolver(NewtonSolver):
         if not state:
             return False
         src_active = np.asarray(state.get("active_dofs", np.array([], dtype=int)), dtype=int).ravel()
-        src_prev = np.asarray(state.get("prev_state", np.array([], dtype=np.int8)), dtype=np.int8).ravel()
-        if src_active.size == 0 or src_prev.size != src_active.size:
+        if src_active.size == 0:
             return False
         tgt_active = np.asarray(self.active_dofs, dtype=int).ravel()
         if tgt_active.size == 0:
             return False
+        src_prev_raw = state.get("prev_state", None)
+        has_prev_state = src_prev_raw is not None
+        src_prev = np.asarray(
+            src_prev_raw if src_prev_raw is not None else np.array([], dtype=np.int8),
+            dtype=np.int8,
+        ).ravel()
+        if has_prev_state and src_prev.size != src_active.size:
+            return False
+        src_z_lo = np.asarray(state.get("ipm_z_lo", np.array([], dtype=float)), dtype=float).ravel()
+        src_z_hi = np.asarray(state.get("ipm_z_hi", np.array([], dtype=float)), dtype=float).ravel()
+        has_ipm_state = src_z_lo.size == src_active.size and src_z_hi.size == src_active.size
+        src_eq_lambda = np.asarray(state.get("vi_eq_lambda_accepted", np.array([], dtype=float)), dtype=float).ravel()
+        try:
+            src_ipm_mu = float(np.asarray(state.get("ipm_mu", np.array([0.0], dtype=float))).ravel()[0])
+        except Exception:
+            src_ipm_mu = 0.0
 
         src_pending = np.asarray(state.get("pending_state", src_prev), dtype=np.int8).ravel()
-        if src_pending.size != src_active.size:
+        if not has_prev_state or src_pending.size != src_active.size:
             src_pending = src_prev.copy()
         src_counts = np.asarray(
             state.get("pending_count", np.zeros(src_active.shape, dtype=np.int16)),
             dtype=np.int16,
         ).ravel()
-        if src_counts.size != src_active.size:
+        if not has_prev_state or src_counts.size != src_active.size:
             src_counts = np.zeros(src_active.shape, dtype=np.int16)
         src_forced = np.asarray(state.get("forced_state", src_prev), dtype=np.int8).ravel()
-        if src_forced.size != src_active.size:
+        if not has_prev_state or src_forced.size != src_active.size:
             src_forced = src_prev.copy()
         src_guard = np.asarray(state.get("guard_state", np.zeros(src_active.shape, dtype=np.int8)), dtype=np.int8).ravel()
-        if src_guard.size != src_active.size:
+        if not has_prev_state or src_guard.size != src_active.size:
             src_guard = np.zeros(src_active.shape, dtype=np.int8)
         try:
             src_guard_remaining = int(np.asarray(state.get("guard_remaining", np.array([0], dtype=np.int32))).ravel()[0])
@@ -8019,34 +8485,70 @@ class PdasNewtonSolver(NewtonSolver):
         imported_counts = np.zeros((tgt_active.size,), dtype=np.int16)
         imported_forced = np.zeros((tgt_active.size,), dtype=np.int8)
         imported_guard = np.zeros((tgt_active.size,), dtype=np.int8)
+        imported_z_lo = np.zeros((tgt_active.size,), dtype=float)
+        imported_z_hi = np.zeros((tgt_active.size,), dtype=float)
 
         matched = 0
         for src_idx, gdof in enumerate(src_active.tolist()):
             tgt_idx = tgt_lookup.get(int(gdof))
             if tgt_idx is None:
                 continue
-            imported_prev[tgt_idx] = np.int8(src_prev[src_idx])
-            imported_pending[tgt_idx] = np.int8(src_pending[src_idx])
-            imported_counts[tgt_idx] = np.int16(src_counts[src_idx])
-            imported_forced[tgt_idx] = np.int8(src_forced[src_idx])
-            imported_guard[tgt_idx] = np.int8(src_guard[src_idx])
+            if has_prev_state:
+                imported_prev[tgt_idx] = np.int8(src_prev[src_idx])
+                imported_pending[tgt_idx] = np.int8(src_pending[src_idx])
+                imported_counts[tgt_idx] = np.int16(src_counts[src_idx])
+                imported_forced[tgt_idx] = np.int8(src_forced[src_idx])
+                imported_guard[tgt_idx] = np.int8(src_guard[src_idx])
+            if has_ipm_state:
+                imported_z_lo[tgt_idx] = float(src_z_lo[src_idx])
+                imported_z_hi[tgt_idx] = float(src_z_hi[src_idx])
             matched += 1
 
         if matched <= 0:
             return False
 
-        self._vi_prev_state = imported_prev
-        self._vi_pending_state = imported_pending
-        self._vi_pending_count = imported_counts
-        self._vi_forced_state = imported_forced if force_once else None
-        if src_guard_remaining > 0 and np.any(imported_guard != 0):
-            self._vi_working_set_guard_state = imported_guard.copy()
-            self._vi_working_set_guard_remaining = int(src_guard_remaining)
-            self._vi_working_set_guard_active = None
-        else:
-            self._vi_clear_working_set_guard()
-        self._vi_preserve_state_on_next_solve = True
-        return True
+        imported_any = False
+        if has_prev_state:
+            self._vi_prev_state = imported_prev
+            self._vi_pending_state = imported_pending
+            self._vi_pending_count = imported_counts
+            self._vi_forced_state = imported_forced if force_once else None
+            if src_guard_remaining > 0 and np.any(imported_guard != 0):
+                self._vi_working_set_guard_state = imported_guard.copy()
+                self._vi_working_set_guard_remaining = int(src_guard_remaining)
+                self._vi_working_set_guard_active = None
+            else:
+                self._vi_clear_working_set_guard()
+            self._vi_preserve_state_on_next_solve = True
+            imported_any = True
+
+        ipm_payload: dict[str, np.ndarray | float] = {}
+        if has_ipm_state:
+            ipm_payload["z_lo"] = imported_z_lo.copy()
+            ipm_payload["z_hi"] = imported_z_hi.copy()
+            ipm_payload["mu"] = float(src_ipm_mu)
+            imported_any = True
+        if src_eq_lambda.size > 0:
+            ipm_payload["eq_lambda"] = np.asarray(src_eq_lambda, dtype=float).copy()
+            imported_any = True
+        if ipm_payload:
+            if force_once:
+                self._ipm_forced_state = ipm_payload
+            else:
+                z_lo_now = ipm_payload.get("z_lo", None)
+                z_hi_now = ipm_payload.get("z_hi", None)
+                if z_lo_now is not None and z_hi_now is not None:
+                    self._ipm_z_lo_current = np.asarray(z_lo_now, dtype=float).copy()
+                    self._ipm_z_hi_current = np.asarray(z_hi_now, dtype=float).copy()
+                if "mu" in ipm_payload:
+                    self._ipm_mu_current = float(ipm_payload["mu"])
+                eq_now = ipm_payload.get("eq_lambda", None)
+                if eq_now is not None:
+                    eq_arr = np.asarray(eq_now, dtype=float).ravel()
+                    if int(eq_arr.size) == int(getattr(self, "_vi_eq_lambda_accepted", np.array([], dtype=float)).size):
+                        self._vi_eq_lambda_accepted = eq_arr.copy()
+                        self._vi_eq_lambda_current = eq_arr.copy()
+        return imported_any
 
     def _build_vi_reduced_field_names(self) -> np.ndarray:
         names: list[str] = []
@@ -12802,6 +13304,1974 @@ class PdasNewtonSolver(NewtonSolver):
             return delta, True, int(last_it)
 
         raise RuntimeError("VI Newton did not converge – adjust tolerances/Δt or verify Jacobian.")
+
+
+class InteriorPointNewtonSolver(PdasNewtonSolver):
+    """
+    Internal primal-dual interior-point Newton solver for box constraints plus
+    optional linear equalities.
+
+    The primal variables remain the physical reduced DOFs. Bounds are enforced
+    through strictly positive slacks/multipliers and a barrier homotopy instead
+    of active-set switching.
+    """
+
+    def __init__(self, *args, vi_params: VIParameters = VIParameters(), **kwargs):
+        super().__init__(*args, vi_params=vi_params, **kwargs)
+        self._ipm_z_lo_current: np.ndarray | None = None
+        self._ipm_z_hi_current: np.ndarray | None = None
+        self._ipm_forced_state: dict[str, np.ndarray | float] | None = None
+        self._ipm_mu_current: float = max(
+            float(getattr(self.vi_params, "interior_point_mu0", 1.0e-2) or 1.0e-2),
+            0.0,
+        )
+
+    @staticmethod
+    def _ipm_bound_masks(lo_red: np.ndarray, hi_red: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        return np.isfinite(np.asarray(lo_red, dtype=float)), np.isfinite(np.asarray(hi_red, dtype=float))
+
+    def _ipm_write_reduced_iterate(self, funcs: list, bcs_now, x_target_red: np.ndarray) -> None:
+        x_curr_red = self._pack_reduced_iterate(funcs)
+        d_red = np.asarray(x_target_red, dtype=float).ravel() - np.asarray(x_curr_red, dtype=float).ravel()
+        if not np.any(d_red):
+            return
+        d_full = self.restrictor.expand_vec(d_red)
+        self.dh.add_to_functions(d_full, funcs)
+        self.dh.apply_bcs(bcs_now, *funcs)
+        if getattr(self, "constraints", None) is not None:
+            self._enforce_constraints_on_functions(funcs)
+
+    def _ipm_push_strictly_interior(
+        self,
+        *,
+        x_red: np.ndarray,
+        lo_red: np.ndarray,
+        hi_red: np.ndarray,
+        eq_data: _PreparedLinearEqualities,
+    ) -> np.ndarray:
+        x_work = np.minimum(np.maximum(np.asarray(x_red, dtype=float), np.asarray(lo_red, dtype=float)), np.asarray(hi_red, dtype=float))
+        push0 = max(float(getattr(self.vi_params, "interior_point_initial_push", 1.0e-8) or 1.0e-8), 1.0e-14)
+        lo_mask, hi_mask = self._ipm_bound_masks(lo_red, hi_red)
+        if not np.any(lo_mask | hi_mask):
+            return x_work.copy()
+
+        push = float(push0)
+        for _ in range(10):
+            lo_tight = np.asarray(lo_red, dtype=float).copy()
+            hi_tight = np.asarray(hi_red, dtype=float).copy()
+
+            both = lo_mask & hi_mask
+            if np.any(both):
+                width = np.maximum(np.asarray(hi_red[both] - lo_red[both], dtype=float), 1.0)
+                lo_tight[both] = np.asarray(lo_red[both], dtype=float) + push * width
+                hi_tight[both] = np.asarray(hi_red[both], dtype=float) - push * width
+                if np.any(lo_tight[both] >= hi_tight[both]):
+                    push *= 0.1
+                    continue
+
+            lo_only = lo_mask & (~hi_mask)
+            if np.any(lo_only):
+                scale = np.maximum(np.abs(np.asarray(x_work[lo_only], dtype=float)), 1.0)
+                lo_tight[lo_only] = np.asarray(lo_red[lo_only], dtype=float) + push * scale
+
+            hi_only = hi_mask & (~lo_mask)
+            if np.any(hi_only):
+                scale = np.maximum(np.abs(np.asarray(x_work[hi_only], dtype=float)), 1.0)
+                hi_tight[hi_only] = np.asarray(hi_red[hi_only], dtype=float) - push * scale
+
+            try:
+                if int(eq_data.B_red.shape[0]) > 0:
+                    x_try = self._project_box_with_prepared_equalities(
+                        x=x_work,
+                        lo=lo_tight,
+                        hi=hi_tight,
+                        eq_data=eq_data,
+                        tol=max(1.0e-14, 0.1 * push),
+                    )
+                else:
+                    x_try = np.minimum(np.maximum(x_work, lo_tight), hi_tight)
+            except Exception:
+                push *= 0.1
+                continue
+
+            strict_tol = max(1.0e-14, 0.25 * push)
+            ok_lo = (not np.any(lo_mask)) or bool(np.all(np.asarray(x_try[lo_mask] - lo_red[lo_mask], dtype=float) > strict_tol))
+            ok_hi = (not np.any(hi_mask)) or bool(np.all(np.asarray(hi_red[hi_mask] - x_try[hi_mask], dtype=float) > strict_tol))
+            if ok_lo and ok_hi:
+                return np.asarray(x_try, dtype=float).copy()
+            x_work = np.asarray(x_try, dtype=float).copy()
+            push *= 0.1
+
+        raise RuntimeError("Interior-point initialization could not find a strictly interior feasible point.")
+
+    def _ipm_initialize_duals(
+        self,
+        *,
+        x_red: np.ndarray,
+        stationarity_red: np.ndarray,
+        lo_red: np.ndarray,
+        hi_red: np.ndarray,
+        mu: float,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        x_red = np.asarray(x_red, dtype=float).ravel()
+        stat = np.asarray(stationarity_red, dtype=float).ravel()
+        lo_mask, hi_mask = self._ipm_bound_masks(lo_red, hi_red)
+        shift = max(float(getattr(self.vi_params, "interior_point_initial_push", 1.0e-8) or 1.0e-8), 1.0e-12)
+        mu_use = max(float(mu), shift)
+        slack_lo = np.zeros(x_red.shape, dtype=float)
+        slack_hi = np.zeros(x_red.shape, dtype=float)
+        if np.any(lo_mask):
+            slack_lo[lo_mask] = np.maximum(np.asarray(x_red[lo_mask] - lo_red[lo_mask], dtype=float), shift)
+        if np.any(hi_mask):
+            slack_hi[hi_mask] = np.maximum(np.asarray(hi_red[hi_mask] - x_red[hi_mask], dtype=float), shift)
+        z_lo = np.zeros(x_red.shape, dtype=float)
+        z_hi = np.zeros(x_red.shape, dtype=float)
+        weight_dual = 1.0
+        for i in range(int(x_red.size)):
+            has_lo = bool(lo_mask[i])
+            has_hi = bool(hi_mask[i])
+            if not has_lo and not has_hi:
+                continue
+            a = float(slack_lo[i]) if has_lo else 0.0
+            b = float(slack_hi[i]) if has_hi else 0.0
+            s = float(stat[i])
+
+            if has_lo and has_hi:
+                m11 = weight_dual + a * a
+                m22 = weight_dual + b * b
+                det = m11 * m22 - weight_dual * weight_dual
+                if det <= 1.0e-30 or not np.isfinite(det):
+                    z_lo_i = max(mu_use / max(a, shift), shift)
+                    z_hi_i = max(mu_use / max(b, shift), shift)
+                else:
+                    rhs1 = weight_dual * s + a * mu_use
+                    rhs2 = -weight_dual * s + b * mu_use
+                    z_lo_i = (m22 * rhs1 + weight_dual * rhs2) / det
+                    z_hi_i = (weight_dual * rhs1 + m11 * rhs2) / det
+                z_lo[i] = max(float(z_lo_i), shift)
+                z_hi[i] = max(float(z_hi_i), shift)
+                continue
+
+            if has_lo:
+                denom = weight_dual + a * a
+                rhs = weight_dual * s + a * mu_use
+                z_lo[i] = max(float(rhs / max(denom, 1.0e-30)), shift)
+                continue
+
+            denom = weight_dual + b * b
+            rhs = -weight_dual * s + b * mu_use
+            z_hi[i] = max(float(rhs / max(denom, 1.0e-30)), shift)
+        return z_lo, z_hi
+
+    def _ipm_residual_data(
+        self,
+        *,
+        x_red: np.ndarray,
+        R_red: np.ndarray,
+        lo_red: np.ndarray,
+        hi_red: np.ndarray,
+        eq_data: _PreparedLinearEqualities,
+        lambda_eq: np.ndarray,
+        z_lo: np.ndarray,
+        z_hi: np.ndarray,
+        mu: float,
+    ) -> dict[str, np.ndarray | float]:
+        x_red = np.asarray(x_red, dtype=float).ravel()
+        R_red = np.asarray(R_red, dtype=float).ravel()
+        z_lo = np.asarray(z_lo, dtype=float).ravel()
+        z_hi = np.asarray(z_hi, dtype=float).ravel()
+        lo_red = np.asarray(lo_red, dtype=float).ravel()
+        hi_red = np.asarray(hi_red, dtype=float).ravel()
+        lo_mask, hi_mask = self._ipm_bound_masks(lo_red, hi_red)
+
+        stationarity_red = self._vi_stationarity_residual(R_red, eq_data, lambda_eq)
+        slack_lo = np.zeros(x_red.shape, dtype=float)
+        slack_hi = np.zeros(x_red.shape, dtype=float)
+        if np.any(lo_mask):
+            slack_lo[lo_mask] = np.asarray(x_red[lo_mask] - lo_red[lo_mask], dtype=float)
+        if np.any(hi_mask):
+            slack_hi[hi_mask] = np.asarray(hi_red[hi_mask] - x_red[hi_mask], dtype=float)
+
+        dual_red = np.asarray(stationarity_red, dtype=float).copy()
+        dual_red -= np.where(lo_mask, z_lo, 0.0)
+        dual_red += np.where(hi_mask, z_hi, 0.0)
+
+        eq_res = self._vi_equality_residual(x_red, eq_data)
+        cent_lo = np.asarray(slack_lo[lo_mask] * z_lo[lo_mask] - float(mu), dtype=float) if np.any(lo_mask) else np.zeros((0,), dtype=float)
+        cent_hi = np.asarray(slack_hi[hi_mask] * z_hi[hi_mask] - float(mu), dtype=float) if np.any(hi_mask) else np.zeros((0,), dtype=float)
+        box_lo = np.maximum(np.asarray(lo_red - x_red, dtype=float), 0.0)
+        box_hi = np.maximum(np.asarray(x_red - hi_red, dtype=float), 0.0)
+        zneg_lo = np.maximum(-np.asarray(z_lo[lo_mask], dtype=float), 0.0) if np.any(lo_mask) else np.zeros((0,), dtype=float)
+        zneg_hi = np.maximum(-np.asarray(z_hi[hi_mask], dtype=float), 0.0) if np.any(hi_mask) else np.zeros((0,), dtype=float)
+
+        residual_blocks = [dual_red]
+        if eq_res.size:
+            residual_blocks.append(eq_res)
+        if cent_lo.size:
+            residual_blocks.append(cent_lo)
+        if cent_hi.size:
+            residual_blocks.append(cent_hi)
+        if np.any(box_lo):
+            residual_blocks.append(box_lo)
+        if np.any(box_hi):
+            residual_blocks.append(box_hi)
+        if zneg_lo.size:
+            residual_blocks.append(zneg_lo)
+        if zneg_hi.size:
+            residual_blocks.append(zneg_hi)
+        residual_vec = np.concatenate(residual_blocks, axis=0) if residual_blocks else np.zeros((0,), dtype=float)
+        residual_norm_inf = float(np.linalg.norm(residual_vec, ord=np.inf)) if residual_vec.size else 0.0
+        residual_merit = 0.5 * float(residual_vec @ residual_vec)
+
+        return {
+            "stationarity": stationarity_red,
+            "dual": dual_red,
+            "eq": eq_res,
+            "slack_lo": slack_lo,
+            "slack_hi": slack_hi,
+            "cent_lo": cent_lo,
+            "cent_hi": cent_hi,
+            "box_lo": box_lo,
+            "box_hi": box_hi,
+            "residual_vec": residual_vec,
+            "G_inf": float(residual_norm_inf),
+            "merit": float(residual_merit),
+            "lo_mask": lo_mask,
+            "hi_mask": hi_mask,
+        }
+
+    def _ipm_metrics(
+        self,
+        *,
+        residual_data: dict[str, np.ndarray | float],
+        mu: float,
+        alpha_trial: float | None = None,
+    ) -> dict[str, float]:
+        dual_inf = float(np.linalg.norm(np.asarray(residual_data["dual"], dtype=float), ord=np.inf)) if np.asarray(residual_data["dual"], dtype=float).size else 0.0
+        eq_inf = float(np.linalg.norm(np.asarray(residual_data["eq"], dtype=float), ord=np.inf)) if np.asarray(residual_data["eq"], dtype=float).size else 0.0
+        box_lo_inf = float(np.linalg.norm(np.asarray(residual_data["box_lo"], dtype=float), ord=np.inf)) if np.asarray(residual_data["box_lo"], dtype=float).size else 0.0
+        box_hi_inf = float(np.linalg.norm(np.asarray(residual_data["box_hi"], dtype=float), ord=np.inf)) if np.asarray(residual_data["box_hi"], dtype=float).size else 0.0
+        cent_lo_inf = float(np.linalg.norm(np.asarray(residual_data["cent_lo"], dtype=float), ord=np.inf)) if np.asarray(residual_data["cent_lo"], dtype=float).size else 0.0
+        cent_hi_inf = float(np.linalg.norm(np.asarray(residual_data["cent_hi"], dtype=float), ord=np.inf)) if np.asarray(residual_data["cent_hi"], dtype=float).size else 0.0
+        stat_inf = float(np.linalg.norm(np.asarray(residual_data["dual"], dtype=float), ord=np.inf)) if np.asarray(residual_data["dual"], dtype=float).size else 0.0
+        slack_feas_inf = float(max(box_lo_inf, box_hi_inf))
+        return {
+            "G_inf": float(residual_data["G_inf"]),
+            "stationarity_inf": float(stat_inf),
+            "inactive_res_inf": float(dual_inf),
+            "slack_feas_inf": float(slack_feas_inf),
+            "active_gap_inf": float(slack_feas_inf),
+            "equality_inf": float(eq_inf),
+            "centrality_inf": float(max(cent_lo_inf, cent_hi_inf)),
+            "merit": float(residual_data["merit"]),
+            "G_half": float(np.sqrt(max(2.0 * float(residual_data["merit"]), 0.0))),
+            "delta_active": 0.0,
+            "soft_active": 0.0,
+            "mu": float(mu),
+            "alpha_trial": float(1.0 if alpha_trial is None else alpha_trial),
+        }
+
+    @staticmethod
+    def _ipm_filter_components(metrics: dict[str, float]) -> tuple[float, float]:
+        feas = max(
+            float(metrics.get("stationarity_inf", metrics.get("inactive_res_inf", 0.0))),
+            float(metrics.get("equality_inf", 0.0)),
+            float(metrics.get("slack_feas_inf", metrics.get("active_gap_inf", 0.0))),
+        )
+        cent = float(metrics.get("centrality_inf", 0.0))
+        return float(feas), float(cent)
+
+    @staticmethod
+    def _ipm_prune_filter_entries(entries: list[tuple[float, float]]) -> list[tuple[float, float]]:
+        if not entries:
+            return []
+        keep: list[tuple[float, float]] = []
+        for i, entry in enumerate(entries):
+            dominated = False
+            for j, other in enumerate(entries):
+                if i == j:
+                    continue
+                if (
+                    float(other[0]) <= float(entry[0]) + 1.0e-16
+                    and float(other[1]) <= float(entry[1]) + 1.0e-16
+                    and (
+                        float(other[0]) < float(entry[0]) - 1.0e-16
+                        or float(other[1]) < float(entry[1]) - 1.0e-16
+                    )
+                ):
+                    dominated = True
+                    break
+            if not dominated:
+                keep.append((float(entry[0]), float(entry[1])))
+        keep.sort(key=lambda item: (float(item[0]), float(item[1])))
+        return keep
+
+    def _ipm_register_filter_entry(
+        self,
+        entries: list[tuple[float, float]],
+        metrics: dict[str, float],
+    ) -> list[tuple[float, float]]:
+        next_entries = list(entries)
+        next_entries.append(self._ipm_filter_components(metrics))
+        next_entries = self._ipm_prune_filter_entries(next_entries)
+        max_entries = max(1, int(getattr(self.vi_params, "interior_point_filter_max_entries", 16) or 16))
+        if len(next_entries) > max_entries:
+            next_entries = next_entries[:max_entries]
+        return next_entries
+
+    def _ipm_filter_accepts(
+        self,
+        *,
+        metrics_trial: dict[str, float],
+        metrics_ref: dict[str, float],
+        filter_entries: list[tuple[float, float]],
+        alpha_trial: float,
+    ) -> tuple[bool, str]:
+        abs_floor = _vi_filter_abs_floor(self.vi_params)
+        slack_ok = float(metrics_trial.get("slack_feas_inf", metrics_trial["active_gap_inf"])) <= max(
+            _vi_filter_threshold(
+                base=float(metrics_ref.get("slack_feas_inf", metrics_ref["active_gap_inf"])),
+                growth=float(getattr(self.vi_params, "filter_max_gap_growth", 1.25) or 1.25),
+                abs_floor=abs_floor,
+            ),
+            abs_floor,
+        )
+        if not slack_ok:
+            return False, "slack_guard"
+        eq_ok = float(metrics_trial["equality_inf"]) <= max(
+            _vi_filter_threshold(
+                base=float(metrics_ref["equality_inf"]),
+                growth=float(getattr(self.vi_params, "filter_max_equality_growth", 1.25) or 1.25),
+                abs_floor=abs_floor,
+            ),
+            abs_floor,
+        )
+        if not eq_ok:
+            return False, "eq_guard"
+
+        gamma = max(float(getattr(self.vi_params, "interior_point_filter_margin", 1.0e-4) or 1.0e-4), 1.0e-8)
+        alpha_eff = max(float(alpha_trial), 1.0e-3)
+        trial_feas, trial_cent = self._ipm_filter_components(metrics_trial)
+        ref_feas, ref_cent = self._ipm_filter_components(metrics_ref)
+        feas_scale = max(float(ref_feas), abs_floor)
+        cent_scale = max(float(ref_cent), abs_floor)
+        feas_growth = float(
+            getattr(
+                self.vi_params,
+                "interior_point_filter_max_feas_growth",
+                getattr(self.vi_params, "filter_max_residual_growth", 1.25) or 1.25,
+            )
+            or 1.25
+        )
+        if float(ref_cent) > 10.0 * feas_scale:
+            feas_growth = max(float(feas_growth), 2.0)
+        feas_growth_limit = max(
+            _vi_filter_threshold(
+                base=float(ref_feas),
+                growth=float(feas_growth),
+                abs_floor=abs_floor,
+            ),
+            abs_floor,
+        )
+        improved_feas = float(trial_feas) <= max((1.0 - gamma * alpha_eff) * feas_scale, abs_floor)
+        improved_cent = float(trial_cent) <= max((1.0 - gamma * alpha_eff) * cent_scale, abs_floor)
+        if float(trial_feas) > float(feas_growth_limit) and not improved_feas:
+            return False, "feas_guard"
+        dominant_feas = feas_scale >= 2.0 * cent_scale
+        if dominant_feas and improved_cent and not improved_feas:
+            merit_ref = max(float(metrics_ref["merit"]), abs_floor)
+            merit_trial = float(metrics_trial["merit"])
+            if float(trial_feas) > 1.01 * feas_scale:
+                return False, "dominant_feas_guard"
+            if merit_trial > (1.0 - 0.25 * gamma * alpha_eff) * merit_ref:
+                return False, "dominant_feas_guard"
+
+        for entry_feas, entry_cent in filter_entries:
+            entry_feas_scale = max(float(entry_feas), abs_floor)
+            entry_cent_scale = max(float(entry_cent), abs_floor)
+            dominated = (
+                float(trial_feas) >= (1.0 - gamma * alpha_eff) * entry_feas_scale
+                and float(trial_cent) >= (1.0 - gamma * alpha_eff) * entry_cent_scale
+            )
+            if dominated:
+                return False, "filter_dominated"
+
+        if improved_feas and improved_cent:
+            return True, "filter_feas+cent"
+        if improved_feas:
+            return True, "filter_feas"
+        if improved_cent:
+            return True, "filter_cent"
+
+        merit_ref = max(float(metrics_ref["merit"]), abs_floor)
+        merit_trial = float(metrics_trial["merit"])
+        if (
+            merit_trial <= (1.0 - gamma * alpha_eff) * merit_ref
+            and float(trial_feas) <= 1.05 * feas_scale
+            and float(trial_cent) <= 1.05 * cent_scale
+        ):
+            return True, "filter_merit"
+        return False, "no_filter_improvement"
+
+    @staticmethod
+    def _ipm_slack_directions(
+        *,
+        dx_red: np.ndarray,
+        lo_mask: np.ndarray,
+        hi_mask: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        dx_red = np.asarray(dx_red, dtype=float).ravel()
+        ds_lo = np.zeros(dx_red.shape, dtype=float)
+        ds_hi = np.zeros(dx_red.shape, dtype=float)
+        if np.any(lo_mask):
+            ds_lo[lo_mask] = np.asarray(dx_red[lo_mask], dtype=float)
+        if np.any(hi_mask):
+            ds_hi[hi_mask] = -np.asarray(dx_red[hi_mask], dtype=float)
+        return ds_lo, ds_hi
+
+    @staticmethod
+    def _ipm_mean_complementarity(
+        *,
+        slack_lo: np.ndarray,
+        slack_hi: np.ndarray,
+        z_lo: np.ndarray,
+        z_hi: np.ndarray,
+        lo_mask: np.ndarray,
+        hi_mask: np.ndarray,
+    ) -> float:
+        comp_vals: list[np.ndarray] = []
+        if np.any(lo_mask):
+            comp_vals.append(np.asarray(slack_lo[lo_mask], dtype=float) * np.asarray(z_lo[lo_mask], dtype=float))
+        if np.any(hi_mask):
+            comp_vals.append(np.asarray(slack_hi[hi_mask], dtype=float) * np.asarray(z_hi[hi_mask], dtype=float))
+        if not comp_vals:
+            return 0.0
+        comp_concat = np.concatenate(comp_vals, axis=0)
+        if comp_concat.size == 0:
+            return 0.0
+        return float(np.mean(comp_concat))
+
+    def _ipm_multiplier_step(
+        self,
+        *,
+        dx_red: np.ndarray,
+        z_lo: np.ndarray,
+        z_hi: np.ndarray,
+        slack_lo: np.ndarray,
+        slack_hi: np.ndarray,
+        lo_mask: np.ndarray,
+        hi_mask: np.ndarray,
+        cent_lo_res: np.ndarray | None = None,
+        cent_hi_res: np.ndarray | None = None,
+        residual_data: dict[str, np.ndarray | float] | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        dx_red = np.asarray(dx_red, dtype=float).ravel()
+        z_lo = np.asarray(z_lo, dtype=float).ravel()
+        z_hi = np.asarray(z_hi, dtype=float).ravel()
+        slack_lo = np.asarray(slack_lo, dtype=float).ravel()
+        slack_hi = np.asarray(slack_hi, dtype=float).ravel()
+        dz_lo = np.zeros(dx_red.shape, dtype=float)
+        dz_hi = np.zeros(dx_red.shape, dtype=float)
+        if cent_lo_res is None:
+            if residual_data is None:
+                raise ValueError("residual_data is required when cent_lo_res is not provided.")
+            cent_lo_use = np.asarray(residual_data["cent_lo"], dtype=float)
+        else:
+            cent_lo_use = np.asarray(cent_lo_res, dtype=float)
+        if cent_hi_res is None:
+            if residual_data is None:
+                raise ValueError("residual_data is required when cent_hi_res is not provided.")
+            cent_hi_use = np.asarray(residual_data["cent_hi"], dtype=float)
+        else:
+            cent_hi_use = np.asarray(cent_hi_res, dtype=float)
+        if np.any(lo_mask):
+            dz_lo[lo_mask] = (
+                -cent_lo_use
+                - np.asarray(z_lo[lo_mask], dtype=float) * np.asarray(dx_red[lo_mask], dtype=float)
+            ) / np.maximum(np.asarray(slack_lo[lo_mask], dtype=float), 1.0e-300)
+        if np.any(hi_mask):
+            dz_hi[hi_mask] = (
+                -cent_hi_use
+                + np.asarray(z_hi[hi_mask], dtype=float) * np.asarray(dx_red[hi_mask], dtype=float)
+            ) / np.maximum(np.asarray(slack_hi[hi_mask], dtype=float), 1.0e-300)
+        return dz_lo, dz_hi
+
+    def _ipm_primal_dual_direction(
+        self,
+        *,
+        A_red,
+        eq_data: _PreparedLinearEqualities,
+        residual_data: dict[str, np.ndarray | float],
+        z_lo: np.ndarray,
+        z_hi: np.ndarray,
+        slack_lo: np.ndarray,
+        slack_hi: np.ndarray,
+        lo_mask: np.ndarray,
+        hi_mask: np.ndarray,
+        cent_lo_res: np.ndarray | None = None,
+        cent_hi_res: np.ndarray | None = None,
+        dual_rhs: np.ndarray | None = None,
+        eq_rhs: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
+        x_shape = np.asarray(z_lo, dtype=float).shape
+        rhs_red = -np.asarray(
+            np.asarray(residual_data["dual"], dtype=float) if dual_rhs is None else np.asarray(dual_rhs, dtype=float),
+            dtype=float,
+        ).copy()
+        diag_red = np.zeros(x_shape, dtype=float)
+        cent_lo_use = (
+            np.asarray(residual_data["cent_lo"], dtype=float)
+            if cent_lo_res is None
+            else np.asarray(cent_lo_res, dtype=float)
+        )
+        cent_hi_use = (
+            np.asarray(residual_data["cent_hi"], dtype=float)
+            if cent_hi_res is None
+            else np.asarray(cent_hi_res, dtype=float)
+        )
+        if np.any(lo_mask):
+            diag_red[lo_mask] += np.asarray(z_lo[lo_mask], dtype=float) / np.maximum(np.asarray(slack_lo[lo_mask], dtype=float), 1.0e-300)
+            rhs_red[lo_mask] += -cent_lo_use / np.maximum(np.asarray(slack_lo[lo_mask], dtype=float), 1.0e-300)
+        if np.any(hi_mask):
+            diag_red[hi_mask] += np.asarray(z_hi[hi_mask], dtype=float) / np.maximum(np.asarray(slack_hi[hi_mask], dtype=float), 1.0e-300)
+            rhs_red[hi_mask] += cent_hi_use / np.maximum(np.asarray(slack_hi[hi_mask], dtype=float), 1.0e-300)
+
+        H_x = (A_red + sp.diags(diag_red, format="csr")).tocsr()
+        eq_res = np.asarray(
+            np.asarray(residual_data["eq"], dtype=float) if eq_rhs is None else np.asarray(eq_rhs, dtype=float),
+            dtype=float,
+        )
+        A_aug, rhs_aug = self._vi_build_augmented_system(
+            H_x,
+            rhs_red,
+            np.zeros(x_shape, dtype=bool),
+            eq_data,
+            eq_res,
+        )
+
+        t_lin = time.perf_counter()
+        step_aug = self._solve_linear_system_with_context(
+            A_aug,
+            rhs_aug,
+            context="vi_augmented",
+        )
+        lin_time = time.perf_counter() - t_lin
+        dx_red, dlam_eq = self._vi_split_augmented_step(step_aug, eq_data)
+        dz_lo, dz_hi = self._ipm_multiplier_step(
+            dx_red=dx_red,
+            z_lo=z_lo,
+            z_hi=z_hi,
+            slack_lo=slack_lo,
+            slack_hi=slack_hi,
+            lo_mask=lo_mask,
+            hi_mask=hi_mask,
+            cent_lo_res=cent_lo_use,
+            cent_hi_res=cent_hi_use,
+        )
+        return dx_red, dlam_eq, dz_lo, dz_hi, float(lin_time)
+
+    def _ipm_predictor_corrector_direction(
+        self,
+        *,
+        A_red,
+        eq_data: _PreparedLinearEqualities,
+        residual_data: dict[str, np.ndarray | float],
+        z_lo: np.ndarray,
+        z_hi: np.ndarray,
+        slack_lo: np.ndarray,
+        slack_hi: np.ndarray,
+        lo_mask: np.ndarray,
+        hi_mask: np.ndarray,
+        mu: float,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, dict[str, float]]:
+        dx_red, dlam_eq, dz_lo, dz_hi, lin_time = self._ipm_primal_dual_direction(
+            A_red=A_red,
+            eq_data=eq_data,
+            residual_data=residual_data,
+            z_lo=z_lo,
+            z_hi=z_hi,
+            slack_lo=slack_lo,
+            slack_hi=slack_hi,
+            lo_mask=lo_mask,
+            hi_mask=hi_mask,
+        )
+        info = {
+            "used": 0.0,
+            "mu_curr": 0.0,
+            "mu_aff": 0.0,
+            "sigma": 1.0,
+            "alpha_aff_pri": 0.0,
+            "alpha_aff_dual": 0.0,
+        }
+        if not bool(getattr(self.vi_params, "interior_point_mehrotra_predictor_corrector", True)):
+            return dx_red, dlam_eq, dz_lo, dz_hi, float(lin_time), info
+        if not np.any(lo_mask) and not np.any(hi_mask):
+            return dx_red, dlam_eq, dz_lo, dz_hi, float(lin_time), info
+
+        mu_curr = self._ipm_mean_complementarity(
+            slack_lo=slack_lo,
+            slack_hi=slack_hi,
+            z_lo=z_lo,
+            z_hi=z_hi,
+            lo_mask=lo_mask,
+            hi_mask=hi_mask,
+        )
+        if not np.isfinite(mu_curr) or mu_curr <= 0.0:
+            return dx_red, dlam_eq, dz_lo, dz_hi, float(lin_time), info
+
+        cent_lo_aff = np.asarray(residual_data["cent_lo"], dtype=float).copy()
+        cent_hi_aff = np.asarray(residual_data["cent_hi"], dtype=float).copy()
+        if cent_lo_aff.size:
+            cent_lo_aff += float(mu)
+        if cent_hi_aff.size:
+            cent_hi_aff += float(mu)
+
+        dx_aff, dlam_aff, dz_lo_aff, dz_hi_aff, lin_aff = self._ipm_primal_dual_direction(
+            A_red=A_red,
+            eq_data=eq_data,
+            residual_data=residual_data,
+            z_lo=z_lo,
+            z_hi=z_hi,
+            slack_lo=slack_lo,
+            slack_hi=slack_hi,
+            lo_mask=lo_mask,
+            hi_mask=hi_mask,
+            cent_lo_res=cent_lo_aff,
+            cent_hi_res=cent_hi_aff,
+        )
+        lin_time += float(lin_aff)
+
+        alpha_aff_pri, alpha_aff_dual = self._ipm_fraction_to_boundary_caps(
+            slack_lo=slack_lo,
+            slack_hi=slack_hi,
+            z_lo=z_lo,
+            z_hi=z_hi,
+            dx_red=dx_aff,
+            dz_lo=dz_lo_aff,
+            dz_hi=dz_hi_aff,
+            lo_mask=lo_mask,
+            hi_mask=hi_mask,
+        )
+        ds_lo_aff, ds_hi_aff = self._ipm_slack_directions(
+            dx_red=dx_aff,
+            lo_mask=lo_mask,
+            hi_mask=hi_mask,
+        )
+        slack_lo_aff = np.asarray(slack_lo, dtype=float).copy()
+        slack_hi_aff = np.asarray(slack_hi, dtype=float).copy()
+        z_lo_aff = np.asarray(z_lo, dtype=float).copy()
+        z_hi_aff = np.asarray(z_hi, dtype=float).copy()
+        if np.any(lo_mask):
+            slack_lo_aff[lo_mask] += float(alpha_aff_pri) * np.asarray(ds_lo_aff[lo_mask], dtype=float)
+            z_lo_aff[lo_mask] += float(alpha_aff_dual) * np.asarray(dz_lo_aff[lo_mask], dtype=float)
+        if np.any(hi_mask):
+            slack_hi_aff[hi_mask] += float(alpha_aff_pri) * np.asarray(ds_hi_aff[hi_mask], dtype=float)
+            z_hi_aff[hi_mask] += float(alpha_aff_dual) * np.asarray(dz_hi_aff[hi_mask], dtype=float)
+        mu_aff = self._ipm_mean_complementarity(
+            slack_lo=slack_lo_aff,
+            slack_hi=slack_hi_aff,
+            z_lo=z_lo_aff,
+            z_hi=z_hi_aff,
+            lo_mask=lo_mask,
+            hi_mask=hi_mask,
+        )
+        sigma = 1.0
+        if np.isfinite(mu_aff) and mu_aff >= 0.0:
+            sigma = float((max(float(mu_aff), 0.0) / max(float(mu_curr), 1.0e-30)) ** 3)
+        sigma = min(
+            max(
+                float(sigma),
+                float(getattr(self.vi_params, "interior_point_mehrotra_sigma_min", 0.0) or 0.0),
+            ),
+            max(
+                float(getattr(self.vi_params, "interior_point_mehrotra_sigma_max", 1.0) or 1.0),
+                0.0,
+            ),
+        )
+
+        cent_lo_corr = np.asarray(residual_data["cent_lo"], dtype=float).copy()
+        cent_hi_corr = np.asarray(residual_data["cent_hi"], dtype=float).copy()
+        if cent_lo_corr.size:
+            cent_lo_corr += (1.0 - float(sigma)) * (
+                np.asarray(ds_lo_aff[lo_mask], dtype=float) * np.asarray(dz_lo_aff[lo_mask], dtype=float)
+            )
+        if cent_hi_corr.size:
+            cent_hi_corr += (1.0 - float(sigma)) * (
+                np.asarray(ds_hi_aff[hi_mask], dtype=float) * np.asarray(dz_hi_aff[hi_mask], dtype=float)
+            )
+
+        dx_pc, dlam_pc, dz_lo_pc, dz_hi_pc, lin_corr = self._ipm_primal_dual_direction(
+            A_red=A_red,
+            eq_data=eq_data,
+            residual_data=residual_data,
+            z_lo=z_lo,
+            z_hi=z_hi,
+            slack_lo=slack_lo,
+            slack_hi=slack_hi,
+            lo_mask=lo_mask,
+            hi_mask=hi_mask,
+            cent_lo_res=cent_lo_corr,
+            cent_hi_res=cent_hi_corr,
+        )
+        lin_time += float(lin_corr)
+        info = {
+            "used": 1.0,
+            "mu_curr": float(mu_curr),
+            "mu_aff": float(mu_aff),
+            "sigma": float(sigma),
+            "alpha_aff_pri": float(alpha_aff_pri),
+            "alpha_aff_dual": float(alpha_aff_dual),
+        }
+        return dx_pc, dlam_pc, dz_lo_pc, dz_hi_pc, float(lin_time), info
+
+    def _ipm_eval_trial_step(
+        self,
+        *,
+        funcs: list,
+        prev_funcs: list,
+        aux_funcs,
+        bcs_now,
+        x_trial_red: np.ndarray,
+        lo_red: np.ndarray,
+        hi_red: np.ndarray,
+        eq_data: _PreparedLinearEqualities,
+        lambda_trial: np.ndarray,
+        z_lo_trial: np.ndarray,
+        z_hi_trial: np.ndarray,
+        mu: float,
+        alpha_trial: float,
+        recenter_duals: bool = False,
+    ) -> tuple[dict[str, np.ndarray | float], dict[str, float], np.ndarray, np.ndarray]:
+        self._ipm_write_reduced_iterate(funcs, bcs_now, x_trial_red)
+        if self.pre_cb is not None:
+            self.pre_cb(funcs)
+        if getattr(self, "constraints", None) is not None:
+            self._enforce_constraints_on_functions(funcs)
+
+        coeffs_trial: Dict[str, "Function"] = {f.name: f for f in funcs}
+        coeffs_trial.update({f.name: f for f in prev_funcs})
+        if aux_funcs:
+            coeffs_trial.update(aux_funcs)
+        _, R_trial = self._assemble_system_reduced(coeffs_trial, need_matrix=False)
+        x_trial_eff = self._pack_reduced_iterate(funcs)
+        z_lo_eval = np.asarray(z_lo_trial, dtype=float).ravel().copy()
+        z_hi_eval = np.asarray(z_hi_trial, dtype=float).ravel().copy()
+        if recenter_duals:
+            stationarity_trial = self._vi_stationarity_residual(np.asarray(R_trial, dtype=float), eq_data, lambda_trial)
+            z_lo_eval, z_hi_eval = self._ipm_initialize_duals(
+                x_red=x_trial_eff,
+                stationarity_red=stationarity_trial,
+                lo_red=lo_red,
+                hi_red=hi_red,
+                mu=float(mu),
+            )
+        trial_residual = self._ipm_residual_data(
+            x_red=x_trial_eff,
+            R_red=R_trial,
+            lo_red=lo_red,
+            hi_red=hi_red,
+            eq_data=eq_data,
+            lambda_eq=lambda_trial,
+            z_lo=z_lo_eval,
+            z_hi=z_hi_eval,
+            mu=float(mu),
+        )
+        metrics_trial = self._ipm_metrics(
+            residual_data=trial_residual,
+            mu=float(mu),
+            alpha_trial=float(alpha_trial),
+        )
+        return trial_residual, metrics_trial, z_lo_eval, z_hi_eval
+
+    def _ipm_fraction_to_boundary_caps(
+        self,
+        *,
+        slack_lo: np.ndarray,
+        slack_hi: np.ndarray,
+        z_lo: np.ndarray,
+        z_hi: np.ndarray,
+        dx_red: np.ndarray,
+        dz_lo: np.ndarray,
+        dz_hi: np.ndarray,
+        lo_mask: np.ndarray,
+        hi_mask: np.ndarray,
+    ) -> float:
+        tau = min(
+            max(float(getattr(self.vi_params, "interior_point_fraction_to_boundary", 0.995) or 0.995), 1.0e-6),
+            0.999999,
+        )
+        alpha_pri = 1.0
+        alpha_dual = 1.0
+
+        if np.any(lo_mask):
+            neg_dx = np.asarray(lo_mask & (np.asarray(dx_red, dtype=float) < 0.0), dtype=bool)
+            if np.any(neg_dx):
+                caps = np.asarray(slack_lo[neg_dx], dtype=float) / np.maximum(-np.asarray(dx_red[neg_dx], dtype=float), 1.0e-300)
+                alpha_pri = min(alpha_pri, float(np.min(caps)))
+            neg_dz = np.asarray(lo_mask & (np.asarray(dz_lo, dtype=float) < 0.0), dtype=bool)
+            if np.any(neg_dz):
+                caps = np.asarray(z_lo[neg_dz], dtype=float) / np.maximum(-np.asarray(dz_lo[neg_dz], dtype=float), 1.0e-300)
+                alpha_dual = min(alpha_dual, float(np.min(caps)))
+
+        if np.any(hi_mask):
+            pos_dx = np.asarray(hi_mask & (np.asarray(dx_red, dtype=float) > 0.0), dtype=bool)
+            if np.any(pos_dx):
+                caps = np.asarray(slack_hi[pos_dx], dtype=float) / np.maximum(np.asarray(dx_red[pos_dx], dtype=float), 1.0e-300)
+                alpha_pri = min(alpha_pri, float(np.min(caps)))
+            neg_dz = np.asarray(hi_mask & (np.asarray(dz_hi, dtype=float) < 0.0), dtype=bool)
+            if np.any(neg_dz):
+                caps = np.asarray(z_hi[neg_dz], dtype=float) / np.maximum(-np.asarray(dz_hi[neg_dz], dtype=float), 1.0e-300)
+                alpha_dual = min(alpha_dual, float(np.min(caps)))
+
+        if not np.isfinite(alpha_pri):
+            alpha_pri = 1.0
+        if not np.isfinite(alpha_dual):
+            alpha_dual = 1.0
+        return (
+            max(0.0, min(1.0, tau * float(alpha_pri))),
+            max(0.0, min(1.0, tau * float(alpha_dual))),
+        )
+
+    def _ipm_fraction_to_boundary_step(
+        self,
+        *,
+        slack_lo: np.ndarray,
+        slack_hi: np.ndarray,
+        z_lo: np.ndarray,
+        z_hi: np.ndarray,
+        dx_red: np.ndarray,
+        dz_lo: np.ndarray,
+        dz_hi: np.ndarray,
+        lo_mask: np.ndarray,
+        hi_mask: np.ndarray,
+    ) -> float:
+        alpha_pri, alpha_dual = self._ipm_fraction_to_boundary_caps(
+            slack_lo=slack_lo,
+            slack_hi=slack_hi,
+            z_lo=z_lo,
+            z_hi=z_hi,
+            dx_red=dx_red,
+            dz_lo=dz_lo,
+            dz_hi=dz_hi,
+            lo_mask=lo_mask,
+            hi_mask=hi_mask,
+        )
+        return min(float(alpha_pri), float(alpha_dual))
+
+    def _ipm_reinitialize_state(
+        self,
+        *,
+        funcs: list,
+        prev_funcs: list,
+        aux_funcs,
+        bcs_now,
+        eq_prepare_callback: Callable[[], _PreparedLinearEqualities],
+        lo_red: np.ndarray,
+        hi_red: np.ndarray,
+        lambda_eq: np.ndarray,
+        mu: float,
+    ) -> tuple[np.ndarray, _PreparedLinearEqualities, np.ndarray, np.ndarray]:
+        eq_data = eq_prepare_callback()
+        x_red = self._pack_reduced_iterate(funcs)
+        x_interior = self._ipm_push_strictly_interior(
+            x_red=x_red,
+            lo_red=lo_red,
+            hi_red=hi_red,
+            eq_data=eq_data,
+        )
+        self._ipm_write_reduced_iterate(funcs, bcs_now, x_interior)
+        if self.pre_cb is not None:
+            self.pre_cb(funcs)
+        if getattr(self, "constraints", None) is not None:
+            self._enforce_constraints_on_functions(funcs)
+        x_red = self._pack_reduced_iterate(funcs)
+        eq_data = eq_prepare_callback()
+        coeffs: Dict[str, "Function"] = {f.name: f for f in funcs}
+        coeffs.update({f.name: f for f in prev_funcs})
+        if aux_funcs:
+            coeffs.update(aux_funcs)
+        _, R_red = self._assemble_system_reduced(coeffs, need_matrix=False)
+        stationarity = self._vi_stationarity_residual(np.asarray(R_red, dtype=float), eq_data, lambda_eq)
+        z_lo, z_hi = self._ipm_initialize_duals(
+            x_red=x_red,
+            stationarity_red=stationarity,
+            lo_red=lo_red,
+            hi_red=hi_red,
+            mu=float(mu),
+        )
+        warm_z_lo = getattr(self, "_ipm_z_lo_current", None)
+        warm_z_hi = getattr(self, "_ipm_z_hi_current", None)
+        z_floor = max(float(getattr(self.vi_params, "interior_point_initial_push", 1.0e-8) or 1.0e-8), 1.0e-12)
+        lo_mask, hi_mask = self._ipm_bound_masks(lo_red, hi_red)
+        if (
+            warm_z_lo is not None
+            and warm_z_hi is not None
+            and np.asarray(warm_z_lo).shape == x_red.shape
+            and np.asarray(warm_z_hi).shape == x_red.shape
+        ):
+            warm_lo = np.asarray(warm_z_lo, dtype=float).ravel()
+            warm_hi = np.asarray(warm_z_hi, dtype=float).ravel()
+            if np.any(lo_mask):
+                z_lo[lo_mask] = np.maximum(
+                    np.where(np.isfinite(warm_lo[lo_mask]), warm_lo[lo_mask], z_lo[lo_mask]),
+                    z_floor,
+                )
+            if np.any(hi_mask):
+                z_hi[hi_mask] = np.maximum(
+                    np.where(np.isfinite(warm_hi[hi_mask]), warm_hi[hi_mask], z_hi[hi_mask]),
+                    z_floor,
+                )
+        return x_red, eq_data, z_lo, z_hi
+
+    def _ipm_choose_barrier_transition_duals(
+        self,
+        *,
+        x_red: np.ndarray,
+        R_red: np.ndarray,
+        lo_red: np.ndarray,
+        hi_red: np.ndarray,
+        eq_data: _PreparedLinearEqualities,
+        lambda_eq: np.ndarray,
+        z_lo: np.ndarray,
+        z_hi: np.ndarray,
+        mu: float,
+        stationarity_red: np.ndarray,
+        trace_ipm: bool = False,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        x_red = np.asarray(x_red, dtype=float).ravel()
+        R_red = np.asarray(R_red, dtype=float).ravel()
+        lambda_eq = np.asarray(lambda_eq, dtype=float).ravel()
+        lo_mask, hi_mask = self._ipm_bound_masks(lo_red, hi_red)
+        z_lo_keep = np.asarray(z_lo, dtype=float).ravel().copy()
+        z_hi_keep = np.asarray(z_hi, dtype=float).ravel().copy()
+        z_lo_init, z_hi_init = self._ipm_initialize_duals(
+            x_red=x_red,
+            stationarity_red=np.asarray(stationarity_red, dtype=float),
+            lo_red=lo_red,
+            hi_red=hi_red,
+            mu=float(mu),
+        )
+
+        candidates: list[tuple[str, np.ndarray, np.ndarray, dict[str, np.ndarray | float], dict[str, float], float]] = []
+        for name, z_lo_cand, z_hi_cand in (
+            ("keep", z_lo_keep, z_hi_keep),
+            ("recenter", z_lo_init, z_hi_init),
+        ):
+            residual_cand = self._ipm_residual_data(
+                x_red=x_red,
+                R_red=R_red,
+                lo_red=lo_red,
+                hi_red=hi_red,
+                eq_data=eq_data,
+                lambda_eq=lambda_eq,
+                z_lo=z_lo_cand,
+                z_hi=z_hi_cand,
+                mu=float(mu),
+            )
+            metrics_cand = self._ipm_metrics(
+                residual_data=residual_cand,
+                mu=float(mu),
+            )
+            mu_curr_cand = self._ipm_mean_complementarity(
+                slack_lo=np.asarray(residual_cand["slack_lo"], dtype=float),
+                slack_hi=np.asarray(residual_cand["slack_hi"], dtype=float),
+                z_lo=z_lo_cand,
+                z_hi=z_hi_cand,
+                lo_mask=lo_mask,
+                hi_mask=hi_mask,
+            )
+            candidates.append((name, z_lo_cand, z_hi_cand, residual_cand, metrics_cand, float(mu_curr_cand)))
+
+        def _score(
+            item: tuple[str, np.ndarray, np.ndarray, dict[str, np.ndarray | float], dict[str, float], float]
+        ) -> tuple[float, float, float]:
+            metrics = item[4]
+            return (
+                float(max(metrics["inactive_res_inf"], metrics["centrality_inf"])),
+                float(metrics["G_inf"]),
+                float(metrics["merit"]),
+            )
+
+        best_name, best_z_lo, best_z_hi, _, best_metrics, best_mu_curr = min(candidates, key=_score)
+        keep_item = next((item for item in candidates if item[0] == "keep"), None)
+        recenter_item = next((item for item in candidates if item[0] == "recenter"), None)
+        if keep_item is not None and recenter_item is not None:
+            keep_metrics = keep_item[4]
+            recenter_metrics = recenter_item[4]
+            keep_mu_curr = float(keep_item[5])
+            dual_growth_max = max(
+                float(getattr(self.vi_params, "interior_point_transition_dual_growth_max", 2.0) or 2.0),
+                1.0,
+            )
+            recenter_ratio_max = max(
+                float(getattr(self.vi_params, "interior_point_transition_recenter_ratio_max", 2.5) or 2.5),
+                1.0,
+            )
+            if (
+                best_name == "keep"
+                and keep_mu_curr > recenter_ratio_max * max(float(mu), 1.0e-30)
+                and float(recenter_metrics["inactive_res_inf"]) <= dual_growth_max * max(float(keep_metrics["inactive_res_inf"]), 1.0e-30)
+            ):
+                best_name = "recenter"
+                best_z_lo = np.asarray(recenter_item[1], dtype=float)
+                best_z_hi = np.asarray(recenter_item[2], dtype=float)
+                best_metrics = recenter_metrics
+                best_mu_curr = float(recenter_item[5])
+        if trace_ipm:
+            parts = []
+            for name, _, _, _, metrics, mu_curr_cand in candidates:
+                parts.append(
+                    f"{name}: dual={float(metrics['inactive_res_inf']):.3e} "
+                    f"cent={float(metrics['centrality_inf']):.3e} "
+                    f"Ginf={float(metrics['G_inf']):.3e} "
+                    f"mu_curr={float(mu_curr_cand):.3e}"
+                )
+            print(
+                "        [vi-ipm] barrier dual transition "
+                f"mu={float(mu):.3e} chose={best_name} ({'; '.join(parts)})"
+            )
+        return np.asarray(best_z_lo, dtype=float).copy(), np.asarray(best_z_hi, dtype=float).copy()
+
+    def _newton_loop(self, funcs, prev_funcs, aux_funcs, bcs_now):
+        if getattr(self, "_box_lower_full", None) is None or getattr(self, "_box_upper_full", None) is None:
+            return super()._newton_loop(funcs, prev_funcs, aux_funcs, bcs_now)
+
+        self._current_bcs = bcs_now
+        dh = self.dh
+        ndof_eff = getattr(self.restrictor, "full_size", dh.total_dofs)
+
+        if getattr(self, "constraints", None) is not None:
+            self._enforce_constraints_on_functions(funcs)
+            self._enforce_constraints_on_functions(prev_funcs)
+
+        eq_prepare_callback = lambda: self._vi_prepare_linear_equalities(funcs, prev_funcs, aux_funcs, bcs_now)
+        if self.pre_cb is not None:
+            self.pre_cb(funcs)
+        eq_data = eq_prepare_callback()
+        forced_ipm_state = getattr(self, "_ipm_forced_state", None)
+        if forced_ipm_state:
+            eq_forced = forced_ipm_state.get("eq_lambda", None)
+            if eq_forced is not None:
+                eq_arr = np.asarray(eq_forced, dtype=float).ravel()
+                if int(eq_arr.size) == int(getattr(self, "_vi_eq_lambda_accepted", np.array([], dtype=float)).size):
+                    self._vi_eq_lambda_accepted = eq_arr.copy()
+                    self._vi_eq_lambda_current = eq_arr.copy()
+            z_lo_forced = forced_ipm_state.get("z_lo", None)
+            z_hi_forced = forced_ipm_state.get("z_hi", None)
+            if z_lo_forced is not None and z_hi_forced is not None:
+                z_lo_arr = np.asarray(z_lo_forced, dtype=float).ravel()
+                z_hi_arr = np.asarray(z_hi_forced, dtype=float).ravel()
+                if z_lo_arr.shape == tuple(np.asarray(self.active_dofs, dtype=int).shape):
+                    self._ipm_z_lo_current = z_lo_arr.copy()
+                if z_hi_arr.shape == tuple(np.asarray(self.active_dofs, dtype=int).shape):
+                    self._ipm_z_hi_current = z_hi_arr.copy()
+            if "mu" in forced_ipm_state:
+                try:
+                    self._ipm_mu_current = float(forced_ipm_state["mu"])
+                except Exception:
+                    pass
+            self._ipm_forced_state = None
+        self._vi_eq_lambda_current = self._vi_eq_lambda_accepted.copy()
+
+        lo_red, hi_red = self._bounds_reduced()
+        if bool(getattr(self.vi_params, "project_initial_guess", True)):
+            self._project_funcs_to_bounds(
+                funcs,
+                bcs_now,
+                lo_red,
+                hi_red,
+                eq_data=eq_data,
+                eq_prepare_callback=eq_prepare_callback,
+            )
+            if self.pre_cb is not None:
+                self.pre_cb(funcs)
+            if getattr(self, "constraints", None) is not None:
+                self._enforce_constraints_on_functions(funcs)
+            eq_data = eq_prepare_callback()
+            lo_red, hi_red = self._bounds_reduced()
+
+        mu0 = max(float(getattr(self.vi_params, "interior_point_mu0", 1.0e-2) or 1.0e-2), 0.0)
+        mu_min = max(float(getattr(self.vi_params, "interior_point_mu_min", 1.0e-10) or 1.0e-10), 1.0e-16)
+        mu_decay = min(max(float(getattr(self.vi_params, "interior_point_mu_decay", 0.2) or 0.2), 1.0e-3), 0.95)
+        stage_tol_factor = max(float(getattr(self.vi_params, "interior_point_stage_tol_factor", 0.25) or 0.25), 1.0e-3)
+        stage_dual_factor = max(float(getattr(self.vi_params, "interior_point_stage_dual_factor", 1.5) or 1.5), 1.0e-3)
+        stage_cent_factor = max(float(getattr(self.vi_params, "interior_point_stage_cent_factor", 1.5) or 1.5), 1.0e-3)
+        stage_gap_factor = max(float(getattr(self.vi_params, "interior_point_stage_gap_factor", 1.0) or 1.0), 1.0e-3)
+        stage_eq_factor = max(float(getattr(self.vi_params, "interior_point_stage_eq_factor", 1.0e-4) or 1.0e-4), 1.0e-12)
+        armijo_c1 = max(float(getattr(self.vi_params, "interior_point_armijo_c1", 1.0e-4) or 1.0e-4), 0.0)
+        step_reduction = min(max(float(getattr(self.vi_params, "interior_point_step_reduction", 0.5) or 0.5), 1.0e-3), 0.95)
+        step_min = max(float(getattr(self.vi_params, "interior_point_step_min", 1.0e-10) or 1.0e-10), 1.0e-16)
+        n_barrier = max(1, int(getattr(self.vi_params, "interior_point_max_barrier_steps", 12) or 12))
+        accept_factor = float(getattr(self.np, "accept_nonconverged_atol_factor", 0.0) or 0.0)
+        atol = float(getattr(self.np, "newton_tol", 0.0) or 0.0)
+        relaxed_g = float(getattr(self.vi_params, "relaxed_filter_accept_ginf", 0.0) or 0.0)
+
+        total_iters = 0
+        last_metrics = {
+            "G_inf": float("inf"),
+            "inactive_res_inf": float("inf"),
+            "active_gap_inf": float("inf"),
+            "equality_inf": float("inf"),
+            "centrality_inf": float("inf"),
+            "merit": float("inf"),
+            "G_half": float("inf"),
+            "delta_active": 0.0,
+            "soft_active": 0.0,
+            "mu": float("inf"),
+            "alpha_trial": 0.0,
+        }
+        norm0_ref: float | None = None
+        self._last_nonlinear_accepted = False
+        self._last_nonlinear_relaxed_accept = False
+        self._last_nonlinear_reason = None
+
+        mu_warm = float(getattr(self, "_ipm_mu_current", mu0) or mu0)
+        mu = max(mu_min, min(max(mu0, mu_min), mu_warm if np.isfinite(mu_warm) and mu_warm > 0.0 else mu0))
+        x_red, eq_data, z_lo, z_hi = self._ipm_reinitialize_state(
+            funcs=funcs,
+            prev_funcs=prev_funcs,
+            aux_funcs=aux_funcs,
+            bcs_now=bcs_now,
+            eq_prepare_callback=eq_prepare_callback,
+            lo_red=lo_red,
+            hi_red=hi_red,
+            lambda_eq=np.asarray(self._vi_eq_lambda_current, dtype=float),
+            mu=float(mu),
+        )
+        lo_red, hi_red = self._bounds_reduced()
+        lo_mask, hi_mask = self._ipm_bound_masks(lo_red, hi_red)
+        trace_ipm = os.getenv("PYCUTFEM_VI_TRACE_IPM", "").lower() in {"1", "true", "yes"}
+        trace_ipm_lm = os.getenv("PYCUTFEM_VI_TRACE_IPM_LM", "").lower() in {"1", "true", "yes"}
+        trace_ptc = os.getenv("PYCUTFEM_VI_TRACE_PTC", "").lower() in {"1", "true", "yes"}
+        lm_trace = trace_ipm_lm or (os.getenv("PYCUTFEM_VI_TRACE_LM", "").lower() in {"1", "true", "yes"})
+        trace_raw_fields = os.getenv("PYCUTFEM_NEWTON_TRACE_RES_FIELDS", "").lower() in {"1", "true", "yes"}
+        trace_raw_worst = os.getenv("PYCUTFEM_RESIDUAL_TRACE", "").lower() in {"1", "true", "yes"}
+        lm_requested = bool(getattr(self.vi_params, "unconstrained_lm", False))
+        ptc_fields = tuple(getattr(self.vi_params, "ptc_fields", ()) or ())
+        ptc_mask_template = self._vi_selected_field_mask(ptc_fields)
+        ptc_sigma0 = max(float(getattr(self.vi_params, "ptc_sigma0", 1.0e-2) or 1.0e-2), 0.0)
+        ptc_sigma_max = max(ptc_sigma0, float(getattr(self.vi_params, "ptc_sigma_max", 1.0e6) or 1.0e6))
+        ptc_growth = max(float(getattr(self.vi_params, "ptc_growth", 5.0) or 5.0), 1.0)
+        self._vi_ptc_sigma_current = max(
+            0.0,
+            float(getattr(self, "_vi_force_initial_ptc_sigma", 0.0) or 0.0),
+        )
+        self._vi_force_initial_ptc_sigma = 0.0
+        if self._vi_ptc_sigma_current > 0.0 and trace_ptc:
+            print(
+                "        [vi-ipm-ptc] pre-armed regularized IPM solve "
+                f"(sigma={self._vi_ptc_sigma_current:.2e}, fields={ptc_fields})"
+            )
+
+        for stage in range(n_barrier):
+            stage_converged = False
+            stage_filter_entries: list[tuple[float, float]] = []
+            for it in range(int(self.np.max_newton_iter)):
+                total_iters += 1
+                if self.pre_cb is not None:
+                    self.pre_cb(funcs)
+                if getattr(self, "constraints", None) is not None:
+                    self._enforce_constraints_on_functions(funcs)
+                    self._enforce_constraints_on_functions(prev_funcs)
+                lo_red, hi_red = self._bounds_reduced()
+                eq_data = eq_prepare_callback()
+
+                x_red = self._pack_reduced_iterate(funcs)
+                if z_lo.shape != x_red.shape or z_hi.shape != x_red.shape:
+                    x_red, eq_data, z_lo, z_hi = self._ipm_reinitialize_state(
+                        funcs=funcs,
+                        prev_funcs=prev_funcs,
+                        aux_funcs=aux_funcs,
+                        bcs_now=bcs_now,
+                        eq_prepare_callback=eq_prepare_callback,
+                        lo_red=lo_red,
+                        hi_red=hi_red,
+                        lambda_eq=np.asarray(self._vi_eq_lambda_current, dtype=float),
+                        mu=float(mu),
+                    )
+                    lo_red, hi_red = self._bounds_reduced()
+                lo_mask, hi_mask = self._ipm_bound_masks(lo_red, hi_red)
+
+                current: Dict[str, "Function"] = {f.name: f for f in funcs}
+                current.update({f.name: f for f in prev_funcs})
+                if aux_funcs:
+                    current.update(aux_funcs)
+
+                t_asm = time.perf_counter()
+                A_red, R_red = self._assemble_system_reduced(current, need_matrix=True)
+                asm_time = time.perf_counter() - t_asm
+                A_red, R_red, pruned, extra_asm = self._prune_decoupled_rows_cols(current, A_red, R_red, ndof_eff)
+                asm_time += extra_asm
+                if pruned:
+                    lo_red, hi_red = self._bounds_reduced()
+                    x_red, eq_data, z_lo, z_hi = self._ipm_reinitialize_state(
+                        funcs=funcs,
+                        prev_funcs=prev_funcs,
+                        aux_funcs=aux_funcs,
+                        bcs_now=bcs_now,
+                        eq_prepare_callback=eq_prepare_callback,
+                        lo_red=lo_red,
+                        hi_red=hi_red,
+                        lambda_eq=np.asarray(self._vi_eq_lambda_current, dtype=float),
+                        mu=float(mu),
+                    )
+                    lo_mask, hi_mask = self._ipm_bound_masks(lo_red, hi_red)
+                    current = {f.name: f for f in funcs}
+                    current.update({f.name: f for f in prev_funcs})
+                    if aux_funcs:
+                        current.update(aux_funcs)
+                    t_asm = time.perf_counter()
+                    A_red, R_red = self._assemble_system_reduced(current, need_matrix=True)
+                    asm_time += time.perf_counter() - t_asm
+
+                residual_data = self._ipm_residual_data(
+                    x_red=x_red,
+                    R_red=R_red,
+                    lo_red=lo_red,
+                    hi_red=hi_red,
+                    eq_data=eq_data,
+                    lambda_eq=np.asarray(self._vi_eq_lambda_current, dtype=float),
+                    z_lo=z_lo,
+                    z_hi=z_hi,
+                    mu=float(mu),
+                )
+                metrics0 = self._ipm_metrics(residual_data=residual_data, mu=float(mu))
+                stage_filter_entries = self._ipm_register_filter_entry(stage_filter_entries, metrics0)
+                self._vi_last_metrics = dict(metrics0)
+                last_metrics = dict(metrics0)
+                self._last_nonlinear_norm = float(metrics0["G_inf"])
+                self._last_nonlinear_norm_label = "|G|_∞"
+                norm0_ref = float(metrics0["G_inf"]) if norm0_ref is None else float(norm0_ref)
+                tol_eff = max(float(self.np.newton_tol), float(getattr(self.np, "newton_rtol", 0.0) or 0.0) * max(norm0_ref, 1.0e-30))
+                stage_tol = max(float(tol_eff), stage_tol_factor * float(mu))
+                dual_stage_tol = max(float(tol_eff), stage_dual_factor * float(mu))
+                cent_stage_tol = max(float(tol_eff), stage_cent_factor * float(mu))
+                gap_stage_tol = max(float(tol_eff), stage_gap_factor * float(mu))
+                eq_stage_tol = max(float(tol_eff), stage_eq_factor * float(mu))
+
+                if trace_ipm:
+                    print(
+                        "        [vi-ipm] "
+                        f"stage={stage+1}/{n_barrier} it={it+1} mu={float(mu):.3e} "
+                        f"Ginf={float(metrics0['G_inf']):.3e} stat={float(metrics0['stationarity_inf']):.3e} "
+                        f"slack={float(metrics0['slack_feas_inf']):.3e} eq={float(metrics0['equality_inf']):.3e} "
+                        f"cent={float(metrics0['centrality_inf']):.3e} "
+                        f"asm={asm_time:.2e}s"
+                    )
+                if trace_raw_fields:
+                    try:
+                        R_full_dbg = self.restrictor.expand_vec(np.asarray(R_red, dtype=float))
+                        field_norms = []
+                        for fld in getattr(self.dh, "field_names", []):
+                            try:
+                                sl = self.dh.get_field_slice(fld)
+                            except Exception:
+                                continue
+                            if sl is None or len(sl) == 0:
+                                continue
+                            sl = np.asarray(sl, dtype=int).ravel()
+                            field_norms.append((float(np.linalg.norm(R_full_dbg[sl], ord=np.inf)), str(fld)))
+                        field_norms.sort(reverse=True, key=lambda item: item[0])
+                        n_show_raw = os.getenv("PYCUTFEM_NEWTON_TRACE_RES_FIELDS_N", "8").strip()
+                        try:
+                            n_show = max(1, int(n_show_raw))
+                        except Exception:
+                            n_show = 8
+                        items = ", ".join(f"{name}:{val:.2e}" for val, name in field_norms[:n_show])
+                        print(f"        [res] {items}")
+                    except Exception as exc:
+                        print(f"        [res] trace failed: {exc}")
+                if trace_raw_worst:
+                    try:
+                        R_full = np.asarray(self.restrictor.expand_vec(np.asarray(R_red, dtype=float)), dtype=float).ravel()
+                        if R_full.size:
+                            worst_full = int(np.argmax(np.abs(R_full)))
+                            worst_val = float(R_full[worst_full])
+                            field = None
+                            try:
+                                field = getattr(self.dh, "_dof_to_node_map", {}).get(worst_full, (None, None))[0]
+                            except Exception:
+                                field = None
+                            fmsg = f", field={field}" if field is not None else ""
+                            print(f"        [res] worst_gdof={worst_full} worst_val={worst_val:.3e}{fmsg}")
+                    except Exception as exc:
+                        print(f"        [res] trace failed: {exc}")
+
+                if (
+                    float(metrics0["inactive_res_inf"]) <= dual_stage_tol
+                    and float(metrics0["equality_inf"]) <= eq_stage_tol
+                    and float(metrics0["active_gap_inf"]) <= gap_stage_tol
+                    and float(metrics0["centrality_inf"]) <= cent_stage_tol
+                ):
+                    if trace_ipm:
+                        print(
+                            "        [vi-ipm] stage target reached "
+                            f"(dual<={dual_stage_tol:.3e}, eq<={eq_stage_tol:.3e}, "
+                            f"gap<={gap_stage_tol:.3e}, cent<={cent_stage_tol:.3e})"
+                        )
+                    stage_converged = True
+                    break
+
+                slack_lo = np.asarray(residual_data["slack_lo"], dtype=float)
+                slack_hi = np.asarray(residual_data["slack_hi"], dtype=float)
+                if (np.any(lo_mask & (slack_lo <= 0.0)) or np.any(hi_mask & (slack_hi <= 0.0))):
+                    x_red, eq_data, z_lo, z_hi = self._ipm_reinitialize_state(
+                        funcs=funcs,
+                        prev_funcs=prev_funcs,
+                        aux_funcs=aux_funcs,
+                        bcs_now=bcs_now,
+                        eq_prepare_callback=eq_prepare_callback,
+                        lo_red=lo_red,
+                        hi_red=hi_red,
+                        lambda_eq=np.asarray(self._vi_eq_lambda_current, dtype=float),
+                        mu=float(mu),
+                    )
+                    continue
+
+                rhs_red = -np.asarray(residual_data["dual"], dtype=float).copy()
+                diag_red = np.zeros(x_red.shape, dtype=float)
+                if np.any(lo_mask):
+                    diag_red[lo_mask] += np.asarray(z_lo[lo_mask], dtype=float) / np.maximum(np.asarray(slack_lo[lo_mask], dtype=float), 1.0e-300)
+                    rhs_red[lo_mask] += -np.asarray(residual_data["cent_lo"], dtype=float) / np.maximum(np.asarray(slack_lo[lo_mask], dtype=float), 1.0e-300)
+                if np.any(hi_mask):
+                    diag_red[hi_mask] += np.asarray(z_hi[hi_mask], dtype=float) / np.maximum(np.asarray(slack_hi[hi_mask], dtype=float), 1.0e-300)
+                    rhs_red[hi_mask] += np.asarray(residual_data["cent_hi"], dtype=float) / np.maximum(np.asarray(slack_hi[hi_mask], dtype=float), 1.0e-300)
+                H_x_base = (A_red + sp.diags(diag_red, format="csr")).tocsr()
+                eq_res = np.asarray(residual_data["eq"], dtype=float)
+                merit0 = float(metrics0["merit"])
+                lambda0 = np.asarray(self._vi_eq_lambda_current, dtype=float).copy()
+                z_lo0 = np.asarray(z_lo, dtype=float).copy()
+                z_hi0 = np.asarray(z_hi, dtype=float).copy()
+                snap = [f.nodal_values.copy() for f in funcs]
+
+                ptc_mask = np.asarray(ptc_mask_template, dtype=bool)
+                if ptc_mask.shape != x_red.shape:
+                    ptc_mask = np.zeros(x_red.shape, dtype=bool)
+                ptc_ready = bool(np.any(ptc_mask)) and (
+                    self._vi_should_try_ptc_recovery(
+                        metrics=metrics0,
+                        active_stable_count=0,
+                    )
+                    or float(getattr(self, "_vi_ptc_sigma_current", 0.0) or 0.0) > 0.0
+                )
+
+                lin_time = 0.0
+                accepted = False
+                accepted_metrics = dict(metrics0)
+                while True:
+                    ptc_sigma = float(getattr(self, "_vi_ptc_sigma_current", 0.0) or 0.0)
+                    H_x = H_x_base
+                    pc_info = {
+                        "used": 0.0,
+                        "mu_curr": 0.0,
+                        "mu_aff": 0.0,
+                        "sigma": 1.0,
+                        "alpha_aff_pri": 0.0,
+                        "alpha_aff_dual": 0.0,
+                    }
+                    if ptc_sigma > 0.0 and np.any(ptc_mask):
+                        H_x, _ = self._vi_apply_ptc_regularization(H_x, H_x_base, ptc_mask, ptc_sigma)
+                        A_aug, rhs_aug = self._vi_build_augmented_system(
+                            H_x,
+                            np.asarray(rhs_red, dtype=float).copy(),
+                            np.zeros(x_red.shape, dtype=bool),
+                            eq_data,
+                            eq_res,
+                        )
+                        t_lin = time.perf_counter()
+                        step_aug = self._solve_linear_system_with_context(
+                            A_aug,
+                            rhs_aug,
+                            context="vi_augmented",
+                        )
+                        lin_time += time.perf_counter() - t_lin
+                        dx_red, dlam_eq = self._vi_split_augmented_step(step_aug, eq_data)
+                        dz_lo, dz_hi = self._ipm_multiplier_step(
+                            dx_red=dx_red,
+                            z_lo=z_lo,
+                            z_hi=z_hi,
+                            slack_lo=slack_lo,
+                            slack_hi=slack_hi,
+                            lo_mask=lo_mask,
+                            hi_mask=hi_mask,
+                            residual_data=residual_data,
+                        )
+                    else:
+                        dx_red, dlam_eq, dz_lo, dz_hi, lin_time_step, pc_info = self._ipm_predictor_corrector_direction(
+                            A_red=A_red,
+                            eq_data=eq_data,
+                            residual_data=residual_data,
+                            z_lo=z_lo,
+                            z_hi=z_hi,
+                            slack_lo=slack_lo,
+                            slack_hi=slack_hi,
+                            lo_mask=lo_mask,
+                            hi_mask=hi_mask,
+                            mu=float(mu),
+                        )
+                        lin_time += float(lin_time_step)
+                        A_aug, rhs_aug = self._vi_build_augmented_system(
+                            H_x_base,
+                            np.asarray(rhs_red, dtype=float).copy(),
+                            np.zeros(x_red.shape, dtype=bool),
+                            eq_data,
+                            eq_res,
+                        )
+
+                    alpha_pri_max, alpha_dual_max = self._ipm_fraction_to_boundary_caps(
+                        slack_lo=slack_lo,
+                        slack_hi=slack_hi,
+                        z_lo=z_lo,
+                        z_hi=z_hi,
+                        dx_red=dx_red,
+                        dz_lo=dz_lo,
+                        dz_hi=dz_hi,
+                        lo_mask=lo_mask,
+                        hi_mask=hi_mask,
+                    )
+                    alpha_max = min(float(alpha_pri_max), float(alpha_dual_max))
+                    if alpha_max <= 0.0 or not np.all(np.isfinite(dx_red)):
+                        next_sigma = ptc_sigma0 if ptc_sigma <= 0.0 else min(ptc_sigma_max, max(ptc_sigma, ptc_sigma0) * ptc_growth)
+                        if ptc_ready and next_sigma > ptc_sigma + max(1.0e-30, 1.0e-12 * max(abs(ptc_sigma), abs(next_sigma))):
+                            self._vi_ptc_sigma_current = float(next_sigma)
+                            if trace_ptc:
+                                print(
+                                    "          [vi-ipm-ptc] retry after non-interior direction "
+                                    f"sigma->{self._vi_ptc_sigma_current:.2e}"
+                                )
+                            continue
+                        raise RuntimeError("Interior-point Newton produced a non-interior or non-finite step.")
+
+                    alpha = 1.0
+                    retry_with_ptc = False
+                    accepted = False
+                    accepted_branch = "none"
+                    accepted_metrics = dict(metrics0)
+                    best_filtered_alpha = 0.0
+                    best_filtered_metrics = None
+                    best_filtered_x = None
+                    best_filtered_lam = None
+                    best_filtered_z_lo = None
+                    best_filtered_z_hi = None
+                    best_filtered_reason = None
+                    g0_ls = float(metrics0["G_inf"])
+                    merit0_ls = float(metrics0["merit"])
+                    eq0_ls = float(metrics0["equality_inf"])
+                    cent0_ls = float(metrics0["centrality_inf"])
+                    if trace_ipm:
+                        dx_inf = float(np.linalg.norm(np.asarray(dx_red, dtype=float), ord=np.inf)) if np.asarray(dx_red, dtype=float).size else 0.0
+                        dz_lo_inf = float(np.linalg.norm(np.asarray(dz_lo[lo_mask], dtype=float), ord=np.inf)) if np.any(lo_mask) else 0.0
+                        dz_hi_inf = float(np.linalg.norm(np.asarray(dz_hi[hi_mask], dtype=float), ord=np.inf)) if np.any(hi_mask) else 0.0
+                        ptc_msg = f" sigma={ptc_sigma:.2e}" if ptc_sigma > 0.0 else ""
+                        print(
+                            "          [vi-ipm] "
+                            f"alpha_pri_max={float(alpha_pri_max):.2e} alpha_dual_max={float(alpha_dual_max):.2e} "
+                            f"|dx|_inf={dx_inf:.3e} "
+                            f"|dz_lo|_inf={dz_lo_inf:.3e} |dz_hi|_inf={dz_hi_inf:.3e}{ptc_msg}"
+                        )
+                        if float(pc_info.get("used", 0.0)) > 0.5:
+                            print(
+                                "          [vi-ipm-pc] "
+                                f"mu_curr={float(pc_info.get('mu_curr', 0.0)):.3e} "
+                                f"mu_aff={float(pc_info.get('mu_aff', 0.0)):.3e} "
+                                f"sigma={float(pc_info.get('sigma', 1.0)):.3e} "
+                                f"alpha_aff_pri={float(pc_info.get('alpha_aff_pri', 0.0)):.2e} "
+                                f"alpha_aff_dual={float(pc_info.get('alpha_aff_dual', 0.0)):.2e}"
+                            )
+                    while alpha >= step_min:
+                        alpha_pri = float(alpha) * float(alpha_pri_max)
+                        alpha_dual = float(alpha) * float(alpha_dual_max)
+                        x_trial = np.asarray(x_red, dtype=float) + float(alpha_pri) * np.asarray(dx_red, dtype=float)
+                        lam_trial = np.asarray(lambda0, dtype=float) + float(alpha_dual) * np.asarray(dlam_eq, dtype=float)
+                        z_lo_trial = np.asarray(z_lo0, dtype=float) + float(alpha_dual) * np.asarray(dz_lo, dtype=float)
+                        z_hi_trial = np.asarray(z_hi0, dtype=float) + float(alpha_dual) * np.asarray(dz_hi, dtype=float)
+
+                        for f, buf in zip(funcs, snap):
+                            f.nodal_values[:] = buf
+                        _, metrics_trial, _, _ = self._ipm_eval_trial_step(
+                            funcs=funcs,
+                            prev_funcs=prev_funcs,
+                            aux_funcs=aux_funcs,
+                            bcs_now=bcs_now,
+                            x_trial_red=x_trial,
+                            lo_red=lo_red,
+                            hi_red=hi_red,
+                            eq_data=eq_data,
+                            lambda_trial=lam_trial,
+                            z_lo_trial=z_lo_trial,
+                            z_hi_trial=z_hi_trial,
+                            mu=float(mu),
+                            alpha_trial=float(min(alpha_pri, alpha_dual)),
+                        )
+                        accepted_metrics = dict(metrics_trial)
+                        filter_ok, filter_reason = self._ipm_filter_accepts(
+                            metrics_trial=metrics_trial,
+                            metrics_ref=metrics0,
+                            filter_entries=stage_filter_entries,
+                            alpha_trial=float(min(alpha_pri, alpha_dual)),
+                        )
+                        armijo_ok = float(metrics_trial["merit"]) <= (1.0 - armijo_c1 * float(alpha)) * max(merit0, 1.0e-30)
+                        if trace_ipm:
+                            print(
+                                "          [vi-ipm] "
+                                f"trial alpha_pri={float(alpha_pri):.2e} alpha_dual={float(alpha_dual):.2e} "
+                                f"merit={float(metrics_trial['merit']):.3e} "
+                                f"Ginf={float(metrics_trial['G_inf']):.3e} stat={float(metrics_trial['stationarity_inf']):.3e} "
+                                f"slack={float(metrics_trial['slack_feas_inf']):.3e} eq={float(metrics_trial['equality_inf']):.3e} "
+                                f"cent={float(metrics_trial['centrality_inf']):.3e} "
+                                f"filter={int(filter_ok)} reason={filter_reason} armijo={int(armijo_ok)}"
+                            )
+                        if filter_ok:
+                            better_g = best_filtered_metrics is None or float(metrics_trial["G_inf"]) < float(best_filtered_metrics["G_inf"]) - 1.0e-15
+                            tie_g = best_filtered_metrics is not None and abs(float(metrics_trial["G_inf"]) - float(best_filtered_metrics["G_inf"])) <= 1.0e-15
+                            better_merit = best_filtered_metrics is None or float(metrics_trial["merit"]) < float(best_filtered_metrics["merit"]) - 1.0e-15
+                            if better_g or (tie_g and better_merit):
+                                best_filtered_alpha = float(alpha_pri)
+                                best_filtered_metrics = dict(metrics_trial)
+                                best_filtered_x = np.asarray(x_trial, dtype=float).copy()
+                                best_filtered_lam = np.asarray(lam_trial, dtype=float).copy()
+                                best_filtered_z_lo = np.asarray(z_lo_trial, dtype=float).copy()
+                                best_filtered_z_hi = np.asarray(z_hi_trial, dtype=float).copy()
+                                best_filtered_reason = str(filter_reason)
+                        if filter_ok:
+                            accepted_alpha_try = float(alpha_pri)
+                            merit_ratio_try = float(metrics_trial["merit"]) / max(merit0, 1.0e-30)
+                            g_ratio_try = float(metrics_trial["G_inf"]) / max(float(metrics0["G_inf"]), 1.0e-30)
+                            next_sigma = ptc_sigma0 if ptc_sigma <= 0.0 else min(ptc_sigma_max, max(ptc_sigma, ptc_sigma0) * ptc_growth)
+                            meaningful_progress = (
+                                merit_ratio_try <= 0.95
+                                or g_ratio_try <= 0.95
+                            )
+                            tiny_accept = accepted_alpha_try <= max(1.0e-3, 100.0 * float(step_min))
+                            if (
+                                ptc_ready
+                                and next_sigma > ptc_sigma + max(1.0e-30, 1.0e-12 * max(abs(ptc_sigma), abs(next_sigma)))
+                                and tiny_accept
+                                and not meaningful_progress
+                                and self._vi_should_arm_ptc_after_accept(
+                                    accepted_alpha=accepted_alpha_try,
+                                    merit_ratio=merit_ratio_try,
+                                    accepted_g_ratio=g_ratio_try,
+                                )
+                            ):
+                                retry_with_ptc = True
+                                self._vi_ptc_sigma_current = float(next_sigma)
+                                if trace_ptc:
+                                    print(
+                                        "          [vi-ipm-ptc] retry after null accepted step "
+                                        f"alpha={accepted_alpha_try:.2e} merit_ratio={merit_ratio_try:.3f} "
+                                        f"G_ratio={g_ratio_try:.3f} sigma->{self._vi_ptc_sigma_current:.2e}"
+                                )
+                                for f, buf in zip(funcs, snap):
+                                    f.nodal_values[:] = buf
+                                break
+                            if tiny_accept and not meaningful_progress:
+                                if trace_ipm:
+                                    print(
+                                        "          [vi-ipm] rejecting tiny filtered step "
+                                        f"alpha={accepted_alpha_try:.2e} merit_ratio={merit_ratio_try:.3f} "
+                                        f"G_ratio={g_ratio_try:.3f}; escalating to fallback globalization."
+                                    )
+                                for f, buf in zip(funcs, snap):
+                                    f.nodal_values[:] = buf
+                                break
+
+                            accepted = True
+                            self._vi_eq_lambda_current = np.asarray(lam_trial, dtype=float).copy()
+                            z_lo = np.asarray(z_lo_trial, dtype=float).copy()
+                            z_hi = np.asarray(z_hi_trial, dtype=float).copy()
+                            self._ls_alpha_prev = float(alpha_pri)
+                            self._vi_last_metrics = dict(metrics_trial)
+                            accepted_branch = "filter+armijo" if armijo_ok else f"filter:{filter_reason}"
+                            self._assert_functions_finite(funcs, context="after accepted interior-point step")
+                            if self.post_cb is not None:
+                                self.post_cb(funcs)
+                            if getattr(self, "constraints", None) is not None:
+                                self._enforce_constraints_on_functions(funcs)
+                            break
+                        alpha *= step_reduction
+
+                    if retry_with_ptc:
+                        continue
+
+                    if not accepted:
+                        for f, buf in zip(funcs, snap):
+                            f.nodal_values[:] = buf
+                        best_filtered_progress_ok = False
+                        if best_filtered_metrics is not None and best_filtered_alpha is not None:
+                            best_filtered_merit_ratio = float(best_filtered_metrics["merit"]) / max(merit0_ls, 1.0e-30)
+                            best_filtered_g_ratio = float(best_filtered_metrics["G_inf"]) / max(g0_ls, 1.0e-30)
+                            best_filtered_tiny = float(best_filtered_alpha) <= max(1.0e-3, 100.0 * float(step_min))
+                            best_filtered_progress_ok = (
+                                (not best_filtered_tiny)
+                                or best_filtered_merit_ratio <= 0.95
+                                or best_filtered_g_ratio <= 0.95
+                            )
+                        if (
+                            best_filtered_metrics is not None
+                            and best_filtered_x is not None
+                            and best_filtered_lam is not None
+                            and best_filtered_z_lo is not None
+                            and best_filtered_z_hi is not None
+                            and bool(best_filtered_progress_ok)
+                            and (
+                                float(best_filtered_metrics["G_inf"]) < g0_ls - max(1.0e-10, 1.0e-6 * max(g0_ls, 1.0))
+                                or float(best_filtered_metrics["merit"]) < merit0_ls - max(1.0e-12, 1.0e-6 * max(merit0_ls, 1.0))
+                            )
+                        ):
+                            self._ipm_write_reduced_iterate(funcs, bcs_now, best_filtered_x)
+                            if self.pre_cb is not None:
+                                self.pre_cb(funcs)
+                            if getattr(self, "constraints", None) is not None:
+                                self._enforce_constraints_on_functions(funcs)
+                            accepted = True
+                            accepted_metrics = dict(best_filtered_metrics)
+                            self._vi_eq_lambda_current = np.asarray(best_filtered_lam, dtype=float).copy()
+                            z_lo = np.asarray(best_filtered_z_lo, dtype=float).copy()
+                            z_hi = np.asarray(best_filtered_z_hi, dtype=float).copy()
+                            self._ls_alpha_prev = float(best_filtered_alpha)
+                            self._vi_last_metrics = dict(best_filtered_metrics)
+                            accepted_branch = f"best-filter:{best_filtered_reason or 'fallback'}"
+                            self._assert_functions_finite(funcs, context="after accepted interior-point best-filtered step")
+                            if self.post_cb is not None:
+                                self.post_cb(funcs)
+                            if getattr(self, "constraints", None) is not None:
+                                self._enforce_constraints_on_functions(funcs)
+                            if trace_ipm:
+                                print(
+                                    "          [vi-ipm] accepted best filtered fallback step "
+                                    f"alpha={float(best_filtered_alpha):.2e} "
+                                    f"Ginf={float(best_filtered_metrics['G_inf']):.3e} "
+                                    f"reason={best_filtered_reason or 'fallback'}"
+                                )
+
+                    if not accepted:
+                        tol_accept = accept_factor * max(tol_eff, 1.0e-30) if accept_factor > 0.0 else 0.0
+                        ls_factor_ok = tol_accept > 0.0 and float(metrics0["G_inf"]) <= tol_accept
+                        next_sigma = ptc_sigma0 if ptc_sigma <= 0.0 else min(ptc_sigma_max, max(ptc_sigma, ptc_sigma0) * ptc_growth)
+                        if ptc_ready and next_sigma > ptc_sigma + max(1.0e-30, 1.0e-12 * max(abs(ptc_sigma), abs(next_sigma))):
+                            self._vi_ptc_sigma_current = float(next_sigma)
+                            if trace_ptc:
+                                print(
+                                    "          [vi-ipm-ptc] retry after line-search stall "
+                                    f"sigma->{self._vi_ptc_sigma_current:.2e}"
+                                )
+                            continue
+                        if lm_requested:
+                            lm_lam = float(getattr(self, "_vi_lm_lambda_current", 0.0) or 0.0)
+                            lm0 = float(getattr(self.vi_params, "unconstrained_lm_lambda0", 1.0e-4) or 1.0e-4)
+                            lm_max = float(getattr(self.vi_params, "unconstrained_lm_lambda_max", 1.0e6) or 1.0e6)
+                            lm_growth = float(getattr(self.vi_params, "unconstrained_lm_growth", 5.0) or 5.0)
+                            lm_decay = float(getattr(self.vi_params, "unconstrained_lm_decay", 0.5) or 0.5)
+                            lm_accept = float(getattr(self.vi_params, "unconstrained_lm_accept_ratio", 1.0e-3) or 1.0e-3)
+                            lm_good = float(getattr(self.vi_params, "unconstrained_lm_good_ratio", 0.75) or 0.75)
+                            lm_max_tries = max(1, int(getattr(self.vi_params, "unconstrained_lm_max_tries", 6) or 6))
+                            max_ginf_growth = float(getattr(self.vi_params, "filter_max_ginf_growth", 1.0) or 1.0)
+                            max_res_growth = float(getattr(self.vi_params, "filter_max_residual_growth", 1.25) or 1.25)
+                            max_gap_growth = float(getattr(self.vi_params, "filter_max_gap_growth", 1.25) or 1.25)
+                            max_eq_growth = float(getattr(self.vi_params, "filter_max_equality_growth", 1.25) or 1.25)
+                            fallback_rho_min = max(1.0e-6, 0.1 * lm_accept)
+                            phi0_lm = float(metrics0["merit"])
+                            dual0_lm = float(metrics0["inactive_res_inf"])
+                            gap0_lm = float(metrics0["active_gap_inf"])
+                            eq0_lm = float(metrics0["equality_inf"])
+                            cent0_lm = float(metrics0["centrality_inf"])
+                            best_filtered_phi = phi0_lm
+                            best_filtered_rho = -np.inf
+                            best_filtered_alpha = 0.0
+                            best_filtered_metrics = None
+                            best_filtered_x = None
+                            best_filtered_lam = None
+                            best_filtered_z_lo = None
+                            best_filtered_z_hi = None
+
+                            for lm_try in range(lm_max_tries):
+                                try:
+                                    H_lm, rhs_lm, _ = self._vi_build_lm_system(
+                                        A_aug,
+                                        rhs_aug,
+                                        lm_lam,
+                                        x_block_size=int(x_red.size),
+                                    )
+                                    t_lin_lm = time.perf_counter()
+                                    step_lm_aug = self._solve_linear_system_with_context(
+                                        H_lm,
+                                        rhs_lm,
+                                        context="vi_augmented",
+                                    )
+                                    lin_time += time.perf_counter() - t_lin_lm
+                                except RuntimeError as exc:
+                                    if lm_trace:
+                                        print(f"          [vi-ipm-lm] try={lm_try+1} λ={lm_lam:.2e} linear solve failed: {exc}")
+                                    lm_lam = min(lm_max, max(lm_lam, lm0) * lm_growth if max(lm_lam, lm0) > 0.0 else lm0)
+                                    continue
+
+                                dx_lm, dlam_lm = self._vi_split_augmented_step(step_lm_aug, eq_data)
+                                dz_lo_lm, dz_hi_lm = self._ipm_multiplier_step(
+                                    dx_red=dx_lm,
+                                    z_lo=z_lo0,
+                                    z_hi=z_hi0,
+                                    slack_lo=slack_lo,
+                                    slack_hi=slack_hi,
+                                    lo_mask=lo_mask,
+                                    hi_mask=hi_mask,
+                                    residual_data=residual_data,
+                                )
+                                alpha_pri_lm, alpha_dual_lm = self._ipm_fraction_to_boundary_caps(
+                                    slack_lo=slack_lo,
+                                    slack_hi=slack_hi,
+                                    z_lo=z_lo0,
+                                    z_hi=z_hi0,
+                                    dx_red=dx_lm,
+                                    dz_lo=dz_lo_lm,
+                                    dz_hi=dz_hi_lm,
+                                    lo_mask=lo_mask,
+                                    hi_mask=hi_mask,
+                                )
+                                alpha_lm = min(float(alpha_pri_lm), float(alpha_dual_lm))
+                                if alpha_lm <= 0.0 or not np.all(np.isfinite(dx_lm)):
+                                    if lm_trace:
+                                        print(
+                                            f"          [vi-ipm-lm] try={lm_try+1} λ={lm_lam:.2e} rejected: "
+                                            f"non-interior alpha={float(alpha_lm):.2e}"
+                                        )
+                                    lm_lam = min(lm_max, max(lm_lam, lm0) * lm_growth if max(lm_lam, lm0) > 0.0 else lm0)
+                                    continue
+
+                                x_trial = np.asarray(x_red, dtype=float) + float(alpha_pri_lm) * np.asarray(dx_lm, dtype=float)
+                                lam_trial = np.asarray(lambda0, dtype=float) + float(alpha_dual_lm) * np.asarray(dlam_lm, dtype=float)
+                                z_lo_lm_trial = np.asarray(z_lo0, dtype=float) + float(alpha_dual_lm) * np.asarray(dz_lo_lm, dtype=float)
+                                z_hi_lm_trial = np.asarray(z_hi0, dtype=float) + float(alpha_dual_lm) * np.asarray(dz_hi_lm, dtype=float)
+
+                                for f, buf in zip(funcs, snap):
+                                    f.nodal_values[:] = buf
+                                _, metrics_trial, z_lo_trial, z_hi_trial = self._ipm_eval_trial_step(
+                                    funcs=funcs,
+                                    prev_funcs=prev_funcs,
+                                    aux_funcs=aux_funcs,
+                                    bcs_now=bcs_now,
+                                    x_trial_red=x_trial,
+                                    lo_red=lo_red,
+                                    hi_red=hi_red,
+                                    eq_data=eq_data,
+                                    lambda_trial=lam_trial,
+                                    z_lo_trial=z_lo_lm_trial,
+                                    z_hi_trial=z_hi_lm_trial,
+                                    mu=float(mu),
+                                    alpha_trial=float(min(alpha_pri_lm, alpha_dual_lm)),
+                                    recenter_duals=False,
+                                )
+                                phi_try = float(metrics_trial["merit"])
+                                actual = phi0_lm - phi_try
+                                rho = actual / max(phi0_lm, 1.0e-30)
+                                filtered_ok, lm_reason = self._ipm_filter_accepts(
+                                    metrics_trial=metrics_trial,
+                                    metrics_ref=metrics0,
+                                    filter_entries=stage_filter_entries,
+                                    alpha_trial=float(min(alpha_pri_lm, alpha_dual_lm)),
+                                )
+                                if lm_trace:
+                                    print(
+                                        f"          [vi-ipm-lm] try={lm_try+1} λ={lm_lam:.2e} "
+                                        f"alpha_pri={float(alpha_pri_lm):.2e} alpha_dual={float(alpha_dual_lm):.2e} "
+                                        f"phi0={phi0_lm:.3e} phitry={phi_try:.3e} "
+                                        f"act={actual:.3e} rho={rho:.3e} Ginf={float(metrics_trial['G_inf']):.3e} "
+                                        f"stat={float(metrics_trial['stationarity_inf']):.3e} "
+                                        f"slack={float(metrics_trial['slack_feas_inf']):.3e} "
+                                        f"eq={float(metrics_trial['equality_inf']):.3e} "
+                                        f"cent={float(metrics_trial['centrality_inf']):.3e} "
+                                        f"filter={int(filtered_ok)} reason={lm_reason}"
+                                    )
+                                if filtered_ok and phi_try < best_filtered_phi:
+                                    best_filtered_phi = phi_try
+                                    best_filtered_rho = float(rho)
+                                    best_filtered_alpha = float(min(alpha_pri_lm, alpha_dual_lm))
+                                    best_filtered_metrics = dict(metrics_trial)
+                                    best_filtered_x = np.asarray(x_trial, dtype=float).copy()
+                                    best_filtered_lam = np.asarray(lam_trial, dtype=float).copy()
+                                    best_filtered_z_lo = np.asarray(z_lo_trial, dtype=float).copy()
+                                    best_filtered_z_hi = np.asarray(z_hi_trial, dtype=float).copy()
+                                if np.isfinite(rho) and actual > 0.0 and rho >= lm_accept and filtered_ok:
+                                    accepted = True
+                                    accepted_branch = f"lm:{lm_reason}"
+                                    accepted_metrics = dict(metrics_trial)
+                                    self._vi_eq_lambda_current = np.asarray(lam_trial, dtype=float).copy()
+                                    z_lo = np.asarray(z_lo_trial, dtype=float).copy()
+                                    z_hi = np.asarray(z_hi_trial, dtype=float).copy()
+                                    self._ls_alpha_prev = float(min(alpha_pri_lm, alpha_dual_lm))
+                                    self._vi_last_metrics = dict(metrics_trial)
+                                    self._assert_functions_finite(funcs, context="after accepted interior-point LM step")
+                                    if self.post_cb is not None:
+                                        self.post_cb(funcs)
+                                    if getattr(self, "constraints", None) is not None:
+                                        self._enforce_constraints_on_functions(funcs)
+                                    if rho >= lm_good:
+                                        lm_lam = max(lm0, lm_lam * lm_decay if lm_lam > 0.0 else lm0)
+                                    self._vi_lm_lambda_current = float(min(max(lm_lam, lm0), lm_max))
+                                    break
+                                lm_lam = min(lm_max, max(lm_lam, lm0) * lm_growth if max(lm_lam, lm0) > 0.0 else lm0)
+
+                            if (
+                                not accepted
+                                and best_filtered_x is not None
+                                and best_filtered_lam is not None
+                                and best_filtered_z_lo is not None
+                                and best_filtered_z_hi is not None
+                                and best_filtered_phi < phi0_lm
+                                and np.isfinite(best_filtered_rho)
+                                and best_filtered_rho >= fallback_rho_min
+                            ):
+                                for f, buf in zip(funcs, snap):
+                                    f.nodal_values[:] = buf
+                                self._ipm_write_reduced_iterate(funcs, bcs_now, best_filtered_x)
+                                if self.pre_cb is not None:
+                                    self.pre_cb(funcs)
+                                if getattr(self, "constraints", None) is not None:
+                                    self._enforce_constraints_on_functions(funcs)
+                                accepted = True
+                                accepted_metrics = dict(best_filtered_metrics or metrics0)
+                                self._vi_eq_lambda_current = np.asarray(best_filtered_lam, dtype=float).copy()
+                                z_lo = np.asarray(best_filtered_z_lo, dtype=float).copy()
+                                z_hi = np.asarray(best_filtered_z_hi, dtype=float).copy()
+                                self._ls_alpha_prev = float(best_filtered_alpha)
+                                self._vi_last_metrics = dict(best_filtered_metrics or metrics0)
+                                accepted_branch = "lm:best-filter"
+                                self._assert_functions_finite(funcs, context="after accepted interior-point LM fallback step")
+                                if self.post_cb is not None:
+                                    self.post_cb(funcs)
+                                if getattr(self, "constraints", None) is not None:
+                                    self._enforce_constraints_on_functions(funcs)
+                                self._vi_lm_lambda_current = float(min(max(lm_lam, lm0), lm_max))
+                                if lm_trace:
+                                    print(
+                                        f"          [vi-ipm-lm] accepted best filtered fallback step "
+                                        f"rho={float(best_filtered_rho):.3e} alpha={float(best_filtered_alpha):.2e}"
+                                    )
+                            elif not accepted:
+                                self._vi_lm_lambda_current = float(max(lm0, 1.0e-30))
+
+                        if not accepted and ls_factor_ok:
+                            if trace_ipm:
+                                why = f"{accept_factor:g}·tol_eff (tol_eff={float(tol_eff):.3e})"
+                                print(
+                                    f"          [vi-ipm] accepting current iterate after line-search failure since "
+                                    f"|G|_∞={float(metrics0['G_inf']):.3e} <= {why}."
+                                )
+                            accepted = True
+                            accepted_metrics = dict(metrics0)
+                            self._ls_alpha_prev = 0.0
+                            self._vi_last_metrics = dict(metrics0)
+                            accepted_branch = "current-iterate-relaxed"
+
+                        if not accepted:
+                            for f, buf in zip(funcs, snap):
+                                f.nodal_values[:] = buf
+                            raise RuntimeError("Interior-point line search failed to decrease the barrier residual.")
+
+                    break
+
+                accepted_alpha_raw = getattr(self, "_ls_alpha_prev", None)
+                accepted_alpha = 1.0 if accepted_alpha_raw is None else float(accepted_alpha_raw)
+                accepted_g_ratio = float(accepted_metrics["G_inf"]) / max(float(metrics0["G_inf"]), 1.0e-30)
+                merit_ratio = float(accepted_metrics["merit"]) / max(merit0, 1.0e-30)
+                stage_filter_entries = self._ipm_register_filter_entry(stage_filter_entries, accepted_metrics)
+                self._vi_update_ptc_after_accept(
+                    ptc_mask=ptc_mask,
+                    metrics=metrics0,
+                    active_stable_count=0,
+                    changed=0,
+                    accepted_alpha=float(accepted_alpha),
+                    merit_ratio=float(merit_ratio),
+                    accepted_g_ratio=float(accepted_g_ratio),
+                )
+                if trace_ipm:
+                    print(
+                        "          [vi-ipm] "
+                        f"solve={lin_time:.2e}s alpha={accepted_alpha:.2e} "
+                        f"merit_ratio={merit_ratio:.3f} branch={accepted_branch}"
+                    )
+
+                z_floor = max(float(getattr(self.vi_params, "interior_point_initial_push", 1.0e-8) or 1.0e-8), 1.0e-14)
+                if np.any(lo_mask):
+                    z_lo[lo_mask] = np.maximum(np.asarray(z_lo[lo_mask], dtype=float), z_floor)
+                if np.any(hi_mask):
+                    z_hi[hi_mask] = np.maximum(np.asarray(z_hi[hi_mask], dtype=float), z_floor)
+
+            if stage_converged:
+                comp_vals = []
+                x_red = self._pack_reduced_iterate(funcs)
+                if np.any(lo_mask):
+                    comp_vals.append(np.asarray((x_red[lo_mask] - lo_red[lo_mask]) * z_lo[lo_mask], dtype=float))
+                if np.any(hi_mask):
+                    comp_vals.append(np.asarray((hi_red[hi_mask] - x_red[hi_mask]) * z_hi[hi_mask], dtype=float))
+                mu_prev = float(mu)
+                if comp_vals:
+                    comp_concat = np.concatenate(comp_vals, axis=0)
+                    mu = max(mu_min, min(float(mu) * mu_decay, 0.25 * float(np.mean(comp_concat))))
+                else:
+                    mu = mu_min
+                if mu < mu_prev - max(1.0e-30, 1.0e-12 * max(abs(mu_prev), abs(mu))):
+                    z_lo, z_hi = self._ipm_choose_barrier_transition_duals(
+                        x_red=x_red,
+                        R_red=R_red,
+                        lo_red=lo_red,
+                        hi_red=hi_red,
+                        eq_data=eq_data,
+                        lambda_eq=np.asarray(self._vi_eq_lambda_current, dtype=float),
+                        z_lo=z_lo,
+                        z_hi=z_hi,
+                        mu=float(mu),
+                        stationarity_red=np.asarray(residual_data["stationarity"], dtype=float),
+                        trace_ipm=bool(trace_ipm),
+                    )
+                final_barrier_tol = max(
+                    float(self.np.newton_tol),
+                    float(getattr(self.np, "newton_rtol", 0.0) or 0.0) * max(norm0_ref or 1.0, 1.0e-30),
+                    stage_tol_factor * mu_min,
+                )
+                if float(last_metrics["G_inf"]) <= final_barrier_tol and mu <= mu_min:
+                    break
+                continue
+            break
+
+        self._vi_eq_lambda_accepted = np.asarray(self._vi_eq_lambda_current, dtype=float).copy()
+        self._ipm_z_lo_current = np.asarray(z_lo, dtype=float).copy()
+        self._ipm_z_hi_current = np.asarray(z_hi, dtype=float).copy()
+        self._ipm_mu_current = float(mu)
+        self._last_nonlinear_norm = float(last_metrics["G_inf"])
+        self._last_nonlinear_norm_label = "|G|_∞"
+
+        tol_eff_final = max(
+            float(self.np.newton_tol),
+            float(getattr(self.np, "newton_rtol", 0.0) or 0.0) * max(norm0_ref or 1.0, 1.0e-30),
+            stage_tol_factor * mu_min,
+        )
+        converged = float(last_metrics["G_inf"]) <= tol_eff_final and float(mu) <= mu_min
+        if converged:
+            self._last_nonlinear_accepted = True
+            delta = np.hstack([f.nodal_values - f_prev.nodal_values for f, f_prev in zip(funcs, prev_funcs)])
+            return delta, True, int(total_iters)
+
+        final_accept = False
+        final_why = None
+        if accept_factor > 0.0 and atol > 0.0 and np.isfinite(float(last_metrics["G_inf"])) and float(last_metrics["G_inf"]) <= accept_factor * atol:
+            final_accept = True
+            final_why = f"{accept_factor:g}·atol (atol={atol:.3e})"
+        elif relaxed_g > 0.0 and np.isfinite(float(last_metrics["G_inf"])) and float(last_metrics["G_inf"]) <= relaxed_g:
+            final_accept = True
+            final_why = f"relaxed_filter_accept_ginf={relaxed_g:.3e}"
+        if final_accept:
+            print(
+                f"    [warn] Accepting interior-point best iterate since |G|_∞={float(last_metrics['G_inf']):.3e} "
+                f"≤ {final_why}."
+            )
+            self._last_nonlinear_reason = 2
+            self._last_nonlinear_accepted = True
+            self._last_nonlinear_relaxed_accept = True
+            delta = np.hstack([f.nodal_values - f_prev.nodal_values for f, f_prev in zip(funcs, prev_funcs)])
+            return delta, True, int(total_iters)
+
+        raise RuntimeError("Interior-point Newton did not converge – adjust tolerances/Δt or verify Jacobian.")
 
 
 

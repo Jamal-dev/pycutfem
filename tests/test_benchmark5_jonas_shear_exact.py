@@ -16,10 +16,12 @@ def test_benchmark5_jonas_shear_exact_properties() -> None:
     y_mid = float(bench.interface_y)
 
     alpha_mid = float(np.asarray(bench.alpha(x_mid, y_mid), dtype=float).reshape(()))
+    B_mid = float(np.asarray(bench.B(x_mid, y_mid), dtype=float).reshape(()))
     mu_mid = float(np.asarray(bench.mu_alpha(x_mid, y_mid), dtype=float).reshape(()))
     g_t = np.asarray(bench.g_t(x_mid, y_mid), dtype=float).reshape(2)
 
     assert math.isclose(alpha_mid, 0.5, rel_tol=0.0, abs_tol=1.0e-12)
+    assert math.isclose(B_mid, 0.25, rel_tol=0.0, abs_tol=1.0e-12)
     assert math.isclose(mu_mid, 0.0, rel_tol=0.0, abs_tol=1.0e-12)
     assert g_t.shape == (2,)
     assert math.isclose(g_t[0], -0.2, rel_tol=0.0, abs_tol=1.0e-12)
@@ -33,4 +35,6 @@ def test_benchmark5_jonas_shear_exact_properties() -> None:
 
     for yy in (0.15, 0.5, 0.85):
         f_alpha = float(np.asarray(bench.f_alpha(x_mid, yy), dtype=float).reshape(()))
+        f_B = float(np.asarray(bench.f_B(x_mid, yy), dtype=float).reshape(()))
         assert math.isclose(f_alpha, 0.0, rel_tol=0.0, abs_tol=1.0e-12)
+        assert math.isclose(f_B, 0.0, rel_tol=0.0, abs_tol=1.0e-12)

@@ -98,6 +98,78 @@ class ExpOp:
     """Instruction to apply the natural exponential exp(x)."""
     pass
 
+
+@dataclass(frozen=True, slots=True)
+class TanhOp:
+    """Instruction to apply the hyperbolic tangent tanh(x)."""
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class SinOp:
+    """Instruction to apply the trigonometric sine sin(x)."""
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class CosOp:
+    """Instruction to apply the trigonometric cosine cos(x)."""
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class TanOp:
+    """Instruction to apply the trigonometric tangent tan(x)."""
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class AsinOp:
+    """Instruction to apply the inverse sine asin(x)."""
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class AcosOp:
+    """Instruction to apply the inverse cosine acos(x)."""
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class AtanOp:
+    """Instruction to apply the inverse tangent atan(x)."""
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class SinhOp:
+    """Instruction to apply the hyperbolic sine sinh(x)."""
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class CoshOp:
+    """Instruction to apply the hyperbolic cosine cosh(x)."""
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class AsinhOp:
+    """Instruction to apply the inverse hyperbolic sine asinh(x)."""
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class AcoshOp:
+    """Instruction to apply the inverse hyperbolic cosine acosh(x)."""
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class AtanhOp:
+    """Instruction to apply the inverse hyperbolic tangent atanh(x)."""
+    pass
+
 @dataclass(frozen=True, slots =True)
 class BinaryOp:
     """Instruction to perform a binary operation (e.g., +, *)."""

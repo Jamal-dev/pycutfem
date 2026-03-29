@@ -8,7 +8,7 @@ from pycutfem.ufl.expressions import (
     Sum, Sub, Prod, Div as UflDiv, Inner as UflInner, Dot as UflDot, Outer as UflOuter,
     Grad as UflGrad, DivOperation, Derivative, FacetNormal, Jump, Pos, Neg,
     PositivePart, Heaviside,
-    Log, Exp,
+    Log, Exp, Tanh, Sin, Cos, Tan, Asin, Acos, Atan, Sinh, Cosh, Asinh, Acosh, Atanh,
     Avg,
     ElementWiseConstant, Transpose as UFLTranspose, CellDiameter as UFLCellDiameter, MeshSize as UFLMeshSize,
     NormalComponent, Restriction, Power as UFLPower, Trace as UFLTrace,
@@ -22,7 +22,7 @@ from pycutfem.jit.ir import (
     Outer as IROuter,
     CellDiameter, MeshSize, LoadFacetNormalComponent, CheckDomain, Trace, Determinant, Inverse, Cofactor,
     PositivePartOp, HeavisideOp,
-    LogOp, ExpOp,
+    LogOp, ExpOp, TanhOp, SinOp, CosOp, TanOp, AsinOp, AcosOp, AtanOp, SinhOp, CoshOp, AsinhOp, AcoshOp, AtanhOp,
     Hessian as IRHessian, Laplacian as IRLaplacian, HdivDiv
 )
 from dataclasses import replace
@@ -202,6 +202,54 @@ class IRGenerator:
         if isinstance(node, Exp):
             self._visit(node.operand, side=side)
             self.ir_sequence.append(ExpOp())
+            return
+        if isinstance(node, Tanh):
+            self._visit(node.operand, side=side)
+            self.ir_sequence.append(TanhOp())
+            return
+        if isinstance(node, Sin):
+            self._visit(node.operand, side=side)
+            self.ir_sequence.append(SinOp())
+            return
+        if isinstance(node, Cos):
+            self._visit(node.operand, side=side)
+            self.ir_sequence.append(CosOp())
+            return
+        if isinstance(node, Tan):
+            self._visit(node.operand, side=side)
+            self.ir_sequence.append(TanOp())
+            return
+        if isinstance(node, Asin):
+            self._visit(node.operand, side=side)
+            self.ir_sequence.append(AsinOp())
+            return
+        if isinstance(node, Acos):
+            self._visit(node.operand, side=side)
+            self.ir_sequence.append(AcosOp())
+            return
+        if isinstance(node, Atan):
+            self._visit(node.operand, side=side)
+            self.ir_sequence.append(AtanOp())
+            return
+        if isinstance(node, Sinh):
+            self._visit(node.operand, side=side)
+            self.ir_sequence.append(SinhOp())
+            return
+        if isinstance(node, Cosh):
+            self._visit(node.operand, side=side)
+            self.ir_sequence.append(CoshOp())
+            return
+        if isinstance(node, Asinh):
+            self._visit(node.operand, side=side)
+            self.ir_sequence.append(AsinhOp())
+            return
+        if isinstance(node, Acosh):
+            self._visit(node.operand, side=side)
+            self.ir_sequence.append(AcoshOp())
+            return
+        if isinstance(node, Atanh):
+            self._visit(node.operand, side=side)
+            self.ir_sequence.append(AtanhOp())
             return
         
         if isinstance(node, (Sum, Sub, Prod, UflDiv, UFLPower)):
@@ -436,6 +484,114 @@ class IRGenerator:
                 self._visit(operand, side=side)
                 self._visit(Derivative(operand.operand, *deriv_order), side=side)
                 self.ir_sequence.append(BinaryOp(op_symbol='*'))
+                return
+            if isinstance(operand, Tanh):
+                self._visit(Constant(1.0), side=side)
+                self._visit(operand, side=side)
+                self._visit(Constant(2.0), side=side)
+                self.ir_sequence.append(BinaryOp(op_symbol='**'))
+                self.ir_sequence.append(BinaryOp(op_symbol='-'))
+                self._visit(Derivative(operand.operand, *deriv_order), side=side)
+                self.ir_sequence.append(BinaryOp(op_symbol='*'))
+                return
+            if isinstance(operand, Sin):
+                self._visit(Cos(operand.operand), side=side)
+                self._visit(Derivative(operand.operand, *deriv_order), side=side)
+                self.ir_sequence.append(BinaryOp(op_symbol='*'))
+                return
+            if isinstance(operand, Cos):
+                self._visit(Constant(-1.0), side=side)
+                self._visit(Sin(operand.operand), side=side)
+                self.ir_sequence.append(BinaryOp(op_symbol='*'))
+                self._visit(Derivative(operand.operand, *deriv_order), side=side)
+                self.ir_sequence.append(BinaryOp(op_symbol='*'))
+                return
+            if isinstance(operand, Tan):
+                self._visit(Constant(1.0), side=side)
+                self._visit(Tan(operand.operand), side=side)
+                self._visit(Constant(2.0), side=side)
+                self.ir_sequence.append(BinaryOp(op_symbol='**'))
+                self.ir_sequence.append(BinaryOp(op_symbol='+'))
+                self._visit(Derivative(operand.operand, *deriv_order), side=side)
+                self.ir_sequence.append(BinaryOp(op_symbol='*'))
+                return
+            if isinstance(operand, Asin):
+                self._visit(Derivative(operand.operand, *deriv_order), side=side)
+                self._visit(Constant(1.0), side=side)
+                self._visit(operand.operand, side=side)
+                self._visit(Constant(2.0), side=side)
+                self.ir_sequence.append(BinaryOp(op_symbol='**'))
+                self.ir_sequence.append(BinaryOp(op_symbol='-'))
+                self._visit(Constant(0.5), side=side)
+                self.ir_sequence.append(BinaryOp(op_symbol='**'))
+                self.ir_sequence.append(BinaryOp(op_symbol='/'))
+                return
+            if isinstance(operand, Acos):
+                self._visit(Derivative(operand.operand, *deriv_order), side=side)
+                self._visit(Constant(1.0), side=side)
+                self._visit(operand.operand, side=side)
+                self._visit(Constant(2.0), side=side)
+                self.ir_sequence.append(BinaryOp(op_symbol='**'))
+                self.ir_sequence.append(BinaryOp(op_symbol='-'))
+                self._visit(Constant(0.5), side=side)
+                self.ir_sequence.append(BinaryOp(op_symbol='**'))
+                self.ir_sequence.append(BinaryOp(op_symbol='/'))
+                self._visit(Constant(-1.0), side=side)
+                self.ir_sequence.append(BinaryOp(op_symbol='*'))
+                return
+            if isinstance(operand, Atan):
+                self._visit(Derivative(operand.operand, *deriv_order), side=side)
+                self._visit(Constant(1.0), side=side)
+                self._visit(operand.operand, side=side)
+                self._visit(Constant(2.0), side=side)
+                self.ir_sequence.append(BinaryOp(op_symbol='**'))
+                self.ir_sequence.append(BinaryOp(op_symbol='+'))
+                self.ir_sequence.append(BinaryOp(op_symbol='/'))
+                return
+            if isinstance(operand, Sinh):
+                self._visit(Cosh(operand.operand), side=side)
+                self._visit(Derivative(operand.operand, *deriv_order), side=side)
+                self.ir_sequence.append(BinaryOp(op_symbol='*'))
+                return
+            if isinstance(operand, Cosh):
+                self._visit(Sinh(operand.operand), side=side)
+                self._visit(Derivative(operand.operand, *deriv_order), side=side)
+                self.ir_sequence.append(BinaryOp(op_symbol='*'))
+                return
+            if isinstance(operand, Asinh):
+                self._visit(Derivative(operand.operand, *deriv_order), side=side)
+                self._visit(Constant(1.0), side=side)
+                self._visit(operand.operand, side=side)
+                self._visit(Constant(2.0), side=side)
+                self.ir_sequence.append(BinaryOp(op_symbol='**'))
+                self.ir_sequence.append(BinaryOp(op_symbol='+'))
+                self._visit(Constant(0.5), side=side)
+                self.ir_sequence.append(BinaryOp(op_symbol='**'))
+                self.ir_sequence.append(BinaryOp(op_symbol='/'))
+                return
+            if isinstance(operand, Acosh):
+                self._visit(Derivative(operand.operand, *deriv_order), side=side)
+                self._visit(operand.operand, side=side)
+                self._visit(Constant(1.0), side=side)
+                self.ir_sequence.append(BinaryOp(op_symbol='-'))
+                self._visit(Constant(0.5), side=side)
+                self.ir_sequence.append(BinaryOp(op_symbol='**'))
+                self._visit(operand.operand, side=side)
+                self._visit(Constant(1.0), side=side)
+                self.ir_sequence.append(BinaryOp(op_symbol='+'))
+                self._visit(Constant(0.5), side=side)
+                self.ir_sequence.append(BinaryOp(op_symbol='**'))
+                self.ir_sequence.append(BinaryOp(op_symbol='*'))
+                self.ir_sequence.append(BinaryOp(op_symbol='/'))
+                return
+            if isinstance(operand, Atanh):
+                self._visit(Derivative(operand.operand, *deriv_order), side=side)
+                self._visit(Constant(1.0), side=side)
+                self._visit(operand.operand, side=side)
+                self._visit(Constant(2.0), side=side)
+                self.ir_sequence.append(BinaryOp(op_symbol='**'))
+                self.ir_sequence.append(BinaryOp(op_symbol='-'))
+                self.ir_sequence.append(BinaryOp(op_symbol='/'))
                 return
             if isinstance(operand, Log):
                 self._visit(Derivative(operand.operand, *deriv_order), side=side)

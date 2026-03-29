@@ -13,6 +13,7 @@ from pycutfem.core.dofhandler import DofHandler
 from pycutfem.core.mesh import Mesh
 from pycutfem.fem.mixedelement import MixedElement
 from pycutfem.solvers.nonlinear_solver import (
+    InteriorPointNewtonSolver,
     LinearEqualityConstraint,
     NewtonParameters,
     NewtonSolver,
@@ -60,6 +61,84 @@ def _build_scalar_vi_solver(*, vi_params: VIParameters) -> PdasNewtonSolver:
     )
     solver.set_box_bounds(by_field={"u": (0.0, 1.0)})
     return solver
+
+
+def _build_scalar_ipm_solver(*, vi_params: VIParameters) -> InteriorPointNewtonSolver:
+    nodes, elems, _, corners = structured_quad(1.0, 1.0, nx=1, ny=1, poly_order=1)
+    mesh = Mesh(
+        nodes,
+        element_connectivity=elems,
+        elements_corner_nodes=corners,
+        poly_order=1,
+        element_type="quad",
+    )
+    me = MixedElement(mesh, field_specs={"u": 1})
+    dh = DofHandler(me, method="cg")
+
+    u_k = Function(name="u_k", field_name="u", dof_handler=dh)
+    u_n = Function(name="u_n", field_name="u", dof_handler=dh)
+    v = UflTestFunction(field_name="u", dof_handler=dh)
+    du = TrialFunction(field_name="u", dof_handler=dh)
+
+    residual_form = u_k * v * dx()
+    jacobian_form = du * v * dx()
+    solver = InteriorPointNewtonSolver(
+        residual_form,
+        jacobian_form,
+        dof_handler=dh,
+        mixed_element=me,
+        bcs=[],
+        bcs_homog=[],
+        newton_params=NewtonParameters(newton_tol=1.0e-12, max_newton_iter=6, line_search=True),
+        vi_params=vi_params,
+        backend="python",
+    )
+    solver.set_box_bounds(by_field={"u": (0.0, 1.0)})
+    return solver
+
+
+def _build_scalar_linear_ipm_solver(
+    *,
+    vi_params: VIParameters,
+    target: float = 0.25,
+    initial_guess: float = 0.0,
+) -> tuple[InteriorPointNewtonSolver, Function, Function]:
+    nodes, elems, _, corners = structured_quad(1.0, 1.0, nx=1, ny=1, poly_order=1)
+    mesh = Mesh(
+        nodes,
+        element_connectivity=elems,
+        elements_corner_nodes=corners,
+        poly_order=1,
+        element_type="quad",
+    )
+    me = MixedElement(mesh, field_specs={"u": 1})
+    dh = DofHandler(me, method="cg")
+
+    u_k = Function(name="u_k", field_name="u", dof_handler=dh)
+    u_n = Function(name="u_n", field_name="u", dof_handler=dh)
+    u_k.nodal_values[:] = float(initial_guess)
+    u_n.nodal_values[:] = float(initial_guess)
+
+    v = UflTestFunction(field_name="u", dof_handler=dh)
+    du = TrialFunction(field_name="u", dof_handler=dh)
+    target_c = Constant(float(target))
+
+    residual_form = (u_k - target_c) * v * dx()
+    jacobian_form = du * v * dx()
+
+    solver = InteriorPointNewtonSolver(
+        residual_form,
+        jacobian_form,
+        dof_handler=dh,
+        mixed_element=me,
+        bcs=[],
+        bcs_homog=[],
+        newton_params=NewtonParameters(newton_tol=1.0e-12, max_newton_iter=6, line_search=True),
+        vi_params=vi_params,
+        backend="python",
+    )
+    solver.set_box_bounds(by_field={"u": (0.0, 1.0)})
+    return solver, u_k, u_n
 
 
 def _build_scalar_nonlinear_vi_solver(
@@ -132,6 +211,45 @@ def _build_two_field_vi_solver(*, vi_params: VIParameters):
     residual_form = alpha_k * test_alpha * dx() + phi_k * test_phi * dx()
     jacobian_form = trial_alpha * test_alpha * dx() + trial_phi * test_phi * dx()
     solver = PdasNewtonSolver(
+        residual_form,
+        jacobian_form,
+        dof_handler=dh,
+        mixed_element=me,
+        bcs=[],
+        bcs_homog=[],
+        newton_params=NewtonParameters(newton_tol=1.0e-12, max_newton_iter=5, line_search=True),
+        vi_params=vi_params,
+        backend="python",
+    )
+    solver.set_box_bounds(by_field={"alpha": (0.0, 1.0), "phi": (0.0, 1.0)})
+    return solver, dh, alpha_k, alpha_n, phi_k, phi_n
+
+
+def _build_two_field_ipm_solver(*, vi_params: VIParameters):
+    nodes, elems, _, corners = structured_quad(1.0, 1.0, nx=1, ny=1, poly_order=1)
+    mesh = Mesh(
+        nodes,
+        element_connectivity=elems,
+        elements_corner_nodes=corners,
+        poly_order=1,
+        element_type="quad",
+    )
+    me = MixedElement(mesh, field_specs={"alpha": 1, "phi": 1})
+    dh = DofHandler(me, method="cg")
+
+    alpha_k = Function(name="alpha_k", field_name="alpha", dof_handler=dh)
+    alpha_n = Function(name="alpha_n", field_name="alpha", dof_handler=dh)
+    phi_k = Function(name="phi_k", field_name="phi", dof_handler=dh)
+    phi_n = Function(name="phi_n", field_name="phi", dof_handler=dh)
+
+    test_alpha = UflTestFunction(field_name="alpha", dof_handler=dh)
+    trial_alpha = TrialFunction(field_name="alpha", dof_handler=dh)
+    test_phi = UflTestFunction(field_name="phi", dof_handler=dh)
+    trial_phi = TrialFunction(field_name="phi", dof_handler=dh)
+
+    residual_form = alpha_k * test_alpha * dx() + phi_k * test_phi * dx()
+    jacobian_form = trial_alpha * test_alpha * dx() + trial_phi * test_phi * dx()
+    solver = InteriorPointNewtonSolver(
         residual_form,
         jacobian_form,
         dof_handler=dh,
@@ -246,6 +364,312 @@ def test_internal_pdas_persistence_requires_repeated_state_change() -> None:
     assert not np.any(act_lo)
 
 
+def test_internal_ipm_fraction_to_boundary_limits_slack_and_dual_steps() -> None:
+    solver = _build_scalar_ipm_solver(vi_params=VIParameters(interior_point_fraction_to_boundary=0.9))
+    alpha = solver._ipm_fraction_to_boundary_step(
+        slack_lo=np.array([0.2, 0.5], dtype=float),
+        slack_hi=np.array([0.8, 0.1], dtype=float),
+        z_lo=np.array([0.3, 0.4], dtype=float),
+        z_hi=np.array([0.7, 0.6], dtype=float),
+        dx_red=np.array([-0.5, 0.25], dtype=float),
+        dz_lo=np.array([-0.6, 0.1], dtype=float),
+        dz_hi=np.array([0.2, -1.5], dtype=float),
+        lo_mask=np.array([True, True], dtype=bool),
+        hi_mask=np.array([True, True], dtype=bool),
+    )
+
+    # Raw caps: (x-lo) => 0.4, (hi-x) => 0.4, z_lo => 0.5, z_hi => 0.4; then tau=0.9.
+    assert alpha == pytest.approx(0.36)
+
+
+def test_internal_ipm_dual_initializer_keeps_near_bound_duals_finite() -> None:
+    solver = _build_scalar_ipm_solver(vi_params=VIParameters(interior_point_initial_push=1.0e-8))
+
+    x_red = np.array([1.0e-8], dtype=float)
+    lo_red = np.array([0.0], dtype=float)
+    hi_red = np.array([1.0], dtype=float)
+    stationarity = np.array([5.0], dtype=float)
+    mu = 1.0e-3
+
+    z_lo, z_hi = solver._ipm_initialize_duals(
+        x_red=x_red,
+        stationarity_red=stationarity,
+        lo_red=lo_red,
+        hi_red=hi_red,
+        mu=mu,
+    )
+
+    slack_lo = x_red - lo_red
+    slack_hi = hi_red - x_red
+
+    assert np.all(z_lo > 0.0)
+    assert np.all(z_hi > 0.0)
+    assert float(z_lo[0]) < 10.0
+    assert float(z_hi[0]) < 0.1
+    assert abs(float(stationarity[0] - z_lo[0] + z_hi[0])) < 1.0e-10
+    assert abs(float(slack_lo[0] * z_lo[0] - mu)) < 2.0e-2
+    assert abs(float(slack_hi[0] * z_hi[0] - mu)) < 2.0e-2
+
+
+def test_internal_ipm_filter_accepts_feasibility_progress_without_merit_drop() -> None:
+    solver = _build_scalar_ipm_solver(vi_params=VIParameters())
+    metrics_ref = {
+        "G_inf": 1.0,
+        "stationarity_inf": 1.0,
+        "inactive_res_inf": 1.0,
+        "slack_feas_inf": 0.0,
+        "active_gap_inf": 0.0,
+        "equality_inf": 0.0,
+        "centrality_inf": 1.0,
+        "merit": 1.0,
+    }
+    filter_entries = solver._ipm_register_filter_entry([], metrics_ref)
+    metrics_trial = {
+        "G_inf": 0.6,
+        "stationarity_inf": 0.4,
+        "inactive_res_inf": 0.4,
+        "slack_feas_inf": 0.0,
+        "active_gap_inf": 0.0,
+        "equality_inf": 0.0,
+        "centrality_inf": 1.02,
+        "merit": 1.05,
+    }
+
+    accepted, reason = solver._ipm_filter_accepts(
+        metrics_trial=metrics_trial,
+        metrics_ref=metrics_ref,
+        filter_entries=filter_entries,
+        alpha_trial=0.5,
+    )
+
+    assert accepted
+    assert reason == "filter_feas"
+
+
+def test_internal_ipm_filter_rejects_trial_dominated_by_current_filter_entry() -> None:
+    solver = _build_scalar_ipm_solver(vi_params=VIParameters())
+    metrics_ref = {
+        "G_inf": 1.0,
+        "stationarity_inf": 1.0,
+        "inactive_res_inf": 1.0,
+        "slack_feas_inf": 0.0,
+        "active_gap_inf": 0.0,
+        "equality_inf": 0.0,
+        "centrality_inf": 1.0,
+        "merit": 1.0,
+    }
+    filter_entries = solver._ipm_register_filter_entry([], metrics_ref)
+    metrics_trial = {
+        "G_inf": 1.0,
+        "stationarity_inf": 1.0,
+        "inactive_res_inf": 1.0,
+        "slack_feas_inf": 0.0,
+        "active_gap_inf": 0.0,
+        "equality_inf": 0.0,
+        "centrality_inf": 1.0,
+        "merit": 0.999,
+    }
+
+    accepted, reason = solver._ipm_filter_accepts(
+        metrics_trial=metrics_trial,
+        metrics_ref=metrics_ref,
+        filter_entries=filter_entries,
+        alpha_trial=1.0,
+    )
+
+    assert not accepted
+    assert reason == "filter_dominated"
+
+
+def test_internal_ipm_filter_rejects_large_feasibility_regression_despite_centrality_improvement() -> None:
+    solver = _build_scalar_ipm_solver(vi_params=VIParameters(interior_point_filter_max_feas_growth=1.25))
+    metrics_ref = {
+        "G_inf": 1.0e-2,
+        "stationarity_inf": 9.5e-3,
+        "inactive_res_inf": 9.5e-3,
+        "slack_feas_inf": 0.0,
+        "active_gap_inf": 0.0,
+        "equality_inf": 1.0e-9,
+        "centrality_inf": 1.0e-2,
+        "merit": 1.0,
+    }
+    filter_entries = solver._ipm_register_filter_entry([], metrics_ref)
+    metrics_trial = {
+        "G_inf": 1.3,
+        "stationarity_inf": 1.3,
+        "inactive_res_inf": 1.3,
+        "slack_feas_inf": 0.0,
+        "active_gap_inf": 0.0,
+        "equality_inf": 1.0e-9,
+        "centrality_inf": 9.9e-3,
+        "merit": 8.0,
+    }
+
+    accepted, reason = solver._ipm_filter_accepts(
+        metrics_trial=metrics_trial,
+        metrics_ref=metrics_ref,
+        filter_entries=filter_entries,
+        alpha_trial=0.03,
+    )
+
+    assert not accepted
+    assert reason == "feas_guard"
+
+
+def test_internal_ipm_filter_rejects_centering_only_step_when_feasibility_dominates_and_merit_does_not_drop() -> None:
+    solver = _build_scalar_ipm_solver(vi_params=VIParameters())
+    metrics_ref = {
+        "G_inf": 1.84e-2,
+        "stationarity_inf": 1.84e-2,
+        "inactive_res_inf": 1.84e-2,
+        "slack_feas_inf": 0.0,
+        "active_gap_inf": 0.0,
+        "equality_inf": 1.0e-9,
+        "centrality_inf": 3.3e-3,
+        "merit": 6.5e-3,
+    }
+    filter_entries = solver._ipm_register_filter_entry([], metrics_ref)
+    metrics_trial = {
+        "G_inf": 2.23e-2,
+        "stationarity_inf": 2.23e-2,
+        "inactive_res_inf": 2.23e-2,
+        "slack_feas_inf": 0.0,
+        "active_gap_inf": 0.0,
+        "equality_inf": 1.0e-9,
+        "centrality_inf": 3.29e-3,
+        "merit": 6.6e-3,
+    }
+
+    accepted, reason = solver._ipm_filter_accepts(
+        metrics_trial=metrics_trial,
+        metrics_ref=metrics_ref,
+        filter_entries=filter_entries,
+        alpha_trial=1.0e-3,
+    )
+
+    assert not accepted
+    assert reason == "dominant_feas_guard"
+
+
+def test_internal_ipm_predictor_corrector_direction_returns_finite_primal_dual_step() -> None:
+    solver, u_k, u_n = _build_scalar_linear_ipm_solver(
+        vi_params=VIParameters(interior_point_mehrotra_predictor_corrector=True),
+        target=2.0,
+        initial_guess=0.5,
+    )
+    funcs = [u_k]
+    prev_funcs = [u_n]
+    coeffs = {u_k.name: u_k, u_n.name: u_n}
+    A_red, R_red = solver._assemble_system_reduced(coeffs, need_matrix=True)
+    lo_red, hi_red = solver._bounds_reduced()
+    x_red = solver._pack_reduced_iterate(funcs)
+    eq_data = _PreparedLinearEqualities(
+        names=tuple(),
+        field_names=tuple(),
+        B_red=np.zeros((0, int(x_red.size)), dtype=float),
+        b_eff=np.zeros((0,), dtype=float),
+        project_feasible=tuple(),
+    )
+    lambda_eq = np.zeros((0,), dtype=float)
+    stationarity = solver._vi_stationarity_residual(np.asarray(R_red, dtype=float), eq_data, lambda_eq)
+    z_lo, z_hi = solver._ipm_initialize_duals(
+        x_red=x_red,
+        stationarity_red=stationarity,
+        lo_red=lo_red,
+        hi_red=hi_red,
+        mu=1.0e-2,
+    )
+    residual_data = solver._ipm_residual_data(
+        x_red=x_red,
+        R_red=R_red,
+        lo_red=lo_red,
+        hi_red=hi_red,
+        eq_data=eq_data,
+        lambda_eq=lambda_eq,
+        z_lo=z_lo,
+        z_hi=z_hi,
+        mu=1.0e-2,
+    )
+
+    dx_red, dlam_eq, dz_lo, dz_hi, lin_time, info = solver._ipm_predictor_corrector_direction(
+        A_red=A_red,
+        eq_data=eq_data,
+        residual_data=residual_data,
+        z_lo=z_lo,
+        z_hi=z_hi,
+        slack_lo=np.asarray(residual_data["slack_lo"], dtype=float),
+        slack_hi=np.asarray(residual_data["slack_hi"], dtype=float),
+        lo_mask=np.asarray(residual_data["lo_mask"], dtype=bool),
+        hi_mask=np.asarray(residual_data["hi_mask"], dtype=bool),
+        mu=1.0e-2,
+    )
+
+    assert np.all(np.isfinite(np.asarray(dx_red, dtype=float)))
+    assert np.all(np.isfinite(np.asarray(dlam_eq, dtype=float)))
+    assert np.all(np.isfinite(np.asarray(dz_lo, dtype=float)))
+    assert np.all(np.isfinite(np.asarray(dz_hi, dtype=float)))
+    assert float(lin_time) >= 0.0
+    assert float(info["used"]) > 0.5
+    assert float(info["mu_curr"]) > 0.0
+    assert float(info["alpha_aff_pri"]) > 0.0
+
+
+def test_internal_ipm_solver_preserves_field_equality_and_stays_strictly_inside_box() -> None:
+    solver, u_k, u_n = _build_scalar_linear_ipm_solver(
+        vi_params=VIParameters(
+            interior_point_mu0=1.0e-2,
+            interior_point_mu_min=1.0e-8,
+            interior_point_mu_decay=0.1,
+            interior_point_max_barrier_steps=8,
+        ),
+        target=0.25,
+        initial_guess=0.0,
+    )
+    weights = np.ones(int(u_k.nodal_values.size), dtype=float)
+    solver.set_linear_equalities(
+        [
+            LinearEqualityConstraint(
+                name="u_mass",
+                weights_full=weights,
+                target=0.25 * float(weights.size),
+                field_name="u",
+                project_feasible=True,
+            )
+        ]
+    )
+
+    _, converged, _ = solver._newton_loop([u_k], [u_n], {}, [])
+
+    vals = np.asarray(u_k.nodal_values, dtype=float)
+    assert converged
+    assert np.all(vals > 0.0)
+    assert np.all(vals < 1.0)
+    assert np.allclose(vals, 0.25, atol=1.0e-8, rtol=0.0)
+    assert float(np.sum(vals)) == pytest.approx(0.25 * float(vals.size), abs=1.0e-10, rel=0.0)
+
+
+def test_internal_ipm_solver_tracks_upper_bound_solution_with_strict_interior_iterates() -> None:
+    solver, u_k, u_n = _build_scalar_linear_ipm_solver(
+        vi_params=VIParameters(
+            interior_point_mu0=1.0e-2,
+            interior_point_mu_min=1.0e-8,
+            interior_point_mu_decay=0.1,
+            interior_point_max_barrier_steps=8,
+        ),
+        target=2.0,
+        initial_guess=0.5,
+    )
+
+    _, converged, _ = solver._newton_loop([u_k], [u_n], {}, [])
+
+    vals = np.asarray(u_k.nodal_values, dtype=float)
+    assert converged
+    assert np.all(vals > 0.0)
+    assert np.all(vals < 1.0)
+    assert np.all(vals > 0.99)
+    assert float(getattr(solver, "_last_nonlinear_norm", float("inf"))) < 1.0e-6
+
+
 def test_newton_solver_set_active_fields_restricts_to_requested_field() -> None:
     solver, dh, alpha_k, alpha_n, phi_k, phi_n = _build_two_field_newton_solver()
 
@@ -319,6 +743,69 @@ def test_newton_logistic_transform_applies_chain_rule_column_scaling() -> None:
     assert np.allclose(A_step.toarray(), A_red.toarray() @ np.diag(scale))
 
 
+def test_reduced_gauss_newton_lm_direction_is_descent() -> None:
+    solver, *_ = _build_two_field_newton_solver()
+    A_red = sp.csr_matrix(
+        np.array(
+            [
+                [1.0, 8.0],
+                [0.0, 1.0],
+            ],
+            dtype=float,
+        )
+    )
+    R_red = np.array([1.0, -2.0], dtype=float)
+
+    step = solver._reduced_gauss_newton_lm_direction(A_red, R_red)
+
+    assert step is not None
+    g = np.asarray(A_red.T @ R_red, dtype=float).ravel()
+    assert np.all(np.isfinite(step))
+    assert float(np.dot(g, step)) < 0.0
+
+
+def test_line_search_reduced_prefers_gauss_newton_fallback_over_stalled_newton_best_effort(monkeypatch) -> None:
+    solver, _, alpha_k, _, phi_k, _ = _build_two_field_newton_solver()
+    funcs = [alpha_k, phi_k]
+    nred = int(len(solver.active_dofs))
+    A_red = sp.eye(nred, format="csr")
+    R_red = np.zeros((nred,), dtype=float)
+    R_red[0] = 1.0
+    S_red = np.zeros((nred,), dtype=float)
+    S_red[0] = -1.0
+    gn_dir = np.zeros((nred,), dtype=float)
+    gn_dir[1] = -1.0
+    trial = {"step": np.zeros((nred,), dtype=float)}
+
+    def fake_apply(step_red, _funcs, _bcs_now):
+        trial["step"] = np.asarray(step_red, dtype=float).copy()
+        return trial["step"]
+
+    def fake_assemble(_coeffs, need_matrix=False):
+        step = np.asarray(trial["step"], dtype=float)
+        res = np.zeros((nred,), dtype=float)
+        if abs(step[1]) > abs(step[0]):
+            res[0] = 0.5
+        else:
+            res[0] = np.sqrt(max(1.0 - 2.0e-6 * abs(step[0]), 0.0))
+        if need_matrix:
+            return A_red, res
+        return None, res
+
+    monkeypatch.setattr(solver, "_apply_solver_coordinate_step", fake_apply)
+    monkeypatch.setattr(solver, "_assemble_system_reduced", fake_assemble)
+    monkeypatch.setattr(solver, "_reduced_gauss_newton_lm_direction", lambda _A, _R: gn_dir.copy())
+
+    solver.np.ls_mode = "armijo"
+    solver.np.ls_max_iter = 4
+    solver.np.ls_reduction = 0.5
+    solver._ls_alpha_prev = 1.0
+
+    step = solver._line_search_reduced(A_red, R_red, S_red, funcs, {}, [])
+
+    assert np.allclose(step, gn_dir)
+
+
 def test_latent_bounded_logit_sigmoid_round_trip_clips_to_open_interval() -> None:
     vals = np.asarray([0.0, 1.0e-8, 0.25, 0.75, 1.0 - 1.0e-8, 1.0], dtype=float)
     eps = 1.0e-6
@@ -329,6 +816,18 @@ def test_latent_bounded_logit_sigmoid_round_trip_clips_to_open_interval() -> Non
     assert np.all(recovered < 1.0 - eps * 0.99)
     assert recovered[2] == pytest.approx(0.25, rel=0.0, abs=1.0e-12)
     assert recovered[3] == pytest.approx(0.75, rel=0.0, abs=1.0e-12)
+
+
+def test_latent_bounded_tanh_round_trip_clips_to_open_interval() -> None:
+    vals = np.asarray([0.0, 1.0e-8, 0.2, 0.8, 1.0 - 1.0e-8, 1.0], dtype=float)
+    eps = 1.0e-6
+    latent = _latent_inverse_array(vals, eps=eps, map_kind="tanh")
+    recovered = _latent_forward_array(latent, map_kind="tanh")
+
+    assert np.all(recovered > eps * 0.99)
+    assert np.all(recovered < 1.0 - eps * 0.99)
+    assert recovered[2] == pytest.approx(0.2, rel=0.0, abs=1.0e-12)
+    assert recovered[3] == pytest.approx(0.8, rel=0.0, abs=1.0e-12)
 
 
 def test_latent_bounded_bcs_duplicate_dirichlet_data_in_logit_coordinates() -> None:
@@ -1244,6 +1743,68 @@ def test_internal_pdas_import_vi_state_maps_transport_state_into_monolithic_spac
     assert np.all(imported_guard[mono_phi_mask] == 0)
     assert monolithic_solver._vi_working_set_guard_remaining == 2
     assert monolithic_solver._vi_preserve_state_on_next_solve is True
+
+
+def test_internal_ipm_import_vi_state_maps_duals_and_mu_into_monolithic_space() -> None:
+    transport_solver, *_ = _build_two_field_ipm_solver(
+        vi_params=VIParameters(interior_point_mu0=1.0e-2, interior_point_mu_min=1.0e-8)
+    )
+    transport_solver.set_active_fields(["alpha"])
+    eq_weights = np.ones(int(transport_solver.dh.total_dofs), dtype=float)
+    transport_solver.set_linear_equalities(
+        [
+            LinearEqualityConstraint(
+                name="alpha_mass",
+                weights_full=eq_weights,
+                target=0.0,
+                field_name="alpha",
+                project_feasible=True,
+            )
+        ]
+    )
+    z_vals = np.linspace(0.2, 0.5, int(transport_solver.active_dofs.size), dtype=float)
+    transport_solver._ipm_z_lo_current = z_vals.copy()
+    transport_solver._ipm_z_hi_current = (z_vals + 0.3).copy()
+    transport_solver._ipm_mu_current = 3.0e-4
+    transport_solver._vi_eq_lambda_accepted = np.array([0.75], dtype=float)
+    transport_solver._vi_eq_lambda_current = transport_solver._vi_eq_lambda_accepted.copy()
+    exported = transport_solver.export_vi_state()
+    assert exported is not None
+    assert "ipm_z_lo" in exported
+    assert "ipm_z_hi" in exported
+    assert "ipm_mu" in exported
+
+    monolithic_solver, *_ = _build_two_field_ipm_solver(
+        vi_params=VIParameters(interior_point_mu0=1.0e-2, interior_point_mu_min=1.0e-8)
+    )
+    monolithic_solver.set_linear_equalities(
+        [
+            LinearEqualityConstraint(
+                name="alpha_mass",
+                weights_full=np.ones(int(monolithic_solver.dh.total_dofs), dtype=float),
+                target=0.0,
+                field_name="alpha",
+                project_feasible=True,
+            )
+        ]
+    )
+
+    assert monolithic_solver.import_vi_state(exported, force_once=True)
+    forced_state = getattr(monolithic_solver, "_ipm_forced_state", None)
+    assert forced_state is not None
+    mono_alpha_mask = np.asarray(monolithic_solver._vi_red_field_names, dtype=object) == "alpha"
+    mono_phi_mask = np.asarray(monolithic_solver._vi_red_field_names, dtype=object) == "phi"
+
+    forced_z_lo = np.asarray(forced_state["z_lo"], dtype=float)
+    forced_z_hi = np.asarray(forced_state["z_hi"], dtype=float)
+    assert forced_z_lo.shape == monolithic_solver.active_dofs.shape
+    assert forced_z_hi.shape == monolithic_solver.active_dofs.shape
+    assert np.all(forced_z_lo[mono_alpha_mask] > 0.0)
+    assert np.all(forced_z_hi[mono_alpha_mask] > 0.0)
+    assert np.allclose(forced_z_lo[mono_phi_mask], 0.0, atol=0.0, rtol=0.0)
+    assert np.allclose(forced_z_hi[mono_phi_mask], 0.0, atol=0.0, rtol=0.0)
+    assert float(forced_state["mu"]) == pytest.approx(3.0e-4, rel=0.0, abs=0.0)
+    assert np.allclose(np.asarray(forced_state["eq_lambda"], dtype=float), np.array([0.75], dtype=float))
 
 
 def test_internal_pdas_detects_period2_state_cycle() -> None:
@@ -2975,3 +3536,72 @@ def test_trust_region_dogleg_step_respects_radius() -> None:
 
     assert boundary
     assert float(np.linalg.norm(step)) <= 0.25 + 1.0e-12
+
+
+def test_newton_loop_trace_context_prints_label_and_global_residual(capsys) -> None:
+    solver, _, alpha_k, alpha_n, phi_k, phi_n = _build_two_field_newton_solver()
+    solver.np.newton_tol = 1.0e-12
+    solver.np.max_newton_iter = 2
+    alpha_k.nodal_values[:] = 1.0
+    alpha_n.nodal_values[:] = 0.0
+    phi_k.nodal_values[:] = 0.0
+    phi_n.nodal_values[:] = 0.0
+    solver._newton_trace_label = "unit-stage"
+    solver._newton_trace_global_residual_cb = lambda funcs, prev_funcs, aux_funcs, bcs_now: 1.234e-3
+    solver._newton_trace_global_residual_label = "|R_raw|_∞"
+
+    solver._newton_loop([alpha_k, phi_k], [alpha_n, phi_n], [], [])
+    out = capsys.readouterr().out
+
+    assert "[unit-stage] Newton 1:" in out
+    assert "|R_raw|_∞ = 1.23e-03" in out
+    assert "[unit-stage] timings:" in out
+
+
+def test_line_search_then_trust_compares_best_effort_against_trust_region(monkeypatch) -> None:
+    solver, dh, alpha_k, alpha_n, phi_k, phi_n = _build_two_field_newton_solver()
+    solver.np.globalization = "line_search_then_trust"
+    solver.np.max_newton_iter = 2
+    solver.np.newton_tol = 1.0e-12
+    solver.np.newton_rtol = 0.0
+    alpha_k.nodal_values[:] = 1.0
+    alpha_n.nodal_values[:] = 0.0
+    phi_k.nodal_values[:] = 0.0
+    phi_n.nodal_values[:] = 0.0
+    alpha_slice = np.asarray(dh.get_field_slice("alpha"), dtype=int).ravel()
+    nred = alpha_k.nodal_values.size + phi_k.nodal_values.size
+    ls_step = np.zeros((nred,), dtype=float)
+    tr_step = np.zeros((nred,), dtype=float)
+    ls_step[alpha_slice] = -0.2
+    tr_step[alpha_slice] = -0.5
+    ls_calls = {"count": 0}
+    tr_calls = {"count": 0}
+
+    def _fake_line_search(A_red, R_red, S_red, funcs, coeffs, bcs_now):
+        ls_calls["count"] += 1
+        solver._ls_last_best_effort = True
+        solver._ls_last_residual_red = np.full((nred,), 5.0e-2, dtype=float)
+        return ls_step.copy()
+
+    def _fake_trust_region(A_red, R_red, S_red, funcs, coeffs, bcs_now):
+        tr_calls["count"] += 1
+        solver._ls_last_residual_red = np.zeros((nred,), dtype=float)
+        return tr_step.copy()
+
+    monkeypatch.setattr(solver, "_line_search_reduced", _fake_line_search)
+    monkeypatch.setattr(solver, "_trust_region_reduced", _fake_trust_region)
+
+    delta, converged, n_iters = solver._newton_loop(
+        [alpha_k, phi_k],
+        [alpha_n, phi_n],
+        [],
+        [],
+    )
+
+    assert converged
+    assert n_iters == 1
+    assert ls_calls["count"] == 1
+    assert tr_calls["count"] == 1
+    assert np.allclose(alpha_k.nodal_values, 0.5)
+    assert np.allclose(phi_k.nodal_values, 0.0)
+    assert np.allclose(delta[alpha_slice], 0.5)

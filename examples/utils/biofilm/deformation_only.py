@@ -9,7 +9,15 @@ This module implements the baseline system described in the manuscript:
   - alpha transport with Cahn--Hilliard regularization.
 
 Compared to `examples.utils.biofilm.one_domain`, this reduced model removes
-porosity transport, substrate, detached biomass, growth, detachment, and damage.
+substrate, detached biomass, growth, detachment, and damage. It supports two
+transport closures:
+
+  - the historical frozen-`phi_b` reduction, where `B = alpha (1-phi_b)` is
+    derived from `alpha`, and
+  - an optional native `alpha-B` transport mode for the conserved-support
+    `internal_conversion` branch, where `B` is an actual unknown and
+    `phi = (alpha-B)/alpha` is derived from the reduced state when needed.
+
 It is the form builder that should be used for the Paper-1 verification program.
 
 An optional Kelvin--Voigt skeleton viscosity `solid_visco_eta` is supported for
@@ -38,7 +46,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import numpy as np
 
-from pycutfem.ufl.expressions import Constant, Identity, div, dot, grad, inner
+from pycutfem.ufl.expressions import Constant, FacetNormal, Identity, div, dot, grad, inner
 
 from .one_domain import (
     _as_constant,
@@ -66,6 +74,28 @@ def _C(alpha, *, phi_b):
 
 def _B(alpha, *, phi_b):
     return alpha * (_c(1.0) - phi_b)
+
+
+def _C_from_B(B):
+    return _c(1.0) - B
+
+
+def _P_from_alpha_B(alpha, B):
+    return alpha - B
+
+
+def _phi_sq_from_alpha_B(alpha, B, *, eps: float = 1.0e-12):
+    P = _P_from_alpha_B(alpha, B)
+    denom = alpha * alpha + _c(float(eps))
+    return (P * P) / denom
+
+
+def _d_phi_sq_from_alpha_B(alpha, B, dalpha, dB, *, eps: float = 1.0e-12):
+    P = _P_from_alpha_B(alpha, B)
+    dP = dalpha - dB
+    denom = alpha * alpha + _c(float(eps))
+    ddenom = _c(2.0) * alpha * dalpha
+    return ((_c(2.0) * P * dP) * denom - (P * P) * ddenom) / (denom * denom)
 
 
 def _mu_mix(alpha, *, mu_f, mu_b):
@@ -134,12 +164,14 @@ class DeformationOnlyForms:
     r_skeleton: object
     r_kinematics: object
     r_alpha: object
+    r_B: object | None
     r_mu_alpha: object
     a_momentum: object
     a_mass: object
     a_skeleton: object
     a_kinematics: object
     a_alpha: object
+    a_B: object | None
     a_mu_alpha: object
     r_drag_lambda: object | None = None
     a_drag_lambda: object | None = None
@@ -157,6 +189,7 @@ def build_deformation_only_forms(
     vS_k,
     u_k,
     alpha_k,
+    B_k=None,
     mu_alpha_k,
     lambda_drag_k=None,
     # unknowns at t_n
@@ -165,6 +198,7 @@ def build_deformation_only_forms(
     vS_n,
     u_n,
     alpha_n,
+    B_n=None,
     mu_alpha_n=None,
     lambda_drag_n=None,
     # Newton increments
@@ -173,6 +207,7 @@ def build_deformation_only_forms(
     dvS,
     du,
     dalpha,
+    dB=None,
     dmu_alpha,
     dlambda_drag=None,
     # tests
@@ -181,6 +216,7 @@ def build_deformation_only_forms(
     vS_test,
     u_test,
     alpha_test,
+    B_test=None,
     mu_alpha_test,
     lambda_drag_test=None,
     # measure and stepping
@@ -211,9 +247,10 @@ def build_deformation_only_forms(
     alpha_mu_aux_pin: float = 1.0,
     kinematics_scale=None,
     # The reduced verification model has no separate phi equation. The intended
-    # physics is therefore the support-preserving internal-conversion limit
-    # with B=alpha(1-phi_b), not the legacy alpha-growth / alpha-to-X exchange
-    # branch from the full one-domain model.
+    # physics is therefore the support-preserving internal-conversion limit. If
+    # (B_k, B_n, dB, B_test) are provided, the reduced model uses the native
+    # alpha-B transport closure. Otherwise it falls back to the historical
+    # frozen-phi_b reduction with B=alpha(1-phi_b).
     support_physics: str = "internal_conversion",
     # Recommended support-preserving alpha transport for the reduced one-domain
     # model is `alpha_advect_with="biofilm_volume"` with
@@ -245,10 +282,13 @@ def build_deformation_only_forms(
     skeleton_pressure_mode: str = "whole_domain",
     # Optional Biot-Willis coefficient for the sharp Seboldt pressure mode.
     alpha_biot: float | None = None,
+    ds_alpha_transport=None,
+    ds_B_transport=None,
     # sources
     f_v=None,
     f_u=None,
     f_alpha=None,
+    f_B=None,
 ) -> DeformationOnlyForms:
     if rho_f is None or mu_f is None or mu_b is None or kappa_inv is None:
         raise ValueError("rho_f, mu_f, mu_b, and kappa_inv are required.")
@@ -267,7 +307,7 @@ def build_deformation_only_forms(
         if not np.isfinite(total_pressure_ref) or total_pressure_ref <= 0.0:
             raise ValueError("solid_volumetric_split requires a positive total-pressure reference scale.")
 
-    th = _c(float(theta))
+    th = _as_constant(theta)
     one_m_th = _c(1.0) - th
     inv_dt = _c(1.0) / dt
 
@@ -286,6 +326,7 @@ def build_deformation_only_forms(
     f_v = f_v if f_v is not None else zero_vector
     f_u = f_u if f_u is not None else zero_vector
     f_alpha = f_alpha if f_alpha is not None else zero_scalar
+    f_B = f_B if f_B is not None else zero_scalar
     g_t_k = g_t_k if g_t_k is not None else zero_vector
     g_t_n = g_t_n if g_t_n is not None else g_t_k
     traction_weight_k = traction_weight_k if traction_weight_k is not None else zero_scalar
@@ -295,17 +336,48 @@ def build_deformation_only_forms(
     r_volumetric = None
     a_volumetric = None
 
-    # Frozen coefficients at time level n (matches the one-step analysis in the manuscript).
-    C_n = _C(alpha_n, phi_b=phi_b_c)
-    B_n = _B(alpha_n, phi_b=phi_b_c)
-    C_k = _C(alpha_k, phi_b=phi_b_c)
-    B_k = _B(alpha_k, phi_b=phi_b_c)
-    gradC_n = -(_c(1.0) - phi_b_c) * grad(alpha_n)
-    gradC_k = -(_c(1.0) - phi_b_c) * grad(alpha_k)
-    gradB_n = (_c(1.0) - phi_b_c) * grad(alpha_n)
-    gradB_k = (_c(1.0) - phi_b_c) * grad(alpha_k)
-    dC_k = -(_c(1.0) - phi_b_c) * dalpha
-    grad_dC_k = -(_c(1.0) - phi_b_c) * grad(dalpha)
+    use_B_transport = any(val is not None for val in (B_k, B_n, dB, B_test))
+    if use_B_transport and not all(val is not None for val in (B_k, B_n, dB, B_test)):
+        raise ValueError("alpha-B reduced transport requires (B_k, B_n, dB, B_test) to be provided together.")
+
+    # Reduced coefficients. The historical mode derives B from frozen phi_b;
+    # the alpha-B mode treats B as a true unknown and derives C=1-B, P=alpha-B.
+    if use_B_transport:
+        C_n = _C_from_B(B_n)
+        C_k = _C_from_B(B_k)
+        P_n = _P_from_alpha_B(alpha_n, B_n)
+        P_k = _P_from_alpha_B(alpha_k, B_k)
+        gradC_n = -grad(B_n)
+        gradC_k = -grad(B_k)
+        gradB_n = grad(B_n)
+        gradB_k = grad(B_k)
+        gradP_n = grad(alpha_n) - grad(B_n)
+        gradP_k = grad(alpha_k) - grad(B_k)
+        dC_k = -dB
+        grad_dC_k = -grad(dB)
+        dB_k = dB
+        grad_dB_k = grad(dB)
+        dP_k = dalpha - dB
+        grad_dP_k = grad(dalpha) - grad(dB)
+    else:
+        C_n = _C(alpha_n, phi_b=phi_b_c)
+        B_n = _B(alpha_n, phi_b=phi_b_c)
+        C_k = _C(alpha_k, phi_b=phi_b_c)
+        B_k = _B(alpha_k, phi_b=phi_b_c)
+        P_n = None
+        P_k = None
+        gradC_n = -(_c(1.0) - phi_b_c) * grad(alpha_n)
+        gradC_k = -(_c(1.0) - phi_b_c) * grad(alpha_k)
+        gradB_n = (_c(1.0) - phi_b_c) * grad(alpha_n)
+        gradB_k = (_c(1.0) - phi_b_c) * grad(alpha_k)
+        gradP_n = None
+        gradP_k = None
+        dC_k = -(_c(1.0) - phi_b_c) * dalpha
+        grad_dC_k = -(_c(1.0) - phi_b_c) * grad(dalpha)
+        dB_k = (_c(1.0) - phi_b_c) * dalpha
+        grad_dB_k = (_c(1.0) - phi_b_c) * grad(dalpha)
+        dP_k = None
+        grad_dP_k = None
     rho_n = rho_f * C_n
     rho_k = rho_f * C_k
     mu_n = _mu_mix(alpha_n, mu_f=mu_f, mu_b=mu_b)
@@ -318,6 +390,15 @@ def build_deformation_only_forms(
     if kappa_inv_key not in {"spatial", "constant", "const"} and not use_refmap_drag:
         raise ValueError(f"Unsupported deformation-only kappa_inv_model {kappa_inv_model!r}.")
     support_physics_key = _support_physics_key(support_physics)
+    if use_B_transport and support_physics_key != "internal_conversion":
+        raise ValueError("alpha-B reduced transport is only implemented for support_physics='internal_conversion'.")
+    if support_physics_key == "internal_conversion":
+        adv_with_norm = str(alpha_advect_with or "biofilm_volume").strip().lower().replace("-", "_")
+        if adv_with_norm not in {"biofilm", "biofilm_volume", "phase", "phase_volume"}:
+            raise ValueError(
+                "deformation_only internal_conversion requires alpha_advect_with='biofilm_volume' "
+                "because alpha tracks the conserved occupied support."
+            )
     drag_form_key = str(drag_formulation or "direct").strip().lower().replace("-", "_")
     if drag_form_key in {"mixed", "mixed_formulation", "mixed_auxiliary", "mixed_lagrange_multiplier"}:
         drag_form_key = "mixed_lm"
@@ -337,6 +418,16 @@ def build_deformation_only_forms(
     vS_th = th * vS_k + one_m_th * vS_n
     u_th = th * u_k + one_m_th * u_n
     alpha_th = th * alpha_k + one_m_th * alpha_n
+
+    alpha_flux_k = None
+    alpha_flux_n = None
+    alpha_flux_k_comp = None
+    alpha_flux_n_comp = None
+    d_alpha_flux_k = None
+    d_alpha_flux_k_comp = None
+    div_alpha_flux_k = None
+    div_alpha_flux_n = None
+    d_div_alpha_flux_k = None
 
     adv_with_key = str(alpha_advect_with or "vS").strip().lower()
     if adv_with_key in {"vs", "skeleton", "solid"}:
@@ -369,17 +460,64 @@ def build_deformation_only_forms(
         div_adv_u_n = C_n * div(v_n) + dot(gradC_n, v_n) + B_n * div(vS_n) + dot(gradB_n, vS_n)
         d_div_adv_u = C_n * div(dv) + dot(gradC_n, dv) + B_n * div(dvS) + dot(gradB_n, dvS)
     elif adv_with_key in {"biofilm", "biofilm_volume", "biofilm-volume", "phase", "phase_volume", "phase-volume"}:
-        # Biofilm-volume velocity from the two constituent volume balances:
-        #   ∂t(α φ_b) + div(α φ_b v) = 0,
-        #   ∂t(α (1-φ_b)) + div(α (1-φ_b) vS) = 0.
-        # Summing gives
-        #   ∂t α + div( α [ φ_b v + (1-φ_b) vS ] ) = 0.
-        adv_u_k = phi_b_c * v_k + (_c(1.0) - phi_b_c) * vS_k
-        adv_u_n = phi_b_c * v_n + (_c(1.0) - phi_b_c) * vS_n
-        dadv_u = phi_b_c * dv + (_c(1.0) - phi_b_c) * dvS
-        div_adv_u_k = phi_b_c * div(v_k) + (_c(1.0) - phi_b_c) * div(vS_k)
-        div_adv_u_n = phi_b_c * div(v_n) + (_c(1.0) - phi_b_c) * div(vS_n)
-        d_div_adv_u = phi_b_c * div(dv) + (_c(1.0) - phi_b_c) * div(dvS)
+        if use_B_transport:
+            # Conservative occupied-support flux:
+            #   q_alpha = P v + B vS,  P = alpha - B.
+            adv_u_k = None
+            adv_u_n = None
+            dadv_u = None
+            div_adv_u_k = None
+            div_adv_u_n = None
+            d_div_adv_u = None
+            alpha_flux_k = P_k * v_k + B_k * vS_k
+            alpha_flux_n = P_n * v_n + B_n * vS_n
+            alpha_flux_k_comp = tuple(
+                P_k * _vector_component(v_k, i) + B_k * _vector_component(vS_k, i) for i in range(2)
+            )
+            alpha_flux_n_comp = tuple(
+                P_n * _vector_component(v_n, i) + B_n * _vector_component(vS_n, i) for i in range(2)
+            )
+            d_alpha_flux_k_comp = tuple(
+                dP_k * _vector_component(v_k, i)
+                + P_k * _vector_component(dv, i)
+                + dB_k * _vector_component(vS_k, i)
+                + B_k * _vector_component(dvS, i)
+                for i in range(2)
+            )
+            div_alpha_flux_k = (
+                P_k * div(v_k)
+                + dot(gradP_k, v_k)
+                + B_k * div(vS_k)
+                + dot(gradB_k, vS_k)
+            )
+            div_alpha_flux_n = (
+                P_n * div(v_n)
+                + dot(gradP_n, v_n)
+                + B_n * div(vS_n)
+                + dot(gradB_n, vS_n)
+            )
+            d_div_alpha_flux_k = (
+                dP_k * div(v_k)
+                + P_k * div(dv)
+                + dot(grad_dP_k, v_k)
+                + dot(gradP_k, dv)
+                + dB_k * div(vS_k)
+                + B_k * div(dvS)
+                + dot(grad_dB_k, vS_k)
+                + dot(gradB_k, dvS)
+            )
+        else:
+            # Biofilm-volume velocity from the two constituent volume balances:
+            #   ∂t(α φ_b) + div(α φ_b v) = 0,
+            #   ∂t(α (1-φ_b)) + div(α (1-φ_b) vS) = 0.
+            # Summing gives
+            #   ∂t α + div( α [ φ_b v + (1-φ_b) vS ] ) = 0.
+            adv_u_k = phi_b_c * v_k + (_c(1.0) - phi_b_c) * vS_k
+            adv_u_n = phi_b_c * v_n + (_c(1.0) - phi_b_c) * vS_n
+            dadv_u = phi_b_c * dv + (_c(1.0) - phi_b_c) * dvS
+            div_adv_u_k = phi_b_c * div(v_k) + (_c(1.0) - phi_b_c) * div(vS_k)
+            div_adv_u_n = phi_b_c * div(v_n) + (_c(1.0) - phi_b_c) * div(vS_n)
+            d_div_adv_u = phi_b_c * div(dv) + (_c(1.0) - phi_b_c) * div(dvS)
     elif adv_with_key in {"relative", "slip", "v_minus_vs", "v-vs"}:
         adv_u_k = v_k - vS_k
         adv_u_n = v_n - vS_n
@@ -439,6 +577,11 @@ def build_deformation_only_forms(
             f"Unsupported deformation-only alpha_advection_form={alpha_advection_form!r}. "
             "Use 'advective', 'conservative', 'conservative_weak', or 'interface_band_conservative'."
         )
+    if support_physics_key == "internal_conversion" and adv_key not in {"conservative", "conservative_weak"}:
+        raise ValueError(
+            "deformation_only internal_conversion requires a conservative alpha law. "
+            "Use alpha_advection_form='conservative_weak' (recommended) or 'conservative'."
+        )
 
     div_C_vtest = _div_weighted_scalar_times_vector(C_k, gradC_k, v_test)
     div_B_vStest = _div_weighted_scalar_times_vector(B_n, gradB_n, vS_test)
@@ -452,8 +595,6 @@ def build_deformation_only_forms(
     d_div_C_vk = dC_k * div(v_k) + C_k * div(dv) + dot(grad_dC_k, v_k) + dot(gradC_k, dv)
     div_B_dvS = _div_weighted_scalar_times_vector(B_n, gradB_n, dvS)
     div_Bk_vSk = _div_weighted_scalar_times_vector(B_k, gradB_k, vS_k)
-    dB_k = (_c(1.0) - phi_b_c) * dalpha
-    grad_dB_k = (_c(1.0) - phi_b_c) * grad(dalpha)
     d_div_Bk_vStest = dB_k * div(vS_test) + dot(grad_dB_k, vS_test)
     d_div_Bk_vSk = dB_k * div(vS_k) + B_k * div(dvS) + dot(grad_dB_k, vS_k) + dot(gradB_k, dvS)
     div_rhov_k = rho_f * div_C_vk
@@ -603,10 +744,12 @@ def build_deformation_only_forms(
                 + vol_pen_c * ((-dalpha) * pi_s_k * q_test + _one_minus(alpha_k) * dpi_s * q_test)
             ) * dx
         if skel_press_key == "seboldt":
-            r_skel_press_k = _c(0.0)
-            r_skel_press_n = _c(0.0)
-            r_skel_pressure = _c(0.0) * dx
-            a_skel_pressure = _c(0.0) * dx
+            # Preserve residual/Jacobian roles even though the split-Seboldt
+            # pressure remainder vanishes identically.
+            r_skel_press_k = _c(0.0) * dot(vS_k, vS_test)
+            r_skel_press_n = _c(0.0) * dot(vS_n, vS_test)
+            r_skel_pressure = (sk_th * r_skel_press_k + sk_one_m_th * r_skel_press_n) * dx
+            a_skel_pressure = _c(0.0) * dot(dvS, vS_test) * dx
         else:
             r_skel_press_k = -(p_k * dot(gradB_k, vS_test))
             r_skel_press_n = -(p_n * dot(gradB_n, vS_test))
@@ -624,13 +767,28 @@ def build_deformation_only_forms(
     diff_k = v_k - vS_k
     diff_n = v_n - vS_n
     ddiff = dv - dvS
-    drag_occ_k = alpha_k if support_physics_key != "internal_conversion" else B_k
-    drag_occ_n = alpha_n if support_physics_key != "internal_conversion" else B_n
-    ddrag_occ = dalpha if support_physics_key != "internal_conversion" else dB_k
-    drag_phi_factor = _c(1.0) if support_physics_key != "internal_conversion" else (phi_b_c * phi_b_c)
-    drag_weight_k = drag_occ_k * drag_phi_factor
-    drag_weight_n = drag_occ_n * drag_phi_factor
-    ddrag_weight = ddrag_occ * drag_phi_factor
+    if support_physics_key == "internal_conversion":
+        drag_occ_k = B_k
+        drag_occ_n = B_n
+        ddrag_occ = dB_k
+        if use_B_transport:
+            drag_phi_factor_k = _phi_sq_from_alpha_B(alpha_k, B_k)
+            drag_phi_factor_n = _phi_sq_from_alpha_B(alpha_n, B_n)
+            d_drag_phi_factor_k = _d_phi_sq_from_alpha_B(alpha_k, B_k, dalpha, dB_k)
+        else:
+            drag_phi_factor_k = phi_b_c * phi_b_c
+            drag_phi_factor_n = phi_b_c * phi_b_c
+            d_drag_phi_factor_k = zero_scalar
+    else:
+        drag_occ_k = alpha_k
+        drag_occ_n = alpha_n
+        ddrag_occ = dalpha
+        drag_phi_factor_k = _c(1.0)
+        drag_phi_factor_n = _c(1.0)
+        d_drag_phi_factor_k = zero_scalar
+    drag_weight_k = drag_occ_k * drag_phi_factor_k
+    drag_weight_n = drag_occ_n * drag_phi_factor_n
+    ddrag_weight = ddrag_occ * drag_phi_factor_k + drag_occ_k * d_drag_phi_factor_k
     r_drag_lambda = None
     a_drag_lambda = None
     if use_refmap_drag:
@@ -648,9 +806,9 @@ def build_deformation_only_forms(
             dkdrag_k_base[1] + dkdrag_k_geom[1],
         )
 
-        beta_coeff_k = drag_occ_k * mu_f * drag_phi_factor
-        beta_coeff_n = drag_occ_n * mu_f * drag_phi_factor
-        dbeta_coeff = ddrag_occ * mu_f * drag_phi_factor
+        beta_coeff_k = drag_occ_k * mu_f * drag_phi_factor_k
+        beta_coeff_n = drag_occ_n * mu_f * drag_phi_factor_n
+        dbeta_coeff = mu_f * ddrag_weight
         if drag_form_key == "mixed_lm":
             det_k = k_inv_k[0, 0] * k_inv_k[1, 1] - k_inv_k[0, 1] * k_inv_k[1, 0]
             inv_raw_k = (
@@ -701,9 +859,9 @@ def build_deformation_only_forms(
                 -(dbeta_coeff * _dot_2d_components(kdrag_k, vS_test) + beta_coeff_k * _dot_2d_components(dkdrag_k, vS_test))
             ) * dx
     else:
-        beta_k = drag_occ_k * mu_f * drag_phi_factor * kappa_inv
-        beta_n = drag_occ_n * mu_f * drag_phi_factor * kappa_inv
-        dbeta = ddrag_occ * mu_f * drag_phi_factor * kappa_inv
+        beta_k = drag_occ_k * mu_f * drag_phi_factor_k * kappa_inv
+        beta_n = drag_occ_n * mu_f * drag_phi_factor_n * kappa_inv
+        dbeta = mu_f * ddrag_weight * kappa_inv
         if drag_form_key == "mixed_lm":
             drag_core_k = mu_f * kappa_inv
             drag_core_inv_k = _c(1.0) / drag_core_k
@@ -861,8 +1019,12 @@ def build_deformation_only_forms(
         time_alpha_k = alpha_k
         time_alpha_n = alpha_n
     elif adv_key == "conservative":
-        adv_alpha_k = dot(grad(alpha_k), adv_u_k) + alpha_k * div_adv_u_k
-        adv_alpha_n = dot(grad(alpha_n), adv_u_n) + alpha_n * div_adv_u_n
+        if use_B_transport:
+            adv_alpha_k = div_alpha_flux_k
+            adv_alpha_n = div_alpha_flux_n
+        else:
+            adv_alpha_k = dot(grad(alpha_k), adv_u_k) + alpha_k * div_adv_u_k
+            adv_alpha_n = dot(grad(alpha_n), adv_u_n) + alpha_n * div_adv_u_n
         time_alpha_k = alpha_k
         time_alpha_n = alpha_n
     elif adv_key == "interface_band_conservative":
@@ -880,19 +1042,39 @@ def build_deformation_only_forms(
     if adv_key == "conservative_weak":
         # Weak conservative alpha transport:
         #
-        #   (partial_t alpha, w) - (alpha F, grad(w)) = 0
+        #   (partial_t alpha, w) - (q_alpha, grad(w)) = 0
         #
-        # with F chosen above. This is the form that preserves the domain
+        # with q_alpha chosen above. This is the form that preserves the domain
         # integral of alpha when the boundary contribution vanishes, either
         # because natural no-flux conditions are used or because the Dirichlet
         # test space vanishes on the relevant boundary.
-        flux_dot_grad_test_k = _c(0.0)
-        flux_dot_grad_test_n = _c(0.0)
-        for i in range(2):
-            flux_dot_grad_test_k = flux_dot_grad_test_k + (alpha_k * _vector_component(adv_u_k, i)) * grad(alpha_test)[i]
-            flux_dot_grad_test_n = flux_dot_grad_test_n + (alpha_n * _vector_component(adv_u_n, i)) * grad(alpha_test)[i]
+        if use_B_transport:
+            flux_dot_grad_test_k = _c(0.0)
+            flux_dot_grad_test_n = _c(0.0)
+            for i in range(2):
+                flux_dot_grad_test_k = flux_dot_grad_test_k + alpha_flux_k_comp[i] * grad(alpha_test)[i]
+                flux_dot_grad_test_n = flux_dot_grad_test_n + alpha_flux_n_comp[i] * grad(alpha_test)[i]
+        else:
+            flux_dot_grad_test_k = _c(0.0)
+            flux_dot_grad_test_n = _c(0.0)
+            for i in range(2):
+                flux_dot_grad_test_k = flux_dot_grad_test_k + (alpha_k * _vector_component(adv_u_k, i)) * grad(alpha_test)[i]
+                flux_dot_grad_test_n = flux_dot_grad_test_n + (alpha_n * _vector_component(adv_u_n, i)) * grad(alpha_test)[i]
         r_alpha += -th * flux_dot_grad_test_k * dx
         r_alpha += -one_m_th * flux_dot_grad_test_n * dx
+        if ds_alpha_transport is not None:
+            n_b = FacetNormal()
+            flux_alpha_bdry_k = _c(0.0)
+            flux_alpha_bdry_n = _c(0.0)
+            for i in range(2):
+                if use_B_transport:
+                    flux_alpha_bdry_k = flux_alpha_bdry_k + alpha_flux_k_comp[i] * _vector_component(n_b, i)
+                    flux_alpha_bdry_n = flux_alpha_bdry_n + alpha_flux_n_comp[i] * _vector_component(n_b, i)
+                else:
+                    flux_alpha_bdry_k = flux_alpha_bdry_k + (alpha_k * _vector_component(adv_u_k, i)) * _vector_component(n_b, i)
+                    flux_alpha_bdry_n = flux_alpha_bdry_n + (alpha_n * _vector_component(adv_u_n, i)) * _vector_component(n_b, i)
+            r_alpha += th * alpha_test * flux_alpha_bdry_k * ds_alpha_transport
+            r_alpha += one_m_th * alpha_test * flux_alpha_bdry_n * ds_alpha_transport
     else:
         r_alpha += th * alpha_test * adv_alpha_k * dx
         r_alpha += one_m_th * alpha_test * adv_alpha_n * dx
@@ -907,22 +1089,79 @@ def build_deformation_only_forms(
     if adv_key == "advective":
         a_alpha += th * alpha_test * (dot(grad(dalpha), adv_u_k) + dot(grad(alpha_k), dadv_u)) * dx
     elif adv_key == "conservative":
-        a_alpha += th * alpha_test * (
-            dot(grad(dalpha), adv_u_k) + dot(grad(alpha_k), dadv_u) + dalpha * div_adv_u_k + alpha_k * d_div_adv_u
-        ) * dx
+        if use_B_transport:
+            a_alpha += th * alpha_test * d_div_alpha_flux_k * dx
+        else:
+            a_alpha += th * alpha_test * (
+                dot(grad(dalpha), adv_u_k) + dot(grad(alpha_k), dadv_u) + dalpha * div_adv_u_k + alpha_k * d_div_adv_u
+            ) * dx
     elif adv_key == "interface_band_conservative":
         a_alpha += th * alpha_test * (
             dot(d_grad_band_alpha, adv_u_k) + dot(grad_band_alpha_k, dadv_u) + dband_alpha * div_adv_u_k + band_alpha_k * d_div_adv_u
         ) * dx
     else:
-        dflux_dot_grad_test_k = _c(0.0)
-        for i in range(2):
-            dflux_dot_grad_test_k = dflux_dot_grad_test_k + (
-                (dalpha * _vector_component(adv_u_k, i) + alpha_k * _vector_component(dadv_u, i)) * grad(alpha_test)[i]
-            )
+        if use_B_transport:
+            dflux_dot_grad_test_k = _c(0.0)
+            for i in range(2):
+                dflux_dot_grad_test_k = dflux_dot_grad_test_k + d_alpha_flux_k_comp[i] * grad(alpha_test)[i]
+        else:
+            dflux_dot_grad_test_k = _c(0.0)
+            for i in range(2):
+                dflux_dot_grad_test_k = dflux_dot_grad_test_k + (
+                    (dalpha * _vector_component(adv_u_k, i) + alpha_k * _vector_component(dadv_u, i)) * grad(alpha_test)[i]
+                )
         a_alpha += -th * dflux_dot_grad_test_k * dx
+        if ds_alpha_transport is not None:
+            n_b = FacetNormal()
+            dflux_alpha_bdry_k = _c(0.0)
+            for i in range(2):
+                if use_B_transport:
+                    dflux_alpha_bdry_k = dflux_alpha_bdry_k + d_alpha_flux_k_comp[i] * _vector_component(n_b, i)
+                else:
+                    dflux_alpha_bdry_k = dflux_alpha_bdry_k + (
+                        (dalpha * _vector_component(adv_u_k, i) + alpha_k * _vector_component(dadv_u, i)) * _vector_component(n_b, i)
+                    )
+            a_alpha += th * alpha_test * dflux_alpha_bdry_k * ds_alpha_transport
     if ch_enabled:
         a_alpha += M_alpha_c * inner(grad(dmu_alpha), grad(alpha_test)) * dx
+
+    r_B = None
+    a_B = None
+    if use_B_transport:
+        r_B = B_test * ((B_k - B_n) * inv_dt) * dx
+        flux_B_grad_test_k = _c(0.0)
+        flux_B_grad_test_n = _c(0.0)
+        for i in range(2):
+            flux_B_grad_test_k = flux_B_grad_test_k + (B_k * _vector_component(vS_k, i)) * grad(B_test)[i]
+            flux_B_grad_test_n = flux_B_grad_test_n + (B_n * _vector_component(vS_n, i)) * grad(B_test)[i]
+        r_B += -th * flux_B_grad_test_k * dx
+        r_B += -one_m_th * flux_B_grad_test_n * dx
+        r_B += -B_test * f_B * dx
+        if ds_B_transport is not None:
+            n_b = FacetNormal()
+            flux_B_bdry_k = _c(0.0)
+            flux_B_bdry_n = _c(0.0)
+            for i in range(2):
+                flux_B_bdry_k = flux_B_bdry_k + (B_k * _vector_component(vS_k, i)) * _vector_component(n_b, i)
+                flux_B_bdry_n = flux_B_bdry_n + (B_n * _vector_component(vS_n, i)) * _vector_component(n_b, i)
+            r_B += th * B_test * flux_B_bdry_k * ds_B_transport
+            r_B += one_m_th * B_test * flux_B_bdry_n * ds_B_transport
+
+        a_B = B_test * (dB * inv_dt) * dx
+        dflux_B_grad_test_k = _c(0.0)
+        for i in range(2):
+            dflux_B_grad_test_k = dflux_B_grad_test_k + (
+                (dB * _vector_component(vS_k, i) + B_k * _vector_component(dvS, i)) * grad(B_test)[i]
+            )
+        a_B += -th * dflux_B_grad_test_k * dx
+        if ds_B_transport is not None:
+            n_b = FacetNormal()
+            dflux_B_bdry_k = _c(0.0)
+            for i in range(2):
+                dflux_B_bdry_k = dflux_B_bdry_k + (
+                    (dB * _vector_component(vS_k, i) + B_k * _vector_component(dvS, i)) * _vector_component(n_b, i)
+                )
+            a_B += th * B_test * dflux_B_bdry_k * ds_B_transport
 
     # (vi) Chemical potential relation.
     if ch_enabled:
@@ -942,6 +1181,10 @@ def build_deformation_only_forms(
 
     residual_form = r_mom + r_mass + r_skel + r_kin + r_alpha + r_mu_alpha
     jacobian_form = a_mom + a_mass + a_skel + a_kin + a_alpha + a_mu_alpha
+    if r_B is not None:
+        residual_form += r_B
+    if a_B is not None:
+        jacobian_form += a_B
     if r_drag_lambda is not None:
         residual_form += r_drag_lambda
     if a_drag_lambda is not None:
@@ -959,12 +1202,14 @@ def build_deformation_only_forms(
         r_skeleton=r_skel,
         r_kinematics=r_kin,
         r_alpha=r_alpha,
+        r_B=r_B,
         r_mu_alpha=r_mu_alpha,
         a_momentum=a_mom,
         a_mass=a_mass,
         a_skeleton=a_skel,
         a_kinematics=a_kin,
         a_alpha=a_alpha,
+        a_B=a_B,
         a_mu_alpha=a_mu_alpha,
         r_drag_lambda=r_drag_lambda,
         a_drag_lambda=a_drag_lambda,
