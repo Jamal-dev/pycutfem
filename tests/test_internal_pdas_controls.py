@@ -1153,6 +1153,76 @@ def test_internal_pdas_column_scaling_balances_selected_fieldwise_column_medians
     assert alpha_med == pytest.approx(phi_med, rel=1.0e-12, abs=1.0e-12)
 
 
+def test_internal_pdas_vi_scaling_uses_ruiz_when_reduced_mode_requests_it() -> None:
+    solver, dh, *_ = _build_two_field_vi_solver(
+        vi_params=VIParameters(
+            equation_row_scaling=True,
+            variable_column_scaling=True,
+        )
+    )
+    alpha_slice = np.asarray(dh.get_field_slice("alpha"), dtype=int)
+    phi_slice = np.asarray(dh.get_field_slice("phi"), dtype=int)
+    n = int(dh.total_dofs)
+    diag = np.ones((n,), dtype=float)
+    diag[alpha_slice] = 1.0e12
+    diag[phi_slice] = 1.0e-4
+    A_red = sp.diags(diag, format="csr")
+
+    solver.set_reduced_system_scaling(
+        equation_row_scaling=True,
+        variable_column_scaling=True,
+        mode="ruiz",
+        ruiz_iters=3,
+    )
+
+    row_scale, col_scale = solver._vi_system_scale_vectors(A_red)
+    row_expected, col_expected = solver._direct_solve_ruiz_scaling(A_red, iters=3)
+
+    assert np.allclose(row_scale, row_expected, rtol=1.0e-12, atol=1.0e-12)
+    assert np.allclose(col_scale, col_expected, rtol=1.0e-12, atol=1.0e-12)
+
+
+def test_internal_pdas_vi_ruiz_applies_manual_prescales_before_equilibration() -> None:
+    solver, dh, *_ = _build_two_field_vi_solver(
+        vi_params=VIParameters(
+            equation_row_scaling=True,
+            variable_column_scaling=True,
+        )
+    )
+    alpha_slice = np.asarray(dh.get_field_slice("alpha"), dtype=int)
+    phi_slice = np.asarray(dh.get_field_slice("phi"), dtype=int)
+    n = int(dh.total_dofs)
+    diag = np.ones((n,), dtype=float)
+    diag[alpha_slice] = 1.0e8
+    diag[phi_slice] = 1.0e-2
+    A_red = sp.diags(diag, format="csr")
+
+    solver.set_manual_reduced_system_scaling(
+        equation_row_field_scales={"alpha": 0.25},
+        variable_column_field_scales={"phi": 8.0},
+    )
+    solver.set_reduced_system_scaling(
+        equation_row_scaling=True,
+        variable_column_scaling=True,
+        mode="ruiz",
+        ruiz_iters=3,
+    )
+
+    row_scale, col_scale = solver._vi_system_scale_vectors(A_red)
+
+    manual_row = np.ones((n,), dtype=float)
+    manual_row[alpha_slice] = 0.25
+    manual_col = np.ones((n,), dtype=float)
+    manual_col[phi_slice] = 8.0
+    A_pre = A_red.multiply(manual_row[:, None]).multiply(manual_col[None, :]).tocsr()
+    row_expected_raw, col_expected_raw = solver._direct_solve_ruiz_scaling(A_pre, iters=3)
+    row_expected = manual_row * row_expected_raw
+    col_expected = manual_col * col_expected_raw
+
+    assert np.allclose(row_scale, row_expected, rtol=1.0e-12, atol=1.0e-12)
+    assert np.allclose(col_scale, col_expected, rtol=1.0e-12, atol=1.0e-12)
+
+
 def test_internal_pdas_stationarity_residual_scales_equality_transpose_term() -> None:
     solver = _build_scalar_vi_solver(vi_params=VIParameters(equation_row_scaling=True))
     R_red = np.array([1.0, -2.0], dtype=float)

@@ -32,12 +32,17 @@ be explicit about which frame their permeability tensor lives in.
 
 Constitutive model
 ------------------
-We provide a compressible Neo-Hookean **Cauchy** stress in spatial form, and its
-Gateaux derivative w.r.t. u in direction du:
+We provide two compressible Neo-Hookean **Cauchy** stresses in spatial form:
 
-  σ(u) = (2c/J) (B - a I),   B = F F^T,   a = J^{-2β}.
+  1. Historical ref-map/FPI law:
+       σ(u) = (2c/J) (B - a I),   B = F F^T,   a = J^{-2β}
 
-This matches the implementation historically used in `examples/utils/fpi/poro.py`.
+  2. Seboldt-consistent fully Eulerian law:
+       σ(u) = (μ/J) (B - I) + λ (J - 1) I
+
+Both are expressed directly in the spatial/Eulerian frame using the reference-
+map kinematics F=(I-∇u)^{-1}. The second form is the one-domain Eulerian
+translation of the compressible wall model used in Seboldt Example 2.
 """
 
 from __future__ import annotations
@@ -119,6 +124,40 @@ def dsigma_neo_hookean(u, du, c, beta, *, dim: int = 2):
 
     # σ = 2c/J (B - a I)
     return Constant(2.0) * c * (-(dJ / (J * J)) * (B - a * I) + (Constant(1.0) / J) * (dB - da * I))
+
+
+def sigma_neo_hookean_seboldt(u, mu_s, lambda_s, *, dim: int = 2):
+    """
+    Seboldt-consistent compressible Neo-Hookean Cauchy stress in Eulerian form.
+
+    The stress is written directly in spatial variables from the reference-map
+    kinematics:
+
+      σ(u) = (μ/J) (B - I) + λ (J - 1) I,
+
+    where F=(I-∇u)^{-1}, J=det(F), and B=F Fᵀ.
+    """
+    F = eulerian_F(u, dim=dim)
+    J = det(F)
+    I = Identity(int(dim))
+    B = dot(F, F.T)
+    return (mu_s / J) * (B - I) + lambda_s * (J - Constant(1.0)) * I
+
+
+def dsigma_neo_hookean_seboldt(u, du, mu_s, lambda_s, *, dim: int = 2):
+    """Gateaux derivative of `sigma_neo_hookean_seboldt` w.r.t. u in direction du."""
+    F = eulerian_F(u, dim=dim)
+    dF = deulerian_F(u, du, dim=dim)
+
+    J = det(F)
+    F_inv = Identity(int(dim)) - grad(u)
+    dJ = J * trace(dot(F_inv, dF))
+
+    I = Identity(int(dim))
+    B = dot(F, F.T)
+    dB = dot(dF, F.T) + dot(F, dF.T)
+
+    return mu_s * (-(dJ / (J * J)) * (B - I) + (Constant(1.0) / J) * dB) + lambda_s * dJ * I
 
 
 def svk_green_lagrange(u, *, dim: int = 2):

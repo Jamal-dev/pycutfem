@@ -1602,18 +1602,36 @@ class NewtonSolver:
         col_scale = np.ones((ncol,), dtype=float)
         if nrow == 0 or ncol == 0:
             return row_scale, col_scale
+        manual_row = np.ones((nrow,), dtype=float)
+        manual_col = np.ones((ncol,), dtype=float)
+        manual_row_used: dict[str, float] = {}
+        manual_col_used: dict[str, float] = {}
+        field_names = np.asarray(getattr(self, "_reduced_field_names", np.asarray([], dtype=object)), dtype=object)
+        if bool(getattr(self, "_reduced_equation_row_scaling", False)):
+            manual_row_map = dict(getattr(self, "_manual_reduced_row_field_scales", {}) or {})
+            if manual_row_map and field_names.shape == manual_row.shape:
+                manual_row, manual_row_used = self._field_name_scale_vector(field_names, manual_row_map)
+        if bool(getattr(self, "_reduced_variable_column_scaling", False)):
+            manual_col_map = dict(getattr(self, "_manual_reduced_col_field_scales", {}) or {})
+            if manual_col_map and field_names.shape == manual_col.shape:
+                manual_col, manual_col_used = self._field_name_scale_vector(field_names, manual_col_map)
+        A_for_ruiz = A_red
+        if not np.allclose(manual_row, 1.0):
+            A_for_ruiz = A_for_ruiz.multiply(manual_row[:, None]).tocsr()
+        if not np.allclose(manual_col, 1.0):
+            A_for_ruiz = A_for_ruiz.multiply(manual_col[None, :]).tocsr()
         row_scale_raw, col_scale_raw = self._direct_solve_ruiz_scaling(
-            A_red,
+            A_for_ruiz,
             iters=int(getattr(self, "_reduced_scaling_ruiz_iters", 6) or 6),
         )
         if bool(getattr(self, "_reduced_equation_row_scaling", False)):
-            row_scale = np.asarray(row_scale_raw, dtype=float).ravel()
+            row_scale = manual_row * np.asarray(row_scale_raw, dtype=float).ravel()
         if bool(getattr(self, "_reduced_variable_column_scaling", False)):
-            col_scale = np.asarray(col_scale_raw, dtype=float).ravel()
+            col_scale = manual_col * np.asarray(col_scale_raw, dtype=float).ravel()
         self._reduced_row_scale_current = row_scale.copy()
         self._reduced_col_scale_current = col_scale.copy()
-        self._reduced_row_scale_field_current = {}
-        self._reduced_col_scale_field_current = {}
+        self._reduced_row_scale_field_current = dict(manual_row_used)
+        self._reduced_col_scale_field_current = dict(manual_col_used)
         return row_scale, col_scale
 
     def _mean_value_gauge_enabled(self) -> bool:
@@ -9013,6 +9031,48 @@ class PdasNewtonSolver(NewtonSolver):
         self._vi_row_scale_field_current = dict(field_scales)
         return scale
 
+    def _vi_ruiz_scale_vectors(self, A_red: sp.csr_matrix) -> tuple[np.ndarray, np.ndarray]:
+        nrow, ncol = map(int, getattr(A_red, "shape", (0, 0)))
+        row_scale = np.ones((nrow,), dtype=float)
+        col_scale = np.ones((ncol,), dtype=float)
+        if nrow == 0 or ncol == 0:
+            self._vi_row_scale_current = row_scale.copy()
+            self._vi_col_scale_current = col_scale.copy()
+            self._vi_row_scale_field_current = {}
+            self._vi_col_scale_field_current = {}
+            return row_scale, col_scale
+        manual_row = np.ones((nrow,), dtype=float)
+        manual_col = np.ones((ncol,), dtype=float)
+        manual_row_used: dict[str, float] = {}
+        manual_col_used: dict[str, float] = {}
+        field_names = np.asarray(self._vi_red_field_names, dtype=object)
+        if bool(getattr(self.vi_params, "equation_row_scaling", False)):
+            manual_row_map = dict(getattr(self, "_manual_reduced_row_field_scales", {}) or {})
+            if manual_row_map and field_names.shape == manual_row.shape:
+                manual_row, manual_row_used = self._field_name_scale_vector(field_names, manual_row_map)
+        if bool(getattr(self.vi_params, "variable_column_scaling", False)):
+            manual_col_map = dict(getattr(self, "_manual_reduced_col_field_scales", {}) or {})
+            if manual_col_map and field_names.shape == manual_col.shape:
+                manual_col, manual_col_used = self._field_name_scale_vector(field_names, manual_col_map)
+        A_for_ruiz = A_red
+        if not np.allclose(manual_row, 1.0):
+            A_for_ruiz = A_for_ruiz.multiply(manual_row[:, None]).tocsr()
+        if not np.allclose(manual_col, 1.0):
+            A_for_ruiz = A_for_ruiz.multiply(manual_col[None, :]).tocsr()
+        row_scale_raw, col_scale_raw = self._direct_solve_ruiz_scaling(
+            A_for_ruiz,
+            iters=int(getattr(self, "_reduced_scaling_ruiz_iters", 6) or 6),
+        )
+        if bool(getattr(self.vi_params, "equation_row_scaling", False)):
+            row_scale = manual_row * np.asarray(row_scale_raw, dtype=float).ravel()
+        if bool(getattr(self.vi_params, "variable_column_scaling", False)):
+            col_scale = manual_col * np.asarray(col_scale_raw, dtype=float).ravel()
+        self._vi_row_scale_current = row_scale.copy()
+        self._vi_col_scale_current = col_scale.copy()
+        self._vi_row_scale_field_current = dict(manual_row_used)
+        self._vi_col_scale_field_current = dict(manual_col_used)
+        return row_scale, col_scale
+
     @staticmethod
     def _vi_scale_matrix_rows(A_red: sp.csr_matrix, row_scale_red: np.ndarray | None) -> sp.csr_matrix:
         if row_scale_red is None:
@@ -9116,6 +9176,15 @@ class PdasNewtonSolver(NewtonSolver):
         self._vi_col_scale_current = np.asarray(scale, dtype=float).copy()
         self._vi_col_scale_field_current = dict(field_scales)
         return scale
+
+    def _vi_system_scale_vectors(self, A_red: sp.csr_matrix) -> tuple[np.ndarray, np.ndarray]:
+        mode_key = str(getattr(self, "_reduced_system_scaling_mode", "field") or "field").strip().lower()
+        if mode_key == "ruiz":
+            return self._vi_ruiz_scale_vectors(A_red)
+        row_scale = np.asarray(self._vi_row_scale_vector(A_red), dtype=float).ravel()
+        A_row = self._vi_scale_matrix_rows(A_red, row_scale)
+        col_scale = np.asarray(self._vi_col_scale_vector(A_row), dtype=float).ravel()
+        return row_scale, col_scale
 
     @staticmethod
     def _vi_scale_matrix_cols(A_red: sp.csr_matrix, col_scale_red: np.ndarray | None) -> sp.csr_matrix:
@@ -11678,9 +11747,8 @@ class PdasNewtonSolver(NewtonSolver):
                 lo_red, hi_red = self._bounds_reduced()
                 eq_data = eq_prepare_callback()
 
-            row_scale_red = self._vi_row_scale_vector(A_red_raw)
+            row_scale_red, col_scale_red = self._vi_system_scale_vectors(A_red_raw)
             A_red = self._vi_scale_matrix_rows(A_red_raw, row_scale_red)
-            col_scale_red = self._vi_col_scale_vector(A_red)
             A_red_step = self._vi_scale_matrix_cols(A_red, col_scale_red)
             R_red_lin = self._vi_scale_vector_rows(R_red_raw, row_scale_red)
 

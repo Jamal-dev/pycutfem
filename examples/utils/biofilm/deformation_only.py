@@ -57,7 +57,19 @@ from .one_domain import (
     _one_minus,
     _support_physics_key,
 )
-from ..shared.nonlinear_solid_refmap import deulerian_k_inv, dsigma_neo_hookean, eulerian_k_inv, sigma_neo_hookean
+from ..shared.nonlinear_solid_refmap import (
+    deulerian_k_inv,
+    dsigma_neo_hookean,
+    dsigma_neo_hookean_seboldt,
+    eulerian_k_inv,
+    sigma_neo_hookean,
+    sigma_neo_hookean_seboldt,
+)
+
+
+def _is_seboldt_neo_hookean_model(model_key: str) -> bool:
+    key = str(model_key).strip().lower().replace("-", "_")
+    return key in {"seboldt_neo_hookean", "neo_hookean_seboldt", "seboldt_nh", "nh_seboldt"}
 
 
 def _W_prime(alpha):
@@ -295,12 +307,27 @@ def build_deformation_only_forms(
     if mu_s is None or lambda_s is None:
         raise ValueError("mu_s and lambda_s are required.")
     solid_model_key = str(solid_model).strip().lower().replace("-", "_")
-    if solid_model_key not in {"linear", "small_strain", "linear_elastic", "neo_hookean", "nh"}:
+    if solid_model_key not in {
+        "linear",
+        "small_strain",
+        "linear_elastic",
+        "neo_hookean",
+        "nh",
+        "neo_hookean_eulerian",
+        "seboldt_neo_hookean",
+        "neo_hookean_seboldt",
+        "seboldt_nh",
+        "nh_seboldt",
+    }:
         raise ValueError(f"Unsupported deformation-only solid model {solid_model!r}.")
     total_pressure_ref = None
     if bool(solid_volumetric_split):
-        if solid_model_key not in {"linear", "small_strain", "linear_elastic"}:
-            raise ValueError("solid_volumetric_split is currently implemented only for solid_model='linear'.")
+        if solid_model_key not in {"linear", "small_strain", "linear_elastic"} and not _is_seboldt_neo_hookean_model(
+            solid_model_key
+        ):
+            raise ValueError(
+                "solid_volumetric_split is currently implemented for the linear and Seboldt Neo-Hookean solid models."
+            )
         if pi_s_k is None or pi_s_n is None or dpi_s is None or pi_s_test is None:
             raise ValueError("solid_volumetric_split requires (pi_s_k, pi_s_n, dpi_s, pi_s_test).")
         total_pressure_ref = 2.0 * float(mu_s) + 2.0 * float(lambda_s)
@@ -318,7 +345,12 @@ def build_deformation_only_forms(
     pressure_block_lift_scale_c = _as_constant(float(pressure_block_lift_scale))
     total_pressure_ref_c = _as_constant(1.0 if total_pressure_ref is None else float(total_pressure_ref))
     total_pressure_ref_inv_c = _as_constant(1.0 if total_pressure_ref is None else (1.0 / float(total_pressure_ref)))
-    lambda_s_over_total_pressure_ref_c = _as_constant(1.0 if total_pressure_ref is None else (float(lambda_s) / float(total_pressure_ref)))
+    drained_bulk_modulus = None
+    if total_pressure_ref is not None:
+        drained_bulk_modulus = float(lambda_s) + float(mu_s)
+    drained_bulk_over_total_pressure_ref_c = _as_constant(
+        1.0 if total_pressure_ref is None else (float(drained_bulk_modulus) / float(total_pressure_ref))
+    )
     ch_enabled = float(M_alpha) != 0.0 and float(gamma_alpha) != 0.0
 
     zero_scalar = _c(0.0)
@@ -644,6 +676,8 @@ def build_deformation_only_forms(
     a_mass = q_test * (d_div_C_vk + d_div_Bk_vSk) * dx
 
     # (iii) Skeleton momentum.
+    mean_dr_k = None
+    dmean_dr_k = None
     if solid_model_key in {"linear", "small_strain", "linear_elastic"}:
         if bool(solid_volumetric_split):
             r_el_k = _linear_deviatoric_elastic_term(u_k, vS_test, mu_s=mu_s, dim=2) + total_pressure_ref_c * pi_s_k * div(vS_test)
@@ -653,6 +687,25 @@ def build_deformation_only_forms(
             r_el_k = _linear_elastic_term(u_k, vS_test, mu_s=mu_s, lambda_s=lambda_s)
             r_el_n = _linear_elastic_term(u_n, vS_test, mu_s=mu_s, lambda_s=lambda_s)
             a_el = _linear_elastic_term(du, vS_test, mu_s=mu_s, lambda_s=lambda_s)
+    elif _is_seboldt_neo_hookean_model(solid_model_key):
+        sig_k = sigma_neo_hookean_seboldt(u_k, mu_s, lambda_s, dim=2)
+        sig_n = sigma_neo_hookean_seboldt(u_n, mu_s, lambda_s, dim=2)
+        dsig_k = dsigma_neo_hookean_seboldt(u_k, du, mu_s, lambda_s, dim=2)
+        if bool(solid_volumetric_split):
+            I = Identity(2)
+            mean_dr_k = trace(sig_k) / _c(2.0)
+            mean_dr_n = trace(sig_n) / _c(2.0)
+            dmean_dr_k = trace(dsig_k) / _c(2.0)
+            sig_dev_k = sig_k - mean_dr_k * I
+            sig_dev_n = sig_n - mean_dr_n * I
+            dsig_dev_k = dsig_k - dmean_dr_k * I
+            r_el_k = inner(sig_dev_k, grad(vS_test)) + total_pressure_ref_c * pi_s_k * div(vS_test)
+            r_el_n = inner(sig_dev_n, grad(vS_test)) + total_pressure_ref_c * pi_s_n * div(vS_test)
+            a_el = inner(dsig_dev_k, grad(vS_test)) + total_pressure_ref_c * dpi_s * div(vS_test)
+        else:
+            r_el_k = inner(sig_k, grad(vS_test))
+            r_el_n = inner(sig_n, grad(vS_test))
+            a_el = inner(dsig_k, grad(vS_test))
     else:
         if c_nh is None:
             c_nh = mu_s / _c(2.0)
@@ -714,16 +767,28 @@ def build_deformation_only_forms(
     a_skel = sk_th * (alpha_k * a_el + dalpha * r_el_k) * dx
     if bool(solid_volumetric_split):
         vol_pen_c = _as_constant(float(solid_volumetric_penalty))
-        vol_drive_k = (
-            pi_s_k
-            - lambda_s_over_total_pressure_ref_c * div(u_k)
-            + total_pressure_ref_inv_c * press_div_coeff_k * p_k
-        )
-        d_vol_drive_k = (
-            dpi_s
-            - lambda_s_over_total_pressure_ref_c * div(du)
-            + total_pressure_ref_inv_c * (d_press_div_coeff_k * p_k + press_div_coeff_k * dp)
-        )
+        if _is_seboldt_neo_hookean_model(solid_model_key):
+            vol_drive_k = (
+                pi_s_k
+                - total_pressure_ref_inv_c * mean_dr_k
+                + total_pressure_ref_inv_c * press_div_coeff_k * p_k
+            )
+            d_vol_drive_k = (
+                dpi_s
+                - total_pressure_ref_inv_c * dmean_dr_k
+                + total_pressure_ref_inv_c * (d_press_div_coeff_k * p_k + press_div_coeff_k * dp)
+            )
+        else:
+            vol_drive_k = (
+                pi_s_k
+                - drained_bulk_over_total_pressure_ref_c * div(u_k)
+                + total_pressure_ref_inv_c * press_div_coeff_k * p_k
+            )
+            d_vol_drive_k = (
+                dpi_s
+                - drained_bulk_over_total_pressure_ref_c * div(du)
+                + total_pressure_ref_inv_c * (d_press_div_coeff_k * p_k + press_div_coeff_k * dp)
+            )
         r_volumetric = (
             alpha_k * pi_s_test * vol_drive_k
             + vol_pen_c * _one_minus(alpha_k) * pi_s_k * pi_s_test

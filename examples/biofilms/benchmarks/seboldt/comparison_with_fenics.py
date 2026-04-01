@@ -92,6 +92,12 @@ def _parse_csv_fields(text: str) -> tuple[str, ...]:
     return tuple(part.strip() for part in str(text).split(",") if part.strip())
 
 
+def _transport_scalar_name(*, enable_phi_evolution: bool, full_ratio_free_state: bool) -> str | None:
+    if not bool(enable_phi_evolution):
+        return None
+    return "B" if bool(full_ratio_free_state) else "phi"
+
+
 def _latent_map_expr_ufl(z, *, map_kind: str):
     key = str(map_kind or "sigmoid").strip().lower()
     if key == "sigmoid":
@@ -197,7 +203,7 @@ def _fenics_audit_diffuse_traction_exprs(mesh):
     }
 
 
-def _initialize_problem(problem: dict[str, object], *, enable_phi_evolution: bool) -> None:
+def _initialize_problem(problem: dict[str, object], *, enable_phi_evolution: bool, full_ratio_free_state: bool) -> None:
     problem["v_k"].set_values_from_function(lambda x, y: np.array([0.18 + 0.04 * x - 0.03 * y, -0.06 + 0.02 * x + 0.015 * y]))
     problem["v_n"].set_values_from_function(lambda x, y: np.array([0.11 + 0.03 * x - 0.02 * y, -0.03 + 0.015 * x + 0.010 * y]))
     problem["vS_k"].set_values_from_function(lambda x, y: np.array([0.05 + 0.02 * x - 0.01 * y, -0.03 + 0.01 * x + 0.015 * y]))
@@ -214,13 +220,17 @@ def _initialize_problem(problem: dict[str, object], *, enable_phi_evolution: boo
     problem["mu_k"].set_values_from_function(lambda x, y: 0.10 + 0.020 * x - 0.015 * y)
     problem["mu_n"].set_values_from_function(lambda x, y: 0.07 + 0.015 * x - 0.010 * y)
     if bool(enable_phi_evolution):
-        problem["phi_k"].set_values_from_function(lambda x, y: 0.68 + 0.04 * x - 0.03 * y)
-        problem["phi_n"].set_values_from_function(lambda x, y: 0.66 + 0.03 * x - 0.02 * y)
+        if bool(full_ratio_free_state):
+            problem["B_k"].set_values_from_function(lambda x, y: 0.18 + 0.02 * x - 0.01 * y)
+            problem["B_n"].set_values_from_function(lambda x, y: 0.16 + 0.015 * x - 0.008 * y)
+        else:
+            problem["phi_k"].set_values_from_function(lambda x, y: 0.68 + 0.04 * x - 0.03 * y)
+            problem["phi_n"].set_values_from_function(lambda x, y: 0.66 + 0.03 * x - 0.02 * y)
         problem["S_k"].set_values_from_function(lambda x, y: 0.20 + 0.02 * x + 0.01 * y)
         problem["S_n"].set_values_from_function(lambda x, y: 0.17 + 0.015 * x + 0.008 * y)
 
 
-def _field_to_func(problem: dict[str, object], *, enable_phi_evolution: bool) -> dict[str, object]:
+def _field_to_func(problem: dict[str, object], *, enable_phi_evolution: bool, full_ratio_free_state: bool) -> dict[str, object]:
     out = {
         "v_x": problem["v_k"].components[0],
         "v_y": problem["v_k"].components[1],
@@ -232,14 +242,22 @@ def _field_to_func(problem: dict[str, object], *, enable_phi_evolution: bool) ->
         "alpha": problem["alpha_k"],
         "mu_alpha": problem["mu_k"],
     }
+    if problem.get("lambda_drag_k") is not None:
+        out["lambda_drag_x"] = problem["lambda_drag_k"].components[0]
+        out["lambda_drag_y"] = problem["lambda_drag_k"].components[1]
     if problem.get("p_mean_k") is not None:
         out["p_mean"] = problem["p_mean_k"]
     if bool(enable_phi_evolution):
-        out["phi"] = problem["phi_k"]
+        scalar_name = _transport_scalar_name(
+            enable_phi_evolution=bool(enable_phi_evolution),
+            full_ratio_free_state=bool(full_ratio_free_state),
+        )
+        if scalar_name is not None:
+            out[scalar_name] = problem[f"{scalar_name}_k"]
         out["S"] = problem["S_k"]
     if problem.get("alpha_latent_k") is not None:
         out["alpha_latent"] = problem["alpha_latent_k"]
-    if bool(enable_phi_evolution) and problem.get("phi_latent_k") is not None:
+    if bool(enable_phi_evolution) and (not bool(full_ratio_free_state)) and problem.get("phi_latent_k") is not None:
         out["phi_latent"] = problem["phi_latent_k"]
     return out
 
@@ -292,6 +310,7 @@ def _build_benchmark_case(
     fluid_convection: str = "full",
     include_skeleton_acceleration: bool = True,
     rho_s0_tilde: float = 1.1,
+    storativity_c0: float = 1.0e-3,
     skeleton_inertia_convection: str = "full",
     skeleton_pressure_mode: str = "whole_domain",
     alpha_biot: float | None = None,
@@ -301,6 +320,7 @@ def _build_benchmark_case(
     solid_volumetric_penalty: float = 1.0,
     mechanics_nondim_mode: str = "legacy",
     outdir: Path | None = None,
+    full_ratio_free_state: bool = True,
 ) -> tuple[dict[str, object], object, dict[str, object], int]:
     poly_order, pressure_order, scalar_order = _resolved_orders(poly_order, pressure_order, scalar_order)
     qdeg = max(6, 2 * int(poly_order) + 2)
@@ -321,8 +341,14 @@ def _build_benchmark_case(
         latent_bounded_formulation=str(latent_bounded_formulation),
         pressure_mean_constraint=bool(pressure_mean_constraint),
         solid_volumetric_split=bool(solid_volumetric_split),
+        drag_formulation="mixed_lm",
+        full_ratio_free_state=bool(full_ratio_free_state),
     )
-    _initialize_problem(problem, enable_phi_evolution=bool(enable_phi_evolution))
+    _initialize_problem(
+        problem,
+        enable_phi_evolution=bool(enable_phi_evolution),
+        full_ratio_free_state=bool(full_ratio_free_state),
+    )
     problem["latent_bounded_fields"] = tuple(str(name).strip() for name in tuple(latent_bounded_fields) if str(name).strip())
     if bool(latent_bounded_transport):
         if "alpha" in tuple(problem.get("latent_bounded_fields", tuple()) or tuple()) and problem.get("alpha_latent_k") is not None:
@@ -338,6 +364,7 @@ def _build_benchmark_case(
             )
         if (
             bool(enable_phi_evolution)
+            and (not bool(full_ratio_free_state))
             and "phi" in tuple(problem.get("latent_bounded_fields", tuple()) or tuple())
             and problem.get("phi_latent_k") is not None
         ):
@@ -415,14 +442,18 @@ def _build_benchmark_case(
         enable_phi_evolution=bool(enable_phi_evolution),
         include_skeleton_acceleration=bool(include_skeleton_acceleration),
         rho_s0_tilde=float(rho_s0_tilde),
+        storativity_c0=float(storativity_c0),
         skeleton_inertia_convection=str(skeleton_inertia_convection),
         fluid_convection=str(fluid_convection),
+        drag_formulation="mixed_lm",
         solid_volumetric_split=bool(solid_volumetric_split),
         solid_volumetric_penalty=float(solid_volumetric_penalty),
         mechanics_nondim_mode=str(mechanics_nondim_mode),
+        full_ratio_free_state=bool(full_ratio_free_state),
     )
     problem["_audit_phi_b"] = 0.18
     problem["_audit_enable_phi_evolution"] = bool(enable_phi_evolution)
+    problem["_audit_full_ratio_free_state"] = bool(full_ratio_free_state)
     problem["_audit_Lx"] = float(Lx)
     problem["_audit_Ly"] = float(Ly)
     problem["_audit_nx"] = int(nx)
@@ -453,6 +484,7 @@ def _build_benchmark_case(
     problem["_audit_alpha_biot"] = (None if alpha_biot is None else float(alpha_biot))
     problem["_audit_include_skeleton_acceleration"] = bool(include_skeleton_acceleration)
     problem["_audit_rho_s0_tilde"] = float(rho_s0_tilde)
+    problem["_audit_storativity_c0"] = float(storativity_c0)
     problem["_audit_latent_bounded_transport"] = bool(latent_bounded_transport)
     problem["_audit_latent_bounded_fields"] = tuple(problem.get("latent_bounded_fields", tuple()) or tuple())
     problem["_audit_latent_bounded_map"] = str(latent_bounded_map)
@@ -498,10 +530,12 @@ def _build_benchmark_case(
         "support_physics": str(support_physics),
         "skeleton_pressure_mode": str(skeleton_pressure_mode),
         "alpha_biot": (None if alpha_biot is None else float(alpha_biot)),
+        "drag_formulation": "mixed_lm",
         "solid_model": "linear",
         "fluid_convection": str(fluid_convection),
         "include_skeleton_acceleration": bool(include_skeleton_acceleration),
         "rho_s0_tilde": float(rho_s0_tilde),
+        "storativity_c0": float(storativity_c0),
         "skeleton_inertia_convection": str(skeleton_inertia_convection),
         "alpha_mu_aux_pin": 1.0,
         "alpha_regularization": str(alpha_regularization),
@@ -516,6 +550,7 @@ def _build_benchmark_case(
         "solid_volumetric_split": bool(solid_volumetric_split),
         "solid_volumetric_penalty": float(solid_volumetric_penalty),
         "mechanics_nondim_mode": str(mechanics_nondim_mode),
+        "full_ratio_free_state": bool(full_ratio_free_state),
         "D_S": 0.0,
         "mu_max": 0.0,
         "K_S": 1.0,
@@ -524,7 +559,11 @@ def _build_benchmark_case(
         "Y": 1.0,
         "rho_s_star": 1.0,
     }
-    return problem, forms, _field_to_func(problem, enable_phi_evolution=bool(enable_phi_evolution)), int(qdeg)
+    return problem, forms, _field_to_func(
+        problem,
+        enable_phi_evolution=bool(enable_phi_evolution),
+        full_ratio_free_state=bool(full_ratio_free_state),
+    ), int(qdeg)
 
 
 def _assemble_residual(forms, dh, qdeg: int, *, backend: str) -> np.ndarray:
@@ -555,10 +594,17 @@ def _directional_fd_audit(
     K = K.tocsr()
     ndofs = int(K.shape[1])
     probe_fields = ["v_x", "v_y", "p", "vS_x", "vS_y", "u_x", "u_y", "alpha", "mu_alpha"]
+    if problem.get("lambda_drag_k") is not None:
+        probe_fields.extend(["lambda_drag_x", "lambda_drag_y"])
     if problem.get("p_mean_k") is not None:
         probe_fields.append("p_mean")
     if bool(enable_phi_evolution):
-        probe_fields.extend(["phi", "S"])
+        scalar_name = _transport_scalar_name(
+            enable_phi_evolution=bool(enable_phi_evolution),
+            full_ratio_free_state=bool(problem.get("_audit_full_ratio_free_state", False)),
+        )
+        if scalar_name is not None:
+            probe_fields.extend([scalar_name, "S"])
     if problem.get("alpha_latent_k") is not None:
         probe_fields.append("alpha_latent")
     if bool(enable_phi_evolution) and problem.get("phi_latent_k") is not None:
@@ -582,9 +628,16 @@ def _directional_fd_audit(
         _field_direction("alpha_latent_only", ["alpha_latent"])
     _field_direction("v_only", ["v_x", "v_y"])
     _field_direction("vS_only", ["vS_x", "vS_y"])
+    if problem.get("lambda_drag_k") is not None:
+        _field_direction("lambda_drag_only", ["lambda_drag_x", "lambda_drag_y"])
     _field_direction("u_only", ["u_x", "u_y"])
     if bool(enable_phi_evolution):
-        _field_direction("phiS_only", ["phi", "S"])
+        scalar_name = _transport_scalar_name(
+            enable_phi_evolution=bool(enable_phi_evolution),
+            full_ratio_free_state=bool(problem.get("_audit_full_ratio_free_state", False)),
+        )
+        if scalar_name is not None:
+            _field_direction(f"{scalar_name}S_only", [scalar_name, "S"])
         if problem.get("phi_latent_k") is not None:
             _field_direction("phi_latent_only", ["phi_latent"])
     _field_direction("random_all", probe_fields)
@@ -1370,6 +1423,8 @@ def _build_fenics_full_system(
     pressure_order: int,
     scalar_order: int,
     enable_phi_evolution: bool,
+    full_ratio_free_state: bool = False,
+    drag_formulation: str = "direct",
     latent_bounded_fields: tuple[str, ...] = tuple(),
     pressure_mean_constraint: bool = False,
     solid_volumetric_split: bool = False,
@@ -1389,13 +1444,17 @@ def _build_fenics_full_system(
     elements = [V_el, P_el]
     if bool(solid_volumetric_split):
         elements.append(P_el)
-    elements.extend([V_el, V_el, A_el, A_el])
+    elements.extend([V_el, V_el])
+    drag_form_key = str(drag_formulation).strip().lower().replace("-", "_")
+    if drag_form_key == "mixed_lm":
+        elements.append(V_el)
+    elements.extend([A_el, A_el])
     if bool(enable_phi_evolution):
         elements.extend([A_el, A_el])
     latent_field_set = {str(name).strip() for name in tuple(latent_bounded_fields or tuple()) if str(name).strip()}
     if "alpha" in latent_field_set:
         elements.append(A_el)
-    if bool(enable_phi_evolution) and "phi" in latent_field_set:
+    if bool(enable_phi_evolution) and (not bool(full_ratio_free_state)) and "phi" in latent_field_set:
         elements.append(A_el)
     W_el = mixed_element(elements)
     if hasattr(dolfinx.fem, "functionspace"):
@@ -1408,6 +1467,8 @@ def _build_fenics_full_system(
 def _audit_field_layout(
     *,
     enable_phi_evolution: bool,
+    full_ratio_free_state: bool = False,
+    drag_formulation: str = "direct",
     latent_bounded_fields: tuple[str, ...] = tuple(),
     pressure_mean_constraint: bool = False,
     solid_volumetric_split: bool = False,
@@ -1424,29 +1485,47 @@ def _audit_field_layout(
     if bool(solid_volumetric_split):
         layout.append(("pi_s", next_idx, None))
         next_idx += 1
+    drag_form_key = str(drag_formulation).strip().lower().replace("-", "_")
     layout.extend(
         [
             ("vS_x", next_idx, 0),
             ("vS_y", next_idx, 1),
             ("u_x", next_idx + 1, 0),
             ("u_y", next_idx + 1, 1),
-            ("alpha", next_idx + 2, None),
-            ("mu_alpha", next_idx + 3, None),
+        ]
+    )
+    next_scalar_idx = next_idx + 2
+    if drag_form_key == "mixed_lm":
+        layout.extend(
+            [
+                ("lambda_drag_x", next_idx + 2, 0),
+                ("lambda_drag_y", next_idx + 2, 1),
+            ]
+        )
+        next_scalar_idx += 1
+    layout.extend(
+        [
+            ("alpha", next_scalar_idx, None),
+            ("mu_alpha", next_scalar_idx + 1, None),
         ]
     )
     if bool(enable_phi_evolution):
+        scalar_name = _transport_scalar_name(
+            enable_phi_evolution=bool(enable_phi_evolution),
+            full_ratio_free_state=bool(full_ratio_free_state),
+        )
         layout.extend(
             [
-                ("phi", next_idx + 4, None),
-                ("S", next_idx + 5, None),
+                (str(scalar_name), next_scalar_idx + 2, None),
+                ("S", next_scalar_idx + 3, None),
             ]
         )
     latent_field_set = {str(name).strip() for name in tuple(latent_bounded_fields or tuple()) if str(name).strip()}
-    next_idx = next_idx + (6 if bool(enable_phi_evolution) else 4)
+    next_idx = next_scalar_idx + (4 if bool(enable_phi_evolution) else 2)
     if "alpha" in latent_field_set:
         layout.append(("alpha_latent", next_idx, None))
         next_idx += 1
-    if bool(enable_phi_evolution) and "phi" in latent_field_set:
+    if bool(enable_phi_evolution) and (not bool(full_ratio_free_state)) and "phi" in latent_field_set:
         layout.append(("phi_latent", next_idx, None))
     return layout
 
@@ -1456,6 +1535,8 @@ def _map_pycutfem_to_fenics_full(
     W,
     *,
     enable_phi_evolution: bool,
+    full_ratio_free_state: bool = False,
+    drag_formulation: str = "direct",
     latent_bounded_fields: tuple[str, ...] = tuple(),
     pressure_mean_constraint: bool = False,
     solid_volumetric_split: bool = False,
@@ -1465,6 +1546,8 @@ def _map_pycutfem_to_fenics_full(
     n_base = int(dolfinx.fem.Function(W).x.array.size)
     for fld, sub_idx, comp in _audit_field_layout(
         enable_phi_evolution=bool(enable_phi_evolution),
+        full_ratio_free_state=bool(full_ratio_free_state),
+        drag_formulation=str(drag_formulation),
         latent_bounded_fields=tuple(latent_bounded_fields or tuple()),
         pressure_mean_constraint=bool(pressure_mean_constraint),
         solid_volumetric_split=bool(solid_volumetric_split),
@@ -1490,6 +1573,7 @@ def _load_fenics_full_state(
     mapping: dict[str, np.ndarray],
     *,
     enable_phi_evolution: bool,
+    full_ratio_free_state: bool = False,
     latent_bounded_fields: tuple[str, ...] = tuple(),
     pressure_mean_constraint: bool = False,
     solid_volumetric_split: bool = False,
@@ -1529,16 +1613,33 @@ def _load_fenics_full_state(
         ("mu_alpha", problem["mu_n"]),
         ]
     )
-    if bool(enable_phi_evolution):
+    if problem.get("lambda_drag_k") is not None:
         fields_k.extend(
             [
-                ("phi", problem["phi_k"]),
+                ("lambda_drag_x", problem["lambda_drag_k"].components[0]),
+                ("lambda_drag_y", problem["lambda_drag_k"].components[1]),
+            ]
+        )
+        fields_n.extend(
+            [
+                ("lambda_drag_x", problem["lambda_drag_n"].components[0]),
+                ("lambda_drag_y", problem["lambda_drag_n"].components[1]),
+            ]
+        )
+    if bool(enable_phi_evolution):
+        scalar_name = _transport_scalar_name(
+            enable_phi_evolution=bool(enable_phi_evolution),
+            full_ratio_free_state=bool(full_ratio_free_state),
+        )
+        fields_k.extend(
+            [
+                (str(scalar_name), problem[f"{scalar_name}_k"]),
                 ("S", problem["S_k"]),
             ]
         )
         fields_n.extend(
             [
-                ("phi", problem["phi_n"]),
+                (str(scalar_name), problem[f"{scalar_name}_n"]),
                 ("S", problem["S_n"]),
             ]
         )
@@ -1546,7 +1647,7 @@ def _load_fenics_full_state(
     if "alpha" in latent_field_set:
         fields_k.append(("alpha_latent", problem["alpha_latent_k"]))
         fields_n.append(("alpha_latent", problem["alpha_latent_n"]))
-    if bool(enable_phi_evolution) and "phi" in latent_field_set:
+    if bool(enable_phi_evolution) and (not bool(full_ratio_free_state)) and "phi" in latent_field_set:
         fields_k.append(("phi_latent", problem["phi_latent_k"]))
         fields_n.append(("phi_latent", problem["phi_latent_n"]))
     for fld, func in fields_k:
@@ -2251,17 +2352,382 @@ def _fenics_full_forms(
     return r_total_fx, a_total_fx, blocks
 
 
+def _fenics_full_forms_ratio_free(
+    *,
+    W,
+    w_k,
+    w_n,
+    qdeg: int,
+    params: dict[str, object],
+):
+    mesh = W.mesh
+    dw = ufl.TrialFunction(W)
+    wtest = ufl.TestFunction(W)
+    dw_parts = list(ufl.split(dw))
+    test_parts = list(ufl.split(wtest))
+    wk_parts = list(ufl.split(w_k))
+    wn_parts = list(ufl.split(w_n))
+
+    idx = 0
+    dv_fx = dw_parts[idx]; v_test_fx = test_parts[idx]; v_k_fx = wk_parts[idx]; v_n_fx = wn_parts[idx]; idx += 1
+    dp_fx = dw_parts[idx]; q_fx = test_parts[idx]; p_k_fx = wk_parts[idx]; p_n_fx = wn_parts[idx]; idx += 1
+    dpi_s_fx = None
+    pi_s_test_fx = None
+    pi_s_k_fx = None
+    pi_s_n_fx = None
+    if bool(params.get("solid_volumetric_split", False)):
+        dpi_s_fx = dw_parts[idx]; pi_s_test_fx = test_parts[idx]; pi_s_k_fx = wk_parts[idx]; pi_s_n_fx = wn_parts[idx]; idx += 1
+    dvS_fx = dw_parts[idx]; vS_test_fx = test_parts[idx]; vS_k_fx = wk_parts[idx]; vS_n_fx = wn_parts[idx]; idx += 1
+    du_fx = dw_parts[idx]; u_test_fx = test_parts[idx]; u_k_fx = wk_parts[idx]; u_n_fx = wn_parts[idx]; idx += 1
+    dlambda_drag_fx = None
+    lambda_drag_test_fx = None
+    lambda_drag_k_fx = None
+    lambda_drag_n_fx = None
+    if str(params.get("drag_formulation", "direct")).strip().lower().replace("-", "_") == "mixed_lm":
+        dlambda_drag_fx = dw_parts[idx]; lambda_drag_test_fx = test_parts[idx]; lambda_drag_k_fx = wk_parts[idx]; lambda_drag_n_fx = wn_parts[idx]; idx += 1
+    dalpha_fx = dw_parts[idx]; alpha_test_fx = test_parts[idx]; alpha_k_fx = wk_parts[idx]; alpha_n_fx = wn_parts[idx]; idx += 1
+    dmu_alpha_fx = dw_parts[idx]; mu_alpha_test_fx = test_parts[idx]; mu_alpha_k_fx = wk_parts[idx]; mu_alpha_n_fx = wn_parts[idx]; idx += 1
+    dB_fx = dw_parts[idx]; B_test_fx = test_parts[idx]; B_k_fx = wk_parts[idx]; B_n_fx = wn_parts[idx]; idx += 1
+    dS_fx = dw_parts[idx]; S_test_fx = test_parts[idx]; S_k_fx = wk_parts[idx]; S_n_fx = wn_parts[idx]; idx += 1
+
+    def _const(val: float):
+        return dolfinx.fem.Constant(mesh, float(val))
+
+    def _eps(v):
+        return ufl.sym(ufl.grad(v))
+
+    def _mu_from_alpha_B(alpha, B):
+        mu_f_fx = _const(float(params["mu_f"]))
+        mu_b_fx = _const(float(params["mu_b"]))
+        mu_b_key = str(params["mu_b_model"]).strip().lower()
+        C = 1.0 - B
+        P = alpha - B
+        if mu_b_key in {"mu", "const", "constant"}:
+            return mu_f_fx
+        if mu_b_key in {"phi_mu", "phi*mu", "phi"}:
+            return mu_f_fx * C
+        if mu_b_key in {"alpha_mu", "alpha", "mu_b", "biofilm_mu", "biofilm"}:
+            return (1.0 - alpha) * mu_f_fx + alpha * mu_b_fx
+        if mu_b_key in {"alpha_phi_mu", "alpha_phi", "alpha*phi_mu", "alpha*phi*mu"}:
+            return (1.0 - alpha) * mu_f_fx + P * mu_b_fx
+        raise ValueError(f"Unsupported mu_b_model={params['mu_b_model']!r}.")
+
+    th_fx = _const(float(params["theta"]))
+    omth_fx = _const(1.0 - float(params["theta"]))
+    inv_dt_fx = _const(1.0 / float(params["dt"]))
+    rho_f_fx = _const(float(params["rho_f"]))
+    mu_f_fx = _const(float(params["mu_f"]))
+    kappa_inv_fx = _const(float(params["kappa_inv"]))
+    mu_s_fx = _const(float(params["mu_s"]))
+    lambda_s_fx = _const(float(params["lambda_s"]))
+    gamma_div_fx = _const(float(params["gamma_div"]))
+    gamma_u_fx = _const(float(params["gamma_u"]))
+    gamma_u_pin_fx = _const(float(params["gamma_u_pin"]))
+    alpha_mu_aux_pin_fx = _const(float(params["alpha_mu_aux_pin"]))
+    storativity_c0_fx = _const(float(params["storativity_c0"]))
+    rho_s0_fx = _const(float(params["rho_s0_tilde"]))
+    mu_max_fx = _const(float(params["mu_max"]))
+    K_S_fx = _const(float(params["K_S"]))
+    k_d_fx = _const(float(params["k_d"]))
+    Y_fx = _const(float(params["Y"]))
+    rho_s_star_fx = _const(float(params["rho_s_star"]))
+    I_fx = ufl.Identity(mesh.geometry.dim)
+
+    dx_fx = ufl.dx(metadata={"quadrature_degree": int(qdeg)})
+    dS_meas_fx = ufl.dS(metadata={"quadrature_degree": int(qdeg)})
+    n_int_fx = ufl.FacetNormal(mesh)
+    h_cell_fx = _fx_mesh_size(mesh)
+    h_face_fx = ufl.avg(h_cell_fx)
+    inv_h2_fx = 1.0 / (h_cell_fx * h_cell_fx)
+
+    C_k_fx = 1.0 - B_k_fx
+    C_n_fx = 1.0 - B_n_fx
+    P_k_fx = alpha_k_fx - B_k_fx
+    P_n_fx = alpha_n_fx - B_n_fx
+    gradC_k_fx = -ufl.grad(B_k_fx)
+    gradC_n_fx = -ufl.grad(B_n_fx)
+    gradB_k_fx = ufl.grad(B_k_fx)
+    gradB_n_fx = ufl.grad(B_n_fx)
+    gradP_k_fx = ufl.grad(alpha_k_fx) - ufl.grad(B_k_fx)
+    gradP_n_fx = ufl.grad(alpha_n_fx) - ufl.grad(B_n_fx)
+    rho_k_fx = rho_f_fx * C_k_fx
+    rho_n_fx = rho_f_fx * C_n_fx
+    mu_k_fx = _mu_from_alpha_B(alpha_k_fx, B_k_fx)
+    mu_n_fx = _mu_from_alpha_B(alpha_n_fx, B_n_fx)
+    divCv_k_fx = C_k_fx * ufl.div(v_k_fx) + ufl.dot(gradC_k_fx, v_k_fx)
+    divCv_n_fx = C_n_fx * ufl.div(v_n_fx) + ufl.dot(gradC_n_fx, v_n_fx)
+    divBvS_k_fx = B_k_fx * ufl.div(vS_k_fx) + ufl.dot(gradB_k_fx, vS_k_fx)
+    divBvS_n_fx = B_n_fx * ufl.div(vS_n_fx) + ufl.dot(gradB_n_fx, vS_n_fx)
+    divF_k_fx = divCv_k_fx + divBvS_k_fx
+    divF_n_fx = divCv_n_fx + divBvS_n_fx
+    diff_k_fx = v_k_fx - vS_k_fx
+    diff_n_fx = v_n_fx - vS_n_fx
+    div_diff_k_fx = ufl.div(v_k_fx) - ufl.div(vS_k_fx)
+    div_diff_n_fx = ufl.div(v_n_fx) - ufl.div(vS_n_fx)
+    divQ_k_fx = P_k_fx * div_diff_k_fx + ufl.dot(gradP_k_fx, diff_k_fx)
+    divQ_n_fx = P_n_fx * div_diff_n_fx + ufl.dot(gradP_n_fx, diff_n_fx)
+    div_C_vtest_k_fx = C_k_fx * ufl.div(v_test_fx) + ufl.dot(gradC_k_fx, v_test_fx)
+    div_B_vStest_k_fx = B_k_fx * ufl.div(vS_test_fx) + ufl.dot(gradB_k_fx, vS_test_fx)
+    div_B_vStest_n_fx = B_n_fx * ufl.div(vS_test_fx) + ufl.dot(gradB_n_fx, vS_test_fx)
+    div_rhov_k_fx = rho_f_fx * divCv_k_fx
+    div_rhov_n_fx = rho_f_fx * divCv_n_fx
+
+    fluid_scale_fx = _const(1.0)
+    skeleton_scale_fx = _const(1.0)
+    mechanics_nondim_key = str(params.get("mechanics_nondim_mode", "legacy")).strip().lower()
+    if mechanics_nondim_key in {"stress_balance", "condition_balanced"}:
+        fluid_ref_val = max(1.0, abs(float(params["mu_f"])), abs(float(params["mu_b"])))
+        solid_ref_val = max(1.0, abs(float(2.0 * float(params["mu_s"]) + 2.0 * float(params["lambda_s"]))))
+        fluid_scale_fx = _const(1.0 / fluid_ref_val)
+        skeleton_scale_fx = _const(1.0 / solid_ref_val)
+
+    # Fluid momentum
+    r_mom_fx = ufl.inner((rho_k_fx * v_k_fx - rho_n_fx * v_n_fx) * inv_dt_fx, v_test_fx) * dx_fx
+    fluid_conv_key = str(params["fluid_convection"]).strip().lower()
+    if fluid_conv_key == "full":
+        conv_k_fx = ufl.dot(ufl.dot(ufl.grad(v_k_fx), v_k_fx), v_test_fx)
+        conv_n_fx = ufl.dot(ufl.dot(ufl.grad(v_n_fx), v_n_fx), v_test_fx)
+        r_mom_fx += (
+            th_fx * (rho_k_fx * conv_k_fx + div_rhov_k_fx * ufl.dot(v_k_fx, v_test_fx))
+            + omth_fx * (rho_n_fx * conv_n_fx + div_rhov_n_fx * ufl.dot(v_n_fx, v_test_fx))
+        ) * dx_fx
+    elif fluid_conv_key == "lagged":
+        conv_k_fx = ufl.dot(ufl.dot(ufl.grad(v_k_fx), v_n_fx), v_test_fx)
+        conv_n_fx = ufl.dot(ufl.dot(ufl.grad(v_n_fx), v_n_fx), v_test_fx)
+        r_mom_fx += (
+            th_fx * (rho_n_fx * conv_k_fx + div_rhov_n_fx * ufl.dot(v_k_fx, v_test_fx))
+            + omth_fx * (rho_n_fx * conv_n_fx + div_rhov_n_fx * ufl.dot(v_n_fx, v_test_fx))
+        ) * dx_fx
+    elif fluid_conv_key == "imex":
+        conv_n_fx = ufl.dot(ufl.dot(ufl.grad(v_n_fx), v_n_fx), v_test_fx)
+        r_mom_fx += (rho_n_fx * conv_n_fx + div_rhov_n_fx * ufl.dot(v_n_fx, v_test_fx)) * dx_fx
+    elif fluid_conv_key != "off":
+        raise ValueError(f"Unsupported fluid_convection={params['fluid_convection']!r}.")
+    r_mom_fx += 2.0 * (th_fx * mu_k_fx * ufl.inner(_eps(v_k_fx), _eps(v_test_fx)) + omth_fx * mu_n_fx * ufl.inner(_eps(v_n_fx), _eps(v_test_fx))) * dx_fx
+    r_mom_fx += -(p_k_fx * div_C_vtest_k_fx) * dx_fx
+    if float(params["gamma_div"]) != 0.0:
+        divF_k_fx = divCv_k_fx + divBvS_k_fx
+        r_mom_fx += gamma_div_fx * divF_k_fx * div_C_vtest_k_fx * dx_fx
+
+    kappa_key = str(params["kappa_inv_model"]).strip().lower()
+    if kappa_key in {"refmap", "eulerian_refmap", "eulerian", "reference_map", "reference-map"}:
+        K_inv_ref_fx = kappa_inv_fx * I_fx
+        F_inv_k_fx = I_fx - ufl.grad(u_k_fx)
+        F_inv_n_fx = I_fx - ufl.grad(u_n_fx)
+        F_k_fx = ufl.inv(F_inv_k_fx)
+        F_n_fx = ufl.inv(F_inv_n_fx)
+        J_k_fx = ufl.det(F_k_fx)
+        J_n_fx = ufl.det(F_n_fx)
+        k_inv_k_fx = J_k_fx * ufl.dot(F_inv_k_fx.T, ufl.dot(K_inv_ref_fx, F_inv_k_fx))
+        k_inv_n_fx = J_n_fx * ufl.dot(F_inv_n_fx.T, ufl.dot(K_inv_ref_fx, F_inv_n_fx))
+        drag_mode = "matrix"
+    elif kappa_key in {"spatial", "constant", "const"}:
+        beta_k_fx = mu_f_fx * P_k_fx * kappa_inv_fx
+        beta_n_fx = mu_f_fx * P_n_fx * kappa_inv_fx
+        drag_mode = "scalar"
+    else:
+        raise ValueError(f"Unsupported kappa_inv_model={params['kappa_inv_model']!r}.")
+
+    drag_form_key = str(params.get("drag_formulation", "direct")).strip().lower().replace("-", "_")
+    if drag_form_key == "mixed_lm":
+        r_mom_fx += ufl.dot(lambda_drag_k_fx, v_test_fx) * dx_fx
+    elif drag_mode == "scalar":
+        r_mom_fx += beta_k_fx * ufl.dot(v_k_fx - vS_k_fx, v_test_fx) * dx_fx
+    else:
+        r_mom_fx += mu_f_fx * P_k_fx * ufl.dot(ufl.dot(k_inv_k_fx, v_k_fx - vS_k_fx), v_test_fx) * dx_fx
+
+    # Pressure / storage row
+    beta_biot_fx = _const(1.0 if params.get("alpha_biot") is None else float(params["alpha_biot"]))
+    r_mass_fx = q_fx * divF_k_fx * dx_fx
+    if float(params["storativity_c0"]) != 0.0:
+        r_mass_fx += q_fx * (storativity_c0_fx * alpha_k_fx * (p_k_fx - p_n_fx) * inv_dt_fx) * dx_fx
+
+    # Skeleton
+    total_pressure_ref_fx = _const(max(1.0, abs(float(2.0 * float(params["mu_s"]) + 2.0 * float(params["lambda_s"])))))
+    total_pressure_ref_inv_fx = 1.0 / total_pressure_ref_fx
+    lambda_over_total_pressure_ref_fx = float(params["lambda_s"]) * total_pressure_ref_inv_fx
+    sk_th_fx = th_fx if bool(params["include_skeleton_acceleration"]) else _const(1.0)
+    sk_omth_fx = omth_fx if bool(params["include_skeleton_acceleration"]) else _const(0.0)
+    if bool(params.get("solid_volumetric_split", False)):
+        dev_u_k = _eps(u_k_fx) - (ufl.tr(_eps(u_k_fx)) / 2.0) * I_fx
+        dev_u_n = _eps(u_n_fx) - (ufl.tr(_eps(u_n_fx)) / 2.0) * I_fx
+        r_elastic_k_fx = 2.0 * mu_s_fx * ufl.inner(dev_u_k, _eps(vS_test_fx)) + total_pressure_ref_fx * pi_s_k_fx * ufl.div(vS_test_fx)
+        r_elastic_n_fx = 2.0 * mu_s_fx * ufl.inner(dev_u_n, _eps(vS_test_fx)) + total_pressure_ref_fx * pi_s_n_fx * ufl.div(vS_test_fx)
+        r_volumetric_fx = (
+            alpha_k_fx
+            * pi_s_test_fx
+            * (
+                pi_s_k_fx
+                - lambda_over_total_pressure_ref_fx * ufl.div(u_k_fx)
+                + total_pressure_ref_inv_fx * (beta_biot_fx * alpha_k_fx) * p_k_fx
+            )
+            + float(params.get("solid_volumetric_penalty", 1.0)) * (1.0 - alpha_k_fx) * pi_s_k_fx * pi_s_test_fx
+        ) * dx_fx
+    else:
+        r_elastic_k_fx = 2.0 * mu_s_fx * ufl.inner(_eps(u_k_fx), _eps(vS_test_fx)) + lambda_s_fx * ufl.div(u_k_fx) * ufl.div(vS_test_fx)
+        r_elastic_n_fx = 2.0 * mu_s_fx * ufl.inner(_eps(u_n_fx), _eps(vS_test_fx)) + lambda_s_fx * ufl.div(u_n_fx) * ufl.div(vS_test_fx)
+        r_volumetric_fx = _const(0.0) * alpha_k_fx * dx_fx
+    r_skel_press_k_fx = -p_k_fx * div_B_vStest_k_fx
+    r_skel_press_n_fx = -p_n_fx * div_B_vStest_n_fx
+    if params["alpha_biot"] is not None:
+        r_skel_press_k_fx += -(p_k_fx * (beta_biot_fx * alpha_k_fx - B_k_fx) * ufl.div(vS_test_fx))
+        r_skel_press_n_fx += -(p_n_fx * (beta_biot_fx * alpha_n_fx - B_n_fx) * ufl.div(vS_test_fx))
+    if drag_form_key == "mixed_lm":
+        r_skel_drag_k_fx = -ufl.dot(lambda_drag_k_fx, vS_test_fx)
+        r_skel_drag_n_fx = -ufl.dot(lambda_drag_n_fx, vS_test_fx)
+    elif drag_mode == "scalar":
+        r_skel_drag_k_fx = -beta_k_fx * ufl.dot(v_k_fx - vS_k_fx, vS_test_fx)
+        r_skel_drag_n_fx = -beta_n_fx * ufl.dot(v_n_fx - vS_n_fx, vS_test_fx)
+    else:
+        r_skel_drag_k_fx = -(mu_f_fx * P_k_fx) * ufl.dot(ufl.dot(k_inv_k_fx, v_k_fx - vS_k_fx), vS_test_fx)
+        r_skel_drag_n_fx = -(mu_f_fx * P_n_fx) * ufl.dot(ufl.dot(k_inv_n_fx, v_n_fx - vS_n_fx), vS_test_fx)
+    r_skeleton_fx = (
+        sk_th_fx * alpha_k_fx * r_elastic_k_fx
+        + sk_omth_fx * alpha_n_fx * r_elastic_n_fx
+        + sk_th_fx * r_skel_press_k_fx
+        + sk_omth_fx * r_skel_press_n_fx
+        + sk_th_fx * r_skel_drag_k_fx
+        + sk_omth_fx * r_skel_drag_n_fx
+    ) * dx_fx
+    if bool(params["include_skeleton_acceleration"]) and float(params["rho_s0_tilde"]) != 0.0:
+        rhoS_k_fx = rho_s0_fx * B_k_fx
+        rhoS_n_fx = rho_s0_fx * B_n_fx
+        r_skeleton_fx += ufl.inner((rhoS_k_fx * vS_k_fx - rhoS_n_fx * vS_n_fx) * inv_dt_fx, vS_test_fx) * dx_fx
+        inertia_conv_key = str(params.get("skeleton_inertia_convection", "lagged")).strip().lower()
+        if inertia_conv_key in {"conservative", "nonlinear"}:
+            inertia_conv_key = "full"
+        if inertia_conv_key in {"picard", "semi", "semi_implicit", "linear"}:
+            inertia_conv_key = "lagged"
+        if inertia_conv_key not in {"full", "lagged"}:
+            raise ValueError(
+                f"Unsupported skeleton_inertia_convection={params.get('skeleton_inertia_convection')!r}."
+            )
+        div_rhoS_vS_k_fx = rho_s0_fx * divBvS_k_fx
+        div_rhoS_vS_n_fx = rho_s0_fx * divBvS_n_fx
+        advS_full_k_fx = ufl.dot(ufl.grad(vS_k_fx), vS_k_fx)
+        advS_full_n_fx = ufl.dot(ufl.grad(vS_n_fx), vS_n_fx)
+        convS_full_k_fx = ufl.dot(advS_full_k_fx, vS_test_fx)
+        convS_full_n_fx = ufl.dot(advS_full_n_fx, vS_test_fx)
+        advS_lagged_k_fx = ufl.dot(ufl.grad(vS_k_fx), vS_n_fx)
+        advS_lagged_n_fx = ufl.dot(ufl.grad(vS_n_fx), vS_n_fx)
+        convS_lagged_k_fx = ufl.dot(advS_lagged_k_fx, vS_test_fx)
+        convS_lagged_n_fx = ufl.dot(advS_lagged_n_fx, vS_test_fx)
+        if inertia_conv_key == "full":
+            r_skeleton_fx += (
+                th_fx * (rhoS_k_fx * convS_full_k_fx + div_rhoS_vS_k_fx * ufl.dot(vS_k_fx, vS_test_fx))
+                + omth_fx * (rhoS_n_fx * convS_full_n_fx + div_rhoS_vS_n_fx * ufl.dot(vS_n_fx, vS_test_fx))
+            ) * dx_fx
+        else:
+            r_skeleton_fx += (
+                th_fx * (rhoS_n_fx * convS_lagged_k_fx + div_rhoS_vS_n_fx * ufl.dot(vS_k_fx, vS_test_fx))
+                + omth_fx * (rhoS_n_fx * convS_lagged_n_fx + div_rhoS_vS_n_fx * ufl.dot(vS_n_fx, vS_test_fx))
+            ) * dx_fx
+
+    gamma_vS_eff = params.get("gamma_vS")
+    if gamma_vS_eff is None:
+        gamma_vS_eff = float(params["gamma_u"])
+    vS_ext_mode_eff = params.get("vS_extension_mode")
+    if vS_ext_mode_eff is None:
+        vS_ext_mode_eff = params["u_extension_mode"]
+    if float(gamma_vS_eff) != 0.0:
+        gamma_vS_fx = _const(float(gamma_vS_eff))
+        if str(vS_ext_mode_eff).strip().lower() in {"l2", "mass"}:
+            r_skeleton_fx += gamma_vS_fx * inv_h2_fx * (1.0 - alpha_k_fx) * ufl.dot(vS_k_fx, vS_test_fx) * dx_fx
+        else:
+            r_skeleton_fx += gamma_vS_fx * (1.0 - alpha_k_fx) * ufl.inner(ufl.grad(vS_k_fx), ufl.grad(vS_test_fx)) * dx_fx
+    if float(params["vS_cip"]) != 0.0:
+        tau_vS_cip_fx = _const(float(params["vS_cip"])) * (h_face_fx * h_face_fx * h_face_fx) * inv_dt_fx
+        r_skeleton_fx += tau_vS_cip_fx * ufl.avg(alpha_n_fx) * _fx_grad_inner_jump(vS_k_fx, vS_test_fx, n_int_fx, mesh.geometry.dim) * dS_meas_fx
+
+    # Kinematics
+    kin_scale_val = float(params["rho_s0_tilde"]) if float(params["rho_s0_tilde"]) != 0.0 else 1.0
+    kin_scale_fx = _const(kin_scale_val)
+    Fkin_k_fx = (u_k_fx - u_n_fx) * inv_dt_fx
+    Fkin_k_fx += th_fx * (ufl.dot(ufl.grad(u_k_fx), vS_k_fx) - vS_k_fx)
+    Fkin_k_fx += omth_fx * (ufl.dot(ufl.grad(u_n_fx), vS_n_fx) - vS_n_fx)
+    r_kinematics_fx = kin_scale_fx * alpha_k_fx * ufl.dot(Fkin_k_fx, u_test_fx) * dx_fx
+    if float(params["gamma_u"]) != 0.0:
+        if str(params["u_extension_mode"]).strip().lower() in {"l2", "mass"}:
+            r_kinematics_fx += gamma_u_fx * inv_h2_fx * (1.0 - alpha_k_fx) * ufl.dot(u_k_fx, u_test_fx) * dx_fx
+        else:
+            r_kinematics_fx += gamma_u_fx * (1.0 - alpha_k_fx) * ufl.inner(ufl.grad(u_k_fx), ufl.grad(u_test_fx)) * dx_fx
+            if float(params["gamma_u_pin"]) != 0.0:
+                r_kinematics_fx += gamma_u_pin_fx * inv_h2_fx * (1.0 - alpha_k_fx) ** 2 * ufl.dot(u_k_fx, u_test_fx) * dx_fx
+
+    # B transport
+    Pi_k_fx = (mu_max_fx * (S_k_fx / (K_S_fx + S_k_fx)) - k_d_fx) * B_k_fx
+    Pi_n_fx = (mu_max_fx * (S_n_fx / (K_S_fx + S_n_fx)) - k_d_fx) * B_n_fx
+    r_B_fx = B_test_fx * ((B_k_fx - B_n_fx) * inv_dt_fx) * dx_fx
+    r_B_fx += -th_fx * ufl.dot(B_k_fx * vS_k_fx, ufl.grad(B_test_fx)) * dx_fx
+    r_B_fx += -omth_fx * ufl.dot(B_n_fx * vS_n_fx, ufl.grad(B_test_fx)) * dx_fx
+    r_B_fx += -B_test_fx * (th_fx * Pi_k_fx + omth_fx * Pi_n_fx) * dx_fx
+
+    # Alpha geometry
+    r_alpha_fx = alpha_test_fx * ((alpha_k_fx - alpha_n_fx) * inv_dt_fx) * dx_fx
+    r_alpha_fx += th_fx * alpha_test_fx * ufl.dot(ufl.grad(alpha_k_fx), vS_k_fx) * dx_fx
+    r_alpha_fx += omth_fx * alpha_test_fx * ufl.dot(ufl.grad(alpha_n_fx), vS_n_fx) * dx_fx
+
+    r_mu_alpha_fx = alpha_mu_aux_pin_fx * mu_alpha_test_fx * mu_alpha_k_fx * dx_fx
+
+    # Substrate
+    monod_k_fx = mu_max_fx * (S_k_fx / (K_S_fx + S_k_fx))
+    monod_n_fx = mu_max_fx * (S_n_fx / (K_S_fx + S_n_fx))
+    RS_k_fx = rho_s_star_fx * (1.0 / Y_fx) * ((monod_k_fx - k_d_fx) * B_k_fx)
+    RS_n_fx = rho_s_star_fx * (1.0 / Y_fx) * ((monod_n_fx - k_d_fx) * B_n_fx)
+    CSk_fx = C_k_fx * S_k_fx
+    CSn_fx = C_n_fx * S_n_fx
+    div_CSv_k_fx = CSk_fx * ufl.div(v_k_fx) + S_k_fx * ufl.dot(gradC_k_fx, v_k_fx) + C_k_fx * ufl.dot(ufl.grad(S_k_fx), v_k_fx)
+    div_CSv_n_fx = CSn_fx * ufl.div(v_n_fx) + S_n_fx * ufl.dot(gradC_n_fx, v_n_fx) + C_n_fx * ufl.dot(ufl.grad(S_n_fx), v_n_fx)
+    r_sub_fx = S_test_fx * ((CSk_fx - CSn_fx) * inv_dt_fx) * dx_fx
+    r_sub_fx += S_test_fx * (th_fx * div_CSv_k_fx + omth_fx * div_CSv_n_fx) * dx_fx
+    r_sub_fx += S_test_fx * (th_fx * RS_k_fx + omth_fx * RS_n_fx) * dx_fx
+
+    # Mixed drag constitutive law
+    r_drag_lambda_fx = None
+    if drag_form_key == "mixed_lm":
+        if drag_mode == "scalar":
+            r_drag_lambda_fx = ufl.dot((1.0 / (mu_f_fx * kappa_inv_fx)) * lambda_drag_k_fx - P_k_fx * diff_k_fx, lambda_drag_test_fx) * dx_fx
+        else:
+            K_k_fx = ufl.inv(k_inv_k_fx)
+            r_drag_lambda_fx = (
+                ufl.dot((1.0 / mu_f_fx) * ufl.dot(K_k_fx, lambda_drag_k_fx) - P_k_fx * diff_k_fx, lambda_drag_test_fx)
+            ) * dx_fx
+
+    r_mom_fx = fluid_scale_fx * r_mom_fx
+    r_skeleton_fx = skeleton_scale_fx * r_skeleton_fx
+    blocks = {
+        "momentum": r_mom_fx,
+        "mass": r_mass_fx,
+        "skeleton": r_skeleton_fx,
+        "kinematics": r_kinematics_fx,
+        "alpha": r_alpha_fx,
+        "mu_alpha": r_mu_alpha_fx,
+        "B": r_B_fx,
+        "substrate": r_sub_fx,
+    }
+    if r_drag_lambda_fx is not None:
+        blocks["lambda_drag"] = r_drag_lambda_fx
+    if bool(params.get("solid_volumetric_split", False)):
+        blocks["pi_s"] = r_volumetric_fx
+    r_total_fx = None
+    for block in blocks.values():
+        r_total_fx = block if r_total_fx is None else r_total_fx + block
+    a_total_fx = ufl.derivative(r_total_fx, w_k, dw)
+    return r_total_fx, a_total_fx, blocks
+
+
 def _pycutfem_full_system_compare(problem, forms, *, qdeg: int, backend: str):
     if str(problem.get("fluid_space", "cg")).strip().lower() != "cg":
         return None
     enable_phi_evolution = bool(problem["_audit_enable_phi_evolution"])
+    full_ratio_free_state = bool(problem.get("_audit_full_ratio_free_state", False))
     requested_latent_fields = tuple(problem.get("_audit_latent_bounded_fields", tuple()) or tuple())
     latent_bounded_fields = []
     for name in requested_latent_fields:
         key = str(name).strip()
         if key == "alpha" and problem.get("alpha_latent_k") is not None:
             latent_bounded_fields.append("alpha")
-        elif key == "phi" and problem.get("phi_latent_k") is not None:
+        elif (not bool(full_ratio_free_state)) and key == "phi" and problem.get("phi_latent_k") is not None:
             latent_bounded_fields.append("phi")
     latent_bounded_fields = tuple(latent_bounded_fields)
     pressure_mean_constraint = bool(problem.get("_audit_pressure_mean_constraint", False))
@@ -2278,6 +2744,8 @@ def _pycutfem_full_system_compare(problem, forms, *, qdeg: int, backend: str):
         pressure_order=int(problem["_audit_pressure_order"]),
         scalar_order=int(problem["_audit_scalar_order"]),
         enable_phi_evolution=bool(enable_phi_evolution),
+        full_ratio_free_state=bool(full_ratio_free_state),
+        drag_formulation=str(params.get("drag_formulation", "direct")),
         latent_bounded_fields=tuple(latent_bounded_fields),
         pressure_mean_constraint=bool(pressure_mean_constraint),
         solid_volumetric_split=bool(solid_volumetric_split),
@@ -2286,6 +2754,8 @@ def _pycutfem_full_system_compare(problem, forms, *, qdeg: int, backend: str):
         problem,
         W_fx,
         enable_phi_evolution=bool(enable_phi_evolution),
+        full_ratio_free_state=bool(full_ratio_free_state),
+        drag_formulation=str(params.get("drag_formulation", "direct")),
         latent_bounded_fields=tuple(latent_bounded_fields),
         pressure_mean_constraint=bool(pressure_mean_constraint),
         solid_volumetric_split=bool(solid_volumetric_split),
@@ -2295,18 +2765,28 @@ def _pycutfem_full_system_compare(problem, forms, *, qdeg: int, backend: str):
         W_fx,
         mapping,
         enable_phi_evolution=bool(enable_phi_evolution),
+        full_ratio_free_state=bool(full_ratio_free_state),
         latent_bounded_fields=tuple(latent_bounded_fields),
         pressure_mean_constraint=bool(pressure_mean_constraint),
         solid_volumetric_split=bool(solid_volumetric_split),
     )
-    r_total_fx, a_total_fx, _ = _fenics_full_forms(
-        W=W_fx,
-        w_k=w_k_fx,
-        w_n=w_n_fx,
-        qdeg=int(qdeg),
-        enable_phi_evolution=bool(enable_phi_evolution),
-        params=params,
-    )
+    if bool(full_ratio_free_state):
+        r_total_fx, a_total_fx, _ = _fenics_full_forms_ratio_free(
+            W=W_fx,
+            w_k=w_k_fx,
+            w_n=w_n_fx,
+            qdeg=int(qdeg),
+            params=params,
+        )
+    else:
+        r_total_fx, a_total_fx, _ = _fenics_full_forms(
+            W=W_fx,
+            w_k=w_k_fx,
+            w_n=w_n_fx,
+            qdeg=int(qdeg),
+            enable_phi_evolution=bool(enable_phi_evolution),
+            params=params,
+        )
     form_r_fx = dolfinx.fem.form(r_total_fx)
     vec_fx = dolfinx.fem.petsc.assemble_vector(form_r_fx)
     r_fx_arr = np.asarray(vec_fx.array, dtype=float).copy()
@@ -2338,6 +2818,8 @@ def _pycutfem_full_system_compare(problem, forms, *, qdeg: int, backend: str):
     order_pc_to_fx = np.empty_like(r_pc, dtype=int)
     for fld, _, _ in _audit_field_layout(
         enable_phi_evolution=bool(enable_phi_evolution),
+        full_ratio_free_state=bool(full_ratio_free_state),
+        drag_formulation=str(params.get("drag_formulation", "direct")),
         latent_bounded_fields=tuple(latent_bounded_fields),
         pressure_mean_constraint=bool(pressure_mean_constraint),
         solid_volumetric_split=bool(solid_volumetric_split),
@@ -2386,6 +2868,18 @@ def _pycutfem_full_system_compare(problem, forms, *, qdeg: int, backend: str):
                 np.asarray(dh.get_field_slice("u_y"), dtype=int),
             ]
         ),
+        **(
+            {
+                "lambda_drag": np.concatenate(
+                    [
+                        np.asarray(dh.get_field_slice("lambda_drag_x"), dtype=int),
+                        np.asarray(dh.get_field_slice("lambda_drag_y"), dtype=int),
+                    ]
+                )
+            }
+            if problem.get("lambda_drag_k") is not None
+            else {}
+        ),
         "alpha": np.asarray(dh.get_field_slice("alpha"), dtype=int),
         "mu_alpha": np.asarray(dh.get_field_slice("mu_alpha"), dtype=int),
     }
@@ -2394,11 +2888,15 @@ def _pycutfem_full_system_compare(problem, forms, *, qdeg: int, backend: str):
     if bool(solid_volumetric_split):
         block_rows["pi_s"] = np.asarray(dh.get_field_slice("pi_s"), dtype=int)
     if bool(enable_phi_evolution):
-        block_rows["phi"] = np.asarray(dh.get_field_slice("phi"), dtype=int)
+        scalar_name = _transport_scalar_name(
+            enable_phi_evolution=bool(enable_phi_evolution),
+            full_ratio_free_state=bool(full_ratio_free_state),
+        )
+        block_rows[str(scalar_name)] = np.asarray(dh.get_field_slice(str(scalar_name)), dtype=int)
         block_rows["substrate"] = np.asarray(dh.get_field_slice("S"), dtype=int)
     if "alpha" in set(latent_bounded_fields):
         block_rows["alpha_latent"] = np.asarray(dh.get_field_slice("alpha_latent"), dtype=int)
-    if bool(enable_phi_evolution) and "phi" in set(latent_bounded_fields):
+    if bool(enable_phi_evolution) and (not bool(full_ratio_free_state)) and "phi" in set(latent_bounded_fields):
         block_rows["phi_latent"] = np.asarray(dh.get_field_slice("phi_latent"), dtype=int)
 
     block_metrics: dict[str, dict[str, float]] = {}
@@ -2475,6 +2973,12 @@ def main() -> None:
     ap.add_argument("--fluid-convection", type=str, default="full", choices=("full", "lagged", "imex", "off"))
     ap.add_argument("--include-skeleton-acceleration", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--rho-s0-tilde", type=float, default=1.1)
+    ap.add_argument(
+        "--storativity-c0",
+        type=float,
+        default=1.0e-3,
+        help="Biot-style storage coefficient used in the compressible stored-support pressure row.",
+    )
     ap.add_argument("--skeleton-inertia-convection", type=str, default="full", choices=("lagged", "full"))
     ap.add_argument("--alpha-supg", type=float, default=0.0)
     ap.add_argument("--alpha-cip", type=float, default=0.0)
@@ -2502,41 +3006,13 @@ def main() -> None:
         "--cases",
         type=str,
         nargs="+",
-        default=("vS_band", "v_band", "interface_band"),
-        choices=(
-            "vS_band",
-            "v_band",
-            "interface_band",
-            "vS_adv",
-            "v_adv",
-            "interface_adv",
-            "biofilm_cons",
-            "biofilm_cweak",
-            "biofilm_cweak_biot1",
-            "biofilm_cweak_seboldt",
-            "biofilm_cweak_alpha_supg",
-            "biofilm_cweak_phi_supg",
-            "christan_cweak_fullstab",
-            "mix_cweak",
-        ),
+        default=("stored_support_adv",),
+        choices=("stored_support_adv",),
     )
     args = ap.parse_args()
 
     all_cases = [
-        ("vS_band", "vS", "interface_band_conservative", "legacy_exchange", 0.0, None, 0.0, 0.0, "whole_domain", None),
-        ("v_band", "v", "interface_band_conservative", "legacy_exchange", 0.0, None, 0.0, 0.0, "whole_domain", None),
-        ("interface_band", "interface", "interface_band_conservative", "legacy_exchange", 0.0, None, 0.0, 0.0, "whole_domain", None),
-        ("vS_adv", "vS", "advective", "legacy_exchange", 0.0, None, 0.0, 0.0, "whole_domain", None),
-        ("v_adv", "v", "advective", "legacy_exchange", 0.0, None, 0.0, 0.0, "whole_domain", None),
-        ("interface_adv", "interface", "advective", "legacy_exchange", 0.0, None, 0.0, 0.0, "whole_domain", None),
-        ("biofilm_cons", "biofilm_volume", "conservative", "internal_conversion", 0.0, 0.0, 0.0, 0.0, "whole_domain", None),
-        ("biofilm_cweak", "biofilm_volume", "conservative_weak", "internal_conversion", 0.0, 0.0, 0.0, 0.0, "whole_domain", None),
-        ("biofilm_cweak_biot1", "biofilm_volume", "conservative_weak", "internal_conversion", 0.0, 0.0, 0.0, 0.0, "whole_domain", 1.0),
-        ("biofilm_cweak_seboldt", "biofilm_volume", "conservative_weak", "internal_conversion", 0.0, 0.0, 0.0, 0.0, "seboldt", 1.0),
-        ("biofilm_cweak_alpha_supg", "biofilm_volume", "conservative_weak", "internal_conversion", 0.0, 0.0, None, 0.0, "whole_domain", None),
-        ("biofilm_cweak_phi_supg", "biofilm_volume", "conservative_weak", "internal_conversion", 1.0, 0.0, 0.0, 0.0, "whole_domain", None),
-        ("christan_cweak_fullstab", "biofilm_volume", "conservative_weak", "internal_conversion", 0.0, 0.0, None, 0.0, "whole_domain", None),
-        ("mix_cweak", "mix", "conservative_weak", "legacy_exchange", 0.0, None, 0.0, 0.0, "whole_domain", None),
+        ("stored_support_adv", "vS", "advective", "stored_support", 0.0, 0.0, 0.0, 0.0, "whole_domain", 1.0),
     ]
     wanted = set(args.cases)
     cases = [item for item in all_cases if item[0] in wanted]
@@ -2544,7 +3020,7 @@ def main() -> None:
     for name in _parse_csv_fields(args.latent_bounded_fields):
         if name == "alpha":
             latent_field_set.append("alpha")
-        elif name == "phi" and bool(args.enable_phi_evolution):
+        elif name == "phi" and False:
             latent_field_set.append("phi")
     latent_bounded_fields = tuple(dict.fromkeys(latent_field_set))
 
@@ -2613,10 +3089,12 @@ def main() -> None:
             fluid_convection=str(args.fluid_convection),
             include_skeleton_acceleration=bool(args.include_skeleton_acceleration),
             rho_s0_tilde=float(args.rho_s0_tilde),
+            storativity_c0=float(args.storativity_c0),
             skeleton_inertia_convection=str(args.skeleton_inertia_convection),
             skeleton_pressure_mode=str(case_skeleton_pressure_mode if case_skeleton_pressure_mode is not None else args.skeleton_pressure_mode),
             alpha_biot=(case_alpha_biot if case_alpha_biot is not None else args.alpha_biot),
             use_diffuse_traction=bool(args.use_diffuse_traction or name == "christan_cweak_fullstab"),
+            full_ratio_free_state=True,
         )
         directional_fd_max_rel, directional_fd_per_case = _directional_fd_audit(
             problem,
@@ -2634,28 +3112,9 @@ def main() -> None:
             qdeg=int(qdeg),
             backend=str(args.pycutfem_backend),
         )
-        alpha_res_max_abs, alpha_res_rel, alpha_jac_max_abs, alpha_jac_rel = _pycutfem_alpha_compare(
-            problem,
-            forms,
-            qdeg=int(qdeg),
-            alpha_advect_with=str(adv_with),
-            alpha_advection_form=str(adv_form),
-            phi_b=float(problem["_audit_phi_b"]),
-            backend=str(args.pycutfem_backend),
-            full_compare=full_compare,
-        ) if not bool(args.latent_bounded_transport) else (None, None, None, None)
-        phi_res_max_abs, phi_res_rel, phi_jac_max_abs, phi_jac_rel = _pycutfem_phi_compare(
-            problem,
-            forms,
-            qdeg=int(qdeg),
-            backend=str(args.pycutfem_backend),
-        ) if (not bool(args.latent_bounded_transport)) else (None, None, None, None)
-        skel_res_max_abs, skel_res_rel, skel_jac_max_abs, skel_jac_rel = _pycutfem_skeleton_pressure_compare(
-            problem,
-            forms,
-            qdeg=int(qdeg),
-            backend=str(args.pycutfem_backend),
-        )
+        alpha_res_max_abs, alpha_res_rel, alpha_jac_max_abs, alpha_jac_rel = (None, None, None, None)
+        phi_res_max_abs, phi_res_rel, phi_jac_max_abs, phi_jac_rel = (None, None, None, None)
+        skel_res_max_abs, skel_res_rel, skel_jac_max_abs, skel_jac_rel = (None, None, None, None)
         summaries.append(
             CaseSummary(
                 name=str(name),

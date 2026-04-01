@@ -4,10 +4,14 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import scipy.sparse as sp
 
 from examples.biofilms.benchmarks.seboldt.paper1_benchmark7_seboldt import (
+    _apply_field_dependent_upper_bound,
     _apply_open_top_global_phi_cleanup,
     _benchmark7_requires_constrained_solver,
+    _benchmark7_solid_model_key,
+    _build_bcs,
     _build_forms,
     _build_support_aware_phi_box_bounds,
     _build_transport_measures,
@@ -17,6 +21,10 @@ from examples.biofilms.benchmarks.seboldt.paper1_benchmark7_seboldt import (
     _create_problem,
     _effective_eps_alpha,
     _effective_logistic_bounded_fields,
+    _interface_tangent_from_normal_2d,
+    _interface_unit_normal_2d,
+    _dot_basis_2d,
+    _normal_viscous_traction_scalar_2d,
     _latent_bounded_fields,
     _normalize_benchmark7_solver_choice,
     _parse_args,
@@ -27,12 +35,14 @@ from examples.biofilms.benchmarks.seboldt.paper1_benchmark7_seboldt import (
     _pc_skeleton_inertia_selectors,
     _pc_should_prefer_exact_probe,
     _pc_should_keep_lambda_stage,
+    _solver_scaled_reduced_matrix,
     _predictor_corrector_startup_enabled,
     _should_use_frozen_transport_restart,
     _should_use_staggered_predictor_after_large_step,
     _startup_stage_relaxed_accept_ginf,
     _startup_monolithic_max_it,
     _startup_stage_solver_kind,
+    _tangential_viscous_traction_scalar_2d,
     _named_constant,
 )
 from tests.test_benchmark7_solver_backend_parity import _initialize_small_benchmark7_state
@@ -41,8 +51,9 @@ from pycutfem.jit.cache import KernelCache
 from pycutfem.jit.ir import strip_side_metadata
 from pycutfem.jit.visitor import IRGenerator
 from pycutfem.ufl.compilers import FormCompiler
-from pycutfem.ufl.expressions import Constant, Integral as ExprIntegral
+from pycutfem.ufl.expressions import Constant, Integral as ExprIntegral, div
 from pycutfem.ufl.forms import Equation, Form, assemble_form
+from pycutfem.ufl.measures import dx
 
 
 def _assemble_block(problem, form, field: str) -> np.ndarray:
@@ -69,6 +80,7 @@ def _make_args(*, enable_phi_evolution: bool, top_drainage_transport: bool) -> S
         alpha_box_constraints=True,
         enable_phi_evolution=bool(enable_phi_evolution),
         top_drainage_transport=bool(top_drainage_transport),
+        internal_conversion_open_top_b_transport=False,
         phi_box_constraints=True,
         backend="python",
     )
@@ -98,6 +110,32 @@ def _build_full_problem():
     upward = lambda x, y: np.array([0.0, 1.0])
     problem["v_k"].set_values_from_function(upward)
     problem["v_n"].set_values_from_function(upward)
+    return problem
+
+
+def _build_ratio_free_full_problem(*, pressure_mean_constraint: bool = False):
+    problem = _create_problem(
+        Lx=1.0,
+        Ly=1.5,
+        nx=1,
+        ny=1,
+        poly_order=2,
+        pressure_order=1,
+        scalar_order=1,
+        fluid_space="cg",
+        fluid_hdiv_order=0,
+        enable_phi_evolution=True,
+        pressure_mean_constraint=bool(pressure_mean_constraint),
+        full_ratio_free_state=True,
+    )
+    for key in ("u_k", "u_n"):
+        problem[key].nodal_values[:] = 0.0
+    for key in ("mu_k", "mu_n", "S_k", "S_n"):
+        problem[key].nodal_values[:] = 0.0
+    for key in ("alpha_k", "alpha_n"):
+        problem[key].nodal_values[:] = 1.0
+    for key in ("B_k", "B_n"):
+        problem[key].nodal_values[:] = 0.82
     return problem
 
 
@@ -431,6 +469,483 @@ def test_benchmark7_legacy_top_transport_can_still_open_boundary_flux_terms() ->
     assert ds_B_transport is not None
 
 
+def test_benchmark7_internal_conversion_can_optionally_open_only_top_B_transport() -> None:
+    problem = _build_full_problem()
+    ds_alpha_transport, ds_B_transport = _build_transport_measures(
+        problem=problem,
+        qdeg=6,
+        enable_phi_evolution=True,
+        top_drainage_transport=True,
+        support_physics="internal_conversion",
+        internal_conversion_open_top_b_transport=True,
+    )
+    assert ds_alpha_transport is None
+    assert ds_B_transport is not None
+
+
+def test_ratio_free_stored_support_pore_row_uses_support_biot_coefficient() -> None:
+    problem = _build_ratio_free_full_problem()
+    shared_velocity = lambda x, y: np.array([0.1 * x, 0.2 * y])
+    for key in ("v_k", "v_n", "vS_k", "vS_n"):
+        problem[key].set_values_from_function(shared_velocity)
+    problem["p_k"].nodal_values[:] = 0.0
+    problem["p_n"].nodal_values[:] = 0.0
+    problem["p_pore_k"].nodal_values[:] = 0.0
+    problem["p_pore_n"].nodal_values[:] = 0.0
+
+    forms = _build_full_forms(
+        problem,
+        support_physics="stored_support",
+        alpha_advect_with="vS",
+        alpha_advection_form="advective",
+        alpha_biot=1.0,
+        storativity_c0=0.0,
+        include_skeleton_acceleration=False,
+    )
+
+    pore_block = _assemble_block(problem, forms.r_pore, "p_pore")
+    expected_form = Constant(0.3) * problem["q_pore_test"] * dx(metadata={"q": 6})
+    expected_block = _assemble_block(problem, expected_form, "p_pore")
+
+    assert np.allclose(pore_block, expected_block, atol=1.0e-12, rtol=1.0e-12)
+
+
+def test_ratio_free_stored_support_default_pore_row_uses_whole_domain_support_coefficient() -> None:
+    problem = _build_ratio_free_full_problem()
+    shared_velocity = lambda x, y: np.array([0.1 * x, 0.2 * y])
+    for key in ("v_k", "v_n", "vS_k", "vS_n"):
+        problem[key].set_values_from_function(shared_velocity)
+    problem["p_k"].nodal_values[:] = 0.0
+    problem["p_n"].nodal_values[:] = 0.0
+    problem["p_pore_k"].nodal_values[:] = 0.0
+    problem["p_pore_n"].nodal_values[:] = 0.0
+
+    forms = _build_full_forms(
+        problem,
+        support_physics="stored_support",
+        alpha_advect_with="vS",
+        alpha_advection_form="advective",
+        alpha_biot=None,
+        skeleton_pressure_mode="whole_domain",
+        storativity_c0=0.0,
+        include_skeleton_acceleration=False,
+    )
+
+    pore_block = _assemble_block(problem, forms.r_pore, "p_pore")
+    expected_form = Constant(0.82 * 0.3) * problem["q_pore_test"] * dx(metadata={"q": 6})
+    expected_block = _assemble_block(problem, expected_form, "p_pore")
+
+    assert np.allclose(pore_block, expected_block, atol=1.0e-12, rtol=1.0e-12)
+
+
+def test_ratio_free_stored_support_pore_storage_row_uses_support_weight() -> None:
+    problem = _build_ratio_free_full_problem()
+    zero_vec = lambda x, y: np.array([0.0, 0.0])
+    for key in ("v_k", "v_n", "vS_k", "vS_n"):
+        problem[key].set_values_from_function(zero_vec)
+    problem["p_n"].nodal_values[:] = 0.2
+    problem["p_k"].nodal_values[:] = 1.2
+    problem["p_pore_n"].nodal_values[:] = 0.2
+    problem["p_pore_k"].nodal_values[:] = 1.2
+
+    forms = _build_full_forms(
+        problem,
+        support_physics="stored_support",
+        alpha_advect_with="vS",
+        alpha_advection_form="advective",
+        alpha_biot=1.0,
+        storativity_c0=1.7,
+        include_skeleton_acceleration=False,
+    )
+
+    pore_block = _assemble_block(problem, forms.r_pore, "p_pore")
+    expected_coeff = 1.7 * (1.2 - 0.2) / 0.1
+    expected_form = Constant(expected_coeff) * problem["q_pore_test"] * dx(metadata={"q": 6})
+    expected_block = _assemble_block(problem, expected_form, "p_pore")
+
+    assert np.allclose(pore_block, expected_block, atol=1.0e-12, rtol=1.0e-12)
+
+
+def test_ratio_free_stored_support_mass_row_keeps_free_fluid_incompressibility() -> None:
+    problem = _build_ratio_free_full_problem()
+    for key in ("alpha_k", "alpha_n", "B_k", "B_n"):
+        problem[key].nodal_values[:] = 0.0
+    fluid_velocity = lambda x, y: np.array([0.1 * x, 0.2 * y])
+    zero_vec = lambda x, y: np.array([0.0, 0.0])
+    for key in ("v_k", "v_n"):
+        problem[key].set_values_from_function(fluid_velocity)
+    for key in ("vS_k", "vS_n"):
+        problem[key].set_values_from_function(zero_vec)
+    problem["p_k"].nodal_values[:] = 0.0
+    problem["p_n"].nodal_values[:] = 0.0
+    problem["p_pore_k"].nodal_values[:] = 17.0
+    problem["p_pore_n"].nodal_values[:] = 17.0
+
+    forms = _build_full_forms(
+        problem,
+        support_physics="stored_support",
+        alpha_advect_with="vS",
+        alpha_advection_form="advective",
+        alpha_biot=1.0,
+        storativity_c0=0.0,
+        include_skeleton_acceleration=False,
+    )
+
+    mass_block = _assemble_block(problem, forms.r_mass, "p")
+    expected_form = Constant(0.3) * problem["q_test"] * dx(metadata={"q": 6})
+    expected_block = _assemble_block(problem, expected_form, "p")
+
+    assert np.allclose(mass_block, expected_block, atol=1.0e-12, rtol=1.0e-12)
+
+
+def test_ratio_free_stored_support_skeleton_pressure_uses_support_biot_coefficient() -> None:
+    problem = _build_ratio_free_full_problem()
+    zero_vec = lambda x, y: np.array([0.0, 0.0])
+    for key in ("v_k", "v_n"):
+        problem[key].set_values_from_function(zero_vec)
+    for key in ("vS_k", "vS_n"):
+        problem[key].set_values_from_function(lambda x, y: np.array([0.1 * x, 0.2 * y]))
+    problem["p_k"].nodal_values[:] = 0.5
+    problem["p_n"].nodal_values[:] = 0.5
+    problem["p_pore_k"].nodal_values[:] = 2.0
+    problem["p_pore_n"].nodal_values[:] = 2.0
+
+    forms = _build_full_forms(
+        problem,
+        support_physics="stored_support",
+        alpha_advect_with="vS",
+        alpha_advection_form="advective",
+        alpha_biot=1.0,
+        storativity_c0=0.0,
+        include_skeleton_acceleration=False,
+    )
+
+    _, residual = assemble_form(
+        Equation(None, forms.r_skeleton_terms["pressure"]),
+        dof_handler=problem["dh"],
+        bcs=[],
+        quad_order=6,
+        backend="python",
+    )
+    residual = np.asarray(residual, dtype=float)
+    vS_x = np.asarray(problem["dh"].get_field_slice("vS_x"), dtype=int)
+    vS_y = np.asarray(problem["dh"].get_field_slice("vS_y"), dtype=int)
+    pressure_block = np.concatenate([residual[vS_x], residual[vS_y]])
+
+    expected_form = -(problem["p_pore_k"] * div(problem["vS_test"])) * dx(metadata={"q": 6})
+    _, expected_residual = assemble_form(
+        Equation(None, expected_form),
+        dof_handler=problem["dh"],
+        bcs=[],
+        quad_order=6,
+        backend="python",
+    )
+    expected_residual = np.asarray(expected_residual, dtype=float)
+    expected_block = np.concatenate([expected_residual[vS_x], expected_residual[vS_y]])
+
+    assert np.allclose(pressure_block, expected_block, atol=1.0e-12, rtol=1.0e-12)
+
+
+def test_ratio_free_stored_support_default_skeleton_pressure_uses_whole_domain_support_coefficient() -> None:
+    problem = _build_ratio_free_full_problem()
+    zero_vec = lambda x, y: np.array([0.0, 0.0])
+    for key in ("v_k", "v_n"):
+        problem[key].set_values_from_function(zero_vec)
+    for key in ("vS_k", "vS_n"):
+        problem[key].set_values_from_function(lambda x, y: np.array([0.1 * x, 0.2 * y]))
+    problem["p_k"].nodal_values[:] = 0.5
+    problem["p_n"].nodal_values[:] = 0.5
+    problem["p_pore_k"].nodal_values[:] = 2.0
+    problem["p_pore_n"].nodal_values[:] = 2.0
+
+    forms = _build_full_forms(
+        problem,
+        support_physics="stored_support",
+        alpha_advect_with="vS",
+        alpha_advection_form="advective",
+        alpha_biot=None,
+        skeleton_pressure_mode="whole_domain",
+        storativity_c0=0.0,
+        include_skeleton_acceleration=False,
+    )
+
+    _, residual = assemble_form(
+        Equation(None, forms.r_skeleton_terms["pressure"]),
+        dof_handler=problem["dh"],
+        bcs=[],
+        quad_order=6,
+        backend="python",
+    )
+    residual = np.asarray(residual, dtype=float)
+    vS_x = np.asarray(problem["dh"].get_field_slice("vS_x"), dtype=int)
+    vS_y = np.asarray(problem["dh"].get_field_slice("vS_y"), dtype=int)
+    pressure_block = np.concatenate([residual[vS_x], residual[vS_y]])
+
+    expected_form = -(problem["B_k"] * problem["p_pore_k"] * div(problem["vS_test"])) * dx(metadata={"q": 6})
+    _, expected_residual = assemble_form(
+        Equation(None, expected_form),
+        dof_handler=problem["dh"],
+        bcs=[],
+        quad_order=6,
+        backend="python",
+    )
+    expected_residual = np.asarray(expected_residual, dtype=float)
+    expected_block = np.concatenate([expected_residual[vS_x], expected_residual[vS_y]])
+
+    assert np.allclose(pressure_block, expected_block, atol=1.0e-12, rtol=1.0e-12)
+
+
+def test_ratio_free_stored_support_fluid_momentum_uses_free_fluid_pressure_off_support() -> None:
+    problem = _build_ratio_free_full_problem()
+    for key in ("alpha_k", "alpha_n", "B_k", "B_n"):
+        problem[key].nodal_values[:] = 0.0
+    zero_vec = lambda x, y: np.array([0.0, 0.0])
+    for key in ("v_k", "v_n", "vS_k", "vS_n"):
+        problem[key].set_values_from_function(zero_vec)
+    problem["p_k"].nodal_values[:] = 3.0
+    problem["p_n"].nodal_values[:] = 3.0
+    problem["p_pore_k"].nodal_values[:] = 19.0
+    problem["p_pore_n"].nodal_values[:] = 19.0
+
+    forms = _build_full_forms(
+        problem,
+        support_physics="stored_support",
+        alpha_advect_with="vS",
+        alpha_advection_form="advective",
+        alpha_biot=1.0,
+        storativity_c0=0.0,
+        include_skeleton_acceleration=False,
+    )
+
+    _, residual = assemble_form(
+        Equation(None, forms.r_momentum_terms["pressure"]),
+        dof_handler=problem["dh"],
+        bcs=[],
+        quad_order=6,
+        backend="python",
+    )
+    residual = np.asarray(residual, dtype=float)
+    v_x = np.asarray(problem["dh"].get_field_slice("v_x"), dtype=int)
+    v_y = np.asarray(problem["dh"].get_field_slice("v_y"), dtype=int)
+    pressure_block = np.concatenate([residual[v_x], residual[v_y]])
+
+    expected_form = -(problem["p_k"] * div(problem["v_test"])) * dx(metadata={"q": 6})
+    _, expected_residual = assemble_form(
+        Equation(None, expected_form),
+        dof_handler=problem["dh"],
+        bcs=[],
+        quad_order=6,
+        backend="python",
+    )
+    expected_residual = np.asarray(expected_residual, dtype=float)
+    expected_block = np.concatenate([expected_residual[v_x], expected_residual[v_y]])
+
+    assert np.allclose(pressure_block, expected_block, atol=1.0e-12, rtol=1.0e-12)
+
+
+def test_ratio_free_pressure_interface_closure_adds_equal_and_opposite_pressure_residuals() -> None:
+    problem = _build_ratio_free_full_problem()
+    zero_vec = lambda x, y: np.array([0.0, 0.0])
+    for key in ("v_k", "v_n", "vS_k", "vS_n"):
+        problem[key].set_values_from_function(zero_vec)
+    for key in ("alpha_k", "alpha_n"):
+        problem[key].nodal_values[:] = 0.5
+    for key in ("B_k", "B_n"):
+        problem[key].nodal_values[:] = 0.41
+    problem["p_k"].nodal_values[:] = 3.0
+    problem["p_n"].nodal_values[:] = 3.0
+    problem["p_pore_k"].nodal_values[:] = -2.0
+    problem["p_pore_n"].nodal_values[:] = -2.0
+
+    forms = _build_full_forms(
+        problem,
+        support_physics="stored_support",
+        alpha_advect_with="vS",
+        alpha_advection_form="advective",
+        alpha_biot=None,
+        skeleton_pressure_mode="whole_domain",
+        storativity_c0=0.0,
+        include_skeleton_acceleration=False,
+        pressure_interface_closure=True,
+        pressure_interface_closure_strength=2.5,
+    )
+
+    pressure_interface_form = problem["_pressure_interface_residual_form"]
+    assert pressure_interface_form is not None
+
+    p_block = _assemble_block(problem, pressure_interface_form, "p")
+    p_pore_block = _assemble_block(problem, pressure_interface_form, "p_pore")
+    expected_form = (
+        Constant(2.5)
+        * Constant(4.0)
+        * problem["alpha_k"]
+        * (Constant(1.0) - problem["alpha_k"])
+        * (problem["p_k"] - problem["p_pore_k"])
+        * (problem["q_test"] - problem["q_pore_test"])
+        * dx(metadata={"q": 6})
+    )
+    expected_p_block = _assemble_block(problem, expected_form, "p")
+    expected_p_pore_block = _assemble_block(problem, expected_form, "p_pore")
+
+    assert np.allclose(p_block, expected_p_block, atol=1.0e-12, rtol=1.0e-12)
+    assert np.allclose(p_pore_block, expected_p_pore_block, atol=1.0e-12, rtol=1.0e-12)
+    assert np.allclose(p_block, -p_pore_block, atol=1.0e-12, rtol=1.0e-12)
+
+
+def test_ratio_free_p_pore_fluid_gauge_pins_off_support_extension_only() -> None:
+    problem = _build_ratio_free_full_problem()
+    zero_vec = lambda x, y: np.array([0.0, 0.0])
+    for key in ("v_k", "v_n", "vS_k", "vS_n"):
+        problem[key].set_values_from_function(zero_vec)
+    for key in ("alpha_k", "alpha_n", "B_k", "B_n"):
+        problem[key].nodal_values[:] = 0.0
+    problem["p_k"].nodal_values[:] = 0.0
+    problem["p_n"].nodal_values[:] = 0.0
+    problem["p_pore_k"].nodal_values[:] = 3.0
+    problem["p_pore_n"].nodal_values[:] = 3.0
+
+    _build_full_forms(
+        problem,
+        support_physics="stored_support",
+        alpha_advect_with="vS",
+        alpha_advection_form="advective",
+        alpha_biot=1.0,
+        storativity_c0=0.0,
+        include_skeleton_acceleration=False,
+        pressure_interface_closure=False,
+        p_pore_fluid_gauge=True,
+        p_pore_fluid_gauge_strength=2.5,
+        interface_entry_closure=False,
+        interface_bjs_closure=False,
+    )
+
+    gauge_form = problem["_p_pore_fluid_gauge_residual_form"]
+    assert gauge_form is not None
+    pore_block = _assemble_block(problem, gauge_form, "p_pore")
+    expected_form = Constant(2.5) * problem["p_pore_k"] * problem["q_pore_test"] * dx(metadata={"q": 6})
+    expected_block = _assemble_block(problem, expected_form, "p_pore")
+    assert np.allclose(pore_block, expected_block, atol=1.0e-12, rtol=1.0e-12)
+
+    for key in ("alpha_k", "alpha_n"):
+        problem[key].nodal_values[:] = 1.0
+    _build_full_forms(
+        problem,
+        support_physics="stored_support",
+        alpha_advect_with="vS",
+        alpha_advection_form="advective",
+        alpha_biot=1.0,
+        storativity_c0=0.0,
+        include_skeleton_acceleration=False,
+        pressure_interface_closure=False,
+        p_pore_fluid_gauge=True,
+        p_pore_fluid_gauge_strength=2.5,
+        interface_entry_closure=False,
+        interface_bjs_closure=False,
+    )
+    zero_block = _assemble_block(problem, problem["_p_pore_fluid_gauge_residual_form"], "p_pore")
+    assert np.allclose(zero_block, 0.0, atol=1.0e-12, rtol=1.0e-12)
+
+
+def test_ratio_free_entry_interface_closure_adds_equal_and_opposite_pressure_residuals() -> None:
+    problem = _build_ratio_free_full_problem()
+    alpha_coords = np.asarray(problem["dh"].get_dof_coords("alpha"), dtype=float)
+    alpha_profile = 0.5 + 0.1 * (alpha_coords[:, 1] - np.mean(alpha_coords[:, 1]))
+    for key in ("alpha_k", "alpha_n"):
+        problem[key].nodal_values[:] = alpha_profile
+    for key in ("B_k", "B_n"):
+        problem[key].nodal_values[:] = 0.4
+    for key in ("vS_k", "vS_n"):
+        problem[key].set_values_from_function(lambda x, y: np.array([0.0, 0.0]))
+    for key in ("v_k", "v_n"):
+        problem[key].set_values_from_function(lambda x, y: np.array([0.2 * y, 0.1 * y]))
+    problem["p_k"].nodal_values[:] = 1.25
+    problem["p_n"].nodal_values[:] = 1.25
+    problem["p_pore_k"].nodal_values[:] = 0.75
+    problem["p_pore_n"].nodal_values[:] = 0.75
+
+    forms = _build_full_forms(
+        problem,
+        support_physics="stored_support",
+        alpha_advect_with="vS",
+        alpha_advection_form="advective",
+        alpha_biot=1.0,
+        storativity_c0=0.0,
+        include_skeleton_acceleration=False,
+        pressure_interface_closure=False,
+        interface_entry_closure=True,
+        interface_entry_closure_strength=2.0,
+        interface_entry_delta=10.0,
+        interface_bjs_closure=False,
+    )
+
+    entry_form = problem["_entry_interface_residual_form"]
+    assert entry_form is not None
+    p_block = _assemble_block(problem, entry_form, "p")
+    p_pore_block = _assemble_block(problem, entry_form, "p_pore")
+    assert np.linalg.norm(p_block, ord=np.inf) > 0.0
+    assert np.allclose(p_block, -p_pore_block, atol=1.0e-12, rtol=1.0e-12)
+
+    n_if = _interface_unit_normal_2d(problem["alpha_n"], eta=1.0e-4)
+    weight = Constant(2.0 / 0.1) * Constant(4.0) * problem["alpha_k"] * (Constant(1.0) - problem["alpha_k"])
+    rel_n = _dot_basis_2d(problem["v_k"], n_if) - _dot_basis_2d(problem["vS_k"], n_if)
+    visc_n = _normal_viscous_traction_scalar_2d(problem["v_k"], _named_constant("mu_f_test", 0.035), n_if)
+    expected_form = weight * ((-problem["p_k"] + visc_n) + problem["p_pore_k"] + Constant(10.0) * rel_n) * (
+        -problem["q_test"] + problem["q_pore_test"]
+    ) * dx(metadata={"q": 6})
+    expected_p_block = _assemble_block(problem, expected_form, "p")
+    expected_p_pore_block = _assemble_block(problem, expected_form, "p_pore")
+    assert np.allclose(p_block, expected_p_block, atol=1.0e-12, rtol=1.0e-12)
+    assert np.allclose(p_pore_block, expected_p_pore_block, atol=1.0e-12, rtol=1.0e-12)
+
+
+def test_ratio_free_bjs_interface_closure_adds_tangential_fluid_and_solid_residuals() -> None:
+    problem = _build_ratio_free_full_problem()
+    alpha_coords = np.asarray(problem["dh"].get_dof_coords("alpha"), dtype=float)
+    alpha_profile = 0.5 + 0.1 * (alpha_coords[:, 1] - np.mean(alpha_coords[:, 1]))
+    for key in ("alpha_k", "alpha_n"):
+        problem[key].nodal_values[:] = alpha_profile
+    for key in ("B_k", "B_n"):
+        problem[key].nodal_values[:] = 0.4
+    for key in ("vS_k", "vS_n"):
+        problem[key].set_values_from_function(lambda x, y: np.array([0.0, 0.0]))
+    for key in ("v_k", "v_n"):
+        problem[key].set_values_from_function(lambda x, y: np.array([0.2 * y, 0.0]))
+    problem["p_k"].nodal_values[:] = 0.0
+    problem["p_n"].nodal_values[:] = 0.0
+    problem["p_pore_k"].nodal_values[:] = 0.0
+    problem["p_pore_n"].nodal_values[:] = 0.0
+
+    _build_full_forms(
+        problem,
+        support_physics="stored_support",
+        alpha_advect_with="vS",
+        alpha_advection_form="advective",
+        alpha_biot=1.0,
+        storativity_c0=0.0,
+        include_skeleton_acceleration=False,
+        pressure_interface_closure=False,
+        interface_entry_closure=False,
+        interface_bjs_closure=True,
+        interface_bjs_closure_strength=3.0,
+        interface_bjs_gamma=1.0e3,
+    )
+
+    bjs_form = problem["_bjs_interface_residual_form"]
+    assert bjs_form is not None
+    _, residual = assemble_form(
+        Equation(None, bjs_form),
+        dof_handler=problem["dh"],
+        bcs=[],
+        quad_order=6,
+        backend="python",
+    )
+    residual = np.asarray(residual, dtype=float)
+    v_x = np.asarray(problem["dh"].get_field_slice("v_x"), dtype=int)
+    vS_x = np.asarray(problem["dh"].get_field_slice("vS_x"), dtype=int)
+    assert np.linalg.norm(residual[v_x], ord=np.inf) > 0.0
+    assert np.linalg.norm(residual[vS_x], ord=np.inf) > 0.0
+
+
 def test_startup_fluid_stage_uses_pdas_when_transport_bounds_are_active() -> None:
     assert _startup_stage_solver_kind(main_solver_kind="pdas", active_fields=["v_x", "v_y", "p", "alpha", "phi"]) == "pdas"
     assert _startup_stage_solver_kind(main_solver_kind="pdas", active_fields=["vS_x", "vS_y", "u_x", "u_y"]) == "newton"
@@ -481,9 +996,13 @@ def test_benchmark7_cli_defaults_use_relaxed_newton_target_and_pc_startup(monkey
 
     assert float(args.newton_tol) == 1.0e-6
     assert float(args.newton_rtol) == 1.0e-6
+    assert bool(args.enable_phi_evolution)
     assert bool(args.alpha_mass_constraint)
     assert not bool(args.alpha_from_refmap)
     assert not bool(args.condition_balanced_solid_cut_fix)
+    assert float(args.gamma_u) == 1.0
+    assert str(args.u_extension) == "h1"
+    assert str(args.reduced_support_state) == "alpha_B"
     assert str(args.latent_bounded_fields) == "alpha,phi"
     assert bool(args.predictor_corrector_startup)
     assert int(args.pc_p1_max_it) == 12
@@ -491,11 +1010,39 @@ def test_benchmark7_cli_defaults_use_relaxed_newton_target_and_pc_startup(monkey
     assert int(args.pc_exact_probe_max_it) == 1
 
 
+def test_benchmark7_reduced_problem_uses_alpha_B_support_state_by_default() -> None:
+    problem = _create_problem(
+        Lx=1.0,
+        Ly=1.5,
+        nx=2,
+        ny=3,
+        poly_order=2,
+        pressure_order=1,
+        scalar_order=1,
+        fluid_space="cg",
+        fluid_hdiv_order=0,
+        enable_phi_evolution=False,
+    )
+
+    assert str(problem["reduced_support_state"]) == "alpha_b"
+    assert "B" in problem["dh"].field_names
+    assert problem["B_k"] is not None
+    assert problem["B_n"] is not None
+    assert problem["dB"] is not None
+    assert problem["B_test"] is not None
+
+
 def test_benchmark7_cli_accepts_tanh_latent_map(monkeypatch) -> None:
     monkeypatch.setattr(sys, "argv", ["paper1_benchmark7_seboldt.py", "--latent-bounded-map", "tanh"])
     args = _parse_args()
 
     assert str(args.latent_bounded_map) == "tanh"
+
+
+def test_benchmark7_maps_default_neo_hookean_to_seboldt_eulerian_wall() -> None:
+    assert _benchmark7_solid_model_key("neo_hookean") == "seboldt_neo_hookean"
+    assert _benchmark7_solid_model_key("nh") == "seboldt_neo_hookean"
+    assert _benchmark7_solid_model_key("neo_hookean_eulerian") == "neo_hookean_eulerian"
 
 
 def test_benchmark7_cpp_fuse_integrals_defaults_on_for_cpp(monkeypatch) -> None:
@@ -941,6 +1488,40 @@ def test_open_top_phi_cleanup_clips_global_phi_even_outside_support() -> None:
     assert np.all(phi_vals <= 1.0 + 1.0e-12)
 
 
+def test_reduced_alpha_B_dependent_upper_bound_tracks_alpha() -> None:
+    problem = _create_problem(
+        Lx=1.0,
+        Ly=1.5,
+        nx=2,
+        ny=3,
+        poly_order=2,
+        pressure_order=1,
+        scalar_order=1,
+        fluid_space="cg",
+        fluid_hdiv_order=0,
+        enable_phi_evolution=False,
+        reduced_support_state="alpha_B",
+    )
+    alpha_vals = np.linspace(0.15, 0.85, problem["alpha_k"].nodal_values.size)
+    problem["alpha_k"].nodal_values[:] = alpha_vals
+    lower_full = np.full(int(problem["dh"].total_dofs), -np.inf, dtype=float)
+    upper_full = np.full(int(problem["dh"].total_dofs), np.inf, dtype=float)
+
+    _apply_field_dependent_upper_bound(
+        upper_full,
+        problem=problem,
+        source_field_name="alpha",
+        target_field_name="B",
+        source_values=problem["alpha_k"].nodal_values,
+    )
+
+    B_dofs = np.asarray(problem["dh"].get_field_slice("B"), dtype=int).ravel()
+    assert np.allclose(upper_full[B_dofs], alpha_vals)
+    alpha_dofs = np.asarray(problem["dh"].get_field_slice("alpha"), dtype=int).ravel()
+    assert np.all(np.isposinf(upper_full[alpha_dofs]))
+    assert np.all(np.isneginf(lower_full[B_dofs]))
+
+
 def test_benchmark7_constrained_configuration_requires_pdas_solver() -> None:
     args = SimpleNamespace(
         nonlinear_solver="newton",
@@ -970,6 +1551,47 @@ def test_benchmark7_unconstrained_configuration_keeps_newton_solver() -> None:
 
     updated = _normalize_benchmark7_solver_choice(args)
 
+    assert updated.nonlinear_solver == "newton"
+
+
+def test_legacy_single_pressure_branch_disables_pressure_mean_constraint() -> None:
+    args = SimpleNamespace(
+        nonlinear_solver="newton",
+        pressure_mean_constraint=True,
+        full_ratio_free_state=False,
+        enable_phi_evolution=False,
+        reduced_support_state="alpha_B",
+        alpha_bc_mode="dirichlet",
+        alpha_box_constraints=False,
+        phi_box_constraints=False,
+    )
+
+    updated = _normalize_benchmark7_solver_choice(args)
+
+    assert not bool(updated.pressure_mean_constraint)
+    assert updated.nonlinear_solver == "newton"
+
+
+def test_legacy_single_pressure_branch_disables_diffuse_interface_closures() -> None:
+    args = SimpleNamespace(
+        nonlinear_solver="newton",
+        pressure_mean_constraint=False,
+        pressure_interface_closure=True,
+        interface_entry_closure=True,
+        interface_bjs_closure=True,
+        full_ratio_free_state=False,
+        enable_phi_evolution=False,
+        reduced_support_state="alpha_B",
+        alpha_bc_mode="dirichlet",
+        alpha_box_constraints=False,
+        phi_box_constraints=False,
+    )
+
+    updated = _normalize_benchmark7_solver_choice(args)
+
+    assert not bool(updated.pressure_interface_closure)
+    assert not bool(updated.interface_entry_closure)
+    assert not bool(updated.interface_bjs_closure)
     assert updated.nonlinear_solver == "newton"
 
 
@@ -1057,6 +1679,116 @@ def test_alpha_from_refmap_disables_latent_transport_when_no_effective_latent_fi
     assert not bool(updated.latent_bounded_transport)
     assert str(updated.latent_bounded_fields) == ""
     assert not bool(updated.alpha_mass_constraint)
+
+
+def test_reduced_alpha_B_disables_exact_alpha_mass_constraint() -> None:
+    args = SimpleNamespace(
+        nonlinear_solver="pdas",
+        alpha_from_refmap=False,
+        latent_bounded_transport=False,
+        latent_bounded_fields="",
+        latent_bounded_formulation="transformed",
+        alpha_mass_constraint=True,
+        predictor_corrector_startup=False,
+        enable_phi_evolution=False,
+        reduced_support_state="alpha_B",
+        startup_bootstrap=False,
+        logistic_bounded_transform=False,
+        latent_block_preconditioner=False,
+        stall_frozen_transport_restart=False,
+        newton_globalization="line_search",
+        alpha_bc_mode="natural",
+        alpha_box_constraints=True,
+        phi_box_constraints=True,
+    )
+
+    updated = _normalize_benchmark7_solver_choice(args)
+
+    assert not bool(updated.alpha_mass_constraint)
+    assert updated.nonlinear_solver == "pdas"
+
+
+def test_reduced_alpha_B_disables_proactive_startup_bootstrap_on_bounded_solver() -> None:
+    args = SimpleNamespace(
+        nonlinear_solver="pdas",
+        alpha_from_refmap=False,
+        latent_bounded_transport=False,
+        latent_bounded_fields="",
+        latent_bounded_formulation="transformed",
+        alpha_mass_constraint=False,
+        predictor_corrector_startup=False,
+        enable_phi_evolution=False,
+        reduced_support_state="alpha_B",
+        startup_bootstrap=True,
+        logistic_bounded_transform=False,
+        latent_block_preconditioner=False,
+        stall_frozen_transport_restart=False,
+        newton_globalization="line_search",
+        alpha_bc_mode="natural",
+        alpha_box_constraints=True,
+        phi_box_constraints=True,
+    )
+
+    updated = _normalize_benchmark7_solver_choice(args)
+
+    assert not bool(updated.startup_bootstrap)
+    assert updated.nonlinear_solver == "pdas"
+
+
+def test_reduced_alpha_B_enables_alpha_box_constraints_for_constrained_solver() -> None:
+    args = SimpleNamespace(
+        nonlinear_solver="pdas",
+        alpha_from_refmap=False,
+        latent_bounded_transport=False,
+        latent_bounded_fields="",
+        latent_bounded_formulation="transformed",
+        alpha_mass_constraint=False,
+        predictor_corrector_startup=False,
+        enable_phi_evolution=False,
+        reduced_support_state="alpha_B",
+        startup_bootstrap=False,
+        logistic_bounded_transform=False,
+        latent_block_preconditioner=False,
+        stall_frozen_transport_restart=False,
+        newton_globalization="line_search",
+        alpha_bc_mode="natural",
+        alpha_box_constraints=False,
+        phi_box_constraints=False,
+    )
+
+    updated = _normalize_benchmark7_solver_choice(args)
+
+    assert bool(updated.alpha_box_constraints)
+    assert updated.nonlinear_solver == "pdas"
+
+
+def test_solver_scaled_reduced_matrix_uses_newton_mode_aware_scaling() -> None:
+    class _StubNewtonSolver:
+        def __init__(self) -> None:
+            self.called = False
+
+        def _apply_reduced_system_scaling(self, A_red, R_red):
+            self.called = True
+            row = np.array([3.0, 4.0], dtype=float)
+            col = np.array([5.0, 6.0], dtype=float)
+            A_scaled = A_red.multiply(row[:, None]).multiply(col[None, :]).tocsr()
+            return A_scaled, np.asarray(R_red, dtype=float), row, col
+
+        def _reduced_row_scale_vector(self, A_red):
+            return np.array([13.0, 17.0], dtype=float)
+
+        def _reduced_col_scale_vector(self, A_red):
+            return np.array([19.0, 23.0], dtype=float)
+
+    solver = _StubNewtonSolver()
+    A_raw = sp.csr_matrix(np.array([[2.0, 0.0], [0.0, 7.0]], dtype=float))
+
+    A_scaled, row_scale, col_scale = _solver_scaled_reduced_matrix(solver, A_raw)
+
+    assert solver.called
+    assert np.allclose(row_scale, np.array([3.0, 4.0], dtype=float))
+    assert np.allclose(col_scale, np.array([5.0, 6.0], dtype=float))
+    assert np.allclose(A_scaled.toarray(), np.array([[30.0, 0.0], [0.0, 168.0]], dtype=float))
 
 
 def test_alpha_from_refmap_filters_alpha_out_of_logistic_newton_fields() -> None:
@@ -1409,6 +2141,134 @@ def test_vi_linear_equalities_skip_alpha_mass_for_refmap_alpha_mode() -> None:
         find_named_function=_find_named_function,
     )
     assert [eq.name for eq in equalities] == ["phi_biofilm_fluid_mass"]
+
+
+def test_build_bcs_can_apply_equilibrium_phi_dirichlet_on_sides_and_top() -> None:
+    bcs = _build_bcs(
+        fluid_space="cg",
+        enable_phi_evolution=True,
+        y_interface=1.0,
+        eps_alpha=0.05,
+        phi_b=0.18,
+        v_in=5.0,
+        t_ramp=0.0,
+        alpha_bc_mode="natural",
+        phi_bc_mode="equilibrium",
+        pressure_mean_constraint=False,
+    )
+    phi_bcs = [(bc.field, bc.domain_tag) for bc in bcs if bc.method == "dirichlet" and bc.field == "phi"]
+    assert ("phi", "left") in phi_bcs
+    assert ("phi", "right") in phi_bcs
+    assert ("phi", "top") in phi_bcs
+    assert ("phi", "bottom") not in phi_bcs
+
+
+def test_build_bcs_lateral_clamped_enforces_zero_side_displacement_components() -> None:
+    bcs = _build_bcs(
+        fluid_space="cg",
+        enable_phi_evolution=True,
+        y_interface=1.0,
+        eps_alpha=0.05,
+        phi_b=0.18,
+        v_in=5.0,
+        t_ramp=0.0,
+        alpha_bc_mode="natural",
+        solid_bc_mode="lateral_clamped",
+        pressure_mean_constraint=False,
+    )
+    side_pairs = {(bc.field, bc.domain_tag) for bc in bcs if bc.method == "dirichlet"}
+    assert ("u_x", "left") in side_pairs
+    assert ("u_y", "left") in side_pairs
+    assert ("u_x", "right") in side_pairs
+    assert ("u_y", "right") in side_pairs
+
+
+def test_build_bcs_wall_normal_leaves_side_tangential_displacement_free() -> None:
+    bcs = _build_bcs(
+        fluid_space="cg",
+        enable_phi_evolution=True,
+        y_interface=1.0,
+        eps_alpha=0.05,
+        phi_b=0.18,
+        v_in=5.0,
+        t_ramp=0.0,
+        alpha_bc_mode="natural",
+        solid_bc_mode="wall_normal",
+        pressure_mean_constraint=False,
+    )
+    side_pairs = {(bc.field, bc.domain_tag) for bc in bcs if bc.method == "dirichlet"}
+    assert ("u_x", "left") in side_pairs
+    assert ("u_y", "left") not in side_pairs
+    assert ("u_x", "right") in side_pairs
+    assert ("u_y", "right") not in side_pairs
+
+
+def test_build_bcs_keeps_legacy_top_pressure_dirichlet_when_pressure_mean_constraint_is_requested() -> None:
+    bcs = _build_bcs(
+        fluid_space="cg",
+        enable_phi_evolution=False,
+        y_interface=1.0,
+        eps_alpha=0.05,
+        phi_b=0.18,
+        v_in=5.0,
+        t_ramp=0.0,
+        alpha_bc_mode="natural",
+        pressure_mean_constraint=True,
+        full_ratio_free_state=False,
+    )
+    top_pairs = {(bc.field, bc.domain_tag) for bc in bcs if bc.method == "dirichlet"}
+    assert ("p", "top") in top_pairs
+    assert ("p_pore", "top") not in top_pairs
+
+
+def test_build_bcs_split_pressure_mean_constraint_moves_top_constraint_to_pore_pressure() -> None:
+    bcs = _build_bcs(
+        fluid_space="cg",
+        enable_phi_evolution=True,
+        y_interface=1.0,
+        eps_alpha=0.05,
+        phi_b=0.18,
+        v_in=5.0,
+        t_ramp=0.0,
+        alpha_bc_mode="natural",
+        pressure_mean_constraint=True,
+        full_ratio_free_state=True,
+    )
+    top_pairs = {(bc.field, bc.domain_tag) for bc in bcs if bc.method == "dirichlet"}
+    assert ("p", "top") not in top_pairs
+    assert ("p_pore", "top") in top_pairs
+
+
+def test_ratio_free_pressure_mean_constraint_weights_only_free_fluid_pressure_region() -> None:
+    problem = _build_ratio_free_full_problem(pressure_mean_constraint=True)
+    zero_vec = lambda x, y: np.array([0.0, 0.0])
+    for key in ("v_k", "v_n", "vS_k", "vS_n", "u_k", "u_n"):
+        problem[key].set_values_from_function(zero_vec)
+    for key in ("alpha_k", "alpha_n"):
+        problem[key].nodal_values[:] = 0.25
+    problem["p_k"].nodal_values[:] = 2.0
+    problem["p_n"].nodal_values[:] = 2.0
+    problem["p_pore_k"].nodal_values[:] = 0.0
+    problem["p_pore_n"].nodal_values[:] = 0.0
+    problem["p_mean_k"].nodal_values[:] = 0.0
+    problem["p_mean_n"].nodal_values[:] = 0.0
+
+    _build_full_forms(
+        problem,
+        support_physics="stored_support",
+        alpha_advect_with="vS",
+        alpha_advection_form="advective",
+        alpha_biot=None,
+        skeleton_pressure_mode="whole_domain",
+        storativity_c0=0.0,
+        include_skeleton_acceleration=False,
+    )
+
+    mean_block = _assemble_block(problem, problem["_pressure_mean_residual_form"], "p_mean")
+    expected_form = Constant((1.0 - 0.25) * 2.0) * problem["p_mean_test"] * dx(metadata={"q": 6})
+    expected_block = _assemble_block(problem, expected_form, "p_mean")
+
+    assert np.allclose(mean_block, expected_block, atol=1.0e-12, rtol=1.0e-12)
 
 
 def test_build_forms_populates_alpha_mass_constraint_row_when_enabled() -> None:
