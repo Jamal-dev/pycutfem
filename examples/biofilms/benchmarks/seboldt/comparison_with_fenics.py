@@ -140,6 +140,16 @@ def _fx_mesh_size(mesh):
     return dolfinx.fem.Constant(mesh, h)
 
 
+def _sigma_neo_hookean_seboldt_fx(u, mu_s, lambda_s, *, dim: int):
+    """Pure-UFL Seboldt Example 2 Cauchy stress for FEniCSx autodiff checks."""
+    I = ufl.Identity(int(dim))
+    F_inv = I - ufl.grad(u)
+    F = ufl.inv(F_inv)
+    J = ufl.det(F)
+    B = F * F.T
+    return (mu_s / J) * (B - I) + lambda_s * (J - 1.0) * I
+
+
 def _compare_dense(pc_arr: np.ndarray, fx_arr: np.ndarray) -> tuple[float, float]:
     diff = np.asarray(pc_arr, dtype=float) - np.asarray(fx_arr, dtype=float)
     denom = max(
@@ -212,6 +222,9 @@ def _initialize_problem(problem: dict[str, object], *, enable_phi_evolution: boo
     problem["u_n"].set_values_from_function(lambda x, y: np.array([0.010 + 0.006 * x * (1.0 - x), -0.005 + 0.004 * y * (1.0 - y / 1.5)]))
     problem["p_k"].set_values_from_function(lambda x, y: 0.25 + 0.10 * x - 0.05 * y)
     problem["p_n"].set_values_from_function(lambda x, y: 0.12 + 0.04 * x - 0.03 * y)
+    if bool(full_ratio_free_state) and problem.get("p_pore_k") is not None:
+        problem["p_pore_k"].set_values_from_function(lambda x, y: 0.16 + 0.06 * x - 0.04 * y)
+        problem["p_pore_n"].set_values_from_function(lambda x, y: 0.09 + 0.03 * x - 0.02 * y)
     if problem.get("p_mean_k") is not None:
         problem["p_mean_k"].nodal_values[:] = 0.0
         problem["p_mean_n"].nodal_values[:] = 0.0
@@ -242,6 +255,8 @@ def _field_to_func(problem: dict[str, object], *, enable_phi_evolution: bool, fu
         "alpha": problem["alpha_k"],
         "mu_alpha": problem["mu_k"],
     }
+    if bool(full_ratio_free_state) and problem.get("p_pore_k") is not None:
+        out["p_pore"] = problem["p_pore_k"]
     if problem.get("lambda_drag_k") is not None:
         out["lambda_drag_x"] = problem["lambda_drag_k"].components[0]
         out["lambda_drag_y"] = problem["lambda_drag_k"].components[1]
@@ -321,6 +336,11 @@ def _build_benchmark_case(
     mechanics_nondim_mode: str = "legacy",
     outdir: Path | None = None,
     full_ratio_free_state: bool = True,
+    mu_b_model: str = "phi_mu",
+    solid_model: str = "neo_hookean",
+    stored_support_content_mode: str = "evolve_B",
+    p_pore_fluid_gauge: bool = True,
+    p_pore_fluid_gauge_strength: float = 1.0,
 ) -> tuple[dict[str, object], object, dict[str, object], int]:
     poly_order, pressure_order, scalar_order = _resolved_orders(poly_order, pressure_order, scalar_order)
     qdeg = max(6, 2 * int(poly_order) + 2)
@@ -343,6 +363,7 @@ def _build_benchmark_case(
         solid_volumetric_split=bool(solid_volumetric_split),
         drag_formulation="mixed_lm",
         full_ratio_free_state=bool(full_ratio_free_state),
+        stored_support_content_mode=str(stored_support_content_mode),
     )
     _initialize_problem(
         problem,
@@ -392,7 +413,7 @@ def _build_benchmark_case(
         rho_f=1.0,
         mu_f=0.035,
         mu_b=0.035,
-        mu_b_model="mu",
+        mu_b_model=str(mu_b_model),
         kappa_inv=1.0e5,
         mu_s=1.67785e5,
         lambda_s=8.22148e6,
@@ -437,7 +458,7 @@ def _build_benchmark_case(
         g_t_n=traction_coeffs["g_t_n"],
         traction_weight_k=traction_coeffs["traction_weight_k"],
         traction_weight_n=traction_coeffs["traction_weight_n"],
-        solid_model="linear",
+        solid_model=str(solid_model),
         kappa_inv_model="refmap",
         enable_phi_evolution=bool(enable_phi_evolution),
         include_skeleton_acceleration=bool(include_skeleton_acceleration),
@@ -450,6 +471,9 @@ def _build_benchmark_case(
         solid_volumetric_penalty=float(solid_volumetric_penalty),
         mechanics_nondim_mode=str(mechanics_nondim_mode),
         full_ratio_free_state=bool(full_ratio_free_state),
+        stored_support_content_mode=str(stored_support_content_mode),
+        p_pore_fluid_gauge=bool(p_pore_fluid_gauge),
+        p_pore_fluid_gauge_strength=float(p_pore_fluid_gauge_strength),
     )
     problem["_audit_phi_b"] = 0.18
     problem["_audit_enable_phi_evolution"] = bool(enable_phi_evolution)
@@ -495,7 +519,7 @@ def _build_benchmark_case(
         "rho_f": 1.0,
         "mu_f": 0.035,
         "mu_b": 0.035,
-        "mu_b_model": "mu",
+        "mu_b_model": str(mu_b_model),
         "kappa_inv": 1.0e5,
         "kappa_inv_model": "refmap",
         "mu_s": 1.67785e5,
@@ -531,7 +555,7 @@ def _build_benchmark_case(
         "skeleton_pressure_mode": str(skeleton_pressure_mode),
         "alpha_biot": (None if alpha_biot is None else float(alpha_biot)),
         "drag_formulation": "mixed_lm",
-        "solid_model": "linear",
+        "solid_model": str(solid_model),
         "fluid_convection": str(fluid_convection),
         "include_skeleton_acceleration": bool(include_skeleton_acceleration),
         "rho_s0_tilde": float(rho_s0_tilde),
@@ -550,7 +574,11 @@ def _build_benchmark_case(
         "solid_volumetric_split": bool(solid_volumetric_split),
         "solid_volumetric_penalty": float(solid_volumetric_penalty),
         "mechanics_nondim_mode": str(mechanics_nondim_mode),
+        "kinematics_scale": float(problem.get("_audit_form_params", {}).get("kinematics_scale", 1.0)),
         "full_ratio_free_state": bool(full_ratio_free_state),
+        "stored_support_content_mode": str(stored_support_content_mode),
+        "p_pore_fluid_gauge": bool(p_pore_fluid_gauge),
+        "p_pore_fluid_gauge_strength": float(p_pore_fluid_gauge_strength),
         "D_S": 0.0,
         "mu_max": 0.0,
         "K_S": 1.0,
@@ -1293,6 +1321,7 @@ def _fenics_skeleton_pressure_forms(
 
     div_B_vStest_k_fx = B_k_fx * ufl.div(vS_test_fx) + ufl.dot(gradB_k_fx, vS_test_fx)
     div_B_vStest_n_fx = B_n_fx * ufl.div(vS_test_fx) + ufl.dot(gradB_n_fx, vS_test_fx)
+    div_B_vStest_n_fx = B_n_fx * ufl.div(vS_test_fx) + ufl.dot(gradB_n_fx, vS_test_fx)
     skel_press_key = str(skeleton_pressure_mode).strip().lower().replace("-", "_")
     if skel_press_key not in {"whole_domain", "seboldt"}:
         raise ValueError(
@@ -1442,15 +1471,22 @@ def _build_fenics_full_system(
     P_el = basix.ufl.element(p_family, "quadrilateral", int(pressure_order))
     A_el = basix.ufl.element(s_family, "quadrilateral", int(scalar_order))
     elements = [V_el, P_el]
+    if bool(full_ratio_free_state):
+        elements.append(P_el)
     if bool(solid_volumetric_split):
         elements.append(P_el)
     elements.extend([V_el, V_el])
     drag_form_key = str(drag_formulation).strip().lower().replace("-", "_")
     if drag_form_key == "mixed_lm":
         elements.append(V_el)
-    elements.extend([A_el, A_el])
-    if bool(enable_phi_evolution):
-        elements.extend([A_el, A_el])
+    if bool(full_ratio_free_state):
+        elements.extend([A_el, A_el, A_el])  # alpha, B, mu_alpha
+        if bool(enable_phi_evolution):
+            elements.append(A_el)  # S
+    else:
+        elements.extend([A_el, A_el])  # alpha, mu_alpha
+        if bool(enable_phi_evolution):
+            elements.extend([A_el, A_el])  # phi, S
     latent_field_set = {str(name).strip() for name in tuple(latent_bounded_fields or tuple()) if str(name).strip()}
     if "alpha" in latent_field_set:
         elements.append(A_el)
@@ -1479,6 +1515,9 @@ def _audit_field_layout(
         ("p", 1, None),
     ]
     next_idx = 2
+    if bool(full_ratio_free_state):
+        layout.append(("p_pore", next_idx, None))
+        next_idx += 1
     if bool(pressure_mean_constraint):
         layout.append(("p_mean", next_idx, None))
         next_idx += 1
@@ -1503,25 +1542,26 @@ def _audit_field_layout(
             ]
         )
         next_scalar_idx += 1
-    layout.extend(
-        [
-            ("alpha", next_scalar_idx, None),
-            ("mu_alpha", next_scalar_idx + 1, None),
-        ]
-    )
-    if bool(enable_phi_evolution):
-        scalar_name = _transport_scalar_name(
-            enable_phi_evolution=bool(enable_phi_evolution),
-            full_ratio_free_state=bool(full_ratio_free_state),
-        )
-        layout.extend(
-            [
-                (str(scalar_name), next_scalar_idx + 2, None),
-                ("S", next_scalar_idx + 3, None),
-            ]
-        )
+    layout.append(("alpha", next_scalar_idx, None))
+    if bool(full_ratio_free_state):
+        layout.append(("B", next_scalar_idx + 1, None))
+        layout.append(("mu_alpha", next_scalar_idx + 2, None))
+        next_idx = next_scalar_idx + 3
+        if bool(enable_phi_evolution):
+            layout.append(("S", next_idx, None))
+            next_idx += 1
+    else:
+        layout.append(("mu_alpha", next_scalar_idx + 1, None))
+        next_idx = next_scalar_idx + 2
+        if bool(enable_phi_evolution):
+            layout.extend(
+                [
+                    ("phi", next_idx, None),
+                    ("S", next_idx + 1, None),
+                ]
+            )
+            next_idx += 2
     latent_field_set = {str(name).strip() for name in tuple(latent_bounded_fields or tuple()) if str(name).strip()}
-    next_idx = next_scalar_idx + (4 if bool(enable_phi_evolution) else 2)
     if "alpha" in latent_field_set:
         layout.append(("alpha_latent", next_idx, None))
         next_idx += 1
@@ -1590,6 +1630,9 @@ def _load_fenics_full_state(
         ("v_y", problem["v_n"].components[1]),
         ("p", problem["p_n"]),
     ]
+    if bool(full_ratio_free_state) and problem.get("p_pore_k") is not None:
+        fields_k.append(("p_pore", problem["p_pore_k"]))
+        fields_n.append(("p_pore", problem["p_pore_n"]))
     if bool(solid_volumetric_split):
         fields_k.append(("pi_s", problem["pi_s_k"]))
         fields_n.append(("pi_s", problem["pi_s_n"]))
@@ -1600,7 +1643,6 @@ def _load_fenics_full_state(
             ("u_x", problem["u_k"].components[0]),
             ("u_y", problem["u_k"].components[1]),
             ("alpha", problem["alpha_k"]),
-            ("mu_alpha", problem["mu_k"]),
         ]
     )
     fields_n.extend(
@@ -1610,9 +1652,13 @@ def _load_fenics_full_state(
         ("u_x", problem["u_n"].components[0]),
         ("u_y", problem["u_n"].components[1]),
         ("alpha", problem["alpha_n"]),
-        ("mu_alpha", problem["mu_n"]),
         ]
     )
+    if bool(full_ratio_free_state) and problem.get("B_k") is not None:
+        fields_k.append(("B", problem["B_k"]))
+        fields_n.append(("B", problem["B_n"]))
+    fields_k.append(("mu_alpha", problem["mu_k"]))
+    fields_n.append(("mu_alpha", problem["mu_n"]))
     if problem.get("lambda_drag_k") is not None:
         fields_k.extend(
             [
@@ -1627,22 +1673,22 @@ def _load_fenics_full_state(
             ]
         )
     if bool(enable_phi_evolution):
-        scalar_name = _transport_scalar_name(
-            enable_phi_evolution=bool(enable_phi_evolution),
-            full_ratio_free_state=bool(full_ratio_free_state),
-        )
-        fields_k.extend(
-            [
-                (str(scalar_name), problem[f"{scalar_name}_k"]),
-                ("S", problem["S_k"]),
-            ]
-        )
-        fields_n.extend(
-            [
-                (str(scalar_name), problem[f"{scalar_name}_n"]),
-                ("S", problem["S_n"]),
-            ]
-        )
+        if bool(full_ratio_free_state):
+            fields_k.append(("S", problem["S_k"]))
+            fields_n.append(("S", problem["S_n"]))
+        else:
+            fields_k.extend(
+                [
+                    ("phi", problem["phi_k"]),
+                    ("S", problem["S_k"]),
+                ]
+            )
+            fields_n.extend(
+                [
+                    ("phi", problem["phi_n"]),
+                    ("S", problem["S_n"]),
+                ]
+            )
     latent_field_set = {str(name).strip() for name in tuple(latent_bounded_fields or tuple()) if str(name).strip()}
     if "alpha" in latent_field_set:
         fields_k.append(("alpha_latent", problem["alpha_latent_k"]))
@@ -1812,8 +1858,12 @@ def _fenics_full_forms(
 
     C_k_fx = _capacity(alpha_k_fx, phi_state_k)
     C_n_fx = _capacity(alpha_n_fx, phi_state_n)
+    F_free_k_fx = 1.0 - alpha_k_fx
+    F_free_n_fx = 1.0 - alpha_n_fx
     B_k_fx = alpha_k_fx * (1.0 - phi_state_k)
     B_n_fx = alpha_n_fx * (1.0 - phi_state_n)
+    gradF_free_k_fx = -ufl.grad(alpha_k_fx)
+    gradF_free_n_fx = -ufl.grad(alpha_n_fx)
     gradC_k_fx = (phi_state_k - 1.0) * ufl.grad(alpha_k_fx)
     gradC_n_fx = (phi_state_n - 1.0) * ufl.grad(alpha_n_fx)
     gradB_k_fx = (1.0 - phi_state_k) * ufl.grad(alpha_k_fx)
@@ -1826,15 +1876,19 @@ def _fenics_full_forms(
 
     divCv_k_fx = C_k_fx * ufl.div(v_k_fx) + ufl.dot(gradC_k_fx, v_k_fx)
     divCv_n_fx = C_n_fx * ufl.div(v_n_fx) + ufl.dot(gradC_n_fx, v_n_fx)
+    divFfree_k_fx = F_free_k_fx * ufl.div(v_k_fx) + ufl.dot(gradF_free_k_fx, v_k_fx)
+    divFfree_n_fx = F_free_n_fx * ufl.div(v_n_fx) + ufl.dot(gradF_free_n_fx, v_n_fx)
+    divFfree_n_fx = F_free_n_fx * ufl.div(v_n_fx) + ufl.dot(gradF_free_n_fx, v_n_fx)
+    divFfree_n_fx = F_free_n_fx * ufl.div(v_n_fx) + ufl.dot(gradF_free_n_fx, v_n_fx)
     divBvS_k_fx = B_k_fx * ufl.div(vS_k_fx) + ufl.dot(gradB_k_fx, vS_k_fx)
     divBvS_n_fx = B_n_fx * ufl.div(vS_n_fx) + ufl.dot(gradB_n_fx, vS_n_fx)
     divF_k_fx = divCv_k_fx + divBvS_k_fx
     divF_n_fx = divCv_n_fx + divBvS_n_fx
 
-    rho_k_fx = rho_f_fx * C_k_fx
-    rho_n_fx = rho_f_fx * C_n_fx
-    mu_k_fx = _mu(alpha_k_fx, phi_state_k)
-    mu_n_fx = _mu(alpha_n_fx, phi_state_n)
+    rho_mom_k_fx = rho_f_fx * F_free_k_fx
+    rho_mom_n_fx = rho_f_fx * F_free_n_fx
+    mu_mom_k_fx = mu_f_fx * F_free_k_fx
+    mu_mom_n_fx = mu_f_fx * F_free_n_fx
 
     support_key = str(params["support_physics"]).strip().lower()
     if support_key == "internal_conversion":
@@ -1882,30 +1936,33 @@ def _fenics_full_forms(
     div_B_vStest_k_fx = B_k_fx * ufl.div(vS_test_fx) + ufl.dot(gradB_k_fx, vS_test_fx)
     div_B_vStest_n_fx = B_n_fx * ufl.div(vS_test_fx) + ufl.dot(gradB_n_fx, vS_test_fx)
 
-    r_mom_fx = ufl.inner((rho_k_fx * v_k_fx - rho_n_fx * v_n_fx) * inv_dt_fx, v_test_fx) * dx_fx
+    r_mom_fx = ufl.inner((rho_mom_k_fx * v_k_fx - rho_mom_n_fx * v_n_fx) * inv_dt_fx, v_test_fx) * dx_fx
     fluid_conv_key = str(params["fluid_convection"]).strip().lower()
-    div_rhov_k_fx = rho_f_fx * divCv_k_fx
-    div_rhov_n_fx = rho_f_fx * divCv_n_fx
+    div_rhov_k_fx = rho_f_fx * divFfree_k_fx
+    div_rhov_n_fx = rho_f_fx * divFfree_n_fx
     if fluid_conv_key == "full":
         conv_k_fx = ufl.dot(ufl.dot(ufl.grad(v_k_fx), v_k_fx), v_test_fx)
         conv_n_fx = ufl.dot(ufl.dot(ufl.grad(v_n_fx), v_n_fx), v_test_fx)
         r_mom_fx += (
-            th_fx * (rho_k_fx * conv_k_fx + div_rhov_k_fx * ufl.dot(v_k_fx, v_test_fx))
-            + omth_fx * (rho_n_fx * conv_n_fx + div_rhov_n_fx * ufl.dot(v_n_fx, v_test_fx))
+            th_fx * (rho_mom_k_fx * conv_k_fx + div_rhov_k_fx * ufl.dot(v_k_fx, v_test_fx))
+            + omth_fx * (rho_mom_n_fx * conv_n_fx + div_rhov_n_fx * ufl.dot(v_n_fx, v_test_fx))
         ) * dx_fx
     elif fluid_conv_key == "lagged":
         conv_k_fx = ufl.dot(ufl.dot(ufl.grad(v_k_fx), v_n_fx), v_test_fx)
         conv_n_fx = ufl.dot(ufl.dot(ufl.grad(v_n_fx), v_n_fx), v_test_fx)
         r_mom_fx += (
-            th_fx * (rho_n_fx * conv_k_fx + div_rhov_n_fx * ufl.dot(v_k_fx, v_test_fx))
-            + omth_fx * (rho_n_fx * conv_n_fx + div_rhov_n_fx * ufl.dot(v_n_fx, v_test_fx))
+            th_fx * (rho_mom_n_fx * conv_k_fx + div_rhov_n_fx * ufl.dot(v_k_fx, v_test_fx))
+            + omth_fx * (rho_mom_n_fx * conv_n_fx + div_rhov_n_fx * ufl.dot(v_n_fx, v_test_fx))
         ) * dx_fx
     elif fluid_conv_key == "imex":
         conv_n_fx = ufl.dot(ufl.dot(ufl.grad(v_n_fx), v_n_fx), v_test_fx)
-        r_mom_fx += (rho_n_fx * conv_n_fx + div_rhov_n_fx * ufl.dot(v_n_fx, v_test_fx)) * dx_fx
+        r_mom_fx += (rho_mom_n_fx * conv_n_fx + div_rhov_n_fx * ufl.dot(v_n_fx, v_test_fx)) * dx_fx
     elif fluid_conv_key != "off":
         raise ValueError(f"Unsupported fluid_convection={params['fluid_convection']!r}.")
-    r_mom_fx += 2.0 * (th_fx * mu_k_fx * ufl.inner(_eps(v_k_fx), _eps(v_test_fx)) + omth_fx * mu_n_fx * ufl.inner(_eps(v_n_fx), _eps(v_test_fx))) * dx_fx
+    r_mom_fx += 2.0 * (
+        th_fx * mu_mom_k_fx * ufl.inner(_eps(v_k_fx), _eps(v_test_fx))
+        + omth_fx * mu_mom_n_fx * ufl.inner(_eps(v_n_fx), _eps(v_test_fx))
+    ) * dx_fx
     r_mom_fx += -(p_k_fx * div_C_vtest_k_fx) * dx_fx
     if float(params["gamma_div"]) != 0.0:
         r_mom_fx += gamma_div_fx * divF_k_fx * div_C_vtest_k_fx * dx_fx
@@ -1926,8 +1983,8 @@ def _fenics_full_forms(
         h_v2_safe_fx = (h_cell_fx * h_cell_fx) + 1.0e-16
         if v_supg_mode in {"streamline", "weak", "legacy"}:
             vmag_n_fx = ufl.sqrt(ufl.dot(v_n_fx, v_n_fx) + 1.0e-12)
-            rho_safe_n_fx = rho_n_fx + 1.0e-16
-            nu_eff_n_fx = mu_n_fx / rho_safe_n_fx
+            rho_safe_n_fx = rho_mom_n_fx + 1.0e-16
+            nu_eff_n_fx = mu_mom_n_fx / rho_safe_n_fx
             drag_rate_n_fx = (beta_n_fx if drag_mode == "scalar" else beta_coeff_n_fx) / rho_safe_n_fx
             tau_v_fx = v_supg_fx / ufl.sqrt(
                 (2.0 * inv_dt_fx) ** 2
@@ -1942,8 +1999,8 @@ def _fenics_full_forms(
             r_mom_fx += tau_v_fx * w_v_fx * ufl.inner(adv_v_k_fx, adv_w_fx) * dx_fx
         elif v_supg_mode in {"residual", "strong", "strong_residual", "strong-residual"}:
             vmag_k_fx = ufl.sqrt(ufl.dot(v_k_fx, v_k_fx) + 1.0e-12)
-            rho_safe_k_fx = rho_k_fx + 1.0e-16
-            nu_eff_k_fx = mu_k_fx / rho_safe_k_fx
+            rho_safe_k_fx = rho_mom_k_fx + 1.0e-16
+            nu_eff_k_fx = mu_mom_k_fx / rho_safe_k_fx
             drag_rate_k_fx = (beta_k_fx if drag_mode == "scalar" else beta_coeff_k_fx) / rho_safe_k_fx
             tau_v_fx = v_supg_fx / ufl.sqrt(
                 (2.0 * inv_dt_fx) ** 2
@@ -1954,16 +2011,16 @@ def _fenics_full_forms(
             )
             w_v_fx = 1.0 - alpha_k_fx
             adv_w_fx = ufl.dot(ufl.grad(v_test_fx), v_k_fx)
-            strong_mom_k_fx = (rho_k_fx * v_k_fx - rho_n_fx * v_n_fx) * inv_dt_fx
+            strong_mom_k_fx = (rho_mom_k_fx * v_k_fx - rho_mom_n_fx * v_n_fx) * inv_dt_fx
             if fluid_conv_key == "full":
-                strong_mom_k_fx += rho_k_fx * ufl.dot(ufl.grad(v_k_fx), v_k_fx) + div_rhov_k_fx * v_k_fx
+                strong_mom_k_fx += rho_mom_k_fx * ufl.dot(ufl.grad(v_k_fx), v_k_fx) + div_rhov_k_fx * v_k_fx
             elif fluid_conv_key == "lagged":
-                strong_mom_k_fx += rho_n_fx * ufl.dot(ufl.grad(v_k_fx), v_n_fx) + div_rhov_n_fx * v_k_fx
+                strong_mom_k_fx += rho_mom_n_fx * ufl.dot(ufl.grad(v_k_fx), v_n_fx) + div_rhov_n_fx * v_k_fx
             elif fluid_conv_key == "imex":
-                strong_mom_k_fx += rho_n_fx * ufl.dot(ufl.grad(v_n_fx), v_n_fx) + div_rhov_n_fx * v_n_fx
+                strong_mom_k_fx += rho_mom_n_fx * ufl.dot(ufl.grad(v_n_fx), v_n_fx) + div_rhov_n_fx * v_n_fx
             elif fluid_conv_key != "off":
                 raise ValueError(f"Unsupported fluid_convection={params['fluid_convection']!r}.")
-            strong_mom_k_fx += -ufl.div(2.0 * mu_k_fx * _eps(v_k_fx))
+            strong_mom_k_fx += -ufl.div(2.0 * mu_mom_k_fx * _eps(v_k_fx))
             strong_mom_k_fx += C_k_fx * ufl.grad(p_k_fx)
             if drag_mode == "scalar":
                 strong_mom_k_fx += beta_k_fx * (v_k_fx - vS_k_fx)
@@ -2004,7 +2061,13 @@ def _fenics_full_forms(
     mechanics_nondim_key = str(params.get("mechanics_nondim_mode", "legacy")).strip().lower()
     if mechanics_nondim_key in {"stress_balance", "condition_balanced"}:
         fluid_ref_val = max(1.0, abs(float(params["mu_f"])), abs(float(params["mu_b"])))
-        solid_ref_val = max(1.0, abs(float(2.0 * float(params["mu_s"]) + float(gdim) * float(params["lambda_s"]))))
+        solid_model_key = str(params.get("solid_model", "linear")).strip().lower()
+        if solid_model_key == "neo_hookean":
+            solid_model_key = "seboldt_neo_hookean"
+        if solid_model_key in {"seboldt_neo_hookean", "neo_hookean_seboldt", "neo-hookean-seboldt"}:
+            solid_ref_val = max(1.0, abs(float(params["mu_s"])), abs(float(params["lambda_s"])))
+        else:
+            solid_ref_val = max(1.0, abs(float(2.0 * float(params["mu_s"]) + float(gdim) * float(params["lambda_s"]))))
         fluid_scale_fx = 1.0 / fluid_ref_val
         skeleton_scale_fx = 1.0 / solid_ref_val
         kin_scale_override_fx = 1.0
@@ -2171,7 +2234,14 @@ def _fenics_full_forms(
     Fkin_k_fx = (u_k_fx - u_n_fx) * inv_dt_fx
     Fkin_k_fx += th_fx * (ufl.dot(ufl.grad(u_k_fx), vS_k_fx) - vS_k_fx)
     Fkin_k_fx += omth_fx * (ufl.dot(ufl.grad(u_n_fx), vS_n_fx) - vS_n_fx)
-    r_kinematics_fx = kin_scale_fx * alpha_k_fx * ufl.dot(Fkin_k_fx, u_test_fx) * dx_fx
+    kinematics_zero_fx = kin_scale_fx * _const(0.0) * ufl.dot(u_k_fx, u_test_fx) * dx_fx
+    kinematics_residual_terms_fx: dict[str, object] = {
+        "base": kin_scale_fx * alpha_k_fx * ufl.dot(Fkin_k_fx, u_test_fx) * dx_fx,
+        "supg": kinematics_zero_fx,
+        "extension": kinematics_zero_fx,
+        "cip": kinematics_zero_fx,
+    }
+    r_kinematics_fx = kinematics_residual_terms_fx["base"]
     if float(params.get("u_supg", 0.0)) != 0.0:
         tau_u_fx = _const(float(params["u_supg"])) * (h_cell_fx * h_cell_fx) / (
             h_cell_fx * ufl.sqrt(ufl.dot(vS_n_fx, vS_n_fx) + 1.0e-12)
@@ -2180,14 +2250,19 @@ def _fenics_full_forms(
         )
         adv_u_k_fx = ufl.dot(ufl.grad(u_k_fx), vS_n_fx)
         adv_u_test_fx = ufl.dot(ufl.grad(u_test_fx), vS_n_fx)
-        r_kinematics_fx += kin_scale_fx * tau_u_fx * alpha_n_fx * ufl.inner(adv_u_k_fx, adv_u_test_fx) * dx_fx
+        kinematics_residual_terms_fx["supg"] = kin_scale_fx * tau_u_fx * alpha_n_fx * ufl.inner(adv_u_k_fx, adv_u_test_fx) * dx_fx
+        r_kinematics_fx += kinematics_residual_terms_fx["supg"]
     if gamma_u_eff != 0.0:
         if u_ext_mode_eff in {"l2", "mass"}:
-            r_kinematics_fx += kin_scale_fx * gamma_u_fx * inv_h2_fx * (1.0 - alpha_k_fx) * ufl.dot(u_k_fx, u_test_fx) * dx_fx
+            kinematics_residual_terms_fx["extension"] = kin_scale_fx * gamma_u_fx * inv_h2_fx * (1.0 - alpha_k_fx) * ufl.dot(u_k_fx, u_test_fx) * dx_fx
+            r_kinematics_fx += kinematics_residual_terms_fx["extension"]
         elif u_ext_mode_eff in {"grad", "h1"}:
-            r_kinematics_fx += kin_scale_fx * gamma_u_fx * (1.0 - alpha_k_fx) * ufl.inner(ufl.grad(u_k_fx), ufl.grad(u_test_fx)) * dx_fx
+            kinematics_residual_terms_fx["extension"] = kin_scale_fx * gamma_u_fx * (1.0 - alpha_k_fx) * ufl.inner(ufl.grad(u_k_fx), ufl.grad(u_test_fx)) * dx_fx
+            r_kinematics_fx += kinematics_residual_terms_fx["extension"]
             if gamma_u_pin_eff != 0.0:
-                r_kinematics_fx += kin_scale_fx * _const(gamma_u_pin_eff) * inv_h2_fx * (1.0 - alpha_k_fx) ** 2 * ufl.dot(u_k_fx, u_test_fx) * dx_fx
+                pin_term_fx = kin_scale_fx * _const(gamma_u_pin_eff) * inv_h2_fx * (1.0 - alpha_k_fx) ** 2 * ufl.dot(u_k_fx, u_test_fx) * dx_fx
+                kinematics_residual_terms_fx["extension"] = kinematics_residual_terms_fx["extension"] + pin_term_fx
+                r_kinematics_fx += pin_term_fx
         else:
             raise ValueError(f"Unsupported u_extension_mode={u_ext_mode_eff!r}.")
     if float(params["u_cip"]) != 0.0:
@@ -2199,7 +2274,8 @@ def _fenics_full_forms(
             w_u_cip_fx = ufl.avg(alpha_n_fx)
         else:
             w_u_cip_fx = 1.0
-        r_kinematics_fx += kin_scale_fx * tau_u_cip_fx * w_u_cip_fx * ufl.inner(ufl.jump(ufl.grad(u_k_fx), n_int_fx), ufl.jump(ufl.grad(u_test_fx), n_int_fx)) * dS_meas_fx
+        kinematics_residual_terms_fx["cip"] = kin_scale_fx * tau_u_cip_fx * w_u_cip_fx * ufl.inner(ufl.jump(ufl.grad(u_k_fx), n_int_fx), ufl.jump(ufl.grad(u_test_fx), n_int_fx)) * dS_meas_fx
+        r_kinematics_fx += kinematics_residual_terms_fx["cip"]
 
     if bool(enable_phi_evolution):
         one_m_alpha_k_fx = 1.0 - alpha_k_fx
@@ -2359,6 +2435,7 @@ def _fenics_full_forms_ratio_free(
     w_n,
     qdeg: int,
     params: dict[str, object],
+    return_debug_terms: bool = False,
 ):
     mesh = W.mesh
     dw = ufl.TrialFunction(W)
@@ -2371,6 +2448,7 @@ def _fenics_full_forms_ratio_free(
     idx = 0
     dv_fx = dw_parts[idx]; v_test_fx = test_parts[idx]; v_k_fx = wk_parts[idx]; v_n_fx = wn_parts[idx]; idx += 1
     dp_fx = dw_parts[idx]; q_fx = test_parts[idx]; p_k_fx = wk_parts[idx]; p_n_fx = wn_parts[idx]; idx += 1
+    dp_pore_fx = dw_parts[idx]; q_pore_fx = test_parts[idx]; p_pore_k_fx = wk_parts[idx]; p_pore_n_fx = wn_parts[idx]; idx += 1
     dpi_s_fx = None
     pi_s_test_fx = None
     pi_s_k_fx = None
@@ -2383,11 +2461,12 @@ def _fenics_full_forms_ratio_free(
     lambda_drag_test_fx = None
     lambda_drag_k_fx = None
     lambda_drag_n_fx = None
-    if str(params.get("drag_formulation", "direct")).strip().lower().replace("-", "_") == "mixed_lm":
+    drag_form_key = str(params.get("drag_formulation", "direct")).strip().lower().replace("-", "_")
+    if drag_form_key == "mixed_lm":
         dlambda_drag_fx = dw_parts[idx]; lambda_drag_test_fx = test_parts[idx]; lambda_drag_k_fx = wk_parts[idx]; lambda_drag_n_fx = wn_parts[idx]; idx += 1
     dalpha_fx = dw_parts[idx]; alpha_test_fx = test_parts[idx]; alpha_k_fx = wk_parts[idx]; alpha_n_fx = wn_parts[idx]; idx += 1
-    dmu_alpha_fx = dw_parts[idx]; mu_alpha_test_fx = test_parts[idx]; mu_alpha_k_fx = wk_parts[idx]; mu_alpha_n_fx = wn_parts[idx]; idx += 1
     dB_fx = dw_parts[idx]; B_test_fx = test_parts[idx]; B_k_fx = wk_parts[idx]; B_n_fx = wn_parts[idx]; idx += 1
+    dmu_alpha_fx = dw_parts[idx]; mu_alpha_test_fx = test_parts[idx]; mu_alpha_k_fx = wk_parts[idx]; mu_alpha_n_fx = wn_parts[idx]; idx += 1
     dS_fx = dw_parts[idx]; S_test_fx = test_parts[idx]; S_k_fx = wk_parts[idx]; S_n_fx = wn_parts[idx]; idx += 1
 
     def _const(val: float):
@@ -2397,19 +2476,19 @@ def _fenics_full_forms_ratio_free(
         return ufl.sym(ufl.grad(v))
 
     def _mu_from_alpha_B(alpha, B):
-        mu_f_fx = _const(float(params["mu_f"]))
-        mu_b_fx = _const(float(params["mu_b"]))
+        mu_f_local = _const(float(params["mu_f"]))
+        mu_b_local = _const(float(params["mu_b"]))
         mu_b_key = str(params["mu_b_model"]).strip().lower()
-        C = 1.0 - B
-        P = alpha - B
+        C_local = 1.0 - B
+        P_local = alpha - B
         if mu_b_key in {"mu", "const", "constant"}:
-            return mu_f_fx
+            return mu_f_local
         if mu_b_key in {"phi_mu", "phi*mu", "phi"}:
-            return mu_f_fx * C
+            return mu_f_local * C_local
         if mu_b_key in {"alpha_mu", "alpha", "mu_b", "biofilm_mu", "biofilm"}:
-            return (1.0 - alpha) * mu_f_fx + alpha * mu_b_fx
+            return (1.0 - alpha) * mu_f_local + alpha * mu_b_local
         if mu_b_key in {"alpha_phi_mu", "alpha_phi", "alpha*phi_mu", "alpha*phi*mu"}:
-            return (1.0 - alpha) * mu_f_fx + P * mu_b_fx
+            return (1.0 - alpha) * mu_f_local + P_local * mu_b_local
         raise ValueError(f"Unsupported mu_b_model={params['mu_b_model']!r}.")
 
     th_fx = _const(float(params["theta"]))
@@ -2420,10 +2499,10 @@ def _fenics_full_forms_ratio_free(
     kappa_inv_fx = _const(float(params["kappa_inv"]))
     mu_s_fx = _const(float(params["mu_s"]))
     lambda_s_fx = _const(float(params["lambda_s"]))
-    gamma_div_fx = _const(float(params["gamma_div"]))
-    gamma_u_fx = _const(float(params["gamma_u"]))
-    gamma_u_pin_fx = _const(float(params["gamma_u_pin"]))
     alpha_mu_aux_pin_fx = _const(float(params["alpha_mu_aux_pin"]))
+    M_alpha_fx = _const(float(params.get("M_alpha", 0.0)))
+    gamma_alpha_fx = _const(float(params.get("gamma_alpha", 0.0)))
+    eps_alpha_fx = _const(max(float(params.get("eps_alpha", 0.0)), 1.0e-12))
     storativity_c0_fx = _const(float(params["storativity_c0"]))
     rho_s0_fx = _const(float(params["rho_s0_tilde"]))
     mu_max_fx = _const(float(params["mu_max"]))
@@ -2431,6 +2510,7 @@ def _fenics_full_forms_ratio_free(
     k_d_fx = _const(float(params["k_d"]))
     Y_fx = _const(float(params["Y"]))
     rho_s_star_fx = _const(float(params["rho_s_star"]))
+    beta_biot_fx = _const(1.0 if params.get("alpha_biot") is None else float(params["alpha_biot"]))
     I_fx = ufl.Identity(mesh.geometry.dim)
 
     dx_fx = ufl.dx(metadata={"quadrature_degree": int(qdeg)})
@@ -2444,70 +2524,86 @@ def _fenics_full_forms_ratio_free(
     C_n_fx = 1.0 - B_n_fx
     P_k_fx = alpha_k_fx - B_k_fx
     P_n_fx = alpha_n_fx - B_n_fx
+    F_free_k_fx = 1.0 - alpha_k_fx
+    F_free_n_fx = 1.0 - alpha_n_fx
     gradC_k_fx = -ufl.grad(B_k_fx)
     gradC_n_fx = -ufl.grad(B_n_fx)
     gradB_k_fx = ufl.grad(B_k_fx)
     gradB_n_fx = ufl.grad(B_n_fx)
     gradP_k_fx = ufl.grad(alpha_k_fx) - ufl.grad(B_k_fx)
     gradP_n_fx = ufl.grad(alpha_n_fx) - ufl.grad(B_n_fx)
-    rho_k_fx = rho_f_fx * C_k_fx
-    rho_n_fx = rho_f_fx * C_n_fx
-    mu_k_fx = _mu_from_alpha_B(alpha_k_fx, B_k_fx)
-    mu_n_fx = _mu_from_alpha_B(alpha_n_fx, B_n_fx)
+    gradF_free_k_fx = -ufl.grad(alpha_k_fx)
+    gradF_free_n_fx = -ufl.grad(alpha_n_fx)
+    timeFfree_k_fx = (F_free_k_fx - F_free_n_fx) * inv_dt_fx
+
+    rho_mom_k_fx = rho_f_fx * F_free_k_fx
+    rho_mom_n_fx = rho_f_fx * F_free_n_fx
+    mu_mom_k_fx = mu_f_fx * F_free_k_fx
+    mu_mom_n_fx = mu_f_fx * F_free_n_fx
     divCv_k_fx = C_k_fx * ufl.div(v_k_fx) + ufl.dot(gradC_k_fx, v_k_fx)
     divCv_n_fx = C_n_fx * ufl.div(v_n_fx) + ufl.dot(gradC_n_fx, v_n_fx)
     divBvS_k_fx = B_k_fx * ufl.div(vS_k_fx) + ufl.dot(gradB_k_fx, vS_k_fx)
     divBvS_n_fx = B_n_fx * ufl.div(vS_n_fx) + ufl.dot(gradB_n_fx, vS_n_fx)
-    divF_k_fx = divCv_k_fx + divBvS_k_fx
-    divF_n_fx = divCv_n_fx + divBvS_n_fx
+    divFfree_k_fx = F_free_k_fx * ufl.div(v_k_fx) + ufl.dot(gradF_free_k_fx, v_k_fx)
+    divFfree_n_fx = F_free_n_fx * ufl.div(v_n_fx) + ufl.dot(gradF_free_n_fx, v_n_fx)
     diff_k_fx = v_k_fx - vS_k_fx
     diff_n_fx = v_n_fx - vS_n_fx
     div_diff_k_fx = ufl.div(v_k_fx) - ufl.div(vS_k_fx)
     div_diff_n_fx = ufl.div(v_n_fx) - ufl.div(vS_n_fx)
+    divPv_k_fx = P_k_fx * ufl.div(v_k_fx) + ufl.dot(gradP_k_fx, v_k_fx)
     divQ_k_fx = P_k_fx * div_diff_k_fx + ufl.dot(gradP_k_fx, diff_k_fx)
     divQ_n_fx = P_n_fx * div_diff_n_fx + ufl.dot(gradP_n_fx, diff_n_fx)
-    div_C_vtest_k_fx = C_k_fx * ufl.div(v_test_fx) + ufl.dot(gradC_k_fx, v_test_fx)
+    div_CSv_k_fx = (C_k_fx * S_k_fx) * ufl.div(v_k_fx) + S_k_fx * ufl.dot(gradC_k_fx, v_k_fx) + C_k_fx * ufl.dot(ufl.grad(S_k_fx), v_k_fx)
+    div_CSv_n_fx = (C_n_fx * S_n_fx) * ufl.div(v_n_fx) + S_n_fx * ufl.dot(gradC_n_fx, v_n_fx) + C_n_fx * ufl.dot(ufl.grad(S_n_fx), v_n_fx)
+    div_Ffree_vtest_k_fx = F_free_k_fx * ufl.div(v_test_fx) + ufl.dot(gradF_free_k_fx, v_test_fx)
+    div_P_vtest_k_fx = P_k_fx * ufl.div(v_test_fx) + ufl.dot(gradP_k_fx, v_test_fx)
     div_B_vStest_k_fx = B_k_fx * ufl.div(vS_test_fx) + ufl.dot(gradB_k_fx, vS_test_fx)
     div_B_vStest_n_fx = B_n_fx * ufl.div(vS_test_fx) + ufl.dot(gradB_n_fx, vS_test_fx)
-    div_rhov_k_fx = rho_f_fx * divCv_k_fx
-    div_rhov_n_fx = rho_f_fx * divCv_n_fx
+    div_rhov_k_fx = rho_f_fx * divFfree_k_fx
+    div_rhov_n_fx = rho_f_fx * divFfree_n_fx
+    pore_balance_coeff_k_fx = beta_biot_fx * alpha_k_fx
 
     fluid_scale_fx = _const(1.0)
     skeleton_scale_fx = _const(1.0)
     mechanics_nondim_key = str(params.get("mechanics_nondim_mode", "legacy")).strip().lower()
     if mechanics_nondim_key in {"stress_balance", "condition_balanced"}:
         fluid_ref_val = max(1.0, abs(float(params["mu_f"])), abs(float(params["mu_b"])))
-        solid_ref_val = max(1.0, abs(float(2.0 * float(params["mu_s"]) + 2.0 * float(params["lambda_s"]))))
+        solid_model_scale_key = str(params.get("solid_model", "linear")).strip().lower()
+        if solid_model_scale_key == "neo_hookean":
+            solid_model_scale_key = "seboldt_neo_hookean"
+        if solid_model_scale_key in {"seboldt_neo_hookean", "neo_hookean_seboldt", "neo-hookean-seboldt"}:
+            solid_ref_val = max(1.0, abs(float(params["mu_s"])), abs(float(params["lambda_s"])))
+        else:
+            solid_ref_val = max(1.0, abs(float(2.0 * float(params["mu_s"]) + 2.0 * float(params["lambda_s"]))))
         fluid_scale_fx = _const(1.0 / fluid_ref_val)
         skeleton_scale_fx = _const(1.0 / solid_ref_val)
 
-    # Fluid momentum
-    r_mom_fx = ufl.inner((rho_k_fx * v_k_fx - rho_n_fx * v_n_fx) * inv_dt_fx, v_test_fx) * dx_fx
+    r_mom_fx = ufl.inner((rho_mom_k_fx * v_k_fx - rho_mom_n_fx * v_n_fx) * inv_dt_fx, v_test_fx) * dx_fx
     fluid_conv_key = str(params["fluid_convection"]).strip().lower()
     if fluid_conv_key == "full":
         conv_k_fx = ufl.dot(ufl.dot(ufl.grad(v_k_fx), v_k_fx), v_test_fx)
         conv_n_fx = ufl.dot(ufl.dot(ufl.grad(v_n_fx), v_n_fx), v_test_fx)
         r_mom_fx += (
-            th_fx * (rho_k_fx * conv_k_fx + div_rhov_k_fx * ufl.dot(v_k_fx, v_test_fx))
-            + omth_fx * (rho_n_fx * conv_n_fx + div_rhov_n_fx * ufl.dot(v_n_fx, v_test_fx))
+            th_fx * (rho_mom_k_fx * conv_k_fx + div_rhov_k_fx * ufl.dot(v_k_fx, v_test_fx))
+            + omth_fx * (rho_mom_n_fx * conv_n_fx + div_rhov_n_fx * ufl.dot(v_n_fx, v_test_fx))
         ) * dx_fx
     elif fluid_conv_key == "lagged":
         conv_k_fx = ufl.dot(ufl.dot(ufl.grad(v_k_fx), v_n_fx), v_test_fx)
         conv_n_fx = ufl.dot(ufl.dot(ufl.grad(v_n_fx), v_n_fx), v_test_fx)
         r_mom_fx += (
-            th_fx * (rho_n_fx * conv_k_fx + div_rhov_n_fx * ufl.dot(v_k_fx, v_test_fx))
-            + omth_fx * (rho_n_fx * conv_n_fx + div_rhov_n_fx * ufl.dot(v_n_fx, v_test_fx))
+            th_fx * (rho_mom_n_fx * conv_k_fx + div_rhov_n_fx * ufl.dot(v_k_fx, v_test_fx))
+            + omth_fx * (rho_mom_n_fx * conv_n_fx + div_rhov_n_fx * ufl.dot(v_n_fx, v_test_fx))
         ) * dx_fx
     elif fluid_conv_key == "imex":
         conv_n_fx = ufl.dot(ufl.dot(ufl.grad(v_n_fx), v_n_fx), v_test_fx)
-        r_mom_fx += (rho_n_fx * conv_n_fx + div_rhov_n_fx * ufl.dot(v_n_fx, v_test_fx)) * dx_fx
+        r_mom_fx += (rho_mom_n_fx * conv_n_fx + div_rhov_n_fx * ufl.dot(v_n_fx, v_test_fx)) * dx_fx
     elif fluid_conv_key != "off":
         raise ValueError(f"Unsupported fluid_convection={params['fluid_convection']!r}.")
-    r_mom_fx += 2.0 * (th_fx * mu_k_fx * ufl.inner(_eps(v_k_fx), _eps(v_test_fx)) + omth_fx * mu_n_fx * ufl.inner(_eps(v_n_fx), _eps(v_test_fx))) * dx_fx
-    r_mom_fx += -(p_k_fx * div_C_vtest_k_fx) * dx_fx
-    if float(params["gamma_div"]) != 0.0:
-        divF_k_fx = divCv_k_fx + divBvS_k_fx
-        r_mom_fx += gamma_div_fx * divF_k_fx * div_C_vtest_k_fx * dx_fx
+    r_mom_fx += 2.0 * (
+        th_fx * mu_mom_k_fx * ufl.inner(_eps(v_k_fx), _eps(v_test_fx))
+        + omth_fx * mu_mom_n_fx * ufl.inner(_eps(v_n_fx), _eps(v_test_fx))
+    ) * dx_fx
+    r_mom_fx += -(p_k_fx * div_Ffree_vtest_k_fx + p_pore_k_fx * div_P_vtest_k_fx) * dx_fx
 
     kappa_key = str(params["kappa_inv_model"]).strip().lower()
     if kappa_key in {"refmap", "eulerian_refmap", "eulerian", "reference_map", "reference-map"}:
@@ -2528,7 +2624,6 @@ def _fenics_full_forms_ratio_free(
     else:
         raise ValueError(f"Unsupported kappa_inv_model={params['kappa_inv_model']!r}.")
 
-    drag_form_key = str(params.get("drag_formulation", "direct")).strip().lower().replace("-", "_")
     if drag_form_key == "mixed_lm":
         r_mom_fx += ufl.dot(lambda_drag_k_fx, v_test_fx) * dx_fx
     elif drag_mode == "scalar":
@@ -2536,42 +2631,91 @@ def _fenics_full_forms_ratio_free(
     else:
         r_mom_fx += mu_f_fx * P_k_fx * ufl.dot(ufl.dot(k_inv_k_fx, v_k_fx - vS_k_fx), v_test_fx) * dx_fx
 
-    # Pressure / storage row
-    beta_biot_fx = _const(1.0 if params.get("alpha_biot") is None else float(params["alpha_biot"]))
-    r_mass_fx = q_fx * divF_k_fx * dx_fx
+    s_v_fx = _const(0.0)
+    r_mass_fx = q_fx * (timeFfree_k_fx + divFfree_k_fx) * dx_fx
+    r_pore_fx = q_pore_fx * (pore_balance_coeff_k_fx * ufl.div(vS_k_fx) + divQ_k_fx - alpha_k_fx * s_v_fx) * dx_fx
     if float(params["storativity_c0"]) != 0.0:
-        r_mass_fx += q_fx * (storativity_c0_fx * alpha_k_fx * (p_k_fx - p_n_fx) * inv_dt_fx) * dx_fx
+        p_pore_mat_rate_k_fx = ((p_pore_k_fx - p_pore_n_fx) * inv_dt_fx) + ufl.dot(vS_k_fx, ufl.grad(p_pore_k_fx))
+        r_pore_fx += q_pore_fx * (pore_balance_coeff_k_fx * storativity_c0_fx * p_pore_mat_rate_k_fx) * dx_fx
+    if bool(params.get("p_pore_fluid_gauge", False)) and float(params.get("p_pore_fluid_gauge_strength", 1.0)) != 0.0:
+        one_m_alpha_k_fx = 1.0 - alpha_k_fx
+        p_pore_fluid_w4_k_fx = one_m_alpha_k_fx * one_m_alpha_k_fx
+        p_pore_fluid_w4_k_fx = p_pore_fluid_w4_k_fx * p_pore_fluid_w4_k_fx
+        p_pore_fluid_w8_k_fx = p_pore_fluid_w4_k_fx * p_pore_fluid_w4_k_fx
+        p_pore_fluid_w_k_fx = p_pore_fluid_w8_k_fx * p_pore_fluid_w8_k_fx
+        r_pore_fx += _const(float(params.get("p_pore_fluid_gauge_strength", 1.0))) * p_pore_fluid_w_k_fx * p_pore_k_fx * q_pore_fx * dx_fx
 
-    # Skeleton
-    total_pressure_ref_fx = _const(max(1.0, abs(float(2.0 * float(params["mu_s"]) + 2.0 * float(params["lambda_s"])))))
+    solid_model_key = str(params.get("solid_model", "linear")).strip().lower()
+    if solid_model_key == "neo_hookean":
+        solid_model_key = "seboldt_neo_hookean"
+    if solid_model_key in {"seboldt_neo_hookean", "neo_hookean_seboldt", "neo-hookean-seboldt"}:
+        total_pressure_ref_fx = _const(float(params["lambda_s"]))
+    else:
+        total_pressure_ref_fx = _const(max(1.0, abs(float(2.0 * float(params["mu_s"]) + 2.0 * float(params["lambda_s"])))))
     total_pressure_ref_inv_fx = 1.0 / total_pressure_ref_fx
     lambda_over_total_pressure_ref_fx = float(params["lambda_s"]) * total_pressure_ref_inv_fx
-    sk_th_fx = th_fx if bool(params["include_skeleton_acceleration"]) else _const(1.0)
-    sk_omth_fx = omth_fx if bool(params["include_skeleton_acceleration"]) else _const(0.0)
+
+    if solid_model_key in {"seboldt_neo_hookean", "neo_hookean_seboldt", "neo-hookean-seboldt"}:
+        sig_k_fx = _sigma_neo_hookean_seboldt_fx(u_k_fx, mu_s_fx, lambda_s_fx, dim=mesh.geometry.dim)
+        sig_n_fx = _sigma_neo_hookean_seboldt_fx(u_n_fx, mu_s_fx, lambda_s_fx, dim=mesh.geometry.dim)
+        if bool(params.get("solid_volumetric_split", False)):
+            mean_dr_k_fx = ufl.tr(sig_k_fx) / float(mesh.geometry.dim)
+            mean_dr_n_fx = ufl.tr(sig_n_fx) / float(mesh.geometry.dim)
+            sig_dev_k_fx = sig_k_fx - mean_dr_k_fx * I_fx
+            sig_dev_n_fx = sig_n_fx - mean_dr_n_fx * I_fx
+            r_elastic_k_fx = ufl.inner(sig_dev_k_fx, ufl.grad(vS_test_fx)) + total_pressure_ref_fx * pi_s_k_fx * ufl.div(vS_test_fx)
+            r_elastic_n_fx = ufl.inner(sig_dev_n_fx, ufl.grad(vS_test_fx)) + total_pressure_ref_fx * pi_s_n_fx * ufl.div(vS_test_fx)
+        else:
+            r_elastic_k_fx = ufl.inner(sig_k_fx, ufl.grad(vS_test_fx))
+            r_elastic_n_fx = ufl.inner(sig_n_fx, ufl.grad(vS_test_fx))
+    else:
+        if bool(params.get("solid_volumetric_split", False)):
+            dev_u_k_fx = _eps(u_k_fx) - (ufl.tr(_eps(u_k_fx)) / 2.0) * I_fx
+            dev_u_n_fx = _eps(u_n_fx) - (ufl.tr(_eps(u_n_fx)) / 2.0) * I_fx
+            r_elastic_k_fx = 2.0 * mu_s_fx * ufl.inner(dev_u_k_fx, _eps(vS_test_fx)) + total_pressure_ref_fx * pi_s_k_fx * ufl.div(vS_test_fx)
+            r_elastic_n_fx = 2.0 * mu_s_fx * ufl.inner(dev_u_n_fx, _eps(vS_test_fx)) + total_pressure_ref_fx * pi_s_n_fx * ufl.div(vS_test_fx)
+        else:
+            r_elastic_k_fx = 2.0 * mu_s_fx * ufl.inner(_eps(u_k_fx), _eps(vS_test_fx)) + lambda_s_fx * ufl.div(u_k_fx) * ufl.div(vS_test_fx)
+            r_elastic_n_fx = 2.0 * mu_s_fx * ufl.inner(_eps(u_n_fx), _eps(vS_test_fx)) + lambda_s_fx * ufl.div(u_n_fx) * ufl.div(vS_test_fx)
+
+    pore_biot_coeff_k_fx = beta_biot_fx * alpha_k_fx
+    pore_biot_coeff_n_fx = beta_biot_fx * alpha_n_fx
+    skel_press_key = str(params.get("skeleton_pressure_mode", "whole_domain")).strip().lower()
+    if skel_press_key == "seboldt":
+        press_div_coeff_k_fx = pore_biot_coeff_k_fx
+        press_div_coeff_n_fx = pore_biot_coeff_n_fx
+        r_skel_press_k_fx = -(p_pore_k_fx * pore_biot_coeff_k_fx * ufl.div(vS_test_fx))
+        r_skel_press_n_fx = -(p_pore_n_fx * pore_biot_coeff_n_fx * ufl.div(vS_test_fx))
+    else:
+        if params["alpha_biot"] is not None:
+            press_div_coeff_k_fx = pore_biot_coeff_k_fx
+            press_div_coeff_n_fx = pore_biot_coeff_n_fx
+            r_skel_press_k_fx = -p_pore_k_fx * div_B_vStest_k_fx - p_pore_k_fx * (pore_biot_coeff_k_fx - B_k_fx) * ufl.div(vS_test_fx)
+            r_skel_press_n_fx = -p_pore_n_fx * div_B_vStest_n_fx - p_pore_n_fx * (pore_biot_coeff_n_fx - B_n_fx) * ufl.div(vS_test_fx)
+        else:
+            press_div_coeff_k_fx = B_k_fx
+            press_div_coeff_n_fx = B_n_fx
+            r_skel_press_k_fx = -p_pore_k_fx * div_B_vStest_k_fx
+            r_skel_press_n_fx = -p_pore_n_fx * div_B_vStest_n_fx
+
     if bool(params.get("solid_volumetric_split", False)):
-        dev_u_k = _eps(u_k_fx) - (ufl.tr(_eps(u_k_fx)) / 2.0) * I_fx
-        dev_u_n = _eps(u_n_fx) - (ufl.tr(_eps(u_n_fx)) / 2.0) * I_fx
-        r_elastic_k_fx = 2.0 * mu_s_fx * ufl.inner(dev_u_k, _eps(vS_test_fx)) + total_pressure_ref_fx * pi_s_k_fx * ufl.div(vS_test_fx)
-        r_elastic_n_fx = 2.0 * mu_s_fx * ufl.inner(dev_u_n, _eps(vS_test_fx)) + total_pressure_ref_fx * pi_s_n_fx * ufl.div(vS_test_fx)
+        if solid_model_key in {"seboldt_neo_hookean", "neo_hookean_seboldt", "neo-hookean-seboldt"}:
+            vol_drive_k_fx = pi_s_k_fx - total_pressure_ref_inv_fx * mean_dr_k_fx + total_pressure_ref_inv_fx * press_div_coeff_k_fx * p_pore_k_fx
+        else:
+            vol_drive_k_fx = pi_s_k_fx - lambda_over_total_pressure_ref_fx * ufl.div(u_k_fx) + total_pressure_ref_inv_fx * press_div_coeff_k_fx * p_pore_k_fx
         r_volumetric_fx = (
-            alpha_k_fx
-            * pi_s_test_fx
-            * (
-                pi_s_k_fx
-                - lambda_over_total_pressure_ref_fx * ufl.div(u_k_fx)
-                + total_pressure_ref_inv_fx * (beta_biot_fx * alpha_k_fx) * p_k_fx
-            )
+            alpha_k_fx * pi_s_test_fx * vol_drive_k_fx
             + float(params.get("solid_volumetric_penalty", 1.0)) * (1.0 - alpha_k_fx) * pi_s_k_fx * pi_s_test_fx
         ) * dx_fx
+        if skel_press_key == "seboldt":
+            r_skel_press_k_fx = _const(0.0) * ufl.dot(vS_k_fx, vS_test_fx)
+            r_skel_press_n_fx = _const(0.0) * ufl.dot(vS_n_fx, vS_test_fx)
+        else:
+            r_skel_press_k_fx = -(p_pore_k_fx * ufl.dot(gradB_k_fx, vS_test_fx))
+            r_skel_press_n_fx = -(p_pore_n_fx * ufl.dot(gradB_n_fx, vS_test_fx))
     else:
-        r_elastic_k_fx = 2.0 * mu_s_fx * ufl.inner(_eps(u_k_fx), _eps(vS_test_fx)) + lambda_s_fx * ufl.div(u_k_fx) * ufl.div(vS_test_fx)
-        r_elastic_n_fx = 2.0 * mu_s_fx * ufl.inner(_eps(u_n_fx), _eps(vS_test_fx)) + lambda_s_fx * ufl.div(u_n_fx) * ufl.div(vS_test_fx)
         r_volumetric_fx = _const(0.0) * alpha_k_fx * dx_fx
-    r_skel_press_k_fx = -p_k_fx * div_B_vStest_k_fx
-    r_skel_press_n_fx = -p_n_fx * div_B_vStest_n_fx
-    if params["alpha_biot"] is not None:
-        r_skel_press_k_fx += -(p_k_fx * (beta_biot_fx * alpha_k_fx - B_k_fx) * ufl.div(vS_test_fx))
-        r_skel_press_n_fx += -(p_n_fx * (beta_biot_fx * alpha_n_fx - B_n_fx) * ufl.div(vS_test_fx))
+
     if drag_form_key == "mixed_lm":
         r_skel_drag_k_fx = -ufl.dot(lambda_drag_k_fx, vS_test_fx)
         r_skel_drag_n_fx = -ufl.dot(lambda_drag_n_fx, vS_test_fx)
@@ -2581,27 +2725,34 @@ def _fenics_full_forms_ratio_free(
     else:
         r_skel_drag_k_fx = -(mu_f_fx * P_k_fx) * ufl.dot(ufl.dot(k_inv_k_fx, v_k_fx - vS_k_fx), vS_test_fx)
         r_skel_drag_n_fx = -(mu_f_fx * P_n_fx) * ufl.dot(ufl.dot(k_inv_n_fx, v_n_fx - vS_n_fx), vS_test_fx)
-    r_skeleton_fx = (
-        sk_th_fx * alpha_k_fx * r_elastic_k_fx
-        + sk_omth_fx * alpha_n_fx * r_elastic_n_fx
-        + sk_th_fx * r_skel_press_k_fx
-        + sk_omth_fx * r_skel_press_n_fx
-        + sk_th_fx * r_skel_drag_k_fx
-        + sk_omth_fx * r_skel_drag_n_fx
-    ) * dx_fx
+
+    zero_skeleton_term_fx = _const(0.0) * ufl.dot(vS_k_fx, vS_test_fx) * dx_fx
+    sk_th_fx = th_fx if bool(params["include_skeleton_acceleration"]) else _const(1.0)
+    sk_omth_fx = omth_fx if bool(params["include_skeleton_acceleration"]) else _const(0.0)
+    skeleton_residual_terms_fx: dict[str, object] = {
+        "elastic_k": sk_th_fx * alpha_k_fx * r_elastic_k_fx * dx_fx,
+        "elastic_n": sk_omth_fx * alpha_n_fx * r_elastic_n_fx * dx_fx,
+        "pressure": (sk_th_fx * r_skel_press_k_fx + sk_omth_fx * r_skel_press_n_fx) * dx_fx,
+        "drag": (sk_th_fx * r_skel_drag_k_fx + sk_omth_fx * r_skel_drag_n_fx) * dx_fx,
+        "body": zero_skeleton_term_fx,
+    }
+    r_skeleton_fx = None
+    for _term_fx in skeleton_residual_terms_fx.values():
+        r_skeleton_fx = _term_fx if r_skeleton_fx is None else r_skeleton_fx + _term_fx
     if bool(params["include_skeleton_acceleration"]) and float(params["rho_s0_tilde"]) != 0.0:
         rhoS_k_fx = rho_s0_fx * B_k_fx
         rhoS_n_fx = rho_s0_fx * B_n_fx
-        r_skeleton_fx += ufl.inner((rhoS_k_fx * vS_k_fx - rhoS_n_fx * vS_n_fx) * inv_dt_fx, vS_test_fx) * dx_fx
+        skeleton_residual_terms_fx["inertia_transient"] = (
+            ufl.inner((rhoS_k_fx * vS_k_fx - rhoS_n_fx * vS_n_fx) * inv_dt_fx, vS_test_fx) * dx_fx
+        )
+        r_skeleton_fx += skeleton_residual_terms_fx["inertia_transient"]
         inertia_conv_key = str(params.get("skeleton_inertia_convection", "lagged")).strip().lower()
         if inertia_conv_key in {"conservative", "nonlinear"}:
             inertia_conv_key = "full"
         if inertia_conv_key in {"picard", "semi", "semi_implicit", "linear"}:
             inertia_conv_key = "lagged"
         if inertia_conv_key not in {"full", "lagged"}:
-            raise ValueError(
-                f"Unsupported skeleton_inertia_convection={params.get('skeleton_inertia_convection')!r}."
-            )
+            raise ValueError(f"Unsupported skeleton_inertia_convection={params.get('skeleton_inertia_convection')!r}.")
         div_rhoS_vS_k_fx = rho_s0_fx * divBvS_k_fx
         div_rhoS_vS_n_fx = rho_s0_fx * divBvS_n_fx
         advS_full_k_fx = ufl.dot(ufl.grad(vS_k_fx), vS_k_fx)
@@ -2613,91 +2764,234 @@ def _fenics_full_forms_ratio_free(
         convS_lagged_k_fx = ufl.dot(advS_lagged_k_fx, vS_test_fx)
         convS_lagged_n_fx = ufl.dot(advS_lagged_n_fx, vS_test_fx)
         if inertia_conv_key == "full":
-            r_skeleton_fx += (
-                th_fx * (rhoS_k_fx * convS_full_k_fx + div_rhoS_vS_k_fx * ufl.dot(vS_k_fx, vS_test_fx))
-                + omth_fx * (rhoS_n_fx * convS_full_n_fx + div_rhoS_vS_n_fx * ufl.dot(vS_n_fx, vS_test_fx))
-            ) * dx_fx
+            skeleton_residual_terms_fx["inertia_convection_k"] = (
+                th_fx * (rhoS_k_fx * convS_full_k_fx + div_rhoS_vS_k_fx * ufl.dot(vS_k_fx, vS_test_fx)) * dx_fx
+            )
+            skeleton_residual_terms_fx["inertia_convection_n"] = (
+                omth_fx * (rhoS_n_fx * convS_full_n_fx + div_rhoS_vS_n_fx * ufl.dot(vS_n_fx, vS_test_fx)) * dx_fx
+            )
         else:
-            r_skeleton_fx += (
-                th_fx * (rhoS_n_fx * convS_lagged_k_fx + div_rhoS_vS_n_fx * ufl.dot(vS_k_fx, vS_test_fx))
-                + omth_fx * (rhoS_n_fx * convS_lagged_n_fx + div_rhoS_vS_n_fx * ufl.dot(vS_n_fx, vS_test_fx))
-            ) * dx_fx
+            skeleton_residual_terms_fx["inertia_convection_k"] = (
+                th_fx * (rhoS_n_fx * convS_lagged_k_fx + div_rhoS_vS_n_fx * ufl.dot(vS_k_fx, vS_test_fx)) * dx_fx
+            )
+            skeleton_residual_terms_fx["inertia_convection_n"] = (
+                omth_fx * (rhoS_n_fx * convS_lagged_n_fx + div_rhoS_vS_n_fx * ufl.dot(vS_n_fx, vS_test_fx)) * dx_fx
+            )
+        r_skeleton_fx += skeleton_residual_terms_fx["inertia_convection_k"]
+        r_skeleton_fx += skeleton_residual_terms_fx["inertia_convection_n"]
 
-    gamma_vS_eff = params.get("gamma_vS")
+    kinematic_setup = _condition_balanced_kinematic_setup(
+        mechanics_nondim_mode=mechanics_nondim_key,
+        mu_f=float(params["mu_f"]),
+        kappa_inv=float(params["kappa_inv"]),
+        gamma_u=float(params["gamma_u"]),
+        u_extension_mode=str(params["u_extension_mode"]),
+        gamma_u_pin=float(params["gamma_u_pin"]),
+        gamma_vS=params.get("gamma_vS"),
+        vS_extension_mode=params.get("vS_extension_mode"),
+        gamma_vS_pin=params.get("gamma_vS_pin"),
+    )
+    gamma_u_eff = float(kinematic_setup["gamma_u"])
+    u_ext_mode_eff = str(kinematic_setup["u_extension_mode"]).strip().lower()
+    gamma_u_pin_eff = float(kinematic_setup["gamma_u_pin"])
+    gamma_vS_eff = (
+        float(kinematic_setup["gamma_vS"]) if kinematic_setup["gamma_vS"] is not None else None
+    )
+    vS_ext_mode_eff = (
+        u_ext_mode_eff
+        if kinematic_setup["vS_extension_mode"] is None
+        else str(kinematic_setup["vS_extension_mode"]).strip().lower()
+    )
+    gamma_vS_pin_eff = (
+        None
+        if kinematic_setup["gamma_vS_pin"] is None
+        else float(kinematic_setup["gamma_vS_pin"])
+    )
+    if mechanics_nondim_key == "condition_balanced":
+        kin_scale_val = float(kinematic_setup["kinematics_scale"])
+    else:
+        kin_scale_val = (
+            float(params["rho_s0_tilde"])
+            if float(params["rho_s0_tilde"]) != 0.0
+            else float(params.get("kinematics_scale", 1.0))
+        )
+    gamma_u_fx = _const(gamma_u_eff)
+    gamma_u_pin_fx = _const(gamma_u_pin_eff)
+
     if gamma_vS_eff is None:
-        gamma_vS_eff = float(params["gamma_u"])
-    vS_ext_mode_eff = params.get("vS_extension_mode")
-    if vS_ext_mode_eff is None:
-        vS_ext_mode_eff = params["u_extension_mode"]
+        gamma_vS_eff = gamma_u_eff
     if float(gamma_vS_eff) != 0.0:
         gamma_vS_fx = _const(float(gamma_vS_eff))
-        if str(vS_ext_mode_eff).strip().lower() in {"l2", "mass"}:
-            r_skeleton_fx += gamma_vS_fx * inv_h2_fx * (1.0 - alpha_k_fx) * ufl.dot(vS_k_fx, vS_test_fx) * dx_fx
+        if vS_ext_mode_eff in {"l2", "mass"}:
+            skeleton_residual_terms_fx["extension"] = (
+                gamma_vS_fx * inv_h2_fx * (1.0 - alpha_k_fx) * ufl.dot(vS_k_fx, vS_test_fx) * dx_fx
+            )
         else:
-            r_skeleton_fx += gamma_vS_fx * (1.0 - alpha_k_fx) * ufl.inner(ufl.grad(vS_k_fx), ufl.grad(vS_test_fx)) * dx_fx
+            skeleton_residual_terms_fx["extension"] = (
+                gamma_vS_fx * (1.0 - alpha_k_fx) * ufl.inner(ufl.grad(vS_k_fx), ufl.grad(vS_test_fx)) * dx_fx
+            )
+            if gamma_vS_pin_eff not in {None, 0.0}:
+                skeleton_residual_terms_fx["extension_pin"] = (
+                    _const(gamma_vS_pin_eff) * inv_h2_fx * (1.0 - alpha_k_fx) ** 2 * ufl.dot(vS_k_fx, vS_test_fx) * dx_fx
+                )
+        r_skeleton_fx += skeleton_residual_terms_fx["extension"]
+        if "extension_pin" in skeleton_residual_terms_fx:
+            r_skeleton_fx += skeleton_residual_terms_fx["extension_pin"]
     if float(params["vS_cip"]) != 0.0:
         tau_vS_cip_fx = _const(float(params["vS_cip"])) * (h_face_fx * h_face_fx * h_face_fx) * inv_dt_fx
-        r_skeleton_fx += tau_vS_cip_fx * ufl.avg(alpha_n_fx) * _fx_grad_inner_jump(vS_k_fx, vS_test_fx, n_int_fx, mesh.geometry.dim) * dS_meas_fx
+        skeleton_residual_terms_fx["cip"] = (
+            tau_vS_cip_fx * ufl.avg(alpha_n_fx) * _fx_grad_inner_jump(vS_k_fx, vS_test_fx, n_int_fx, mesh.geometry.dim) * dS_meas_fx
+        )
+        r_skeleton_fx += skeleton_residual_terms_fx["cip"]
 
-    # Kinematics
-    kin_scale_val = float(params["rho_s0_tilde"]) if float(params["rho_s0_tilde"]) != 0.0 else 1.0
     kin_scale_fx = _const(kin_scale_val)
     Fkin_k_fx = (u_k_fx - u_n_fx) * inv_dt_fx
     Fkin_k_fx += th_fx * (ufl.dot(ufl.grad(u_k_fx), vS_k_fx) - vS_k_fx)
     Fkin_k_fx += omth_fx * (ufl.dot(ufl.grad(u_n_fx), vS_n_fx) - vS_n_fx)
-    r_kinematics_fx = kin_scale_fx * alpha_k_fx * ufl.dot(Fkin_k_fx, u_test_fx) * dx_fx
-    if float(params["gamma_u"]) != 0.0:
-        if str(params["u_extension_mode"]).strip().lower() in {"l2", "mass"}:
-            r_kinematics_fx += gamma_u_fx * inv_h2_fx * (1.0 - alpha_k_fx) * ufl.dot(u_k_fx, u_test_fx) * dx_fx
+    kinematics_zero_fx = kin_scale_fx * _const(0.0) * ufl.dot(u_k_fx, u_test_fx) * dx_fx
+    kinematics_residual_terms_fx: dict[str, object] = {
+        "base": kin_scale_fx * alpha_k_fx * ufl.dot(Fkin_k_fx, u_test_fx) * dx_fx,
+        "supg": kinematics_zero_fx,
+        "extension": kinematics_zero_fx,
+        "cip": kinematics_zero_fx,
+    }
+    r_kinematics_fx = kinematics_residual_terms_fx["base"]
+    if float(params.get("u_supg", 0.0)) != 0.0:
+        tau_u_fx = _const(float(params["u_supg"])) * (h_cell_fx * h_cell_fx) / (
+            h_cell_fx * ufl.sqrt(ufl.dot(vS_n_fx, vS_n_fx) + 1.0e-12)
+            + (h_cell_fx * h_cell_fx) * inv_dt_fx
+            + 1.0e-16
+        )
+        adv_u_k_fx = ufl.dot(ufl.grad(u_k_fx), vS_n_fx)
+        adv_u_test_fx = ufl.dot(ufl.grad(u_test_fx), vS_n_fx)
+        kinematics_residual_terms_fx["supg"] = kin_scale_fx * tau_u_fx * alpha_n_fx * ufl.inner(adv_u_k_fx, adv_u_test_fx) * dx_fx
+        r_kinematics_fx += kinematics_residual_terms_fx["supg"]
+    if gamma_u_eff != 0.0:
+        if u_ext_mode_eff in {"l2", "mass"}:
+            kinematics_residual_terms_fx["extension"] = kin_scale_fx * gamma_u_fx * inv_h2_fx * (1.0 - alpha_k_fx) * ufl.dot(u_k_fx, u_test_fx) * dx_fx
+            r_kinematics_fx += kinematics_residual_terms_fx["extension"]
         else:
-            r_kinematics_fx += gamma_u_fx * (1.0 - alpha_k_fx) * ufl.inner(ufl.grad(u_k_fx), ufl.grad(u_test_fx)) * dx_fx
-            if float(params["gamma_u_pin"]) != 0.0:
-                r_kinematics_fx += gamma_u_pin_fx * inv_h2_fx * (1.0 - alpha_k_fx) ** 2 * ufl.dot(u_k_fx, u_test_fx) * dx_fx
+            kinematics_residual_terms_fx["extension"] = kin_scale_fx * gamma_u_fx * (1.0 - alpha_k_fx) * ufl.inner(ufl.grad(u_k_fx), ufl.grad(u_test_fx)) * dx_fx
+            r_kinematics_fx += kinematics_residual_terms_fx["extension"]
+            if gamma_u_pin_eff != 0.0:
+                pin_term_fx = kin_scale_fx * gamma_u_pin_fx * inv_h2_fx * (1.0 - alpha_k_fx) ** 2 * ufl.dot(u_k_fx, u_test_fx) * dx_fx
+                kinematics_residual_terms_fx["extension"] = kinematics_residual_terms_fx["extension"] + pin_term_fx
+                r_kinematics_fx += pin_term_fx
+    if float(params.get("u_cip", 0.0)) != 0.0:
+        tau_u_cip_fx = _const(float(params["u_cip"])) * (h_face_fx * h_face_fx * h_face_fx) * inv_dt_fx
+        u_cip_weight_key = str(params["u_cip_weight"]).strip().lower()
+        if u_cip_weight_key in {"fluid", "one_minus_alpha", "1-alpha", "one-minus-alpha"}:
+            w_u_cip_fx = ufl.avg(1.0 - alpha_n_fx)
+        elif u_cip_weight_key in {"biofilm", "alpha"}:
+            w_u_cip_fx = ufl.avg(alpha_n_fx)
+        else:
+            w_u_cip_fx = 1.0
+        kinematics_residual_terms_fx["cip"] = kin_scale_fx * tau_u_cip_fx * w_u_cip_fx * ufl.inner(
+            ufl.jump(ufl.grad(u_k_fx), n_int_fx), ufl.jump(ufl.grad(u_test_fx), n_int_fx)
+        ) * dS_meas_fx
+        r_kinematics_fx += kinematics_residual_terms_fx["cip"]
 
-    # B transport
     Pi_k_fx = (mu_max_fx * (S_k_fx / (K_S_fx + S_k_fx)) - k_d_fx) * B_k_fx
     Pi_n_fx = (mu_max_fx * (S_n_fx / (K_S_fx + S_n_fx)) - k_d_fx) * B_n_fx
-    r_B_fx = B_test_fx * ((B_k_fx - B_n_fx) * inv_dt_fx) * dx_fx
-    r_B_fx += -th_fx * ufl.dot(B_k_fx * vS_k_fx, ufl.grad(B_test_fx)) * dx_fx
-    r_B_fx += -omth_fx * ufl.dot(B_n_fx * vS_n_fx, ufl.grad(B_test_fx)) * dx_fx
-    r_B_fx += -B_test_fx * (th_fx * Pi_k_fx + omth_fx * Pi_n_fx) * dx_fx
+    content_mode_key = str(params.get("stored_support_content_mode", "evolve_B")).strip().lower().replace("-", "_")
+    if content_mode_key == "freeze_b":
+        r_B_fx = B_test_fx * ((B_k_fx - B_n_fx) * inv_dt_fx) * dx_fx
+    elif content_mode_key == "frozen_phi_b":
+        r_B_fx = B_test_fx * (B_k_fx - (1.0 - float(params["phi_b"])) * alpha_k_fx) * dx_fx
+    else:
+        r_B_fx = B_test_fx * ((B_k_fx - B_n_fx) * inv_dt_fx) * dx_fx
+        r_B_fx += -th_fx * ufl.dot(B_k_fx * vS_k_fx, ufl.grad(B_test_fx)) * dx_fx
+        r_B_fx += -omth_fx * ufl.dot(B_n_fx * vS_n_fx, ufl.grad(B_test_fx)) * dx_fx
+        r_B_fx += -B_test_fx * (th_fx * Pi_k_fx + omth_fx * Pi_n_fx) * dx_fx
 
-    # Alpha geometry
     r_alpha_fx = alpha_test_fx * ((alpha_k_fx - alpha_n_fx) * inv_dt_fx) * dx_fx
     r_alpha_fx += th_fx * alpha_test_fx * ufl.dot(ufl.grad(alpha_k_fx), vS_k_fx) * dx_fx
     r_alpha_fx += omth_fx * alpha_test_fx * ufl.dot(ufl.grad(alpha_n_fx), vS_n_fx) * dx_fx
 
-    r_mu_alpha_fx = alpha_mu_aux_pin_fx * mu_alpha_test_fx * mu_alpha_k_fx * dx_fx
+    if float(params.get("alpha_supg", 0.0)) != 0.0:
+        vmag2_fx = ufl.dot(vS_n_fx, vS_n_fx)
+        vmag_fx = ufl.sqrt(vmag2_fx + 1.0e-12)
+        denom_fx = (2.0 * inv_dt_fx) ** 2 + (2.0 * vmag_fx / (h_cell_fx + 1.0e-12)) ** 2
+        tau_supg_fx = _const(float(params["alpha_supg"])) / ufl.sqrt(denom_fx + 1.0e-16)
+        w_supg_fx = ufl.dot(ufl.grad(alpha_test_fx), vS_n_fx)
+        adv_alpha_k_fx = ufl.dot(ufl.grad(alpha_k_fx), vS_k_fx)
+        adv_alpha_n_fx = ufl.dot(ufl.grad(alpha_n_fx), vS_n_fx)
+        f_alpha_supg_fx = (alpha_k_fx - alpha_n_fx) * inv_dt_fx
+        f_alpha_supg_fx += th_fx * adv_alpha_k_fx + omth_fx * adv_alpha_n_fx
+        r_alpha_fx += tau_supg_fx * w_supg_fx * f_alpha_supg_fx * dx_fx
 
-    # Substrate
-    monod_k_fx = mu_max_fx * (S_k_fx / (K_S_fx + S_k_fx))
-    monod_n_fx = mu_max_fx * (S_n_fx / (K_S_fx + S_n_fx))
-    RS_k_fx = rho_s_star_fx * (1.0 / Y_fx) * ((monod_k_fx - k_d_fx) * B_k_fx)
-    RS_n_fx = rho_s_star_fx * (1.0 / Y_fx) * ((monod_n_fx - k_d_fx) * B_n_fx)
-    CSk_fx = C_k_fx * S_k_fx
-    CSn_fx = C_n_fx * S_n_fx
-    div_CSv_k_fx = CSk_fx * ufl.div(v_k_fx) + S_k_fx * ufl.dot(gradC_k_fx, v_k_fx) + C_k_fx * ufl.dot(ufl.grad(S_k_fx), v_k_fx)
-    div_CSv_n_fx = CSn_fx * ufl.div(v_n_fx) + S_n_fx * ufl.dot(gradC_n_fx, v_n_fx) + C_n_fx * ufl.dot(ufl.grad(S_n_fx), v_n_fx)
-    r_sub_fx = S_test_fx * ((CSk_fx - CSn_fx) * inv_dt_fx) * dx_fx
+    alpha_reg_key = str(params.get("alpha_regularization", "none")).strip().lower()
+    ch_enabled = alpha_reg_key == "ch" and float(params.get("M_alpha", 0.0)) != 0.0 and float(params.get("gamma_alpha", 0.0)) != 0.0
+    if ch_enabled:
+        Wp_ch_k_fx = 2.0 * alpha_k_fx * (1.0 - alpha_k_fx) * (1.0 - 2.0 * alpha_k_fx)
+        r_alpha_fx += th_fx * ufl.inner(ufl.grad(mu_alpha_k_fx) * M_alpha_fx, ufl.grad(alpha_test_fx)) * dx_fx
+        r_alpha_fx += omth_fx * ufl.inner(ufl.grad(mu_alpha_n_fx) * M_alpha_fx, ufl.grad(alpha_test_fx)) * dx_fx
+        r_mu_alpha_fx = mu_alpha_test_fx * mu_alpha_k_fx * dx_fx
+        r_mu_alpha_fx += -(gamma_alpha_fx * eps_alpha_fx) * ufl.inner(ufl.grad(alpha_k_fx), ufl.grad(mu_alpha_test_fx)) * dx_fx
+        r_mu_alpha_fx += -mu_alpha_test_fx * ((gamma_alpha_fx / eps_alpha_fx) * Wp_ch_k_fx) * dx_fx
+    else:
+        r_mu_alpha_fx = alpha_mu_aux_pin_fx * mu_alpha_test_fx * mu_alpha_k_fx * dx_fx
+
+    RS_k_fx = rho_s_star_fx * (1.0 / Y_fx) * ((mu_max_fx * (S_k_fx / (K_S_fx + S_k_fx)) - k_d_fx) * B_k_fx)
+    RS_n_fx = rho_s_star_fx * (1.0 / Y_fx) * ((mu_max_fx * (S_n_fx / (K_S_fx + S_n_fx)) - k_d_fx) * B_n_fx)
+    r_sub_fx = S_test_fx * (((C_k_fx * S_k_fx) - (C_n_fx * S_n_fx)) * inv_dt_fx) * dx_fx
     r_sub_fx += S_test_fx * (th_fx * div_CSv_k_fx + omth_fx * div_CSv_n_fx) * dx_fx
     r_sub_fx += S_test_fx * (th_fx * RS_k_fx + omth_fx * RS_n_fx) * dx_fx
 
-    # Mixed drag constitutive law
     r_drag_lambda_fx = None
     if drag_form_key == "mixed_lm":
         if drag_mode == "scalar":
             r_drag_lambda_fx = ufl.dot((1.0 / (mu_f_fx * kappa_inv_fx)) * lambda_drag_k_fx - P_k_fx * diff_k_fx, lambda_drag_test_fx) * dx_fx
         else:
             K_k_fx = ufl.inv(k_inv_k_fx)
-            r_drag_lambda_fx = (
-                ufl.dot((1.0 / mu_f_fx) * ufl.dot(K_k_fx, lambda_drag_k_fx) - P_k_fx * diff_k_fx, lambda_drag_test_fx)
-            ) * dx_fx
+            r_drag_lambda_fx = ufl.dot((1.0 / mu_f_fx) * ufl.dot(K_k_fx, lambda_drag_k_fx) - P_k_fx * diff_k_fx, lambda_drag_test_fx) * dx_fx
 
     r_mom_fx = fluid_scale_fx * r_mom_fx
     r_skeleton_fx = skeleton_scale_fx * r_skeleton_fx
+    for _key, _term_fx in tuple(skeleton_residual_terms_fx.items()):
+        skeleton_residual_terms_fx[_key] = skeleton_scale_fx * _term_fx
+    skeleton_jacobian_terms_fx = {
+        "elastic": ufl.derivative(
+            skeleton_residual_terms_fx["elastic_k"] + skeleton_residual_terms_fx["elastic_n"],
+            w_k,
+            dw,
+        ),
+        "pressure": ufl.derivative(skeleton_residual_terms_fx["pressure"], w_k, dw),
+        "drag": ufl.derivative(skeleton_residual_terms_fx["drag"], w_k, dw),
+        "body": ufl.derivative(skeleton_residual_terms_fx["body"], w_k, dw),
+    }
+    if "extension" in skeleton_residual_terms_fx:
+        skeleton_jacobian_terms_fx["extension"] = ufl.derivative(
+            skeleton_residual_terms_fx["extension"], w_k, dw
+        )
+    if "extension_pin" in skeleton_residual_terms_fx:
+        skeleton_jacobian_terms_fx["extension_pin"] = ufl.derivative(
+            skeleton_residual_terms_fx["extension_pin"], w_k, dw
+        )
+    if "cip" in skeleton_residual_terms_fx:
+        skeleton_jacobian_terms_fx["cip"] = ufl.derivative(
+            skeleton_residual_terms_fx["cip"], w_k, dw
+        )
+    if "inertia_transient" in skeleton_residual_terms_fx:
+        skeleton_jacobian_terms_fx["inertia_transient"] = ufl.derivative(
+            skeleton_residual_terms_fx["inertia_transient"], w_k, dw
+        )
+    if (
+        "inertia_convection_k" in skeleton_residual_terms_fx
+        or "inertia_convection_n" in skeleton_residual_terms_fx
+    ):
+        _inertia_conv_fx = zero_skeleton_term_fx
+        if "inertia_convection_k" in skeleton_residual_terms_fx:
+            _inertia_conv_fx = _inertia_conv_fx + skeleton_residual_terms_fx["inertia_convection_k"]
+        if "inertia_convection_n" in skeleton_residual_terms_fx:
+            _inertia_conv_fx = _inertia_conv_fx + skeleton_residual_terms_fx["inertia_convection_n"]
+        skeleton_jacobian_terms_fx["inertia_convection"] = ufl.derivative(
+            _inertia_conv_fx, w_k, dw
+        )
     blocks = {
         "momentum": r_mom_fx,
         "mass": r_mass_fx,
+        "pore": r_pore_fx,
         "skeleton": r_skeleton_fx,
         "kinematics": r_kinematics_fx,
         "alpha": r_alpha_fx,
@@ -2713,6 +3007,12 @@ def _fenics_full_forms_ratio_free(
     for block in blocks.values():
         r_total_fx = block if r_total_fx is None else r_total_fx + block
     a_total_fx = ufl.derivative(r_total_fx, w_k, dw)
+    if bool(return_debug_terms):
+        return r_total_fx, a_total_fx, blocks, {
+            "skeleton_residual_terms": skeleton_residual_terms_fx,
+            "skeleton_jacobian_terms": skeleton_jacobian_terms_fx,
+            "kinematics_residual_terms": kinematics_residual_terms_fx,
+        }
     return r_total_fx, a_total_fx, blocks
 
 
@@ -2796,11 +3096,35 @@ def _pycutfem_full_system_compare(problem, forms, *, qdeg: int, backend: str):
     indptr, indices, data = A_fx.getValuesCSR()
     J_fx = csr_matrix((data, indices, indptr), shape=A_fx.getSize()).tocsr()
     if bool(pressure_mean_constraint):
-        q_fx_form = dolfinx.fem.form(ufl.split(ufl.TestFunction(W_fx))[1] * ufl.dx(metadata={"quadrature_degree": int(qdeg)}))
+        if bool(full_ratio_free_state):
+            alpha_sub_idx = next(
+                int(sub_idx)
+                for fld, sub_idx, _ in _audit_field_layout(
+                    enable_phi_evolution=bool(enable_phi_evolution),
+                    full_ratio_free_state=bool(full_ratio_free_state),
+                    drag_formulation=str(params.get("drag_formulation", "direct")),
+                    latent_bounded_fields=tuple(latent_bounded_fields),
+                    pressure_mean_constraint=bool(pressure_mean_constraint),
+                    solid_volumetric_split=bool(solid_volumetric_split),
+                )
+                if fld == "alpha"
+            )
+            if bool(pressure_mean_constraint) and alpha_sub_idx > 1:
+                alpha_sub_idx -= 1
+            pressure_mean_weight_fx = 1.0 - ufl.split(w_k_fx)[alpha_sub_idx]
+        else:
+            pressure_mean_weight_fx = 1.0
+        q_fx_form = dolfinx.fem.form(
+            pressure_mean_weight_fx * ufl.split(ufl.TestFunction(W_fx))[1] * ufl.dx(metadata={"quadrature_degree": int(qdeg)})
+        )
         q_vec = dolfinx.fem.petsc.assemble_vector(q_fx_form)
         c_fx = np.asarray(q_vec.array, dtype=float).copy()
         p_mean_val = float(np.asarray(problem["p_mean_k"].nodal_values, dtype=float).reshape(-1)[0])
-        p_mean_res = float(dolfinx.fem.assemble_scalar(dolfinx.fem.form(ufl.split(w_k_fx)[1] * ufl.dx(metadata={"quadrature_degree": int(qdeg)}))))
+        p_mean_res = float(
+            dolfinx.fem.assemble_scalar(
+                dolfinx.fem.form(pressure_mean_weight_fx * ufl.split(w_k_fx)[1] * ufl.dx(metadata={"quadrature_degree": int(qdeg)}))
+            )
+        )
         r_fx_arr = np.concatenate([r_fx_arr + p_mean_val * c_fx, np.asarray([p_mean_res], dtype=float)])
         n_base = int(J_fx.shape[0])
         J_ext = np.zeros((n_base + 1, n_base + 1), dtype=float)
@@ -2878,6 +3202,11 @@ def _pycutfem_full_system_compare(problem, forms, *, qdeg: int, backend: str):
                 )
             }
             if problem.get("lambda_drag_k") is not None
+            else {}
+        ),
+        **(
+            {"pore": np.asarray(dh.get_field_slice("p_pore"), dtype=int)}
+            if problem.get("p_pore_k") is not None
             else {}
         ),
         "alpha": np.asarray(dh.get_field_slice("alpha"), dtype=int),
@@ -2989,6 +3318,16 @@ def main() -> None:
     ap.add_argument("--D-phi", type=float, default=0.0)
     ap.add_argument("--gamma-phi", type=float, default=5.0)
     ap.add_argument("--use-diffuse-traction", action=argparse.BooleanOptionalAction, default=False)
+    ap.add_argument("--mu-b-model", type=str, default="phi_mu", choices=("mu", "phi_mu", "alpha_mu", "alpha_phi_mu"))
+    ap.add_argument("--solid-model", type=str, default="neo_hookean", choices=("linear", "neo_hookean"))
+    ap.add_argument(
+        "--stored-support-content-mode",
+        type=str,
+        default="evolve_B",
+        choices=("evolve_B", "freeze_B", "frozen_phi_b"),
+    )
+    ap.add_argument("--p-pore-fluid-gauge", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--p-pore-fluid-gauge-strength", type=float, default=1.0)
     ap.add_argument(
         "--alpha-biot",
         type=float,
@@ -3006,13 +3345,14 @@ def main() -> None:
         "--cases",
         type=str,
         nargs="+",
-        default=("stored_support_adv",),
-        choices=("stored_support_adv",),
+        default=("stored_support_adv_ns_darcy",),
+        choices=("stored_support_adv", "stored_support_adv_ns_darcy"),
     )
     args = ap.parse_args()
 
     all_cases = [
         ("stored_support_adv", "vS", "advective", "stored_support", 0.0, 0.0, 0.0, 0.0, "whole_domain", 1.0),
+        ("stored_support_adv_ns_darcy", "vS", "advective", "stored_support", 0.0, 0.0, 0.0, 0.0, "whole_domain", 1.0),
     ]
     wanted = set(args.cases)
     cases = [item for item in all_cases if item[0] in wanted]
@@ -3095,6 +3435,11 @@ def main() -> None:
             alpha_biot=(case_alpha_biot if case_alpha_biot is not None else args.alpha_biot),
             use_diffuse_traction=bool(args.use_diffuse_traction or name == "christan_cweak_fullstab"),
             full_ratio_free_state=True,
+            mu_b_model=str(args.mu_b_model),
+            solid_model=str(args.solid_model),
+            stored_support_content_mode=str(args.stored_support_content_mode),
+            p_pore_fluid_gauge=bool(args.p_pore_fluid_gauge),
+            p_pore_fluid_gauge_strength=float(args.p_pore_fluid_gauge_strength),
         )
         directional_fd_max_rel, directional_fd_per_case = _directional_fd_audit(
             problem,

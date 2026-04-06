@@ -5492,6 +5492,29 @@ class NewtonSolver:
         newton_rtol = max(float(getattr(np_cfg, "newton_rtol", 0.0) or 0.0), 0.0)
         usable_atol = max(usable_atol, 10.0 * newton_tol)
         usable_rtol = max(usable_rtol, 100.0 * max(newton_tol, newton_rtol))
+        if linear_context == "vi_augmented":
+            current_vi_res = getattr(self, "_current_newton_residual_norm", None)
+            try:
+                current_vi_res = float(current_vi_res)
+            except Exception:
+                current_vi_res = float("nan")
+            # The augmented PDAS/IPM solve only needs to be accurate relative
+            # to the current semismooth residual. When |G| is still O(1e-1),
+            # rejecting O(1e-4) relative solves causes expensive retry storms
+            # without materially changing the nonlinear step, but late-stage
+            # solves should tighten automatically as |G| shrinks.
+            vi_usable_atol_cap = float(os.getenv("PYCUTFEM_DIRECT_SOLVE_USABLE_ATOL_VI", "1e-5") or "1e-5")
+            vi_usable_rtol_cap = float(os.getenv("PYCUTFEM_DIRECT_SOLVE_USABLE_RTOL_VI", "1e-3") or "1e-3")
+            vi_usable_atol_floor = max(10.0 * newton_tol, 1.0e-8)
+            vi_usable_rtol_floor = max(10.0 * max(newton_tol, newton_rtol), 1.0e-5)
+            if np.isfinite(current_vi_res) and current_vi_res > 0.0:
+                vi_scale = max(1.0e-12, 1.0e-2 * current_vi_res)
+                usable_atol = min(vi_usable_atol_cap, max(vi_usable_atol_floor, vi_scale))
+                usable_rtol = min(vi_usable_rtol_cap, max(vi_usable_rtol_floor, vi_scale))
+            else:
+                usable_atol = vi_usable_atol_cap
+                usable_rtol = vi_usable_rtol_cap
+            allow_usable = True
         return atol, rtol, allow_usable, usable_atol, usable_rtol
 
     def _direct_solve_quality_passes(self, res_inf: float, rel_inf: float, *, allow_usable_override: bool | None = None) -> bool:
@@ -11225,6 +11248,7 @@ class PdasNewtonSolver(NewtonSolver):
         snap = [f.nodal_values.copy() for f in funcs]
         stat0 = self._vi_stationarity_residual(R0_red, eq_data, lambda0_eq)
         metrics0 = self._vi_metrics(x0_red, stat0, lo_red, hi_red, act_lo0, act_hi0, G0, eq0_res)
+        self._current_newton_residual_norm = float(metrics0["G_inf"])
         norm0 = float(metrics0["G_inf"])
         phi0 = float(metrics0["G_half"])
         merit0 = norm0 if merit_mode == "legacy" and mode == "dealii" else (phi0 if merit_mode == "legacy" else float(metrics0["merit"]))

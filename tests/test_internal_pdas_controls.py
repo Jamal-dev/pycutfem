@@ -2072,6 +2072,19 @@ def test_direct_solve_quality_check_is_looser_for_vi_augmented_context(monkeypat
         solver._linear_solve_context = None
 
 
+def test_vi_augmented_usable_direct_solve_quality_tracks_current_vi_residual() -> None:
+    solver = _build_scalar_vi_solver(vi_params=VIParameters())
+    solver._linear_solve_context = "vi_augmented"
+    try:
+        solver._current_newton_residual_norm = 1.2e-1
+        assert solver._direct_solve_quality_passes(4.0e-4, 4.0e-4)
+
+        solver._current_newton_residual_norm = 1.0e-4
+        assert not solver._direct_solve_quality_passes(4.0e-4, 4.0e-4)
+    finally:
+        solver._linear_solve_context = None
+
+
 def test_internal_pdas_inactive_regularization_shifts_only_inactive_block() -> None:
     solver = _build_scalar_vi_solver(
         vi_params=VIParameters(inactive_reg_lambda0=0.5, inactive_reg_min_diag=1.0e-12)

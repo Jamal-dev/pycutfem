@@ -46,7 +46,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import numpy as np
 
-from pycutfem.ufl.expressions import Constant, FacetNormal, Identity, div, dot, grad, inner
+from pycutfem.ufl.expressions import Constant, FacetNormal, Identity, div, dot, grad, inner, trace
 
 from .one_domain import (
     _as_constant,
@@ -330,7 +330,10 @@ def build_deformation_only_forms(
             )
         if pi_s_k is None or pi_s_n is None or dpi_s is None or pi_s_test is None:
             raise ValueError("solid_volumetric_split requires (pi_s_k, pi_s_n, dpi_s, pi_s_test).")
-        total_pressure_ref = 2.0 * float(mu_s) + 2.0 * float(lambda_s)
+        if _is_seboldt_neo_hookean_model(solid_model_key):
+            total_pressure_ref = float(lambda_s)
+        else:
+            total_pressure_ref = 2.0 * float(mu_s) + 2.0 * float(lambda_s)
         if not np.isfinite(total_pressure_ref) or total_pressure_ref <= 0.0:
             raise ValueError("solid_volumetric_split requires a positive total-pressure reference scale.")
 
@@ -347,7 +350,10 @@ def build_deformation_only_forms(
     total_pressure_ref_inv_c = _as_constant(1.0 if total_pressure_ref is None else (1.0 / float(total_pressure_ref)))
     drained_bulk_modulus = None
     if total_pressure_ref is not None:
-        drained_bulk_modulus = float(lambda_s) + float(mu_s)
+        if _is_seboldt_neo_hookean_model(solid_model_key):
+            drained_bulk_modulus = float(lambda_s)
+        else:
+            drained_bulk_modulus = float(lambda_s) + float(mu_s)
     drained_bulk_over_total_pressure_ref_c = _as_constant(
         1.0 if total_pressure_ref is None else (float(drained_bulk_modulus) / float(total_pressure_ref))
     )

@@ -37,12 +37,16 @@ We provide two compressible Neo-Hookean **Cauchy** stresses in spatial form:
   1. Historical ref-map/FPI law:
        σ(u) = (2c/J) (B - a I),   B = F F^T,   a = J^{-2β}
 
-  2. Seboldt-consistent fully Eulerian law:
+  2. Seboldt Example 2 wall law:
        σ(u) = (μ/J) (B - I) + λ (J - 1) I
 
 Both are expressed directly in the spatial/Eulerian frame using the reference-
-map kinematics F=(I-∇u)^{-1}. The second form is the one-domain Eulerian
-translation of the compressible wall model used in Seboldt Example 2.
+map kinematics F=(I-∇u)^{-1}. The second form is the Eulerian translation of
+the compressible wall model used in Seboldt Example 2,
+
+  W = C1 (I1 - d - 2 ln J) + D1 (J - 1)^2,
+
+with 2 C1 = μ and 2 D1 = λ.
 """
 
 from __future__ import annotations
@@ -128,12 +132,15 @@ def dsigma_neo_hookean(u, du, c, beta, *, dim: int = 2):
 
 def sigma_neo_hookean_seboldt(u, mu_s, lambda_s, *, dim: int = 2):
     """
-    Seboldt-consistent compressible Neo-Hookean Cauchy stress in Eulerian form.
+    Seboldt Example 2 compressible Neo-Hookean Cauchy stress in Eulerian form.
 
-    The stress is written directly in spatial variables from the reference-map
-    kinematics:
+    Derived from the paper's energy
 
-      σ(u) = (μ/J) (B - I) + λ (J - 1) I,
+      W = C1 (I1 - d - 2 ln J) + D1 (J - 1)^2,
+
+    with 2 C1 = mu_s and 2 D1 = lambda_s. The resulting Cauchy stress is
+
+      σ(u) = (mu_s / J) (B - I) + lambda_s (J - 1) I,
 
     where F=(I-∇u)^{-1}, J=det(F), and B=F Fᵀ.
     """
@@ -156,8 +163,10 @@ def dsigma_neo_hookean_seboldt(u, du, mu_s, lambda_s, *, dim: int = 2):
     I = Identity(int(dim))
     B = dot(F, F.T)
     dB = dot(dF, F.T) + dot(F, dF.T)
+    pref = mu_s / J
+    dpref = -mu_s * (dJ / (J * J))
 
-    return mu_s * (-(dJ / (J * J)) * (B - I) + (Constant(1.0) / J) * dB) + lambda_s * dJ * I
+    return dpref * (B - I) + pref * dB + lambda_s * dJ * I
 
 
 def svk_green_lagrange(u, *, dim: int = 2):
