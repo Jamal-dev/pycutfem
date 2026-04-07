@@ -119,7 +119,15 @@ def contract_first_first(a, b, dtype):
     if DEBUG: print("contract_first_first")
     if b.ndim == 0:
         raise ValueError("contract_first_first: second operand must have at least 1 dimension")
-    if a.shape[0] != b.shape[0]:
+
+    if b.ndim == 1:
+        b_flat = np.ascontiguousarray(b)
+    elif b.ndim == 2 and (b.shape[0] == 1 or b.shape[1] == 1):
+        b_flat = np.ascontiguousarray(b).reshape(b.size)
+    else:
+        raise ValueError("contract_first_first: second operand must be a 1D vector or row/column matrix")
+
+    if a.shape[0] != b_flat.shape[0]:
         raise ValueError("Dot dimension mismatch")
 
     # --- Setup for 'a' ---
@@ -130,19 +138,13 @@ def contract_first_first(a, b, dtype):
     a_flat = np.ascontiguousarray(a).reshape(a.shape[0], left_dim)
     
     # --- Setup for 'b'  ---
-    if b.ndim == 1:
-        # b is a 1D vector, shape (k,)
-        b_flat = np.ascontiguousarray(b)
-        a_flat_t = np.ascontiguousarray(a_flat.T)
-        # dot_flat is (m*n, k) @ (k,) -> (m*n,)
-        dot_flat = a_flat_t @ b_flat
-        # out_shape is (m, n)
-        out_shape = a.shape[1:]
-        # (m*n,).reshape(m, n) -> Correct
-        return dot_flat.reshape(out_shape)
-    
-    else:
-        raise ValueError("contract_first_first: second operand must be 1D vector")
+    a_flat_t = np.ascontiguousarray(a_flat.T)
+    # dot_flat is (m*n, k) @ (k,) -> (m*n,)
+    dot_flat = a_flat_t @ b_flat
+    # out_shape is (m, n)
+    out_shape = a.shape[1:]
+    # (m*n,).reshape(m, n) -> Correct
+    return dot_flat.reshape(out_shape)
 
 
 
@@ -153,6 +155,13 @@ def dot_mixed_const(a, b, dtype):
     Vectorized via (k*nm) matvec.
     """
     if DEBUG: print("dot_mixed_const")
+    if b.ndim == 2:
+        if b.shape[0] == 1 or b.shape[1] == 1:
+            b = np.ascontiguousarray(b).reshape(b.size)
+        else:
+            raise ValueError("dot_mixed_const: constant operand must be 1D or row/column matrix")
+    elif b.ndim != 1:
+        raise ValueError("dot_mixed_const: constant operand must be 1D or row/column matrix")
     k = a.shape[0]
     nm = a.shape[1] * a.shape[2]
     a2 = np.ascontiguousarray(a).reshape(k, nm)
@@ -168,11 +177,58 @@ def dot_const_mixed(a, b, dtype):
     Vectorized via (1 x k) @ (k x nm).
     """
     if DEBUG: print("dot_const_mixed")
+    if a.ndim == 2:
+        if a.shape[0] == 1 or a.shape[1] == 1:
+            a = np.ascontiguousarray(a).reshape(a.size)
+        else:
+            raise ValueError("dot_const_mixed: constant operand must be 1D or row/column matrix")
+    elif a.ndim != 1:
+        raise ValueError("dot_const_mixed: constant operand must be 1D or row/column matrix")
     k = b.shape[0]
     nm = b.shape[1] * b.shape[2]
     b2 = np.ascontiguousarray(b).reshape(k, nm)
     return (np.ascontiguousarray(a) @ b2).reshape(b.shape[1], b.shape[2])
 
+
+
+@numba.njit(cache=True)
+def dot_vec_grad_components(vec_basis, grad_basis, swap_roles, dtype):
+    """
+    Contract vector basis components with gradient basis components.
+
+    vec_basis : (k, n_vec)
+    grad_basis:
+      - scalar gradient basis: (d, n_grad)
+      - vector gradient basis: (k, n_grad, d)
+
+    Canonical ordering is rows=test, cols=trial. `swap_roles=True` means the
+    left vector basis is the test side and the right gradient basis is the
+    trial side.
+    """
+    if DEBUG: print("dot_vec_grad_components")
+    if grad_basis.ndim == 2:
+        if vec_basis.shape[0] != grad_basis.shape[0]:
+            raise ValueError("dot_vec_grad_components: scalar-gradient component mismatch")
+        if swap_roles:
+            return np.ascontiguousarray(vec_basis.T) @ np.ascontiguousarray(grad_basis)
+        return np.ascontiguousarray(grad_basis.T) @ np.ascontiguousarray(vec_basis)
+
+    k_vec, n_vec = vec_basis.shape
+    k_grad, n_grad, d_dim = grad_basis.shape
+    if k_vec != k_grad:
+        raise ValueError("dot_vec_grad_components: vector/gradient component mismatch")
+
+    n_rows = n_vec if swap_roles else n_grad
+    n_cols = n_grad if swap_roles else n_vec
+    out = np.zeros((d_dim, n_rows, n_cols), dtype=dtype)
+    vec_basis_c = np.ascontiguousarray(vec_basis)
+    grad_basis_c = np.ascontiguousarray(grad_basis)
+    for r in range(d_dim):
+        if swap_roles:
+            out[r] = np.ascontiguousarray(vec_basis_c.T) @ np.ascontiguousarray(grad_basis_c[:, :, r])
+        else:
+            out[r] = np.ascontiguousarray(grad_basis_c[:, :, r].T) @ vec_basis_c
+    return out
 
 
 @numba.njit(cache=True)

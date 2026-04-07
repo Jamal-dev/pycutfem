@@ -71,7 +71,15 @@ except ImportError:  # pragma: no cover - platform dependent.
 #   stack-aware dot-case lowering for basis/value tensor contractions.
 # - v65 invalidates kernels after fixing sum-path layout lookup to use the
 #   lowering result instead of ExpressionMeta.
-CODEGEN_ABI_CPP = "2026-04-07-cpp-v65-sum-layout-fix"
+# - v66 invalidates kernels after normalizing row/column rank-1 values through
+#   the shared mixed-dot contraction helpers.
+# - v67 invalidates kernels after forcing all vector-tagged C++ temporaries to
+#   materialize as true `Eigen::VectorXd` values instead of relying on `auto`
+#   expressions that could still be row/column matrices.
+# - v68 invalidates kernels after routing 2D basis-rank1 contractions,
+#   including scalar-gradient test/trial carriers, through the shared
+#   mass-style contraction path instead of the stack-only grad-grad helper.
+CODEGEN_ABI_CPP = "2026-04-07-cpp-v68-rank1-basis-contractions"
 
 
 @contextmanager

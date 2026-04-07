@@ -421,9 +421,9 @@ def _cpp_vector_input_expr(item: Any) -> str:
     shape = tuple(int(v) for v in (getattr(item, "shape", ()) or ()))
     name = str(getattr(item, "name", ""))
     actual_kind = str(getattr(item, "tmp_kind", "") or getattr(item, "kind", "") or "")
+    if len(shape) == 2 and (int(shape[0]) == 1 or int(shape[1]) == 1):
+        return f"matrix_like_to_vector({_cpp_matrix_input_expr(item)})"
     if actual_kind == "mat":
-        if len(shape) == 2 and (int(shape[0]) == 1 or int(shape[1]) == 1):
-            return f"matrix_like_to_vector({name})"
         return f"matrix_like_to_vector({name})"
     return name
 
@@ -456,6 +456,21 @@ def _value_spec_is_scalar_basis_row(spec: Any) -> bool:
     if spec is None:
         return False
     return _meta_is_scalar_basis_row(getattr(spec, "meta", None))
+
+
+def _meta_is_value_rank1(meta: Any) -> bool:
+    tensor = getattr(meta, "tensor", None)
+    return bool(
+        tensor is not None
+        and int(getattr(tensor, "basis_rank", -1)) == 0
+        and int(getattr(tensor, "tensor_rank", -1)) == 1
+    )
+
+
+def _value_spec_is_value_rank1(spec: Any) -> bool:
+    if spec is None:
+        return False
+    return _meta_is_value_rank1(getattr(spec, "meta", None))
 
 
 def _scalar_basis_row_shape(shape: tuple[int, ...]) -> tuple[int, int]:
@@ -1332,10 +1347,12 @@ class CppCodeGen:
                 emit_line(f"double {name} = {expr};")
 
         def emit_vec(name: str, expr: str, *, tmp_kind: str | None = None) -> None:
+            tmp_name = new_tmp("vec_eval")
+            emit_line(f"auto {tmp_name} = ({expr}).eval();")
             if tmp_kind is not None:
-                emit_line(f"{name} = ({expr}).eval();")
+                emit_line(f"{name} = ensure_vector({tmp_name});")
             else:
-                emit_line(f"auto {name} = ({expr}).eval();")
+                emit_line(f"Eigen::VectorXd {name} = ensure_vector({tmp_name});")
 
         def emit_mat(name: str, expr: str, *, tmp_kind: str | None = None) -> None:
             if tmp_kind is not None:
@@ -3355,8 +3372,10 @@ class CppCodeGen:
                         )
                     )
                 )
-                a_sum_vector_like = a.kind == "vec" or a_rank1_matrix
-                b_sum_vector_like = b.kind == "vec" or b_rank1_matrix
+                a_semantic_value_rank1 = _semantic_is_value_rank1(a, spatial_dim=self.spatial_dim)
+                b_semantic_value_rank1 = _semantic_is_value_rank1(b, spatial_dim=self.spatial_dim)
+                a_sum_vector_like = a.kind == "vec" or a_rank1_matrix or a_semantic_value_rank1
+                b_sum_vector_like = b.kind == "vec" or b_rank1_matrix or b_semantic_value_rank1
                 a_stack_runtime = _semantic_uses_cpp_stack_storage(a, spatial_dim=self.spatial_dim)
                 b_stack_runtime = _semantic_uses_cpp_stack_storage(b, spatial_dim=self.spatial_dim)
                 sum_planned_kind = getattr(sum_value_spec, "kind", "") or ""
@@ -3379,6 +3398,10 @@ class CppCodeGen:
                     if sum_value_spec is not None
                     else (sum_plan.result if sum_plan is not None else (a.expression_meta or b.expression_meta))
                 )
+                sum_result_is_semantic_value_rank1 = bool(
+                    (sum_plan is not None and _meta_is_value_rank1(sum_plan.result))
+                    or _value_spec_is_value_rank1(sum_value_spec)
+                )
                 if op.op_symbol == "+":
                     if sum_result_is_scalar_basis_row and a_sum_vector_like and b_sum_vector_like:
                         nm, tmp_kind, tmp_slot = alloc_tmp("mat", "bin")
@@ -3397,6 +3420,26 @@ class CppCodeGen:
                             tmp_slot=tmp_slot,
                             layout_tag=(sum_value_spec.layout.value if sum_value_spec is not None else ""),
                             expression_meta=(sum_value_spec.meta if sum_value_spec is not None else (sum_plan.result if sum_plan is not None else None)),
+                            respect_sum_specs=False,
+                        )
+                        continue
+                    if sum_result_is_semantic_value_rank1 and a_sum_vector_like and b_sum_vector_like:
+                        nm, tmp_kind, tmp_slot = alloc_tmp("vec", "bin")
+                        emit_vec(
+                            nm,
+                            f"{_cpp_sum_vector_expr(a, spatial_dim=self.spatial_dim)} + {_cpp_sum_vector_expr(b, spatial_dim=self.spatial_dim)}",
+                            tmp_kind=tmp_kind,
+                        )
+                        push_bin(
+                            "vec",
+                            getattr(sum_value_spec, "role", "") or getattr(sum_plan.result.tensor, "role", "") or a.role,
+                            getattr(sum_value_spec, "shape", ()) or a.shape or b.shape,
+                            a.field_names or b.field_names,
+                            a.parent or b.parent,
+                            tmp_kind=tmp_kind,
+                            tmp_slot=tmp_slot,
+                            layout_tag=sum_layout_tag,
+                            expression_meta=sum_expression_meta,
                             respect_sum_specs=False,
                         )
                         continue
@@ -3611,6 +3654,26 @@ class CppCodeGen:
                             tmp_slot=tmp_slot,
                             layout_tag=(sum_value_spec.layout.value if sum_value_spec is not None else ""),
                             expression_meta=(sum_value_spec.meta if sum_value_spec is not None else (sum_plan.result if sum_plan is not None else None)),
+                            respect_sum_specs=False,
+                        )
+                        continue
+                    if sum_result_is_semantic_value_rank1 and a_sum_vector_like and b_sum_vector_like:
+                        nm, tmp_kind, tmp_slot = alloc_tmp("vec", "bin")
+                        emit_vec(
+                            nm,
+                            f"{_cpp_sum_vector_expr(a, spatial_dim=self.spatial_dim)} - {_cpp_sum_vector_expr(b, spatial_dim=self.spatial_dim)}",
+                            tmp_kind=tmp_kind,
+                        )
+                        push_bin(
+                            "vec",
+                            getattr(sum_value_spec, "role", "") or getattr(sum_plan.result.tensor, "role", "") or a.role,
+                            getattr(sum_value_spec, "shape", ()) or a.shape or b.shape,
+                            a.field_names or b.field_names,
+                            a.parent or b.parent,
+                            tmp_kind=tmp_kind,
+                            tmp_slot=tmp_slot,
+                            layout_tag=sum_layout_tag,
+                            expression_meta=sum_expression_meta,
                             respect_sum_specs=False,
                         )
                         continue
@@ -5565,7 +5628,10 @@ class CppCodeGen:
                             a.parent or b.parent,
                             side,
                             a.field_sides or b.field_sides,
-                            layout_tag=(dot_lowering.result.layout.value if dot_lowering is not None else ""),
+                            # dot_vec_grad_components materializes component-first
+                            # stack storage regardless of whether the surviving
+                            # semantic free axis is the derivative direction.
+                            layout_tag=MixedLayout.COMPONENT_FIRST.value,
                             expression_meta=dot_meta,
                         )
                     continue
@@ -5573,11 +5639,12 @@ class CppCodeGen:
                 if (
                     a.role in {"trial", "test"}
                     and b.role in {"trial", "test"}
-                    and a.kind == "mat"
-                    and b.kind == "mat"
+                    and a.kind in {"mat", "grad"}
+                    and b.kind in {"mat", "grad"}
+                    and len(a.shape) == 2
+                    and len(b.shape) == 2
                     and _semantic_is_basis_rank1(a, spatial_dim=self.spatial_dim)
                     and _semantic_is_basis_rank1(b, spatial_dim=self.spatial_dim)
-                    and not (a.is_gradient or b.is_gradient or a.is_hessian or b.is_hessian)
                 ):
                     component_carried_mixed = bool(
                         (
@@ -5630,7 +5697,14 @@ class CppCodeGen:
 
                 # trial/test mass
                 # Gradient advection combinations: grad(Function) · Trial  or Trial · grad(Function)
-                if a.kind == "grad" and b.kind == "grad" and a.role in {"test", "trial"} and b.role in {"test", "trial"}:
+                if (
+                    a.kind == "grad"
+                    and b.kind == "grad"
+                    and len(a.shape) >= 3
+                    and len(b.shape) >= 3
+                    and a.role in {"test", "trial"}
+                    and b.role in {"test", "trial"}
+                ):
                     flag = 1 if (a.role == "trial" and b.role == "test") else (2 if (a.role == "test" and b.role == "trial") else 0)
                     if flag == 0:
                         raise NotImplementedError("dot_grad_grad_mixed expects test/trial or trial/test combination.")
@@ -6274,7 +6348,7 @@ class CppCodeGen:
                     and b.role in {"const", "value"}
                 ):
                     nm, tmp_kind, tmp_slot = alloc_tmp("mat", "dot")
-                    emit_mat(nm, f"contract_first_first({a.name}, {b.name})", tmp_kind=tmp_kind)
+                    emit_mat(nm, f"contract_first_first({a.name}, {_cpp_dot_value_operand_expr(b, 1)})", tmp_kind=tmp_kind)
                     fallback_shape = (a.shape[1], a.shape[2]) if len(a.shape) == 3 else a.shape[1:]
                     push(
                         (dot_value_spec.kind if dot_value_spec is not None else "mat"),
@@ -6369,7 +6443,7 @@ class CppCodeGen:
                     and a.role in {"const", "value"}
                 ):
                     nm, tmp_kind, tmp_slot = alloc_tmp("mat", "dot")
-                    emit_mat(nm, f"contract_first_first({b.name}, {a.name})", tmp_kind=tmp_kind)
+                    emit_mat(nm, f"contract_first_first({b.name}, {_cpp_dot_value_operand_expr(a, 1)})", tmp_kind=tmp_kind)
                     fallback_shape = (b.shape[1], b.shape[2]) if len(b.shape) == 3 else b.shape[1:]
                     push(
                         (dot_value_spec.kind if dot_value_spec is not None else "mat"),

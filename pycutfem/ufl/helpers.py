@@ -437,6 +437,68 @@ class VecOpInfo(BaseOpInfo):
             return VecOpInfo(data, role=f"{role}_n", **self.update_meta(meta)) # (n,)
         else: # lhs
             return VecOpInfo(data[np.newaxis,:], role=role, **self.update_meta(meta)) # (1,n)
+
+    def _matrix_contract_left(self, other: np.ndarray) -> "BaseOpInfo":
+        mat = np.asarray(other, dtype=float)
+        if mat.ndim != 2:
+            raise NotImplementedError(self._error_msg(other, "matrix_contract_left"))
+
+        meta = self.update_meta(self.meta())
+        if self.role in {"function", "vector"}:
+            vals = _collapsed_function(self) if self.role == "function" else np.asarray(self.data, dtype=float)
+            vals = np.asarray(vals, dtype=float).reshape(-1)
+            if mat.shape[1] != vals.shape[0]:
+                raise NotImplementedError(self._error_msg(other, "matrix_contract_left"))
+            data = mat @ vals
+            role = "scalar" if np.ndim(data) == 0 or np.asarray(data).shape == (1,) else "vector"
+            return VecOpInfo(np.asarray(data), role=role, **meta)
+
+        if self.role in {"trial", "test", "trial_n", "test_n"}:
+            basis = np.asarray(self.data, dtype=float)
+            if basis.ndim == 2 and mat.shape[1] == basis.shape[0]:
+                data = np.einsum("ij,jn->in", mat, basis, optimize=True)
+                return VecOpInfo(data, role=self.role, **meta)
+            raise NotImplementedError(self._error_msg(other, "matrix_contract_left"))
+
+        if self.role == "mixed":
+            mixed = np.asarray(self.data, dtype=float)
+            if mixed.ndim == 3 and mat.shape[1] == mixed.shape[0]:
+                data = np.einsum("ij,jmn->imn", mat, mixed, optimize=True)
+                return VecOpInfo(data, role=self.role, **meta)
+            raise NotImplementedError(self._error_msg(other, "matrix_contract_left"))
+
+        raise NotImplementedError(self._error_msg(other, "matrix_contract_left"))
+
+    def _matrix_contract_right(self, other: np.ndarray) -> "BaseOpInfo":
+        mat = np.asarray(other, dtype=float)
+        if mat.ndim != 2:
+            raise NotImplementedError(self._error_msg(other, "matrix_contract_right"))
+
+        meta = self.update_meta(self.meta())
+        if self.role in {"function", "vector"}:
+            vals = _collapsed_function(self) if self.role == "function" else np.asarray(self.data, dtype=float)
+            vals = np.asarray(vals, dtype=float).reshape(-1)
+            if vals.shape[0] != mat.shape[0]:
+                raise NotImplementedError(self._error_msg(other, "matrix_contract_right"))
+            data = vals @ mat
+            role = "scalar" if np.ndim(data) == 0 or np.asarray(data).shape == (1,) else "vector"
+            return VecOpInfo(np.asarray(data), role=role, **meta)
+
+        if self.role in {"trial", "test", "trial_n", "test_n"}:
+            basis = np.asarray(self.data, dtype=float)
+            if basis.ndim == 2 and basis.shape[0] == mat.shape[0]:
+                data = np.einsum("in,ij->jn", basis, mat, optimize=True)
+                return VecOpInfo(data, role=self.role, **meta)
+            raise NotImplementedError(self._error_msg(other, "matrix_contract_right"))
+
+        if self.role == "mixed":
+            mixed = np.asarray(self.data, dtype=float)
+            if mixed.ndim == 3 and mixed.shape[0] == mat.shape[0]:
+                data = np.einsum("imn,ij->jmn", mixed, mat, optimize=True)
+                return VecOpInfo(data, role=self.role, **meta)
+            raise NotImplementedError(self._error_msg(other, "matrix_contract_right"))
+
+        raise NotImplementedError(self._error_msg(other, "matrix_contract_right"))
     
 
     def inner(self, other: Optional[Union["VecOpInfo", np.ndarray]]) -> np.ndarray:
@@ -566,7 +628,7 @@ class VecOpInfo(BaseOpInfo):
         elif self.role in {"mixed"}:
             if self.shape[0] == const.shape[0]:
                 data = np.einsum("kmn,k->mn", self.data, const, optimize=True)
-                return data
+                return self._with(data, role=self.role)
         elif self.role == "scalar":
             data = self.data * const
             role = "vector" if data.ndim == 1 else "scalar"
@@ -674,6 +736,13 @@ class VecOpInfo(BaseOpInfo):
                 return VecOpInfo(data, role="vector",
                                 **self.update_meta(meta))
             else: raise NotImplementedError(self._error_msg(grad, "dot_grad"))
+        elif self.role == "mixed" and grad.role in {"function", "scalar"}:
+            grad_val = _collapsed_grad(grad)
+            meta = _resolve_meta(self.meta(), meta_grad, prefer='a')
+            if grad_val.shape[0] == 1 and self.shape[0] == grad_val.shape[1]:
+                data = np.einsum("kmn,k->mn", self.data, grad_val[0], optimize=True)
+                return VecOpInfo(data, role=self.role, **self.update_meta(meta))
+            raise NotImplementedError(self._error_msg(grad, "dot_grad"))
         elif self.role in {"trial", "test", "trial_n", "test_n"} and grad.role in {"trial", "test", "trial_n", "test_n"}:
             # Use the gradient-side contraction as the single source of truth
             # for mixed basis vector · basis gradient. This keeps the carried
@@ -692,6 +761,9 @@ class VecOpInfo(BaseOpInfo):
             raise TypeError(f"Expected VecOpInfo, got {type(other_vec)}.")
         if other_vec.shape[0] != self.data.shape[0]:
             raise ValueError(f"Input vector of shape {other_vec.shape} cannot be dotted with VecOpInfo of shape {self.data.shape}.")
+
+        if self.role in {"function", "vector"} and other_vec.role == "mixed":
+            return other_vec.dot_vec(self)
         
         # case 1 function dot test
         if  self.role in {"function", "vector"} and other_vec.role in {"test", "trial"}: # rhs time derivative term
@@ -754,6 +826,13 @@ class VecOpInfo(BaseOpInfo):
                 return VecOpInfo(data, role=self.role, **self.update_meta(meta))
             else:
                 raise NotImplementedError(self._error_msg(other_vec, "dot_vec"))
+        if self.role == "mixed" and other_vec.role == "vector":
+            meta = _resolve_meta(self.meta(), other_vec.meta(), prefer='a')
+            v_values = np.asarray(other_vec.data, dtype=float).reshape(-1)
+            if self.shape[0] == v_values.shape[0]:
+                data = np.einsum("kmn,k->mn", self.data, v_values, optimize=True)
+                return VecOpInfo(data, role=self.role, **self.update_meta(meta))
+            raise NotImplementedError(self._error_msg(other_vec, "dot_vec"))
         # case 4 function and function
         if self.role == "function" and other_vec.role == "function":
             u_values = _collapsed_function(self)  # shape (k,)
@@ -806,6 +885,11 @@ class VecOpInfo(BaseOpInfo):
                     return self._with(vals * other, role="vector")
                 return self._with(np.asarray([self.data[0,:] * comp for comp in other]), role=self.role)
             elif other.ndim == 2:
+                if self.role in {"function", "vector", "trial", "test", "trial_n", "test_n", "mixed"}:
+                    try:
+                        return self._matrix_contract_right(other)
+                    except NotImplementedError:
+                        pass
                 # Scale a matrix by a scalar-valued function (e.g. div(u_k) * dot(u_trial, v_test)
                 # in the skew-symmetric convection Jacobian).
                 if self.data.ndim == 0:
@@ -1138,13 +1222,11 @@ class VecOpInfo(BaseOpInfo):
     def __rmul__(self, other: Union[float, np.ndarray]) -> "VecOpInfo":
         if isinstance(other, np.ndarray):
             other = np.asarray(other)
-            if other.ndim == 2 and self.role in {"function", "vector"}:
-                vals = _collapsed_function(self) if self.role == "function" else np.asarray(self.data, dtype=float)
-                vals = np.asarray(vals, dtype=float)
-                if vals.ndim == 1 and other.shape[1] == vals.shape[0]:
-                    data = other @ vals
-                    role = "scalar" if np.ndim(data) == 0 or (np.ndim(data) == 1 and np.asarray(data).shape == (1,)) else "vector"
-                    return VecOpInfo(np.asarray(data), role=role, **self.update_meta(self.meta()))
+            if other.ndim == 2 and self.role in {"function", "vector", "trial", "test", "trial_n", "test_n", "mixed"}:
+                try:
+                    return self._matrix_contract_left(other)
+                except NotImplementedError:
+                    pass
         return self.__mul__(other)
 
     def __truediv__(self, other):
@@ -1681,7 +1763,12 @@ class GradOpInfo(BaseOpInfo):
                     if self.data.shape[0] != left_vec.data.shape[0]:
                         raise NotImplementedError(self._error_msg(left_vec, "left_dot with vector"))
                     meta = _resolve_meta(self.meta(), left_vec.meta(), prefer='a')
-                    data = np.einsum("km,knd->dnm", left_vec.data, self.data, optimize=True)
+                    if left_vec.role.startswith("test") and self.role.startswith("trial"):
+                        data = np.einsum("km,knd->dmn", left_vec.data, self.data, optimize=True)
+                    elif left_vec.role.startswith("trial") and self.role.startswith("test"):
+                        data = np.einsum("km,knd->dnm", left_vec.data, self.data, optimize=True)
+                    else:
+                        data = np.einsum("km,knd->dmn", left_vec.data, self.data, optimize=True)
                     return VecOpInfo(data, role="mixed", **self.update_meta(meta))
                 if left_vec.role == "function":
                     u_vals = _collapsed_function(left_vec)  # shape (k,)
@@ -1758,6 +1845,9 @@ class GradOpInfo(BaseOpInfo):
         """
         
         if isinstance(other_vec, (VecOpInfo)): # this part is until trial grad(u) dot u_k  ((∇u) · u_k)
+
+            if self.role in {"function", "scalar"} and other_vec.role == "mixed":
+                return other_vec.dot_grad(self)
 
             if self.role == "function" and other_vec.role == "trial": # introducing a new branch
                 # Case:  Grad(Function) · Vec(Trial)      (∇u_k) · u

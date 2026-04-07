@@ -480,6 +480,12 @@ class KernelRunner:
 
         debug = os.getenv("PYCUTFEM_JIT_DEBUG", "").lower() in {"1", "true", "yes"}
 
+        def _kernel_float64_arg(value):
+            arr = np.asarray(value, dtype=np.float64)
+            if arr.ndim == 0:
+                return arr
+            return np.ascontiguousarray(arr)
+
         # ---------------------------------------------------------------
         # A)  start from a shallow copy of the caller-supplied dict
         # ---------------------------------------------------------------
@@ -498,7 +504,7 @@ class KernelRunner:
                         continue
                     try:
                         # Scalars are carried as 0d arrays for ABI compatibility.
-                        kernel_args[name] = np.asarray(getattr(const, "value", const), dtype=np.float64)
+                        kernel_args[name] = _kernel_float64_arg(getattr(const, "value", const))
                     except Exception as exc:
                         raise TypeError(
                             f"[jit] Failed converting Constant '{name}' to float64 array for kernel "
@@ -695,12 +701,12 @@ class KernelRunner:
             val = functions[tag]
             try:
                 if isinstance(val, np.ndarray):
-                    kernel_args[tag] = val
+                    kernel_args[tag] = np.ascontiguousarray(val) if val.ndim > 0 else val
                 elif hasattr(val, "value") and not hasattr(val, "nodal_values"):
                     # UFL Constant-like object (scalar or array)
-                    kernel_args[tag] = np.asarray(val.value, dtype=np.float64)
+                    kernel_args[tag] = _kernel_float64_arg(val.value)
                 else:
-                    kernel_args[tag] = np.asarray(val, dtype=np.float64)
+                    kernel_args[tag] = _kernel_float64_arg(val)
             except Exception as exc:
                 raise TypeError(
                     f"[jit] Failed converting auxiliary kernel arg '{tag}' (type={type(val).__name__}) "

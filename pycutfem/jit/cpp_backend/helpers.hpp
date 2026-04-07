@@ -636,6 +636,19 @@ inline Eigen::MatrixXd contract_first_first(const std::vector<Eigen::MatrixXd>& 
     return result;
 }
 
+inline Eigen::MatrixXd contract_first_first(const std::vector<Eigen::MatrixXd>& A,
+                                            const Eigen::MatrixXd& B) {
+    if (B.rows() == 1) {
+        Eigen::VectorXd vec = B.row(0).transpose().eval();
+        return contract_first_first(A, vec);
+    }
+    if (B.cols() == 1) {
+        Eigen::VectorXd vec = B.col(0).eval();
+        return contract_first_first(A, vec);
+    }
+    throw std::runtime_error("contract_first_first: second operand must be a vector or row/column matrix");
+}
+
 // Matrix (m,k) contracted with the component axis of a gradient stack (k,n,d)
 // -> gradient stack (m,n,d).
 inline std::vector<Eigen::MatrixXd> contract_component_matrix_grad(
@@ -1810,6 +1823,14 @@ inline Eigen::VectorXd matrix_like_to_vector(const Eigen::MatrixXd& mat_like) {
         return mat_like.col(0);
     }
     throw std::runtime_error("matrix_like_to_vector: expected a row/column matrix");
+}
+
+inline Eigen::VectorXd ensure_vector(const Eigen::VectorXd& vec_like) {
+    return vec_like;
+}
+
+inline Eigen::VectorXd ensure_vector(const Eigen::MatrixXd& mat_like) {
+    return matrix_like_to_vector(mat_like);
 }
 
 inline double dot_matrix_like_vector(const Eigen::MatrixXd& mat_like,

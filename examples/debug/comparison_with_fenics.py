@@ -1,4 +1,5 @@
 import argparse
+import atexit
 import numpy as np
 import pandas as pd
 import os
@@ -7,6 +8,36 @@ import re
 import sys
 import scipy.sparse as sp
 import traceback
+
+
+def _extract_cli_backend_spec(argv: list[str]) -> str:
+    for idx, token in enumerate(argv[1:], start=1):
+        if token in {"--backend", "--backends"}:
+            if idx + 1 < len(argv):
+                return argv[idx + 1]
+            return ""
+        if token.startswith("--backend="):
+            return token.split("=", 1)[1]
+        if token.startswith("--backends="):
+            return token.split("=", 1)[1]
+    return ""
+
+
+def _preconfigure_backend_mode_from_argv(argv: list[str]) -> None:
+    backend_spec = _extract_cli_backend_spec(argv).strip()
+    if not backend_spec:
+        return
+    for raw_token in backend_spec.split(","):
+        token = raw_token.strip().lower()
+        if token == "fast_jit":
+            os.environ["NUMBA_DISABLE_JIT"] = "1"
+        elif token == "fast_cpp":
+            os.environ["PYCUTFEM_CPP_FAST_COMPILE"] = "1"
+
+
+if __name__ == "__main__":
+    _preconfigure_backend_mode_from_argv(sys.argv)
+
 
 # FEniCSx imports
 from mpi4py import MPI
@@ -29,7 +60,7 @@ from pycutfem.ufl.expressions import (
     HdivTrialFunction,
     TrialFunction, TestFunction, VectorTrialFunction, VectorTestFunction,
     Function, VectorFunction, Constant, grad, inner,
-    dot, div, trace, Hessian, Laplacian, FacetNormal, Identity, det, inv, dyad,
+    dot, div, trace, Hessian, Laplacian, FacetNormal, Identity, det, inv, cof, dyad,
     pos_part, heaviside, MeshSize, CellDiameter,
 )
 from pycutfem.ufl.measures import dx, dInterface, dS
@@ -97,7 +128,7 @@ def _parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--backend",
         "--backends",
         dest="backends",
-        help="Comma-separated backend list: python, jit, cpp, or all.",
+        help="Comma-separated backend list: python, jit, cpp, fast_jit, fast_cpp, or all.",
     )
     parser.add_argument(
         "--problem",
@@ -138,13 +169,51 @@ def _parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _normalize_backend_request(spec: str) -> tuple[str, dict[str, str]]:
+    raw_spec = (spec or "").strip()
+    if not raw_spec:
+        return "", {}
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    env_updates: dict[str, str] = {}
+
+    for raw_token in raw_spec.split(","):
+        token = raw_token.strip().lower()
+        if not token:
+            continue
+
+        actual_tokens: list[str]
+        if token == "all":
+            actual_tokens = ["python", "jit", "cpp"]
+        elif token == "fast_jit":
+            env_updates["NUMBA_DISABLE_JIT"] = "1"
+            actual_tokens = ["jit"]
+        elif token == "fast_cpp":
+            env_updates["PYCUTFEM_CPP_FAST_COMPILE"] = "1"
+            actual_tokens = ["cpp"]
+        else:
+            actual_tokens = [token]
+
+        for actual in actual_tokens:
+            if actual not in seen:
+                normalized.append(actual)
+                seen.add(actual)
+
+    return ",".join(normalized), env_updates
+
+
 def _apply_cli_defaults(args: argparse.Namespace) -> None:
     backend_spec = (args.backends or "").strip()
     problem_spec = (args.problem or "").strip()
     terms_spec = args.terms
 
-    if backend_spec:
-        os.environ["COMP_FENICS_BACKENDS"] = backend_spec
+    normalized_backend_spec, backend_env_updates = _normalize_backend_request(backend_spec)
+
+    if normalized_backend_spec:
+        os.environ["COMP_FENICS_BACKENDS"] = normalized_backend_spec
+    for env_name, env_value in backend_env_updates.items():
+        os.environ[env_name] = env_value
     if problem_spec:
         os.environ["COMP_FENICS_PROBLEM"] = problem_spec
     if terms_spec is not None:
@@ -162,10 +231,10 @@ def _apply_cli_defaults(args: argparse.Namespace) -> None:
 
     # CLI backend selection should default to the full FEniCSx parity sweep
     # unless the caller explicitly narrows the scope with --terms or --problem.
-    if backend_spec and terms_spec is None and not _env_flag("COMP_FENICS_RUN_ALL"):
+    if normalized_backend_spec and terms_spec is None and not _env_flag("COMP_FENICS_RUN_ALL"):
         os.environ["COMP_FENICS_RUN_ALL"] = "1"
     if (
-        backend_spec
+        normalized_backend_spec
         and not problem_spec
         and terms_spec is None
         and not _env_flag("COMP_FENICS_RUN_ALL_SUITES")
@@ -188,6 +257,9 @@ def _requested_backends(default: str) -> list[str]:
         spec = os.environ.get("BACKEND", "").strip()
     if not spec:
         spec = "python,jit,cpp" if _run_all_terms_requested() else default
+    spec, env_updates = _normalize_backend_request(spec)
+    for env_name, env_value in env_updates.items():
+        os.environ[env_name] = env_value
     if spec.strip().lower() == "all":
         return ["python", "jit", "cpp"]
     return [backend.strip() for backend in spec.split(",") if backend.strip()]
@@ -1333,6 +1405,52 @@ def create_true_dof_map(dof_handler_pc, W_fenicsx):
     coord_map_q1 = one_to_one_map_coords(pc_coords['p'], fx_coords['p'])
     P[pc_dofs['p']] = fx_dofs['p'][coord_map_q1]
     print("True DoF map discovered successfully.")
+    return P
+
+
+def create_true_dof_map_fluid_full(dof_handler_pc, W_fenicsx):
+    print("=" * 70)
+    print("Discovering true DoF map for full fluid (u, m, p) by matching DoF coordinates...")
+    print("=" * 70)
+
+    Wu, U_map = W_fenicsx.sub(0).collapse()
+    Wm, M_map = W_fenicsx.sub(1).collapse()
+    Wp, P_map_fx = W_fenicsx.sub(2).collapse()
+
+    Wu0, U0_map = Wu.sub(0).collapse()
+    Wu1, U1_map = Wu.sub(1).collapse()
+    Wm0, M0_map = Wm.sub(0).collapse()
+    Wm1, M1_map = Wm.sub(1).collapse()
+
+    fx_coords = {
+        "ux": Wu0.tabulate_dof_coordinates()[:, :2],
+        "uy": Wu1.tabulate_dof_coordinates()[:, :2],
+        "mx": Wm0.tabulate_dof_coordinates()[:, :2],
+        "my": Wm1.tabulate_dof_coordinates()[:, :2],
+        "p": Wp.tabulate_dof_coordinates()[:, :2],
+    }
+
+    U_map_np = np.asarray(U_map, dtype=int)
+    M_map_np = np.asarray(M_map, dtype=int)
+    fx_dofs = {
+        "ux": U_map_np[np.asarray(U0_map, dtype=int)],
+        "uy": U_map_np[np.asarray(U1_map, dtype=int)],
+        "mx": M_map_np[np.asarray(M0_map, dtype=int)],
+        "my": M_map_np[np.asarray(M1_map, dtype=int)],
+        "p": np.asarray(P_map_fx, dtype=int),
+    }
+
+    pc_fields = ["ux", "uy", "mx", "my", "p"]
+    pc_coords = {field: get_pycutfem_dof_coords(dof_handler_pc, field) for field in pc_fields}
+    pc_dofs = {field: dof_handler_pc.get_field_slice(field) for field in pc_fields}
+
+    P = np.zeros(dof_handler_pc.total_dofs, dtype=int)
+    P[pc_dofs["ux"]] = fx_dofs["ux"][one_to_one_map_coords(pc_coords["ux"], fx_coords["ux"])]
+    P[pc_dofs["uy"]] = fx_dofs["uy"][one_to_one_map_coords(pc_coords["uy"], fx_coords["uy"])]
+    P[pc_dofs["mx"]] = fx_dofs["mx"][one_to_one_map_coords(pc_coords["mx"], fx_coords["mx"])]
+    P[pc_dofs["my"]] = fx_dofs["my"][one_to_one_map_coords(pc_coords["my"], fx_coords["my"])]
+    P[pc_dofs["p"]] = fx_dofs["p"][one_to_one_map_coords(pc_coords["p"], fx_coords["p"])]
+    print("True DoF map for full fluid discovered successfully.")
     return P
 
 
@@ -4799,6 +4917,60 @@ def setup_problems():
     
     return pc, dof_handler_pc, fenicsx
 
+
+def setup_full_fluid_problems():
+    nx, ny = 1, 1
+    nodes_q2, elems_q2, _, corners_q2 = structured_quad(1.0, 1.0, nx=nx, ny=ny, poly_order=2)
+    mesh_q2 = Mesh(nodes=nodes_q2, element_connectivity=elems_q2, elements_corner_nodes=corners_q2, element_type="quad", poly_order=2)
+    mesh_q2.tag_boundary_edges({"all": lambda x, y: True})
+
+    mixed_element_pc = MixedElement(mesh_q2, field_specs={"ux": 2, "uy": 2, "p": 1, "mx": 2, "my": 2})
+    dof_handler_pc = DofHandler(mixed_element_pc, method="cg")
+
+    velocity_fs = FunctionSpace("velocity", ["ux", "uy"], dim=1)
+    pressure_fs = FunctionSpace("pressure", ["p"], dim=0)
+    mesh_fs = FunctionSpace("mesh", ["mx", "my"], dim=1)
+    pc = {
+        "du": VectorTrialFunction(velocity_fs, dof_handler=dof_handler_pc),
+        "dp": TrialFunction(name="dp", field_name="p", dof_handler=dof_handler_pc),
+        "v": VectorTestFunction(velocity_fs, dof_handler=dof_handler_pc),
+        "q": TestFunction(name="q", field_name="p", dof_handler=dof_handler_pc),
+        "dm": VectorTrialFunction(mesh_fs, dof_handler=dof_handler_pc),
+        "z": VectorTestFunction(mesh_fs, dof_handler=dof_handler_pc),
+        "u_k": VectorFunction(name="u_k", field_names=["ux", "uy"], dof_handler=dof_handler_pc),
+        "u_prev": VectorFunction(name="u_prev", field_names=["ux", "uy"], dof_handler=dof_handler_pc),
+        "a_prev": VectorFunction(name="a_prev", field_names=["ux", "uy"], dof_handler=dof_handler_pc),
+        "p_k": Function(name="p_k", field_name="p", dof_handler=dof_handler_pc),
+        "d_mesh": VectorFunction(name="d_mesh", field_names=["mx", "my"], dof_handler=dof_handler_pc),
+        "d_prev": VectorFunction(name="d_prev", field_names=["mx", "my"], dof_handler=dof_handler_pc),
+        "rho": Constant(1.0, dim=0),
+        "dt": Constant(0.1, dim=0),
+        "mu": Constant(1.0e-2, dim=0),
+    }
+
+    mesh_fx = dolfinx.mesh.create_unit_square(MPI.COMM_WORLD, nx, ny, dolfinx.mesh.CellType.quadrilateral)
+    gdim = mesh_fx.geometry.dim
+    U_el = basix.ufl.element("Lagrange", "quadrilateral", 2, shape=(gdim,))
+    M_el = basix.ufl.element("Lagrange", "quadrilateral", 2, shape=(gdim,))
+    P_el = basix.ufl.element("Lagrange", "quadrilateral", 1)
+    W_el = mixed_element([U_el, M_el, P_el])
+    W_fx = dolfinx.fem.functionspace(mesh_fx, W_el)
+    U_fx, _ = W_fx.sub(0).collapse()
+    M_fx, _ = W_fx.sub(1).collapse()
+
+    fenicsx = {
+        "mesh": mesh_fx,
+        "W": W_fx,
+        "rho": dolfinx.fem.Constant(mesh_fx, 1.0),
+        "dt": dolfinx.fem.Constant(mesh_fx, 0.1),
+        "mu": dolfinx.fem.Constant(mesh_fx, 1.0e-2),
+        "u_m_p_k": dolfinx.fem.Function(W_fx, name="u_m_p_k"),
+        "u_prev": dolfinx.fem.Function(U_fx, name="u_prev"),
+        "a_prev": dolfinx.fem.Function(U_fx, name="a_prev"),
+        "d_prev": dolfinx.fem.Function(M_fx, name="d_prev"),
+    }
+    return pc, dof_handler_pc, fenicsx
+
 def initialize_functions(pc, fenicsx, dof_handler_pc, P_map):
     print("Initializing and synchronizing function data...")
     np.random.seed(1234)
@@ -4861,6 +5033,64 @@ def initialize_functions(pc, fenicsx, dof_handler_pc, P_map):
     pycutfem_uk_values = pc['u_k'].nodal_values
     np.testing.assert_allclose(np.sort(pycutfem_uk_values), np.sort(u_k_values), rtol=1e-8, atol=1e-15)
     print("\n✅ ASSERTION PASSED: pycutfem and FEniCSx calculated the same set of nodal values for u_k.")
+
+
+def initialize_full_fluid_functions(pc, fenicsx, dof_handler_pc, P_map):
+    print("Initializing and synchronizing full fluid (u, m, p) data...")
+
+    def u_k_init_func(x):
+        return [11.0 + x[0] * x[1], 33.0 + x[1]]
+
+    def u_prev_init_func(x):
+        vals = u_k_init_func(x)
+        return [0.5 * vals[0], 0.5 * vals[1]]
+
+    def p_k_init_func(x):
+        return np.sin(2.0 * np.pi * x[0] * x[1])
+
+    def d_mesh_init_func(x):
+        return [0.08 * x[0] * (1.0 - x[1]), -0.05 * x[1] * (1.0 - x[0])]
+
+    def d_prev_init_func(x):
+        vals = d_mesh_init_func(x)
+        return [0.6 * vals[0], 0.6 * vals[1]]
+
+    def a_prev_init_func(x):
+        return [0.17 + 0.03 * x[0], -0.11 + 0.02 * x[1]]
+
+    pc["u_k"].set_values_from_function(lambda x, y: u_k_init_func([x, y]))
+    pc["u_prev"].set_values_from_function(lambda x, y: u_prev_init_func([x, y]))
+    pc["p_k"].set_values_from_function(lambda x, y: p_k_init_func([x, y]))
+    pc["d_mesh"].set_values_from_function(lambda x, y: d_mesh_init_func([x, y]))
+    pc["d_prev"].set_values_from_function(lambda x, y: d_prev_init_func([x, y]))
+    pc["a_prev"].set_values_from_function(lambda x, y: a_prev_init_func([x, y]))
+
+    W_fx = fenicsx["W"]
+    u_m_p_k_fx = fenicsx["u_m_p_k"]
+    U_fx, U_to_W = W_fx.sub(0).collapse()
+    M_fx, M_to_W = W_fx.sub(1).collapse()
+    P_fx, P_to_W = W_fx.sub(2).collapse()
+
+    u_sub_fx = u_m_p_k_fx.sub(0)
+    m_sub_fx = u_m_p_k_fx.sub(1)
+    p_sub_fx = u_m_p_k_fx.sub(2)
+
+    u_values = u_sub_fx.debug_interpolate(u_k_init_func)
+    m_values = m_sub_fx.debug_interpolate(d_mesh_init_func)
+    p_values = p_sub_fx.debug_interpolate(p_k_init_func)
+    u_m_p_k_fx.x.array[np.asarray(U_to_W, dtype=int)] = u_values
+    u_m_p_k_fx.x.array[np.asarray(M_to_W, dtype=int)] = m_values
+    u_m_p_k_fx.x.array[np.asarray(P_to_W, dtype=int)] = p_values
+    u_m_p_k_fx.x.scatter_forward()
+
+    fenicsx["u_prev"].x.array[:] = fenicsx["u_prev"].debug_interpolate(u_prev_init_func)
+    fenicsx["u_prev"].x.scatter_forward()
+    fenicsx["a_prev"].x.array[:] = fenicsx["a_prev"].debug_interpolate(a_prev_init_func)
+    fenicsx["a_prev"].x.scatter_forward()
+    fenicsx["d_prev"].x.array[:] = fenicsx["d_prev"].debug_interpolate(d_prev_init_func)
+    fenicsx["d_prev"].x.scatter_forward()
+
+    print("✅ Full fluid functions initialized.")
 
 def compare_term(
     term_name,
@@ -5011,6 +5241,7 @@ def compare_term(
 
 GLOBAL_TOTAL_SUCCESS = 0
 GLOBAL_TOTAL_FAILED = []
+GLOBAL_SUMMARY_PRINTED = False
 
 def print_test_summary(success_count, failed_tests):
     """Prints a summary of the test results."""
@@ -5020,12 +5251,29 @@ def print_test_summary(success_count, failed_tests):
     
     total_tests = success_count + len(failed_tests)
     failure_count = len(failed_tests)
+    print("\n" + "-" * 70)
+    print("TEST SUMMARY")
+    print("-" * 70)
+    print(f"✅ Successful tests: {success_count}")
+    print(f"❌ Failed tests:     {failure_count}")
+    print(f"ℹ️ Total tests:      {total_tests}")
+    if failed_tests:
+        print("\n--- Failed Tests In This Run ---")
+        for test_name in failed_tests:
+            print(f"  - {test_name}")
+    print("-" * 70)
 
 
 def _print_global_summary():
+    global GLOBAL_SUMMARY_PRINTED
+    if GLOBAL_SUMMARY_PRINTED:
+        return
+    GLOBAL_SUMMARY_PRINTED = True
+    total_tests = GLOBAL_TOTAL_SUCCESS + len(GLOBAL_TOTAL_FAILED)
     print("\n" + "★"*70)
     print(" " * 20 + "GLOBAL TEST EXECUTION SUMMARY")
     print("★"*70)
+    print(f"ℹ️ OVERALL Total tests:      {total_tests}")
     print(f"✅ OVERALL Successful tests: {GLOBAL_TOTAL_SUCCESS}")
     print(f"❌ OVERALL Failed tests:     {len(GLOBAL_TOTAL_FAILED)}")
     if GLOBAL_TOTAL_FAILED:
@@ -5033,6 +5281,19 @@ def _print_global_summary():
         for test_name in GLOBAL_TOTAL_FAILED:
             print(f"  - {test_name}")
     print("★"*70)
+
+
+def _install_exit_summary_hook() -> None:
+    """Ensure the global summary is printed once on normal CLI termination."""
+
+    def _emit_summary_at_exit():
+        if not GLOBAL_SUMMARY_PRINTED and (GLOBAL_TOTAL_SUCCESS or GLOBAL_TOTAL_FAILED):
+            try:
+                _print_global_summary()
+            except Exception:
+                pass
+
+    atexit.register(_emit_summary_at_exit)
 
 # ==============================================================================
 #  Semi-smooth contact (PositivePart/Heaviside) comparison harness vs FEniCSx
@@ -5753,22 +6014,366 @@ def run_multiplication_semantics_comparison():
 # ==============================================================================
 if __name__ == '__main__':
     _apply_cli_defaults(_parse_cli_args())
+    _install_exit_summary_hook()
     run_all_suites = _env_flag("COMP_FENICS_RUN_ALL_SUITES")
-    problem = os.environ.get("COMP_FENICS_PROBLEM", "fluid").strip().lower()
+def run_full_fluid_exact_comparison():
+    pc, dof_handler_pc, fenicsx = setup_full_fluid_problems()
+    P_map = create_true_dof_map_fluid_full(dof_handler_pc, fenicsx["W"])
+    initialize_full_fluid_functions(pc, fenicsx, dof_handler_pc, P_map)
 
-    if run_all_suites:
-        print("\n" + "🔥"*35)
-        print("   INITIATING ALL PROBLEM SUITES")
-        print("🔥"*35)
-        run_contact_comparison()
-        run_alpha_ch_comparison()
-        run_benchmark7_hdiv_comparison()
-        run_biofilm_comparison()
-        run_poro_comparison()
-        run_component_semantics_comparison()
-        run_multiplication_semantics_comparison()
-        # The script will now naturally fall through to run the fluid comparison below
-    else:
+    W_fx = fenicsx["W"]
+    w_trial = ufl.TrialFunction(W_fx)
+    w_test = ufl.TestFunction(W_fx)
+    du_fx, _dm_fx, dp_fx = ufl.split(w_trial)
+    v_fx, _z_fx, q_fx = ufl.split(w_test)
+    u_k_fx, d_mesh_fx, p_k_fx = ufl.split(fenicsx["u_m_p_k"])
+    u_prev_fx = fenicsx["u_prev"]
+    a_prev_fx = fenicsx["a_prev"]
+    d_prev_fx = fenicsx["d_prev"]
+
+    metadata = {"quadrature_degree": 8}
+    dx_pc = dx(metadata={"q": 8})
+    dx_fx = ufl.dx(metadata=metadata)
+
+    I2_pc = Identity(2)
+    I2_fx = ufl.Identity(2)
+
+    F_pc = I2_pc + grad(pc["d_mesh"])
+    F_fx = I2_fx + ufl.grad(d_mesh_fx)
+    Finv_pc = inv(F_pc)
+    Finv_fx = ufl.inv(F_fx)
+    J_pc = det(F_pc)
+    J_fx = ufl.det(F_fx)
+
+    F_old_pc = I2_pc + grad(pc["d_prev"])
+    F_old_fx = I2_fx + ufl.grad(d_prev_fx)
+    cof_F_pc = cof(F_pc)
+    cof_F_fx = ufl.cofac(F_fx)
+    cof_F_old_pc = cof(F_old_pc)
+    cof_F_old_fx = ufl.cofac(F_old_fx)
+
+    grad_u_phys_pc = dot(grad(pc["u_k"]), Finv_pc)
+    grad_u_phys_fx = ufl.dot(ufl.grad(u_k_fx), Finv_fx)
+    grad_du_phys_pc = dot(grad(pc["du"]), Finv_pc)
+    grad_du_phys_fx = ufl.dot(ufl.grad(du_fx), Finv_fx)
+
+    div_u_phys_pc = inner(cof_F_pc, grad(pc["u_k"])) / J_pc
+    div_u_phys_fx = ufl.inner(cof_F_fx, ufl.grad(u_k_fx)) / J_fx
+    div_du_phys_pc = inner(cof_F_pc, grad(pc["du"])) / J_pc
+    div_du_phys_fx = ufl.inner(cof_F_fx, ufl.grad(du_fx)) / J_fx
+    div_u_old_phys_pc = inner(cof_F_old_pc, grad(pc["u_prev"])) / det(F_old_pc)
+    div_u_old_phys_fx = ufl.inner(cof_F_old_fx, ufl.grad(u_prev_fx)) / ufl.det(F_old_fx)
+    div_v_phys_pc = inner(cof_F_pc, grad(pc["v"])) / J_pc
+    div_v_phys_fx = ufl.inner(cof_F_fx, ufl.grad(v_fx)) / J_fx
+
+    w_mesh_pc = (pc["d_mesh"] - pc["d_prev"]) / pc["dt"]
+    w_mesh_fx = (d_mesh_fx - d_prev_fx) / fenicsx["dt"]
+    conv_velocity_pc = pc["u_k"] - w_mesh_pc
+    conv_velocity_fx = u_k_fx - w_mesh_fx
+    conv_speed_pc = (dot(conv_velocity_pc, conv_velocity_pc) + Constant(1.0e-12, dim=0)) ** Constant(0.5, dim=0)
+    conv_speed_fx = ufl.sqrt(ufl.dot(conv_velocity_fx, conv_velocity_fx) + dolfinx.fem.Constant(fenicsx["mesh"], 1.0e-12))
+
+    bossak_alpha_value = -0.3
+    bossak_gamma_value = 0.5 - bossak_alpha_value
+    bossak_ma0_value = 1.0 / (bossak_gamma_value * float(pc["dt"].value))
+    bossak_ma2_value = (-1.0 + bossak_gamma_value) / bossak_gamma_value
+    bossak_mam_value = (1.0 - bossak_alpha_value) * bossak_ma0_value
+    bossak_alpha_pc = Constant(bossak_alpha_value, dim=0)
+    bossak_alpha_fx = dolfinx.fem.Constant(fenicsx["mesh"], bossak_alpha_value)
+    bossak_ma0_pc = Constant(bossak_ma0_value, dim=0)
+    bossak_ma0_fx = dolfinx.fem.Constant(fenicsx["mesh"], bossak_ma0_value)
+    bossak_ma2_pc = Constant(bossak_ma2_value, dim=0)
+    bossak_ma2_fx = dolfinx.fem.Constant(fenicsx["mesh"], bossak_ma2_value)
+    bossak_mam_pc = Constant(bossak_mam_value, dim=0)
+    bossak_mam_fx = dolfinx.fem.Constant(fenicsx["mesh"], bossak_mam_value)
+
+    a_curr_pc = bossak_ma0_pc * (pc["u_k"] - pc["u_prev"]) + bossak_ma2_pc * pc["a_prev"]
+    a_curr_fx = bossak_ma0_fx * (u_k_fx - u_prev_fx) + bossak_ma2_fx * a_prev_fx
+    a_relaxed_pc = (Constant(1.0, dim=0) - bossak_alpha_pc) * a_curr_pc + bossak_alpha_pc * pc["a_prev"]
+    a_relaxed_fx = (dolfinx.fem.Constant(fenicsx["mesh"], 1.0) - bossak_alpha_fx) * a_curr_fx + bossak_alpha_fx * a_prev_fx
+
+    h_pc = CellDiameter()
+    h_fx = ufl.CellDiameter(fenicsx["mesh"])
+    rho_pc = pc["rho"]
+    rho_fx = fenicsx["rho"]
+    mu_pc = pc["mu"]
+    mu_fx = fenicsx["mu"]
+    tau_c1_pc = Constant(8.0, dim=0)
+    tau_c1_fx = dolfinx.fem.Constant(fenicsx["mesh"], 8.0)
+    tau_c2_pc = Constant(2.0, dim=0)
+    tau_c2_fx = dolfinx.fem.Constant(fenicsx["mesh"], 2.0)
+    dynamic_tau_pc = Constant(1.0, dim=0)
+    dynamic_tau_fx = dolfinx.fem.Constant(fenicsx["mesh"], 1.0)
+    inv_dt_pc = Constant(1.0 / max(float(pc["dt"].value), 1.0e-14), dim=0)
+    inv_dt_fx = dolfinx.fem.Constant(fenicsx["mesh"], 1.0 / max(float(fenicsx["dt"].value), 1.0e-14))
+
+    tau_one_pc = dynamic_tau_pc / (tau_c1_pc * mu_pc / (h_pc * h_pc) + rho_pc * (inv_dt_pc + tau_c2_pc * conv_speed_pc / h_pc))
+    tau_one_fx = dynamic_tau_fx / (tau_c1_fx * mu_fx / (h_fx * h_fx) + rho_fx * (inv_dt_fx + tau_c2_fx * conv_speed_fx / h_fx))
+    tau_two_pc = mu_pc + rho_pc * conv_speed_pc * h_pc / Constant(4.0, dim=0)
+    tau_two_fx = mu_fx + rho_fx * conv_speed_fx * h_fx / dolfinx.fem.Constant(fenicsx["mesh"], 4.0)
+    tau_p_pc = rho_pc * h_pc * h_pc * inv_dt_pc / tau_c1_pc
+    tau_p_fx = rho_fx * h_fx * h_fx * inv_dt_fx / tau_c1_fx
+
+    grad_p_phys_pc = dot(Finv_pc.T, grad(pc["p_k"]))
+    grad_p_phys_fx = ufl.dot(Finv_fx.T, ufl.grad(p_k_fx))
+    grad_q_phys_pc = dot(Finv_pc.T, grad(pc["q"]))
+    grad_q_phys_fx = ufl.dot(Finv_fx.T, ufl.grad(q_fx))
+    grad_dp_phys_pc = dot(Finv_pc.T, grad(pc["dp"]))
+    grad_dp_phys_fx = ufl.dot(Finv_fx.T, ufl.grad(dp_fx))
+
+    tau_test_mass_pc = rho_pc * bossak_mam_pc * pc["v"]
+    tau_test_mass_fx = rho_fx * bossak_mam_fx * v_fx
+    tau_test_conv_pc = rho_pc * dot(dot(grad(pc["v"]), Finv_pc), conv_velocity_pc)
+    tau_test_conv_fx = rho_fx * ufl.dot(ufl.dot(ufl.grad(v_fx), Finv_fx), conv_velocity_fx)
+    tau_test_pres_pc = grad_q_phys_pc
+    tau_test_pres_fx = grad_q_phys_fx
+    tau_res_mass_pc = rho_pc * a_relaxed_pc
+    tau_res_mass_fx = rho_fx * a_relaxed_fx
+    tau_res_conv_pc = rho_pc * dot(grad_u_phys_pc, conv_velocity_pc)
+    tau_res_conv_fx = rho_fx * ufl.dot(grad_u_phys_fx, conv_velocity_fx)
+    tau_res_pres_pc = grad_p_phys_pc
+    tau_res_pres_fx = grad_p_phys_fx
+
+    tau_dtest_conv_pc = rho_pc * dot(dot(grad(pc["v"]), Finv_pc), pc["du"])
+    tau_dtest_conv_fx = rho_fx * ufl.dot(ufl.dot(ufl.grad(v_fx), Finv_fx), du_fx)
+    tau_dres_mass_pc = rho_pc * bossak_mam_pc * pc["du"]
+    tau_dres_mass_fx = rho_fx * bossak_mam_fx * du_fx
+    tau_dres_conv_1_pc = rho_pc * dot(grad_du_phys_pc, conv_velocity_pc)
+    tau_dres_conv_1_fx = rho_fx * ufl.dot(grad_du_phys_fx, conv_velocity_fx)
+    tau_dres_conv_2_pc = rho_pc * dot(grad_u_phys_pc, pc["du"])
+    tau_dres_conv_2_fx = rho_fx * ufl.dot(grad_u_phys_fx, du_fx)
+    tau_dres_pres_pc = grad_dp_phys_pc
+    tau_dres_pres_fx = grad_dp_phys_fx
+
+    sigma_pc = -pc["p_k"] * I2_pc + mu_pc * (grad_u_phys_pc + dot(Finv_pc.T, grad(pc["u_k"]).T))
+    sigma_fx = -p_k_fx * I2_fx + mu_fx * (grad_u_phys_fx + ufl.dot(Finv_fx.T, ufl.grad(u_k_fx).T))
+    sigma_du_pc = -pc["dp"] * I2_pc + mu_pc * (grad_du_phys_pc + dot(Finv_pc.T, grad(pc["du"]).T))
+    sigma_du_fx = -dp_fx * I2_fx + mu_fx * (grad_du_phys_fx + ufl.dot(Finv_fx.T, ufl.grad(du_fx).T))
+
+    gauge_pc = Constant(1.0e-8, dim=0)
+    gauge_fx = dolfinx.fem.Constant(fenicsx["mesh"], 1.0e-8)
+
+    full_residual_pc = rho_pc * J_pc * dot(a_relaxed_pc, pc["v"]) * dx_pc
+    full_residual_pc += J_pc * rho_pc * dot(dot(grad_u_phys_pc, conv_velocity_pc), pc["v"]) * dx_pc
+    full_residual_pc += inner(J_pc * dot(sigma_pc, Finv_pc.T), grad(pc["v"])) * dx_pc
+    full_residual_pc += inner(cof_F_pc, grad(pc["u_k"])) * pc["q"] * dx_pc
+    full_residual_pc += gauge_pc * pc["p_k"] * pc["q"] * dx_pc
+    full_residual_pc += J_pc * tau_one_pc * dot(tau_test_mass_pc, tau_res_mass_pc) * dx_pc
+    full_residual_pc += J_pc * tau_one_pc * dot(tau_test_mass_pc, tau_res_conv_pc) * dx_pc
+    full_residual_pc += J_pc * tau_one_pc * dot(tau_test_mass_pc, tau_res_pres_pc) * dx_pc
+    full_residual_pc += J_pc * tau_one_pc * dot(tau_test_conv_pc, tau_res_mass_pc) * dx_pc
+    full_residual_pc += J_pc * tau_one_pc * dot(tau_test_conv_pc, tau_res_conv_pc) * dx_pc
+    full_residual_pc += J_pc * tau_one_pc * dot(tau_test_conv_pc, tau_res_pres_pc) * dx_pc
+    full_residual_pc += J_pc * tau_one_pc * dot(tau_test_pres_pc, tau_res_mass_pc) * dx_pc
+    full_residual_pc += J_pc * tau_one_pc * dot(tau_test_pres_pc, tau_res_conv_pc) * dx_pc
+    full_residual_pc += J_pc * tau_one_pc * dot(tau_test_pres_pc, tau_res_pres_pc) * dx_pc
+    full_residual_pc += J_pc * (((tau_two_pc + tau_p_pc) * div_u_phys_pc - tau_p_pc * div_u_old_phys_pc) * div_v_phys_pc) * dx_pc
+
+    full_residual_fx = rho_fx * J_fx * ufl.dot(a_relaxed_fx, v_fx) * dx_fx
+    full_residual_fx += J_fx * rho_fx * ufl.dot(ufl.dot(grad_u_phys_fx, conv_velocity_fx), v_fx) * dx_fx
+    full_residual_fx += ufl.inner(J_fx * ufl.dot(sigma_fx, Finv_fx.T), ufl.grad(v_fx)) * dx_fx
+    full_residual_fx += ufl.inner(cof_F_fx, ufl.grad(u_k_fx)) * q_fx * dx_fx
+    full_residual_fx += gauge_fx * p_k_fx * q_fx * dx_fx
+    full_residual_fx += J_fx * tau_one_fx * ufl.dot(tau_test_mass_fx, tau_res_mass_fx) * dx_fx
+    full_residual_fx += J_fx * tau_one_fx * ufl.dot(tau_test_mass_fx, tau_res_conv_fx) * dx_fx
+    full_residual_fx += J_fx * tau_one_fx * ufl.dot(tau_test_mass_fx, tau_res_pres_fx) * dx_fx
+    full_residual_fx += J_fx * tau_one_fx * ufl.dot(tau_test_conv_fx, tau_res_mass_fx) * dx_fx
+    full_residual_fx += J_fx * tau_one_fx * ufl.dot(tau_test_conv_fx, tau_res_conv_fx) * dx_fx
+    full_residual_fx += J_fx * tau_one_fx * ufl.dot(tau_test_conv_fx, tau_res_pres_fx) * dx_fx
+    full_residual_fx += J_fx * tau_one_fx * ufl.dot(tau_test_pres_fx, tau_res_mass_fx) * dx_fx
+    full_residual_fx += J_fx * tau_one_fx * ufl.dot(tau_test_pres_fx, tau_res_conv_fx) * dx_fx
+    full_residual_fx += J_fx * tau_one_fx * ufl.dot(tau_test_pres_fx, tau_res_pres_fx) * dx_fx
+    full_residual_fx += J_fx * (((tau_two_fx + tau_p_fx) * div_u_phys_fx - tau_p_fx * div_u_old_phys_fx) * div_v_phys_fx) * dx_fx
+
+    full_jacobian_pc = rho_pc * J_pc * dot(bossak_mam_pc * pc["du"], pc["v"]) * dx_pc
+    full_jacobian_pc += J_pc * rho_pc * dot(dot(grad_du_phys_pc, conv_velocity_pc), pc["v"]) * dx_pc
+    full_jacobian_pc += J_pc * rho_pc * dot(dot(grad_u_phys_pc, pc["du"]), pc["v"]) * dx_pc
+    full_jacobian_pc += inner(J_pc * dot(sigma_du_pc, Finv_pc.T), grad(pc["v"])) * dx_pc
+    full_jacobian_pc += inner(cof_F_pc, grad(pc["du"])) * pc["q"] * dx_pc
+    full_jacobian_pc += gauge_pc * pc["dp"] * pc["q"] * dx_pc
+    full_jacobian_pc += J_pc * tau_one_pc * dot(tau_dtest_conv_pc, tau_res_mass_pc) * dx_pc
+    full_jacobian_pc += J_pc * tau_one_pc * dot(tau_dtest_conv_pc, tau_res_conv_pc) * dx_pc
+    full_jacobian_pc += J_pc * tau_one_pc * dot(tau_dtest_conv_pc, tau_res_pres_pc) * dx_pc
+    full_jacobian_pc += J_pc * tau_one_pc * dot(tau_test_mass_pc, tau_dres_mass_pc) * dx_pc
+    full_jacobian_pc += J_pc * tau_one_pc * dot(tau_test_mass_pc, tau_dres_conv_1_pc) * dx_pc
+    full_jacobian_pc += J_pc * tau_one_pc * dot(tau_test_mass_pc, tau_dres_conv_2_pc) * dx_pc
+    full_jacobian_pc += J_pc * tau_one_pc * dot(tau_test_mass_pc, tau_dres_pres_pc) * dx_pc
+    full_jacobian_pc += J_pc * tau_one_pc * dot(tau_test_conv_pc, tau_dres_mass_pc) * dx_pc
+    full_jacobian_pc += J_pc * tau_one_pc * dot(tau_test_conv_pc, tau_dres_conv_1_pc) * dx_pc
+    full_jacobian_pc += J_pc * tau_one_pc * dot(tau_test_conv_pc, tau_dres_conv_2_pc) * dx_pc
+    full_jacobian_pc += J_pc * tau_one_pc * dot(tau_test_conv_pc, tau_dres_pres_pc) * dx_pc
+    full_jacobian_pc += J_pc * tau_one_pc * dot(tau_test_pres_pc, tau_dres_mass_pc) * dx_pc
+    full_jacobian_pc += J_pc * tau_one_pc * dot(tau_test_pres_pc, tau_dres_conv_1_pc) * dx_pc
+    full_jacobian_pc += J_pc * tau_one_pc * dot(tau_test_pres_pc, tau_dres_conv_2_pc) * dx_pc
+    full_jacobian_pc += J_pc * tau_one_pc * dot(tau_test_pres_pc, tau_dres_pres_pc) * dx_pc
+    full_jacobian_pc += J_pc * ((tau_two_pc + tau_p_pc) * div_du_phys_pc * div_v_phys_pc) * dx_pc
+
+    full_jacobian_fx = rho_fx * J_fx * ufl.dot(bossak_mam_fx * du_fx, v_fx) * dx_fx
+    full_jacobian_fx += J_fx * rho_fx * ufl.dot(ufl.dot(grad_du_phys_fx, conv_velocity_fx), v_fx) * dx_fx
+    full_jacobian_fx += J_fx * rho_fx * ufl.dot(ufl.dot(grad_u_phys_fx, du_fx), v_fx) * dx_fx
+    full_jacobian_fx += ufl.inner(J_fx * ufl.dot(sigma_du_fx, Finv_fx.T), ufl.grad(v_fx)) * dx_fx
+    full_jacobian_fx += ufl.inner(cof_F_fx, ufl.grad(du_fx)) * q_fx * dx_fx
+    full_jacobian_fx += gauge_fx * dp_fx * q_fx * dx_fx
+    full_jacobian_fx += J_fx * tau_one_fx * ufl.dot(tau_dtest_conv_fx, tau_res_mass_fx) * dx_fx
+    full_jacobian_fx += J_fx * tau_one_fx * ufl.dot(tau_dtest_conv_fx, tau_res_conv_fx) * dx_fx
+    full_jacobian_fx += J_fx * tau_one_fx * ufl.dot(tau_dtest_conv_fx, tau_res_pres_fx) * dx_fx
+    full_jacobian_fx += J_fx * tau_one_fx * ufl.dot(tau_test_mass_fx, tau_dres_mass_fx) * dx_fx
+    full_jacobian_fx += J_fx * tau_one_fx * ufl.dot(tau_test_mass_fx, tau_dres_conv_1_fx) * dx_fx
+    full_jacobian_fx += J_fx * tau_one_fx * ufl.dot(tau_test_mass_fx, tau_dres_conv_2_fx) * dx_fx
+    full_jacobian_fx += J_fx * tau_one_fx * ufl.dot(tau_test_mass_fx, tau_dres_pres_fx) * dx_fx
+    full_jacobian_fx += J_fx * tau_one_fx * ufl.dot(tau_test_conv_fx, tau_dres_mass_fx) * dx_fx
+    full_jacobian_fx += J_fx * tau_one_fx * ufl.dot(tau_test_conv_fx, tau_dres_conv_1_fx) * dx_fx
+    full_jacobian_fx += J_fx * tau_one_fx * ufl.dot(tau_test_conv_fx, tau_dres_conv_2_fx) * dx_fx
+    full_jacobian_fx += J_fx * tau_one_fx * ufl.dot(tau_test_conv_fx, tau_dres_pres_fx) * dx_fx
+    full_jacobian_fx += J_fx * tau_one_fx * ufl.dot(tau_test_pres_fx, tau_dres_mass_fx) * dx_fx
+    full_jacobian_fx += J_fx * tau_one_fx * ufl.dot(tau_test_pres_fx, tau_dres_conv_1_fx) * dx_fx
+    full_jacobian_fx += J_fx * tau_one_fx * ufl.dot(tau_test_pres_fx, tau_dres_conv_2_fx) * dx_fx
+    full_jacobian_fx += J_fx * tau_one_fx * ufl.dot(tau_test_pres_fx, tau_dres_pres_fx) * dx_fx
+    full_jacobian_fx += J_fx * ((tau_two_fx + tau_p_fx) * div_du_phys_fx * div_v_phys_fx) * dx_fx
+
+    terms = {
+        "Fluid full exact residual": {
+            "pc": full_residual_pc,
+            "f_lambda": lambda deg: full_residual_fx,
+            "mat": False,
+            "deg": 8,
+        },
+        "Fluid full exact jacobian": {
+            "pc": full_jacobian_pc,
+            "f_lambda": lambda deg: full_jacobian_fx,
+            "mat": True,
+            "deg": 8,
+        },
+        "Fluid full exact div-old stabilization residual": {
+            "pc": J_pc * (((tau_two_pc + tau_p_pc) * div_u_phys_pc - tau_p_pc * div_u_old_phys_pc) * div_v_phys_pc) * dx_pc,
+            "f_lambda": lambda deg: J_fx * (((tau_two_fx + tau_p_fx) * div_u_phys_fx - tau_p_fx * div_u_old_phys_fx) * div_v_phys_fx) * dx_fx,
+            "mat": False,
+            "deg": 8,
+        },
+        "Fluid full exact div-old stabilization jacobian": {
+            "pc": J_pc * ((tau_two_pc + tau_p_pc) * div_du_phys_pc * div_v_phys_pc) * dx_pc,
+            "f_lambda": lambda deg: J_fx * ((tau_two_fx + tau_p_fx) * div_du_phys_fx * div_v_phys_fx) * dx_fx,
+            "mat": True,
+            "deg": 8,
+        },
+    }
+
+    filter_terms = os.environ.get("COMP_FENICS_TERMS")
+    if filter_terms:
+        allowed = _parse_filter_terms(filter_terms)
+        terms = {k: v for k, v in terms.items() if k in allowed}
+        print(f"Running filtered full-fluid terms only: {sorted(terms)}")
+
+    fenics_ref = {}
+    for name, forms in terms.items():
+        try:
+            form_fx_ufl = forms["f_lambda"](forms["deg"])
+            form_fx_compiled = dolfinx.fem.form(form_fx_ufl)
+            if forms["mat"]:
+                A = dolfinx.fem.petsc.assemble_matrix(form_fx_compiled)
+                A.assemble()
+                indptr, indices, data = A.getValuesCSR()
+                fenics_ref[name] = csr_matrix((data, indices, indptr), shape=A.getSize()).toarray()
+            else:
+                vec = dolfinx.fem.petsc.assemble_vector(form_fx_compiled)
+                fenics_ref[name] = vec.array.copy()
+        except Exception as exc:
+            print(f"❌ FEniCSx assembly failed for '{name}': {exc}")
+            _maybe_print_traceback()
+            fenics_ref[name] = None
+
+    backends = _requested_backends("jit")
+    parity_rtol = float(os.environ.get("COMP_FENICS_PARITY_RTOL", "1e-9"))
+    parity_atol = float(os.environ.get("COMP_FENICS_PARITY_ATOL", "1e-9"))
+    ref_backend = "python" if "python" in backends else (backends[0] if backends else "python")
+    ref_pc = {}
+    success_count = 0
+    failed_tests = []
+
+    try:
+        for backend_type in backends:
+            print("\n" + "=" * 70)
+            print(f"COMPARISON (problem=fluid_full, backend={backend_type})")
+            print("=" * 70)
+            for name, forms in terms.items():
+                if fenics_ref.get(name) is None:
+                    failed_tests.append(_failure_label(name, backend_type, "fenics-assemble"))
+                    continue
+
+                J_pc, R_pc = None, None
+                print(f"Compiling/assembling '{name}' with degree {forms['deg']} [backend={backend_type}]")
+                if forms["mat"]:
+                    J_pc, _ = assemble_form(
+                        Equation(forms["pc"], None),
+                        dof_handler_pc,
+                        quad_degree=forms["deg"],
+                        bcs=[],
+                        backend=backend_type,
+                    )
+                else:
+                    _, R_pc = assemble_form(
+                        Equation(None, forms["pc"]),
+                        dof_handler_pc,
+                        bcs=[],
+                        backend=backend_type,
+                    )
+
+                if backend_type == ref_backend:
+                    if forms["mat"]:
+                        ref_pc[name] = J_pc.toarray()
+                    else:
+                        ref_pc[name] = np.asarray(R_pc, dtype=float).copy()
+                else:
+                    if forms["mat"]:
+                        np.testing.assert_allclose(J_pc.toarray(), ref_pc[name], rtol=parity_rtol, atol=parity_atol)
+                    else:
+                        np.testing.assert_allclose(np.asarray(R_pc, dtype=float), ref_pc[name], rtol=parity_rtol, atol=parity_atol)
+                    print(f"✅ pycutfem backend parity OK vs '{ref_backend}'.")
+
+                J_fx_ref, R_fx_ref = (fenics_ref[name], None) if forms["mat"] else (None, fenics_ref[name])
+                is_success = compare_term(
+                    f"{name} [backend={backend_type}]",
+                    J_pc,
+                    R_pc,
+                    J_fx_ref,
+                    R_fx_ref,
+                    P_map,
+                    dof_handler_pc,
+                    W_fx,
+                    rtol=forms.get("rtol", 1e-8),
+                    atol=forms.get("atol", 1e-8),
+                )
+                if is_success:
+                    success_count += 1
+                else:
+                    failed_tests.append(_failure_label(name, backend_type))
+    except KeyboardInterrupt:
+        print("\n⛔ KeyboardInterrupt (Ctrl+C). Showing summary so far...")
+        print_test_summary(success_count, failed_tests)
+        _print_global_summary()
+        sys.exit(130)
+
+    print_test_summary(success_count, failed_tests)
+
+
+problem = os.environ.get("COMP_FENICS_PROBLEM", "fluid").strip().lower()
+
+if run_all_suites:
+    print("\n" + "🔥"*35)
+    print("   INITIATING ALL PROBLEM SUITES")
+    print("🔥"*35)
+    run_contact_comparison()
+    run_alpha_ch_comparison()
+    run_benchmark7_hdiv_comparison()
+    run_biofilm_comparison()
+    run_poro_comparison()
+    run_component_semantics_comparison()
+    run_multiplication_semantics_comparison()
+    # The script will now naturally fall through to run the fluid comparison below
+
+def run_fluid_comparison():
+    global fenicsx, I2_pc, I2_fx, F_pc, F_fx, E_pc, E_fx, S_pc, S_fx, sigma_s_nonlinear_fx, dsigma_s_fx
+    if not run_all_suites:
         if problem.startswith("contact") or problem.startswith("semismooth"):
             run_contact_comparison()
             _print_global_summary()
@@ -5795,6 +6400,10 @@ if __name__ == '__main__':
             sys.exit(0)
         if problem.startswith("multiplication") or problem.startswith("product_semantics") or problem.startswith("product-semantics"):
             run_multiplication_semantics_comparison()
+            _print_global_summary()
+            sys.exit(0)
+        if problem.startswith("fluid_full") or problem.startswith("example2_full") or problem.startswith("nirb_full"):
+            run_full_fluid_exact_comparison()
             _print_global_summary()
             sys.exit(0)
 
@@ -7164,3 +7773,7 @@ if __name__ == '__main__':
         print_test_summary(success_count, failed_tests)
 
     _print_global_summary()
+
+
+if __name__ == '__main__':
+    run_fluid_comparison()

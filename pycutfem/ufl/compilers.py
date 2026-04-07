@@ -2748,23 +2748,23 @@ class FormCompiler:
         if isinstance(b, GradOpInfo) and role_b == "identity":
             return a
 
-        # Constant matrix × value vector/function -> value vector.
-        if isinstance(a, np.ndarray) and a.ndim == 2 and isinstance(b, VecOpInfo) and role_b in {"function", "vector"}:
-            vals = _collapsed_function(b) if role_b == "function" else np.asarray(b.data, dtype=float)
-            vals = np.asarray(vals, dtype=float)
-            if vals.ndim == 1 and a.shape[1] == vals.shape[0]:
-                data = a @ vals
-                role = "scalar" if np.ndim(data) == 0 or (np.ndim(data) == 1 and np.asarray(data).shape == (1,)) else "vector"
-                return VecOpInfo(np.asarray(data), role=role, **b.update_meta(b.meta()))
+        # Constant matrix × semantic rank-1 carrier -> semantic rank-1 carrier.
+        if (
+            isinstance(a, np.ndarray)
+            and a.ndim == 2
+            and isinstance(b, VecOpInfo)
+            and role_b in {"function", "vector", "trial", "test", "trial_n", "test_n", "mixed"}
+        ):
+            return b.__rmul__(a)
 
-        # Value vector/function × constant matrix -> value vector.
-        if isinstance(b, np.ndarray) and b.ndim == 2 and isinstance(a, VecOpInfo) and role_a in {"function", "vector"}:
-            vals = _collapsed_function(a) if role_a == "function" else np.asarray(a.data, dtype=float)
-            vals = np.asarray(vals, dtype=float)
-            if vals.ndim == 1 and vals.shape[0] == b.shape[0]:
-                data = vals @ b
-                role = "scalar" if np.ndim(data) == 0 or (np.ndim(data) == 1 and np.asarray(data).shape == (1,)) else "vector"
-                return VecOpInfo(np.asarray(data), role=role, **a.update_meta(a.meta()))
+        # Semantic rank-1 carrier × constant matrix -> semantic rank-1 carrier.
+        if (
+            isinstance(b, np.ndarray)
+            and b.ndim == 2
+            and isinstance(a, VecOpInfo)
+            and role_a in {"function", "vector", "trial", "test", "trial_n", "test_n", "mixed"}
+        ):
+            return a.__mul__(b)
 
         # Constant 2D tensor × GradOpInfo:
         # - If b is already collapsed to a 2D matrix (function path), keep the
