@@ -1,3 +1,4 @@
+import argparse
 import numpy as np
 import pandas as pd
 import os
@@ -28,8 +29,8 @@ from pycutfem.ufl.expressions import (
     HdivTrialFunction,
     TrialFunction, TestFunction, VectorTrialFunction, VectorTestFunction,
     Function, VectorFunction, Constant, grad, inner,
-    dot, div, trace, Hessian, Laplacian, FacetNormal, Identity, det, inv,
-    pos_part, heaviside, MeshSize,
+    dot, div, trace, Hessian, Laplacian, FacetNormal, Identity, det, inv, dyad,
+    pos_part, heaviside, MeshSize, CellDiameter,
 )
 from pycutfem.ufl.measures import dx, dInterface, dS
 from pycutfem.ufl.forms import assemble_form
@@ -86,6 +87,90 @@ def _install_keyboard_interrupt_summary_hook() -> None:
 
 if __name__ == '__main__':
     _install_keyboard_interrupt_summary_hook()
+
+
+def _parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Compare pycutfem form assembly against FEniCSx.",
+    )
+    parser.add_argument(
+        "--backend",
+        "--backends",
+        dest="backends",
+        help="Comma-separated backend list: python, jit, cpp, or all.",
+    )
+    parser.add_argument(
+        "--problem",
+        help=(
+            "Problem suite to run. Omit together with --backend to keep the "
+            "environment-driven default; omit with --backend to run all suites."
+        ),
+    )
+    parser.add_argument(
+        "--terms",
+        help="Optional COMP_FENICS_TERMS filter spec.",
+    )
+    parser.add_argument(
+        "--all-terms",
+        action="store_true",
+        help="Run all terms in the selected problem/suite scope.",
+    )
+    parser.add_argument(
+        "--all-suites",
+        action="store_true",
+        help="Run every registered comparison suite before the fluid suite.",
+    )
+    parser.add_argument(
+        "--write-xlsx",
+        choices=("0", "1"),
+        help="Set COMP_FENICS_WRITE_XLSX.",
+    )
+    parser.add_argument(
+        "--qdeg",
+        type=int,
+        help="Override COMP_FENICS_QDEG.",
+    )
+    parser.add_argument(
+        "--traceback",
+        action="store_true",
+        help="Print full tracebacks on comparison failures.",
+    )
+    return parser.parse_args(argv)
+
+
+def _apply_cli_defaults(args: argparse.Namespace) -> None:
+    backend_spec = (args.backends or "").strip()
+    problem_spec = (args.problem or "").strip()
+    terms_spec = args.terms
+
+    if backend_spec:
+        os.environ["COMP_FENICS_BACKENDS"] = backend_spec
+    if problem_spec:
+        os.environ["COMP_FENICS_PROBLEM"] = problem_spec
+    if terms_spec is not None:
+        os.environ["COMP_FENICS_TERMS"] = terms_spec
+    if args.write_xlsx is not None:
+        os.environ["COMP_FENICS_WRITE_XLSX"] = args.write_xlsx
+    if args.qdeg is not None:
+        os.environ["COMP_FENICS_QDEG"] = str(args.qdeg)
+    if args.traceback:
+        os.environ["COMP_FENICS_TRACEBACK"] = "1"
+    if args.all_terms:
+        os.environ["COMP_FENICS_RUN_ALL"] = "1"
+    if args.all_suites:
+        os.environ["COMP_FENICS_RUN_ALL_SUITES"] = "1"
+
+    # CLI backend selection should default to the full FEniCSx parity sweep
+    # unless the caller explicitly narrows the scope with --terms or --problem.
+    if backend_spec and terms_spec is None and not _env_flag("COMP_FENICS_RUN_ALL"):
+        os.environ["COMP_FENICS_RUN_ALL"] = "1"
+    if (
+        backend_spec
+        and not problem_spec
+        and terms_spec is None
+        and not _env_flag("COMP_FENICS_RUN_ALL_SUITES")
+    ):
+        os.environ["COMP_FENICS_RUN_ALL_SUITES"] = "1"
 
 
 def _env_flag(name: str) -> bool:
@@ -1024,6 +1109,60 @@ def _quadrilateral_rt_fenicsx_row_signs_against_pycutfem(V_fenicsx) -> np.ndarra
         if (on_left or on_top) and (int(mode) % 2 == 1):
             signs[i] = -1.0
     return signs
+
+
+def _valid_pmap_mask(P_map) -> np.ndarray:
+    return np.asarray(P_map, dtype=int) >= 0
+
+
+def _reorder_fenics_vector_to_pycutfem(vec_fx, P_map, *, sign_map=None):
+    P_arr = np.asarray(P_map, dtype=int).reshape(-1)
+    valid = _valid_pmap_mask(P_arr)
+    if sign_map is None:
+        sign_arr = np.ones(P_arr.shape[0], dtype=float)
+    else:
+        sign_arr = np.asarray(sign_map, dtype=float).reshape(-1)
+    out = np.zeros(P_arr.shape[0], dtype=float)
+    if np.any(valid):
+        out[valid] = sign_arr[valid] * np.asarray(vec_fx, dtype=float).reshape(-1)[P_arr[valid]]
+    return out
+
+
+def _reorder_fenics_matrix_to_pycutfem(mat_fx, P_map, *, sign_map=None, sparse_output: bool = False):
+    P_arr = np.asarray(P_map, dtype=int).reshape(-1)
+    valid = _valid_pmap_mask(P_arr)
+    if sign_map is None:
+        sign_arr = np.ones(P_arr.shape[0], dtype=float)
+    else:
+        sign_arr = np.asarray(sign_map, dtype=float).reshape(-1)
+
+    n_pc = P_arr.shape[0]
+    valid_idx = np.flatnonzero(valid)
+    n_valid = valid_idx.shape[0]
+    if n_valid == 0:
+        return csr_matrix((n_pc, n_pc)) if sparse_output else np.zeros((n_pc, n_pc), dtype=float)
+
+    if sp.issparse(mat_fx):
+        sub = mat_fx.tocsr()[P_arr[valid], :][:, P_arr[valid]].tocsr()
+    else:
+        sub = np.asarray(mat_fx, dtype=float)[P_arr[valid], :][:, P_arr[valid]]
+
+    sign_valid = sign_arr[valid]
+    if sparse_output:
+        sub_sparse = sub if sp.issparse(sub) else csr_matrix(np.asarray(sub, dtype=float))
+        D_sign = sp.diags(sign_valid)
+        sub_signed = (D_sign @ sub_sparse @ D_sign).tocsr()
+        scatter = csr_matrix(
+            (np.ones(n_valid, dtype=float), (valid_idx, np.arange(n_valid, dtype=int))),
+            shape=(n_pc, n_valid),
+        )
+        return (scatter @ sub_signed @ scatter.T).tocsr()
+
+    sub_dense = sub.toarray() if sp.issparse(sub) else np.asarray(sub, dtype=float)
+    sub_signed = sign_valid[:, None] * sub_dense * sign_valid[None, :]
+    out = np.zeros((n_pc, n_pc), dtype=float)
+    out[np.ix_(valid, valid)] = sub_signed
+    return out
 
 
 def _build_rt1_local_transform(me_pc: MixedElement, V_fenicsx, *, field: str = "v") -> np.ndarray:
@@ -2210,6 +2349,7 @@ def run_alpha_ch_comparison():
                 fenics_ref[name] = vec.array.copy()
         except Exception as exc:
             print(f"❌ FEniCSx assembly failed for '{name}': {exc}")
+            _maybe_print_traceback()
             fenics_ref[name] = None
 
     backends = _requested_backends("jit")
@@ -2243,6 +2383,7 @@ def run_alpha_ch_comparison():
                         _, R_pc = assemble_form(Equation(None, spec["pc"]), dof_handler_pc, bcs=[], backend=backend_type)
                 except Exception as exc:
                     print(f"❌ pycutfem assembly failed for '{name}' on backend '{backend_type}': {exc}")
+                    _maybe_print_traceback()
                     failed_tests.append(_failure_label(name, backend_type, "assemble"))
                     continue
     
@@ -3348,11 +3489,19 @@ def run_biofilm_comparison():
     C_n_fx = capacity(alpha_n_fx, phi_n_fx)
     B_k_fx = alpha_k_fx * one_minus(phi_k_fx)
     B_n_fx = alpha_n_fx * one_minus(phi_n_fx)
+    F_free_k_fx = one_minus(alpha_k_fx)
+    F_free_n_fx = one_minus(alpha_n_fx)
+    gradF_free_k_fx = -ufl.grad(alpha_k_fx)
+    gradF_free_n_fx = -ufl.grad(alpha_n_fx)
 
     rho_k_fx = rho_f_fx * C_k_fx
     rho_n_fx = rho_f_fx * C_n_fx
     mu_k_fx = mu_f_fx * C_k_fx  # phi_mu choice
     mu_n_fx = mu_f_fx * C_n_fx
+    rho_mom_k_fx = rho_f_fx * F_free_k_fx
+    rho_mom_n_fx = rho_f_fx * F_free_n_fx
+    mu_mom_k_fx = mu_f_fx * F_free_k_fx
+    mu_mom_n_fx = mu_f_fx * F_free_n_fx
 
     # Damage degradation factors (Miehe-type) used by momentum/skeleton drag and solid stiffness.
     one_m_d_k_fx = one_minus(d_k_fx)
@@ -3399,6 +3548,8 @@ def run_biofilm_comparison():
 
     gradB_k_fx = ufl.grad(alpha_k_fx) * one_minus(phi_k_fx) - ufl.grad(phi_k_fx) * alpha_k_fx
     gradB_n_fx = ufl.grad(alpha_n_fx) * one_minus(phi_n_fx) - ufl.grad(phi_n_fx) * alpha_n_fx
+    divFfree_k_fx = F_free_k_fx * ufl.div(v_k_fx) + ufl.dot(gradF_free_k_fx, v_k_fx)
+    divFfree_n_fx = F_free_n_fx * ufl.div(v_n_fx) + ufl.dot(gradF_free_n_fx, v_n_fx)
     divBvS_k_fx = B_k_fx * div_vS_k_fx + ufl.dot(gradB_k_fx, vS_k_fx)
     divBvS_n_fx = B_n_fx * div_vS_n_fx + ufl.dot(gradB_n_fx, vS_n_fx)
 
@@ -3408,29 +3559,29 @@ def run_biofilm_comparison():
     # ------------------------------------------------------------------
     # Residual pieces (fenics)
     # ------------------------------------------------------------------
-    vdot_fx = (rho_k_fx * v_k_fx - rho_n_fx * v_n_fx) / dt_fx
+    vdot_fx = (rho_mom_k_fx * v_k_fx - rho_mom_n_fx * v_n_fx) / dt_fx
     conv_k_fx = ufl.dot(ufl.dot(ufl.grad(v_k_fx), v_k_fx), w_fx)
     conv_n_fx = ufl.dot(ufl.dot(ufl.grad(v_n_fx), v_n_fx), w_fx)
-    div_rhov_k_fx = rho_f_fx * divCv_k_fx
-    div_rhov_n_fx = rho_f_fx * divCv_n_fx
+    div_rhov_k_fx = rho_f_fx * divFfree_k_fx
+    div_rhov_n_fx = rho_f_fx * divFfree_n_fx
     div_C_w_fx = C_k_fx * ufl.div(w_fx) + ufl.dot(gradC_k_fx, w_fx)
 
     r_mom_fx = ufl.inner(vdot_fx, w_fx) * dx_fx
     if fluid_convection_key == "full":
-        r_mom_fx += theta_fx * (rho_k_fx * conv_k_fx + div_rhov_k_fx * ufl.dot(v_k_fx, w_fx)) * dx_fx
-        r_mom_fx += (1.0 - theta_fx) * (rho_n_fx * conv_n_fx + div_rhov_n_fx * ufl.dot(v_n_fx, w_fx)) * dx_fx
+        r_mom_fx += theta_fx * (rho_mom_k_fx * conv_k_fx + div_rhov_k_fx * ufl.dot(v_k_fx, w_fx)) * dx_fx
+        r_mom_fx += (1.0 - theta_fx) * (rho_mom_n_fx * conv_n_fx + div_rhov_n_fx * ufl.dot(v_n_fx, w_fx)) * dx_fx
     elif fluid_convection_key in {"lagged", "explicit"}:
         conv_lag_k_fx = ufl.dot(ufl.dot(ufl.grad(v_k_fx), v_n_fx), w_fx)
-        r_mom_fx += theta_fx * (rho_n_fx * conv_lag_k_fx + div_rhov_n_fx * ufl.dot(v_k_fx, w_fx)) * dx_fx
-        r_mom_fx += (1.0 - theta_fx) * (rho_n_fx * conv_n_fx + div_rhov_n_fx * ufl.dot(v_n_fx, w_fx)) * dx_fx
+        r_mom_fx += theta_fx * (rho_mom_n_fx * conv_lag_k_fx + div_rhov_n_fx * ufl.dot(v_k_fx, w_fx)) * dx_fx
+        r_mom_fx += (1.0 - theta_fx) * (rho_mom_n_fx * conv_n_fx + div_rhov_n_fx * ufl.dot(v_n_fx, w_fx)) * dx_fx
     elif fluid_convection_key == "imex":
-        r_mom_fx += (rho_n_fx * conv_n_fx + div_rhov_n_fx * ufl.dot(v_n_fx, w_fx)) * dx_fx
+        r_mom_fx += (rho_mom_n_fx * conv_n_fx + div_rhov_n_fx * ufl.dot(v_n_fx, w_fx)) * dx_fx
     elif fluid_convection_key == "off":
         pass
     else:
         raise ValueError(f"Unknown COMP_FENICS_FLUID_CONVECTION={fluid_convection_key!r}.")
-    r_mom_fx += 2.0 * theta_fx * mu_k_fx * ufl.inner(eps_fx(v_k_fx), eps_fx(w_fx)) * dx_fx
-    r_mom_fx += 2.0 * (1.0 - theta_fx) * mu_n_fx * ufl.inner(eps_fx(v_n_fx), eps_fx(w_fx)) * dx_fx
+    r_mom_fx += 2.0 * theta_fx * mu_mom_k_fx * ufl.inner(eps_fx(v_k_fx), eps_fx(w_fx)) * dx_fx
+    r_mom_fx += 2.0 * (1.0 - theta_fx) * mu_mom_n_fx * ufl.inner(eps_fx(v_n_fx), eps_fx(w_fx)) * dx_fx
     r_mom_fx += -p_k_fx * div_C_w_fx * dx_fx
     r_mom_fx += gamma_div_fx * divF_k_fx * div_C_w_fx * dx_fx
     if use_refmap_drag_fx:
@@ -3447,13 +3598,13 @@ def run_biofilm_comparison():
         gap_t_n_fx = vt_n_fx
         penalty_t_fx = fenicsx["hdiv_tangential_gamma"] / (h_fx + 1.0e-16)
         r_mom_fx += (
-            penalty_t_fx * (theta_fx * mu_k_fx * gap_t_k_fx + (1.0 - theta_fx) * mu_n_fx * gap_t_n_fx) * wt_fx
+            penalty_t_fx * (theta_fx * mu_mom_k_fx * gap_t_k_fx + (1.0 - theta_fx) * mu_mom_n_fx * gap_t_n_fx) * wt_fx
         ) * ds_hdiv_tangential_fx(1)
         if str(fenicsx.get("hdiv_tangential_method", "penalty")) == "nitsche":
-            traction_t_k_fx = tangential_viscous_traction_fx(v_k_fx, mu_k_fx, n_b_fx)
-            traction_t_n_fx = tangential_viscous_traction_fx(v_n_fx, mu_n_fx, n_b_fx)
-            traction_t_w_k_fx = tangential_viscous_traction_fx(w_fx, mu_k_fx, n_b_fx)
-            traction_t_w_n_fx = tangential_viscous_traction_fx(w_fx, mu_n_fx, n_b_fx)
+            traction_t_k_fx = tangential_viscous_traction_fx(v_k_fx, mu_mom_k_fx, n_b_fx)
+            traction_t_n_fx = tangential_viscous_traction_fx(v_n_fx, mu_mom_n_fx, n_b_fx)
+            traction_t_w_k_fx = tangential_viscous_traction_fx(w_fx, mu_mom_k_fx, n_b_fx)
+            traction_t_w_n_fx = tangential_viscous_traction_fx(w_fx, mu_mom_n_fx, n_b_fx)
             r_mom_fx += (
                 -(theta_fx * traction_t_k_fx + (1.0 - theta_fx) * traction_t_n_fx) * wt_fx
                 - (theta_fx * traction_t_w_k_fx * gap_t_k_fx + (1.0 - theta_fx) * traction_t_w_n_fx * gap_t_n_fx)
@@ -3464,8 +3615,8 @@ def run_biofilm_comparison():
             raise NotImplementedError("Biofilm comparison harness does not define SUPG drag-rate scaling for refmap kappa_inv_model.")
         if v_supg_mode_key in {"streamline", "weak", "legacy"}:
             vmag_n_fx = ufl.sqrt(ufl.dot(v_n_fx, v_n_fx) + 1.0e-12)
-            rho_safe_n_fx = rho_n_fx + 1.0e-16
-            nu_eff_n_fx = mu_n_fx / rho_safe_n_fx
+            rho_safe_n_fx = rho_mom_n_fx + 1.0e-16
+            nu_eff_n_fx = mu_mom_n_fx / rho_safe_n_fx
             drag_rate_n_fx = beta_n_fx / rho_safe_n_fx
             tau_v_fx = v_supg_fx / ufl.sqrt(
                 (2.0 / dt_fx) ** 2
@@ -3479,8 +3630,8 @@ def run_biofilm_comparison():
             r_mom_fx += tau_v_fx * (1.0 - alpha_n_fx) * ufl.inner(adv_v_k_fx, adv_w_fx) * dx_fx
         elif v_supg_mode_key in {"residual", "strong", "strong_residual", "strong-residual"}:
             vmag_k_fx = ufl.sqrt(ufl.dot(v_k_fx, v_k_fx) + 1.0e-12)
-            rho_safe_k_fx = rho_k_fx + 1.0e-16
-            nu_eff_k_fx = mu_k_fx / rho_safe_k_fx
+            rho_safe_k_fx = rho_mom_k_fx + 1.0e-16
+            nu_eff_k_fx = mu_mom_k_fx / rho_safe_k_fx
             drag_rate_k_fx = beta_k_fx / rho_safe_k_fx
             tau_v_fx = v_supg_fx / ufl.sqrt(
                 (2.0 / dt_fx) ** 2
@@ -3490,16 +3641,16 @@ def run_biofilm_comparison():
                 + 1.0e-16
             )
             if fluid_space == "hdiv":
-                strong_visc_k_fx = strong_div_2mu_eps_hdiv_fx(v_k_fx, mu_k_fx)
+                strong_visc_k_fx = strong_div_2mu_eps_hdiv_fx(v_k_fx, mu_mom_k_fx)
             else:
-                strong_visc_k_fx = ufl.div(2.0 * mu_k_fx * eps_fx(v_k_fx))
-            strong_mom_k_fx = ((rho_k_fx * (v_k_fx - v_n_fx)) / dt_fx) - strong_visc_k_fx + C_k_fx * ufl.grad(p_k_fx)
+                strong_visc_k_fx = ufl.div(2.0 * mu_mom_k_fx * eps_fx(v_k_fx))
+            strong_mom_k_fx = ((rho_mom_k_fx * (v_k_fx - v_n_fx)) / dt_fx) - strong_visc_k_fx + C_k_fx * ufl.grad(p_k_fx)
             if fluid_convection_key == "full":
-                strong_mom_k_fx += rho_k_fx * advected_grad_fx(v_k_fx, v_k_fx) + div_rhov_k_fx * v_k_fx
+                strong_mom_k_fx += rho_mom_k_fx * advected_grad_fx(v_k_fx, v_k_fx) + div_rhov_k_fx * v_k_fx
             elif fluid_convection_key in {"lagged", "explicit"}:
-                strong_mom_k_fx += rho_n_fx * advected_grad_fx(v_k_fx, v_n_fx) + div_rhov_n_fx * v_k_fx
+                strong_mom_k_fx += rho_mom_n_fx * advected_grad_fx(v_k_fx, v_n_fx) + div_rhov_n_fx * v_k_fx
             elif fluid_convection_key == "imex":
-                strong_mom_k_fx += rho_n_fx * advected_grad_fx(v_n_fx, v_n_fx) + div_rhov_n_fx * v_n_fx
+                strong_mom_k_fx += rho_mom_n_fx * advected_grad_fx(v_n_fx, v_n_fx) + div_rhov_n_fx * v_n_fx
             if use_refmap_drag_fx:
                 strong_mom_k_fx += beta_coeff_k_fx * kdrag_k_fx
             else:
@@ -3948,6 +4099,7 @@ def run_biofilm_comparison():
                 fenics_ref[name] = vec.array.copy()
         except Exception as exc:
             print(f"❌ FEniCSx assembly failed for '{name}': {exc}")
+            _maybe_print_traceback()
             fenics_ref[name] = None
 
     backends = _requested_backends("jit")
@@ -3981,6 +4133,7 @@ def run_biofilm_comparison():
                         _, R_pc = assemble_form(Equation(None, spec["pc"]), dof_handler_pc, bcs=[], backend=backend_type)
                 except Exception as exc:
                     print(f"❌ pycutfem assembly failed for '{name}' on backend '{backend_type}': {exc}")
+                    _maybe_print_traceback()
                     failed_tests.append(_failure_label(name, backend_type, "assemble"))
                     continue
     
@@ -4084,6 +4237,11 @@ def setup_benchmark7_hdiv_problems(*, nx: int = 2, ny: int = 3):
         fluid_hdiv_order=int(fluid_hdiv_order),
         enable_phi_evolution=False,
     )
+    # Keep the pycutfem builder aligned with the explicit FEniCS reference
+    # below, which uses the reduced support as B = alpha * (1 - phi_b) with
+    # fixed phi_b rather than the alpha-B transport subsystem.
+    problem_pc["support_physics"] = "legacy_exchange"
+    problem_pc["reduced_support_state"] = "frozen_phi_b"
     dof_handler_pc = problem_pc["dh"]
 
     p_family = "DQ" if int(pressure_order) == 0 else "Lagrange"
@@ -4153,7 +4311,7 @@ def create_true_dof_map_benchmark7_hdiv(dof_handler_pc: DofHandler, W_fenicsx):
     print("Discovering Seboldt H(div) DoF map (RT,p,vS,u,alpha,mu_alpha)...")
     print("=" * 70)
 
-    P = np.zeros(dof_handler_pc.total_dofs, dtype=int)
+    P = -np.ones(dof_handler_pc.total_dofs, dtype=int)
     fx_coords_all = np.zeros((W_fenicsx.dofmap.index_map.size_global, 2), dtype=float)
 
     Wv, Vv_map = W_fenicsx.sub(0).collapse()
@@ -4234,11 +4392,12 @@ def initialize_benchmark7_hdiv_functions(problem, fenicsx, map_info):
     x_pc_n = _benchmark7_hdiv_state_vector(problem, suffix="n")
     sign_map = np.asarray(map_info["sign_map"], dtype=float)
     P_map = np.asarray(map_info["P"], dtype=int)
+    valid = _valid_pmap_mask(P_map)
 
     fenicsx["w_k"].x.array[:] = 0.0
     fenicsx["w_n"].x.array[:] = 0.0
-    fenicsx["w_k"].x.array[P_map] = sign_map * x_pc_k
-    fenicsx["w_n"].x.array[P_map] = sign_map * x_pc_n
+    fenicsx["w_k"].x.array[P_map[valid]] = sign_map[valid] * x_pc_k[valid]
+    fenicsx["w_n"].x.array[P_map[valid]] = sign_map[valid] * x_pc_n[valid]
     fenicsx["w_k"].x.scatter_forward()
     fenicsx["w_n"].x.scatter_forward()
 
@@ -4346,9 +4505,11 @@ def run_benchmark7_hdiv_comparison():
         alpha_reg_eta=1.0e-12,
         alpha_advect_with="vS",
         alpha_advection_form="conservative",
+        support_physics="legacy_exchange",
         solid_model="linear",
         kappa_inv_model="spatial",
         enable_phi_evolution=False,
+        reduced_support_state="frozen_phi_b",
         alpha_supg=0.0,                      
         alpha_cip=0.0,                       
         include_skeleton_acceleration=False, 
@@ -4492,6 +4653,7 @@ def run_benchmark7_hdiv_comparison():
                 fenics_ref[name] = vec.array.copy()
         except Exception as exc:
             print(f"❌ FEniCSx assembly failed for '{name}': {exc}")
+            _maybe_print_traceback()
             fenics_ref[name] = None
 
     backends = _requested_backends("jit")
@@ -4736,7 +4898,7 @@ def compare_term(
         if transform_arr is not None:
             R_fx_reordered = np.asarray(transform_arr.T @ np.asarray(R_fx, dtype=float), dtype=float).reshape(-1)
         else:
-            R_fx_reordered = sign_map * np.asarray(R_fx, dtype=float)[P_map]
+            R_fx_reordered = _reorder_fenics_vector_to_pycutfem(R_fx, P_map, sign_map=sign_map)
         
         R_pc_flat = R_pc.flatten()
         R_fx_reordered_flat = R_fx_reordered.flatten()
@@ -4785,12 +4947,12 @@ def compare_term(
                 else:
                     J_fx_reordered = (T_sparse.T @ csr_matrix(np.asarray(J_fx, dtype=float)) @ T_sparse).tocsr()
             else:
-                if sp.issparse(J_fx):
-                    J_fx_reordered = J_fx.tocsr()[P_map, :][:, P_map]
-                else:
-                    J_fx_reordered = csr_matrix(np.asarray(J_fx, dtype=float)[P_map, :][:, P_map])
-                D_sign = sp.diags(sign_map)
-                J_fx_reordered = (D_sign @ J_fx_reordered @ D_sign).tocsr()
+                J_fx_reordered = _reorder_fenics_matrix_to_pycutfem(
+                    J_fx,
+                    P_map,
+                    sign_map=sign_map,
+                    sparse_output=True,
+                )
             ok, max_abs, worst = _sparse_matrix_allclose(J_pc_sparse, J_fx_reordered, rtol=rtol, atol=atol)
             print(
                 f"ℹ️ Sparse Jacobian compare: nnz_pycutfem={J_pc_sparse.nnz}, "
@@ -4819,8 +4981,12 @@ def compare_term(
             if transform_arr is not None:
                 J_fx_reordered = np.asarray(transform_arr.T @ np.asarray(J_fx, dtype=float) @ transform_arr, dtype=float)
             else:
-                J_fx_reordered = np.asarray(J_fx, dtype=float)[P_map, :][:, P_map]
-                J_fx_reordered = sign_map[:, None] * J_fx_reordered * sign_map[None, :]
+                J_fx_reordered = _reorder_fenics_matrix_to_pycutfem(
+                    J_fx,
+                    P_map,
+                    sign_map=sign_map,
+                    sparse_output=False,
+                )
             if write_xlsx:
                 if transform_arr is not None:
                     print("ℹ️ Skipping Jacobian Excel export for transform-based comparison.")
@@ -5042,6 +5208,7 @@ def run_contact_comparison():
                     )
                 except Exception as exc:
                     print(f"❌ pycutfem assembly failed for '{name}' on backend '{backend_type}': {exc}")
+                    _maybe_print_traceback()
                     failed_tests.append(_failure_label(name, backend_type, "assemble"))
                     continue
     
@@ -5094,6 +5261,7 @@ def run_component_semantics_comparison():
     qdeg = int(os.environ.get("COMP_FENICS_QDEG", 6))
     backend_types = tuple(_requested_backends("python,jit,cpp"))
     metadata = {"quadrature_degree": qdeg}
+    metadata_finv = {"quadrature_degree": max(qdeg, 16)}
 
     W_fx = fenicsx["W"]
     w_trial = ufl.TrialFunction(W_fx)
@@ -5105,6 +5273,29 @@ def run_component_semantics_comparison():
     B_arr = np.array([[2.0, -0.5], [1.0, 3.0]], dtype=float)
     B_pc = Constant(B_arr, dim=2)
     B_fx = dolfinx.fem.Constant(fenicsx["mesh"], B_arr)
+    phi_const_pc = Constant(1.75, dim=0)
+    phi_const_fx = dolfinx.fem.Constant(fenicsx["mesh"], 1.75)
+    I2_pc = Identity(2)
+    I2_fx = ufl.Identity(2)
+    Finv_pc = inv(I2_pc + grad(pc["u_k"]))
+    Finv_fx = ufl.inv(I2_fx + ufl.grad(u_k_fx))
+
+    def _scalar_vector_div_product_fx(phi_expr, vec_expr):
+        return ufl.dot(vec_expr, ufl.grad(phi_expr)) + phi_expr * ufl.div(vec_expr)
+
+    def _div_dyad_fx(A_expr, T_expr):
+        return T_expr * ufl.div(A_expr) + ufl.dot(ufl.grad(T_expr), A_expr)
+
+    def _scalar_laplacian_fx(expr):
+        return expr.dx(0).dx(0) + expr.dx(1).dx(1)
+
+    def _vector_laplacian_fx(vec_expr):
+        return ufl.as_vector(
+            (
+                _scalar_laplacian_fx(vec_expr[0]),
+                _scalar_laplacian_fx(vec_expr[1]),
+            )
+        )
 
     form_specs = [
         {
@@ -5259,7 +5450,117 @@ def run_component_semantics_comparison():
                 for j in range(2)
             ) * ufl.dx(metadata=metadata),
         },
+        {
+            "name": "GradTest Finv Function Residual",
+            "kind": "res",
+            "pc": dot(dot(dot(grad(pc["v"]), Finv_pc), pc["u_k"]), pc["c"]) * dx(metadata=metadata_finv),
+            "fx": ufl.dot(ufl.dot(ufl.dot(ufl.grad(v_fx), Finv_fx), u_k_fx), fenicsx["c"]) * ufl.dx(metadata=metadata_finv),
+            "qdeg": max(qdeg, 16),
+            "rtol": 1e-10,
+            "atol": 1e-10,
+        },
+        {
+            "name": "GradTest Finv Trial Bilinear",
+            "kind": "jac",
+            "pc": dot(dot(dot(grad(pc["v"]), Finv_pc), pc["du"]), pc["c"]) * dx(metadata=metadata_finv),
+            "fx": ufl.dot(ufl.dot(ufl.dot(ufl.grad(v_fx), Finv_fx), du_fx), fenicsx["c"]) * ufl.dx(metadata=metadata_finv),
+            "qdeg": max(qdeg, 16),
+            "rtol": 1e-10,
+            "atol": 1e-10,
+        },
+        {
+            "name": "Div ScalarVector FunctionTrial Bilinear",
+            "kind": "jac",
+            "pc": div(pc["p_k"] * pc["du"]) * pc["q"] * dx(metadata=metadata),
+            "fx": _scalar_vector_div_product_fx(p_k_fx, du_fx) * q_fx * ufl.dx(metadata=metadata),
+        },
+        {
+            "name": "Div ScalarVector TrialFunction Bilinear",
+            "kind": "jac",
+            "pc": div(pc["dp"] * pc["u_k"]) * pc["q"] * dx(metadata=metadata),
+            "fx": _scalar_vector_div_product_fx(dp_fx, u_k_fx) * q_fx * ufl.dx(metadata=metadata),
+        },
+        {
+            "name": "Div ScalarVector TestFunction Residual",
+            "kind": "res",
+            "pc": div(pc["q"] * pc["u_k"]) * dx(metadata=metadata),
+            "fx": _scalar_vector_div_product_fx(q_fx, u_k_fx) * ufl.dx(metadata=metadata),
+        },
+        {
+            "name": "Div ScalarVector ConstantTest Residual",
+            "kind": "res",
+            "pc": div(phi_const_pc * pc["v"]) * dx(metadata=metadata),
+            "fx": (phi_const_fx * ufl.div(v_fx)) * ufl.dx(metadata=metadata),
+        },
+        {
+            "name": "Div Dyad FunctionTrial Bilinear",
+            "kind": "jac",
+            "pc": inner(div(dyad(pc["u_k"], pc["du"])), pc["v"]) * dx(metadata=metadata),
+            "fx": ufl.inner(_div_dyad_fx(u_k_fx, du_fx), v_fx) * ufl.dx(metadata=metadata),
+        },
+        {
+            "name": "Div Dyad TrialFunction Bilinear",
+            "kind": "jac",
+            "pc": inner(div(dyad(pc["du"], pc["u_k"])), pc["v"]) * dx(metadata=metadata),
+            "fx": ufl.inner(_div_dyad_fx(du_fx, u_k_fx), v_fx) * ufl.dx(metadata=metadata),
+        },
+        {
+            "name": "Div Dyad ConstantFunction Residual",
+            "kind": "res",
+            "pc": inner(div(dyad(pc["c"], pc["u_k"])), pc["v"]) * dx(metadata=metadata),
+            "fx": ufl.inner(ufl.dot(ufl.grad(u_k_fx), fenicsx["c"]), v_fx) * ufl.dx(metadata=metadata),
+        },
+        {
+            "name": "Div Dyad FunctionConstant Residual",
+            "kind": "res",
+            "pc": inner(div(dyad(pc["u_k"], pc["c"])), pc["v"]) * dx(metadata=metadata),
+            "fx": ufl.inner(fenicsx["c"] * ufl.div(u_k_fx), v_fx) * ufl.dx(metadata=metadata),
+        },
+        {
+            "name": "Div Dyad FunctionScalarTrial Bilinear",
+            "kind": "jac",
+            "pc": pc["q"] * div(dyad(pc["u_k"], pc["dp"])) * dx(metadata=metadata),
+            "fx": q_fx * _div_dyad_fx(u_k_fx, dp_fx) * ufl.dx(metadata=metadata),
+        },
+        {
+            "name": "Div Dyad FunctionScalarTest Residual",
+            "kind": "res",
+            "pc": pc["p_k"] * div(dyad(pc["u_k"], pc["q"])) * dx(metadata=metadata),
+            "fx": p_k_fx * _div_dyad_fx(u_k_fx, q_fx) * ufl.dx(metadata=metadata),
+        },
+        {
+            "name": "Scalar DivGrad Bilinear Explicit Laplacian",
+            "kind": "jac",
+            "pc": div(grad(pc["dp"])) * pc["q"] * dx(metadata=metadata),
+            "fx": _scalar_laplacian_fx(dp_fx) * q_fx * ufl.dx(metadata=metadata),
+        },
+        {
+            "name": "Scalar DivGrad Residual Explicit Laplacian",
+            "kind": "res",
+            "pc": div(grad(pc["p_k"])) * pc["q"] * dx(metadata=metadata),
+            "fx": _scalar_laplacian_fx(p_k_fx) * q_fx * ufl.dx(metadata=metadata),
+        },
+        {
+            "name": "Vector DivGrad Bilinear Explicit Laplacian",
+            "kind": "jac",
+            "pc": inner(div(grad(pc["du"])), pc["v"]) * dx(metadata=metadata),
+            "fx": ufl.inner(_vector_laplacian_fx(du_fx), v_fx) * ufl.dx(metadata=metadata),
+        },
+        {
+            "name": "Vector DivGrad Residual Explicit Laplacian",
+            "kind": "res",
+            "pc": inner(div(grad(pc["u_k"])), pc["v"]) * dx(metadata=metadata),
+            "fx": ufl.inner(_vector_laplacian_fx(u_k_fx), v_fx) * ufl.dx(metadata=metadata),
+        },
     ]
+
+    filter_terms = os.environ.get("COMP_FENICS_TERMS")
+    if filter_terms:
+        allowed = _parse_filter_terms(filter_terms)
+        form_specs = [spec for spec in form_specs if spec["name"] in allowed]
+        print(f"Running filtered component-semantics terms only: {[spec['name'] for spec in form_specs]}")
+    else:
+        print(f"Running component-semantics terms: {[spec['name'] for spec in form_specs]}")
 
     success_count = 0
     failed_tests = []
@@ -5274,7 +5575,7 @@ def run_component_semantics_comparison():
                         J_pc, _ = assemble_form(
                             Equation(spec["pc"], None),
                             dof_handler_pc,
-                            quad_degree=qdeg,
+                            quad_degree=spec.get("qdeg", qdeg),
                             bcs=[],
                             backend=backend_type,
                         )
@@ -5289,7 +5590,7 @@ def run_component_semantics_comparison():
                         _, R_pc = assemble_form(
                             Equation(None, spec["pc"]),
                             dof_handler_pc,
-                            quad_degree=qdeg,
+                            quad_degree=spec.get("qdeg", qdeg),
                             bcs=[],
                             backend=backend_type,
                         )
@@ -5312,8 +5613,8 @@ def run_component_semantics_comparison():
                     P_map,
                     dof_handler_pc,
                     W_fx,
-                    rtol=1e-12,
-                    atol=1e-12,
+                    rtol=spec.get("rtol", 1e-12),
+                    atol=spec.get("atol", 1e-12),
                 )
                 if is_success:
                     success_count += 1
@@ -5451,6 +5752,7 @@ def run_multiplication_semantics_comparison():
 #                      MAIN TEST HARNESS
 # ==============================================================================
 if __name__ == '__main__':
+    _apply_cli_defaults(_parse_cli_args())
     run_all_suites = _env_flag("COMP_FENICS_RUN_ALL_SUITES")
     problem = os.environ.get("COMP_FENICS_PROBLEM", "fluid").strip().lower()
 
@@ -5816,6 +6118,83 @@ if __name__ == '__main__':
     div_du_fx = ufl.tr(grad_du_phys_fx)
     stab_eps_pc = Constant(1e-8, dim=0)
     stab_eps_fx = dolfinx.fem.Constant(fenicsx['mesh'], 1e-8)
+    # Exact Bossak + ALE/DVMS subexpressions mirrored from the local NIRB fluid form.
+    # These are split out here so we can compare each transformed-gradient/stabilized
+    # contraction against FEniCSx and identify the first backend that fails.
+    h_cell_pc = CellDiameter()
+    h_cell_fx = ufl.CellDiameter(fenicsx["mesh"])
+    one_pc = Constant(1.0, dim=0)
+    one_fx = dolfinx.fem.Constant(fenicsx["mesh"], 1.0)
+    bossak_dt_value = 0.1
+    bossak_alpha_value = -0.3
+    bossak_gamma_value = 0.5 - bossak_alpha_value
+    bossak_ma0_value = 1.0 / (bossak_gamma_value * bossak_dt_value)
+    bossak_ma2_value = (-1.0 + bossak_gamma_value) / bossak_gamma_value
+    bossak_mam_value = (1.0 - bossak_alpha_value) * bossak_ma0_value
+    bossak_alpha_pc = Constant(bossak_alpha_value, dim=0)
+    bossak_alpha_fx = dolfinx.fem.Constant(fenicsx["mesh"], bossak_alpha_value)
+    bossak_ma0_pc = Constant(bossak_ma0_value, dim=0)
+    bossak_ma0_fx = dolfinx.fem.Constant(fenicsx["mesh"], bossak_ma0_value)
+    bossak_ma2_pc = Constant(bossak_ma2_value, dim=0)
+    bossak_ma2_fx = dolfinx.fem.Constant(fenicsx["mesh"], bossak_ma2_value)
+    bossak_mam_pc = Constant(bossak_mam_value, dim=0)
+    bossak_mam_fx = dolfinx.fem.Constant(fenicsx["mesh"], bossak_mam_value)
+    dynamic_tau_pc = Constant(1.0, dim=0)
+    dynamic_tau_fx = dolfinx.fem.Constant(fenicsx["mesh"], 1.0)
+    tau_c1_pc = Constant(8.0, dim=0)
+    tau_c1_fx = dolfinx.fem.Constant(fenicsx["mesh"], 8.0)
+    tau_c2_pc = Constant(2.0, dim=0)
+    tau_c2_fx = dolfinx.fem.Constant(fenicsx["mesh"], 2.0)
+    a_prev_pc = Constant([0.17, -0.11], dim=1)
+    a_prev_fx = dolfinx.fem.Constant(fenicsx["mesh"], np.array([0.17, -0.11], dtype=float))
+    w_mesh_pc = Constant([0.12, -0.04], dim=1)
+    w_mesh_fx = dolfinx.fem.Constant(fenicsx["mesh"], np.array([0.12, -0.04], dtype=float))
+    conv_velocity_pc = pc["u_k"] - w_mesh_pc
+    conv_velocity_fx = u_k_fx - w_mesh_fx
+    conv_speed_pc = (dot(conv_velocity_pc, conv_velocity_pc) + Constant(1.0e-12, dim=0)) ** Constant(0.5, dim=0)
+    conv_speed_fx = ufl.sqrt(ufl.dot(conv_velocity_fx, conv_velocity_fx) + dolfinx.fem.Constant(fenicsx["mesh"], 1.0e-12))
+    tau_one_pc = dynamic_tau_pc / (
+        tau_c1_pc * pc["mu"] / (h_cell_pc * h_cell_pc)
+        + pc["rho"] * (one_pc / pc["dt"] + tau_c2_pc * conv_speed_pc / h_cell_pc)
+    )
+    tau_one_fx = dynamic_tau_fx / (
+        tau_c1_fx * fenicsx["mu"] / (h_cell_fx * h_cell_fx)
+        + fenicsx["rho"] * (one_fx / fenicsx["dt"] + tau_c2_fx * conv_speed_fx / h_cell_fx)
+    )
+    a_curr_pc = bossak_ma0_pc * (pc["u_k"] - pc["u_n"]) + bossak_ma2_pc * a_prev_pc
+    a_curr_fx = bossak_ma0_fx * (u_k_fx - u_n_fx) + bossak_ma2_fx * a_prev_fx
+    a_relaxed_pc = (one_pc - bossak_alpha_pc) * a_curr_pc + bossak_alpha_pc * a_prev_pc
+    a_relaxed_fx = (one_fx - bossak_alpha_fx) * a_curr_fx + bossak_alpha_fx * a_prev_fx
+    grad_p_phys_pc = dot(Finv_pc.T, grad(pc["p_k"]))
+    grad_p_phys_fx = ufl.dot(Finv_fx.T, ufl.grad(p_k_fx))
+    grad_q_phys_pc = dot(Finv_pc.T, grad(pc["q"]))
+    grad_q_phys_fx = ufl.dot(Finv_fx.T, ufl.grad(q_fx))
+    grad_dp_phys_pc = dot(Finv_pc.T, grad(pc["dp"]))
+    grad_dp_phys_fx = ufl.dot(Finv_fx.T, ufl.grad(dp))
+    grad_p_phys_row_pc = dot(grad(pc["p_k"]), Finv_pc)
+    grad_p_phys_row_fx = ufl.dot(ufl.grad(p_k_fx), Finv_fx)
+    grad_q_phys_row_pc = dot(grad(pc["q"]), Finv_pc)
+    grad_q_phys_row_fx = ufl.dot(ufl.grad(q_fx), Finv_fx)
+    grad_dp_phys_row_pc = dot(grad(pc["dp"]), Finv_pc)
+    grad_dp_phys_row_fx = ufl.dot(ufl.grad(dp), Finv_fx)
+    streamline_residual_exact_pc = pc["rho"] * a_relaxed_pc + pc["rho"] * dot(grad_uk_phys_pc, conv_velocity_pc) + grad_p_phys_pc
+    streamline_residual_exact_fx = fenicsx["rho"] * a_relaxed_fx + fenicsx["rho"] * ufl.dot(grad_uk_phys_fx, conv_velocity_fx) + grad_p_phys_fx
+    streamline_test_exact_pc = pc["rho"] * bossak_mam_pc * pc["v"] + pc["rho"] * dot(dot(grad(pc["v"]), Finv_pc), conv_velocity_pc) + grad_q_phys_pc
+    streamline_test_exact_fx = fenicsx["rho"] * bossak_mam_fx * v_fx + fenicsx["rho"] * ufl.dot(ufl.dot(ufl.grad(v_fx), Finv_fx), conv_velocity_fx) + grad_q_phys_fx
+    d_streamline_test_exact_pc = pc["rho"] * dot(dot(grad(pc["v"]), Finv_pc), pc["du"])
+    d_streamline_test_exact_fx = fenicsx["rho"] * ufl.dot(ufl.dot(ufl.grad(v_fx), Finv_fx), du)
+    d_streamline_residual_exact_pc = (
+        pc["rho"] * bossak_mam_pc * pc["du"]
+        + pc["rho"] * dot(grad_du_phys_pc, conv_velocity_pc)
+        + pc["rho"] * dot(grad_uk_phys_pc, pc["du"])
+        + grad_dp_phys_pc
+    )
+    d_streamline_residual_exact_fx = (
+        fenicsx["rho"] * bossak_mam_fx * du
+        + fenicsx["rho"] * ufl.dot(grad_du_phys_fx, conv_velocity_fx)
+        + fenicsx["rho"] * ufl.dot(grad_uk_phys_fx, du)
+        + grad_dp_phys_fx
+    )
 
     def _solid_cross_component_entry(label: str,deg_fe:int = 6, deg_pc:int = 6):
         pc_expr = d2sigma_pc_terms[label]
@@ -6011,6 +6390,115 @@ if __name__ == '__main__':
             'deg': 6,
             # 'rtol': 1e-6,
             # 'atol': 1e-6,
+        },
+        # Exact transformed-pressure-gradient and tau-one ALE/DVMS terms.
+        "Fluid DVMS exact [F^{-T} grad(p)] · c RHS": {
+            'pc': dot(grad_p_phys_pc, c_pc) * pc['q'] * dx(metadata={"q": 8}),
+            'f_lambda': lambda deg: ufl.dot(grad_p_phys_fx, c_fx) * q_fx * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': False,
+            'deg': 8,
+        },
+        "Fluid DVMS exact [F^{-T} grad(dp)] · c LHS": {
+            'pc': dot(grad_dp_phys_pc, c_pc) * pc['q'] * dx(metadata={"q": 8}),
+            'f_lambda': lambda deg: ufl.dot(grad_dp_phys_fx, c_fx) * q_fx * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': True,
+            'deg': 8,
+            'rtol': 3e-7,
+        },
+        "Fluid DVMS row-grad [grad(p) F^{-1}] · c RHS": {
+            'pc': dot(grad_p_phys_row_pc, c_pc) * pc['q'] * dx(metadata={"q": 8}),
+            'f_lambda': lambda deg: ufl.dot(grad_p_phys_row_fx, c_fx) * q_fx * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': False,
+            'deg': 8,
+        },
+        "Fluid DVMS row-grad [grad(dp) F^{-1}] · c LHS": {
+            'pc': dot(grad_dp_phys_row_pc, c_pc) * pc['q'] * dx(metadata={"q": 8}),
+            'f_lambda': lambda deg: ufl.dot(grad_dp_phys_row_fx, c_fx) * q_fx * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': True,
+            'deg': 8,
+            'rtol': 3e-7,
+        },
+        "Fluid DVMS exact transformed PSPG RHS": {
+            'pc': J_geo_pc * tau_one_pc * dot(grad_q_phys_pc, grad_p_phys_pc) * dx(metadata={"q": 8}),
+            'f_lambda': lambda deg: J_geo_fx * tau_one_fx * ufl.dot(grad_q_phys_fx, grad_p_phys_fx) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': False,
+            'deg': 8,
+        },
+        "Fluid DVMS exact transformed PSPG LHS": {
+            'pc': J_geo_pc * tau_one_pc * dot(grad_q_phys_pc, grad_dp_phys_pc) * dx(metadata={"q": 8}),
+            'f_lambda': lambda deg: J_geo_fx * tau_one_fx * ufl.dot(grad_q_phys_fx, grad_dp_phys_fx) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': True,
+            'deg': 8,
+        },
+        "Fluid DVMS row-grad transformed PSPG RHS": {
+            'pc': J_geo_pc * tau_one_pc * dot(grad_q_phys_row_pc, grad_p_phys_row_pc) * dx(metadata={"q": 8}),
+            'f_lambda': lambda deg: J_geo_fx * tau_one_fx * ufl.dot(grad_q_phys_row_fx, grad_p_phys_row_fx) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': False,
+            'deg': 8,
+        },
+        "Fluid DVMS row-grad transformed PSPG LHS": {
+            'pc': J_geo_pc * tau_one_pc * dot(grad_q_phys_row_pc, grad_dp_phys_row_pc) * dx(metadata={"q": 8}),
+            'f_lambda': lambda deg: J_geo_fx * tau_one_fx * ufl.dot(grad_q_phys_row_fx, grad_dp_phys_row_fx) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': True,
+            'deg': 8,
+        },
+        "Fluid DVMS exact tau1 cross [rho mam v · grad(p)]": {
+            'pc': J_geo_pc * tau_one_pc * dot(pc["rho"] * bossak_mam_pc * pc["v"], grad_p_phys_pc) * dx(metadata={"q": 8}),
+            'f_lambda': lambda deg: J_geo_fx * tau_one_fx * ufl.dot(fenicsx["rho"] * bossak_mam_fx * v_fx, grad_p_phys_fx) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': False,
+            'deg': 8,
+        },
+        "Fluid DVMS exact tau1 cross [rho G(v) c · grad(p)]": {
+            'pc': J_geo_pc * tau_one_pc * dot(pc["rho"] * dot(dot(grad(pc["v"]), Finv_pc), conv_velocity_pc), grad_p_phys_pc) * dx(metadata={"q": 8}),
+            'f_lambda': lambda deg: J_geo_fx * tau_one_fx * ufl.dot(fenicsx["rho"] * ufl.dot(ufl.dot(ufl.grad(v_fx), Finv_fx), conv_velocity_fx), grad_p_phys_fx) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': False,
+            'deg': 8,
+        },
+        "Fluid DVMS exact tau1 cross [F^{-T} grad(q) · rho a]": {
+            'pc': J_geo_pc * tau_one_pc * dot(grad_q_phys_pc, pc["rho"] * a_relaxed_pc) * dx(metadata={"q": 8}),
+            'f_lambda': lambda deg: J_geo_fx * tau_one_fx * ufl.dot(grad_q_phys_fx, fenicsx["rho"] * a_relaxed_fx) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': False,
+            'deg': 8,
+        },
+        "Fluid DVMS exact tau1 cross [F^{-T} grad(q) · rho G(u) c]": {
+            'pc': J_geo_pc * tau_one_pc * dot(grad_q_phys_pc, pc["rho"] * dot(grad_uk_phys_pc, conv_velocity_pc)) * dx(metadata={"q": 8}),
+            'f_lambda': lambda deg: J_geo_fx * tau_one_fx * ufl.dot(grad_q_phys_fx, fenicsx["rho"] * ufl.dot(grad_uk_phys_fx, conv_velocity_fx)) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': False,
+            'deg': 8,
+        },
+        "Fluid DVMS exact tau1 residual": {
+            'pc': J_geo_pc * tau_one_pc * dot(streamline_test_exact_pc, streamline_residual_exact_pc) * dx(metadata={"q": 8}),
+            'f_lambda': lambda deg: J_geo_fx * tau_one_fx * ufl.dot(streamline_test_exact_fx, streamline_residual_exact_fx) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': False,
+            'deg': 8,
+            'rtol': 3e-8,
+        },
+        "Fluid DVMS exact tau1 jac [dL · r]": {
+            'pc': J_geo_pc * tau_one_pc * dot(d_streamline_test_exact_pc, streamline_residual_exact_pc) * dx(metadata={"q": 8}),
+            'f_lambda': lambda deg: J_geo_fx * tau_one_fx * ufl.dot(d_streamline_test_exact_fx, streamline_residual_exact_fx) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': True,
+            'deg': 8,
+            'rtol': 3e-7,
+        },
+        "Fluid DVMS exact tau1 jac [L · dr]": {
+            'pc': J_geo_pc * tau_one_pc * dot(streamline_test_exact_pc, d_streamline_residual_exact_pc) * dx(metadata={"q": 8}),
+            'f_lambda': lambda deg: J_geo_fx * tau_one_fx * ufl.dot(streamline_test_exact_fx, d_streamline_residual_exact_fx) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': True,
+            'deg': 8,
+            'rtol': 3e-7,
+        },
+        "Fluid DVMS exact tau1 jac": {
+            'pc': J_geo_pc * tau_one_pc * (
+                dot(d_streamline_test_exact_pc, streamline_residual_exact_pc)
+                + dot(streamline_test_exact_pc, d_streamline_residual_exact_pc)
+            ) * dx(metadata={"q": 8}),
+            'f_lambda': lambda deg: J_geo_fx * tau_one_fx * (
+                ufl.dot(d_streamline_test_exact_fx, streamline_residual_exact_fx)
+                + ufl.dot(streamline_test_exact_fx, d_streamline_residual_exact_fx)
+            ) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': True,
+            'deg': 8,
+            'rtol': 3e-7,
         },
 
         "Mixed Basic [Fk@Finv]": {
@@ -6579,6 +7067,7 @@ if __name__ == '__main__':
                 fenics_ref[name] = vec.array.copy()
         except Exception as exc:
             print(f"❌ FEniCSx assembly failed for '{name}': {exc}")
+            _maybe_print_traceback()
             fenics_ref[name] = None
 
     backends = _requested_backends("jit")
@@ -6622,6 +7111,7 @@ if __name__ == '__main__':
                         )
                 except Exception as exc:
                     print(f"❌ pycutfem assembly failed for '{name}' on backend '{backend_type}': {exc}")
+                    _maybe_print_traceback()
                     failed_tests.append(_failure_label(name, backend_type, "assemble"))
                     continue
     

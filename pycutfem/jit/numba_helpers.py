@@ -526,16 +526,12 @@ def swap_mixed_basis_tensor(tensor, dtype):
     Swap the two basis axes of a mixed tensor.
     Supports:
       (n_test, n_trial) <-> (n_trial, n_test)
-      (k, n_test, n_trial) <-> (k, n_trial, n_test)
+      (free..., n_test, n_trial, free...) with basis axes in slots 1/2
     """
     if tensor.ndim == 2:
         return np.ascontiguousarray(tensor.T.copy())
-    if tensor.ndim == 3:
-        k_dim, n0, n1 = tensor.shape
-        res = np.empty((k_dim, n1, n0), dtype=dtype)
-        for i in range(k_dim):
-            res[i] = np.ascontiguousarray(tensor[i].T.copy())
-        return res
+    if tensor.ndim >= 3:
+        return np.ascontiguousarray(np.swapaxes(tensor, 1, 2).copy())
     raise ValueError(f"swap_mixed_basis_tensor: unsupported ndim={tensor.ndim}")
 
 
@@ -1092,6 +1088,22 @@ def scalar_trial_times_grad_test(grad_test, trial_vals, dtype):
             np.ascontiguousarray(trial_vals)[None, None, :, None])
 
 
+@numba.njit(cache=True)
+def scalar_trial_times_basis_test(basis_test, trial_vals, dtype):
+    """
+    Scalar Trial (n_trial,) times rank-2 Test basis (r0,n_test,r1)
+    -> mixed rank-2 tensor (r0,n_test,n_trial,r1).
+    """
+    if DEBUG: print("scalar_trial_times_basis_test")
+    B = np.ascontiguousarray(basis_test)
+    phi_trial = trial_vals[0] if trial_vals.ndim == 2 else trial_vals
+    basis_view = B.reshape((B.shape[0], B.shape[1], 1) + B.shape[2:])
+    trial_view = np.ascontiguousarray(phi_trial).reshape(
+        (1, 1, phi_trial.shape[0]) + (1,) * (B.ndim - 2)
+    )
+    return basis_view * trial_view
+
+
 
 @numba.njit(cache=True)
 def grad_trial_times_scalar_test(grad_trial, test_vals, dtype):
@@ -1102,6 +1114,22 @@ def grad_trial_times_scalar_test(grad_trial, test_vals, dtype):
     if DEBUG: print("grad_trial_times_scalar_test")
     return (np.ascontiguousarray(grad_trial)[:, None, :, :] *
             np.ascontiguousarray(test_vals)[None, :, None, None])
+
+
+@numba.njit(cache=True)
+def basis_trial_times_scalar_test(basis_trial, test_vals, dtype):
+    """
+    Rank-2 Trial basis (r0,n_trial,r1) times scalar Test (n_test,)
+    -> mixed rank-2 tensor (r0,n_test,n_trial,r1).
+    """
+    if DEBUG: print("basis_trial_times_scalar_test")
+    B = np.ascontiguousarray(basis_trial)
+    phi_test = test_vals[0] if test_vals.ndim == 2 else test_vals
+    basis_view = B.reshape((B.shape[0], 1, B.shape[1]) + B.shape[2:])
+    test_view = np.ascontiguousarray(phi_test).reshape(
+        (1, phi_test.shape[0], 1) + (1,) * (B.ndim - 2)
+    )
+    return test_view * basis_view
 
 
 

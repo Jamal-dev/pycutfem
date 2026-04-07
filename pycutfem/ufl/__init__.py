@@ -19,6 +19,7 @@ from pycutfem.ufl.expressions import (
     HdivTestFunction,
     grad,
     div,
+    laplacian,
     dot,
     inner,
 )
@@ -46,6 +47,7 @@ __all__ = [
     "y",
     "grad",
     "div",
+    "laplacian",
     "dot",
     "inner",
     "dx",

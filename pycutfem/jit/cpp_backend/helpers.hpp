@@ -9,6 +9,7 @@
 #include <Eigen/Dense>
 #include <unsupported/Eigen/CXX11/Tensor>
 #include <iostream>
+#include <type_traits>
 bool is_debug = false;
 namespace py = pybind11;
 namespace pycutfem::cpp_backend {
@@ -516,6 +517,44 @@ inline std::vector<Eigen::MatrixXd> contract_last_first(
     return out;
 }
 
+// Semantic last-first contraction for two stack-backed tensors:
+// A: (i, n_a, c), B: (c, n_b, j) -> out: (i, n_a, n_b, j)
+inline std::vector<Eigen::MatrixXd> contract_last_first(
+    const std::vector<Eigen::MatrixXd>& A,
+    const std::vector<Eigen::MatrixXd>& B)
+{
+    if (is_debug) {std::cout << "C++ backend: contract_last_first(stack,stack) called" << std::endl;}
+    if (A.empty() || B.empty()) return {};
+
+    const int i_dim = static_cast<int>(A.size());
+    const int n_a = static_cast<int>(A[0].rows());
+    const int c_dim = static_cast<int>(A[0].cols());
+    if (static_cast<int>(B.size()) != c_dim) {
+        throw std::runtime_error("contract_last_first(stack,stack): contracted dimension mismatch.");
+    }
+
+    const int n_b = static_cast<int>(B[0].rows());
+    const int j_dim = static_cast<int>(B[0].cols());
+    std::vector<Eigen::MatrixXd> out(static_cast<size_t>(i_dim * j_dim), Eigen::MatrixXd::Zero(n_a, n_b));
+
+    for (int i = 0; i < i_dim; ++i) {
+        if (A[static_cast<size_t>(i)].rows() != n_a || A[static_cast<size_t>(i)].cols() != c_dim) {
+            throw std::runtime_error("contract_last_first(stack,stack): inconsistent lhs component shape.");
+        }
+        for (int c = 0; c < c_dim; ++c) {
+            if (B[static_cast<size_t>(c)].rows() != n_b || B[static_cast<size_t>(c)].cols() != j_dim) {
+                throw std::runtime_error("contract_last_first(stack,stack): inconsistent rhs component shape.");
+            }
+            for (int j = 0; j < j_dim; ++j) {
+                out[static_cast<size_t>(i * j_dim + j)].noalias() +=
+                    A[static_cast<size_t>(i)].col(c) * B[static_cast<size_t>(c)].col(j).transpose();
+            }
+        }
+    }
+
+    return out;
+}
+
 /**
  * Overload for Vector-Matrix contraction.
  * Handles A (Vector) contracted with B (Matrix).
@@ -536,12 +575,6 @@ inline Eigen::MatrixXd contract_last_first(const Eigen::VectorXd& A,
     // A.transpose() turns it into a RowVector (1, K).
     // (1, K) * (K, N) = (1, N)
     return (A.transpose() * B).transpose(); // Return as (N, 1) column vector
-}
-
-// Convenience overload for fixed-size 2-vectors to avoid overload ambiguity
-inline Eigen::MatrixXd contract_last_first(const Eigen::Vector2d& A,
-                                           const Eigen::MatrixXd& B) {
-    return contract_last_first(static_cast<Eigen::VectorXd>(A), B);
 }
 
 // ALSO handle the case where A is passed as a thin MatrixXd (K, 1)
@@ -601,6 +634,32 @@ inline Eigen::MatrixXd contract_first_first(const std::vector<Eigen::MatrixXd>& 
     }
 
     return result;
+}
+
+// Matrix (m,k) contracted with the component axis of a gradient stack (k,n,d)
+// -> gradient stack (m,n,d).
+inline std::vector<Eigen::MatrixXd> contract_component_matrix_grad(
+    const Eigen::MatrixXd& A,
+    const std::vector<Eigen::MatrixXd>& grad_basis)
+{
+    if (grad_basis.empty()) return {};
+    if (A.cols() != static_cast<Eigen::Index>(grad_basis.size())) {
+        throw std::runtime_error("contract_component_matrix_grad: matrix columns must match gradient component count.");
+    }
+
+    const Eigen::Index n = grad_basis[0].rows();
+    const Eigen::Index d = grad_basis[0].cols();
+    std::vector<Eigen::MatrixXd> out(static_cast<size_t>(A.rows()), Eigen::MatrixXd::Zero(n, d));
+
+    for (Eigen::Index i = 0; i < A.rows(); ++i) {
+        for (Eigen::Index k = 0; k < A.cols(); ++k) {
+            if (grad_basis[static_cast<size_t>(k)].rows() != n || grad_basis[static_cast<size_t>(k)].cols() != d) {
+                throw std::runtime_error("contract_component_matrix_grad: inconsistent gradient component shapes.");
+            }
+            out[static_cast<size_t>(i)].noalias() += A(i, k) * grad_basis[static_cast<size_t>(k)];
+        }
+    }
+    return out;
 }
 // Mirrors dot_grad_basis_vector
 // grad_basis: (k, n, d)
@@ -763,6 +822,13 @@ inline Eigen::MatrixXd dot_mass_test_trial(const Eigen::MatrixXd& test_vec,
     return test_vec.transpose() * trial_vec;
 }
 
+inline std::vector<Eigen::MatrixXd> dot_mass_test_trial(
+    const std::vector<Eigen::MatrixXd>& test_vec,
+    const Eigen::MatrixXd& trial_vec) {
+    if (is_debug) {std::cout<< "-----------------dot_mass_test_trial(component-carried)---------------------"<<std::endl;}
+    return contract_last_first(test_vec, trial_vec);
+}
+
 inline Eigen::MatrixXd dot_grad_grad_value(const Eigen::MatrixXd& grad_a,
                                            const Eigen::MatrixXd& grad_b) {
     
@@ -781,6 +847,45 @@ inline Eigen::MatrixXd dot_mass_trial_test(const Eigen::MatrixXd& trial_vec,
                                            const Eigen::MatrixXd& test_vec) {
     if (is_debug) {std::cout<< "-----------------dot_mass_trial_test---------------------"<<std::endl;}
     return trial_vec.transpose() * test_vec;
+}
+
+inline std::vector<Eigen::MatrixXd> dot_mass_trial_test(
+    const std::vector<Eigen::MatrixXd>& trial_vec,
+    const Eigen::MatrixXd& test_vec) {
+    if (is_debug) {std::cout<< "-----------------dot_mass_trial_test(component-carried)---------------------"<<std::endl;}
+    return contract_last_first(trial_vec, test_vec);
+}
+
+inline std::vector<Eigen::MatrixXd> vector_trial_times_scalar_test(
+    const Eigen::MatrixXd& trial_vec,
+    const Eigen::MatrixXd& test_scalar) {
+    if (is_debug) {std::cout<< "-----------------vector_trial_times_scalar_test---------------------"<<std::endl;}
+    if (test_scalar.rows() != 1) {
+        throw std::runtime_error("vector_trial_times_scalar_test expects scalar test basis as (1,n_test)");
+    }
+    std::vector<Eigen::MatrixXd> out;
+    out.reserve(static_cast<size_t>(trial_vec.rows()));
+    const Eigen::VectorXd phi_test = test_scalar.row(0).transpose();
+    for (Eigen::Index comp = 0; comp < trial_vec.rows(); ++comp) {
+        out.push_back(phi_test * trial_vec.row(comp));
+    }
+    return out;
+}
+
+inline std::vector<Eigen::MatrixXd> vector_test_times_scalar_trial(
+    const Eigen::MatrixXd& test_vec,
+    const Eigen::MatrixXd& trial_scalar) {
+    if (is_debug) {std::cout<< "-----------------vector_test_times_scalar_trial---------------------"<<std::endl;}
+    if (trial_scalar.rows() != 1) {
+        throw std::runtime_error("vector_test_times_scalar_trial expects scalar trial basis as (1,n_trial)");
+    }
+    std::vector<Eigen::MatrixXd> out;
+    out.reserve(static_cast<size_t>(test_vec.rows()));
+    const Eigen::RowVectorXd phi_trial = trial_scalar.row(0);
+    for (Eigen::Index comp = 0; comp < test_vec.rows(); ++comp) {
+        out.push_back(test_vec.row(comp).transpose() * phi_trial);
+    }
+    return out;
 }
 
 // grad(Function) @ Trial (grad_func: k x d, trial: k x n) -> d x n
@@ -808,6 +913,18 @@ inline Eigen::MatrixXd dot_grad_basis_vector(const std::vector<Eigen::MatrixXd>&
         }
         out.row(c) = (grad_basis[c] * vec).transpose();
     }
+    return out;
+}
+
+// Canonical scalar gradient basis: (d, n) dotted with spatial vector (d,) -> (1, n)
+inline Eigen::MatrixXd dot_grad_basis_vector(const Eigen::MatrixXd& grad_basis,
+                                             const Eigen::VectorXd& vec) {
+    if (is_debug) {std::cout<< "-----------------dot_grad_basis_vector (matrix)---------------------"<<std::endl;}
+    if (grad_basis.rows() != vec.size()) {
+        throw std::runtime_error("dot_grad_basis_vector(matrix): vector length must match gradient rows");
+    }
+    Eigen::MatrixXd out(1, grad_basis.cols());
+    out.row(0) = vec.transpose() * grad_basis;
     return out;
 }
 
@@ -893,18 +1010,38 @@ inline Eigen::MatrixXd vector_dot_grad_basis(const Eigen::VectorXd& vec,
     throw std::runtime_error("vector_dot_grad_basis: incompatible shapes.");
 }
 
-// Vector basis (k,n) dotted with grad(value) (k,d) -> (n,d)
+// Canonical scalar gradient basis: vector (d,) dotted with (d, n) -> (1, n)
+inline Eigen::MatrixXd vector_dot_grad_basis(const Eigen::VectorXd& vec,
+                                             const Eigen::MatrixXd& grad_basis) {
+    if (is_debug) {std::cout<< "-----------------vector_dot_grad_basis (matrix)---------------------"<<std::endl;}
+    if (grad_basis.rows() != vec.size()) {
+        throw std::runtime_error("vector_dot_grad_basis(matrix): vector length must match gradient rows");
+    }
+    Eigen::MatrixXd out(1, grad_basis.cols());
+    out.row(0) = vec.transpose() * grad_basis;
+    return out;
+}
+
+// Vector basis (k,n) dotted with grad(value) (k,d) -> (d,n)
 inline Eigen::MatrixXd vector_dot_grad_value(const Eigen::MatrixXd& vec_basis,
                                              const Eigen::MatrixXd& grad_value) {
     if (is_debug) {std::cout<< "-----------------vector_dot_grad_value---------------------"<<std::endl;}
+    if (grad_value.rows() == 1 && vec_basis.rows() == grad_value.cols()) {
+        Eigen::MatrixXd out(1, vec_basis.cols());
+        const Eigen::VectorXd g = grad_value.row(0).transpose();
+        for (int j = 0; j < vec_basis.cols(); ++j) {
+            out(0, j) = vec_basis.col(j).dot(g);
+        }
+        return out;
+    }
     if (vec_basis.rows() != grad_value.rows()) {
         throw std::runtime_error("vector_dot_grad_value: incompatible shapes.");
     }
     const int n = static_cast<int>(vec_basis.cols());
     const int d = static_cast<int>(grad_value.cols());
-    Eigen::MatrixXd out(n, d);
+    Eigen::MatrixXd out(d, n);
     for (int j = 0; j < n; ++j) {
-        out.row(j).noalias() = vec_basis.col(j).transpose() * grad_value;
+        out.col(j).noalias() = grad_value.transpose() * vec_basis.col(j);
     }
     return out;
 }
@@ -929,6 +1066,45 @@ inline std::vector<Eigen::MatrixXd> dot_vec_grad_components(const Eigen::MatrixX
             } else {
                 // rows from vec_basis (test), cols from grad_basis (trial)
                 out[r].noalias() += vec_basis.row(c).transpose() * grad_basis[c].col(r).transpose();
+            }
+        }
+    }
+    return out;
+}
+
+inline std::vector<Eigen::MatrixXd> dot_vec_grad_components(const std::vector<Eigen::MatrixXd>& vec_basis,
+                                                            const std::vector<Eigen::MatrixXd>& grad_basis,
+                                                            bool swap_roles=false) {
+    if (is_debug) {std::cout<< "-----------------dot_vec_grad_components(stack,stack)---------------------"<<std::endl;}
+    const int k = static_cast<int>(grad_basis.size());
+    if (k == 0 || vec_basis.empty()) return {};
+    if (static_cast<int>(vec_basis.size()) != k) {
+        throw std::runtime_error("dot_vec_grad_components(stack,stack): component mismatch.");
+    }
+    const int n_vec = static_cast<int>(vec_basis[0].rows());
+    const int j_dim = static_cast<int>(vec_basis[0].cols());
+    const int n_grad = static_cast<int>(grad_basis[0].rows());
+    const int d_dim = static_cast<int>(grad_basis[0].cols());
+    const int n_rows = swap_roles ? n_vec : n_grad;
+    const int n_cols = swap_roles ? n_grad : n_vec;
+    std::vector<Eigen::MatrixXd> out(static_cast<size_t>(j_dim * d_dim), Eigen::MatrixXd::Zero(n_rows, n_cols));
+    for (int c = 0; c < k; ++c) {
+        if (vec_basis[static_cast<size_t>(c)].rows() != n_vec || vec_basis[static_cast<size_t>(c)].cols() != j_dim) {
+            throw std::runtime_error("dot_vec_grad_components(stack,stack): inconsistent lhs component shape.");
+        }
+        if (grad_basis[static_cast<size_t>(c)].rows() != n_grad || grad_basis[static_cast<size_t>(c)].cols() != d_dim) {
+            throw std::runtime_error("dot_vec_grad_components(stack,stack): inconsistent rhs component shape.");
+        }
+        for (int j = 0; j < j_dim; ++j) {
+            for (int r = 0; r < d_dim; ++r) {
+                auto& block = out[static_cast<size_t>(j * d_dim + r)];
+                if (!swap_roles) {
+                    block.noalias() += grad_basis[static_cast<size_t>(c)].col(r) *
+                                       vec_basis[static_cast<size_t>(c)].col(j).transpose();
+                } else {
+                    block.noalias() += vec_basis[static_cast<size_t>(c)].col(j) *
+                                       grad_basis[static_cast<size_t>(c)].col(r).transpose();
+                }
             }
         }
     }
@@ -1000,6 +1176,42 @@ inline std::vector<Eigen::MatrixXd> grad_trial_times_scalar_test(
     return out;
 }
 
+// Scalar basis row (1,n) scaled by a value vector (k,) -> matrix (k,n).
+inline Eigen::MatrixXd scalar_basis_times_vector(
+    const Eigen::MatrixXd& scalar_basis,
+    const Eigen::VectorXd& vector_vals) {
+    if (is_debug) {std::cout<< "-----------------scalar_basis_times_vector---------------------"<<std::endl;}
+    if (scalar_basis.rows() != 1) {
+        throw std::runtime_error("scalar_basis_times_vector expects scalar basis as (1,n)");
+    }
+    return vector_vals * scalar_basis;
+}
+
+inline Eigen::MatrixXd scalar_basis_times_vector(
+    const Eigen::VectorXd& scalar_basis,
+    const Eigen::VectorXd& vector_vals) {
+    if (is_debug) {std::cout<< "-----------------scalar_basis_times_vector(vec)---------------------"<<std::endl;}
+    return vector_vals * scalar_basis.transpose();
+}
+
+// Scalar basis row (1,n) scaled by a value/const matrix (k,d) -> tensor basis (k,n,d).
+// Representation matches the existing grad-stack convention: one (n x d) matrix per component row.
+inline std::vector<Eigen::MatrixXd> scalar_basis_times_matrix_tensor(
+    const Eigen::MatrixXd& scalar_basis,
+    const Eigen::MatrixXd& value_mat) {
+    if (is_debug) {std::cout<< "-----------------scalar_basis_times_matrix_tensor---------------------"<<std::endl;}
+    if (scalar_basis.rows() != 1) {
+        throw std::runtime_error("scalar_basis_times_matrix_tensor expects scalar basis as (1,n)");
+    }
+    std::vector<Eigen::MatrixXd> out;
+    out.reserve(static_cast<size_t>(value_mat.rows()));
+    const Eigen::VectorXd phi = scalar_basis.transpose();
+    for (Eigen::Index comp = 0; comp < value_mat.rows(); ++comp) {
+        out.push_back(phi * value_mat.row(comp));
+    }
+    return out;
+}
+
 // Inner product of grad stacks -> n x n
 inline Eigen::MatrixXd inner_grad_grad(const std::vector<Eigen::MatrixXd>& test,
                                        const std::vector<Eigen::MatrixXd>& trial) {
@@ -1022,6 +1234,17 @@ inline Eigen::MatrixXd inner_grad_grad(const std::vector<Eigen::MatrixXd>& test,
     return out;
 }
 
+// Inner product of canonical scalar-grad basis/value matrices (d,n) -> (n,n)
+inline Eigen::MatrixXd inner_grad_grad(const Eigen::MatrixXd& test,
+                                       const Eigen::MatrixXd& trial) {
+    if (is_debug) {std::cout<< "-----------------inner_grad_grad(rank1_basis)---------------------"<<std::endl;}
+    if (test.rows() != trial.rows()) {
+        throw std::runtime_error(
+            "inner_grad_grad(rank1_basis): spatial dimensions must match");
+    }
+    return test.transpose() * trial;
+}
+
 // Inner of grad(test) (k,n,d) with grad(value) (k,d) -> (n,)
 inline Eigen::VectorXd inner_grad_const(const std::vector<Eigen::MatrixXd>& grad_test,
                                         const Eigen::MatrixXd& grad_val) {
@@ -1034,6 +1257,22 @@ inline Eigen::VectorXd inner_grad_const(const std::vector<Eigen::MatrixXd>& grad
         out += grad_test[c] * grad_val.row(c).transpose();
     }
     return out;
+}
+
+// Inner of canonical scalar grad(test) basis (d,n) with grad(value) (1,d) -> (n,)
+inline Eigen::VectorXd inner_grad_const(const Eigen::MatrixXd& grad_test,
+                                        const Eigen::MatrixXd& grad_val) {
+    if (is_debug) {std::cout<< "-----------------inner_grad_const(rank1_basis)---------------------"<<std::endl;}
+    if (grad_val.rows() != 1) {
+        throw std::runtime_error("inner_grad_const(rank1_basis): expected scalar grad(value) with shape (1,d)");
+    }
+    if (grad_test.rows() == grad_val.cols()) {
+        return grad_test.transpose() * grad_val.row(0).transpose();
+    }
+    if (grad_test.cols() == grad_val.cols()) {
+        return grad_test * grad_val.row(0).transpose();
+    }
+    throw std::runtime_error("inner_grad_const(rank1_basis): incompatible scalar grad basis/value shapes");
 }
 
 // Inner product of Hessian stacks stored as (n,4) flattened blocks
@@ -1187,24 +1426,70 @@ inline Eigen::MatrixXd vector_dot_hessian_value(const Eigen::VectorXd& vec,
                                                 const Eigen::MatrixXd& hess) {
     if (is_debug) {std::cout<< "-----------------vector_dot_hessian_value---------------------"<<std::endl;}
     int k = static_cast<int>(hess.rows());
-    double acc00 = 0.0, acc01 = 0.0, acc10 = 0.0, acc11 = 0.0;
-    for (int c = 0; c < k; ++c) {
-        double v = vec(c);
-        acc00 += v * hess(c, 0);
-        acc01 += v * hess(c, 1);
-        acc10 += v * hess(c, 2);
-        acc11 += v * hess(c, 3);
+    int vec_len = static_cast<int>(vec.size());
+    if (vec_len == k && k > 1) {
+        double acc00 = 0.0, acc01 = 0.0, acc10 = 0.0, acc11 = 0.0;
+        for (int c = 0; c < k; ++c) {
+            double v = vec(c);
+            acc00 += v * hess(c, 0);
+            acc01 += v * hess(c, 1);
+            acc10 += v * hess(c, 2);
+            acc11 += v * hess(c, 3);
+        }
+        Eigen::MatrixXd out(2, 2);
+        out(0, 0) = acc00; out(0, 1) = acc01;
+        out(1, 0) = acc10; out(1, 1) = acc11;
+        return out;
     }
-    Eigen::MatrixXd out(2, 2);
-    out(0, 0) = acc00; out(0, 1) = acc01;
-    out(1, 0) = acc10; out(1, 1) = acc11;
-    return out;
+    if (k == 1 && vec_len == 2) {
+        Eigen::MatrixXd out(1, 2);
+        const double v0 = vec(0);
+        const double v1 = vec(1);
+        const double h00 = hess(0, 0);
+        const double h01 = hess(0, 1);
+        const double h10 = hess(0, 2);
+        const double h11 = hess(0, 3);
+        out(0, 0) = v0 * h00 + v1 * h10;
+        out(0, 1) = v0 * h01 + v1 * h11;
+        return out;
+    }
+    throw std::runtime_error("vector_dot_hessian_value: Incompatible shapes.");
 }
 
 // Inner of grad(value) (k,d) with grad(test) (k,n,d) -> (n,)
 inline Eigen::VectorXd inner_const_grad(const Eigen::MatrixXd& grad_val,
                                         const std::vector<Eigen::MatrixXd>& grad_test) {
     return inner_grad_const(grad_test, grad_val);
+}
+
+inline Eigen::VectorXd inner_const_grad(const Eigen::MatrixXd& grad_val,
+                                        const Eigen::MatrixXd& grad_test) {
+    return inner_grad_const(grad_test, grad_val);
+}
+
+inline Eigen::VectorXd inner_rank2_value_rank2_basis(const Eigen::MatrixXd& value_rank2,
+                                                     const std::vector<Eigen::MatrixXd>& basis_rank2) {
+    if (is_debug) {std::cout<< "-----------------inner_rank2_value_rank2_basis---------------------"<<std::endl;}
+    if (basis_rank2.empty()) return Eigen::VectorXd();
+    const int r0 = static_cast<int>(basis_rank2.size());
+    const int n = static_cast<int>(basis_rank2[0].rows());
+    const int r1 = static_cast<int>(basis_rank2[0].cols());
+    if (value_rank2.rows() != r0 || value_rank2.cols() != r1) {
+        throw std::runtime_error("inner_rank2_value_rank2_basis: incompatible value/basis shapes");
+    }
+    Eigen::VectorXd out = Eigen::VectorXd::Zero(n);
+    for (int i = 0; i < r0; ++i) {
+        if (basis_rank2[i].rows() != n || basis_rank2[i].cols() != r1) {
+            throw std::runtime_error("inner_rank2_value_rank2_basis: inconsistent basis matrix shapes");
+        }
+        out.noalias() += basis_rank2[i] * value_rank2.row(i).transpose();
+    }
+    return out;
+}
+
+inline Eigen::VectorXd inner_rank2_basis_rank2_value(const std::vector<Eigen::MatrixXd>& basis_rank2,
+                                                     const Eigen::MatrixXd& value_rank2) {
+    return inner_rank2_value_rank2_basis(value_rank2, basis_rank2);
 }
 
 // elementwise add/sub for common scalar/vector/matrix types
@@ -1420,17 +1705,128 @@ inline Eigen::VectorXd dot_grad_with_value(const Eigen::MatrixXd& grad_mat,
 inline Eigen::VectorXd const_vector_dot_basis_1d(const Eigen::VectorXd& const_vec,
                                                  const Eigen::MatrixXd& basis) {
     //
-    // Constant vector (k,) dotted with basis (k,n) -> (n,).
+    // Constant vector dotted with a rank-1 basis carrier -> basis vector.
+    // Supports both component-first storage (k,n) and free-last storage (n,k).
     //
     if (is_debug) {std::cout<< "-----------------const_vector_dot_basis_1d---------------------"<<std::endl;}
-    if (basis.rows() != const_vec.size()) {
-        throw std::runtime_error("const_vector_dot_basis_1d: incompatible shapes "
-                                 + std::to_string(basis.cols()) + " vs " + std::to_string(const_vec.size())
-                                + ". The shapes were given as basis (" + std::to_string(basis.rows()) + ", " 
-                                + std::to_string(basis.cols()) + 
-                                ") and const_vec (" + std::to_string(const_vec.size()) + ")." );
+    if (basis.rows() == const_vec.size()) {
+        return basis.transpose() * const_vec;
     }
-    return basis.transpose() * const_vec;
+    if (basis.cols() == const_vec.size()) {
+        return basis * const_vec;
+    }
+    throw std::runtime_error("const_vector_dot_basis_1d: incompatible shapes "
+                             + std::to_string(basis.rows()) + "x" + std::to_string(basis.cols())
+                             + " and vec(" + std::to_string(const_vec.size()) + ")");
+}
+
+
+template <typename Derived,
+          typename std::enable_if_t<
+              !std::is_same_v<std::decay_t<Derived>, Eigen::VectorXd>
+              && !std::is_same_v<std::decay_t<Derived>, Eigen::MatrixXd>,
+              int> = 0>
+inline Eigen::VectorXd const_vector_dot_basis_1d(const Eigen::MatrixBase<Derived>& const_vec_expr,
+                                                 const Eigen::MatrixXd& basis) {
+    Eigen::MatrixXd mat_like = const_vec_expr;
+    Eigen::VectorXd const_vec;
+    if (mat_like.rows() == 1) {
+        const_vec = mat_like.row(0).transpose();
+    } else if (mat_like.cols() == 1) {
+        const_vec = mat_like.col(0);
+    } else {
+        throw std::runtime_error("const_vector_dot_basis_1d: expected a row/column vector expression");
+    }
+    return const_vector_dot_basis_1d(const_vec, basis);
+}
+
+inline Eigen::VectorXd const_vector_dot_basis_1d(const Eigen::VectorXd& const_vec,
+                                                 const std::vector<Eigen::MatrixXd>& basis) {
+    if (is_debug) {std::cout<< "-----------------const_vector_dot_basis_1d(vector)---------------------"<<std::endl;}
+    if (basis.empty()) {
+        return Eigen::VectorXd();
+    }
+    if (basis.size() != 1) {
+        throw std::runtime_error("const_vector_dot_basis_1d(vector): expected a scalar carried basis (size 1)");
+    }
+    return const_vector_dot_basis_1d(const_vec, basis[0]);
+}
+
+inline Eigen::MatrixXd basis_dot_const_vector(const Eigen::MatrixXd& basis,
+                                              const Eigen::VectorXd& const_vec) {
+    if (is_debug) {std::cout<< "-----------------basis_dot_const_vector---------------------"<<std::endl;}
+    if (basis.rows() == const_vec.size()) {
+        Eigen::MatrixXd out(1, basis.cols());
+        out.row(0) = basis.transpose() * const_vec;
+        return out;
+    }
+    if (basis.cols() == const_vec.size()) {
+        Eigen::MatrixXd out(1, basis.rows());
+        out.row(0) = (basis * const_vec).transpose();
+        return out;
+    }
+    throw std::runtime_error("basis_dot_const_vector: incompatible shapes "
+                             + std::to_string(basis.rows()) + "x" + std::to_string(basis.cols())
+                             + " and vec(" + std::to_string(const_vec.size()) + ")");
+}
+
+inline Eigen::MatrixXd basis_dot_const_vector(const std::vector<Eigen::MatrixXd>& basis,
+                                              const Eigen::VectorXd& const_vec) {
+    if (is_debug) {std::cout<< "-----------------basis_dot_const_vector(vector)---------------------"<<std::endl;}
+    if (basis.empty()) {
+        return Eigen::MatrixXd(0, 0);
+    }
+    const int carried = static_cast<int>(basis.size());
+    int basis_len = -1;
+    Eigen::MatrixXd out;
+    for (int c = 0; c < carried; ++c) {
+        const auto& B = basis[static_cast<size_t>(c)];
+        Eigen::VectorXd contracted;
+        if (B.rows() == const_vec.size()) {
+            contracted = B.transpose() * const_vec;
+        } else if (B.cols() == const_vec.size()) {
+            contracted = B * const_vec;
+        } else {
+            throw std::runtime_error("basis_dot_const_vector(vector): incompatible component shape "
+                                     + std::to_string(B.rows()) + "x" + std::to_string(B.cols())
+                                     + " and vec(" + std::to_string(const_vec.size()) + ")");
+        }
+        if (basis_len < 0) {
+            basis_len = static_cast<int>(contracted.size());
+            out.resize(carried, basis_len);
+        } else if (basis_len != contracted.size()) {
+            throw std::runtime_error("basis_dot_const_vector(vector): inconsistent basis lengths across components");
+        }
+        out.row(c) = contracted.transpose();
+    }
+    return out;
+}
+
+inline Eigen::VectorXd matrix_like_to_vector(const Eigen::MatrixXd& mat_like) {
+    if (mat_like.rows() == 1) {
+        return mat_like.row(0).transpose();
+    }
+    if (mat_like.cols() == 1) {
+        return mat_like.col(0);
+    }
+    throw std::runtime_error("matrix_like_to_vector: expected a row/column matrix");
+}
+
+inline double dot_matrix_like_vector(const Eigen::MatrixXd& mat_like,
+                                     const Eigen::VectorXd& vec) {
+    if (is_debug) {std::cout<< "-----------------dot_matrix_like_vector---------------------"<<std::endl;}
+    if (mat_like.rows() == 1 && mat_like.cols() == vec.size()) {
+        return mat_like.row(0).dot(vec);
+    }
+    if (mat_like.cols() == 1 && mat_like.rows() == vec.size()) {
+        return mat_like.col(0).dot(vec);
+    }
+    throw std::runtime_error("dot_matrix_like_vector: expected a row/column matrix compatible with the vector");
+}
+
+inline double dot_vector_matrix_like(const Eigen::VectorXd& vec,
+                                     const Eigen::MatrixXd& mat_like) {
+    return dot_matrix_like_vector(mat_like, vec);
 }
 inline Eigen::MatrixXd const_vector_dot_basis_1d(const Eigen::MatrixXd& const_mat,
                                                  const Eigen::MatrixXd& basis) {
@@ -1452,6 +1848,9 @@ inline Eigen::MatrixXd const_vector_dot_basis_1d(const Eigen::MatrixXd& const_ma
 inline Eigen::MatrixXd dot_trial_vec_grad_func(const Eigen::MatrixXd& trial_vec,
                                                const Eigen::MatrixXd& grad_func) {
     if (is_debug) {std::cout<< "-----------------dot_trial_vec_grad_func---------------------"<<std::endl;}
+    if (grad_func.rows() == 1 && grad_func.cols() == trial_vec.rows()) {
+        return grad_func * trial_vec;
+    }
     if (grad_func.cols() != trial_vec.rows()) {
         throw std::runtime_error("dot_trial_vec_grad_func: incompatible shapes");
     }
@@ -1654,6 +2053,18 @@ inline Eigen::MatrixXd inner_mixed_grad_const(const std::vector<Eigen::MatrixXd>
                                               const Eigen::MatrixXd& grad_const,
                                               int k, int d) {
     if (mixed_grad.empty()) return Eigen::MatrixXd();
+    const int total_entries = static_cast<int>(mixed_grad.size());
+    if (total_entries == k * d) {
+        // Split-component storage: each entry already carries one (n_test x n_trial)
+        // block, so rows/cols are the real mixed basis extents.
+        return inner_mixed_grad_const(
+            mixed_grad,
+            grad_const,
+            k,
+            d,
+            static_cast<int>(mixed_grad[0].rows()),
+            static_cast<int>(mixed_grad[0].cols()));
+    }
     int n_rows = static_cast<int>(mixed_grad[0].rows());
     int n_trial = static_cast<int>(std::round(std::sqrt(static_cast<double>(n_rows))));
     int n_test = (n_trial > 0) ? n_rows / n_trial : n_rows;
@@ -1735,6 +2146,89 @@ inline std::vector<Eigen::MatrixXd> sub_mixed(const std::vector<Eigen::MatrixXd>
 inline std::vector<Eigen::MatrixXd> scale_mixed(const std::vector<Eigen::MatrixXd>& a, double s) {
     std::vector<Eigen::MatrixXd> out = a;
     for (auto& m : out) m *= s;
+    return out;
+}
+
+// Generic component-stack helpers. These intentionally work on the raw
+// std::vector<MatrixXd> runtime carrier used for gradients and plain
+// basis-carrying rank-2+ tensors alike.
+inline std::vector<Eigen::MatrixXd> add_stack(const std::vector<Eigen::MatrixXd>& a,
+                                              const std::vector<Eigen::MatrixXd>& b) {
+    return add_mixed(a, b);
+}
+
+inline std::vector<Eigen::MatrixXd> sub_stack(const std::vector<Eigen::MatrixXd>& a,
+                                              const std::vector<Eigen::MatrixXd>& b) {
+    return sub_mixed(a, b);
+}
+
+inline std::vector<Eigen::MatrixXd> scale_stack(const std::vector<Eigen::MatrixXd>& a, double s) {
+    return scale_mixed(a, s);
+}
+
+inline std::vector<Eigen::MatrixXd> add_stack_mat(const std::vector<Eigen::MatrixXd>& a,
+                                                  const Eigen::MatrixXd& b) {
+    std::vector<Eigen::MatrixXd> out = a;
+    for (auto& m : out) {
+        if (m.rows() != b.rows() || m.cols() != b.cols()) {
+            throw std::runtime_error("add_stack_mat: shape mismatch");
+        }
+        m += b;
+    }
+    return out;
+}
+
+inline std::vector<Eigen::MatrixXd> add_mat_stack(const Eigen::MatrixXd& a,
+                                                  const std::vector<Eigen::MatrixXd>& b) {
+    return add_stack_mat(b, a);
+}
+
+inline std::vector<Eigen::MatrixXd> sub_stack_mat(const std::vector<Eigen::MatrixXd>& a,
+                                                  const Eigen::MatrixXd& b) {
+    std::vector<Eigen::MatrixXd> out = a;
+    for (auto& m : out) {
+        if (m.rows() != b.rows() || m.cols() != b.cols()) {
+            throw std::runtime_error("sub_stack_mat: shape mismatch");
+        }
+        m -= b;
+    }
+    return out;
+}
+
+inline std::vector<Eigen::MatrixXd> sub_mat_stack(const Eigen::MatrixXd& a,
+                                                  const std::vector<Eigen::MatrixXd>& b) {
+    std::vector<Eigen::MatrixXd> out = b;
+    for (auto& m : out) {
+        if (m.rows() != a.rows() || m.cols() != a.cols()) {
+            throw std::runtime_error("sub_mat_stack: shape mismatch");
+        }
+        m = a - m;
+    }
+    return out;
+}
+
+inline std::vector<Eigen::MatrixXd> add_stack_scalar(const std::vector<Eigen::MatrixXd>& a, double s) {
+    std::vector<Eigen::MatrixXd> out = a;
+    for (auto& m : out) {
+        m = (m.array() + s).matrix();
+    }
+    return out;
+}
+
+inline std::vector<Eigen::MatrixXd> sub_stack_scalar(const std::vector<Eigen::MatrixXd>& a, double s) {
+    std::vector<Eigen::MatrixXd> out = a;
+    for (auto& m : out) {
+        m = (m.array() - s).matrix();
+    }
+    return out;
+}
+
+inline std::vector<Eigen::MatrixXd> sub_scalar_stack(double s,
+                                                     const std::vector<Eigen::MatrixXd>& a) {
+    std::vector<Eigen::MatrixXd> out = a;
+    for (auto& m : out) {
+        m = (-m.array() + s).matrix();
+    }
     return out;
 }
 
@@ -1880,6 +2374,13 @@ inline GradStack add_grad_mat(const GradStack& g, const Eigen::MatrixXd& m) {
             out.comps[i] = Gi.rowwise() + m.row(static_cast<Eigen::Index>(i));
             continue;
         }
+        // Component-first gradient storage (d x n) appears in a few lowered
+        // paths for rank-1 basis gradients. Accept it by transposing into the
+        // row-wise GradStack convention (n x d) at this bridge point.
+        if (m.rows() == Gi.cols() && m.cols() == Gi.rows()) {
+            out.comps[i] = Gi + m.transpose();
+            continue;
+        }
         // Simple broadcast cases: column vector or row vector
         if (Gi.rows() == m.rows() && m.cols() == 1) {
             out.comps[i] = Gi.colwise() + m.col(0);
@@ -1901,6 +2402,16 @@ inline GradStack add_grad_mat(const GradStack& g, const Eigen::MatrixXd& m) {
     return out;
 }
 
+inline GradStack add_grad_mat(const GradStack& g, const std::vector<Eigen::MatrixXd>& mats) {
+    if (mats.size() == 1) {
+        return add_grad_mat(g, mats[0]);
+    }
+    if (static_cast<ssize_t>(mats.size()) == g.n_comps()) {
+        return add_grad(g, GradStack{mats});
+    }
+    throw std::runtime_error("add_grad_mat: component mismatch");
+}
+
 inline GradStack sub_grad_mat(const GradStack& g, const Eigen::MatrixXd& m) {
     GradStack out;
     out.comps.resize(g.n_comps());
@@ -1914,6 +2425,10 @@ inline GradStack sub_grad_mat(const GradStack& g, const Eigen::MatrixXd& m) {
         // Broadcast (k x d) constant across rows, matching gradient components.
         if (m.rows() == static_cast<int>(g.n_comps()) && m.cols() == Gi.cols()) {
             out.comps[i] = Gi.rowwise() - m.row(static_cast<Eigen::Index>(i));
+            continue;
+        }
+        if (m.rows() == Gi.cols() && m.cols() == Gi.rows()) {
+            out.comps[i] = Gi - m.transpose();
             continue;
         }
         if (Gi.rows() == m.rows() && m.cols() == 1) {
@@ -1934,15 +2449,58 @@ inline GradStack sub_grad_mat(const GradStack& g, const Eigen::MatrixXd& m) {
     return out;
 }
 
+inline GradStack sub_grad_mat(const GradStack& g, const std::vector<Eigen::MatrixXd>& mats) {
+    if (mats.size() == 1) {
+        return sub_grad_mat(g, mats[0]);
+    }
+    if (static_cast<ssize_t>(mats.size()) == g.n_comps()) {
+        GradStack out;
+        out.comps.resize(g.n_comps());
+        for (size_t i = 0; i < g.comps.size(); ++i) {
+            if (g.comps[i].rows() != mats[i].rows() || g.comps[i].cols() != mats[i].cols()) {
+                throw std::runtime_error("sub_grad_mat: shape mismatch");
+            }
+            out.comps[i] = g.comps[i] - mats[i];
+        }
+        return out;
+    }
+    throw std::runtime_error("sub_grad_mat: component mismatch");
+}
+
 inline GradStack mat_sub_grad(const Eigen::MatrixXd& m, const GradStack& g) {
     GradStack out;
     out.comps.resize(g.n_comps());
     for (size_t i = 0; i < g.comps.size(); ++i) {
-        if (g.comps[i].rows() != m.rows() || g.comps[i].cols() != m.cols())
-            throw std::runtime_error("mat_sub_grad: shape mismatch");
-        out.comps[i] = m - g.comps[i];
+        const auto& Gi = g.comps[i];
+        if (Gi.rows() == m.rows() && Gi.cols() == m.cols()) {
+            out.comps[i] = m - Gi;
+            continue;
+        }
+        if (m.rows() == Gi.cols() && m.cols() == Gi.rows()) {
+            out.comps[i] = m.transpose() - Gi;
+            continue;
+        }
+        throw std::runtime_error("mat_sub_grad: shape mismatch");
     }
     return out;
+}
+
+inline GradStack mat_sub_grad(const std::vector<Eigen::MatrixXd>& mats, const GradStack& g) {
+    if (mats.size() == 1) {
+        return mat_sub_grad(mats[0], g);
+    }
+    if (static_cast<ssize_t>(mats.size()) == g.n_comps()) {
+        GradStack out;
+        out.comps.resize(g.n_comps());
+        for (size_t i = 0; i < g.comps.size(); ++i) {
+            if (mats[i].rows() != g.comps[i].rows() || mats[i].cols() != g.comps[i].cols()) {
+                throw std::runtime_error("mat_sub_grad: shape mismatch");
+            }
+            out.comps[i] = mats[i] - g.comps[i];
+        }
+        return out;
+    }
+    throw std::runtime_error("mat_sub_grad: component mismatch");
 }
 
 inline GradStack scale_grad(const GradStack& g, double s) {
@@ -2070,6 +2628,34 @@ inline std::vector<Eigen::MatrixXd> trace_times_identity(const Eigen::MatrixXd& 
     }
 
     return res;
+}
+
+inline std::vector<Eigen::MatrixXd> identity_times_trace_matrix(const Eigen::MatrixXd& identity,
+                                                                const Eigen::MatrixXd& trace_matrix) {
+    if (is_debug) {std::cout << "-----------------identity_times_trace_matrix---------------------" << std::endl;}
+    const Eigen::Index k_comps = identity.rows();
+    const Eigen::Index d_dim = identity.cols();
+    std::vector<Eigen::MatrixXd> res(static_cast<size_t>(k_comps * d_dim));
+    for (Eigen::Index i = 0; i < k_comps; ++i) {
+        for (Eigen::Index j = 0; j < d_dim; ++j) {
+            res[static_cast<size_t>(i * d_dim + j)] = trace_matrix * identity(i, j);
+        }
+    }
+    return res;
+}
+
+inline std::vector<Eigen::MatrixXd> identity_times_trace_matrix(const Eigen::MatrixXd& identity,
+                                                                const std::vector<Eigen::MatrixXd>& trace_stack) {
+    if (is_debug) {std::cout << "-----------------identity_times_trace_matrix(stack)---------------------" << std::endl;}
+    if (trace_stack.empty()) return {};
+    Eigen::MatrixXd acc = Eigen::MatrixXd::Zero(trace_stack[0].rows(), trace_stack[0].cols());
+    for (const auto& block : trace_stack) {
+        if (block.rows() != acc.rows() || block.cols() != acc.cols()) {
+            throw std::runtime_error("identity_times_trace_matrix(stack): inconsistent trace block shape.");
+        }
+        acc += block;
+    }
+    return identity_times_trace_matrix(identity, acc);
 }
 
 // Generic tensor contraction helper (einsum-style) using Eigen::Tensor

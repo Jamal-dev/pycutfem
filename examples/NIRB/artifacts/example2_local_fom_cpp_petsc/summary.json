@@ -1,0 +1,27 @@
+{
+  "output_dir": "examples/NIRB/artifacts/example2_local_fom_cpp_petsc",
+  "mesh_path": "examples/NIRB/artifacts/example2_local_fom_cpp_petsc/double_flap_conforming.msh",
+  "reynolds": 250.0,
+  "reference_velocity": 2.5,
+  "dt": 0.008,
+  "end_time": 0.008,
+  "pressure_gauge": 1e-08,
+  "steps_requested": 1,
+  "steps_converged": 0,
+  "max_coupling_iters": 1,
+  "snapshot_mode": "all",
+  "snapshot_count": 1,
+  "interface_dofs": 20,
+  "solid_state_dofs": 22,
+  "coupling_iters_per_step": [
+    1
+  ],
+  "mean_coupling_iters": 1.0,
+  "total_wall_time_s": 1.0971269760048017,
+  "mean_increment_time_s": 1.097102781990543,
+  "mean_solid_solve_time_s": 0.030718052992597222,
+  "mean_fluid_solve_time_s": 0.8202273970237002,
+  "co_sim_dir": "examples/NIRB/artifacts/example2_local_fom_cpp_petsc/coSimData",
+  "timeseries_path": "examples/NIRB/artifacts/example2_local_fom_cpp_petsc/timeseries.csv",
+  "snapshot_metadata_path": "examples/NIRB/artifacts/example2_local_fom_cpp_petsc/snapshot_metadata.csv"
+}

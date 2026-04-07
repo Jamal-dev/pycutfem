@@ -1,0 +1,2 @@
+step,time_s,coupling_iter,disp_abs,disp_rel,load_abs,load_rel,solid_time_s,fluid_time_s,disp_max,load_guess_max,load_return_max,force_omega
+1,0.008,1,0.0,0.0,2.5694568275082764e-05,0.11785113019775793,0.03803735598921776,2.4806934519438073,0.0,0.0,8.16922083297402e-05,0.5

@@ -40,21 +40,37 @@ class Expression:
     def __add__(self, other):
         if not isinstance(other, Expression):
             other = Constant(other)
+        if _is_zero_expression_exact(self):
+            return other
+        if _is_zero_expression_exact(other):
+            return self
         return Sum(self, other)
 
     def __radd__(self, other):
         if not isinstance(other, Expression):
             other = Constant(other)
+        if _is_zero_expression_exact(other):
+            return self
+        if _is_zero_expression_exact(self):
+            return other
         return Sum(other, self)
 
     def __sub__(self, other):
         if not isinstance(other, Expression):
             other = Constant(other)
+        if _is_zero_expression_exact(other):
+            return self
+        if _is_zero_expression_exact(self):
+            return -other
         return Sub(self, other)
 
     def __rsub__(self, other):
         if not isinstance(other, Expression):
             other = Constant(other)
+        if _is_zero_expression_exact(self):
+            return other
+        if _is_zero_expression_exact(other):
+            return -self
         return Sub(other, self)
 
     def __mul__(self, other):
@@ -64,6 +80,14 @@ class Expression:
             return other.__rmul__(self)
         if not isinstance(other, Expression):
             other = Constant(other)
+        if _is_zero_expression_exact(self):
+            return _preserve_zero_product(self, other)
+        if _is_zero_expression_exact(other):
+            return _preserve_zero_product(self, other)
+        if _is_scalar_one_expression_exact(self):
+            return other
+        if _is_scalar_one_expression_exact(other):
+            return self
         if _should_promote_product_to_outer(self, other):
             return Outer(self, other)
         return Prod(self, other)
@@ -75,6 +99,14 @@ class Expression:
             return other.__rmul__(self)
         if not isinstance(other, Expression):
             other = Constant(other)
+        if _is_zero_expression_exact(other):
+            return _preserve_zero_product(other, self)
+        if _is_zero_expression_exact(self):
+            return _preserve_zero_product(other, self)
+        if _is_scalar_one_expression_exact(other):
+            return self
+        if _is_scalar_one_expression_exact(self):
+            return other
         if _should_promote_product_to_outer(other, self):
             return Outer(other, self)
         return Prod(other, self)
@@ -254,6 +286,126 @@ def _scalar_sum(terms):
     for term in terms:
         total = term if total is None else total + term
     return total if total is not None else Constant(0.0)
+
+
+_SPATIAL_DIM = 2
+
+
+def _is_constant_like(expr) -> bool:
+    return isinstance(expr, (Constant, ElementWiseConstant))
+
+
+def _constant_array(expr):
+    if isinstance(expr, Constant):
+        return np.asarray(expr.value, dtype=float)
+    if isinstance(expr, ElementWiseConstant):
+        return np.asarray(expr.values, dtype=float)
+    return None
+
+
+def _is_zero_expression_exact(expr) -> bool:
+    if expr is None:
+        return False
+    arr = _constant_array(expr)
+    if arr is not None:
+        return bool(np.all(arr == 0.0))
+
+    seen = set()
+
+    def _walk(node) -> bool:
+        if node is None:
+            return False
+        nid = id(node)
+        if nid in seen:
+            return False
+        seen.add(nid)
+
+        arr = _constant_array(node)
+        if arr is not None:
+            return bool(np.all(arr == 0.0))
+
+        if isinstance(node, (Pos, Neg, Restriction, Side, Avg, Transpose)):
+            child = getattr(node, "operand", None)
+            if child is None:
+                child = getattr(node, "f", None)
+            if child is None:
+                child = getattr(node, "v", None)
+            if child is None:
+                child = getattr(node, "A", None)
+            return _walk(child)
+
+        if isinstance(node, Jump):
+            return _walk(node.u_pos) and _walk(node.u_neg)
+
+        if isinstance(node, (Sum, Sub)):
+            return _walk(node.a) and _walk(node.b)
+
+        if isinstance(node, Prod):
+            return _walk(node.a) or _walk(node.b)
+
+        if isinstance(node, (Dot, Inner, Outer)):
+            return _walk(node.a) or _walk(node.b)
+
+        return False
+
+    return _walk(expr)
+
+
+def _is_scalar_one_expression_exact(expr) -> bool:
+    arr = _constant_array(expr)
+    return bool(arr is not None and arr.shape == () and float(arr) == 1.0)
+
+
+def _zero_product_expression(expr):
+    try:
+        return _zero_expression(_expr_shape(expr))
+    except Exception:
+        return Constant(0.0)
+
+
+def _preserve_zero_product(a, b):
+    if _is_constant_like(a) and _is_constant_like(b):
+        try:
+            return _zero_expression(_expr_shape(Prod(a, b)))
+        except Exception:
+            return Constant(0.0)
+    return Prod(a, b)
+
+
+def _zero_expression(shape: tuple[int, ...]):
+    shp = tuple(int(v) for v in shape)
+    if shp == ():
+        return Constant(0.0)
+    return Constant(np.zeros(shp, dtype=float))
+
+
+def _grad_result_shape(shape: tuple[int, ...]) -> tuple[int, ...]:
+    shp = tuple(int(v) for v in shape)
+    if shp == ():
+        return (_SPATIAL_DIM,)
+    if len(shp) == 1:
+        return (shp[0], _SPATIAL_DIM)
+    raise TypeError(f"Grad is only defined for scalar or vector operands, got shape {shp!r}.")
+
+
+def _div_result_shape(shape: tuple[int, ...]) -> tuple[int, ...]:
+    shp = tuple(int(v) for v in shape)
+    if shp == ():
+        raise TypeError("Divergence is not defined for scalar operands.")
+    if int(shp[-1]) != _SPATIAL_DIM:
+        raise TypeError(
+            f"Divergence expects the trailing axis to be the spatial axis of size {_SPATIAL_DIM}, got {shp!r}."
+        )
+    return shp[:-1]
+
+
+def _laplacian_result_shape(shape: tuple[int, ...]) -> tuple[int, ...]:
+    shp = tuple(int(v) for v in shape)
+    if shp == ():
+        return ()
+    if len(shp) == 1:
+        return shp
+    raise TypeError(f"Laplacian is only defined for scalar or vector operands, got shape {shp!r}.")
 
 
 def _should_promote_product_to_outer(a, b) -> bool:
@@ -1838,7 +1990,7 @@ class Dot(Expression):
 
 
 class CellDiameter(Expression):
-    """Return element‑wise √area — identical to mesh.element_char_length(eid)."""
+    """Return the UFL/FEniCS-style cell diameter (max vertex-to-vertex distance)."""
     def __init__(self):
         super().__init__()
         self.role = "none"
@@ -1934,10 +2086,53 @@ def cof(A):
     return Cofactor(A)
 
 # --- Helper functions to create operator instances ---
-def grad(v): return Grad(v)
+def grad(v):
+    """Create a symbolic gradient, expanding constant operands to exact zeros."""
+    if _is_constant_like(v):
+        return _zero_expression(_grad_result_shape(_expr_shape(v)))
+    return Grad(v)
+
+
+def laplacian(v):
+    """Create a symbolic Laplacian, expanding constant operands to exact zeros."""
+    if _is_constant_like(v):
+        return _zero_expression(_laplacian_result_shape(_expr_shape(v)))
+    return Laplacian(v)
+
+
 def div(v):
-    """Creates a symbolic representation of the divergence of a field."""
+    """Create a symbolic divergence with basic product and dyad identities."""
+    if _is_constant_like(v):
+        return _zero_expression(_div_result_shape(_expr_shape(v)))
+    if isinstance(v, Pos):
+        return Pos(div(v.operand))
+    if isinstance(v, Neg):
+        return Neg(div(v.operand))
+    if isinstance(v, Restriction):
+        return Restriction(div(v.operand), v.domain)
+    if isinstance(v, Jump):
+        return Jump(div(v.u_pos), div(v.u_neg))
+    if isinstance(v, Sum):
+        return div(v.a) + div(v.b)
+    if isinstance(v, Sub):
+        return div(v.a) - div(v.b)
+    if isinstance(v, Grad):
+        return laplacian(v.operand)
+    if isinstance(v, Prod):
+        shape_a = _expr_shape(v.a)
+        shape_b = _expr_shape(v.b)
+        if shape_a == () and shape_b != ():
+            return dot(v.b, grad(v.a)) + v.a * div(v.b)
+        if shape_b == () and shape_a != ():
+            return dot(v.a, grad(v.b)) + div(v.a) * v.b
+    if isinstance(v, Outer):
+        shape_a = _expr_shape(v.a)
+        shape_b = _expr_shape(v.b)
+        if len(shape_a) == 1 and int(shape_a[0]) == _SPATIAL_DIM and len(shape_b) <= 1:
+            return v.b * div(v.a) + dot(grad(v.b), v.a)
     return DivOperation(v)
+
+
 def inner(a, b): return Inner(a, b)
 def outer(a, b): return Outer(a, b)
 def dyad(a, b): return Outer(a, b)

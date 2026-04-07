@@ -126,9 +126,15 @@ def _collapsed_grad(g: Union["GradOpInfo", np.ndarray]) -> np.ndarray:
             return np.einsum("knd,kn->kd", G, g.coeffs, optimize=True)
         if G.ndim == 2:
             return G
+        if G.ndim == 1:
+            # Scalar gradients may be stored as a plain spatial vector (d,).
+            return G[np.newaxis, :]
         raise ValueError(f"_collapsed_grad: unexpected grad data shape {G.shape}")
     G = np.asarray(g)
-    if G.ndim == 2: return G
+    if G.ndim == 2:
+        return G
+    if G.ndim == 1:
+        return G[np.newaxis, :]
     raise ValueError(f"_collapsed_grad: unexpected ndarray shape {G.shape}")
 
 
@@ -769,7 +775,7 @@ class VecOpInfo(BaseOpInfo):
         return self.data.shape[0] if self.data.ndim > 0 else 1
     def is_scalar_function(self) -> bool:
         """Check if the VecOpInfo represents a scalar function."""
-        if self.role == "function":
+        if self.role in {"function", "scalar"}:
             vals = _collapsed_function(self)  # shape (k,)
             return vals.shape[0] == 1
         elif self.role in {"trial", "test", "trial_n", "test_n"}:
@@ -890,6 +896,16 @@ class VecOpInfo(BaseOpInfo):
                 scale = float(other.data)
                 meta = _resolve_meta(self.meta(), other.meta(), prefer="a")
                 return VecOpInfo(scale * self.data, role=self.role, **self.update_meta(meta))
+            elif self.role in {"trial", "test"} and other.role in {"function", "vector"} and other.is_scalar_function():
+                # Scalar coefficient function/value scaling a vector-valued basis carrier.
+                scale = float(_collapsed_function(other)[0])
+                meta = _resolve_meta(self.meta(), other.meta(), prefer="a")
+                return VecOpInfo(scale * self.data, role=self.role, **self.update_meta(meta))
+            elif self.role in {"function", "vector"} and other.role in {"trial", "test"} and self.is_scalar_function():
+                # Scalar coefficient function/value scaling a vector-valued basis carrier.
+                scale = float(_collapsed_function(self)[0])
+                meta = _resolve_meta(self.meta(), other.meta(), prefer="b")
+                return VecOpInfo(scale * other.data, role=other.role, **other.update_meta(meta))
             elif self.role in {"trial","test"} and other.role in {"function", "vector"}:
                 # Case: Scalar Trial/Test * Function 
                 v_vals = _collapsed_function(other)  # shape (k,)
@@ -1245,6 +1261,21 @@ class VecOpInfo(BaseOpInfo):
                     return VecOpInfo(data, role=other_role, **other.update_meta(meta))
                 meta = _resolve_meta(self.meta(), other_meta, prefer='a')
                 return VecOpInfo(data, role=self.role, **self.update_meta(meta))
+        arr_self = np.asarray(self.data)
+        arr_other = np.asarray(other_data)
+        if arr_self.shape != arr_other.shape:
+            self_is_zero = arr_self.size == 0 or np.count_nonzero(arr_self) == 0
+            other_is_zero = arr_other.size == 0 or np.count_nonzero(arr_other) == 0
+            if self_is_zero:
+                if isinstance(other, VecOpInfo):
+                    meta = _resolve_meta(self.meta(), other_meta, prefer='b')
+                    return VecOpInfo(arr_other.copy(), role=other_role, **other.update_meta(meta))
+                return arr_other.copy()
+            if other_is_zero:
+                if isinstance(other, VecOpInfo):
+                    meta = _resolve_meta(self.meta(), other_meta, prefer='a')
+                    return VecOpInfo(arr_self.copy(), role=self.role, **self.update_meta(meta))
+                return VecOpInfo(arr_self.copy(), role=self.role, **self.update_meta(self.meta()))
         if self.data.shape != other_data.shape:
             raise ValueError(f"VecOpInfo shapes mismatch in addition: {self.data.shape} vs {other_data.shape}"
                              f" Roles: {self.role}, other={getattr(other, 'role', None)}."
@@ -1381,7 +1412,7 @@ class GradOpInfo(BaseOpInfo):
             raise ValueError(f"Inner product requires another GradOpInfo, got {type(other)}."
                 f"Or Incompatible GradOpInfo shapes: {self.data.shape} and {other.data.shape}.")
         if self.is_rhs:
-            if self.role in {"function", "identity"} and other.role in {"trial", "test"}:
+            if self.role in {"function", "identity", "scalar"} and other.role in {"trial", "test"}:
                 # Case: Function · Grad(Trial) or Grad(Test)  -> (n,)
                 kd = _collapsed_grad(self)  # shape (k, d)  —   ∇u_k(ξ)
                 if _is_scalar_field(other) and kd.shape[0] == 1:
@@ -1389,7 +1420,7 @@ class GradOpInfo(BaseOpInfo):
                 if kd.shape[0] == other.shape[0]:
                     return  np.einsum("kd,knd->n", kd, other.data, optimize=True)
                 else: raise NotImplementedError(self._error_msg(other, "inner between gradients"))
-            elif self.role in {"trial", "test"} and other.role in {"function", "identity"}:
+            elif self.role in {"trial", "test"} and other.role in {"function", "identity", "scalar"}:
                 # Case: Grad(Trial) or Grad(Test) · Function  -> (n,)
                 kd = _collapsed_grad(other)  # shape (k, d)  —   ∇u_k(ξ)
                 if _is_scalar_field(self) and kd.shape[0] == 1:
@@ -1397,13 +1428,13 @@ class GradOpInfo(BaseOpInfo):
                 if kd.shape[0] == self.shape[0]:
                     return np.einsum("knd,kd->n", self.data, kd, optimize=True)
                 else: raise NotImplementedError(self._error_msg(other, "inner between gradients"))
-            elif self.role in {"function", "identity"} and other.role in {"function", "identity"}:
+            elif self.role in {"function", "identity", "scalar"} and other.role in {"function", "identity", "scalar"}:
                 # Case: Function · Function  -> ()
-                if self.role == "function":
+                if self.role in {"function", "scalar"}:
                     kd_self = _collapsed_grad(self)  # shape (k, d)  —   ∇u_k(ξ)
                 else:
                     kd_self = self.data  # shape (k, d)  —   ∇u_k(ξ)
-                if other.role == "function":
+                if other.role in {"function", "scalar"}:
                     kd_other = _collapsed_grad(other)  # shape (k, d)  —   ∇u_k(ξ)
                 else:
                     kd_other = other.data  # shape (k, d)  —   ∇u_k(ξ)
@@ -1424,7 +1455,7 @@ class GradOpInfo(BaseOpInfo):
             if _is_scalar_field(self) and _is_scalar_field(other):
                 return np.einsum("dn,dm->mn", _scalar_grad_basis_matrix(self), _scalar_grad_basis_matrix(other), optimize=True)
             return np.einsum("knd,kmd->mn", self.data, other.data, optimize=True)
-        elif self.role in {"function", "identity"} and other.role in {"trial", "test"}:
+        elif self.role in {"function", "identity", "scalar"} and other.role in {"trial", "test"}:
             # Case: Function · Grad(Trial) or Grad(Test)  -> (n,)
             kd = _collapsed_grad(self)  # shape (k, d)  —   ∇u_k(ξ)
             if _is_scalar_field(other) and kd.shape[0] == 1:
@@ -1432,7 +1463,7 @@ class GradOpInfo(BaseOpInfo):
             if kd.shape[0] == other.shape[0]:
                 return np.einsum("kd,knd->n", kd, other.data, optimize=True)
             else: raise NotImplementedError(self._error_msg(other, "inner between gradients"))
-        elif self.role in {"trial", "test"} and other.role in {"function", "identity"}:
+        elif self.role in {"trial", "test"} and other.role in {"function", "identity", "scalar"}:
             # Case: Grad(Trial) or Grad(Test) · Function  -> (n,)
             kd = _collapsed_grad(other)  # shape (k, d)  —   ∇u_k(ξ)
             if _is_scalar_field(self) and kd.shape[0] == 1:
@@ -1440,25 +1471,25 @@ class GradOpInfo(BaseOpInfo):
             if kd.shape[0] == self.shape[0]:
                 return np.einsum("knd,kd->n", self.data, kd, optimize=True)
             else: raise NotImplementedError(self._error_msg(other, "inner between gradients"))
-        elif self.role in {"function", "identity"} and other.role in {"mixed"}:
+        elif self.role in {"function", "identity", "scalar"} and other.role in {"mixed"}:
             # Case: Function · Grad(Mixed)  -> (n,)
             kd = _collapsed_grad(self)  # shape (k, d)  —   ∇u_k(ξ)
             if kd.shape[0] == other.shape[0]:
                 return np.einsum("kd,knmd->nm", kd, other.data, optimize=True)
             else: raise NotImplementedError(self._error_msg(other, "inner between gradients"))
-        elif self.role in {"mixed"} and other.role in {"function", "identity"}:
+        elif self.role in {"mixed"} and other.role in {"function", "identity", "scalar"}:
             # Case: Grad(Mixed) · Function  -> (n,)
             kd = _collapsed_grad(other)  # shape (k, d)  —   ∇u_k(ξ)
             if kd.shape[0] == self.shape[0]:
                 return np.einsum("knmd,kd->nm", self.data, kd, optimize=True)
             else: raise NotImplementedError(self._error_msg(other, "inner between gradients"))
-        elif self.role in {"function", "identity"} and other.role in {"function", "identity"}:
+        elif self.role in {"function", "identity", "scalar"} and other.role in {"function", "identity", "scalar"}:
             # (RHS or unusual cases rarely hit here; keep the default if needed)
-            if self.role == "function":
+            if self.role in {"function", "scalar"}:
                 kd_self = _collapsed_grad(self)  # shape (k, d)  —   ∇u_k(ξ)
             else:
                 kd_self = self.data  # shape (k, d)  —   ∇u_k(ξ)
-            if other.role == "function":
+            if other.role in {"function", "scalar"}:
                 kd_other = _collapsed_grad(other)  # shape (k, d)  —   ∇u_k(ξ)
             else:
                 kd_other = other.data  # shape (k, d)  —   ∇u_k(ξ)
@@ -1472,85 +1503,132 @@ class GradOpInfo(BaseOpInfo):
                                       f" Roles: {self.role} and {other.role}.")
 
 
-    def dot(self, other:"GradOpInfo") -> "GradOpInfo":
+    def dot(self, other:"GradOpInfo") -> "BaseOpInfo":
         """
         Computes dot(∇u, ∇v) for two GradOpInfo objects.
-        Returns a new GradOpInfo with shape (k, n, d).
+
+        Depending on the surviving free axes, the result may still be a
+        gradient/matrix carrier or may collapse to a vector/scalar carrier.
         """
         if not isinstance(other, GradOpInfo):
             raise TypeError(f"Expected GradOpInfo, got {type(other)}.")
-        
-        # Case 1: Function · Grad(Trial)  · Grad(Function)
-        if self.role == "function" and other.role in {"trial", "test"}:
-            # Case:  Function · Grad(Trial)      ∇u_k · ∇u_trial
-            # (k, d)   =  Σ_i  u_{k,i}  ∂_d φ_i   – true ∇u_k at this quad-point
-            grad_val = _collapsed_grad(self)  # shape (k, d)  —   ∇u_k(ξ)
+
+        def _value_role_from_vec(data: np.ndarray) -> str:
+            arr = np.asarray(data)
+            if arr.ndim == 0:
+                return "scalar"
+            if arr.ndim == 1 and arr.shape[0] == 1:
+                return "scalar"
+            return "vector"
+
+        # Case 1: value-gradient · basis-gradient
+        if self.role in {"function", "scalar"} and other.role in {"trial", "test"}:
+            grad_val = _collapsed_grad(self)  # shape (k, d)
+            meta = _resolve_meta(self.meta(), other.meta(), prefer='b')
+            if _is_scalar_field(other):
+                g_basis = _scalar_grad_basis_matrix(other)  # (d, n)
+                if grad_val.shape[1] == g_basis.shape[0]:
+                    data = grad_val @ g_basis
+                    return VecOpInfo(data, role=other.role, **self.update_meta(meta))
+                raise NotImplementedError(self._error_msg(other, "dot between gradients"))
             if grad_val.shape[-1] == other.shape[0]:
-                # (2)  matrix multiplication
                 data = np.einsum("ks,snd->knd", grad_val, other.data, optimize=True)
-                meta = _resolve_meta(self.meta(), other.meta(), prefer='b')
                 return GradOpInfo(data, role=other.role, **self.update_meta(meta))
-            else: raise NotImplementedError(self._error_msg(other, "dot between gradients"))
-        elif self.role in {"trial", "test"} and other.role == "function":
-            # Case:  Grad(Trial) · Grad(Function)      ∇u_trial · ∇u_k
-            # (1)  value of u_trial at this quad-point
-            grad_val = _collapsed_grad(other)  # shape (k, d)  —   ∇u_k(ξ)
+            raise NotImplementedError(self._error_msg(other, "dot between gradients"))
+
+        # Case 2: basis-gradient · value-gradient
+        if self.role in {"trial", "test"} and other.role in {"function", "scalar"}:
+            grad_val = _collapsed_grad(other)  # shape (k, d)
+            meta = _resolve_meta(self.meta(), other.meta(), prefer='a')
+            if _is_scalar_field(self):
+                g_basis = _scalar_grad_basis_matrix(self)  # (d, n)
+                if grad_val.shape[0] == 1 and g_basis.shape[0] == grad_val.shape[1]:
+                    data = grad_val[0] @ g_basis
+                    return VecOpInfo(data[np.newaxis, :], role=self.role, **self.update_meta(meta))
+                if g_basis.shape[0] == grad_val.shape[0]:
+                    data = grad_val.T @ g_basis
+                    return VecOpInfo(data, role=self.role, **self.update_meta(meta))
+                raise NotImplementedError(self._error_msg(other, "dot between gradients"))
             if self.shape[-1] == grad_val.shape[0]:
                 data = np.einsum("kns,sd->knd", self.data, grad_val, optimize=True)
-                meta = _resolve_meta(self.meta(), other.meta(), prefer='a')
                 return GradOpInfo(data, role=self.role, **self.update_meta(meta))
-            else: raise NotImplementedError(self._error_msg(other, "dot between gradients"))
-        elif self.role in {"mixed"} and other.role in {"function"}:
-            other_grad_val = _collapsed_grad(other)  # shape (k, d)  —   ∇u_k(ξ)
-            # self.shape = (k, n, m, d)
+            raise NotImplementedError(self._error_msg(other, "dot between gradients"))
+
+        if self.role in {"mixed"} and other.role in {"function", "scalar"}:
+            other_grad_val = _collapsed_grad(other)  # shape (k, d)
             if self.shape[-1] != other_grad_val.shape[0]:
                 raise NotImplementedError(self._error_msg(other, "dot between gradients"))
             data = np.einsum("knms,sd->knmd", self.data, other_grad_val, optimize=True)
             meta = _resolve_meta(self.meta(), other.meta(), prefer='a')
             return GradOpInfo(data, role=self.role, **self.update_meta(meta))
-        elif self.role in {"function"} and other.role in {"mixed"}:
-            self_grad_val = _collapsed_grad(self)  # shape (k, d)  —   ∇u_k(ξ)
-            # other.shape = (k, n, m, d)
+
+        if self.role in {"function", "scalar"} and other.role in {"mixed"}:
+            self_grad_val = _collapsed_grad(self)  # shape (k, d)
             if self_grad_val.shape[-1] != other.shape[0]:
                 raise NotImplementedError(self._error_msg(other, "dot between gradients"))
             data = np.einsum("ks,snmd->knmd", self_grad_val, other.data, optimize=True)
             meta = _resolve_meta(self.meta(), other.meta(), prefer='b')
             return GradOpInfo(data, role=other.role, **self.update_meta(meta))
-        elif self.role in {"function", "identity"} and other.role in {"function", "identity"}:
-            # Case:  Grad(Function) · Grad(Function)      ∇u_k · ∇u_k
-            # (1)  value of ∇u_k at this quad-point
-            grad_val = _collapsed_grad(self)  # shape (k, d)  —   ∇u_k(ξ)
-            other_grad_val = _collapsed_grad(other)  # shape (k, d)  —   ∇u_k(ξ)
-            if grad_val.shape[0] == other_grad_val.shape[0]:
-                # Matrix multiplication
-                data = np.einsum("kd,dn->kn", grad_val, other_grad_val, optimize=True)
-                meta = _resolve_meta(self.meta(), other.meta())
+
+        # Case 3: value-gradient · value-gradient
+        if self.role in {"function", "identity", "scalar"} and other.role in {"function", "identity", "scalar"}:
+            grad_val = _collapsed_grad(self)
+            other_grad_val = _collapsed_grad(other)
+            meta = _resolve_meta(self.meta(), other.meta())
+            if grad_val.shape[1] == other_grad_val.shape[0]:
+                data = grad_val @ other_grad_val
+                if np.ndim(data) == 0 or (isinstance(data, np.ndarray) and data.shape == (1, 1)):
+                    return VecOpInfo(np.asarray(float(np.asarray(data).reshape(()))), role="scalar", **self.update_meta(meta))
+                if isinstance(data, np.ndarray) and data.ndim == 2 and 1 in data.shape and data.size > 1:
+                    vec = np.ravel(data)
+                    return VecOpInfo(vec, role=_value_role_from_vec(vec), **self.update_meta(meta))
                 return GradOpInfo(data, role=self.role, **self.update_meta(meta))
-            else: raise NotImplementedError(self._error_msg(other, "dot between gradients"))
-        elif (self.role in {"trial", "test"} and other.role in {"trial", "test"}
-             and self.shape[-1] == other.shape[0]):
-            # Special Case:  Grad(Trial) · Grad(Trial) or Grad(Test) · Grad(Test) or mixed; outer product
+            if other_grad_val.shape[0] == 1 and grad_val.shape[1] == other_grad_val.shape[1]:
+                data = grad_val @ other_grad_val[0]
+                return VecOpInfo(np.asarray(data), role=_value_role_from_vec(data), **self.update_meta(meta))
+            if grad_val.shape[0] == 1 and grad_val.shape[1] == other_grad_val.shape[0]:
+                data = grad_val[0] @ other_grad_val
+                return VecOpInfo(np.asarray(data), role=_value_role_from_vec(data), **self.update_meta(meta))
+            raise NotImplementedError(self._error_msg(other, "dot between gradients"))
+
+        # Case 4: scalar basis-gradient · scalar basis-gradient -> mixed scalar block
+        if self.role in {"trial", "test"} and other.role in {"trial", "test"} and _is_scalar_field(self) and _is_scalar_field(other):
+            lhs_basis = _scalar_grad_basis_matrix(self)
+            rhs_basis = _scalar_grad_basis_matrix(other)
+            meta = _resolve_meta(self.meta(), other.meta())
+            if self.role == "test" and other.role == "trial":
+                data = lhs_basis.T @ rhs_basis
+            elif self.role == "trial" and other.role == "test":
+                data = rhs_basis.T @ lhs_basis
+            else:
+                raise NotImplementedError("GradOpInfo.dot between two trial or two test scalar gradients is not implemented.")
+            return VecOpInfo(data, role="mixed", **self.update_meta(meta))
+
+        # Case 5: vector/tensor basis-gradient · vector/tensor basis-gradient
+        if self.role in {"trial", "test"} and other.role in {"trial", "test"} and self.shape[-1] == other.shape[0]:
             is_test = self.role == "test" or other.role == "test"
             is_trial = self.role == "trial" or other.role == "trial"
             if is_trial and is_test:
                 role = "mixed"
                 if self.role == "trial" and other.role == "test":
-                    # standard order: rows=test, cols=trial
                     data = np.einsum("knd,dml->kmnl", self.data, other.data, optimize=True)
                 else:
-                    # reversed inputs: build rows=test, cols=trial anyway
                     data = np.einsum("knd,dml->knml", self.data, other.data, optimize=True)
-                return GradOpInfo(data, role=role,
-                                  field_names=self.field_names,
-                                  parent_name=self.parent_name, side=self.side,
-                                  field_sides=self.field_sides, is_rhs=self.is_rhs)
-            else:
-                raise NotImplementedError("GradOpInfo.dot between two trial or two test functions is not implemented.")
-            
-        
-        else:
-            raise NotImplementedError(f"GradOpInfo.dot not implemented for roles {self.role} and {other.role}."
-                                      f" Shapes: {self.data.shape} and {other.data.shape}.")
+                return GradOpInfo(
+                    data,
+                    role=role,
+                    field_names=self.field_names,
+                    parent_name=self.parent_name,
+                    side=self.side,
+                    field_sides=self.field_sides,
+                    is_rhs=self.is_rhs,
+                )
+            raise NotImplementedError("GradOpInfo.dot between two trial or two test functions is not implemented.")
+
+        raise NotImplementedError(
+            f"GradOpInfo.dot not implemented for roles {self.role} and {other.role}."
+            f" Shapes: {self.data.shape} and {other.data.shape}."
+        )
 
     def left_dot(self, left_vec:np.ndarray) -> VecOpInfo:
         """

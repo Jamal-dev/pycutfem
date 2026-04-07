@@ -1388,13 +1388,35 @@ class Mesh:
     def element_char_length(self, elem_id):
         if elem_id is None:
             return 0.0
-        return np.sqrt(self.areas_list[elem_id])
+        elem_id = int(elem_id)
+        cache = getattr(self, "_element_diameter_cache", None)
+        if cache is None or len(cache) != len(self.elements_list):
+            cache = np.full(len(self.elements_list), np.nan, dtype=float)
+            self._element_diameter_cache = cache
+        cached = cache[elem_id]
+        if np.isfinite(cached):
+            return float(cached)
+
+        elem = self.elements_list[elem_id]
+        corner_nodes = tuple(int(n) for n in getattr(elem, "corner_nodes", ()) or getattr(elem, "nodes", ()))
+        if len(corner_nodes) >= 2:
+            coords = np.asarray(self.nodes_x_y_pos[list(corner_nodes)], dtype=float)
+            diffs = coords[:, None, :] - coords[None, :, :]
+            d2 = np.einsum("...i,...i->...", diffs, diffs, optimize=True)
+            diameter = float(np.sqrt(np.max(d2)))
+        else:
+            diameter = float(np.sqrt(self.areas_list[elem_id]))
+
+        cache[elem_id] = diameter
+        return diameter
+
     def face_char_length(self, left_eid: int | None, right_eid: int | None) -> float:
         hs = []
         for eid in (left_eid, right_eid):
             if eid is None: continue
-            a = float(self.areas_list[int(eid)])
-            if a > 0.0: hs.append(np.sqrt(a))
+            h = float(self.element_char_length(int(eid)) or 0.0)
+            if h > 0.0:
+                hs.append(h)
         if hs: return float(min(hs))
         pos = self.areas_list[self.areas_list > 0.0]
         return float(np.sqrt(pos.min())) if pos.size else 1.0

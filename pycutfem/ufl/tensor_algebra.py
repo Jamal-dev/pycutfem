@@ -368,6 +368,39 @@ def _merge_provenance(lhs: ProvenanceSignature, rhs: ProvenanceSignature) -> Pro
     return ProvenanceSignature(_dedupe_sources(list(lhs.sources) + list(rhs.sources)))
 
 
+def _project_provenance_to_tensor(
+    provenance: ProvenanceSignature,
+    tensor: TensorSignature,
+) -> ProvenanceSignature:
+    derivative_rank = 0
+    labels = {axis.label for axis in tensor.free_axes}
+    if AxisLabel.HESSIAN_ROW in labels or AxisLabel.HESSIAN_COL in labels:
+        derivative_rank = 2
+    elif AxisLabel.DERIVATIVE in labels:
+        derivative_rank = 1
+
+    if derivative_rank == 0 and not provenance.sources:
+        return provenance
+
+    projected: list[FieldSource] = []
+    for src in provenance.sources:
+        new_depth = min(int(src.derivative_depth), derivative_rank)
+        new_kind = src.kind
+        if src.kind == ProvenanceKind.DERIVATIVE_CHANNELS and new_depth == 0:
+            new_kind = ProvenanceKind.FIELD_COMPONENTS if src.fields else ProvenanceKind.UNKNOWN
+        projected.append(
+            FieldSource(
+                parent=src.parent,
+                fields=src.fields,
+                kind=new_kind,
+                derivative_depth=new_depth,
+                role=src.role,
+                source=src.source,
+            )
+        )
+    return ProvenanceSignature(_dedupe_sources(projected))
+
+
 def _storage_axis_positions(tensor_rank: int, basis_rank: int) -> tuple[tuple[int, ...], tuple[int, ...]]:
     if basis_rank == 0:
         return tuple(range(tensor_rank)), ()
@@ -699,18 +732,19 @@ def _max_derivative_depth(meta: ExpressionMeta) -> int:
 
 def _is_gradient_semantic(meta: ExpressionMeta) -> bool:
     sig = meta.tensor
-    if _is_grad_storage(sig):
-        return True
-    if _is_hess_storage(sig):
-        return False
-    return _max_derivative_depth(meta) == 1 and sig.tensor_rank >= 1
+    # Kernel selection must follow the *exposed tensor axes*, not merely the
+    # fact that the entries depend on derivatives. Expressions like
+    # ``dot(Finv.T, grad(p))`` or ``dot(grad(q), Finv)`` are transformed
+    # gradients whose surviving free axis is a physical component/row/col axis,
+    # not a derivative axis. Treating them as semantic gradients routes later
+    # dot products through the grad-specialized backend kernels and breaks
+    # transformed PSPG/ALE terms.
+    return _is_grad_storage(sig)
 
 
 def _is_hessian_semantic(meta: ExpressionMeta) -> bool:
     sig = meta.tensor
-    if _is_hess_storage(sig):
-        return True
-    return _max_derivative_depth(meta) >= 2 and sig.tensor_rank >= 2
+    return _is_hess_storage(sig)
 
 
 def _classify_product_result(
@@ -928,6 +962,13 @@ def _kernel_kind_from_lowering(
         return "mixed"
     if lowered.is_hessian:
         return "hess"
+    # Basis-carrying rank-2+ tensors are stored in the JIT/C++ backends using
+    # the same component-stack convention as gradients: one (n x d...) matrix
+    # per leading physical component/free axis. Reporting them as plain "mat"
+    # causes later sum/product/dot lowering to route through MatrixXd shortcuts
+    # even though the runtime value is actually std::vector<Eigen::MatrixXd>.
+    if sig.basis_rank == 1 and (lowered.is_gradient or sig.tensor_rank >= 2):
+        return "grad"
     if sig.tensor_rank == 1 and len(stored_shape) == 2:
         return "mat"
     if lowered.is_gradient:
@@ -1024,9 +1065,13 @@ class TensorRuleEngine:
     ) -> ExpressionMeta:
         lhs_meta = TensorRuleEngine.infer_expression_meta(lhs_obj, spatial_dim=spatial_dim)
         rhs_meta = TensorRuleEngine.infer_expression_meta(rhs_obj, spatial_dim=spatial_dim)
+        provenance = _project_provenance_to_tensor(
+            _merge_provenance(lhs_meta.provenance, rhs_meta.provenance),
+            result_tensor,
+        )
         return ExpressionMeta(
             tensor=result_tensor,
-            provenance=_merge_provenance(lhs_meta.provenance, rhs_meta.provenance),
+            provenance=provenance,
         )
 
     @staticmethod
@@ -1414,7 +1459,10 @@ class TensorRuleEngine:
             rhs=rhs,
             result=ExpressionMeta(
                 tensor=result_tensor,
-                provenance=_merge_provenance(lhs.provenance, rhs.provenance),
+                provenance=_project_provenance_to_tensor(
+                    _merge_provenance(lhs.provenance, rhs.provenance),
+                    result_tensor,
+                ),
             ),
         )
 
@@ -1503,7 +1551,10 @@ class TensorRuleEngine:
             rhs=rhs,
             result=ExpressionMeta(
                 tensor=result_tensor,
-                provenance=_merge_provenance(lhs.provenance, rhs.provenance),
+                provenance=_project_provenance_to_tensor(
+                    _merge_provenance(lhs.provenance, rhs.provenance),
+                    result_tensor,
+                ),
             ),
         )
 
@@ -1608,7 +1659,10 @@ class TensorRuleEngine:
         )
         result = ExpressionMeta(
             tensor=result_tensor,
-            provenance=_merge_provenance(lhs.provenance, rhs.provenance),
+            provenance=_project_provenance_to_tensor(
+                _merge_provenance(lhs.provenance, rhs.provenance),
+                result_tensor,
+            ),
         )
         return SumPlan(kind=OperationKind.SUM_GENERIC, lhs=lhs, rhs=rhs, result=result)
 
@@ -1731,7 +1785,10 @@ class TensorRuleEngine:
         )
         meta = ExpressionMeta(
             tensor=algebra.result,
-            provenance=_merge_provenance(lhs_meta.provenance, rhs_meta.provenance),
+            provenance=_project_provenance_to_tensor(
+                _merge_provenance(lhs_meta.provenance, rhs_meta.provenance),
+                algebra.result,
+            ),
         )
         if algebra.kind == OperationKind.PRODUCT_SCALE:
             carrier_storage = rhs_storage if algebra.lhs.is_scalar else lhs_storage

@@ -223,6 +223,46 @@ def _semantic_is_rank1_matrix(item: Any, *, spatial_dim: int = 2) -> bool:
     )
 
 
+def _semantic_uses_cpp_stack_storage(item: Any, *, spatial_dim: int = 2) -> bool:
+    actual_kind = str(getattr(item, "tmp_kind", "") or getattr(item, "kind", "") or "")
+    role = str(getattr(item, "role", "") or "")
+    shape = tuple(int(v) for v in getattr(item, "shape", ()) or ())
+
+    # Canonical rank-1 gradient and mixed carriers can be stored directly as a
+    # MatrixXd even when their semantic kind is "grad"/"mixed". The raw C++
+    # stack carrier is only used once the stored layout still has an explicit
+    # leading component/free axis. Planner drift can temporarily label such
+    # stack-backed temporaries as "mat", so shape must participate too.
+    if actual_kind == "hess":
+        return role in {"test", "trial", "test_n", "trial_n", "mixed"} or len(shape) > 2
+    if actual_kind in {"grad", "mixed"}:
+        return len(shape) > 2
+    if actual_kind == "mat":
+        return len(shape) > 2
+
+    sig = _try_signature(item, spatial_dim=spatial_dim)
+    if sig is None:
+        return False
+    return sig.basis_rank >= 1 and len(shape) > 2
+
+
+def _cpp_stack_result_kind(*items: Any, planned_kind: str = "", planned_role: str = "") -> str:
+    planned_kind = str(planned_kind or "")
+    planned_role = str(planned_role or "")
+    if planned_kind in {"grad", "mixed", "hess"}:
+        return planned_kind
+    if planned_role == "mixed":
+        return "mixed"
+    for item in items:
+        kind = str(getattr(item, "tmp_kind", "") or getattr(item, "kind", "") or "")
+        role = str(getattr(item, "role", "") or "")
+        if kind == "hess":
+            return "hess"
+        if kind == "mixed" or role == "mixed":
+            return "mixed"
+    return "grad"
+
+
 def _semantic_is_value_rank2(item: Any, *, spatial_dim: int = 2) -> bool:
     sig = _try_signature(item, spatial_dim=spatial_dim)
     return bool(sig is not None and sig.basis_rank == 0 and sig.tensor_rank == 2)
@@ -272,15 +312,83 @@ def _planned_storage_shape(lowering: Any, fallback_shape: tuple[int, ...]) -> tu
     return planned or tuple(int(v) for v in fallback_shape)
 
 
-def _normalize_cpp_storage_kind(kind: str, role: str, shape: tuple[int, ...]) -> str:
+def _is_scalar_grad_basis_shape(shape: tuple[int, ...], spatial_dim: int) -> bool:
+    shp = tuple(int(v) for v in shape)
+    return (
+        (len(shp) == 3 and int(shp[0]) == 1 and int(shp[2]) == spatial_dim)
+        or (len(shp) == 2 and int(shp[0]) == spatial_dim)
+    )
+
+
+def _is_scalar_grad_value_shape(shape: tuple[int, ...], spatial_dim: int) -> bool:
+    shp = tuple(int(v) for v in shape)
+    return len(shp) == 2 and (
+        (int(shp[0]) == 1 and int(shp[1]) == spatial_dim)
+        or (int(shp[0]) == spatial_dim and int(shp[1]) == 1)
+    )
+
+
+def _semantic_is_scalar_grad_basis_carrier(item: Any, *, spatial_dim: int = 2) -> bool:
+    role = str(getattr(item, "role", "") or "")
+    shape = tuple(int(v) for v in getattr(item, "shape", ()) or ())
+    return (
+        role in {"test", "trial", "test_n", "trial_n"}
+        and _semantic_has_derivative_provenance(item, spatial_dim=spatial_dim)
+        and _is_scalar_grad_basis_shape(shape, spatial_dim)
+    )
+
+
+def _semantic_is_scalar_grad_value_carrier(item: Any, *, spatial_dim: int = 2) -> bool:
+    role = str(getattr(item, "role", "") or "")
+    shape = tuple(int(v) for v in getattr(item, "shape", ()) or ())
+    return (
+        role in {"value", "const", "function", "identity", "scalar"}
+        and _semantic_has_derivative_provenance(item, spatial_dim=spatial_dim)
+        and _is_scalar_grad_value_shape(shape, spatial_dim)
+    )
+
+
+def _normalize_cpp_storage_kind(
+    kind: str,
+    role: str,
+    shape: tuple[int, ...],
+    *,
+    expression_meta: Any = None,
+) -> str:
     kind = str(kind or "")
     role = str(role or "")
     shape = tuple(int(v) for v in (shape or ()))
+    tensor = getattr(expression_meta, "tensor", None)
     # Preserve semantic mixed carriers even when the stored layout is a plain
     # 2D (n_test, n_trial) matrix. Downgrading them to "mat" hides the shared
     # tensor-plan result and breaks downstream mixed product rules.
-    if kind == "mixed":
+    if role == "mixed" and kind in {"mixed", "mat"}:
         return "mixed"
+    if kind == "mat" and tensor is not None:
+        basis_rank = int(getattr(tensor, "basis_rank", 0))
+        tensor_rank = int(getattr(tensor, "tensor_rank", 0))
+        if basis_rank >= 2:
+            return "mixed"
+        # Basis-carrying rank-2+ tensors are emitted through stack carriers in
+        # C++ even when the stored planner shape is only 2D after layout
+        # compression. Use the semantic tensor rank to preserve that runtime
+        # carrier kind for later dot/add/sub dispatch.
+        if basis_rank == 1 and tensor_rank >= 2:
+            return "grad"
+    # Basis-carrying rank-2+ tensors are emitted in C++ as stack-backed
+    # component carriers even when the planner/value spec reports a plain
+    # matrix-like result. Normalizing them here keeps later dispatch on the
+    # semantic stack path instead of matrix-only shortcuts.
+    if kind == "mat" and len(shape) > 2:
+        if tensor is not None:
+            if getattr(tensor, "basis_rank", 0) >= 2:
+                return "mixed"
+            if getattr(tensor, "basis_rank", 0) == 1:
+                return "grad"
+        if role == "mixed":
+            return "mixed"
+        if role in {"test", "trial", "test_n", "trial_n"}:
+            return "grad"
     if kind == "grad" and len(shape) <= 2:
         if role in {"test", "trial", "test_n", "trial_n", "mixed"}:
             return "grad"
@@ -290,6 +398,23 @@ def _normalize_cpp_storage_kind(kind: str, role: str, shape: tuple[int, ...]) ->
     if kind == "vec" and len(shape) == 0:
         return "scalar"
     return kind
+
+
+def _merge_cpp_planned_kind(current_kind: str, planned_kind: str, role: str) -> str:
+    current_kind = str(current_kind or "")
+    planned_kind = str(planned_kind or "")
+    role = str(role or "")
+    if planned_kind in {"", "none"}:
+        return current_kind
+    # Planner/storage specs may report plain "mat" for 2D carriers even when
+    # the runtime lowering intentionally emits stack-backed gradient/Hessian or
+    # mixed-basis temporaries. Preserve the emitted semantic kind so later
+    # products keep using the correct stack helpers.
+    if planned_kind == "mat" and current_kind in {"grad", "hess", "mixed"}:
+        return current_kind
+    if planned_kind == "mat" and role == "mixed":
+        return "mixed"
+    return planned_kind
 
 
 def _cpp_vector_input_expr(item: Any) -> str:
@@ -3084,15 +3209,13 @@ class CppCodeGen:
                             role = planned_role
                     if respect_sum_specs and sum_value_spec is not None:
                         planned_kind = getattr(sum_value_spec, "kind", "") or ""
-                        if planned_kind not in {"", "none"}:
-                            kind = planned_kind
+                        kind = _merge_cpp_planned_kind(kind, planned_kind, role)
                         planned_role = getattr(sum_value_spec, "role", "") or ""
                         if planned_role not in {"", "none"}:
                             role = planned_role
                     if product_value_spec is not None:
                         planned_kind = getattr(product_value_spec, "kind", "") or ""
-                        if planned_kind not in {"", "none"}:
-                            kind = planned_kind
+                        kind = _merge_cpp_planned_kind(kind, planned_kind, role)
                         planned_role = getattr(product_value_spec, "role", "") or ""
                         if planned_role not in {"", "none"}:
                             role = planned_role
@@ -3102,8 +3225,7 @@ class CppCodeGen:
                             role = planned_role
                     if division_value_spec is not None:
                         planned_kind = getattr(division_value_spec, "kind", "") or ""
-                        if planned_kind not in {"", "none"}:
-                            kind = planned_kind
+                        kind = _merge_cpp_planned_kind(kind, planned_kind, role)
                         planned_shape = tuple(int(v) for v in getattr(division_value_spec, "shape", ()) or ())
                         if planned_shape:
                             shape = planned_shape
@@ -3114,7 +3236,12 @@ class CppCodeGen:
                         vec_dim = max(int(shape[0]), int(shape[1]))
                         if vec_dim > 1:
                             shape = (vec_dim,)
-                    kind = _normalize_cpp_storage_kind(kind, role, shape)
+                    kind = _normalize_cpp_storage_kind(
+                        kind,
+                        role,
+                        shape,
+                        expression_meta=expression_meta,
+                    )
                     stack.append(
                         StackItem(
                             nm,
@@ -3230,6 +3357,28 @@ class CppCodeGen:
                 )
                 a_sum_vector_like = a.kind == "vec" or a_rank1_matrix
                 b_sum_vector_like = b.kind == "vec" or b_rank1_matrix
+                a_stack_runtime = _semantic_uses_cpp_stack_storage(a, spatial_dim=self.spatial_dim)
+                b_stack_runtime = _semantic_uses_cpp_stack_storage(b, spatial_dim=self.spatial_dim)
+                sum_planned_kind = getattr(sum_value_spec, "kind", "") or ""
+                sum_planned_role = (
+                    getattr(sum_value_spec, "role", "")
+                    or getattr(getattr(sum_plan, "result", None), "role", "")
+                    or ""
+                )
+                sum_layout_tag = (
+                    sum_value_spec.layout.value
+                    if sum_value_spec is not None
+                    else (
+                        sum_lowering.result.layout.value
+                        if sum_lowering is not None
+                        else (a.layout_tag or b.layout_tag)
+                    )
+                )
+                sum_expression_meta = (
+                    sum_value_spec.meta
+                    if sum_value_spec is not None
+                    else (sum_plan.result if sum_plan is not None else (a.expression_meta or b.expression_meta))
+                )
                 if op.op_symbol == "+":
                     if sum_result_is_scalar_basis_row and a_sum_vector_like and b_sum_vector_like:
                         nm, tmp_kind, tmp_slot = alloc_tmp("mat", "bin")
@@ -3290,6 +3439,35 @@ class CppCodeGen:
                             a.field_names or b.field_names,
                             a.parent or b.parent,
                             respect_sum_specs=False,
+                        )
+                        continue
+                    if a_stack_runtime or b_stack_runtime:
+                        stack_kind = _cpp_stack_result_kind(
+                            a,
+                            b,
+                            planned_kind=sum_planned_kind,
+                            planned_role=sum_planned_role,
+                        )
+                        if a_stack_runtime and b_stack_runtime:
+                            emit_line(f"auto {nm} = add_stack({a.name}, {b.name});")
+                        elif a_stack_runtime and b.kind == "scalar":
+                            emit_line(f"auto {nm} = add_stack_scalar({a.name}, {b.name});")
+                        elif b_stack_runtime and a.kind == "scalar":
+                            emit_line(f"auto {nm} = add_stack_scalar({b.name}, {a.name});")
+                        elif a_stack_runtime:
+                            emit_line(f"auto {nm} = add_stack_mat({a.name}, {b_mat_expr});")
+                        else:
+                            emit_line(f"auto {nm} = add_mat_stack({a_mat_expr}, {b.name});")
+                        push_bin(
+                            stack_kind,
+                            a.role if a_stack_runtime else b.role,
+                            a.shape if a_stack_runtime else b.shape,
+                            f_names,
+                            parent,
+                            side,
+                            f_sides,
+                            layout_tag=sum_layout_tag,
+                            expression_meta=sum_expression_meta,
                         )
                         continue
                     if a.kind == "grad" and b.kind == "grad":
@@ -3475,6 +3653,35 @@ class CppCodeGen:
                             a.field_names or b.field_names,
                             a.parent or b.parent,
                             respect_sum_specs=False,
+                        )
+                        continue
+                    if a_stack_runtime or b_stack_runtime:
+                        stack_kind = _cpp_stack_result_kind(
+                            a,
+                            b,
+                            planned_kind=sum_planned_kind,
+                            planned_role=sum_planned_role,
+                        )
+                        if a_stack_runtime and b_stack_runtime:
+                            emit_line(f"auto {nm} = sub_stack({a.name}, {b.name});")
+                        elif a_stack_runtime and b.kind == "scalar":
+                            emit_line(f"auto {nm} = sub_stack_scalar({a.name}, {b.name});")
+                        elif b_stack_runtime and a.kind == "scalar":
+                            emit_line(f"auto {nm} = sub_scalar_stack({a.name}, {b.name});")
+                        elif a_stack_runtime:
+                            emit_line(f"auto {nm} = sub_stack_mat({a.name}, {b_mat_expr});")
+                        else:
+                            emit_line(f"auto {nm} = sub_mat_stack({a_mat_expr}, {b.name});")
+                        push_bin(
+                            stack_kind,
+                            a.role if a_stack_runtime else b.role,
+                            a.shape if a_stack_runtime else b.shape,
+                            f_names,
+                            parent,
+                            side,
+                            f_sides,
+                            layout_tag=sum_layout_tag,
+                            expression_meta=sum_expression_meta,
                         )
                         continue
                     if a.kind == "grad" and b.kind == "grad":
@@ -3794,6 +4001,58 @@ class CppCodeGen:
                     if a.kind == "mixed" and b.kind == "mixed":
                         emit_line('throw std::runtime_error("Mixed * mixed not supported in C++ backend");')
                         continue
+                    if a.kind == "scalar" and _semantic_uses_cpp_stack_storage(b, spatial_dim=self.spatial_dim):
+                        emit_line(f"auto {nm} = scale_stack({b.name}, {a.name});")
+                        push_bin(
+                            _cpp_stack_result_kind(
+                                b,
+                                planned_kind=(getattr(product_value_spec, "kind", "") or ""),
+                                planned_role=(getattr(product_value_spec, "role", "") or getattr(product_lowering.result, "role", "") if product_lowering is not None else ""),
+                            ),
+                            b.role,
+                            b.shape,
+                            b.field_names,
+                            b.parent,
+                            b.side,
+                            b.field_sides,
+                            layout_tag=(
+                                product_value_spec.layout.value
+                                if product_value_spec is not None
+                                else (product_lowering.result.layout.value if product_lowering is not None else b.layout_tag)
+                            ),
+                            expression_meta=(
+                                product_value_spec.meta
+                                if product_value_spec is not None
+                                else (product_lowering.meta if product_lowering is not None else b.expression_meta)
+                            ),
+                        )
+                        continue
+                    if b.kind == "scalar" and _semantic_uses_cpp_stack_storage(a, spatial_dim=self.spatial_dim):
+                        emit_line(f"auto {nm} = scale_stack({a.name}, {b.name});")
+                        push_bin(
+                            _cpp_stack_result_kind(
+                                a,
+                                planned_kind=(getattr(product_value_spec, "kind", "") or ""),
+                                planned_role=(getattr(product_value_spec, "role", "") or getattr(product_lowering.result, "role", "") if product_lowering is not None else ""),
+                            ),
+                            a.role,
+                            a.shape,
+                            a.field_names,
+                            a.parent,
+                            a.side,
+                            a.field_sides,
+                            layout_tag=(
+                                product_value_spec.layout.value
+                                if product_value_spec is not None
+                                else (product_lowering.result.layout.value if product_lowering is not None else a.layout_tag)
+                            ),
+                            expression_meta=(
+                                product_value_spec.meta
+                                if product_value_spec is not None
+                                else (product_lowering.meta if product_lowering is not None else a.expression_meta)
+                            ),
+                        )
+                        continue
                     if a.kind == "scalar" and b.kind == "mixed":
                         if len(b.shape) == 2:
                             emit_line(f"Eigen::MatrixXd {nm} = ({a.name} * {b.name}).eval();")
@@ -3921,14 +4180,136 @@ class CppCodeGen:
                         push_bin("mat", role, (1, a.shape[0]), a.field_names or b.field_names, a.parent or b.parent, tmp_kind=tmp_kind, tmp_slot=tmp_slot)
                         continue
                     if a.kind == "scalar" and b.kind == "mat":
-                        nm, tmp_kind, tmp_slot = alloc_tmp("mat", "bin")
-                        emit_mat(nm, f"{a.name} * {b.name}", tmp_kind=tmp_kind)
-                        push_bin("mat", b.role, b.shape, b.field_names, b.parent, tmp_kind=tmp_kind, tmp_slot=tmp_slot)
+                        carrier_is_grad = (
+                            _semantic_is_scalar_grad_basis_carrier(b, spatial_dim=self.spatial_dim)
+                            or _semantic_is_scalar_grad_value_carrier(b, spatial_dim=self.spatial_dim)
+                        )
+                        push_kind = _normalize_cpp_storage_kind("grad", b.role, b.shape)
+                        meta = (
+                            product_value_spec.meta
+                            if product_value_spec is not None
+                            else (
+                                product_lowering.meta
+                                if product_lowering is not None
+                                else b.expression_meta
+                            )
+                        )
+                        layout_tag = (
+                            product_value_spec.layout.value
+                            if product_value_spec is not None
+                            else (
+                                product_lowering.result.layout.value
+                                if product_lowering is not None
+                                else b.layout_tag
+                            )
+                        )
+                        if carrier_is_grad:
+                            if push_kind == "grad" and b.role == "mixed":
+                                emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({b.name}.size());")
+                                emit_line(f"for (size_t _i=0; _i<{b.name}.size(); ++_i) {nm}[_i] = {a.name} * {b.name}[_i];")
+                                stack.append(
+                                    StackItem(
+                                        nm,
+                                        push_kind,
+                                        b.role,
+                                        b.shape,
+                                        b.field_names or f_names,
+                                        b.parent or parent,
+                                        side,
+                                        b.field_sides or f_sides,
+                                        layout_tag=layout_tag,
+                                        expression_meta=meta,
+                                    )
+                                )
+                            else:
+                                nm, tmp_kind, tmp_slot = alloc_tmp("mat", "bin")
+                                emit_mat(nm, f"{a.name} * {b.name}", tmp_kind=tmp_kind)
+                                stack.append(
+                                    StackItem(
+                                        nm,
+                                        push_kind,
+                                        b.role,
+                                        b.shape,
+                                        b.field_names or f_names,
+                                        b.parent or parent,
+                                        side,
+                                        b.field_sides or f_sides,
+                                        tmp_kind=tmp_kind,
+                                        tmp_slot=tmp_slot,
+                                        layout_tag=layout_tag,
+                                        expression_meta=meta,
+                                    )
+                                )
+                        else:
+                            nm, tmp_kind, tmp_slot = alloc_tmp("mat", "bin")
+                            emit_mat(nm, f"{a.name} * {b.name}", tmp_kind=tmp_kind)
+                            push_bin("mat", b.role, b.shape, b.field_names, b.parent, tmp_kind=tmp_kind, tmp_slot=tmp_slot)
                         continue
                     if b.kind == "scalar" and a.kind == "mat":
-                        nm, tmp_kind, tmp_slot = alloc_tmp("mat", "bin")
-                        emit_mat(nm, f"{b.name} * {a.name}", tmp_kind=tmp_kind)
-                        push_bin("mat", a.role, a.shape, a.field_names, a.parent, tmp_kind=tmp_kind, tmp_slot=tmp_slot)
+                        carrier_is_grad = (
+                            _semantic_is_scalar_grad_basis_carrier(a, spatial_dim=self.spatial_dim)
+                            or _semantic_is_scalar_grad_value_carrier(a, spatial_dim=self.spatial_dim)
+                        )
+                        push_kind = _normalize_cpp_storage_kind("grad", a.role, a.shape)
+                        meta = (
+                            product_value_spec.meta
+                            if product_value_spec is not None
+                            else (
+                                product_lowering.meta
+                                if product_lowering is not None
+                                else a.expression_meta
+                            )
+                        )
+                        layout_tag = (
+                            product_value_spec.layout.value
+                            if product_value_spec is not None
+                            else (
+                                product_lowering.result.layout.value
+                                if product_lowering is not None
+                                else a.layout_tag
+                            )
+                        )
+                        if carrier_is_grad:
+                            if push_kind == "grad" and a.role == "mixed":
+                                emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({a.name}.size());")
+                                emit_line(f"for (size_t _i=0; _i<{a.name}.size(); ++_i) {nm}[_i] = {b.name} * {a.name}[_i];")
+                                stack.append(
+                                    StackItem(
+                                        nm,
+                                        push_kind,
+                                        a.role,
+                                        a.shape,
+                                        a.field_names or f_names,
+                                        a.parent or parent,
+                                        side,
+                                        a.field_sides or f_sides,
+                                        layout_tag=layout_tag,
+                                        expression_meta=meta,
+                                    )
+                                )
+                            else:
+                                nm, tmp_kind, tmp_slot = alloc_tmp("mat", "bin")
+                                emit_mat(nm, f"{b.name} * {a.name}", tmp_kind=tmp_kind)
+                                stack.append(
+                                    StackItem(
+                                        nm,
+                                        push_kind,
+                                        a.role,
+                                        a.shape,
+                                        a.field_names or f_names,
+                                        a.parent or parent,
+                                        side,
+                                        a.field_sides or f_sides,
+                                        tmp_kind=tmp_kind,
+                                        tmp_slot=tmp_slot,
+                                        layout_tag=layout_tag,
+                                        expression_meta=meta,
+                                    )
+                                )
+                        else:
+                            nm, tmp_kind, tmp_slot = alloc_tmp("mat", "bin")
+                            emit_mat(nm, f"{b.name} * {a.name}", tmp_kind=tmp_kind)
+                            push_bin("mat", a.role, a.shape, a.field_names, a.parent, tmp_kind=tmp_kind, tmp_slot=tmp_slot)
                         continue
                     if a.kind in {"mat", "mixed"} and a.role == "mixed" and len(a.shape) == 2 and a.shape[0] == 1 and b.kind == "mat" and b.role in {"const", "value"} and len(b.shape) == 2:
                         emit_line(f"auto {nm} = scalar_basis_times_matrix_tensor({a.name}, {b.name});")
@@ -4157,27 +4538,159 @@ class CppCodeGen:
                             push_bin("grad", b.role, (a.shape[0], b.shape[1], b.shape[2]), b.field_names, b.parent)
                             continue
                     if a.kind == "scalar" and b.kind == "grad":
-                        if len(b.shape) == 2:
+                        out_shape = tuple(
+                            int(v)
+                            for v in (
+                                product_lowering.result_storage.stored_shape
+                                if product_lowering is not None
+                                else b.shape
+                            )
+                        )
+                        meta = product_lowering.meta if product_lowering is not None else b.expression_meta
+                        layout_tag = (
+                            product_value_spec.layout.value
+                            if product_value_spec is not None
+                            else (
+                                product_lowering.result.layout.value
+                                if product_lowering is not None
+                                else b.layout_tag
+                            )
+                        )
+                        push_kind = _normalize_cpp_storage_kind("grad", b.role, out_shape)
+                        if push_kind == "grad" and b.role == "mixed":
+                            emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({b.name}.size());")
+                            emit_line(f"for (size_t _i=0; _i<{b.name}.size(); ++_i) {nm}[_i] = {b.name}[_i] * {a.name};")
+                            stack.append(
+                                StackItem(
+                                    nm,
+                                    push_kind,
+                                    b.role,
+                                    out_shape,
+                                    b.field_names or f_names,
+                                    b.parent or parent,
+                                    side,
+                                    b.field_sides or f_sides,
+                                    layout_tag=layout_tag,
+                                    expression_meta=meta,
+                                )
+                            )
+                        elif len(b.shape) == 2:
                             nm, tmp_kind, tmp_slot = alloc_tmp("mat", "bin")
                             emit_mat(nm, f"{b.name} * {a.name}", tmp_kind=tmp_kind)
-                            push_bin("mat", b.role, product_lowering.result_storage.stored_shape if product_lowering is not None else b.shape, b.field_names, b.parent, tmp_kind=tmp_kind, tmp_slot=tmp_slot, expression_meta=product_lowering.meta if product_lowering is not None else None)
+                            stack.append(
+                                StackItem(
+                                    nm,
+                                    push_kind,
+                                    b.role,
+                                    out_shape,
+                                    b.field_names or f_names,
+                                    b.parent or parent,
+                                    side,
+                                    b.field_sides or f_sides,
+                                    tmp_kind=tmp_kind,
+                                    tmp_slot=tmp_slot,
+                                    layout_tag=layout_tag,
+                                    expression_meta=meta,
+                                )
+                            )
                         elif product_lowering is not None and len(product_lowering.result_storage.stored_shape) == 2:
                             nm, tmp_kind, tmp_slot = alloc_tmp("mat", "bin")
                             emit_mat(nm, f"{_cpp_matrix_input_expr(b)} * {a.name}", tmp_kind=tmp_kind)
-                            push_bin("mat", b.role, product_lowering.result_storage.stored_shape, b.field_names, b.parent, tmp_kind=tmp_kind, tmp_slot=tmp_slot, expression_meta=product_lowering.meta if product_lowering is not None else None)
+                            stack.append(
+                                StackItem(
+                                    nm,
+                                    push_kind,
+                                    b.role,
+                                    out_shape,
+                                    b.field_names or f_names,
+                                    b.parent or parent,
+                                    side,
+                                    b.field_sides or f_sides,
+                                    tmp_kind=tmp_kind,
+                                    tmp_slot=tmp_slot,
+                                    layout_tag=layout_tag,
+                                    expression_meta=meta,
+                                )
+                            )
                         else:
                             emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({b.name}.size());")
                             emit_line(f"for (size_t _i=0; _i<{b.name}.size(); ++_i) {nm}[_i] = {b.name}[_i] * {a.name};")
                             push_bin("grad", b.role, b.shape, b.field_names, b.parent)
                     elif b.kind == "scalar" and a.kind == "grad":
-                        if len(a.shape) == 2:
+                        out_shape = tuple(
+                            int(v)
+                            for v in (
+                                product_lowering.result_storage.stored_shape
+                                if product_lowering is not None
+                                else a.shape
+                            )
+                        )
+                        meta = product_lowering.meta if product_lowering is not None else a.expression_meta
+                        layout_tag = (
+                            product_value_spec.layout.value
+                            if product_value_spec is not None
+                            else (
+                                product_lowering.result.layout.value
+                                if product_lowering is not None
+                                else a.layout_tag
+                            )
+                        )
+                        push_kind = _normalize_cpp_storage_kind("grad", a.role, out_shape)
+                        if push_kind == "grad" and a.role == "mixed":
+                            emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({a.name}.size());")
+                            emit_line(f"for (size_t _i=0; _i<{a.name}.size(); ++_i) {nm}[_i] = {a.name}[_i] * {b.name};")
+                            stack.append(
+                                StackItem(
+                                    nm,
+                                    push_kind,
+                                    a.role,
+                                    out_shape,
+                                    a.field_names or f_names,
+                                    a.parent or parent,
+                                    side,
+                                    a.field_sides or f_sides,
+                                    layout_tag=layout_tag,
+                                    expression_meta=meta,
+                                )
+                            )
+                        elif len(a.shape) == 2:
                             nm, tmp_kind, tmp_slot = alloc_tmp("mat", "bin")
                             emit_mat(nm, f"{a.name} * {b.name}", tmp_kind=tmp_kind)
-                            push_bin("mat", a.role, product_lowering.result_storage.stored_shape if product_lowering is not None else a.shape, a.field_names, a.parent, tmp_kind=tmp_kind, tmp_slot=tmp_slot, expression_meta=product_lowering.meta if product_lowering is not None else None)
+                            stack.append(
+                                StackItem(
+                                    nm,
+                                    push_kind,
+                                    a.role,
+                                    out_shape,
+                                    a.field_names or f_names,
+                                    a.parent or parent,
+                                    side,
+                                    a.field_sides or f_sides,
+                                    tmp_kind=tmp_kind,
+                                    tmp_slot=tmp_slot,
+                                    layout_tag=layout_tag,
+                                    expression_meta=meta,
+                                )
+                            )
                         elif product_lowering is not None and len(product_lowering.result_storage.stored_shape) == 2:
                             nm, tmp_kind, tmp_slot = alloc_tmp("mat", "bin")
                             emit_mat(nm, f"{_cpp_matrix_input_expr(a)} * {b.name}", tmp_kind=tmp_kind)
-                            push_bin("mat", a.role, product_lowering.result_storage.stored_shape, a.field_names, a.parent, tmp_kind=tmp_kind, tmp_slot=tmp_slot, expression_meta=product_lowering.meta if product_lowering is not None else None)
+                            stack.append(
+                                StackItem(
+                                    nm,
+                                    push_kind,
+                                    a.role,
+                                    out_shape,
+                                    a.field_names or f_names,
+                                    a.parent or parent,
+                                    side,
+                                    a.field_sides or f_sides,
+                                    tmp_kind=tmp_kind,
+                                    tmp_slot=tmp_slot,
+                                    layout_tag=layout_tag,
+                                    expression_meta=meta,
+                                )
+                            )
                         else:
                             emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({a.name}.size());")
                             emit_line(f"for (size_t _i=0; _i<{a.name}.size(); ++_i) {nm}[_i] = {a.name}[_i] * {b.name};")
@@ -4209,6 +4722,10 @@ class CppCodeGen:
                                 nm, tmp_kind, tmp_slot = alloc_tmp("vec", "bin")
                                 emit_vec(nm, f"{b.name} * {a.name}", tmp_kind=tmp_kind)
                                 push_bin("vec", b.role, b.shape, b.field_names, b.parent, tmp_kind=tmp_kind, tmp_slot=tmp_slot)
+                        elif b.kind in {"mixed", "hess"}:
+                            emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({b.name}.size());")
+                            emit_line(f"for (size_t _i=0; _i<{b.name}.size(); ++_i) {nm}[_i] = {b.name}[_i] * {a.name};")
+                            push_bin(b.kind, b.role, b.shape, b.field_names, b.parent)
                         else:
                             emit_line(f"auto {nm} = {b.name} * {a.name};")
                             push_bin(b.kind, b.role, b.shape, b.field_names, b.parent)
@@ -4226,6 +4743,10 @@ class CppCodeGen:
                                 nm, tmp_kind, tmp_slot = alloc_tmp("vec", "bin")
                                 emit_vec(nm, f"{a.name} * {b.name}", tmp_kind=tmp_kind)
                                 push_bin("vec", a.role, a.shape, a.field_names, a.parent, tmp_kind=tmp_kind, tmp_slot=tmp_slot)
+                        elif a.kind in {"mixed", "hess"}:
+                            emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({a.name}.size());")
+                            emit_line(f"for (size_t _i=0; _i<{a.name}.size(); ++_i) {nm}[_i] = {a.name}[_i] * {b.name};")
+                            push_bin(a.kind, a.role, a.shape, a.field_names, a.parent)
                         else:
                             emit_line(f"auto {nm} = {a.name} * {b.name};")
                             push_bin(a.kind, a.role, a.shape, a.field_names, a.parent)
@@ -4707,12 +5228,61 @@ class CppCodeGen:
                         f", dot_case ({dot_case.value if dot_case is not None else ''})"
                         f", planned_shape ({tuple(int(v) for v in dot_value_spec.shape) if dot_value_spec is not None else None})"
                     )
+                if (
+                    a.role == "test"
+                    and b.role == "trial"
+                    and _semantic_is_basis_rank1(a, spatial_dim=self.spatial_dim)
+                    and _semantic_is_basis_rank1(b, spatial_dim=self.spatial_dim)
+                    and getattr(a, "layout_tag", "") == MixedLayout.COMPONENT_FIRST.value
+                    and _semantic_has_derivative_provenance(a, spatial_dim=self.spatial_dim)
+                ):
+                    nm = new_tmp("dot")
+                    emit_line(f"auto {nm} = dot_mass_test_trial({a.name}, {b.name});")
+                    push(
+                        (dot_value_spec.kind if dot_value_spec is not None else "mixed"),
+                        (dot_value_spec.role if dot_value_spec is not None else "mixed"),
+                        tuple(int(v) for v in (
+                            dot_value_spec.shape
+                            if dot_value_spec is not None
+                            else _planned_storage_shape(dot_lowering, (a.shape[0], a.shape[1], b.shape[1]))
+                        )),
+                        a.field_names or b.field_names,
+                        a.parent or b.parent,
+                        side,
+                        a.field_sides or b.field_sides,
+                        layout_tag=(dot_value_spec.layout.value if dot_value_spec is not None else MixedLayout.COMPONENT_FIRST.value),
+                        expression_meta=(dot_value_spec.meta if dot_value_spec is not None else dot_meta),
+                    )
+                    continue
                 if dot_case == DotKernelCase.BASIS_BASIS_MASS and a.role in {"trial", "test"} and b.role in {"trial", "test"}:
-                    nm, tmp_kind, tmp_slot = alloc_tmp("mat", "dot")
+                    component_carried_mixed = bool(
+                        (
+                            dot_value_spec is not None
+                            and getattr(dot_value_spec, "kind", "") == "mixed"
+                            and len(getattr(dot_value_spec, "shape", ()) or ()) > 2
+                        )
+                        or (
+                            dot_lowering is not None
+                            and getattr(dot_lowering.result, "role", "") == "mixed"
+                            and int(getattr(dot_lowering.result, "tensor_rank", 0)) > 0
+                        )
+                    )
+                    if component_carried_mixed:
+                        nm = new_tmp("dot")
+                        tmp_kind = None
+                        tmp_slot = None
+                    else:
+                        nm, tmp_kind, tmp_slot = alloc_tmp("mat", "dot")
                     if a.role == "trial" and b.role == "test":
-                        emit_mat(nm, f"dot_mass_test_trial({b.name}, {a.name})", tmp_kind=tmp_kind)
+                        if component_carried_mixed:
+                            emit_line(f"auto {nm} = dot_mass_test_trial({b.name}, {a.name});")
+                        else:
+                            emit_mat(nm, f"dot_mass_test_trial({b.name}, {a.name})", tmp_kind=tmp_kind)
                     elif a.role == "test" and b.role == "trial":
-                        emit_mat(nm, f"dot_mass_test_trial({a.name}, {b.name})", tmp_kind=tmp_kind)
+                        if component_carried_mixed:
+                            emit_line(f"auto {nm} = dot_mass_test_trial({a.name}, {b.name});")
+                        else:
+                            emit_mat(nm, f"dot_mass_test_trial({a.name}, {b.name})", tmp_kind=tmp_kind)
                     else:
                         raise NotImplementedError(f"Unsupported basis-basis dot orientation: {a.role}, {b.role}")
                     push(
@@ -4823,25 +5393,46 @@ class CppCodeGen:
                         else:
                             emit_mat(nm, f"basis_dot_const_vector({b.name}, {_cpp_vector_input_expr(a)})", tmp_kind=tmp_kind)
                             fallback_shape = (1, b.shape[1])
+                    elif _semantic_uses_cpp_stack_storage(b, spatial_dim=self.spatial_dim):
+                        nm = new_tmp("dot")
+                        tmp_kind = None
+                        tmp_slot = None
+                        emit_line(f"auto {nm} = contract_component_matrix_grad({a.name}, {b.name});")
+                        fallback_shape = tuple(int(v) for v in (_planned_storage_shape(dot_lowering, b.shape) or b.shape))
                     else:
                         nm, tmp_kind, tmp_slot = alloc_tmp("mat", "dot")
                         emit_mat(nm, f"dot_grad_func_trial_vec({a.name}, {b.name})", tmp_kind=tmp_kind)
                         fallback_shape = (a.shape[0] if len(a.shape) > 0 else -1, b.shape[1])
-                    push(
-                        (dot_value_spec.kind if dot_value_spec is not None else ("vec" if len(fallback_shape) == 1 else "mat")),
-                        (dot_value_spec.role if dot_value_spec is not None else b.role),
-                        tuple(int(v) for v in (
-                            dot_value_spec.shape if dot_value_spec is not None else _planned_storage_shape(dot_lowering, fallback_shape)
-                        )),
-                        b.field_names,
-                        b.parent,
-                        side,
-                        b.field_sides,
-                        tmp_kind=tmp_kind,
-                        tmp_slot=tmp_slot,
-                        layout_tag=(dot_value_spec.layout.value if dot_value_spec is not None else ""),
-                        expression_meta=(dot_value_spec.meta if dot_value_spec is not None else dot_meta),
-                    )
+                    if _semantic_uses_cpp_stack_storage(b, spatial_dim=self.spatial_dim):
+                        push(
+                            "grad",
+                            b.role,
+                            tuple(int(v) for v in (_planned_storage_shape(dot_lowering, fallback_shape) if fallback_shape else ())),
+                            b.field_names,
+                            b.parent,
+                            side,
+                            b.field_sides,
+                            tmp_kind=tmp_kind,
+                            tmp_slot=tmp_slot,
+                            layout_tag=(dot_lowering.result.layout.value if dot_lowering is not None else ""),
+                            expression_meta=dot_meta,
+                        )
+                    else:
+                        push(
+                            (dot_value_spec.kind if dot_value_spec is not None else ("vec" if len(fallback_shape) == 1 else "mat")),
+                            (dot_value_spec.role if dot_value_spec is not None else b.role),
+                            tuple(int(v) for v in (
+                                dot_value_spec.shape if dot_value_spec is not None else _planned_storage_shape(dot_lowering, fallback_shape)
+                            )),
+                            b.field_names,
+                            b.parent,
+                            side,
+                            b.field_sides,
+                            tmp_kind=tmp_kind,
+                            tmp_slot=tmp_slot,
+                            layout_tag=(dot_value_spec.layout.value if dot_value_spec is not None else ""),
+                            expression_meta=(dot_value_spec.meta if dot_value_spec is not None else dot_meta),
+                        )
                     continue
 
                 if dot_case == DotKernelCase.BASIS_VECTOR_DOT_VALUE_GRAD and a.role in {"trial", "test"}:
@@ -4857,25 +5448,46 @@ class CppCodeGen:
                         else:
                             emit_mat(nm, f"basis_dot_const_vector({a.name}, {_cpp_vector_input_expr(b)})", tmp_kind=tmp_kind)
                             fallback_shape = (1, a.shape[1])
+                    elif _semantic_uses_cpp_stack_storage(a, spatial_dim=self.spatial_dim):
+                        nm = new_tmp("dot")
+                        tmp_kind = None
+                        tmp_slot = None
+                        emit_line(f"auto {nm} = contract_last_first({a.name}, {b.name});")
+                        fallback_shape = tuple(int(v) for v in (_planned_storage_shape(dot_lowering, a.shape) or a.shape))
                     else:
                         nm, tmp_kind, tmp_slot = alloc_tmp("mat", "dot")
                         emit_mat(nm, f"contract_last_first(Eigen::MatrixXd(({b.name}.transpose()).eval()), {a.name})", tmp_kind=tmp_kind)
                         fallback_shape = (b.shape[1], a.shape[1])
-                    push(
-                        (dot_value_spec.kind if dot_value_spec is not None else ("vec" if len(fallback_shape) == 1 else "mat")),
-                        (dot_value_spec.role if dot_value_spec is not None else a.role),
-                        tuple(int(v) for v in (
-                            dot_value_spec.shape if dot_value_spec is not None else _planned_storage_shape(dot_lowering, fallback_shape)
-                        )),
-                        a.field_names,
-                        a.parent,
-                        side,
-                        a.field_sides,
-                        tmp_kind=tmp_kind,
-                        tmp_slot=tmp_slot,
-                        layout_tag=(dot_value_spec.layout.value if dot_value_spec is not None else ""),
-                        expression_meta=(dot_value_spec.meta if dot_value_spec is not None else dot_meta),
-                    )
+                    if _semantic_uses_cpp_stack_storage(a, spatial_dim=self.spatial_dim):
+                        push(
+                            "grad",
+                            a.role,
+                            tuple(int(v) for v in (_planned_storage_shape(dot_lowering, fallback_shape) if fallback_shape else ())),
+                            a.field_names,
+                            a.parent,
+                            side,
+                            a.field_sides,
+                            tmp_kind=tmp_kind,
+                            tmp_slot=tmp_slot,
+                            layout_tag=(dot_lowering.result.layout.value if dot_lowering is not None else ""),
+                            expression_meta=dot_meta,
+                        )
+                    else:
+                        push(
+                            (dot_value_spec.kind if dot_value_spec is not None else ("vec" if len(fallback_shape) == 1 else "mat")),
+                            (dot_value_spec.role if dot_value_spec is not None else a.role),
+                            tuple(int(v) for v in (
+                                dot_value_spec.shape if dot_value_spec is not None else _planned_storage_shape(dot_lowering, fallback_shape)
+                            )),
+                            a.field_names,
+                            a.parent,
+                            side,
+                            a.field_sides,
+                            tmp_kind=tmp_kind,
+                            tmp_slot=tmp_slot,
+                            layout_tag=(dot_value_spec.layout.value if dot_value_spec is not None else ""),
+                            expression_meta=(dot_value_spec.meta if dot_value_spec is not None else dot_meta),
+                        )
                     continue
 
                 if dot_case == DotKernelCase.BASIS_GRAD_DOT_BASIS_VECTOR and a.role in {"trial", "test"} and b.role in {"trial", "test"}:
@@ -4958,6 +5570,64 @@ class CppCodeGen:
                         )
                     continue
 
+                if (
+                    a.role in {"trial", "test"}
+                    and b.role in {"trial", "test"}
+                    and a.kind == "mat"
+                    and b.kind == "mat"
+                    and _semantic_is_basis_rank1(a, spatial_dim=self.spatial_dim)
+                    and _semantic_is_basis_rank1(b, spatial_dim=self.spatial_dim)
+                    and not (a.is_gradient or b.is_gradient or a.is_hessian or b.is_hessian)
+                ):
+                    component_carried_mixed = bool(
+                        (
+                            dot_value_spec is not None
+                            and getattr(dot_value_spec, "kind", "") == "mixed"
+                            and len(getattr(dot_value_spec, "shape", ()) or ()) > 2
+                        )
+                        or (
+                            dot_lowering is not None
+                            and getattr(dot_lowering.result, "role", "") == "mixed"
+                            and int(getattr(dot_lowering.result, "tensor_rank", 0)) > 0
+                        )
+                    )
+                    if component_carried_mixed:
+                        nm = new_tmp("dot")
+                        tmp_kind = None
+                        tmp_slot = None
+                    else:
+                        nm, tmp_kind, tmp_slot = alloc_tmp("mat", "dot")
+                    test_item = a if a.role == "test" else b
+                    trial_item = a if a.role == "trial" else b
+                    if component_carried_mixed:
+                        emit_line(f"auto {nm} = dot_mass_test_trial({test_item.name}, {trial_item.name});")
+                    else:
+                        emit_mat(nm, f"dot_mass_test_trial({test_item.name}, {trial_item.name})", tmp_kind=tmp_kind)
+                    push(
+                        (dot_value_spec.kind if dot_value_spec is not None else "mixed"),
+                        (dot_value_spec.role if dot_value_spec is not None else "mixed"),
+                        tuple(int(v) for v in (
+                            dot_value_spec.shape
+                            if dot_value_spec is not None
+                            else _planned_storage_shape(
+                                dot_lowering,
+                                (
+                                    test_item.shape[1] if len(test_item.shape) >= 2 else test_item.shape[0],
+                                    trial_item.shape[1] if len(trial_item.shape) >= 2 else trial_item.shape[0],
+                                ),
+                            )
+                        )),
+                        a.field_names or b.field_names,
+                        a.parent or b.parent,
+                        side,
+                        a.field_sides or b.field_sides,
+                        tmp_kind=tmp_kind,
+                        tmp_slot=tmp_slot,
+                        layout_tag=(dot_value_spec.layout.value if dot_value_spec is not None else ""),
+                        expression_meta=(dot_value_spec.meta if dot_value_spec is not None else dot_meta),
+                    )
+                    continue
+
                 # trial/test mass
                 # Gradient advection combinations: grad(Function) · Trial  or Trial · grad(Function)
                 if a.kind == "grad" and b.kind == "grad" and a.role in {"test", "trial"} and b.role in {"test", "trial"}:
@@ -5006,6 +5676,7 @@ class CppCodeGen:
                 elif (
                     a.role == "trial"
                     and _semantic_is_basis_rank1(a, spatial_dim=self.spatial_dim)
+                    and not (a.is_gradient or a.is_hessian)
                     and b.role in {"value", "const"}
                     and (_semantic_is_value_rank1(b, spatial_dim=self.spatial_dim) or _semantic_is_value_rank2(b, spatial_dim=self.spatial_dim))
                 ):
@@ -5035,6 +5706,7 @@ class CppCodeGen:
                 elif (
                     a.role == "test"
                     and _semantic_is_basis_rank1(a, spatial_dim=self.spatial_dim)
+                    and not (a.is_gradient or a.is_hessian)
                     and b.role in {"value", "const"}
                     and (_semantic_is_value_rank1(b, spatial_dim=self.spatial_dim) or _semantic_is_value_rank2(b, spatial_dim=self.spatial_dim))
                 ):
@@ -5044,7 +5716,11 @@ class CppCodeGen:
                         emit_mat(nm, f"basis_dot_const_vector({a.name}, {_cpp_dot_value_operand_expr(b, rhs_rank)})", tmp_kind=tmp_kind)
                         fallback_shape = (1, a.shape[1])
                     else:
-                        emit_mat(nm, f"contract_last_first({_cpp_dot_value_operand_expr(b, rhs_rank)}.transpose().eval(), {a.name})", tmp_kind=tmp_kind)
+                        emit_mat(
+                            nm,
+                            f"contract_last_first(Eigen::MatrixXd(({_cpp_dot_value_operand_expr(b, rhs_rank)}.transpose()).eval()), {a.name})",
+                            tmp_kind=tmp_kind,
+                        )
                         if dot_plan is not None and dot_plan.result.tensor_rank > 0:
                             fallback_shape = tuple(int(axis.size) for axis in dot_plan.result.free_axes)
                         else:
@@ -5063,8 +5739,26 @@ class CppCodeGen:
                     )
                 # Explicit Test/Trial mass-like dot even when shapes are concrete (not -1 flagged)
                 elif a.kind == "mat" and b.kind == "mat" and a.role == "trial" and b.role == "test":
-                    nm, tmp_kind, tmp_slot = alloc_tmp("mat", "dot")
-                    emit_mat(nm, f"dot_mass_test_trial({b.name}, {a.name})", tmp_kind=tmp_kind)
+                    component_carried_mixed = bool(
+                        (
+                            dot_value_spec is not None
+                            and getattr(dot_value_spec, "kind", "") == "mixed"
+                            and len(getattr(dot_value_spec, "shape", ()) or ()) > 2
+                        )
+                        or (
+                            dot_lowering is not None
+                            and getattr(dot_lowering.result, "role", "") == "mixed"
+                            and int(getattr(dot_lowering.result, "tensor_rank", 0)) > 0
+                        )
+                    )
+                    if component_carried_mixed:
+                        nm = new_tmp("dot")
+                        tmp_kind = None
+                        tmp_slot = None
+                        emit_line(f"auto {nm} = dot_mass_test_trial({b.name}, {a.name});")
+                    else:
+                        nm, tmp_kind, tmp_slot = alloc_tmp("mat", "dot")
+                        emit_mat(nm, f"dot_mass_test_trial({b.name}, {a.name})", tmp_kind=tmp_kind)
                     push(
                         (dot_value_spec.kind if dot_value_spec is not None else "mixed"),
                         (dot_value_spec.role if dot_value_spec is not None else "mixed"),
@@ -5083,8 +5777,26 @@ class CppCodeGen:
                         expression_meta=(dot_value_spec.meta if dot_value_spec is not None else dot_meta),
                     )
                 elif a.kind == "mat" and b.kind == "mat" and a.role == "test" and b.role == "trial":
-                    nm, tmp_kind, tmp_slot = alloc_tmp("mat", "dot")
-                    emit_mat(nm, f"dot_mass_test_trial({a.name}, {b.name})", tmp_kind=tmp_kind)
+                    component_carried_mixed = bool(
+                        (
+                            dot_value_spec is not None
+                            and getattr(dot_value_spec, "kind", "") == "mixed"
+                            and len(getattr(dot_value_spec, "shape", ()) or ()) > 2
+                        )
+                        or (
+                            dot_lowering is not None
+                            and getattr(dot_lowering.result, "role", "") == "mixed"
+                            and int(getattr(dot_lowering.result, "tensor_rank", 0)) > 0
+                        )
+                    )
+                    if component_carried_mixed:
+                        nm = new_tmp("dot")
+                        tmp_kind = None
+                        tmp_slot = None
+                        emit_line(f"auto {nm} = dot_mass_test_trial({a.name}, {b.name});")
+                    else:
+                        nm, tmp_kind, tmp_slot = alloc_tmp("mat", "dot")
+                        emit_mat(nm, f"dot_mass_test_trial({a.name}, {b.name})", tmp_kind=tmp_kind)
                     push(
                         (dot_value_spec.kind if dot_value_spec is not None else "mixed"),
                         (dot_value_spec.role if dot_value_spec is not None else "mixed"),
@@ -5125,7 +5837,24 @@ class CppCodeGen:
                     # Preserve Test/Trial orientation (test^T @ trial)
                     role = "value"
                     shape = (-1, -1)
-                    nm, tmp_kind, tmp_slot = alloc_tmp("mat", "dot")
+                    component_carried_mixed = bool(
+                        (
+                            dot_value_spec is not None
+                            and getattr(dot_value_spec, "kind", "") == "mixed"
+                            and len(getattr(dot_value_spec, "shape", ()) or ()) > 2
+                        )
+                        or (
+                            dot_lowering is not None
+                            and getattr(dot_lowering.result, "role", "") == "mixed"
+                            and int(getattr(dot_lowering.result, "tensor_rank", 0)) > 0
+                        )
+                    )
+                    if component_carried_mixed and {a.role, b.role} == {"test", "trial"}:
+                        nm = new_tmp("dot")
+                        tmp_kind = None
+                        tmp_slot = None
+                    else:
+                        nm, tmp_kind, tmp_slot = alloc_tmp("mat", "dot")
                     if is_a_1d and b.role in {"test", "trial"} and b_union_mat:
                         # If component counts match, use the streamlined contraction; otherwise fall back to mass dot
                         if (a.shape[0] not in (-1, 0) and b.shape[0] not in (-1, 0) ):
@@ -5144,9 +5873,15 @@ class CppCodeGen:
                         shape = (a.shape[0], b.shape[1])
                         emit_mat(nm, f"contract_vector_matrix({a.name}, {b.name})", tmp_kind=tmp_kind)
                     elif a.role == "trial" and b.role == "test":
-                        emit_mat(nm, f"dot_mass_trial_test({a.name}, {b.name})", tmp_kind=tmp_kind)
+                        if component_carried_mixed:
+                            emit_line(f"auto {nm} = dot_mass_trial_test({a.name}, {b.name});")
+                        else:
+                            emit_mat(nm, f"dot_mass_trial_test({a.name}, {b.name})", tmp_kind=tmp_kind)
                     elif a.role == "test" and b.role == "trial":
-                        emit_mat(nm, f"dot_mass_test_trial({a.name}, {b.name})", tmp_kind=tmp_kind)
+                        if component_carried_mixed:
+                            emit_line(f"auto {nm} = dot_mass_test_trial({a.name}, {b.name});")
+                        else:
+                            emit_mat(nm, f"dot_mass_test_trial({a.name}, {b.name})", tmp_kind=tmp_kind)
                     # elif a.role == "test":
                     #     emit_line(f"Eigen::MatrixXd {nm} = dot_mass_test_trial({a.name}, {b.name});")
                     else:
@@ -6000,10 +6735,22 @@ class CppCodeGen:
                 is_b_scalar = b.kind in {"scalar", "vec", "mat"} and (b.shape == () or b.shape == (1,))
                 is_a_grad_basis = a.kind == "grad" and a.role in {"test", "trial"} and len(a.shape) == 3
                 is_b_grad_basis = b.kind == "grad" and b.role in {"test", "trial"} and len(b.shape) == 3
-                is_a_grad_rank1_basis = _semantic_is_gradient_rank1_basis(a, spatial_dim=self.spatial_dim)
-                is_b_grad_rank1_basis = _semantic_is_gradient_rank1_basis(b, spatial_dim=self.spatial_dim)
-                is_a_grad_rank1_value = _semantic_is_gradient_rank1_value(a, spatial_dim=self.spatial_dim)
-                is_b_grad_rank1_value = _semantic_is_gradient_rank1_value(b, spatial_dim=self.spatial_dim)
+                is_a_grad_rank1_basis = (
+                    _semantic_is_gradient_rank1_basis(a, spatial_dim=self.spatial_dim)
+                    or _semantic_is_scalar_grad_basis_carrier(a, spatial_dim=self.spatial_dim)
+                )
+                is_b_grad_rank1_basis = (
+                    _semantic_is_gradient_rank1_basis(b, spatial_dim=self.spatial_dim)
+                    or _semantic_is_scalar_grad_basis_carrier(b, spatial_dim=self.spatial_dim)
+                )
+                is_a_grad_rank1_value = (
+                    _semantic_is_gradient_rank1_value(a, spatial_dim=self.spatial_dim)
+                    or _semantic_is_scalar_grad_value_carrier(a, spatial_dim=self.spatial_dim)
+                )
+                is_b_grad_rank1_value = (
+                    _semantic_is_gradient_rank1_value(b, spatial_dim=self.spatial_dim)
+                    or _semantic_is_scalar_grad_value_carrier(b, spatial_dim=self.spatial_dim)
+                )
                 is_a_trial_test = a.role in {"test", "trial"}
                 is_b_trial_test = b.role in {"test", "trial"}
                 is_a_mixed = a.kind == "mixed"

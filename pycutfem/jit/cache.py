@@ -11,9 +11,9 @@ from pycutfem.core import mesh
 from pycutfem.jit.ir import LoadAnalytic
 
 # Bump when generated kernel source semantics/signature change.
-# 2026-03-26 invalidates stale JIT kernels after the Hessian push-forward
-# source change that removes the remaining contiguity warning path.
-CODEGEN_ABI = "2026-03-26-abi-dot-product-ghost-layout-v12"
+# 2026-04-07 invalidates stale JIT kernels after the mixed rank-2 contraction
+# and scalar-basis promotion fixes for value-gradient/basis and solid tangent terms.
+CODEGEN_ABI = "2026-04-07-abi-dot-product-ghost-layout-v14"
 
 
 def _resolve_cache_dir(override: str | os.PathLike[str] | None = None) -> Path:

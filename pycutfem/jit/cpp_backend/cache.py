@@ -44,7 +44,34 @@ except ImportError:  # pragma: no cover - platform dependent.
 #   whole-domain assembly.
 # - v34 invalidates kernels after fixing scalar-times-gradient products with
 #   2D stored layouts to keep `StackItem.kind` aligned with emitted storage.
-CODEGEN_ABI_CPP = "2026-03-26-cpp-v52-facet-restricted-grad-value-fix"
+# - v53 invalidates kernels after fixing component-carried basis/test-trial dot
+#   lowering for transformed gradient carriers and updating helper overloads.
+# - v54 invalidates kernels after preserving scalar-scaled canonical gradient
+#   carriers through later inner-product lowering.
+# - v55 invalidates kernels after forcing scalar-scaled canonical gradient
+#   carriers to retain their basis/value role through codegen stack pushes.
+# - v56 invalidates kernels after fixing the dedicated scalar-times-grad product
+#   path so 2D gradient carriers are not downgraded to plain matrices.
+# - v57 invalidates kernels after extending GradStack +/- matrix helpers to
+#   also accept raw vector-of-matrix temporaries emitted by planner-aligned
+#   gradient stack sums in the C++ backend.
+# - v58 invalidates kernels after fixing scalar-times-mixed-gradient lowering
+#   so component-stack temporaries do not fall back to the plain MatrixXd path.
+# - v59 invalidates kernels after fixing the generic scalar-times-stack product
+#   fallback for mixed and Hessian carriers in the C++ backend.
+# - v60 invalidates kernels after preserving mixed-role carriers through
+#   normalization even when planner storage kind is reported as plain "mat".
+# - v61 invalidates kernels after preventing planner mat-kinds from
+#   downgrading emitted grad/hess/mixed stack temporaries inside push_bin().
+# - v62 invalidates kernels after routing stack-backed add/sub/scale temporaries
+#   through planner-aligned stack helpers instead of MatrixXd shortcuts.
+# - v63 invalidates kernels after promoting stack-backed basis tensors to their
+#   semantic C++ carrier kind before later dot/add/sub dispatch.
+# - v64 invalidates kernels after adding stack-stack contraction overloads and
+#   stack-aware dot-case lowering for basis/value tensor contractions.
+# - v65 invalidates kernels after fixing sum-path layout lookup to use the
+#   lowering result instead of ExpressionMeta.
+CODEGEN_ABI_CPP = "2026-04-07-cpp-v65-sum-layout-fix"
 
 
 @contextmanager

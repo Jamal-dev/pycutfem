@@ -637,6 +637,13 @@ def _emit_dot_storage_reorder(body_lines: list[str], var_name: str, raw_shape: t
     if len(raw_shape) == len(planned_shape) == 3 and planned_shape == (raw_shape[1], raw_shape[0], raw_shape[2]):
         body_lines.append(f"{var_name} = swap_mixed_basis_tensor({var_name}, {dtype_expr})")
         return planned_shape
+    if (
+        len(raw_shape) == len(planned_shape)
+        and len(raw_shape) >= 4
+        and planned_shape == (raw_shape[0], raw_shape[2], raw_shape[1]) + raw_shape[3:]
+    ):
+        body_lines.append(f"{var_name} = swap_mixed_basis_tensor({var_name}, {dtype_expr})")
+        return planned_shape
     return raw_shape
 
 
@@ -3207,7 +3214,7 @@ class NumbaCodeGen:
                     )
                     _push_inner_result(
                         default_role="value",
-                        fallback_shape=(test_item.shape[1], trial_item.shape[1]),
+                        fallback_shape=(_basis_col_dim(test_item.shape), _basis_col_dim(trial_item.shape)),
                         field_names=field_names,
                         parent_name=parent_name,
                         side=side,
@@ -3246,13 +3253,16 @@ class NumbaCodeGen:
                     elif (
                         (not a.is_vector)
                         and (not b.is_vector)
-                        and len(a.shape) == 2
-                        and a.shape[0] == 1
+                        and (
+                            (len(a.shape) == 2 and a.shape[0] == 1)
+                            or len(a.shape) == 1
+                        )
                     ):
                         # a: (1,n), b: () -> (n,)
                         body_lines.append("# RHS: Inner(Test(Scalar), Value(Scalar))")
+                        basis_expr = f"{a.var_name}[0]" if len(a.shape) == 2 else a.var_name
                         body_lines.append(
-                            f"{res_var} = mul_scalar({b.var_name}, {a.var_name}[0], {self.dtype})"
+                            f"{res_var} = mul_scalar({b.var_name}, {basis_expr}, {self.dtype})"
                         )
                     else:
                         raise NotImplementedError(
@@ -3332,11 +3342,19 @@ class NumbaCodeGen:
                             body_lines.append(
                                 f"{res_var} = contract_last_first({b.var_name}[0], {a.var_name}, {self.dtype})"
                             )
-                    elif not a.is_vector and not b.is_vector and b.shape[0] == 1 and len(b.shape) == 2:
+                    elif (
+                        not a.is_vector
+                        and not b.is_vector
+                        and (
+                            (len(b.shape) == 2 and b.shape[0] == 1)
+                            or len(b.shape) == 1
+                        )
+                    ):
                         # a: (), b: (n,)  → (n,)
                         body_lines.append("# RHS: Inner(Value(Scalar), Test(Scalar))")
+                        basis_expr = f"{b.var_name}[0]" if len(b.shape) == 2 else b.var_name
                         body_lines.append(
-                            f"{res_var} = mul_scalar({a.var_name}, {b.var_name}[0], {self.dtype})"
+                            f"{res_var} = mul_scalar({a.var_name}, {basis_expr}, {self.dtype})"
                         )
 
                     else:
@@ -3731,8 +3749,10 @@ class NumbaCodeGen:
                             )
                             fallback_shape = (1, _basis_col_dim(b.shape))
                     else:
-                        body_lines.append(f"{res_var} = dot_grad_func_trial_vec({a.var_name}, {b.var_name}, {self.dtype})")
-                        fallback_shape = (a.shape[0], b.shape[1])
+                        body_lines.append(
+                            f"{res_var} = contract_last_first({a.var_name}, {b.var_name}, {self.dtype})"
+                        )
+                        fallback_shape = a.shape[:-1] + b.shape[1:]
                     res_shape, is_vector, is_gradient = _basis_result_shape_from_dot(
                         dot_lowering,
                         b,
@@ -3878,6 +3898,48 @@ class NumbaCodeGen:
                             side=side,
                             field_sides=field_sides or [],
                             layout_tag=layout_tag,
+                            expression_meta=dot_meta,
+                        )
+                    )
+                    continue
+
+                if (
+                    a.role in {"trial", "test"}
+                    and b.role in {"trial", "test"}
+                    and _semantic_is_basis_rank1(a, spatial_dim=self.spatial_dim)
+                    and _semantic_is_basis_rank1(b, spatial_dim=self.spatial_dim)
+                    and not (a.is_gradient or b.is_gradient or a.is_hessian or b.is_hessian)
+                ):
+                    body_lines.append("# Dot fallback: semantic basis-vector · basis-vector mass contraction")
+                    test_var = a if a.role == "test" else b
+                    trial_var = a if a.role == "trial" else b
+                    body_lines.append(
+                        f"{res_var} = dot_mass_test_trial({test_var.var_name}, {trial_var.var_name}, {self.dtype})"
+                    )
+                    field_names, parent_name, side, field_sides = StackItem.resolve_metadata(a, b, prefer=None, strict=False)
+                    stack.append(
+                        StackItem(
+                            var_name=res_var,
+                            role=(dot_value_spec.role if dot_value_spec is not None else "mixed"),
+                            shape=tuple(
+                                int(v)
+                                for v in (
+                                    dot_value_spec.shape
+                                    if dot_value_spec is not None
+                                    else _planned_storage_shape(
+                                        dot_lowering,
+                                        (_basis_col_dim(test_var.shape), _basis_col_dim(trial_var.shape)),
+                                    )
+                                )
+                            ),
+                            is_vector=(dot_value_spec.is_vector if dot_value_spec is not None else False),
+                            is_gradient=(dot_value_spec.is_gradient if dot_value_spec is not None else False),
+                            is_hessian=(dot_value_spec.is_hessian if dot_value_spec is not None else False),
+                            field_names=field_names,
+                            parent_name=parent_name,
+                            side=side,
+                            field_sides=field_sides or [],
+                            layout_tag=(dot_value_spec.layout.value if dot_value_spec is not None else ""),
                             expression_meta=dot_meta,
                         )
                     )
@@ -4216,32 +4278,60 @@ class NumbaCodeGen:
                 # ---------------------------------------------------------------------
                 # dot(grad(Function), grad(Trial/Test)) and its transposed variants.
                 # ---------------------------------------------------------------------
-                elif (a.role == 'value' and a.is_gradient and 
-                    b.role in {'trial', 'test'} and b.is_gradient and 
-                    a.shape[0] == b.shape[0] and a.shape[1] == b.shape[2]):
-                    k = b.shape[0]; n_locs = b.shape[1]; d = b.shape[2]
+                elif a.role == 'value' and a.is_gradient and b.role in {'trial', 'test'} and b.is_gradient:
                     role = "trial" if b.role == "trial" else "test"
+                    if _is_scalar_grad_basis_shape(b.shape, self.spatial_dim):
+                        body_lines.append("# Dot: matrix-like value gradient · scalar Grad(basis) -> vector basis")
+                        body_lines.append(
+                            f"{res_var} = contract_last_first({a.var_name}, {b.var_name}, {self.dtype})"
+                        )
+                        basis_dot_kwargs = _basis_dot_result_stack_kwargs(
+                            dot_lowering,
+                            dot_value_spec,
+                            b,
+                            (a.shape[0], _scalar_grad_basis_ncols(b.shape)),
+                            role,
+                        )
+                        stack.append(StackItem(
+                            var_name=res_var,
+                            field_names=b.field_names,
+                            parent_name=b.parent_name,
+                            side=b.side,
+                            field_sides=b.field_sides or [],
+                            expression_meta=dot_meta,
+                            **basis_dot_kwargs,
+                        ))
+                    elif (
+                        len(b.shape) == 3
+                        and len(a.shape) == 2
+                        and a.shape[0] == b.shape[0]
+                        and a.shape[1] == b.shape[2]
+                    ):
+                        k = b.shape[0]; n_locs = b.shape[1]; d = b.shape[2]
 
-                    # a: grad(u_k) or grad(u_k).T -> Function value, shape (k, d)
-                    # b: grad(du)             -> Trial function basis, shape (k, n, d)
+                        # a: grad(u_k) or grad(u_k).T -> Function value, shape (k, d)
+                        # b: grad(du)                  -> Trial/Test basis, shape (k, n, d)
+                        body_lines.append(f"# dot(grad(value), grad({role})) -> (k,n,d) tensor basis")
+                        body_lines.append(
+                            f"{res_var} = dot_grad_value_with_grad_basis({a.var_name}, {b.var_name}, {self.dtype})"
+                        )
 
-                    body_lines.append(f"# dot(grad(value), grad({role})) -> (k,n,d) tensor basis")
-                    body_lines.append(
-                        f"{res_var} = dot_grad_value_with_grad_basis({a.var_name}, {b.var_name}, {self.dtype})"
-                    )
-                    
-                    fallback_shape = (k, n_locs, d)
-                    res_shape, is_vector, is_gradient, is_hessian, layout_tag = _dot_result_flags_and_layout(
-                        dot_lowering,
-                        fallback_shape,
-                    )
-                    role_out = getattr(dot_lowering.result, "role", role) if dot_lowering is not None else role
-                    stack.append(StackItem(var_name=res_var, role=role_out,
-                                        shape=res_shape, is_vector=is_vector, is_gradient=is_gradient,
-                                        is_hessian=is_hessian, layout_tag=layout_tag,
-                                        field_names=b.field_names, parent_name=b.parent_name,
-                                        side=b.side, field_sides=b.field_sides or [],
-                                        expression_meta=dot_meta))
+                        fallback_shape = (k, n_locs, d)
+                        res_shape, is_vector, is_gradient, is_hessian, layout_tag = _dot_result_flags_and_layout(
+                            dot_lowering,
+                            fallback_shape,
+                        )
+                        role_out = getattr(dot_lowering.result, "role", role) if dot_lowering is not None else role
+                        stack.append(StackItem(var_name=res_var, role=role_out,
+                                            shape=res_shape, is_vector=is_vector, is_gradient=is_gradient,
+                                            is_hessian=is_hessian, layout_tag=layout_tag,
+                                            field_names=b.field_names, parent_name=b.parent_name,
+                                            side=b.side, field_sides=b.field_sides or [],
+                                            expression_meta=dot_meta))
+                    else:
+                        raise NotImplementedError(
+                            f"dot(grad(value), grad({role})) unsupported for shapes {a.shape}/{b.shape}"
+                        )
 
                 # ---------------------------------------------------------------------
                 # dot(grad(Function), grad(Function)) and its transposed variants.
@@ -5422,6 +5512,118 @@ class NumbaCodeGen:
                             is_hessian=False,
                             expression_meta=product_meta,
                         )
+                    elif (
+                        a.role == "trial"
+                        and _is_basis_row_like(a)
+                        and not a.is_vector and not a.is_gradient and not a.is_hessian
+                        and b.role == "test"
+                        and _semantic_is_basis_rank2(b, spatial_dim=self.spatial_dim)
+                        and not b.is_gradient and not b.is_hessian
+                    ):
+                        body_lines.append("# Product: scalar Trial × rank-2 Test basis → mixed rank-2 tensor")
+                        scalar_expr = a.var_name if len(a.shape) == 1 else f"{a.var_name}[0]"
+                        body_lines.append(
+                            f"{res_var} = scalar_trial_times_basis_test({b.var_name}, {scalar_expr}, {self.dtype})"
+                        )
+                        field_names, parent_name, side, field_sides = StackItem.resolve_metadata(a, b, prefer='b', strict=False)
+                        stack.append(StackItem(
+                            var_name=res_var,
+                            role="mixed",
+                            shape=(b.shape[0], b.shape[1], _basis_col_dim(a.shape), b.shape[2]),
+                            is_vector=False,
+                            is_gradient=False,
+                            is_hessian=False,
+                            field_names=field_names,
+                            parent_name=parent_name,
+                            side=side,
+                            field_sides=field_sides,
+                            layout_tag=MixedLayout.DEFAULT.value,
+                            expression_meta=product_meta,
+                        ))
+                    elif (
+                        a.role == "test"
+                        and _is_basis_row_like(a)
+                        and not a.is_vector and not a.is_gradient and not a.is_hessian
+                        and b.role == "trial"
+                        and _semantic_is_basis_rank2(b, spatial_dim=self.spatial_dim)
+                        and not b.is_gradient and not b.is_hessian
+                    ):
+                        body_lines.append("# Product: scalar Test × rank-2 Trial basis → mixed rank-2 tensor")
+                        scalar_expr = a.var_name if len(a.shape) == 1 else f"{a.var_name}[0]"
+                        body_lines.append(
+                            f"{res_var} = basis_trial_times_scalar_test({b.var_name}, {scalar_expr}, {self.dtype})"
+                        )
+                        field_names, parent_name, side, field_sides = StackItem.resolve_metadata(a, b, prefer='a', strict=False)
+                        stack.append(StackItem(
+                            var_name=res_var,
+                            role="mixed",
+                            shape=(b.shape[0], _basis_col_dim(a.shape), b.shape[1], b.shape[2]),
+                            is_vector=False,
+                            is_gradient=False,
+                            is_hessian=False,
+                            field_names=field_names,
+                            parent_name=parent_name,
+                            side=side,
+                            field_sides=field_sides,
+                            layout_tag=MixedLayout.DEFAULT.value,
+                            expression_meta=product_meta,
+                        ))
+                    elif (
+                        a.role == "test"
+                        and _semantic_is_basis_rank2(a, spatial_dim=self.spatial_dim)
+                        and not a.is_gradient and not a.is_hessian
+                        and b.role == "trial"
+                        and _is_basis_row_like(b)
+                        and not b.is_vector and not b.is_gradient and not b.is_hessian
+                    ):
+                        body_lines.append("# Product: rank-2 Test basis × scalar Trial → mixed rank-2 tensor")
+                        scalar_expr = b.var_name if len(b.shape) == 1 else f"{b.var_name}[0]"
+                        body_lines.append(
+                            f"{res_var} = scalar_trial_times_basis_test({a.var_name}, {scalar_expr}, {self.dtype})"
+                        )
+                        field_names, parent_name, side, field_sides = StackItem.resolve_metadata(a, b, prefer='a', strict=False)
+                        stack.append(StackItem(
+                            var_name=res_var,
+                            role="mixed",
+                            shape=(a.shape[0], a.shape[1], _basis_col_dim(b.shape), a.shape[2]),
+                            is_vector=False,
+                            is_gradient=False,
+                            is_hessian=False,
+                            field_names=field_names,
+                            parent_name=parent_name,
+                            side=side,
+                            field_sides=field_sides,
+                            layout_tag=MixedLayout.DEFAULT.value,
+                            expression_meta=product_meta,
+                        ))
+                    elif (
+                        a.role == "trial"
+                        and _semantic_is_basis_rank2(a, spatial_dim=self.spatial_dim)
+                        and not a.is_gradient and not a.is_hessian
+                        and b.role == "test"
+                        and _is_basis_row_like(b)
+                        and not b.is_vector and not b.is_gradient and not b.is_hessian
+                    ):
+                        body_lines.append("# Product: rank-2 Trial basis × scalar Test → mixed rank-2 tensor")
+                        scalar_expr = b.var_name if len(b.shape) == 1 else f"{b.var_name}[0]"
+                        body_lines.append(
+                            f"{res_var} = basis_trial_times_scalar_test({a.var_name}, {scalar_expr}, {self.dtype})"
+                        )
+                        field_names, parent_name, side, field_sides = StackItem.resolve_metadata(a, b, prefer='b', strict=False)
+                        stack.append(StackItem(
+                            var_name=res_var,
+                            role="mixed",
+                            shape=(a.shape[0], _basis_col_dim(b.shape), a.shape[1], a.shape[2]),
+                            is_vector=False,
+                            is_gradient=False,
+                            is_hessian=False,
+                            field_names=field_names,
+                            parent_name=parent_name,
+                            side=side,
+                            field_sides=field_sides,
+                            layout_tag=MixedLayout.DEFAULT.value,
+                            expression_meta=product_meta,
+                        ))
                     elif (a.role in {"trial", "test"} and not a.is_vector and not a.is_gradient and not a.is_hessian and len(a.shape) == 1
                           and b.role in {"value", "const"} and b.is_vector):
                         role = 'trial' if a.role == 'trial' else 'test'
@@ -6319,7 +6521,9 @@ from pycutfem.jit.numba_helpers import (
         vector_test_times_scalar_trial,
         vector_vector_outer_product,
     scalar_trial_times_grad_test,
+    scalar_trial_times_basis_test,
     grad_trial_times_scalar_test,
+    basis_trial_times_scalar_test,
     scale_mixed_basis_with_coeffs,
     trace_times_identity,
     identity_times_trace_matrix,
