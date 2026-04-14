@@ -11,9 +11,10 @@ from pycutfem.core import mesh
 from pycutfem.jit.ir import LoadAnalytic
 
 # Bump when generated kernel source semantics/signature change.
-# 2026-04-07 invalidates stale JIT kernels after the mixed rank-2 contraction
-# and scalar-basis promotion fixes for value-gradient/basis and solid tangent terms.
-CODEGEN_ABI = "2026-04-07-abi-dot-product-ghost-layout-v14"
+# 2026-04-13 invalidates stale JIT kernels after fixing transported rank-2
+# basis dot classification, scalar-basis/matrix products, and rank-2 inner
+# contractions.
+CODEGEN_ABI = "2026-04-14-abi-rank2-dot-inner-v18"
 
 
 def _resolve_cache_dir(override: str | os.PathLike[str] | None = None) -> Path:

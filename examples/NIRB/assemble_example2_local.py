@@ -5,13 +5,22 @@ from pathlib import Path
 
 from pycutfem.core.dofhandler import DofHandler
 from pycutfem.fem.mixedelement import MixedElement
-from pycutfem.ufl.expressions import Constant, Function, TestFunction, TrialFunction, VectorFunction, VectorTestFunction, VectorTrialFunction
+from pycutfem.ufl.expressions import Function, TestFunction, TrialFunction, VectorFunction, VectorTestFunction, VectorTrialFunction
 from pycutfem.ufl.forms import Equation, assemble_form
 from pycutfem.ufl.spaces import FunctionSpace
 from pycutfem.utils.gmsh_loader import mesh_from_gmsh
 
 from examples.NIRB.example2_local_setup import load_example2_local_setup
-from examples.NIRB.example2_problem import build_bcs, build_conforming_mesh, build_jac, build_residual, classify_fluid_solid, retag_boundaries, tag_interface_edges
+from examples.NIRB.example2_problem import (
+    _named_constant,
+    build_bcs,
+    build_conforming_mesh,
+    build_jac,
+    build_residual,
+    classify_fluid_solid,
+    retag_boundaries,
+    tag_interface_edges,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -76,18 +85,18 @@ def main() -> None:
     for func in (uk, u_prev, dk, d_prev, pk, p_prev):
         func.nodal_values.fill(0.0)
 
-    rho_f = Constant(setup.material.density)
-    nu_f = Constant(setup.material.kinematic_viscosity)
+    rho_f = _named_constant("example2_rho_f", setup.material.density)
+    nu_f = _named_constant("example2_nu_f", setup.material.kinematic_viscosity)
     mu_f = rho_f * nu_f
-    rho_s = Constant(setup.material.density)
-    mu_s = Constant(setup.material.shear_modulus)
-    lambda_s = Constant(setup.material.lame_lambda)
-    alpha_u = Constant(1.0e-8)
-    stab_eps = Constant(1.0e-8)
-    dt_const = Constant(setup.boundaries.time_step)
-    theta_const = Constant(0.5)
+    rho_s = _named_constant("example2_rho_s", setup.material.density)
+    mu_s = _named_constant("example2_mu_s", setup.material.shear_modulus)
+    lambda_s = _named_constant("example2_lambda_s", setup.material.lame_lambda)
+    alpha_u = _named_constant("example2_alpha_u", 1.0e-8)
+    stab_eps = _named_constant("example2_stab_eps", 1.0e-8)
+    dt_const = _named_constant("example2_dt", setup.boundaries.time_step)
+    theta_const = _named_constant("example2_theta", 0.5)
     quad_order = 2 * int(args.field_order) + 2
-    p_gauge = Constant(1.0e-6)
+    p_gauge = _named_constant("example2_p_gauge", 1.0e-6)
 
     res_form = build_residual(
         uk=uk,

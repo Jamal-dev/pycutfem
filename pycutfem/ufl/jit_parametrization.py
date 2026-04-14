@@ -39,6 +39,8 @@ class JitParametrization:
     const_by_name: Dict[str, Any]
     ewc_name_by_id: Dict[int, str]
     ewc_by_name: Dict[str, Any]
+    qstate_name_by_id: Dict[int, str]
+    qstate_by_name: Dict[str, Any]
     analytic_id_by_id: Dict[int, int]
     analytic_by_id: Dict[int, Any]
     domain_token_by_id: Dict[int, str]
@@ -101,6 +103,7 @@ def build_jit_parametrization(expr) -> JitParametrization:
     runs as long as the expression structure is unchanged.
     """
     from pycutfem.ufl.expressions import Constant, ElementWiseConstant, Restriction
+    from pycutfem.state.coefficient import QuadratureStateCoefficient
     from pycutfem.ufl.analytic import Analytic
     from pycutfem.ufl.helpers import _find_all
 
@@ -151,6 +154,27 @@ def build_jit_parametrization(expr) -> JitParametrization:
         ewc_by_name[name] = ewc
 
     # ------------------------------------------------------------------
+    # Quadrature-state coefficients
+    # ------------------------------------------------------------------
+    qstate_name_by_id: Dict[int, str] = {}
+    qstate_by_name: Dict[str, QuadratureStateCoefficient] = {}
+    auto_idx = 0
+    for qstate in _find_all(expr, QuadratureStateCoefficient):
+        raw = getattr(qstate, "_jit_name", None) or getattr(qstate, "jit_name", None)
+        name = _as_valid_identifier(raw) if raw else None
+        if not name:
+            name = f"jit_qstate_{auto_idx}"
+            auto_idx += 1
+        base = name
+        suffix = 1
+        while name in used:
+            suffix += 1
+            name = f"{base}_{suffix}"
+        used.add(name)
+        qstate_name_by_id[id(qstate)] = name
+        qstate_by_name[name] = qstate
+
+    # ------------------------------------------------------------------
     # Analytic functions (indexed, not named)
     # ------------------------------------------------------------------
     analytic_id_by_id: Dict[int, int] = {}
@@ -180,9 +204,10 @@ def build_jit_parametrization(expr) -> JitParametrization:
         const_by_name=const_by_name,
         ewc_name_by_id=ewc_name_by_id,
         ewc_by_name=ewc_by_name,
+        qstate_name_by_id=qstate_name_by_id,
+        qstate_by_name=qstate_by_name,
         analytic_id_by_id=analytic_id_by_id,
         analytic_by_id=analytic_by_id,
         domain_token_by_id=domain_token_by_id,
         domain_by_token=domain_by_token,
     )
-

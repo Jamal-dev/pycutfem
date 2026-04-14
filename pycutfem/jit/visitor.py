@@ -15,9 +15,11 @@ from pycutfem.ufl.expressions import (
     Determinant as UFLDeterminant, Inverse as UFLInverse, Cofactor as UFLCofactor,
     Hessian as UFLHessian, Laplacian as UFLLaplacian, _expr_shape
 )
+from pycutfem.state.coefficient import QuadratureStateCoefficient
 from pycutfem.ufl.analytic import Analytic
 from pycutfem.jit.ir import (
     LoadVariable, LoadConstant, LoadConstantArray, LoadElementWiseConstant as LoadEWC_IR,
+    LoadQuadratureState,
     LoadAnalytic, LoadFacetNormal, Grad, PackGradient, Div, BinaryOp, Inner, Dot, Store, Transpose,
     Outer as IROuter,
     CellDiameter, MeshSize, LoadFacetNormalComponent, CheckDomain, Trace, Determinant, Inverse, Cofactor,
@@ -714,14 +716,13 @@ class IRGenerator:
 
             value_arr = np.asarray(node.value)
             is_vec = value_arr.ndim == 1
-            is_grad = value_arr.ndim == 2 and value_arr.shape[0] == value_arr.shape[1]
             self.ir_sequence.append(
                 LoadConstantArray(
                     name=str(name),
                     shape=node.shape,
                     role="const",
                     is_vector=is_vec,
-                    is_gradient=is_grad,
+                    is_gradient=False,
                 )
             )
             return
@@ -754,6 +755,15 @@ class IRGenerator:
                 name = f"jit_ewc_fallback_{id(node)}"
             # This was a bug, creating a UFL node instead of an IR node
             self.ir_sequence.append(LoadEWC_IR(name=name, tensor_shape=node.tensor_shape))
+            return
+
+        if isinstance(node, QuadratureStateCoefficient):
+            name = None
+            if self._param is not None:
+                name = self._param.qstate_name_by_id.get(id(node))
+            if name is None:
+                name = f"jit_qstate_fallback_{id(node)}"
+            self.ir_sequence.append(LoadQuadratureState(name=name, tensor_shape=node.tensor_shape))
             return
 
         if isinstance(node, Analytic):

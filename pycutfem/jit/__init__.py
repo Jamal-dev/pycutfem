@@ -512,6 +512,82 @@ class KernelRunner:
                         ) from exc
 
         # ---------------------------------------------------------------
+        # A0.5) refresh ElementWiseConstant / cell-state parameters
+        #       (so mutable per-element state can change without recompiling)
+        # ---------------------------------------------------------------
+        if param is not None:
+            ewc_by_name = getattr(param, "ewc_by_name", None)
+            if isinstance(ewc_by_name, dict) and ewc_by_name:
+                mesh = self.dof_handler.mixed_element.mesh
+                n_elems = int(getattr(mesh, "n_elements", 0))
+                eids = kernel_args.get("eids")
+                eids = None if eids is None else np.asarray(eids, dtype=np.int32).ravel()
+
+                def _expand_subset_to_full(arr: np.ndarray, name: str) -> np.ndarray:
+                    a = np.asarray(arr, dtype=np.float64)
+                    if a.ndim == 0:
+                        return a
+                    if int(a.shape[0]) == n_elems:
+                        return a
+                    if eids is not None and int(a.shape[0]) == int(eids.shape[0]):
+                        out = np.zeros((n_elems,) + a.shape[1:], dtype=a.dtype)
+                        out[eids] = a
+                        return out
+                    raise ValueError(
+                        f"[jit] ElementWiseConstant '{name}' has leading dimension {int(a.shape[0])}, "
+                        f"expected either n_elems={n_elems} or len(eids)={0 if eids is None else int(eids.shape[0])}."
+                    )
+
+                for name, ewc in ewc_by_name.items():
+                    if name not in self._param_set:
+                        continue
+                    arr = _expand_subset_to_full(getattr(ewc, "values", ewc), name)
+                    prev = kernel_args.get(name)
+                    if isinstance(prev, np.ndarray) and prev.shape == arr.shape:
+                        prev[...] = arr
+                    else:
+                        kernel_args[name] = np.ascontiguousarray(arr)
+
+        # ---------------------------------------------------------------
+        # A0.6) refresh QuadratureStateCoefficient parameters
+        #       (mutable per-element, per-qp state without recompiling)
+        # ---------------------------------------------------------------
+        if param is not None:
+            qstate_by_name = getattr(param, "qstate_by_name", None)
+            if isinstance(qstate_by_name, dict) and qstate_by_name:
+                mesh = self.dof_handler.mixed_element.mesh
+                n_elems = int(getattr(mesh, "n_elements", 0))
+                eids = kernel_args.get("eids")
+                eids = None if eids is None else np.asarray(eids, dtype=np.int32).ravel()
+
+                def _expand_qstate_subset_to_full(arr: np.ndarray, name: str) -> np.ndarray:
+                    a = np.asarray(arr, dtype=np.float64)
+                    if a.ndim < 2:
+                        raise ValueError(
+                            f"[jit] QuadratureStateCoefficient '{name}' must have shape (n_elem, n_qp, ...), got {a.shape}."
+                        )
+                    if int(a.shape[0]) == n_elems:
+                        return a
+                    if eids is not None and int(a.shape[0]) == int(eids.shape[0]):
+                        out = np.zeros((n_elems,) + a.shape[1:], dtype=a.dtype)
+                        out[eids] = a
+                        return out
+                    raise ValueError(
+                        f"[jit] QuadratureStateCoefficient '{name}' has leading dimension {int(a.shape[0])}, "
+                        f"expected either n_elems={n_elems} or len(eids)={0 if eids is None else int(eids.shape[0])}."
+                    )
+
+                for name, qstate in qstate_by_name.items():
+                    if name not in self._param_set:
+                        continue
+                    arr = _expand_qstate_subset_to_full(getattr(qstate, "values", qstate), name)
+                    prev = kernel_args.get(name)
+                    if isinstance(prev, np.ndarray) and prev.shape == arr.shape:
+                        prev[...] = arr
+                    else:
+                        kernel_args[name] = np.ascontiguousarray(arr)
+
+        # ---------------------------------------------------------------
         # A1) refresh Analytic parameters (time-dependent forcing support)
         #
         # Compiled backends (jit/cpp) traditionally precompute Analytic(x,y)

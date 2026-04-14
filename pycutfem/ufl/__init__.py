@@ -5,7 +5,12 @@ This package exposes the most commonly used symbolic building blocks and the
 high-level assembly entry point.
 """
 
-from pycutfem.ufl.forms import Equation, BoundaryCondition, assemble_form
+from pycutfem.ufl.forms import (
+    Equation,
+    BoundaryCondition,
+    CondensedQuadratureLocalSystem,
+    assemble_form,
+)
 from pycutfem.ufl.expressions import (
     Constant,
     TrialFunction,
@@ -30,6 +35,7 @@ from pycutfem.ufl.spaces import FunctionSpace
 __all__ = [
     "Equation",
     "BoundaryCondition",
+    "CondensedQuadratureLocalSystem",
     "assemble_form",
     "Constant",
     "TrialFunction",

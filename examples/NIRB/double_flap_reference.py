@@ -318,6 +318,7 @@ def load_double_flap_reference(root: str | Path | None = None) -> DoubleFlapRefe
     fluid_json = _load_json(root_path / "ProjectParametersCFD.json")
     solid_json = _load_json(root_path / "ProjectParametersCSM.json")
     coupling_json = _load_json(root_path / "DoubleFlap_fsi_parameters_ROM.json")
+    fluid_materials_json = _load_json(root_path / "FluidMaterials.json")
 
     fluid_coords = np.asarray(list(fluid.nodes.values()), dtype=float)
     solid_coords = np.asarray(list(solid.nodes.values()), dtype=float)
@@ -344,8 +345,10 @@ def load_double_flap_reference(root: str | Path | None = None) -> DoubleFlapRefe
     bc_processes = fluid_json["processes"]["boundary_conditions_process_list"]
     inlet_ramp = bc_processes[0]["Parameters"]
     inlet_steady = bc_processes[1]["Parameters"]
-    material = fluid_json["solver_settings"]["fluid_solver_settings"]["material_import_settings"]
-    del material  # kept to mirror the source structure in local debugging
+    material = fluid_materials_json["properties"][0]["Material"]["Variables"]
+    density = float(material["DENSITY"])
+    dynamic_viscosity = float(material["DYNAMIC_VISCOSITY"])
+    kinematic_viscosity = dynamic_viscosity / max(density, 1.0e-14)
 
     return DoubleFlapReference(
         root=root_path,
@@ -368,8 +371,8 @@ def load_double_flap_reference(root: str | Path | None = None) -> DoubleFlapRefe
         inlet_ramp_end_time=float(inlet_ramp["interval"][1]),
         inlet_modulus_ramp=str(inlet_ramp["modulus"]),
         inlet_modulus_steady=str(inlet_steady["modulus"]),
-        density=1000.0,
-        kinematic_viscosity=0.001,
+        density=density,
+        kinematic_viscosity=kinematic_viscosity,
         max_velocity=2.5,
         cylinder_center=cylinder_center,
         cylinder_radius=cylinder_radius,

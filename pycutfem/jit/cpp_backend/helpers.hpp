@@ -1207,6 +1207,51 @@ inline Eigen::MatrixXd scalar_basis_times_vector(
     return vector_vals * scalar_basis.transpose();
 }
 
+inline std::vector<Eigen::MatrixXd> value_vector_outer_basis_vector(
+    const Eigen::VectorXd& value_vec,
+    const Eigen::MatrixXd& basis_vec) {
+    if (is_debug) {std::cout<< "-----------------value_vector_outer_basis_vector---------------------"<<std::endl;}
+    std::vector<Eigen::MatrixXd> out(static_cast<size_t>(value_vec.size()));
+    const Eigen::MatrixXd basis_cols = basis_vec.transpose();
+    for (Eigen::Index comp = 0; comp < value_vec.size(); ++comp) {
+        out[static_cast<size_t>(comp)] = value_vec(comp) * basis_cols;
+    }
+    return out;
+}
+
+inline std::vector<Eigen::MatrixXd> basis_vector_outer_value_vector(
+    const Eigen::MatrixXd& basis_vec,
+    const Eigen::VectorXd& value_vec) {
+    if (is_debug) {std::cout<< "-----------------basis_vector_outer_value_vector---------------------"<<std::endl;}
+    std::vector<Eigen::MatrixXd> out(static_cast<size_t>(basis_vec.rows()));
+    for (Eigen::Index comp = 0; comp < basis_vec.rows(); ++comp) {
+        out[static_cast<size_t>(comp)] = basis_vec.row(comp).transpose() * value_vec.transpose();
+    }
+    return out;
+}
+
+inline std::vector<Eigen::MatrixXd> basis_vector_outer_basis_vector(
+    const Eigen::MatrixXd& lhs_basis,
+    const Eigen::MatrixXd& rhs_basis,
+    const bool lhs_is_test) {
+    if (is_debug) {std::cout<< "-----------------basis_vector_outer_basis_vector---------------------"<<std::endl;}
+    const Eigen::Index lhs_comps = lhs_basis.rows();
+    const Eigen::Index rhs_comps = rhs_basis.rows();
+    std::vector<Eigen::MatrixXd> out(static_cast<size_t>(lhs_comps * rhs_comps));
+    for (Eigen::Index i = 0; i < lhs_comps; ++i) {
+        for (Eigen::Index j = 0; j < rhs_comps; ++j) {
+            if (lhs_is_test) {
+                out[static_cast<size_t>(i * rhs_comps + j)] =
+                    lhs_basis.row(i).transpose() * rhs_basis.row(j);
+            } else {
+                out[static_cast<size_t>(i * rhs_comps + j)] =
+                    rhs_basis.row(j).transpose() * lhs_basis.row(i);
+            }
+        }
+    }
+    return out;
+}
+
 // Scalar basis row (1,n) scaled by a value/const matrix (k,d) -> tensor basis (k,n,d).
 // Representation matches the existing grad-stack convention: one (n x d) matrix per component row.
 inline std::vector<Eigen::MatrixXd> scalar_basis_times_matrix_tensor(
@@ -2302,23 +2347,49 @@ inline std::vector<Eigen::MatrixXd> dot_mat_mixed(const Eigen::MatrixXd& mat,
 }
 
 // Contract mixed tensor (k, rows, cols, d) with spatial vector (d,)
-inline Eigen::MatrixXd dot_mixed_with_vec(const std::vector<Eigen::MatrixXd>& mixed,
-                                          const Eigen::VectorXd& vec,
-                                          int k, int d) {
+// -> carried mixed rank-1 tensor (k, rows, cols)
+inline std::vector<Eigen::MatrixXd> dot_mixed_with_vec(const std::vector<Eigen::MatrixXd>& mixed,
+                                                       const Eigen::VectorXd& vec,
+                                                       int k, int d) {
     if (is_debug) {std::cout<< "-----------------dot_mixed_with_vec---------------------"<<std::endl;}
-    if (mixed.empty()) return Eigen::MatrixXd();
+    if (mixed.empty()) return {};
     if (vec.size() != d) {
         throw std::runtime_error("dot_mixed_with_vec: vector length must match spatial dimension");
     }
+    if (static_cast<int>(mixed.size()) != k * d) {
+        throw std::runtime_error("dot_mixed_with_vec: mixed tensor stack size mismatch");
+    }
     Eigen::Index n_rows = mixed[0].rows();
     Eigen::Index n_cols = mixed[0].cols();
-    Eigen::MatrixXd out = Eigen::MatrixXd::Zero(n_rows, n_cols);
+    std::vector<Eigen::MatrixXd> out(static_cast<size_t>(k), Eigen::MatrixXd::Zero(n_rows, n_cols));
     for (int i = 0; i < k; ++i) {
         for (int r = 0; r < d; ++r) {
             int idx = i * d + r;
-            if (idx < static_cast<int>(mixed.size())) {
-                out.noalias() += mixed[static_cast<size_t>(idx)] * vec(r);
-            }
+            out[static_cast<size_t>(i)].noalias() += mixed[static_cast<size_t>(idx)] * vec(r);
+        }
+    }
+    return out;
+}
+
+inline std::vector<Eigen::MatrixXd> left_dot_mixed_tensor_with_vec(
+    const std::vector<Eigen::MatrixXd>& mixed,
+    const Eigen::VectorXd& vec,
+    int k,
+    int d) {
+    if (is_debug) {std::cout<< "-----------------left_dot_mixed_tensor_with_vec---------------------"<<std::endl;}
+    if (mixed.empty()) return {};
+    if (vec.size() != k) {
+        throw std::runtime_error("left_dot_mixed_tensor_with_vec: vector length must match leading component dimension");
+    }
+    if (static_cast<int>(mixed.size()) != k * d) {
+        throw std::runtime_error("left_dot_mixed_tensor_with_vec: mixed tensor stack size mismatch");
+    }
+    Eigen::Index n_rows = mixed[0].rows();
+    Eigen::Index n_cols = mixed[0].cols();
+    std::vector<Eigen::MatrixXd> out(static_cast<size_t>(d), Eigen::MatrixXd::Zero(n_rows, n_cols));
+    for (int i = 0; i < k; ++i) {
+        for (int r = 0; r < d; ++r) {
+            out[static_cast<size_t>(r)].noalias() += mixed[static_cast<size_t>(i * d + r)] * vec(i);
         }
     }
     return out;

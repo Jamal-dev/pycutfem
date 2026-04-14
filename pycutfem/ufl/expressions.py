@@ -198,6 +198,8 @@ def _shape_after_slice(shape: tuple[int, ...], index: tuple[int, ...]) -> tuple[
 def _expr_shape(expr) -> tuple[int, ...]:
     if isinstance(expr, Constant):
         return tuple(expr.shape)
+    if getattr(expr, "_is_quadrature_state_coefficient", False):
+        return tuple(expr.shape)
     if isinstance(expr, ElementWiseConstant):
         return tuple(expr.shape)
     if isinstance(expr, (FacetNormal, VectorFunction, VectorTrialFunction, VectorTestFunction,
@@ -292,10 +294,12 @@ _SPATIAL_DIM = 2
 
 
 def _is_constant_like(expr) -> bool:
-    return isinstance(expr, (Constant, ElementWiseConstant))
+    return isinstance(expr, (Constant, ElementWiseConstant)) and not getattr(expr, "_preserve_runtime_structure", False)
 
 
 def _constant_array(expr):
+    if getattr(expr, "_preserve_runtime_structure", False):
+        return None
     if isinstance(expr, Constant):
         return np.asarray(expr.value, dtype=float)
     if isinstance(expr, ElementWiseConstant):
@@ -463,6 +467,8 @@ def _index_expression(expr, index):
 
     if isinstance(expr, Constant):
         return _slice_constant(expr.value, idx)
+    if getattr(expr, "_is_quadrature_state_coefficient", False):
+        return expr.slice_component(idx)
     if isinstance(expr, ElementWiseConstant):
         return ElementWiseConstant(expr.values[(slice(None),) + idx])
     if isinstance(expr, (Pos, Neg)):

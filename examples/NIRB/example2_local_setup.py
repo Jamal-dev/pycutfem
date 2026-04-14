@@ -84,7 +84,7 @@ class Example2LocalSetup:
             "paper_example2_notes": {
                 "fluid_and_solid_meshes_in_reference_are_separate": True,
                 "local_pycutfem_problem_uses_a_single_conforming_mesh": True,
-                "local_solid_constitutive_law": "compressible Neo-Hookean",
+                "local_solid_constitutive_law": "Kratos HyperElasticPlaneStrain2DLaw",
                 "current_target": "Use the local DoubleFlap geometry, boundary conditions, and weak forms to assemble the pycutfem FOM directly.",
             },
         }

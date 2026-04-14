@@ -382,6 +382,17 @@ def _project_provenance_to_tensor(
     if derivative_rank == 0 and not provenance.sources:
         return provenance
 
+    # Basis-backed intermediates frequently collapse or transform derivative
+    # axes into carried component axes before a later contraction consumes them.
+    # We still need that derivative origin in the provenance so chained dot()
+    # planning can distinguish transported gradients from plain vector bases.
+    #
+    # For pure values we continue to project to the exposed tensor axes only;
+    # this avoids reclassifying transformed value gradients such as
+    # dot(Finv.T, grad(p)) as semantic gradients in later contractions.
+    if tensor.basis_rank > 0:
+        return ProvenanceSignature(_dedupe_sources(list(provenance.sources)))
+
     projected: list[FieldSource] = []
     for src in provenance.sources:
         new_depth = min(int(src.derivative_depth), derivative_rank)
@@ -739,7 +750,13 @@ def _is_gradient_semantic(meta: ExpressionMeta) -> bool:
     # not a derivative axis. Treating them as semantic gradients routes later
     # dot products through the grad-specialized backend kernels and breaks
     # transformed PSPG/ALE terms.
-    return _is_grad_storage(sig)
+    if _is_grad_storage(sig):
+        return True
+
+    # Basis-backed rank-1 intermediates can lose their explicit derivative axis
+    # after a transport or contraction, but they still need to route through
+    # the basis-gradient kernels in subsequent dot() closures.
+    return sig.basis_rank > 0 and sig.tensor_rank == 1 and _has_derivative_provenance(meta)
 
 
 def _is_hessian_semantic(meta: ExpressionMeta) -> bool:
@@ -1382,26 +1399,77 @@ class TensorRuleEngine:
         rhs_is_grad = _is_gradient_semantic(rhs_meta)
         lhs_is_hess = _is_hessian_semantic(lhs_meta)
         rhs_is_hess = _is_hessian_semantic(rhs_meta)
+        lhs_basis_tensor = lhs.basis_rank == 1 and lhs.tensor_rank > 1 and not lhs_is_hess
+        rhs_basis_tensor = rhs.basis_rank == 1 and rhs.tensor_rank > 1 and not rhs_is_hess
+        lhs_value_tensor = lhs.basis_rank == 0 and lhs.tensor_rank > 1 and not lhs_is_hess
+        rhs_value_tensor = rhs.basis_rank == 0 and rhs.tensor_rank > 1 and not rhs_is_hess
 
-        if lhs.basis_rank == 1 and rhs.basis_rank == 1 and not lhs_is_grad and not rhs_is_grad and not lhs_is_hess and not rhs_is_hess:
+        if (
+            lhs.basis_rank == 1
+            and rhs.basis_rank == 1
+            and lhs.tensor_rank == 1
+            and rhs.tensor_rank == 1
+            and not lhs_is_grad
+            and not rhs_is_grad
+            and not lhs_is_hess
+            and not rhs_is_hess
+        ):
             return DotKernelPlan(lowering=lowering, case=DotKernelCase.BASIS_BASIS_MASS)
 
-        if lhs.basis_rank == 1 and rhs.basis_rank == 0 and lhs_is_grad and rhs.tensor_rank == 1:
+        if (
+            lhs.basis_rank == 1
+            and rhs.basis_rank == 0
+            and rhs.tensor_rank == 1
+            and (lhs_is_grad or lhs_basis_tensor)
+        ):
             return DotKernelPlan(lowering=lowering, case=DotKernelCase.BASIS_GRAD_DOT_VALUE_VECTOR)
 
-        if lhs.basis_rank == 0 and rhs.basis_rank == 1 and lhs.tensor_rank == 1 and rhs_is_grad:
+        if (
+            lhs.basis_rank == 0
+            and rhs.basis_rank == 1
+            and lhs.tensor_rank == 1
+            and (rhs_is_grad or rhs_basis_tensor)
+        ):
             return DotKernelPlan(lowering=lowering, case=DotKernelCase.VALUE_VECTOR_DOT_BASIS_GRAD)
 
-        if lhs.basis_rank == 0 and rhs.basis_rank == 1 and lhs_is_grad and not rhs_is_grad and not rhs_is_hess:
+        if (
+            lhs.basis_rank == 0
+            and rhs.basis_rank == 1
+            and rhs.tensor_rank == 1
+            and (lhs_is_grad or lhs_value_tensor)
+            and not rhs_is_grad
+            and not rhs_is_hess
+        ):
             return DotKernelPlan(lowering=lowering, case=DotKernelCase.VALUE_GRAD_DOT_BASIS_VECTOR)
 
-        if lhs.basis_rank == 1 and rhs.basis_rank == 0 and not lhs_is_grad and not lhs_is_hess and rhs_is_grad:
+        if (
+            lhs.basis_rank == 1
+            and rhs.basis_rank == 0
+            and lhs.tensor_rank == 1
+            and not lhs_is_grad
+            and not lhs_is_hess
+            and (rhs_is_grad or rhs_value_tensor)
+        ):
             return DotKernelPlan(lowering=lowering, case=DotKernelCase.BASIS_VECTOR_DOT_VALUE_GRAD)
 
-        if lhs.basis_rank == 1 and rhs.basis_rank == 1 and lhs_is_grad and not rhs_is_grad and not rhs_is_hess:
+        if (
+            lhs.basis_rank == 1
+            and rhs.basis_rank == 1
+            and rhs.tensor_rank == 1
+            and (lhs_is_grad or lhs_basis_tensor)
+            and not rhs_is_grad
+            and not rhs_is_hess
+        ):
             return DotKernelPlan(lowering=lowering, case=DotKernelCase.BASIS_GRAD_DOT_BASIS_VECTOR)
 
-        if lhs.basis_rank == 1 and rhs.basis_rank == 1 and not lhs_is_grad and not lhs_is_hess and rhs_is_grad:
+        if (
+            lhs.basis_rank == 1
+            and rhs.basis_rank == 1
+            and lhs.tensor_rank == 1
+            and not lhs_is_grad
+            and not lhs_is_hess
+            and (rhs_is_grad or rhs_basis_tensor)
+        ):
             return DotKernelPlan(lowering=lowering, case=DotKernelCase.BASIS_VECTOR_DOT_BASIS_GRAD)
 
         return DotKernelPlan(lowering=lowering, case=DotKernelCase.GENERIC_CONTRACT_LAST_FIRST)

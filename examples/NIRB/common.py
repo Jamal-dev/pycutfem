@@ -14,7 +14,10 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
-import pyvista as pv
+try:
+    import pyvista as pv
+except Exception:  # pragma: no cover - optional for non-VTK utility paths
+    pv = None
 
 
 ARTERIAL_REPO_URL = "https://github.com/FsiROM/ArterialWallROM.git"

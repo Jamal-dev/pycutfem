@@ -103,6 +103,8 @@ class PolynomialDegreeEstimator:
             result = dim * self._get_degree(expr.A)
         elif isinstance(expr, FacetNormal):
             result = self._geom_deg
+        elif getattr(expr, "_is_quadrature_state_coefficient", False):
+            result = 0
         elif isinstance(expr, ElementWiseConstant):
             # ElementWiseConstant is a special case that should not be confused with Constant.
             # It represents a constant value that is element-wise, so its degree is 0.

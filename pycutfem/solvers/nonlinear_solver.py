@@ -24,7 +24,7 @@ import threading
 import subprocess
 import tempfile
 from dataclasses import dataclass, field
-from typing import Dict, List, Callable, Optional, Tuple
+from typing import Dict, List, Callable, Optional, Tuple, Sequence
 import inspect
 import warnings
 from pathlib import Path
@@ -40,6 +40,7 @@ except Exception:
 # from pycutfem.jit.kernel_args import _scatter_element_contribs
 from pycutfem.jit.kernel_args import _build_jit_kernel_args
 from pycutfem.jit import compile_multi        
+from pycutfem.operators import OperatorManager, RuntimeOperator
 from pycutfem.ufl.forms import Equation
 from pycutfem.ufl.helpers import analyze_active_dofs
 from pycutfem.solvers.dt_controller import AdaptiveDtController, DtControllerParams
@@ -283,7 +284,14 @@ def _scatter_element_contribs_reduced(
             cols = cmap[cmask]
 
             Ke = K_elem[i][np.ix_(rmask, cmask)]
-            A_red[np.ix_(rows, cols)] += Ke
+            if sp.issparse(A_red):
+                for row_i, row in enumerate(rows.tolist()):
+                    for col_j, col in enumerate(cols.tolist()):
+                        val = float(Ke[row_i, col_j])
+                        if val != 0.0:
+                            A_red[row, col] = float(A_red[row, col]) + val
+            else:
+                A_red[np.ix_(rows, cols)] += Ke
 
     # --- Vector block: keep only free rows ----------------------------
     if R_red is not None and F_elem is not None:
@@ -345,6 +353,12 @@ class NewtonParameters:
     # Allow deeper backtracking; some stiff problems only descend for very small α
     ls_max_iter: int = 12
     ls_reduction: float = 0.5           # α ← β·α after reject
+    # When False, a failed residual-decrease line search returns the smallest
+    # tried step (or zero step in the full-space path) instead of aborting the
+    # nonlinear solve. This is useful for exact local operators whose Newton
+    # path is physically correct but can occasionally defeat the globalization
+    # filter near convergence.
+    ls_fail_hard: bool = True
     # NOTE: A too-large `ls_c1` makes the Armijo test overly strict and can
     # stall Newton (tiny accepted steps). Use a standard small value.
     ls_c1: float = 1.0e-4               # sufficient‑decrease parameter
@@ -380,6 +394,16 @@ class NewtonParameters:
     stall_window: int = 0
     stall_min_abs_decrease_inf: float = 0.0
     stall_min_rel_decrease_inf: float = 0.0
+    # Optional Kratos-style mixed solution criteria. Each entry is
+    # ("field_a,field_b,...", relative_tol, absolute_tol) and is evaluated on
+    # the accepted Newton correction using RMS-L2 absolute norm and L2-relative
+    # norm. The nonlinear step is accepted when every listed field/group meets
+    # either its absolute or relative tolerance.
+    mixed_solution_criteria: tuple[tuple[str, float, float], ...] = ()
+    # Optional safeguard for mixed solution acceptance: require the updated
+    # residual to also satisfy |R|_inf <= factor * newton_tol. A non-positive
+    # value disables the guard.
+    mixed_solution_max_residual_factor: float = 0.0
     # Optional pseudo-transient continuation on a selected reduced block for
     # plain Newton solves. This is intended for latent / unconstrained
     # formulations that need additional local damping in weakly coupled
@@ -466,6 +490,108 @@ class TimeStepperParameters:
             self.final_time = float(self.t0) + float(self.max_steps) * float(self.dt)
         if self.dt_max is None:
             self.dt_max = float(self.dt)
+
+
+def _normalize_mixed_solution_criteria(
+    criteria: object,
+) -> list[tuple[tuple[str, ...], float, float]]:
+    out: list[tuple[tuple[str, ...], float, float]] = []
+    if not criteria:
+        return out
+    try:
+        iterable = list(criteria)
+    except Exception:
+        return out
+    for item in iterable:
+        try:
+            group_spec, rel_tol, abs_tol = item
+        except Exception:
+            continue
+        fields = tuple(
+            token.strip()
+            for token in str(group_spec).split(",")
+            if token.strip()
+        )
+        if not fields:
+            continue
+        out.append((fields, float(rel_tol), float(abs_tol)))
+    return out
+
+
+def _mixed_solution_criteria_report(
+    *,
+    dh,
+    funcs,
+    delta_full: np.ndarray,
+    criteria: object,
+) -> tuple[bool, list[dict[str, object]]]:
+    try:
+        from pycutfem.ufl.expressions import VectorFunction as _VectorFunction
+    except Exception:  # pragma: no cover - defensive import
+        _VectorFunction = tuple()  # type: ignore[assignment]
+    parsed = _normalize_mixed_solution_criteria(criteria)
+    if not parsed:
+        return False, []
+
+    scalar_map: dict[str, np.ndarray] = {}
+    value_map: dict[str, np.ndarray] = {}
+    for function in list(funcs):
+        if isinstance(function, _VectorFunction):
+            pieces = list(function.components)
+        else:
+            pieces = [function]
+        for piece in pieces:
+            field_name = str(getattr(piece, "field_name", ""))
+            if not field_name:
+                continue
+            try:
+                field_slice = np.asarray(dh.get_field_slice(field_name), dtype=int)
+            except Exception:
+                continue
+            if field_slice.size == 0:
+                continue
+            scalar_map[field_name] = np.asarray(delta_full[field_slice], dtype=float).reshape(-1)
+            value_map[field_name] = np.asarray(piece.nodal_values, dtype=float).reshape(-1)
+
+    reports: list[dict[str, object]] = []
+    all_ok = True
+    for fields, rel_tol, abs_tol in parsed:
+        parts_du = [scalar_map[fld] for fld in fields if fld in scalar_map]
+        parts_u = [value_map[fld] for fld in fields if fld in value_map]
+        if not parts_du or not parts_u:
+            all_ok = False
+            reports.append(
+                {
+                    "fields": fields,
+                    "rel_tol": float(rel_tol),
+                    "abs_tol": float(abs_tol),
+                    "abs_norm": float("inf"),
+                    "rel_norm": float("inf"),
+                    "ok": False,
+                    "missing": True,
+                }
+            )
+            continue
+        du = np.concatenate(parts_du).reshape(-1)
+        uu = np.concatenate(parts_u).reshape(-1)
+        size = max(int(du.size), 1)
+        abs_norm = float(np.linalg.norm(du, ord=2) / math.sqrt(float(size)))
+        base = max(float(np.linalg.norm(uu, ord=2)), 1.0e-14)
+        rel_norm = float(abs_norm / base)
+        ok = bool((abs_norm <= float(abs_tol)) or (rel_norm <= float(rel_tol)))
+        all_ok = bool(all_ok and ok)
+        reports.append(
+            {
+                "fields": fields,
+                "rel_tol": float(rel_tol),
+                "abs_tol": float(abs_tol),
+                "abs_norm": abs_norm,
+                "rel_norm": rel_norm,
+                "ok": ok,
+                "missing": False,
+            }
+        )
+    return all_ok, reports
 
 
 @dataclass
@@ -1000,6 +1126,7 @@ class NewtonSolver:
         postproc_cb: Optional[Callable[[List], None]] = None,
         backend: str = "jit",
         postproc_timeloop_cb: Optional[Callable[[List], None]] = None,
+        operators: Optional[Sequence[RuntimeOperator]] = None,
     ) -> None:
         self.dh = dof_handler
         self.me = mixed_element
@@ -1016,6 +1143,8 @@ class NewtonSolver:
         self.quad_order = quad_order
         self.deformation = deformation
         self._deformation_update = deformation_update
+        self.operators: tuple[RuntimeOperator, ...] = tuple()
+        self.operator_manager: OperatorManager | None = None
 
         # Keep original forms handy (their .integrand is needed later)
         self._residual_form = residual_form
@@ -1166,6 +1295,291 @@ class NewtonSolver:
         self._reduced_schur_last_info: dict[str, object] = {}
         self._newton_ptc_sigma_current: float = 0.0
         self._refresh_reduced_field_names()
+        self.set_runtime_operators(operators)
+
+    def set_runtime_operators(self, operators: Optional[Sequence[RuntimeOperator]] = None) -> None:
+        self.operators = tuple(operators or ())
+        self.operator_manager = OperatorManager(self.operators) if self.operators else None
+        if self.operator_manager is not None:
+            self.operator_manager.bind(self)
+
+    def _before_reduced_assembly(self, coeffs, *, need_matrix: bool) -> None:
+        if getattr(self, "preassemble_cb", None) is not None:
+            self.preassemble_cb(coeffs)
+        if self.operator_manager is not None:
+            self.operator_manager.before_assembly(
+                solver=self,
+                coeffs=coeffs,
+                need_matrix=bool(need_matrix),
+            )
+
+    def _after_reduced_assembly(self, coeffs, A_red, R_red, *, need_matrix: bool):
+        if self.operator_manager is None:
+            return A_red, R_red
+        return self.operator_manager.after_assembly(
+            solver=self,
+            coeffs=coeffs,
+            A_red=A_red,
+            R_red=R_red,
+            need_matrix=bool(need_matrix),
+        )
+
+    def scatter_element_contribs_reduced(
+        self,
+        *,
+        K_elem: np.ndarray | None,
+        F_elem: np.ndarray | None,
+        element_ids: np.ndarray,
+        gdofs_map: np.ndarray,
+        A_red,
+        R_red,
+        hook=None,
+    ):
+        """
+        Scatter explicit element-local contributions into the reduced system.
+
+        This is the stable solver-facing entry point for runtime operators that
+        own discrete local algebra and want to inject their already-assembled
+        element blocks after the ordinary backend assembly.
+        """
+        def _runtime_reduced_scatter_plan(gdofs_arr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+            if getattr(self, "_pattern_stale", True):
+                self._build_reduced_pattern()
+            cache = getattr(self, "_runtime_reduced_scatter_plan_cache", None)
+            if not isinstance(cache, dict):
+                cache = {}
+                self._runtime_reduced_scatter_plan_cache = cache
+            key = int(id(gdofs_arr))
+            cached = cache.get(key)
+            if cached is not None:
+                return cached
+            full = np.asarray(gdofs_arr, dtype=np.int64)
+            ndof_full = int(getattr(self.full_to_red, "size", 0))
+            red = -np.ones_like(full, dtype=np.int32)
+            valid = (full >= 0) & (full < ndof_full)
+            if np.any(valid):
+                red[valid] = self.full_to_red[full[valid]]
+            if _HAVE_NUMBA_REDUCED_PATTERN:
+                _wait_numba_reduced_pattern_precompile()
+                pos_flat = _build_pos_flat_numba(red, self._csr_indptr, self._csr_indices)
+            else:
+                n_ent, n_loc = int(red.shape[0]), int(red.shape[1])
+                pos_flat = -np.ones((n_ent, int(n_loc * n_loc)), dtype=np.int32)
+                indptr = np.asarray(self._csr_indptr, dtype=np.int32)
+                indices = np.asarray(self._csr_indices, dtype=np.int32)
+                for e in range(n_ent):
+                    row_red = red[e]
+                    col_mask = row_red >= 0
+                    if not np.any(col_mask):
+                        continue
+                    cols_act = row_red[col_mask].astype(np.int32, copy=False)
+                    all_cols_active = bool(np.all(col_mask))
+                    for i in range(n_loc):
+                        ra = int(row_red[i])
+                        if ra < 0:
+                            continue
+                        s = int(indptr[ra])
+                        epos = int(indptr[ra + 1])
+                        row_cols = indices[s:epos]
+                        row_pos = s + np.searchsorted(row_cols, cols_act)
+                        seg = pos_flat[e, int(i * n_loc) : int((i + 1) * n_loc)]
+                        if all_cols_active:
+                            seg[:] = row_pos
+                        else:
+                            seg[col_mask] = row_pos
+            cache[key] = (pos_flat, red)
+            return pos_flat, red
+
+        fast_runtime_scatter = (
+            hasattr(self, "active_dofs")
+            and hasattr(self, "full_to_red")
+            and
+            getattr(self, "constraints", None) is None
+            and isinstance(gdofs_map, np.ndarray)
+            and gdofs_map.ndim == 2
+            and (
+                (A_red is not None and sp.isspmatrix(A_red))
+                or (A_red is None and R_red is not None)
+            )
+        )
+        if fast_runtime_scatter:
+            pos_flat, red_map = _runtime_reduced_scatter_plan(np.asarray(gdofs_map, dtype=int))
+            A_work = A_red
+            if A_red is not None and sp.isspmatrix(A_red) and not sp.isspmatrix_csr(A_red):
+                A_work = A_red.tocsr(copy=True)
+            try:
+                if A_work is not None and K_elem is not None and sp.isspmatrix_csr(A_work):
+                    k_flat = np.asarray(K_elem, dtype=float).reshape(int(K_elem.shape[0]), -1)
+                    data = A_work.data
+                    for e in range(int(pos_flat.shape[0])):
+                        pflat = np.asarray(pos_flat[e], dtype=np.int32)
+                        if pflat.size == 0:
+                            continue
+                        mask = pflat >= 0
+                        if not np.any(mask):
+                            continue
+                        data[pflat[mask]] += k_flat[e, mask]
+                if R_red is not None and F_elem is not None:
+                    rm = np.asarray(red_map, dtype=np.int32).ravel()
+                    ff = np.asarray(F_elem, dtype=float).ravel()
+                    if ff.size == rm.size and ff.size:
+                        mask = rm >= 0
+                        if np.any(mask):
+                            np.add.at(R_red, rm[mask], ff[mask])
+                return A_work, R_red
+            except IndexError:
+                self._pattern_stale = True
+                if hasattr(self, "_runtime_reduced_scatter_plan_cache"):
+                    self._runtime_reduced_scatter_plan_cache = {}
+                self._build_reduced_pattern()
+
+        A_work = A_red
+        if A_red is not None and sp.isspmatrix(A_red) and not sp.isspmatrix_lil(A_red):
+            A_work = A_red.tolil(copy=True)
+        _scatter_element_contribs_reduced(
+            K_elem=K_elem,
+            F_elem=F_elem,
+            J_elem=None,
+            element_ids=np.asarray(element_ids, dtype=int),
+            gdofs_map=np.asarray(gdofs_map, dtype=int),
+            A_red=A_work,
+            R_red=R_red,
+            full_to_red=np.asarray(self.full_to_red, dtype=int),
+            hook=hook,
+        )
+        if A_work is not A_red:
+            A_red = A_work.tocsr()
+        return A_red, R_red
+
+    def scatter_element_contribs_full(
+        self,
+        *,
+        K_elem: np.ndarray | None,
+        F_elem: np.ndarray | None,
+        element_ids: np.ndarray,
+        gdofs_map: np.ndarray,
+        A_full=None,
+        R_full=None,
+        add: bool = True,
+        hook=None,
+    ):
+        """
+        Scatter explicit element-local contributions into a full system.
+
+        This mirrors the reduced scatter helper but targets the unreduced
+        matrix/vector containers. It is primarily useful for local operators
+        that want a stable solver-owned scatter utility outside the compiled
+        backend assembly path.
+        """
+        element_ids_arr = np.asarray(element_ids, dtype=int)
+        gdofs_map_arr = np.asarray(gdofs_map, dtype=int)
+        if A_full is not None and K_elem is not None:
+            _scatter_element_contribs(
+                K_elem=np.asarray(K_elem, dtype=float),
+                F_elem=None,
+                J_elem=None,
+                element_ids=element_ids_arr,
+                gdofs_map=gdofs_map_arr,
+                target=A_full,
+                ctx={"rhs": False, "add": bool(add)},
+                integrand=None,
+                hook=hook,
+            )
+        if R_full is not None and F_elem is not None:
+            _scatter_element_contribs(
+                K_elem=None,
+                F_elem=np.asarray(F_elem, dtype=float),
+                J_elem=None,
+                element_ids=element_ids_arr,
+                gdofs_map=gdofs_map_arr,
+                target=R_full,
+                ctx={"rhs": True, "add": bool(add)},
+                integrand=None,
+                hook=hook,
+            )
+        return A_full, R_full
+
+    def _notify_operator_step_begin(
+        self,
+        *,
+        functions,
+        prev_functions,
+        aux_functions,
+        step: int,
+        step_no: int,
+        t: float,
+        dt: float,
+        bcs,
+    ) -> None:
+        if self.operator_manager is None:
+            return
+        self.operator_manager.on_step_begin(
+            solver=self,
+            functions=functions,
+            prev_functions=prev_functions,
+            aux_functions=aux_functions,
+            step=int(step),
+            step_no=int(step_no),
+            t=float(t),
+            dt=float(dt),
+            bcs=bcs,
+        )
+
+    def _notify_operator_step_accept(
+        self,
+        *,
+        functions,
+        prev_functions,
+        aux_functions,
+        step: int,
+        step_no: int,
+        t: float,
+        dt: float,
+        bcs,
+    ) -> None:
+        if self.operator_manager is None:
+            return
+        self.operator_manager.on_step_accept(
+            solver=self,
+            functions=functions,
+            prev_functions=prev_functions,
+            aux_functions=aux_functions,
+            step=int(step),
+            step_no=int(step_no),
+            t=float(t),
+            dt=float(dt),
+            bcs=bcs,
+        )
+
+    def _notify_operator_step_reject(
+        self,
+        *,
+        functions,
+        prev_functions,
+        aux_functions,
+        step: int,
+        step_no: int,
+        t: float,
+        dt: float,
+        bcs,
+        exception,
+        reason: str | None,
+    ) -> None:
+        if self.operator_manager is None:
+            return
+        self.operator_manager.on_step_reject(
+            solver=self,
+            functions=functions,
+            prev_functions=prev_functions,
+            aux_functions=aux_functions,
+            step=int(step),
+            step_no=int(step_no),
+            t=float(t),
+            dt=float(dt),
+            bcs=bcs,
+            exception=exception,
+            reason=None if reason is None else str(reason),
+        )
 
     @staticmethod
     def _field_name_scale_vector(field_names, field_scales: dict[str, float] | None) -> tuple[np.ndarray, dict[str, float]]:
@@ -2824,6 +3238,16 @@ class NewtonSolver:
                 dh.apply_bcs(bcs_now, *functions)
                 if getattr(self, "constraints", None) is not None:
                     self._enforce_constraints_on_functions(functions)
+            self._notify_operator_step_begin(
+                functions=functions,
+                prev_functions=prev_functions,
+                aux_functions=aux_functions,
+                step=int(global_step),
+                step_no=int(global_step_no),
+                t=float(t_n),
+                dt=float(dt),
+                bcs=bcs_now,
+            )
 
             # Newton loop -----------------------------------------
             # Expose step metadata for debug hooks (e.g. step-scoped FD checks).
@@ -2842,6 +3266,19 @@ class NewtonSolver:
                 delta_U, converged, n_iters = self._newton_loop(functions, prev_functions, aux_functions, bcs_now)
             except Exception as e:
                 print(f"    Newton failed at step {global_step_no} with dt={dt:.3e}: {e}")
+                reject_reason = _classify_newton_exception(e)
+                self._notify_operator_step_reject(
+                    functions=functions,
+                    prev_functions=prev_functions,
+                    aux_functions=aux_functions,
+                    step=int(global_step),
+                    step_no=int(global_step_no),
+                    t=float(t_n),
+                    dt=float(dt),
+                    bcs=bcs_now,
+                    exception=e,
+                    reason=reject_reason,
+                )
                 on_fail = getattr(time_params, "on_step_failure", None)
                 if callable(on_fail):
                     try:
@@ -2876,8 +3313,7 @@ class NewtonSolver:
                 if not bool(getattr(time_params, "allow_dt_reduction", False)) or dt_controller is None:
                     raise
                 _require_dt_callback()
-                reason = _classify_newton_exception(e)
-                decision = dt_controller.on_failure(dt=dt, reason=reason)
+                decision = dt_controller.on_failure(dt=dt, reason=reject_reason)
                 # Guard against infinite retry loops when dt hits dt_min (or when
                 # a controller misconfiguration yields a non-decreasing dt).
                 new_dt = float(decision.dt)
@@ -2908,6 +3344,19 @@ class NewtonSolver:
 
             if not converged:
                 # Some solver backends (e.g. SNES) may return the best iterate without raising.
+                reject_exc = RuntimeError("Newton did not converge.")
+                self._notify_operator_step_reject(
+                    functions=functions,
+                    prev_functions=prev_functions,
+                    aux_functions=aux_functions,
+                    step=int(global_step),
+                    step_no=int(global_step_no),
+                    t=float(t_n),
+                    dt=float(dt),
+                    bcs=bcs_now,
+                    exception=reject_exc,
+                    reason="not_converged",
+                )
                 on_fail = getattr(time_params, "on_step_failure", None)
                 if callable(on_fail):
                     try:
@@ -2920,7 +3369,7 @@ class NewtonSolver:
                             local_step_no=int(step + 1),
                             t=float(t_n),
                             dt=float(dt),
-                            exception=RuntimeError("Newton did not converge."),
+                            exception=reject_exc,
                             functions=functions,
                             prev_functions=prev_functions,
                             bcs=bcs_now,
@@ -2987,6 +3436,18 @@ class NewtonSolver:
                         _adjust_max_steps_for_final_time(t_now=t_n, step_now=step, dt_new=float(time_params.dt))
                         print(
                             f"    Rejecting step {global_step_no}; setting Δt → {time_params.dt:.3e} ({decision.reason}) and retrying."
+                        )
+                        self._notify_operator_step_reject(
+                            functions=functions,
+                            prev_functions=prev_functions,
+                            aux_functions=aux_functions,
+                            step=int(global_step),
+                            step_no=int(global_step_no),
+                            t=float(t_n),
+                            dt=float(dt),
+                            bcs=bcs_now,
+                            exception=None,
+                            reason=str(decision.reason),
                         )
                         if abort_on_dt_reduction and float(time_params.dt) < float(dt):
                             raise RuntimeError(
@@ -3106,16 +3567,30 @@ class NewtonSolver:
             post_accept_cb = getattr(self, "post_accept_cb", None)
             if callable(post_accept_cb):
                 post_accept_cb(functions)
+            self._notify_operator_step_accept(
+                functions=functions,
+                prev_functions=prev_functions,
+                aux_functions=aux_functions,
+                step=int(global_step),
+                step_no=int(global_step_no),
+                t=float(t_n),
+                dt=float(dt),
+                bcs=bcs_now,
+            )
+
+            # Re-impose inhomogeneous Dirichlet values on the accepted iterate
+            # before promotion. The reduced Newton path excludes constrained
+            # rows, but trial globalization / runtime operator hooks can still
+            # leave the stored function arrays slightly inconsistent with the
+            # prescribed boundary data.
+            dh.apply_bcs(bcs_now, *functions)
+            if getattr(self, "constraints", None) is not None:
+                self._enforce_constraints_on_functions(functions)
 
             # Accept: promote current → previous
             for f_prev, f in zip(prev_functions, functions):
                 f_prev.nodal_values[:] = f.nodal_values[:]
             prev_delta_inf = delta_inf
-
-            # # Accept: promote current → previous ------------------
-            # dh.apply_bcs(bcs_now, *functions)
-            # for f_prev, f in zip(prev_functions, functions):
-            #     f_prev.nodal_values[:] = f.nodal_values[:]
             # Post time-loop callback
             if self.post_timeloop_cb is not None:
                 self.post_timeloop_cb(functions)
@@ -4107,6 +4582,21 @@ class NewtonSolver:
             if self.post_cb is not None:
                 self.post_cb(funcs)
 
+            try:
+                dx_inf = float(np.linalg.norm(np.asarray(dU_full, dtype=float), ord=np.inf))
+            except Exception:
+                dx_inf = float("nan")
+            self._last_nonlinear_update_inf = float(dx_inf)
+            self._last_nonlinear_update_label = "Δx_newton∞"
+            self._last_nonlinear_accepted = True
+
+            mixed_solution_ok, mixed_solution_reports = _mixed_solution_criteria_report(
+                dh=dh,
+                funcs=funcs,
+                delta_full=dU_full,
+                criteria=getattr(self.np, "mixed_solution_criteria", ()),
+            )
+
             # Reuse the residual computed during line search to detect convergence
             # without a second full assembly on the updated iterate.
             norm_after: float | None = None
@@ -4199,6 +4689,50 @@ class NewtonSolver:
                 self._last_iteration_totals = totals
                 return delta, converged, it + 1
 
+            mixed_solution_residual_ok = True
+            mixed_solution_residual_factor = float(
+                getattr(self.np, "mixed_solution_max_residual_factor", 0.0) or 0.0
+            )
+            mixed_solution_residual_limit = None
+            mixed_solution_residual_value = None
+            if mixed_solution_residual_factor > 0.0:
+                mixed_solution_residual_value = float(norm_after if norm_after is not None else norm_R)
+                mixed_solution_residual_limit = mixed_solution_residual_factor * float(tol_eff)
+                mixed_solution_residual_ok = bool(
+                    np.isfinite(mixed_solution_residual_value)
+                    and np.isfinite(mixed_solution_residual_limit)
+                    and mixed_solution_residual_value <= mixed_solution_residual_limit
+                )
+
+            if mixed_solution_ok and mixed_solution_residual_ok:
+                if int(getattr(self.np, "print_level", 2) or 0) >= 2:
+                    parts = []
+                    for report in mixed_solution_reports:
+                        fields = ",".join(str(v) for v in report["fields"])
+                        parts.append(
+                            f"{fields}: abs={float(report['abs_norm']):.3e} "
+                            f"rel={float(report['rel_norm']):.3e}"
+                        )
+                    joined = "; ".join(parts)
+                    print(
+                        "        Mixed solution criteria satisfied; accepting iterate "
+                        f"({joined})."
+                    )
+                converged = True
+                delta = np.hstack(
+                    [f.nodal_values - f_prev.nodal_values for f, f_prev in zip(funcs, prev_funcs)]
+                )
+                self._last_nonlinear_reason = "mixed_solution_criteria"
+                self._last_iteration_totals = totals
+                return delta, converged, it + 1
+            if mixed_solution_ok and (not mixed_solution_residual_ok):
+                if int(getattr(self.np, "print_level", 2) or 0) >= 2:
+                    print(
+                        "        Mixed solution criteria met, but residual safeguard rejected the iterate "
+                        f"(|R|_∞={float(mixed_solution_residual_value):.3e} > "
+                        f"{float(mixed_solution_residual_limit):.3e})."
+                    )
+
         # If we get here, Newton did not converge within the iteration budget
         accept_factor_raw = os.getenv("PYCUTFEM_NEWTON_MAXITER_ACCEPT_FACTOR", "").strip()
         if accept_factor_raw:
@@ -4243,6 +4777,8 @@ class NewtonSolver:
         Drop decoupled (zero) rows/cols in the reduced system and rebuild the
         reduced pattern. Returns (A_red, R_red, pruned, extra_asm_time).
         """
+        if bool(getattr(self, "_skip_prune_decoupled", False)):
+            return A_red, R_red, False, 0.0
         pruned = False
         extra_asm = 0.0
         trace = os.getenv("PYCUTFEM_PRUNE_TRACE", "").lower() in {"1", "true", "yes"}
@@ -4809,7 +5345,10 @@ class NewtonSolver:
         min_alpha = alpha
         if int(getattr(self.np, "print_level", 2) or 0) >= 2:
             print(f"        Line search failed – taking minimal step α = {min_alpha:.2e}.")
-        if os.getenv("PYCUTFEM_LS_FAIL_HARD", "1").lower() not in {"0", "false", "no"}:
+        ls_fail_hard = bool(getattr(np_, "ls_fail_hard", True))
+        if os.getenv("PYCUTFEM_LS_FAIL_HARD", "").strip():
+            ls_fail_hard = os.getenv("PYCUTFEM_LS_FAIL_HARD", "1").lower() not in {"0", "false", "no"}
+        if ls_fail_hard:
             raise RuntimeError("Line search failed: no residual decrease.")
         self._ls_alpha_prev = min_alpha
         self._ls_last_best_effort = True
@@ -4905,10 +5444,15 @@ class NewtonSolver:
     #  Reduced Linear system & BC handling
     # ------------------------------------------------------------------
     def _assemble_system_reduced(self, coeffs, *, need_matrix: bool = True):
-        if getattr(self, "preassemble_cb", None) is not None:
-            self.preassemble_cb(coeffs)
+        self._before_reduced_assembly(coeffs, need_matrix=need_matrix)
         if self.backend == "python":
-            return self._assemble_system_reduced_python(coeffs, need_matrix=need_matrix)
+            A_red, R_red = self._assemble_system_reduced_python(coeffs, need_matrix=need_matrix)
+            return self._after_reduced_assembly(
+                coeffs,
+                A_red,
+                R_red,
+                need_matrix=need_matrix,
+            )
         self._maybe_refresh_deformation(coeffs)
         nred = len(self.active_dofs)
         if need_matrix:
@@ -4925,7 +5469,12 @@ class NewtonSolver:
                 R_red_fast=R_red,
                 need_matrix=True,
             )
-            return A_red, R_red
+            return self._after_reduced_assembly(
+                coeffs,
+                A_red,
+                R_red,
+                need_matrix=True,
+            )
         else:
             R_red = self._assemble_residual_reduced_fast(coeffs)
             _, R_red = self._apply_mean_value_gauge_to_reduced(
@@ -4940,7 +5489,12 @@ class NewtonSolver:
                 R_red_fast=R_red,
                 need_matrix=False,
             )
-            return None, R_red
+            return self._after_reduced_assembly(
+                coeffs,
+                None,
+                R_red,
+                need_matrix=False,
+            )
 
     def _debug_compare_reduced_backend(
         self,
@@ -6466,7 +7020,10 @@ class NewtonSolver:
                 print(f"        Line search failed, using best-effort α = {best_alpha:.2e} (‖R‖∞ decreased).")
                 return best_alpha * dU
             print("        Line search failed – no decreasing step found; taking α = 0.")
-            if os.getenv("PYCUTFEM_LS_FAIL_HARD", "1").lower() not in {"0", "false", "no"}:
+            ls_fail_hard = bool(getattr(np_, "ls_fail_hard", True))
+            if os.getenv("PYCUTFEM_LS_FAIL_HARD", "").strip():
+                ls_fail_hard = os.getenv("PYCUTFEM_LS_FAIL_HARD", "1").lower() not in {"0", "false", "no"}
+            if ls_fail_hard:
                 raise RuntimeError("Line search failed: no residual decrease.")
             return np.zeros_like(dU)
 
@@ -6815,6 +7372,7 @@ class NewtonSolver:
             self._res_red_maps = None
 
         self._pattern_stale = False
+        self._runtime_reduced_scatter_plan_cache = {}
         if _profile:
             try:
                 print(f"[setup] unique gdofs_maps: {int(len(seen_gdofs_maps))}  plan cache hits: {int(cache_hits)}")
@@ -7069,6 +7627,7 @@ class NewtonSolver:
             self._elem_extra.append(extra_list)
 
         self._pattern_stale = False
+        self._runtime_reduced_scatter_plan_cache = {}
 
 
     def _assemble_system_reduced_fast(self, coeffs):
@@ -7116,6 +7675,8 @@ class NewtonSolver:
                 )
             Kloc, _, _ = ker.exec(coeffs)  # shape [nel, nloc, nloc]
             exec_time = time.perf_counter() - t_exec
+            if not isinstance(Kloc, np.ndarray) or Kloc.size == 0:
+                continue
             if trace_exec:
                 print(
                     f"        [kern] done jacobian dom={getattr(ker,'domain','?')} exec={exec_time:.3e}s",
@@ -7167,13 +7728,37 @@ class NewtonSolver:
                         m = pflat >= 0
                         if not np.any(m):
                             continue
-                        data[pflat[m]] += Kflat[e, m]
+                        try:
+                            data[pflat[m]] += Kflat[e, m]
+                        except IndexError as exc:
+                            retrying = bool(getattr(self, "_reduced_fast_retrying", False))
+                            if retrying:
+                                raise
+                            self._pattern_stale = True
+                            self._reduced_fast_retrying = True
+                            try:
+                                self._build_reduced_pattern()
+                                return self._assemble_system_reduced_fast(coeffs)
+                            finally:
+                                self._reduced_fast_retrying = False
                 else:
                     for e, (pflat, lidx) in enumerate(zip(pos_list, lidx_list)):
                         if pflat.size == 0:
                             continue
                         Kel = Kloc[e][np.ix_(lidx, lidx)].ravel()
-                        data[pflat] += Kel
+                        try:
+                            data[pflat] += Kel
+                        except IndexError as exc:
+                            retrying = bool(getattr(self, "_reduced_fast_retrying", False))
+                            if retrying:
+                                raise
+                            self._pattern_stale = True
+                            self._reduced_fast_retrying = True
+                            try:
+                                self._build_reduced_pattern()
+                                return self._assemble_system_reduced_fast(coeffs)
+                            finally:
+                                self._reduced_fast_retrying = False
             else:
                 # Constraint-aware scatter for entities with hanging-node slaves.
                 for e, (pflat, lidx, meta) in enumerate(zip(pos_list, lidx_list, extra_list)):
@@ -7181,7 +7766,19 @@ class NewtonSolver:
                         continue
                     if meta is None:
                         Kel = Kloc[e][np.ix_(lidx, lidx)].ravel()
-                        data[pflat] += Kel
+                        try:
+                            data[pflat] += Kel
+                        except IndexError as exc:
+                            retrying = bool(getattr(self, "_reduced_fast_retrying", False))
+                            if retrying:
+                                raise
+                            self._pattern_stale = True
+                            self._reduced_fast_retrying = True
+                            try:
+                                self._build_reduced_pattern()
+                                return self._assemble_system_reduced_fast(coeffs)
+                            finally:
+                                self._reduced_fast_retrying = False
                         continue
                     rows_unique, ptr, rep_j, rep_w = meta
                     m = int(rows_unique.size)
@@ -7235,6 +7832,8 @@ class NewtonSolver:
                 )
             _, Floc, _ = ker.exec(coeffs)  # [nel, nloc]
             exec_time = time.perf_counter() - t_exec
+            if not isinstance(Floc, np.ndarray) or Floc.size == 0:
+                continue
             if trace_exec:
                 print(
                     f"        [kern] done residual dom={getattr(ker,'domain','?')} exec={exec_time:.3e}s",
@@ -7288,9 +7887,12 @@ class NewtonSolver:
                 if red_map.shape == getattr(Floc, "shape", None):
                     rm = np.asarray(red_map, dtype=np.int32).ravel()
                     ff = np.asarray(Floc, dtype=float).ravel()
-                    mask = rm >= 0
-                    if np.any(mask):
-                        np.add.at(R, rm[mask], ff[mask])
+                    if ff.size != rm.size or ff.size == 0:
+                        red_map = None
+                    else:
+                        mask = rm >= 0
+                        if np.any(mask):
+                            np.add.at(R, rm[mask], ff[mask])
                 else:
                     red_map = None
             else:
@@ -7300,9 +7902,14 @@ class NewtonSolver:
                 if not isinstance(gdofs, np.ndarray):
                     gdofs = ker.static_args["gdofs_map"]
                 for e in range(gdofs.shape[0]):
+                    if e >= int(getattr(Floc, "shape", (0,))[0]):
+                        continue
                     full = gdofs[e]
                     valid_full = full >= 0
                     if not np.any(valid_full):
+                        continue
+                    frow = np.asarray(Floc[e], dtype=float).reshape(-1)
+                    if frow.size != full.size:
                         continue
                     if not has_constraints:
                         rmap = -np.ones_like(full, dtype=int)
@@ -7311,7 +7918,7 @@ class NewtonSolver:
                         if not np.any(mask):
                             continue
                         rows = rmap[mask]
-                        np.add.at(R, rows, Floc[e][mask])
+                        np.add.at(R, rows, frow[mask])
                     else:
                         full_to_master = getattr(self, "_constr_full_to_master", None)
                         is_slave = getattr(self, "_constr_is_slave", None)
@@ -7326,7 +7933,7 @@ class NewtonSolver:
                             gd_i = int(gd)
                             if gd_i < 0 or gd_i >= int(full_to_master.size):
                                 continue
-                            val = float(Floc[e][int(loc_i)])
+                            val = float(frow[int(loc_i)])
                             if not np.isfinite(val) or val == 0.0:
                                 continue
                             if bool(is_slave[gd_i]):

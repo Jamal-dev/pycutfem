@@ -78,8 +78,10 @@ except ImportError:  # pragma: no cover - platform dependent.
 #   expressions that could still be row/column matrices.
 # - v68 invalidates kernels after routing 2D basis-rank1 contractions,
 #   including scalar-gradient test/trial carriers, through the shared
+# - v69 invalidates kernels after adding runtime quadrature-state loads,
+#   including matrix-valued quadrature-state support in the C++ backend.
 #   mass-style contraction path instead of the stack-only grad-grad helper.
-CODEGEN_ABI_CPP = "2026-04-07-cpp-v68-rank1-basis-contractions"
+CODEGEN_ABI_CPP = "2026-04-14-cpp-v75-matrix-like-vector-dot-normalization"
 
 
 @contextmanager

@@ -4,6 +4,7 @@ import pytest
 from pycutfem.core.mesh import Mesh
 from pycutfem.core.dofhandler import DofHandler
 from pycutfem.fem.mixedelement import MixedElement
+from pycutfem.integration.quadrature import volume as quadrature_volume
 from pycutfem.utils.bitset import BitSet
 from pycutfem.utils.meshgen import structured_quad
 
@@ -11,6 +12,7 @@ from pycutfem.jit.cache import KernelCache
 from pycutfem.jit.ir import LoadConstant, strip_side_metadata
 from pycutfem.jit.visitor import IRGenerator
 from pycutfem.jit import compile_backend
+from pycutfem.state import QuadratureLayout, StateRegistry
 
 from pycutfem.ufl.analytic import Analytic, x as x_ana
 from pycutfem.ufl.expressions import (
@@ -25,6 +27,7 @@ from pycutfem.ufl.expressions import (
     grad,
     inner,
     restrict,
+    trace,
 )
 from pycutfem.jit.kernel_args import _build_jit_kernel_args
 
@@ -256,3 +259,215 @@ def test_analytic_value_change_updates_kernel_inputs_without_recompile(backend, 
 
     factor = 2.5 / 1.5
     assert np.allclose(F2, factor * F1)
+
+
+@pytest.mark.parametrize("backend", ("jit", "cpp"))
+def test_cell_state_value_change_updates_kernel_inputs_without_recompile(backend, monkeypatch, tmp_path):
+    if backend == "cpp":
+        monkeypatch.setenv("PYCUTFEM_JIT_BACKEND", "cpp")
+    else:
+        monkeypatch.delenv("PYCUTFEM_JIT_BACKEND", raising=False)
+    monkeypatch.setenv("PYCUTFEM_CACHE_DIR", str(tmp_path / backend))
+
+    dh, me = _make_dh(nx=1, ny=1, poly_order=1)
+    u = TrialFunction(field_name="u", name="u", dof_handler=dh)
+    v = TestFunction(field_name="u", name="v", dof_handler=dh)
+
+    registry = StateRegistry()
+    field = registry.register_cell(
+        "diffusivity",
+        values=np.full((int(me.mesh.n_elements), 1), 1.5, dtype=float),
+        tensor_shape=(),
+        persistence="step",
+        copy=False,
+    )
+    expr = field.coefficient(jit_name="cell_diffusivity") * inner(grad(u), grad(v))
+
+    runner, ir = compile_backend(expr, dh, me, on_facet=False)
+
+    geom = dh.precompute_geometric_factors(quad_order=2, level_set=lambda *_: 0.0, reuse=False)
+    static_args = dict(geom)
+    static_args["gdofs_map"] = np.vstack(
+        [np.asarray(dh.get_elemental_dofs(eid), dtype=np.int32) for eid in range(me.mesh.n_elements)]
+    ).astype(np.int32)
+    static_args.update(
+        _build_jit_kernel_args(
+            ir,
+            expr,
+            me,
+            2,
+            dof_handler=dh,
+            gdofs_map=static_args["gdofs_map"],
+            param_order=getattr(runner, "param_order", []),
+            pre_built=static_args,
+        )
+    )
+
+    K1, *_ = runner({}, static_args)
+    field.assign(np.full(field.shape, 2.5, dtype=float))
+    K2, *_ = runner({}, static_args)
+
+    factor = 2.5 / 1.5
+    assert np.allclose(K2, factor * K1)
+
+
+@pytest.mark.parametrize("backend", ("jit", "cpp"))
+def test_quadrature_state_value_change_updates_kernel_inputs_without_recompile(backend, monkeypatch, tmp_path):
+    if backend == "cpp":
+        monkeypatch.setenv("PYCUTFEM_JIT_BACKEND", "cpp")
+    else:
+        monkeypatch.delenv("PYCUTFEM_JIT_BACKEND", raising=False)
+    monkeypatch.setenv("PYCUTFEM_CACHE_DIR", str(tmp_path / backend))
+
+    dh, me = _make_dh(nx=1, ny=1, poly_order=1)
+    u = TrialFunction(field_name="u", name="u", dof_handler=dh)
+    v = TestFunction(field_name="u", name="v", dof_handler=dh)
+
+    qp_ref, qw_ref = quadrature_volume("quad", 2)
+    layout = QuadratureLayout(
+        entity_kind="volume_cell",
+        cell_type="quad",
+        quadrature_order=2,
+        reference_points=np.asarray(qp_ref, dtype=float),
+        reference_weights=np.asarray(qw_ref, dtype=float),
+    )
+    registry = StateRegistry()
+    field = registry.register_quadrature(
+        "qp_diffusivity",
+        layout=layout,
+        values=np.full((int(me.mesh.n_elements), int(layout.n_qp)), 1.5, dtype=float),
+        tensor_shape=(),
+        persistence="step",
+        copy=False,
+    )
+    expr = field.coefficient(jit_name="qp_diffusivity") * inner(grad(u), grad(v))
+
+    runner, ir = compile_backend(expr, dh, me, on_facet=False)
+
+    geom = dh.precompute_geometric_factors(quad_order=2, level_set=lambda *_: 0.0, reuse=False)
+    static_args = dict(geom)
+    static_args["gdofs_map"] = np.vstack(
+        [np.asarray(dh.get_elemental_dofs(eid), dtype=np.int32) for eid in range(me.mesh.n_elements)]
+    ).astype(np.int32)
+    static_args.update(
+        _build_jit_kernel_args(
+            ir,
+            expr,
+            me,
+            2,
+            dof_handler=dh,
+            gdofs_map=static_args["gdofs_map"],
+            param_order=getattr(runner, "param_order", []),
+            pre_built=static_args,
+        )
+    )
+
+    K1, *_ = runner({}, static_args)
+    field.assign(np.full(field.shape, 2.5, dtype=float))
+    K2, *_ = runner({}, static_args)
+
+    factor = 2.5 / 1.5
+    assert np.allclose(K2, factor * K1)
+
+
+@pytest.mark.parametrize("backend", ("jit", "cpp"))
+def test_matrix_quadrature_state_value_change_updates_kernel_inputs_without_recompile(backend, monkeypatch, tmp_path):
+    if backend == "cpp":
+        monkeypatch.setenv("PYCUTFEM_JIT_BACKEND", "cpp")
+    else:
+        monkeypatch.delenv("PYCUTFEM_JIT_BACKEND", raising=False)
+    monkeypatch.setenv("PYCUTFEM_CACHE_DIR", str(tmp_path / f"{backend}_matrix"))
+
+    dh, me = _make_dh(nx=1, ny=1, poly_order=1)
+    u = TrialFunction(field_name="u", name="u", dof_handler=dh)
+    v = TestFunction(field_name="u", name="v", dof_handler=dh)
+
+    qp_ref, qw_ref = quadrature_volume("quad", 2)
+    layout = QuadratureLayout(
+        entity_kind="volume_cell",
+        cell_type="quad",
+        quadrature_order=2,
+        reference_points=np.asarray(qp_ref, dtype=float),
+        reference_weights=np.asarray(qw_ref, dtype=float),
+    )
+    registry = StateRegistry()
+    base_tensor = np.zeros((int(me.mesh.n_elements), int(layout.n_qp), 2, 2), dtype=float)
+    base_tensor[..., 0, 0] = 1.5
+    base_tensor[..., 1, 1] = 1.5
+    field = registry.register_quadrature(
+        "qp_tensor",
+        layout=layout,
+        values=base_tensor,
+        tensor_shape=(2, 2),
+        persistence="step",
+        copy=False,
+    )
+    expr = trace(field.coefficient(jit_name="qp_tensor")) * inner(grad(u), grad(v))
+
+    runner, ir = compile_backend(expr, dh, me, on_facet=False)
+
+    geom = dh.precompute_geometric_factors(quad_order=2, level_set=lambda *_: 0.0, reuse=False)
+    static_args = dict(geom)
+    static_args["gdofs_map"] = np.vstack(
+        [np.asarray(dh.get_elemental_dofs(eid), dtype=np.int32) for eid in range(me.mesh.n_elements)]
+    ).astype(np.int32)
+    static_args.update(
+        _build_jit_kernel_args(
+            ir,
+            expr,
+            me,
+            2,
+            dof_handler=dh,
+            gdofs_map=static_args["gdofs_map"],
+            param_order=getattr(runner, "param_order", []),
+            pre_built=static_args,
+        )
+    )
+
+    K1, *_ = runner({}, static_args)
+    updated_tensor = np.zeros_like(base_tensor)
+    updated_tensor[..., 0, 0] = 2.5
+    updated_tensor[..., 1, 1] = 2.5
+    field.assign(updated_tensor)
+    K2, *_ = runner({}, static_args)
+
+    factor = 2.5 / 1.5
+    assert np.allclose(K2, factor * K1)
+
+
+def test_named_constant_with_local_substring_compiles_in_jit(monkeypatch, tmp_path):
+    monkeypatch.delenv("PYCUTFEM_JIT_BACKEND", raising=False)
+    monkeypatch.setenv("PYCUTFEM_CACHE_DIR", str(tmp_path / "jit"))
+
+    dh, me = _make_dh(nx=1, ny=1, poly_order=1)
+    u = TrialFunction(field_name="u", name="u", dof_handler=dh)
+    v = TestFunction(field_name="u", name="v", dof_handler=dh)
+
+    coeff = Constant(1.5)
+    coeff._jit_name = "foo_local_bar"
+    expr = coeff * inner(grad(u), grad(v))
+
+    runner, ir = compile_backend(expr, dh, me, on_facet=False)
+
+    geom = dh.precompute_geometric_factors(quad_order=2, level_set=lambda *_: 0.0, reuse=False)
+    static_args = dict(geom)
+    static_args["gdofs_map"] = np.vstack(
+        [np.asarray(dh.get_elemental_dofs(eid), dtype=np.int32) for eid in range(me.mesh.n_elements)]
+    ).astype(np.int32)
+    static_args.update(
+        _build_jit_kernel_args(
+            ir,
+            expr,
+            me,
+            2,
+            dof_handler=dh,
+            gdofs_map=static_args["gdofs_map"],
+            param_order=getattr(runner, "param_order", []),
+            pre_built=static_args,
+        )
+    )
+
+    K, *_ = runner({}, static_args)
+
+    assert np.all(np.isfinite(K))
+    assert np.max(np.abs(K)) > 0.0

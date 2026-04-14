@@ -249,3 +249,6 @@ examples/biofilms/**/*.pdf
 examples/biofilms/**/*.avi
 examples/biofilms/**/*.png
 examples/biofilms/**/*.jpg
+examples/NIRB/artifacts
+examples/NIRB/**/*.pdf
+examples/NIRB/**/*.tex

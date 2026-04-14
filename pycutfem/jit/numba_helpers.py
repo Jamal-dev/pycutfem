@@ -147,6 +147,55 @@ def contract_first_first(a, b, dtype):
     return dot_flat.reshape(out_shape)
 
 
+@numba.njit(cache=True)
+def contract_component_first_basis(lhs_basis, rhs_basis, dtype):
+    """
+    Contract two component-first basis carriers over their leading component axis.
+
+    Supported combinations:
+      (k, n_test)   · (k, n_trial)   -> (n_test, n_trial)
+      (k, n_test,d) · (k, n_trial)   -> (d, n_test, n_trial)
+      (k, n_test)   · (k, n_trial,d) -> (d, n_test, n_trial)
+      (k, n_test,d) · (k, n_trial,m) -> (d, n_test, n_trial, m)
+    """
+    if DEBUG: print("contract_component_first_basis")
+    if lhs_basis.shape[0] != rhs_basis.shape[0]:
+        raise ValueError("contract_component_first_basis: component dimension mismatch")
+
+    if lhs_basis.ndim == 2 and rhs_basis.ndim == 2:
+        return np.ascontiguousarray(lhs_basis.T) @ np.ascontiguousarray(rhs_basis)
+
+    if lhs_basis.ndim == 3 and rhs_basis.ndim == 2:
+        _, n_test, d_lhs = lhs_basis.shape
+        n_trial = rhs_basis.shape[1]
+        out = np.zeros((d_lhs, n_test, n_trial), dtype=dtype)
+        rhs_c = np.ascontiguousarray(rhs_basis)
+        for r in range(d_lhs):
+            out[r] = np.ascontiguousarray(lhs_basis[:, :, r].T) @ rhs_c
+        return out
+
+    if lhs_basis.ndim == 2 and rhs_basis.ndim == 3:
+        n_test = lhs_basis.shape[1]
+        _, n_trial, d_rhs = rhs_basis.shape
+        out = np.zeros((d_rhs, n_test, n_trial), dtype=dtype)
+        lhs_t = np.ascontiguousarray(lhs_basis.T)
+        for r in range(d_rhs):
+            out[r] = lhs_t @ np.ascontiguousarray(rhs_basis[:, :, r])
+        return out
+
+    if lhs_basis.ndim == 3 and rhs_basis.ndim == 3:
+        _, n_test, d_lhs = lhs_basis.shape
+        _, n_trial, d_rhs = rhs_basis.shape
+        out = np.zeros((d_lhs, n_test, n_trial, d_rhs), dtype=dtype)
+        for rl in range(d_lhs):
+            lhs_t = np.ascontiguousarray(lhs_basis[:, :, rl].T)
+            for rr in range(d_rhs):
+                out[rl, :, :, rr] = lhs_t @ np.ascontiguousarray(rhs_basis[:, :, rr])
+        return out
+
+    raise ValueError("contract_component_first_basis: unsupported carrier ranks")
+
+
 
 @numba.njit(cache=True)
 def dot_mixed_const(a, b, dtype):
@@ -206,6 +255,8 @@ def dot_vec_grad_components(vec_basis, grad_basis, swap_roles, dtype):
     trial side.
     """
     if DEBUG: print("dot_vec_grad_components")
+    if vec_basis.ndim != 2:
+        raise ValueError("dot_vec_grad_components expects a rank-2 basis vector carrier (k,n)")
     if grad_basis.ndim == 2:
         if vec_basis.shape[0] != grad_basis.shape[0]:
             raise ValueError("dot_vec_grad_components: scalar-gradient component mismatch")
@@ -1087,6 +1138,26 @@ def matrix_times_scalar_basis(matrix_vals, scalar_basis, dtype):
 
 
 @numba.njit(cache=True)
+def value_matrix_times_scalar_basis_tensor(matrix_vals, scalar_basis, dtype):
+    """
+    Matrix value (k, d) times scalar basis (n,) or (1, n) -> carried tensor (k, n, d).
+    """
+    if DEBUG: print("value_matrix_times_scalar_basis_tensor")
+    if scalar_basis.ndim == 2:
+        phi = scalar_basis[0]
+    else:
+        phi = scalar_basis
+    k_dim, d_dim = matrix_vals.shape
+    out = np.zeros((k_dim, phi.shape[0], d_dim), dtype=dtype)
+    for i in range(k_dim):
+        for r in range(phi.shape[0]):
+            coeff = phi[r]
+            for j in range(d_dim):
+                out[i, r, j] = matrix_vals[i, j] * coeff
+    return out
+
+
+@numba.njit(cache=True)
 def scalar_vector_outer_product(scalar_vals, vector_vals, dtype):
     """
     Scalar values (n,) times vector (k,) -> (k,n).
@@ -1129,6 +1200,78 @@ def vector_vector_outer_product(vec_a, vec_b, dtype):
     """
     if DEBUG: print("vector_vector_outer_product")
     return np.ascontiguousarray(vec_a)[:, None] * np.ascontiguousarray(vec_b)[None, :]
+
+
+@numba.njit(cache=True)
+def value_vector_outer_basis_vector(value_vec, basis_vec, dtype):
+    """
+    Value/const vector (k,) ⊗ basis vector (d,n) -> carried tensor (k,n,d).
+    """
+    if DEBUG: print("value_vector_outer_basis_vector")
+    return (
+        np.ascontiguousarray(value_vec)[:, None, None]
+        * np.ascontiguousarray(basis_vec).T[None, :, :]
+    )
+
+
+@numba.njit(cache=True)
+def basis_vector_outer_value_vector(basis_vec, value_vec, dtype):
+    """
+    Basis vector (k,n) ⊗ value/const vector (d,) -> carried tensor (k,n,d).
+    """
+    if DEBUG: print("basis_vector_outer_value_vector")
+    return (
+        np.ascontiguousarray(basis_vec)[:, :, None]
+        * np.ascontiguousarray(value_vec)[None, None, :]
+    )
+
+
+@numba.njit(cache=True)
+def basis_vector_outer_basis_vector(lhs_basis, rhs_basis, lhs_is_test, dtype):
+    """
+    Basis vector ⊗ basis vector -> mixed carried tensor (k_lhs,n_test,n_trial,k_rhs).
+    """
+    if DEBUG: print("basis_vector_outer_basis_vector")
+    if lhs_is_test:
+        return (
+            np.ascontiguousarray(lhs_basis)[:, :, None, None]
+            * np.ascontiguousarray(rhs_basis).T[None, None, :, :]
+        )
+    return (
+        np.ascontiguousarray(lhs_basis)[:, None, :, None]
+        * np.ascontiguousarray(rhs_basis).T[None, :, None, :]
+    )
+
+
+@numba.njit(cache=True)
+def left_dot_mixed_tensor_with_vec(mixed_tensor, vec, dtype):
+    """
+    Left contraction of a mixed rank-2 tensor (k,n_test,n_trial,d) with a
+    spatial vector (k,) -> carried mixed rank-1 tensor (d,n_test,n_trial).
+    """
+    if DEBUG: print("left_dot_mixed_tensor_with_vec")
+    if vec.ndim == 2:
+        if vec.shape[0] == 1 or vec.shape[1] == 1:
+            vec_flat = np.ascontiguousarray(vec).reshape(vec.size)
+        else:
+            raise ValueError("left_dot_mixed_tensor_with_vec: vector operand must be 1D or row/column matrix")
+    elif vec.ndim == 1:
+        vec_flat = np.ascontiguousarray(vec)
+    else:
+        raise ValueError("left_dot_mixed_tensor_with_vec: vector operand must be 1D or row/column matrix")
+
+    if mixed_tensor.shape[0] != vec_flat.shape[0]:
+        raise ValueError("left_dot_mixed_tensor_with_vec: leading component dimension mismatch")
+
+    out = np.zeros(
+        (mixed_tensor.shape[3], mixed_tensor.shape[1], mixed_tensor.shape[2]),
+        dtype=dtype,
+    )
+    for s in range(mixed_tensor.shape[0]):
+        coeff = vec_flat[s]
+        for d in range(mixed_tensor.shape[3]):
+            out[d] += mixed_tensor[s, :, :, d] * coeff
+    return out
 
 
 
@@ -1387,6 +1530,19 @@ def inner_rank2_value_rank2_basis(value_rank2, basis_rank2, dtype):
 def inner_rank2_basis_rank2_value(basis_rank2, value_rank2, dtype):
     if DEBUG: print("inner_rank2_basis_rank2_value")
     return inner_rank2_value_rank2_basis(value_rank2, basis_rank2, dtype)
+
+
+@numba.njit(cache=True)
+def inner_full_contraction(lhs, rhs, dtype):
+    """
+    Full Frobenius contraction for equal-shape value tensors.
+    """
+    if DEBUG: print("inner_full_contraction")
+    lhs_c = np.ascontiguousarray(lhs)
+    rhs_c = np.ascontiguousarray(rhs)
+    if lhs_c.shape != rhs_c.shape:
+        raise ValueError("inner_full_contraction: shape mismatch")
+    return float(np.sum(lhs_c * rhs_c))
 
 
 @numba.njit(cache=True)
@@ -1728,6 +1884,11 @@ for _helper_name in (
     "vector_trial_times_scalar_test",
     "vector_test_times_scalar_trial",
     "vector_vector_outer_product",
+    "value_vector_outer_basis_vector",
+    "basis_vector_outer_value_vector",
+    "basis_vector_outer_basis_vector",
+    "left_dot_mixed_tensor_with_vec",
+    "contract_component_first_basis",
     "scalar_basis_times_vector",
     "scalar_trial_times_grad_test",
     "grad_trial_times_scalar_test",
@@ -1739,6 +1900,8 @@ for _helper_name in (
     "transpose_hessian_tensor",
     "transpose_matrix",
     "mul_scalar",
+    "inner_full_contraction",
+    "value_matrix_times_scalar_basis_tensor",
     "dot_grad_basis_vector",
     "vector_dot_grad_basis",
     "vector_dot_grad_value",

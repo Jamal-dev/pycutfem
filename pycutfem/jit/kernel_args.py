@@ -228,6 +228,7 @@ def _build_jit_kernel_args(       # ← signature unchanged
     from pycutfem.ufl.expressions import (
         Function, VectorFunction, Constant as UflConst, Grad, ElementWiseConstant
     )
+    from pycutfem.state.coefficient import QuadratureStateCoefficient
     from pycutfem.jit.ir import LoadVariable, LoadConstantArray
     from pycutfem.ufl.analytic import Analytic
     from pycutfem.ufl.helpers import _find_all
@@ -1450,6 +1451,35 @@ def _build_jit_kernel_args(       # ← signature unchanged
     # ------------------------------------------------------------------
     const_arrays: dict[str, UflConst] = dict(param_map.const_by_name)
     ewc_arrays: dict[str, ElementWiseConstant] = dict(param_map.ewc_by_name)
+    qstate_arrays: dict[str, QuadratureStateCoefficient] = dict(param_map.qstate_by_name)
+
+    def _validate_qstate_layout(qstate: QuadratureStateCoefficient, name: str) -> None:
+        if pre_built is None:
+            raise ValueError(
+                f"QuadratureStateCoefficient '{name}' requires standard volume precomputed quadrature data."
+            )
+        entity_kind = str(pre_built.get("entity_kind", "") or "")
+        if entity_kind and entity_kind != "element":
+            raise NotImplementedError(
+                f"QuadratureStateCoefficient '{name}' is only supported on standard volume elements in phase 1; "
+                f"got entity_kind={entity_kind!r}."
+            )
+        qref_raw = _first_present(pre_built, "qp_ref", "qref")
+        if qref_raw is None:
+            raise ValueError(
+                f"QuadratureStateCoefficient '{name}' requires 'qp_ref' or 'qref' in pre_built."
+            )
+        ref_points = np.asarray(qref_raw, dtype=np.float64)
+        if ref_points.ndim == 3:
+            raise NotImplementedError(
+                f"QuadratureStateCoefficient '{name}' is not yet supported with per-element/ragged quadrature."
+            )
+        _, ref_weights = volume(mixed_element.mesh.element_type, q_order)
+        qstate.layout.validate_against(
+            reference_points=ref_points,
+            reference_weights=np.asarray(ref_weights, dtype=np.float64),
+            context=f"_build_jit_kernel_args[{name}]",
+        )
 
     # cache gdofs_map for coefficient gathering
     if gdofs_map is None:
@@ -1800,6 +1830,16 @@ def _build_jit_kernel_args(       # ← signature unchanged
                 np.asarray(ewc.values, dtype=np.float64), what=f"EWC {name}"
             )
             args[name] = arr
+
+        # ---- quadrature-state coefficients ------------------------------
+        elif name in qstate_arrays:
+            qstate = qstate_arrays[name]
+            _validate_qstate_layout(qstate, name)
+            arr = _expand_subset_to_full(
+                np.asarray(qstate.values, dtype=np.float64),
+                what=f"QuadratureState {name}",
+            )
+            args[name] = np.ascontiguousarray(arr)
 
         # ---- analytic expressions ----------------------------------------
         elif name.startswith("ana_"):

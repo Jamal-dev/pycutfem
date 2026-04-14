@@ -23,6 +23,18 @@ from examples.fsi_dealii_reference import tag_fluid_solid_interface_edges as _ta
 from .double_flap_reference import DoubleFlapReference, load_double_flap_reference
 
 
+def _named_constant(name: str, value, *, dim: int | None = None) -> Constant:
+    const = value if isinstance(value, Constant) else Constant(value, dim=dim)
+    setattr(const, "_jit_name", str(name))
+    return const
+
+
+_EX2_HALF = _named_constant("example2_half", 0.5)
+_EX2_ONE = _named_constant("example2_one", 1.0)
+_EX2_TWO = _named_constant("example2_two", 2.0)
+_EX2_TWO_THIRDS = _named_constant("example2_two_thirds", 2.0 / 3.0)
+
+
 @dataclass(frozen=True)
 class DoubleFlapGeometry:
     channel_length: float
@@ -389,31 +401,31 @@ def build_conforming_mesh(
 
 
 def _neo_hookean_pk1(F, mu_s: Constant, lambda_s: Constant):
-    c10 = Constant(0.5) * mu_s
-    kappa = lambda_s + Constant(2.0 / 3.0) * mu_s
+    c10 = _EX2_HALF * mu_s
+    kappa = lambda_s + _EX2_TWO_THIRDS * mu_s
     I2 = Identity(2)
     C = dot(F.T, F)
     A = inv(C)
     I1 = trace(C)
     J = det(F)
-    S_iso = (Constant(2.0) * c10 / J) * (I2 - Constant(0.5) * I1 * A)
-    p = kappa * (J - Constant(1.0))
+    S_iso = (_EX2_TWO * c10 / J) * (I2 - _EX2_HALF * I1 * A)
+    p = kappa * (J - _EX2_ONE)
     S_vol = J * p * A
     S = S_iso + S_vol
     return dot(F, S)
 
 
 def _neo_hookean_delta_pk1(F, grad_dd, mu_s: Constant, lambda_s: Constant):
-    c10 = Constant(0.5) * mu_s
-    kappa = lambda_s + Constant(2.0 / 3.0) * mu_s
+    c10 = _EX2_HALF * mu_s
+    kappa = lambda_s + _EX2_TWO_THIRDS * mu_s
     I2 = Identity(2)
     C = dot(F.T, F)
     A = inv(C)
     I1 = trace(C)
     J = det(F)
 
-    S_iso = (Constant(2.0) * c10 / J) * (I2 - Constant(0.5) * I1 * A)
-    p = kappa * (J - Constant(1.0))
+    S_iso = (_EX2_TWO * c10 / J) * (I2 - _EX2_HALF * I1 * A)
+    p = kappa * (J - _EX2_ONE)
     S_vol = J * p * A
     S = S_iso + S_vol
 
@@ -421,16 +433,16 @@ def _neo_hookean_delta_pk1(F, grad_dd, mu_s: Constant, lambda_s: Constant):
     tr_delta_C = trace(delta_C)
     tr_A_delta_C = trace(dot(A, delta_C))
 
-    mu2 = Constant(2.0) * c10
-    term_I = I2 - Constant(0.5) * I1 * A
+    mu2 = _EX2_TWO * c10
+    term_I = I2 - _EX2_HALF * I1 * A
     delta_S_iso = (
-        -(mu2 / (Constant(2.0) * J)) * tr_A_delta_C * term_I
-        + (mu2 / J) * (-Constant(0.5) * tr_delta_C * A + Constant(0.5) * I1 * dot(dot(A, delta_C), A))
+        -(mu2 / (_EX2_TWO * J)) * tr_A_delta_C * term_I
+        + (mu2 / J) * (-_EX2_HALF * tr_delta_C * A + _EX2_HALF * I1 * dot(dot(A, delta_C), A))
     )
 
-    alpha = kappa * J * (J - Constant(1.0))
+    alpha = kappa * J * (J - _EX2_ONE)
     delta_S_vol = (
-        Constant(0.5) * kappa * J * (Constant(2.0) * J - Constant(1.0)) * tr_A_delta_C * A
+        _EX2_HALF * kappa * J * (_EX2_TWO * J - _EX2_ONE) * tr_A_delta_C * A
         - alpha * dot(dot(A, delta_C), A)
     )
     delta_S = delta_S_iso + delta_S_vol
@@ -467,6 +479,18 @@ def build_jac(
     quad_order: int = 4,
 ):
     del p_prev, stab_eps
+
+    timestep = _named_constant("example2_dt", timestep)
+    theta = _named_constant("example2_theta", theta)
+    rho_f = _named_constant("example2_rho_f", rho_f)
+    if isinstance(mu_f, Constant):
+        mu_f = _named_constant("example2_mu_f", mu_f)
+    rho_s = _named_constant("example2_rho_s", rho_s)
+    lambda_s = _named_constant("example2_lambda_s", lambda_s)
+    mu_s = _named_constant("example2_mu_s", mu_s)
+    alpha_u = _named_constant("example2_alpha_u", alpha_u)
+    if p_gauge is not None:
+        p_gauge = _named_constant("example2_p_gauge", p_gauge)
 
     dx_f = dx(defined_on=fluid_bs, metadata={"q": quad_order})
     dx_s = dx(defined_on=solid_bs, metadata={"q": quad_order})
@@ -619,6 +643,18 @@ def build_residual(
 ):
     del p_prev, stab_eps
 
+    dt = _named_constant("example2_dt", dt)
+    theta = _named_constant("example2_theta", theta)
+    rho_f = _named_constant("example2_rho_f", rho_f)
+    if isinstance(mu_f, Constant):
+        mu_f = _named_constant("example2_mu_f", mu_f)
+    rho_s = _named_constant("example2_rho_s", rho_s)
+    lambda_s = _named_constant("example2_lambda_s", lambda_s)
+    mu_s = _named_constant("example2_mu_s", mu_s)
+    alpha_u = _named_constant("example2_alpha_u", alpha_u)
+    if p_gauge is not None:
+        p_gauge = _named_constant("example2_p_gauge", p_gauge)
+
     dx_f = dx(defined_on=fluid_bs, metadata={"q": quad_order})
     dx_s = dx(defined_on=solid_bs, metadata={"q": quad_order})
     dS_outlet = dS(defined_on=outlet_bs, metadata={"q": quad_order})
@@ -635,7 +671,7 @@ def build_residual(
     Finv_old = ALE_Helpers.get_F_inv(F_old)
     J_old = ALE_Helpers.get_J(F_old)
     pI = pk * Identity(2)
-    J_theta = theta * J + (1.0 - theta) * J_old
+    J_theta = theta * J + (_EX2_ONE - theta) * J_old
 
     acc_term = rho_f * J_theta * inner(uk - u_prev, v_test)
     convection_fluid = rho_f * J * dot(dot(grad_v, Finv), uk)
@@ -644,7 +680,7 @@ def build_residual(
     old_convection_fluid = rho_f * J_old * dot(dot(grad_v_old, Finv_old), u_prev)
     convec_term = (
         dt * theta * dot(convection_fluid, v_test)
-        + dt * (1.0 - theta) * dot(old_convection_fluid, v_test)
+        + dt * (_EX2_ONE - theta) * dot(old_convection_fluid, v_test)
         - dot(convection_fluid_with_u - convection_fluid_with_u_old, v_test)
     )
     pressure_term = dt * inner(-(J * dot(pI, Finv.T)), grad(v_test))
@@ -654,7 +690,7 @@ def build_residual(
     stress_fluid_viscous = J * dot(sigma_ALE, Finv.T)
     stress_fluid_viscous_old = J_old * dot(sigma_ALE_old, Finv_old.T)
     stress_term = dt * theta * inner(stress_fluid_viscous, grad(v_test))
-    stress_term += dt * (1.0 - theta) * inner(stress_fluid_viscous_old, grad(v_test))
+    stress_term += dt * (_EX2_ONE - theta) * inner(stress_fluid_viscous_old, grad(v_test))
 
     biharmonic_term = alpha_u / J * inner(grad(dk), grad(w_test))
     incompressibility_term = NSE_ALE.get_Incompressibility_ALE(uk, F) * q_test
@@ -676,7 +712,7 @@ def build_residual(
     stress_fluid_transpose_old = J_old * dot(sigma_ALE_tilde_old, Finv_old.T)
     out_flow = (
         -dt * theta * dot(dot(stress_fluid_transpose, n), v_test)
-        - dt * (1.0 - theta) * dot(dot(stress_fluid_transpose_old, n), v_test)
+        - dt * (_EX2_ONE - theta) * dot(dot(stress_fluid_transpose_old, n), v_test)
     )
     residual_outlet = out_flow * dS_outlet
 
@@ -685,10 +721,10 @@ def build_residual(
     residual_solid = (
         rho_s * inner(uk - u_prev, v_test)
         + dt * theta * inner(P_solid, grad(v_test))
-        + dt * (1.0 - theta) * inner(P_solid_old, grad(v_test))
+        + dt * (_EX2_ONE - theta) * inner(P_solid_old, grad(v_test))
         + rho_s * inner(dk - d_prev, w_test)
         - rho_s * dt * theta * inner(uk, w_test)
-        - rho_s * dt * (1.0 - theta) * inner(u_prev, w_test)
+        - rho_s * dt * (_EX2_ONE - theta) * inner(u_prev, w_test)
         + pk * q_test
     ) * dx_s
     if p_gauge is not None:

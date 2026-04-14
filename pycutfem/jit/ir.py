@@ -27,6 +27,13 @@ class LoadElementWiseConstant:
     name: str          # An identifier for the data array
     tensor_shape: tuple[int, ...] = field(default=())
 
+
+@dataclass(frozen=True, slots=True)
+class LoadQuadratureState:
+    """Instruction to load a value from a per-element, per-quadrature data array."""
+    name: str
+    tensor_shape: tuple[int, ...] = field(default=())
+
 @dataclass(frozen=True, slots=True)
 class LoadAnalytic:
     """Instruction to evaluate an analytic Python function."""

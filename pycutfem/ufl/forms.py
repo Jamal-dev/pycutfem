@@ -1,5 +1,6 @@
+from dataclasses import dataclass
 from pycutfem.ufl.expressions import Expression, Integral, Sum, Sub, Prod, Constant
-from typing import Callable, List, Dict
+from typing import Callable, List, Dict, Sequence, Any
 import numbers
 
 class Form(Expression):
@@ -111,6 +112,60 @@ class Equation:
         # Allow a side to be None, otherwise ensure it's a Form object.
         self.a = self._valid_form(a)
         self.L = self._valid_form(L)
+
+
+@dataclass(frozen=True)
+class CondensedQuadratureLocalSystem:
+    """
+    Compiler-level description of a local system with quadrature-local hidden
+    state eliminated through a Schur complement.
+
+    The base FE system is assembled from `base_form_or_equation`. The hidden
+    state is local to quadrature points and described by:
+
+    - `coupling_left[a]`   : local FE row block C_a(x_q)
+    - `coupling_right[a]`  : local FE column block B_a(x_q)
+    - `hidden_jacobian[a][b]` : local hidden-state Jacobian G_ab(x_q)
+    - `hidden_residual[a]` : local hidden-state residual r_a(x_q)
+
+    The compiler assembles the condensed local correction
+
+        K_hat = K_base + sign * sum_q C^T G^{-1} B
+        F_hat = F_base + sign * sum_q C^T G^{-1} r
+
+    where `sign=-1.0` recovers the usual Schur-complement elimination.
+
+    Notes
+    -----
+    - The hidden-state dimension is given by `len(hidden_residual)`.
+    - Each coupling entry must be a scalar UFL expression whose pointwise
+      evaluation yields one local FE vector.
+    - The hidden Jacobian/residual entries must be coefficient-only scalar UFL
+      expressions evaluated at the supplied quadrature layout.
+    """
+
+    base_form_or_equation: Any
+    coupling_left: Sequence[Expression]
+    coupling_right: Sequence[Expression]
+    hidden_jacobian: Sequence[Sequence[Expression]]
+    hidden_residual: Sequence[Expression]
+    quadrature_layout: Any
+    sign: float = -1.0
+
+    def __post_init__(self) -> None:
+        n_hidden = int(len(tuple(self.hidden_residual)))
+        if n_hidden <= 0:
+            raise ValueError("CondensedQuadratureLocalSystem requires at least one hidden-state residual entry.")
+        if int(len(tuple(self.coupling_left))) != n_hidden:
+            raise ValueError("coupling_left must have the same length as hidden_residual.")
+        if int(len(tuple(self.coupling_right))) != n_hidden:
+            raise ValueError("coupling_right must have the same length as hidden_residual.")
+        rows = tuple(tuple(row) for row in self.hidden_jacobian)
+        if int(len(rows)) != n_hidden:
+            raise ValueError("hidden_jacobian must be square with side length len(hidden_residual).")
+        for row in rows:
+            if int(len(row)) != n_hidden:
+                raise ValueError("hidden_jacobian must be square with side length len(hidden_residual).")
 
 class BoundaryCondition:
     def __init__(self, field: str, method: str, domain_tag: str, value: Callable):

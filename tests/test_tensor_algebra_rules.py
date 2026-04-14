@@ -22,6 +22,19 @@ from pycutfem.ufl.tensor_algebra import (
 )
 
 
+def _stack_item_from_value_spec(var_name: str, spec) -> SimpleNamespace:
+    return SimpleNamespace(
+        var_name=var_name,
+        role=spec.role,
+        shape=spec.shape,
+        is_vector=spec.is_vector,
+        is_gradient=spec.is_gradient,
+        is_hessian=spec.is_hessian,
+        layout_tag=spec.layout.value,
+        expression_meta=spec.meta,
+    )
+
+
 def test_infer_signature_for_scalar_gradient_basis_is_spatial_vector_basis():
     grad_trial = GradOpInfo(np.zeros((2, 3), dtype=float), role="trial", is_rhs=False)
 
@@ -148,6 +161,131 @@ def test_dot_kernel_plan_preserves_gradient_semantics_from_provenance_across_cha
     assert kernel_plan.case == DotKernelCase.BASIS_GRAD_DOT_BASIS_VECTOR
 
 
+def test_dot_kernel_plan_treats_transported_basis_rank2_as_basis_gradient_against_basis_vector():
+    transported_basis_tensor = SimpleNamespace(
+        var_name="Fg_test_rank2",
+        role="test",
+        shape=(2, 5, 2),
+        is_gradient=False,
+        is_vector=False,
+        is_hessian=False,
+        expression_meta=ExpressionMeta(
+            tensor=TensorSignature(
+                free_axes=(
+                    TensorAxis(AxisSpace.PHYSICAL, AxisLabel.COMPONENT, 2),
+                    TensorAxis(AxisSpace.PHYSICAL, AxisLabel.COL, 2),
+                ),
+                basis_axes=(BasisLabel.TEST,),
+                storage_kind="dot_result",
+                raw_shape=(2, 5, 2),
+                role="test",
+                source="dot",
+            ),
+            provenance=ProvenanceSignature(
+                (
+                    FieldSource("u", ("ux", "uy"), ProvenanceKind.FIELD_COMPONENTS, 0, "test", "dot"),
+                    FieldSource("u", ("ux", "uy"), ProvenanceKind.DERIVATIVE_CHANNELS, 1, "test", "dot"),
+                )
+            ),
+        ),
+    )
+    vec_trial = VecOpInfo(np.zeros((2, 7), dtype=float), role="trial", is_rhs=False)
+
+    kernel_plan = TensorRuleEngine.plan_dot_kernel(transported_basis_tensor, vec_trial)
+
+    assert kernel_plan.case == DotKernelCase.BASIS_GRAD_DOT_BASIS_VECTOR
+
+
+def test_dot_kernel_plan_treats_basis_vector_against_transported_basis_rank2_as_basis_gradient():
+    vec_test = VecOpInfo(np.zeros((2, 5), dtype=float), role="test", is_rhs=False)
+    transported_basis_tensor = SimpleNamespace(
+        var_name="Fg_trial_rank2",
+        role="trial",
+        shape=(2, 7, 2),
+        is_gradient=False,
+        is_vector=False,
+        is_hessian=False,
+        expression_meta=ExpressionMeta(
+            tensor=TensorSignature(
+                free_axes=(
+                    TensorAxis(AxisSpace.PHYSICAL, AxisLabel.ROW, 2),
+                    TensorAxis(AxisSpace.PHYSICAL, AxisLabel.COL, 2),
+                ),
+                basis_axes=(BasisLabel.TRIAL,),
+                storage_kind="dot_result",
+                raw_shape=(2, 7, 2),
+                role="trial",
+                source="dot",
+            ),
+            provenance=ProvenanceSignature(
+                (
+                    FieldSource("u", ("ux", "uy"), ProvenanceKind.FIELD_COMPONENTS, 0, "trial", "dot"),
+                    FieldSource("u", ("ux", "uy"), ProvenanceKind.DERIVATIVE_CHANNELS, 1, "trial", "dot"),
+                )
+            ),
+        ),
+    )
+
+    kernel_plan = TensorRuleEngine.plan_dot_kernel(vec_test, transported_basis_tensor)
+
+    assert kernel_plan.case == DotKernelCase.BASIS_VECTOR_DOT_BASIS_GRAD
+
+
+def test_inner_value_spec_for_rank2_value_tensors_is_scalar():
+    lhs = SimpleNamespace(
+        var_name="Fk",
+        role="value",
+        shape=(2, 2),
+        is_gradient=False,
+        is_vector=False,
+        is_hessian=False,
+        expression_meta=ExpressionMeta(
+            tensor=TensorSignature(
+                free_axes=(
+                    TensorAxis(AxisSpace.PHYSICAL, AxisLabel.ROW, 2),
+                    TensorAxis(AxisSpace.PHYSICAL, AxisLabel.COL, 2),
+                ),
+                basis_axes=(),
+                storage_kind="dot_result",
+                raw_shape=(2, 2),
+                role="value",
+                source="synthetic",
+            ),
+            provenance=ProvenanceSignature(()),
+        ),
+    )
+    rhs = SimpleNamespace(
+        var_name="Finv",
+        role="value",
+        shape=(2, 2),
+        is_gradient=False,
+        is_vector=False,
+        is_hessian=False,
+        expression_meta=ExpressionMeta(
+            tensor=TensorSignature(
+                free_axes=(
+                    TensorAxis(AxisSpace.PHYSICAL, AxisLabel.ROW, 2),
+                    TensorAxis(AxisSpace.PHYSICAL, AxisLabel.COL, 2),
+                ),
+                basis_axes=(),
+                storage_kind="dot_result",
+                raw_shape=(2, 2),
+                role="value",
+                source="synthetic",
+            ),
+            provenance=ProvenanceSignature(()),
+        ),
+    )
+
+    plan = TensorRuleEngine.plan_inner(lhs, rhs)
+    value_spec = TensorRuleEngine.plan_inner_value_spec(lhs, rhs)
+
+    assert plan.kind == OperationKind.INNER_FULL
+    assert plan.result.tensor.tensor_rank == 0
+    assert value_spec.kind == "scalar"
+    assert value_spec.shape == ()
+
+
 def test_product_lowering_storage_for_scalar_basis_times_gradient_value_is_exact():
     scalar_trial = VecOpInfo(np.zeros((1, 6), dtype=float), role="trial", is_rhs=False)
     grad_value = GradOpInfo(np.array([[0.5, -0.25]], dtype=float), role="function", is_rhs=False)
@@ -202,6 +340,120 @@ def test_product_plan_for_vector_times_vector_is_dyad():
     assert plan.result.tensor_rank == 2
     assert [axis.label for axis in plan.result.free_axes] == [AxisLabel.COMPONENT, AxisLabel.COMPONENT]
     assert [axis.size for axis in plan.result.free_axes] == [2, 2]
+
+
+def test_dot_plan_for_value_trial_dyad_with_right_vector_keeps_trial_component_axis():
+    value_vec = VecOpInfo(np.array([1.0, -2.0], dtype=float), role="value", is_rhs=False)
+    trial_vec = VecOpInfo(np.zeros((2, 5), dtype=float), role="trial", is_rhs=False)
+    rhs_vec = VecOpInfo(np.array([0.25, 0.75], dtype=float), role="const", is_rhs=False)
+
+    dyad_item = _stack_item_from_value_spec(
+        "value_trial_dyad",
+        TensorRuleEngine.plan_product_value_spec(value_vec, trial_vec),
+    )
+
+    plan = TensorRuleEngine.plan_dot(dyad_item, rhs_vec)
+    lowering = TensorRuleEngine.plan_dot_lowering(dyad_item, rhs_vec)
+
+    assert plan.kind == OperationKind.DOT_TENSOR_TENSOR
+    assert plan.result.role == "trial"
+    assert plan.result.basis_axes == (BasisLabel.TRIAL,)
+    assert [axis.label for axis in plan.result.free_axes] == [AxisLabel.COMPONENT]
+    assert lowering.result_storage.stored_shape == (2, 5)
+
+
+def test_dot_plan_for_test_trial_dyad_with_right_vector_returns_mixed_rank1():
+    test_vec = VecOpInfo(np.zeros((2, 7), dtype=float), role="test", is_rhs=False)
+    trial_vec = VecOpInfo(np.zeros((2, 5), dtype=float), role="trial", is_rhs=False)
+    rhs_vec = VecOpInfo(np.array([0.25, 0.75], dtype=float), role="const", is_rhs=False)
+
+    dyad_item = _stack_item_from_value_spec(
+        "test_trial_dyad",
+        TensorRuleEngine.plan_product_value_spec(test_vec, trial_vec),
+    )
+
+    plan = TensorRuleEngine.plan_dot(dyad_item, rhs_vec)
+    lowering = TensorRuleEngine.plan_dot_lowering(dyad_item, rhs_vec)
+
+    assert plan.kind == OperationKind.DOT_TENSOR_TENSOR
+    assert plan.result.role == "mixed"
+    assert plan.result.basis_axes == (BasisLabel.TEST, BasisLabel.TRIAL)
+    assert [axis.label for axis in plan.result.free_axes] == [AxisLabel.COMPONENT]
+    assert lowering.result_storage.stored_shape == (2, 7, 5)
+
+
+def test_dot_plan_for_left_vector_with_test_trial_dyad_returns_mixed_rank1():
+    lhs_vec = VecOpInfo(np.array([1.0, -2.0], dtype=float), role="const", is_rhs=False)
+    test_vec = VecOpInfo(np.zeros((2, 7), dtype=float), role="test", is_rhs=False)
+    trial_vec = VecOpInfo(np.zeros((2, 5), dtype=float), role="trial", is_rhs=False)
+
+    dyad_item = _stack_item_from_value_spec(
+        "test_trial_dyad",
+        TensorRuleEngine.plan_product_value_spec(test_vec, trial_vec),
+    )
+
+    plan = TensorRuleEngine.plan_dot(lhs_vec, dyad_item)
+    lowering = TensorRuleEngine.plan_dot_lowering(lhs_vec, dyad_item)
+
+    assert plan.kind == OperationKind.DOT_TENSOR_TENSOR
+    assert plan.result.role == "mixed"
+    assert plan.result.basis_axes == (BasisLabel.TEST, BasisLabel.TRIAL)
+    assert [axis.label for axis in plan.result.free_axes] == [AxisLabel.COMPONENT]
+    assert lowering.result_storage.stored_shape == (2, 7, 5)
+
+
+def test_dot_plan_for_test_trial_dyad_with_right_matrix_returns_mixed_rank2():
+    test_vec = VecOpInfo(np.zeros((2, 7), dtype=float), role="test", is_rhs=False)
+    trial_vec = VecOpInfo(np.zeros((2, 5), dtype=float), role="trial", is_rhs=False)
+    rhs_mat = SimpleNamespace(
+        var_name="A",
+        role="const",
+        shape=(2, 2),
+        is_gradient=False,
+        is_vector=False,
+        is_hessian=False,
+    )
+
+    dyad_item = _stack_item_from_value_spec(
+        "test_trial_dyad",
+        TensorRuleEngine.plan_product_value_spec(test_vec, trial_vec),
+    )
+
+    plan = TensorRuleEngine.plan_dot(dyad_item, rhs_mat)
+    lowering = TensorRuleEngine.plan_dot_lowering(dyad_item, rhs_mat)
+
+    assert plan.kind == OperationKind.DOT_TENSOR_TENSOR
+    assert plan.result.role == "mixed"
+    assert plan.result.basis_axes == (BasisLabel.TEST, BasisLabel.TRIAL)
+    assert [axis.label for axis in plan.result.free_axes] == [AxisLabel.COMPONENT, AxisLabel.COL]
+    assert lowering.result_storage.stored_shape == (2, 7, 5, 2)
+
+
+def test_dot_plan_for_left_matrix_with_test_trial_dyad_returns_mixed_rank2():
+    lhs_mat = SimpleNamespace(
+        var_name="A",
+        role="const",
+        shape=(2, 2),
+        is_gradient=False,
+        is_vector=False,
+        is_hessian=False,
+    )
+    test_vec = VecOpInfo(np.zeros((2, 7), dtype=float), role="test", is_rhs=False)
+    trial_vec = VecOpInfo(np.zeros((2, 5), dtype=float), role="trial", is_rhs=False)
+
+    dyad_item = _stack_item_from_value_spec(
+        "test_trial_dyad",
+        TensorRuleEngine.plan_product_value_spec(test_vec, trial_vec),
+    )
+
+    plan = TensorRuleEngine.plan_dot(lhs_mat, dyad_item)
+    lowering = TensorRuleEngine.plan_dot_lowering(lhs_mat, dyad_item)
+
+    assert plan.kind == OperationKind.DOT_TENSOR_TENSOR
+    assert plan.result.role == "mixed"
+    assert plan.result.basis_axes == (BasisLabel.TEST, BasisLabel.TRIAL)
+    assert [axis.label for axis in plan.result.free_axes] == [AxisLabel.ROW, AxisLabel.COMPONENT]
+    assert lowering.result_storage.stored_shape == (2, 7, 5, 2)
 
 
 def test_product_plan_for_vector_times_matrix_appends_all_free_axes():

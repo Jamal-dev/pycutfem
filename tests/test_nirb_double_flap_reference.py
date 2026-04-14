@@ -80,6 +80,12 @@ def test_double_flap_reference_summary_matches_download() -> None:
     assert math.isclose(reference.fluid_time_step, 0.008)
     assert math.isclose(reference.solid_time_step, 0.008)
     assert math.isclose(reference.cylinder_radius, 0.05, rel_tol=2.0e-2)
-    assert math.isclose(setup.u_mean_for_reynolds(250.0), 2.5, rel_tol=1.0e-6)
+    assert math.isclose(reference.density, 1000.0, rel_tol=1.0e-12)
+    assert math.isclose(reference.kinematic_viscosity, 7.0e-4, rel_tol=1.0e-12)
+    assert math.isclose(
+        setup.u_mean_for_reynolds(250.0),
+        reynolds_to_mean_velocity(250.0, kinematic_viscosity=reference.kinematic_viscosity, cylinder_diameter=0.1),
+        rel_tol=1.0e-12,
+    )
     assert math.isclose(setup.geometry.base_height, 0.06, rel_tol=5.0e-2)
     assert math.isclose(setup.geometry.arm_width, 0.06, rel_tol=5.0e-2)

@@ -1613,6 +1613,9 @@ class GradOpInfo(BaseOpInfo):
                     data = grad_val @ g_basis
                     return VecOpInfo(data, role=other.role, **self.update_meta(meta))
                 raise NotImplementedError(self._error_msg(other, "dot between gradients"))
+            if grad_val.shape[0] == 1 and other.shape[-1] == grad_val.shape[1]:
+                data = np.einsum("s,snd->dn", grad_val[0], other.data, optimize=True)
+                return VecOpInfo(data, role=other.role, **self.update_meta(meta))
             if grad_val.shape[-1] == other.shape[0]:
                 data = np.einsum("ks,snd->knd", grad_val, other.data, optimize=True)
                 return GradOpInfo(data, role=other.role, **self.update_meta(meta))
@@ -1631,6 +1634,9 @@ class GradOpInfo(BaseOpInfo):
                     data = grad_val.T @ g_basis
                     return VecOpInfo(data, role=self.role, **self.update_meta(meta))
                 raise NotImplementedError(self._error_msg(other, "dot between gradients"))
+            if grad_val.shape[0] == 1 and self.shape[-1] == grad_val.shape[1]:
+                data = np.einsum("knd,d->kn", self.data, grad_val[0], optimize=True)
+                return VecOpInfo(data, role=self.role, **self.update_meta(meta))
             if self.shape[-1] == grad_val.shape[0]:
                 data = np.einsum("kns,sd->knd", self.data, grad_val, optimize=True)
                 return GradOpInfo(data, role=self.role, **self.update_meta(meta))
@@ -1782,6 +1788,14 @@ class GradOpInfo(BaseOpInfo):
                         meta = _resolve_meta(self.meta(), left_vec.meta(), prefer='a')
                         return VecOpInfo(data, role=self.role, **left_vec.update_meta(meta))
                     else: raise NotImplementedError(self._error_msg(left_vec, "left_dot with vector"))
+            elif self.role == "mixed":
+                if left_vec.role in {"function", "vector"}:
+                    vec_vals = _collapsed_function(left_vec) if left_vec.role == "function" else np.asarray(left_vec.data, dtype=float)
+                    if vec_vals.ndim == 1 and vec_vals.shape[0] == self.data.shape[0]:
+                        data = np.einsum("s,snmd->dnm", vec_vals, self.data, optimize=True)
+                        meta = _resolve_meta(self.meta(), left_vec.meta(), prefer='a')
+                        return VecOpInfo(data, role=self.role, **self.update_meta(meta))
+                raise NotImplementedError(self._error_msg(left_vec, "left_dot with mixed tensor"))
 
         if isinstance(left_vec, np.ndarray) and left_vec.ndim == 1:
             if self.role == "function":
@@ -1820,6 +1834,12 @@ class GradOpInfo(BaseOpInfo):
                 else:
                     raise ValueError(f"Cannot left_dot with vector of shape {left_vec.shape} and {self.shape}."
                                      f" with roles {self.role} and {getattr(left_vec, 'role', None)}.")
+            elif self.role == "mixed":
+                if left_vec.shape[0] != self.data.shape[0]:
+                    raise ValueError(f"Cannot left_dot mixed GradOpInfo {self.shape} with vector of shape {left_vec.shape}.")
+                data = np.einsum("s,snmd->dnm", left_vec, self.data, optimize=True)
+                meta = _resolve_meta(self.meta(), {}, prefer='a')
+                return VecOpInfo(data, role=self.role, **self.update_meta(meta))
 
         if isinstance(left_vec, np.ndarray) and left_vec.ndim == 2:
             if self.role in {"trial", "test"}:
@@ -1834,6 +1854,11 @@ class GradOpInfo(BaseOpInfo):
                 data = left_vec @ grad_val
                 role = "vector" if data.ndim == 2 else "scalar"
                 return VecOpInfo(data, role=role, **self.update_meta(self.meta()))
+            if self.role == "mixed":
+                if left_vec.shape[1] != self.data.shape[0]:
+                    raise ValueError(f"Cannot left_dot mixed GradOpInfo {self.shape} with matrix of shape {left_vec.shape}.")
+                data = np.einsum("im,mnrd->inrd", left_vec, self.data, optimize=True)
+                return self._with(data, role=self.role, coeffs=self.coeffs)
 
         raise ValueError(f"Cannot left_dot with vector of shape {left_vec.shape}.")
 
@@ -1952,6 +1977,16 @@ class GradOpInfo(BaseOpInfo):
                     meta = _resolve_meta(self.meta(), other_vec.meta(), prefer='a')
                     return VecOpInfo(contracted, role=self.role, **self.update_meta(meta))
                 raise NotImplementedError(self._error_msg(other_vec, "dot_vec with vector data"))
+            elif self.role == "function" and other_vec.role == "vector":
+                grad_val = _collapsed_grad(self)
+                vec_vals = np.asarray(other_vec.data)
+                if vec_vals.ndim == 1 and grad_val.shape[-1] == vec_vals.shape[0]:
+                    data = np.einsum("kd,d->k", grad_val, vec_vals, optimize=True)
+                    if isinstance(data, np.ndarray) and data.shape == (1,):
+                        return VecOpInfo(np.asarray(data[0]), role="scalar", **self.update_meta(self.meta()))
+                    role = "scalar" if np.ndim(data) == 0 else "vector"
+                    return VecOpInfo(data, role=role, **self.update_meta(self.meta()))
+                raise NotImplementedError(self._error_msg(other_vec, "dot_vec with vector data"))
             else:
                 raise NotImplementedError(
                     f"dot_vec of GradOpInfo not implemented for role {self.role} and VecOpInfo role {other_vec.role}."
@@ -2015,6 +2050,14 @@ class GradOpInfo(BaseOpInfo):
                 data = grad_val @ other_vec
                 role = "vector" if data.ndim == 2 else "scalar"
                 return VecOpInfo(data, role=role, **self.update_meta(self.meta()))
+            if self.role == "mixed":
+                if other_vec.shape[0] != self.data.shape[-1]:
+                    raise NotImplementedError(self._error_msg(other_vec, "dot_vec"))
+                return self._with(
+                    np.einsum("...d,dm->...m", self.data, other_vec, optimize=True),
+                    role=self.role,
+                    coeffs=self.coeffs,
+                )
         other_role = getattr(other_vec, "role", None)
         raise NotImplementedError(
             f"dot_vec of GradOpInfo not implemented for role {self.role}, type {type(other_vec)} with role: {other_role}."
@@ -2050,7 +2093,7 @@ class GradOpInfo(BaseOpInfo):
                 # Reshape (n,) -> (1, n, 1) to broadcast over (k, n, d)
                 new_data = self.data * other[np.newaxis, :, np.newaxis]
             elif other.ndim == 2:
-                if self.data.ndim == 3:
+                if self.data.ndim >= 3:
                     if other.shape[0] != self.data.shape[-1]:
                         raise ValueError(
                             f"Cannot right-contract GradOpInfo(shape={self.shape}) with matrix of shape {other.shape}."
@@ -2127,6 +2170,13 @@ class GradOpInfo(BaseOpInfo):
         if isinstance(other, np.ndarray):
             other = np.asarray(other)
             if other.ndim == 2:
+                if self.data.ndim == 4:
+                    if other.shape[1] != self.data.shape[0]:
+                        raise ValueError(
+                            f"Cannot left-contract matrix of shape {other.shape} with mixed/tensor GradOpInfo of shape {self.shape}."
+                        )
+                    new_data = np.einsum("mk,k...->m...", other, self.data, optimize=True)
+                    return self._with(new_data, role=self.role)
                 if self.data.ndim == 3:
                     if self.data.shape[0] == 1:
                         if other.shape[1] != self.data.shape[-1]:
