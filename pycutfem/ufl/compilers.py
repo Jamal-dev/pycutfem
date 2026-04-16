@@ -71,7 +71,14 @@ from pycutfem.ufl.helpers import (VecOpInfo, GradOpInfo, HessOpInfo, _collapsed_
                                   normalize_elem_ids)
 from pycutfem.ufl.analytic import Analytic
 from pycutfem.jit.kernel_args import  _build_jit_kernel_args, _scatter_element_contribs, _stack_ragged
-from pycutfem.jit import _active_field_order, _active_columns, _compress_static_for_active
+from pycutfem.jit import (
+    _FusedIntegralGroup,
+    _active_field_order,
+    _active_columns,
+    _compress_static_for_active,
+    _plan_equation_assembly,
+    _plan_integral_execution_units,
+)
 from pycutfem.state.coefficient import QuadratureStateCoefficient
 from pycutfem.ufl.condensed_backend import condense_local_system
 from pycutfem.ufl.helpers_geom import (
@@ -175,6 +182,7 @@ class FormCompiler:
         self._coeff_cache: Dict[tuple, np.ndarray] = {}
         self._collapsed_cache: Dict[tuple, np.ndarray] = {}
         self._basis_cache: Dict[str, Dict[str, np.ndarray]] = {}
+        self._volume_jit_kernel_cache: Dict[tuple, tuple[Any, dict[str, Any], dict[str, Any], np.ndarray]] = {}
         self.degree_estimator = PolynomialDegreeEstimator(dh)
         self.backend = backend
         self._jit_backend = None
@@ -339,35 +347,87 @@ class FormCompiler:
 
 
     # ============================ PUBLIC API ===============================
-    def assemble(self, eq: Equation, bcs: Union[Mapping, Iterable, None] = None):
+    def assemble(
+        self,
+        eq: Equation,
+        bcs: Union[Mapping, Iterable, None] = None,
+        *,
+        need_matrix: bool = True,
+        need_vector: bool = True,
+    ):
         # Coefficients may change between assembly calls (e.g., FD checks); reset caches.
         self._basis_cache.clear()
         self._coeff_cache.clear()
         self._collapsed_cache.clear()
         ndofs = self.dh.total_dofs
-        K = sp.lil_matrix((ndofs, ndofs))
+        p_geo = int(getattr(self.me.mesh, "poly_order", 1))
+        plan = _plan_equation_assembly(
+            eq,
+            compiler=self,
+            p_geo=p_geo,
+            backend=self.backend,
+            need_matrix=bool(need_matrix),
+            need_vector=bool(need_vector),
+            vector_first=True,
+        )
+        K = sp.lil_matrix((ndofs, ndofs)) if bool(need_matrix) else None
         F = np.zeros(ndofs)
 
-        # Assemble LHS if it is provided.
-        if eq.a is not None and not (isinstance(eq.a, (int, float)) or eq.a != 0.0):
-            logger.info("Assembling LHS...")
-            self.ctx["rhs"] = False
-            self._assemble_form(eq.a, K)
+        for stage in plan.stages:
+            if stage.target == "vector":
+                logger.info("Assembling RHS vector F...")
+                self._assemble_integral_units(stage.units, F, rhs=True)
+                continue
+            if stage.target == "matrix":
+                if K is None:
+                    raise RuntimeError("Equation assembly plan requested a matrix stage without a matrix target.")
+                logger.info("Assembling LHS...")
+                self._assemble_integral_units(stage.units, K, rhs=False)
+                continue
+            raise RuntimeError(f"Unknown equation assembly stage target {stage.target!r}.")
 
-        # Assemble RHS if it is provided.
-        if eq.L is not None and not (isinstance(eq.L, (int, float)) or eq.L != 0.0):
-            logger.info("Assembling RHS vector F...")
-            self.ctx["rhs"] = True
-            self._assemble_form(eq.L, F)
-        
-        # --- THE FIX ---
-        # Apply boundary conditions AFTER both LHS and RHS have been assembled.
-        # This block is now outside of the `if eq.L` check.
-        logger.info("Applying Dirichlet boundary conditions...")
-        self._apply_bcs(K, F, bcs)
+        if bcs:
+            if K is None:
+                raise ValueError(
+                    "Dirichlet BC application in FormCompiler.assemble requires need_matrix=True."
+                )
+            logger.info("Applying Dirichlet boundary conditions...")
+            K = self._apply_bcs(K, F, bcs)
 
         logger.info("Assembly complete.")
-        return K.tocsr(), F
+        if K is None:
+            return None, F
+        try:
+            K_csr = K.tocsr()
+        except ValueError:
+            if not sp.isspmatrix_lil(K):
+                raise
+            rows: list[int] = []
+            cols: list[int] = []
+            data: list[float] = []
+            for row_id, (row_cols_raw, row_vals_raw) in enumerate(zip(K.rows, K.data)):
+                row_cols = np.atleast_1d(np.asarray(row_cols_raw, dtype=int)).reshape(-1)
+                row_vals = np.atleast_1d(np.asarray(row_vals_raw, dtype=float)).reshape(-1)
+                if row_cols.size == 0:
+                    continue
+                if row_vals.size == 1 and row_cols.size > 1:
+                    row_vals = np.full(int(row_cols.size), float(row_vals[0]), dtype=float)
+                if row_cols.size != row_vals.size:
+                    raise ValueError(
+                        f"Malformed LIL row {row_id}: column/value size mismatch "
+                        f"({row_cols.size} vs {row_vals.size})."
+                    )
+                rows.extend([int(row_id)] * int(row_cols.size))
+                cols.extend(int(col_id) for col_id in row_cols.tolist())
+                data.extend(float(val) for val in row_vals.tolist())
+            K_csr = sp.csr_matrix(
+                (
+                    np.asarray(data, dtype=float),
+                    (np.asarray(rows, dtype=int), np.asarray(cols, dtype=int)),
+                ),
+                shape=K.shape,
+            )
+        return K_csr, F
 
     def _populate_volume_basis_cache(
         self,
@@ -1383,17 +1443,55 @@ class FormCompiler:
             entity_kind=entity_kind,
         )
 
+    def _volume_jit_kernel_cache_key(
+        self,
+        integral,
+        *,
+        element_ids: np.ndarray,
+        full_local_layout: bool,
+    ) -> tuple:
+        element_ids_arr = np.asarray(element_ids, dtype=np.int32).ravel()
+        if isinstance(integral, _FusedIntegralGroup):
+            integral_key = ("group", tuple(int(id(item)) for item in integral.integrals))
+        else:
+            integral_key = ("single", int(id(integral)))
+        return (
+            integral_key,
+            bool(full_local_layout),
+            int(element_ids_arr.size),
+            bytes(element_ids_arr.tobytes()),
+        )
+
     def _prepare_volume_jit_kernel(
         self,
-        integral: Integral,
+        integral,
         *,
         element_ids: np.ndarray,
         full_local_layout: bool,
     ):
+        cache_key = self._volume_jit_kernel_cache_key(
+            integral,
+            element_ids=np.asarray(element_ids, dtype=np.int32),
+            full_local_layout=bool(full_local_layout),
+        )
+        cached = self._volume_jit_kernel_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         mesh = self.me.mesh
         on_facet = integral.measure.on_facet
         current_funcs = self._get_data_functions_objs(integral)
-        runner, ir = self._compile_backend(integral.integrand, self.dh, self.me, on_facet=on_facet)
+        if isinstance(integral, _FusedIntegralGroup) and self.backend in {"cpp", "c++"}:
+            from pycutfem.jit.cpp_backend import compile_backend_cpp_group
+
+            runner, ir = compile_backend_cpp_group(
+                [item.integrand for item in integral.integrals],
+                self.dh,
+                self.me,
+                on_facet=on_facet,
+            )
+        else:
+            runner, ir = self._compile_backend(integral.integrand, self.dh, self.me, on_facet=on_facet)
         _, need_hess, need_o3, need_o4 = self._find_req_derivs(integral, runner)
 
         if full_local_layout:
@@ -1474,7 +1572,9 @@ class FormCompiler:
             static_args = _compress_static_for_active(static_args, self.me, active_cols)
             gdofs_map = np.asarray(static_args.get("gdofs_map", gdofs_map), dtype=np.int32)
 
-        return runner, current_funcs, static_args, gdofs_map
+        cached_value = (runner, current_funcs, static_args, gdofs_map)
+        self._volume_jit_kernel_cache[cache_key] = cached_value
+        return cached_value
 
     def _assemble_volume_jit_local_batch(self, integral: Integral, *, element_ids: np.ndarray) -> LocalVolumeAssemblyBatch:
         runner, current_funcs, static_args, gdofs_map = self._prepare_volume_jit_kernel(
@@ -1616,6 +1716,8 @@ class FormCompiler:
         form_or_equation,
         *,
         element_ids=None,
+        need_matrix: bool = True,
+        need_vector: bool = True,
     ) -> LocalVolumeAssemblyBatch:
         """
         Assemble explicit element-local volume contributions without scattering.
@@ -1626,16 +1728,36 @@ class FormCompiler:
         """
         from pycutfem.ufl.forms import Equation, Form
 
+        p_geo = int(getattr(self.me.mesh, "poly_order", 1))
         if isinstance(form_or_equation, Equation):
-            forms = [frm for frm in (form_or_equation.a, form_or_equation.L) if frm is not None]
+            plan = _plan_equation_assembly(
+                form_or_equation,
+                compiler=self,
+                p_geo=p_geo,
+                backend=self.backend,
+                need_matrix=bool(need_matrix),
+                need_vector=bool(need_vector),
+                vector_first=True,
+            )
+            planned_units = [unit for stage in plan.stages for unit in stage.units]
         elif isinstance(form_or_equation, Form):
-            forms = [form_or_equation]
+            planned_units = list(getattr(form_or_equation, "integrals", []))
         elif isinstance(form_or_equation, Integral):
-            forms = [form_or_equation]
+            planned_units = [form_or_equation]
         else:
             raise TypeError(
                 "assemble_volume_local_contributions expects an Equation, Form, or volume Integral."
             )
+
+        def _unit_enabled(unit) -> bool:
+            trial, test = _trial_test(unit.integrand)
+            if trial is not None and test is not None:
+                return bool(need_matrix)
+            if trial is None and test is not None:
+                return bool(need_vector)
+            return False
+
+        planned_units = [unit for unit in planned_units if _unit_enabled(unit)]
 
         base_element_ids = self._resolve_volume_local_element_ids(element_ids)
         if base_element_ids.size == 0:
@@ -1667,27 +1789,31 @@ class FormCompiler:
                     F_elem = np.zeros((base_element_ids.size, batch.F_elem.shape[1]), dtype=float)
                 F_elem[rows, :] += np.asarray(batch.F_elem, dtype=float)
 
-        for form in forms:
-            integrals = [form] if isinstance(form, Integral) else list(getattr(form, "integrals", []))
-            for integral in integrals:
-                if not isinstance(integral, Integral):
-                    continue
-                if str(getattr(integral.measure, "domain_type", "")).strip().lower() != "volume":
-                    raise NotImplementedError(
-                        "assemble_volume_local_contributions currently supports only standard volume integrals."
-                    )
-                if getattr(integral.measure, "level_set", None) is not None:
-                    raise NotImplementedError(
-                        "assemble_volume_local_contributions does not yet support cut-volume integrals."
-                    )
-                subset_eids = self._integral_volume_element_ids(integral, base_element_ids=base_element_ids)
-                if subset_eids.size == 0:
-                    continue
-                if self._is_jit_backend():
-                    batch = self._assemble_volume_jit_local_batch(integral, element_ids=subset_eids)
-                else:
-                    batch = self._assemble_volume_python_local_batch(integral, element_ids=subset_eids)
-                _accumulate_batch(batch)
+        if self.backend in {"cpp", "c++"} and not isinstance(form_or_equation, Equation):
+            planned_units = _plan_integral_execution_units(
+                [integral for integral in planned_units if isinstance(integral, Integral)],
+                compiler=self,
+                p_geo=p_geo,
+                backend=self.backend,
+            )
+
+        for integral in planned_units:
+            if str(getattr(integral.measure, "domain_type", "")).strip().lower() != "volume":
+                raise NotImplementedError(
+                    "assemble_volume_local_contributions currently supports only standard volume integrals."
+                )
+            if getattr(integral.measure, "level_set", None) is not None:
+                raise NotImplementedError(
+                    "assemble_volume_local_contributions does not yet support cut-volume integrals."
+                )
+            subset_eids = self._integral_volume_element_ids(integral, base_element_ids=base_element_ids)
+            if subset_eids.size == 0:
+                continue
+            if self._is_jit_backend():
+                batch = self._assemble_volume_jit_local_batch(integral, element_ids=subset_eids)
+            else:
+                batch = self._assemble_volume_python_local_batch(integral, element_ids=subset_eids)
+            _accumulate_batch(batch)
 
         return LocalVolumeAssemblyBatch(
             K_elem=K_elem,
@@ -1805,6 +1931,8 @@ class FormCompiler:
         form_or_equation,
         *,
         entity_ids=None,
+        need_matrix: bool = True,
+        need_vector: bool = True,
     ) -> LocalAssemblyBatch:
         if isinstance(form_or_equation, CondensedQuadratureLocalSystem):
             return self.assemble_condensed_local_contributions(form_or_equation, element_ids=entity_ids)
@@ -1823,7 +1951,12 @@ class FormCompiler:
             )
         domain_type = next(iter(domain_types))
         if domain_type == "volume":
-            return self.assemble_volume_local_contributions(form_or_equation, element_ids=entity_ids)
+            return self.assemble_volume_local_contributions(
+                form_or_equation,
+                element_ids=entity_ids,
+                need_matrix=bool(need_matrix),
+                need_vector=bool(need_vector),
+            )
         if domain_type == "exterior_facet":
             return self.assemble_exterior_facet_local_contributions(form_or_equation, edge_ids=entity_ids)
         if domain_type == "interface":
@@ -1962,7 +2095,12 @@ class FormCompiler:
                 need_matrix=bool(need_matrix),
                 element_ids=entity_ids,
             )
-        batch = self.assemble_local_contributions(form_or_equation, entity_ids=entity_ids)
+        batch = self.assemble_local_contributions(
+            form_or_equation,
+            entity_ids=entity_ids,
+            need_matrix=bool(need_matrix),
+            need_vector=True,
+        )
         return solver.scatter_element_contribs_reduced(
             K_elem=batch.K_elem if bool(need_matrix) else None,
             F_elem=batch.F_elem,
@@ -1986,6 +2124,7 @@ class FormCompiler:
         base_batch = self.assemble_volume_local_contributions(
             condensed.base_form_or_equation,
             element_ids=elem_ids,
+            need_matrix=bool(need_matrix),
         )
         A_red, R_red = solver.scatter_element_contribs_reduced(
             K_elem=base_batch.K_elem if bool(need_matrix) else None,
@@ -5131,60 +5270,72 @@ class FormCompiler:
     def _visit_Analytic(self, node): return node.eval(self.ctx['x_phys'])
 
     # ======================= ASSEMBLY CORE ============================
+    def _assemble_integral(self, integral, target):
+        """Assemble one integral-like unit into the provided target."""
+        if not isinstance(integral, (Integral, _FusedIntegralGroup)):
+            return
+
+        # --- The rest of the dispatching logic remains the same ---
+        if integral.measure.domain_type == "interface":
+            # Handle interface integrals with a level set
+            logger.info(f"Assembling interface integral: {integral} with backend {self.backend}")
+            self._assemble_interface(integral, target)
+            return
+        if integral.measure.domain_type == "nonmatching_interface":
+            logger.info(f"Assembling nonmatching-interface integral: {integral} with backend {self.backend}")
+            self._assemble_nonmatching_interface(integral, target)
+            return
+        if integral.measure.domain_type == "volume":
+            # Handle volume integrals
+            logger.info(f"Assembling volume integral: {integral} with backend {self.backend}")
+            self._assemble_volume(integral, target)
+            return
+        if integral.measure.domain_type == "ghost_edge":
+            logger.info(f"Assembling ghost edge integral: {integral} with backend {self.backend}")
+            self._assemble_ghost_edge(integral, target)
+            return
+        if integral.measure.domain_type == "facet_patch":
+            logger.info(f"Assembling facet-patch integral: {integral} with backend {self.backend}")
+            self._assemble_facet_patch(integral, target)
+            return
+        if integral.measure.domain_type == "interior_facet":
+            logger.info(f"Assembling interior-facet integral: {integral} with backend {self.backend}")
+            self._assemble_interior_edge(integral, target)
+            return
+        if integral.measure.domain_type == "cut_interior_facet":
+            logger.info(f"Assembling cut interior-facet integral: {integral} with backend {self.backend}")
+            self._assemble_cut_interior_edge(integral, target)
+            return
+        if integral.measure.domain_type == "exterior_facet":
+            logger.info(f"Assembling exterior-facet integral: {integral} with backend {self.backend}")
+            self._assemble_boundary_edge(integral, target)
+            return
+
+    def _assemble_integral_units(self, integrals, target, *, rhs: bool) -> None:
+        old_rhs = self.ctx.get("rhs", None)
+        try:
+            self.ctx["rhs"] = bool(rhs)
+            for integral in list(integrals or []):
+                self._assemble_integral(integral, target)
+        finally:
+            if old_rhs is None:
+                self.ctx.pop("rhs", None)
+            else:
+                self.ctx["rhs"] = old_rhs
+
     def _assemble_form(self, form, target):
         """Accept a Form object and iterate through its integrals."""
         from pycutfem.ufl.forms import Form
-        # from pycutfem.ufl.measures import Integral
 
         # This guard clause correctly handles one-sided equations (e.g., L=None or a=None)
         if form is None or not isinstance(form, Form):
             return
 
-        for integral in form.integrals:
-            if not isinstance(integral, Integral):
-                continue
-            
-            # --- The rest of the dispatching logic remains the same ---
-            if integral.measure.domain_type == "interface":
-                # Handle interface integrals with a level set
-                logger.info(f"Assembling interface integral: {integral} with backend {self.backend}")
-                # print(f"Assembling interface integral with backend {self.backend}")
-                self._assemble_interface(integral, target)
-                continue
-            if integral.measure.domain_type == "nonmatching_interface":
-                logger.info(f"Assembling nonmatching-interface integral: {integral} with backend {self.backend}")
-                self._assemble_nonmatching_interface(integral, target)
-                continue
-            if integral.measure.domain_type == "volume":
-                # Handle volume integrals
-                logger.info(f"Assembling volume integral: {integral} with backend {self.backend}")
-                # print(f"Assembling volume integral with backend {self.backend}")
-                self._assemble_volume(integral, target)
-                continue
-            if integral.measure.domain_type == "ghost_edge":
-                logger.info(f"Assembling ghost edge integral: {integral} with backend {self.backend}")
-                # print(f"Assembling ghost edge integral with backend {self.backend}")
-                self._assemble_ghost_edge(integral, target)
-                continue
-            if integral.measure.domain_type == "facet_patch":
-                logger.info(f"Assembling facet-patch integral: {integral} with backend {self.backend}")
-                self._assemble_facet_patch(integral, target)
-                continue
-            if integral.measure.domain_type == "interior_facet":
-                logger.info(f"Assembling interior-facet integral: {integral} with backend {self.backend}")
-                self._assemble_interior_edge(integral, target)
-                continue
-            if integral.measure.domain_type == "cut_interior_facet":
-                logger.info(f"Assembling cut interior-facet integral: {integral} with backend {self.backend}")
-                self._assemble_cut_interior_edge(integral, target)
-                continue
-            if integral.measure.domain_type == "exterior_facet":
-                logger.info(f"Assembling exterior-facet integral: {integral} with backend {self.backend}")
-                # print(f"Assembling exterior-facet integral with backend {self.backend}")
-                self._assemble_boundary_edge(integral, target)
-                continue
-
-            logger.warning(f"Skipping unsupported integral type: {integral.measure.domain_type}")
+        self._assemble_integral_units(
+            [integral for integral in form.integrals if isinstance(integral, Integral)],
+            target,
+            rhs=bool(self.ctx.get("rhs", True)),
+        )
 
 
     def _find_q_order(self, integral: Integral) -> int:
@@ -5232,26 +5383,62 @@ class FormCompiler:
     
     # ====================== BC handling ===============================
     def _apply_bcs(self, K, F, bcs):
-        # This method remains unchanged from your provided file
-        if not bcs: return
+        if not bcs:
+            return K
         data = self.dh.get_dirichlet_data(bcs)
-        if not data: return
+        if not data:
+            return K
         rows = np.fromiter(data.keys(), dtype=int)
         vals = np.fromiter(data.values(), dtype=float)
         
         # Apply to RHS vector F
         F -= K @ np.bincount(rows, weights=vals, minlength=F.size)
         
-        # Zero out rows and columns in the matrix
-        K_lil = K.tolil()
-        K_lil[rows, :] = 0
-        K_lil[:, rows] = 0
-        K_lil[rows, rows] = 1.0
-        # copy the edited data back
-        K[:] = K_lil  # Convert back to CSR format
-        
+        # Zero out rows and columns in CSR/CSC space to avoid slow LIL fancy sets.
+        K_csc = K.tocsc(copy=True) if hasattr(K, "tocsc") else sp.csc_matrix(K)
+        n_rows, n_cols = K_csc.shape
+        keep = (rows >= 0) & (rows < min(n_rows, n_cols))
+        rows = rows[keep]
+        vals = vals[keep]
+        c_indptr = K_csc.indptr
+        c_data = K_csc.data
+        for rr in rows.tolist():
+            start = int(c_indptr[rr])
+            end = int(c_indptr[rr + 1])
+            if end > start:
+                c_data[start:end] = 0.0
+
+        K_csr = K_csc.tocsr()
+        indptr = K_csr.indptr
+        indices = K_csr.indices
+        values = K_csr.data
+        missing_diag: list[int] = []
+        for rr in rows.tolist():
+            start = int(indptr[rr])
+            end = int(indptr[rr + 1])
+            if end <= start:
+                missing_diag.append(rr)
+                continue
+            values[start:end] = 0.0
+            hit = np.nonzero(indices[start:end] == rr)[0]
+            if hit.size:
+                values[start + int(hit[0])] = 1.0
+            else:
+                missing_diag.append(rr)
+        if missing_diag:
+            diag_rows = np.asarray(missing_diag, dtype=int)
+            K_csr = (
+                K_csr
+                + sp.csr_matrix(
+                    (np.ones(diag_rows.size, dtype=float), (diag_rows, diag_rows)),
+                    shape=K_csr.shape,
+                )
+            ).tocsr()
+        K_csr.eliminate_zeros()
+
         # Set values in the RHS vector
         F[rows] = vals
+        return K_csr
     
     def _union_element_dofs(self, eid: int, fields: list[str]) -> np.ndarray:
         """

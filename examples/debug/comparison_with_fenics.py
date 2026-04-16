@@ -52,7 +52,7 @@ from petsc4py import PETSc # Import PETSc for enums like InsertMode
 # pycutfem imports
 from pycutfem.core.mesh import Mesh
 from pycutfem.core.dofhandler import DofHandler
-from pycutfem.utils.meshgen import structured_quad
+from pycutfem.utils.meshgen import structured_quad, structured_triangles
 from pycutfem.ufl.spaces import FunctionSpace
 from pycutfem.ufl.expressions import (
     HdivFunction,
@@ -82,6 +82,8 @@ from examples.biofilms.benchmarks.seboldt.paper1_benchmark7_seboldt import (
     _build_forms as build_benchmark7_seboldt_forms,
     _create_problem as create_benchmark7_seboldt_problem,
 )
+from examples.NIRB.dvms.helpers import _bossak_coefficients, _kratos_dvms_element_size_coefficient
+from examples.NIRB.dvms.symbolics import build_fluid_dvms_local_forms
 
 # Imports for mapping and matrix conversion
 from scipy.optimize import linear_sum_assignment
@@ -209,6 +211,22 @@ def _apply_cli_defaults(args: argparse.Namespace) -> None:
     terms_spec = args.terms
 
     normalized_backend_spec, backend_env_updates = _normalize_backend_request(backend_spec)
+    explicit_problem = bool(problem_spec)
+    explicit_terms = terms_spec is not None
+    should_run_all_terms = bool(args.all_terms)
+    should_run_all_suites = bool(args.all_suites)
+
+    # A CLI backend selection is treated as an explicit parity sweep request.
+    # Unless the caller narrows the scope with --terms, run every term.
+    if normalized_backend_spec and not explicit_terms:
+        should_run_all_terms = True
+    # When the caller selects a backend but does not choose a specific suite,
+    # broaden the scope to all registered suites.
+    if normalized_backend_spec and not explicit_problem and not explicit_terms:
+        should_run_all_suites = True
+    # All-suites mode also implies "run all terms" semantics inside each suite.
+    if should_run_all_suites:
+        should_run_all_terms = True
 
     if normalized_backend_spec:
         os.environ["COMP_FENICS_BACKENDS"] = normalized_backend_spec
@@ -216,30 +234,26 @@ def _apply_cli_defaults(args: argparse.Namespace) -> None:
         os.environ[env_name] = env_value
     if problem_spec:
         os.environ["COMP_FENICS_PROBLEM"] = problem_spec
+    elif normalized_backend_spec and should_run_all_suites:
+        os.environ.pop("COMP_FENICS_PROBLEM", None)
     if terms_spec is not None:
         os.environ["COMP_FENICS_TERMS"] = terms_spec
+    elif normalized_backend_spec:
+        os.environ.pop("COMP_FENICS_TERMS", None)
     if args.write_xlsx is not None:
         os.environ["COMP_FENICS_WRITE_XLSX"] = args.write_xlsx
     if args.qdeg is not None:
         os.environ["COMP_FENICS_QDEG"] = str(args.qdeg)
     if args.traceback:
         os.environ["COMP_FENICS_TRACEBACK"] = "1"
-    if args.all_terms:
+    if should_run_all_terms:
         os.environ["COMP_FENICS_RUN_ALL"] = "1"
-    if args.all_suites:
+    else:
+        os.environ.pop("COMP_FENICS_RUN_ALL", None)
+    if should_run_all_suites:
         os.environ["COMP_FENICS_RUN_ALL_SUITES"] = "1"
-
-    # CLI backend selection should default to the full FEniCSx parity sweep
-    # unless the caller explicitly narrows the scope with --terms or --problem.
-    if normalized_backend_spec and terms_spec is None and not _env_flag("COMP_FENICS_RUN_ALL"):
-        os.environ["COMP_FENICS_RUN_ALL"] = "1"
-    if (
-        normalized_backend_spec
-        and not problem_spec
-        and terms_spec is None
-        and not _env_flag("COMP_FENICS_RUN_ALL_SUITES")
-    ):
-        os.environ["COMP_FENICS_RUN_ALL_SUITES"] = "1"
+    else:
+        os.environ.pop("COMP_FENICS_RUN_ALL_SUITES", None)
 
 
 def _env_flag(name: str) -> bool:
@@ -3700,7 +3714,10 @@ def run_biofilm_comparison():
         raise ValueError(f"Unknown COMP_FENICS_FLUID_CONVECTION={fluid_convection_key!r}.")
     r_mom_fx += 2.0 * theta_fx * mu_mom_k_fx * ufl.inner(eps_fx(v_k_fx), eps_fx(w_fx)) * dx_fx
     r_mom_fx += 2.0 * (1.0 - theta_fx) * mu_mom_n_fx * ufl.inner(eps_fx(v_n_fx), eps_fx(w_fx)) * dx_fx
-    r_mom_fx += -p_k_fx * div_C_w_fx * dx_fx
+    # Match the production one-domain builder: pressure enters the fluid row as
+    # a weighted stress -(C p) div(w), not as the multiplier of the weighted
+    # divergence constraint -p div(C w).
+    r_mom_fx += -(C_k_fx * p_k_fx) * ufl.div(w_fx) * dx_fx
     r_mom_fx += gamma_div_fx * divF_k_fx * div_C_w_fx * dx_fx
     if use_refmap_drag_fx:
         r_mom_fx += beta_coeff_k_fx * ufl.dot(kdrag_k_fx, w_fx) * dx_fx
@@ -3762,7 +3779,12 @@ def run_biofilm_comparison():
                 strong_visc_k_fx = strong_div_2mu_eps_hdiv_fx(v_k_fx, mu_mom_k_fx)
             else:
                 strong_visc_k_fx = ufl.div(2.0 * mu_mom_k_fx * eps_fx(v_k_fx))
-            strong_mom_k_fx = ((rho_mom_k_fx * (v_k_fx - v_n_fx)) / dt_fx) - strong_visc_k_fx + C_k_fx * ufl.grad(p_k_fx)
+            strong_mom_k_fx = (
+                ((rho_mom_k_fx * (v_k_fx - v_n_fx)) / dt_fx)
+                - strong_visc_k_fx
+                + C_k_fx * ufl.grad(p_k_fx)
+                + p_k_fx * gradC_k_fx
+            )
             if fluid_convection_key == "full":
                 strong_mom_k_fx += rho_mom_k_fx * advected_grad_fx(v_k_fx, v_k_fx) + div_rhov_k_fx * v_k_fx
             elif fluid_convection_key in {"lagged", "explicit"}:
@@ -4400,6 +4422,21 @@ def setup_benchmark7_hdiv_problems(*, nx: int = 2, ny: int = 3):
         "gamma_alpha": float(os.environ.get("COMP_FENICS_B7_GAMMA_ALPHA", "1.0")),
         "eps_alpha": float(os.environ.get("COMP_FENICS_B7_EPS_ALPHA", "0.05")),
         "gamma_div": float(os.environ.get("COMP_FENICS_B7_GAMMA_DIV", "0.0")),
+        "gamma_v": float(os.environ.get("COMP_FENICS_B7_GAMMA_V", "0.0")),
+        "v_extension_mode": str(os.environ.get("COMP_FENICS_B7_V_EXTENSION_MODE", "h1")),
+        "gamma_v_pin": float(os.environ.get("COMP_FENICS_B7_GAMMA_V_PIN", "0.0")),
+        "gamma_p": float(os.environ.get("COMP_FENICS_B7_GAMMA_P", "0.0")),
+        "p_extension_mode": str(os.environ.get("COMP_FENICS_B7_P_EXTENSION_MODE", "h1")),
+        "gamma_p_pin": float(os.environ.get("COMP_FENICS_B7_GAMMA_P_PIN", "0.0")),
+        "gamma_vP": float(os.environ.get("COMP_FENICS_B7_GAMMA_VP", "0.0")),
+        "vP_extension_mode": str(os.environ.get("COMP_FENICS_B7_VP_EXTENSION_MODE", "h1")),
+        "gamma_vP_pin": float(os.environ.get("COMP_FENICS_B7_GAMMA_VP_PIN", "0.0")),
+        "gamma_p_pore": float(os.environ.get("COMP_FENICS_B7_GAMMA_P_PORE", "0.0")),
+        "p_pore_extension_mode": str(os.environ.get("COMP_FENICS_B7_P_PORE_EXTENSION_MODE", "h1")),
+        "gamma_p_pore_pin": float(os.environ.get("COMP_FENICS_B7_GAMMA_P_PORE_PIN", "0.0")),
+        "gamma_rho_s": float(os.environ.get("COMP_FENICS_B7_GAMMA_RHO_S", "0.0")),
+        "rho_s_extension_mode": str(os.environ.get("COMP_FENICS_B7_RHO_S_EXTENSION_MODE", "h1")),
+        "gamma_rho_s_pin": float(os.environ.get("COMP_FENICS_B7_GAMMA_RHO_S_PIN", "0.0")),
     }
 
     fenicsx = {
@@ -4614,6 +4651,21 @@ def run_benchmark7_hdiv_comparison():
         D_phi=0.0,
         phi_diffusion_weight="fluid",
         gamma_phi=0.0,
+        gamma_v=float(params["gamma_v"]),
+        v_extension_mode=str(params["v_extension_mode"]),
+        gamma_v_pin=float(params["gamma_v_pin"]),
+        gamma_p=float(params["gamma_p"]),
+        p_extension_mode=str(params["p_extension_mode"]),
+        gamma_p_pin=float(params["gamma_p_pin"]),
+        gamma_vP=float(params["gamma_vP"]),
+        vP_extension_mode=str(params["vP_extension_mode"]),
+        gamma_vP_pin=float(params["gamma_vP_pin"]),
+        gamma_p_pore=float(params["gamma_p_pore"]),
+        p_pore_extension_mode=str(params["p_pore_extension_mode"]),
+        gamma_p_pore_pin=float(params["gamma_p_pore_pin"]),
+        gamma_rho_s=float(params["gamma_rho_s"]),
+        rho_s_extension_mode=str(params["rho_s_extension_mode"]),
+        gamma_rho_s_pin=float(params["gamma_rho_s_pin"]),
         phi_supg=0.0,
         phi_cip=0.0,
         alpha_regularization="ch",
@@ -5091,6 +5143,172 @@ def initialize_full_fluid_functions(pc, fenicsx, dof_handler_pc, P_map):
     fenicsx["d_prev"].x.scatter_forward()
 
     print("✅ Full fluid functions initialized.")
+
+
+def _triangle_min_altitude_function_fx(mesh_fx):
+    Q0 = dolfinx.fem.functionspace(mesh_fx, ("DG", 0))
+    h_fun = dolfinx.fem.Function(Q0, name="kratos_h")
+    conn = np.asarray(mesh_fx.geometry.dofmap, dtype=int)
+    coords = np.asarray(mesh_fx.geometry.x, dtype=float)
+    values = np.zeros((conn.shape[0],), dtype=float)
+    for cell in range(int(conn.shape[0])):
+        verts = coords[conn[cell], :2]
+        edge01 = float(np.linalg.norm(verts[0] - verts[1]))
+        edge12 = float(np.linalg.norm(verts[1] - verts[2]))
+        edge20 = float(np.linalg.norm(verts[2] - verts[0]))
+        max_edge = max(edge01, edge12, edge20, 1.0e-30)
+        area = 0.5 * abs(
+            (verts[1, 0] - verts[0, 0]) * (verts[2, 1] - verts[0, 1])
+            - (verts[2, 0] - verts[0, 0]) * (verts[1, 1] - verts[0, 1])
+        )
+        values[cell] = (2.0 * max(area, 1.0e-30)) / max_edge
+    h_fun.x.array[: values.shape[0]] = values
+    h_fun.x.scatter_forward()
+    return h_fun
+
+
+def setup_nirb_dvms_local_problems(*, nx: int = 2, ny: int = 2):
+    nodes_t1, elems_t1, edges_t1, corners_t1 = structured_triangles(
+        1.0,
+        1.0,
+        nx_quads=int(nx),
+        ny_quads=int(ny),
+        poly_order=1,
+    )
+    mesh_t1 = Mesh(
+        nodes=nodes_t1,
+        element_connectivity=elems_t1,
+        edges_connectivity=edges_t1,
+        elements_corner_nodes=corners_t1,
+        element_type="tri",
+        poly_order=1,
+    )
+    mixed_element_pc = MixedElement(mesh_t1, field_specs={"ux": 1, "uy": 1, "p": 1, "mx": 1, "my": 1})
+    dof_handler_pc = DofHandler(mixed_element_pc, method="cg")
+
+    velocity_fs = FunctionSpace("velocity", ["ux", "uy"], dim=1)
+    bossak = _bossak_coefficients(alpha=-0.2, dt=0.2)
+    pc = {
+        "du": VectorTrialFunction(velocity_fs, dof_handler=dof_handler_pc),
+        "dp": TrialFunction(name="dp", field_name="p", dof_handler=dof_handler_pc),
+        "v": VectorTestFunction(velocity_fs, dof_handler=dof_handler_pc),
+        "q": TestFunction(name="q", field_name="p", dof_handler=dof_handler_pc),
+        "u_k": VectorFunction(name="u_k", field_names=["ux", "uy"], dof_handler=dof_handler_pc),
+        "u_prev": VectorFunction(name="u_prev", field_names=["ux", "uy"], dof_handler=dof_handler_pc),
+        "a_prev": VectorFunction(name="a_prev", field_names=["ux", "uy"], dof_handler=dof_handler_pc),
+        "p_k": Function(name="p_k", field_name="p", dof_handler=dof_handler_pc),
+        "d_mesh": VectorFunction(name="d_mesh", field_names=["mx", "my"], dof_handler=dof_handler_pc),
+        "d_prev": VectorFunction(name="d_prev", field_names=["mx", "my"], dof_handler=dof_handler_pc),
+        "rho": Constant(1.5, dim=0),
+        "dt": Constant(0.2, dim=0),
+        "mu": Constant(0.05, dim=0),
+        "bossak_alpha": Constant(float(bossak["alpha"]), dim=0),
+        "bossak_ma0": Constant(float(bossak["ma0"]), dim=0),
+        "bossak_ma2": Constant(float(bossak["ma2"]), dim=0),
+        "predicted_subscale": Constant(np.array([0.12, -0.07], dtype=float), dim=1),
+        "old_subscale": Constant(np.array([-0.03, 0.05], dtype=float), dim=1),
+        "momentum_projection": Constant(np.array([0.08, -0.02], dtype=float), dim=1),
+        "mass_projection": Constant(0.11, dim=0),
+        "old_mass_residual": Constant(-0.04, dim=0),
+        "body_force": Constant(np.array([0.06, -0.03], dtype=float), dim=1),
+        "h": _kratos_dvms_element_size_coefficient(mesh_t1),
+    }
+
+    mesh_fx = dolfinx.mesh.create_unit_square(MPI.COMM_WORLD, int(nx), int(ny), dolfinx.mesh.CellType.triangle)
+    gdim = mesh_fx.geometry.dim
+    U_el = basix.ufl.element("Lagrange", "triangle", 1, shape=(gdim,))
+    M_el = basix.ufl.element("Lagrange", "triangle", 1, shape=(gdim,))
+    P_el = basix.ufl.element("Lagrange", "triangle", 1)
+    W_el = mixed_element([U_el, M_el, P_el])
+    W_fx = dolfinx.fem.functionspace(mesh_fx, W_el)
+    U_fx, _ = W_fx.sub(0).collapse()
+    M_fx, _ = W_fx.sub(1).collapse()
+    fenicsx = {
+        "mesh": mesh_fx,
+        "W": W_fx,
+        "rho": dolfinx.fem.Constant(mesh_fx, 1.5),
+        "dt": dolfinx.fem.Constant(mesh_fx, 0.2),
+        "mu": dolfinx.fem.Constant(mesh_fx, 0.05),
+        "bossak_alpha": dolfinx.fem.Constant(mesh_fx, float(bossak["alpha"])),
+        "bossak_ma0": dolfinx.fem.Constant(mesh_fx, float(bossak["ma0"])),
+        "bossak_ma2": dolfinx.fem.Constant(mesh_fx, float(bossak["ma2"])),
+        "predicted_subscale": dolfinx.fem.Constant(mesh_fx, np.array([0.12, -0.07], dtype=float)),
+        "old_subscale": dolfinx.fem.Constant(mesh_fx, np.array([-0.03, 0.05], dtype=float)),
+        "momentum_projection": dolfinx.fem.Constant(mesh_fx, np.array([0.08, -0.02], dtype=float)),
+        "mass_projection": dolfinx.fem.Constant(mesh_fx, 0.11),
+        "old_mass_residual": dolfinx.fem.Constant(mesh_fx, -0.04),
+        "body_force": dolfinx.fem.Constant(mesh_fx, np.array([0.06, -0.03], dtype=float)),
+        "h": _triangle_min_altitude_function_fx(mesh_fx),
+        "u_m_p_k": dolfinx.fem.Function(W_fx, name="u_m_p_k"),
+        "u_prev": dolfinx.fem.Function(U_fx, name="u_prev"),
+        "a_prev": dolfinx.fem.Function(U_fx, name="a_prev"),
+        "d_prev": dolfinx.fem.Function(M_fx, name="d_prev"),
+    }
+    return pc, dof_handler_pc, fenicsx
+
+
+def initialize_nirb_dvms_local_functions(pc, fenicsx, dof_handler_pc, P_map):
+    del dof_handler_pc, P_map
+
+    def u_k_init_func(x):
+        return [0.7 + 0.1 * x[0] - 0.2 * x[1], -0.3 + 0.05 * x[0] + 0.15 * x[1]]
+
+    def u_prev_init_func(x):
+        return [0.4 + 0.03 * x[0] - 0.1 * x[1], -0.15 + 0.02 * x[0] + 0.05 * x[1]]
+
+    def a_prev_init_func(x):
+        return [0.17 + 0.01 * x[0], -0.11 + 0.015 * x[1]]
+
+    def p_k_init_func(x):
+        return 0.2 + 0.3 * x[0] - 0.4 * x[1]
+
+    def d_prev_init_func(x):
+        return [0.01 * x[0], -0.015 * x[1]]
+
+    def d_mesh_init_func(x):
+        u_val = u_k_init_func(x)
+        d_prev_val = d_prev_init_func(x)
+        dt_val = float(pc["dt"].value)
+        return [
+            d_prev_val[0] + dt_val * (u_val[0] - 0.4),
+            d_prev_val[1] + dt_val * (u_val[1] + 0.2),
+        ]
+
+    pc["u_k"].set_values_from_function(lambda x, y: u_k_init_func([x, y]))
+    pc["u_prev"].set_values_from_function(lambda x, y: u_prev_init_func([x, y]))
+    pc["a_prev"].set_values_from_function(lambda x, y: a_prev_init_func([x, y]))
+    pc["p_k"].set_values_from_function(lambda x, y: p_k_init_func([x, y]))
+    pc["d_prev"].set_values_from_function(lambda x, y: d_prev_init_func([x, y]))
+    pc["d_mesh"].set_values_from_function(lambda x, y: d_mesh_init_func([x, y]))
+
+    W_fx = fenicsx["W"]
+    u_m_p_k_fx = fenicsx["u_m_p_k"]
+    U_fx, U_to_W = W_fx.sub(0).collapse()
+    M_fx, M_to_W = W_fx.sub(1).collapse()
+    P_fx, P_to_W = W_fx.sub(2).collapse()
+
+    u_sub_fx = u_m_p_k_fx.sub(0)
+    m_sub_fx = u_m_p_k_fx.sub(1)
+    p_sub_fx = u_m_p_k_fx.sub(2)
+
+    u_values = u_sub_fx.debug_interpolate(u_k_init_func)
+    m_values = m_sub_fx.debug_interpolate(d_mesh_init_func)
+    p_values = p_sub_fx.debug_interpolate(p_k_init_func)
+    u_m_p_k_fx.x.array[np.asarray(U_to_W, dtype=int)] = u_values
+    u_m_p_k_fx.x.array[np.asarray(M_to_W, dtype=int)] = m_values
+    u_m_p_k_fx.x.array[np.asarray(P_to_W, dtype=int)] = p_values
+    u_m_p_k_fx.x.scatter_forward()
+
+    fenicsx["u_prev"].x.array[:] = fenicsx["u_prev"].debug_interpolate(u_prev_init_func)
+    fenicsx["u_prev"].x.scatter_forward()
+    fenicsx["a_prev"].x.array[:] = fenicsx["a_prev"].debug_interpolate(a_prev_init_func)
+    fenicsx["a_prev"].x.scatter_forward()
+    fenicsx["d_prev"].x.array[:] = fenicsx["d_prev"].debug_interpolate(d_prev_init_func)
+    fenicsx["d_prev"].x.scatter_forward()
+
+    np.testing.assert_allclose(np.sort(pc["u_k"].nodal_values), np.sort(u_values), rtol=1.0e-8, atol=1.0e-15)
+    np.testing.assert_allclose(np.sort(pc["p_k"].nodal_values), np.sort(p_values), rtol=1.0e-8, atol=1.0e-15)
+    np.testing.assert_allclose(np.sort(pc["d_mesh"].nodal_values), np.sort(m_values), rtol=1.0e-8, atol=1.0e-15)
 
 def compare_term(
     term_name,
@@ -5907,7 +6125,11 @@ def run_multiplication_semantics_comparison():
     u_k_fx, _p_k_fx = ufl.split(fenicsx["u_k_p_k"])
 
     B_arr = np.array([[2.0, -0.5], [1.0, 3.0]], dtype=float)
+    c_arr = np.array([0.4, -0.6], dtype=float)
     B_pc = Constant(B_arr, dim=2)
+    c_pc = Constant(c_arr, dim=1)
+    B_fx = dolfinx.fem.Constant(fenicsx["mesh"], B_arr)
+    c_fx = dolfinx.fem.Constant(fenicsx["mesh"], c_arr)
 
     form_specs = [
         {
@@ -5939,6 +6161,54 @@ def run_multiplication_semantics_comparison():
             "kind": "res",
             "pc": ((pc["u_k"] * grad(pc["u_k"]))[1, 0, 0]) * pc["q"] * dx(metadata=metadata),
             "fx": (u_k_fx[1] * ufl.grad(u_k_fx)[0, 0] * q_fx) * ufl.dx(metadata=metadata),
+        },
+        {
+            "name": "DyadDotVector ValueTrial Right",
+            "kind": "jac",
+            "pc": dot(dot(pc["u_k"] * pc["du"], c_pc), pc["v"]) * dx(metadata=metadata),
+            "fx": ufl.dot(ufl.dot(ufl.outer(u_k_fx, du_fx), c_fx), v_fx) * ufl.dx(metadata=metadata),
+        },
+        {
+            "name": "DyadDotVector ValueTrial Left",
+            "kind": "jac",
+            "pc": dot(dot(c_pc, pc["u_k"] * pc["du"]), pc["v"]) * dx(metadata=metadata),
+            "fx": ufl.dot(ufl.dot(c_fx, ufl.outer(u_k_fx, du_fx)), v_fx) * ufl.dx(metadata=metadata),
+        },
+        {
+            "name": "DyadDotMatrix ValueTrial Right",
+            "kind": "jac",
+            "pc": inner(dot(pc["u_k"] * pc["du"], B_pc), grad(pc["v"])) * dx(metadata=metadata),
+            "fx": ufl.inner(ufl.dot(ufl.outer(u_k_fx, du_fx), B_fx), ufl.grad(v_fx)) * ufl.dx(metadata=metadata),
+        },
+        {
+            "name": "DyadDotMatrix ValueTrial Left",
+            "kind": "jac",
+            "pc": inner(dot(B_pc, pc["u_k"] * pc["du"]), grad(pc["v"])) * dx(metadata=metadata),
+            "fx": ufl.inner(ufl.dot(B_fx, ufl.outer(u_k_fx, du_fx)), ufl.grad(v_fx)) * ufl.dx(metadata=metadata),
+        },
+        {
+            "name": "DyadDotVector TestTrial Right",
+            "kind": "jac",
+            "pc": dot(dot(pc["v"] * pc["du"], c_pc), c_pc) * dx(metadata=metadata),
+            "fx": ufl.dot(ufl.dot(ufl.outer(v_fx, du_fx), c_fx), c_fx) * ufl.dx(metadata=metadata),
+        },
+        {
+            "name": "DyadDotVector TestTrial Left",
+            "kind": "jac",
+            "pc": dot(dot(c_pc, pc["v"] * pc["du"]), c_pc) * dx(metadata=metadata),
+            "fx": ufl.dot(ufl.dot(c_fx, ufl.outer(v_fx, du_fx)), c_fx) * ufl.dx(metadata=metadata),
+        },
+        {
+            "name": "DyadDotMatrix TestTrial Right",
+            "kind": "jac",
+            "pc": inner(dot(pc["v"] * pc["du"], B_pc), B_pc) * dx(metadata=metadata),
+            "fx": ufl.inner(ufl.dot(ufl.outer(v_fx, du_fx), B_fx), B_fx) * ufl.dx(metadata=metadata),
+        },
+        {
+            "name": "DyadDotMatrix TestTrial Left",
+            "kind": "jac",
+            "pc": inner(dot(B_pc, pc["v"] * pc["du"]), B_pc) * dx(metadata=metadata),
+            "fx": ufl.inner(ufl.dot(B_fx, ufl.outer(v_fx, du_fx)), B_fx) * ufl.dx(metadata=metadata),
         },
     ]
 
@@ -6006,6 +6276,237 @@ def run_multiplication_semantics_comparison():
         print_test_summary(success_count, failed_tests)
         _print_global_summary()
         sys.exit(130)
+    print_test_summary(success_count, failed_tests)
+
+
+def run_nirb_dvms_local_comparison():
+    pc, dof_handler_pc, fenicsx = setup_nirb_dvms_local_problems(nx=2, ny=2)
+    P_map = create_true_dof_map_fluid_full(dof_handler_pc, fenicsx["W"])
+    initialize_nirb_dvms_local_functions(pc, fenicsx, dof_handler_pc, P_map)
+
+    qdeg_pc = 1
+    qdeg_fx = 2
+    dx_pc = dx(metadata={"q": qdeg_pc})
+    dx_fx = ufl.dx(metadata={"quadrature_degree": qdeg_fx})
+
+    forms_pc = build_fluid_dvms_local_forms(
+        du=pc["du"],
+        dp=pc["dp"],
+        v=pc["v"],
+        q=pc["q"],
+        u_k=pc["u_k"],
+        u_prev=pc["u_prev"],
+        a_prev=pc["a_prev"],
+        p_k=pc["p_k"],
+        d_mesh=pc["d_mesh"],
+        d_prev=pc["d_prev"],
+        dx_measure=dx_pc,
+        rho=pc["rho"],
+        mu=pc["mu"],
+        dt=pc["dt"],
+        h=pc["h"],
+        bossak_ma0=pc["bossak_ma0"],
+        bossak_ma2=pc["bossak_ma2"],
+        bossak_alpha=pc["bossak_alpha"],
+        predicted_subscale=pc["predicted_subscale"],
+        old_subscale=pc["old_subscale"],
+        momentum_projection=pc["momentum_projection"],
+        mass_projection=pc["mass_projection"],
+        old_mass_residual=pc["old_mass_residual"],
+        body_force=pc["body_force"],
+        use_oss=False,
+    )
+
+    W_fx = fenicsx["W"]
+    w_trial = ufl.TrialFunction(W_fx)
+    w_test = ufl.TestFunction(W_fx)
+    du_fx, _dm_fx, dp_fx = ufl.split(w_trial)
+    v_fx, _z_fx, q_fx = ufl.split(w_test)
+    u_k_fx, d_mesh_fx, p_k_fx = ufl.split(fenicsx["u_m_p_k"])
+    u_prev_fx = fenicsx["u_prev"]
+    a_prev_fx = fenicsx["a_prev"]
+    d_prev_fx = fenicsx["d_prev"]
+
+    I2_fx = ufl.Identity(2)
+    F_fx = I2_fx + ufl.grad(d_mesh_fx)
+    J_fx = ufl.det(F_fx)
+    cof_F_fx = ufl.cofac(F_fx)
+    Finv_fx = cof_F_fx.T / J_fx
+    grad_u_phys_fx = ufl.dot(ufl.grad(u_k_fx), Finv_fx)
+    div_u_phys_fx = ufl.inner(cof_F_fx, ufl.grad(u_k_fx)) / J_fx
+    w_mesh_fx = (d_mesh_fx - d_prev_fx) / fenicsx["dt"]
+    resolved_conv_velocity_fx = u_k_fx - w_mesh_fx
+    a_curr_fx = fenicsx["bossak_ma0"] * (u_k_fx - u_prev_fx) + fenicsx["bossak_ma2"] * a_prev_fx
+    a_relaxed_fx = a_curr_fx
+    a_scheme_fx = (1.0 - fenicsx["bossak_alpha"]) * a_curr_fx + fenicsx["bossak_alpha"] * a_prev_fx
+    grad_p_phys_fx = ufl.dot(Finv_fx.T, ufl.grad(p_k_fx))
+
+    conv_velocity_fx = resolved_conv_velocity_fx + fenicsx["predicted_subscale"]
+    conv_speed_fx = ufl.sqrt(ufl.dot(conv_velocity_fx, conv_velocity_fx))
+    inv_dt_fx = dolfinx.fem.Constant(fenicsx["mesh"], 1.0 / float(fenicsx["dt"].value))
+    tau_one_fx = 1.0 / (
+        8.0 * fenicsx["mu"] / (fenicsx["h"] * fenicsx["h"])
+        + fenicsx["rho"] * (inv_dt_fx + 2.0 * conv_speed_fx / fenicsx["h"])
+    )
+    tau_two_fx = fenicsx["mu"] + fenicsx["rho"] * conv_speed_fx * fenicsx["h"] / 4.0
+    tau_p_fx = fenicsx["rho"] * fenicsx["h"] * fenicsx["h"] * inv_dt_fx / 8.0
+
+    grad_du_phys_fx = ufl.dot(ufl.grad(du_fx), Finv_fx)
+    div_du_phys_fx = ufl.inner(cof_F_fx, ufl.grad(du_fx)) / J_fx
+    div_v_phys_fx = ufl.inner(cof_F_fx, ufl.grad(v_fx)) / J_fx
+    grad_q_phys_fx = ufl.dot(Finv_fx.T, ufl.grad(q_fx))
+    grad_dp_phys_fx = ufl.dot(Finv_fx.T, ufl.grad(dp_fx))
+
+    sigma_fx = -p_k_fx * I2_fx + fenicsx["mu"] * (
+        grad_u_phys_fx + grad_u_phys_fx.T - (2.0 / 3.0) * div_u_phys_fx * I2_fx
+    )
+    sigma_du_fx = -dp_fx * I2_fx + fenicsx["mu"] * (
+        grad_du_phys_fx + grad_du_phys_fx.T - (2.0 / 3.0) * div_du_phys_fx * I2_fx
+    )
+    viscous_sigma_fx = fenicsx["mu"] * (
+        grad_u_phys_fx + grad_u_phys_fx.T - (2.0 / 3.0) * div_u_phys_fx * I2_fx
+    )
+    viscous_sigma_du_fx = fenicsx["mu"] * (
+        grad_du_phys_fx + grad_du_phys_fx.T - (2.0 / 3.0) * div_du_phys_fx * I2_fx
+    )
+
+    old_uss_term_fx = fenicsx["rho"] * inv_dt_fx * fenicsx["old_subscale"]
+    add_velocity_source_fx = fenicsx["body_force"] - fenicsx["momentum_projection"] + old_uss_term_fx
+    tau_test_conv_fx = fenicsx["rho"] * ufl.dot(ufl.dot(ufl.grad(v_fx), Finv_fx), conv_velocity_fx)
+    tau_test_mass_fx = tau_test_conv_fx - inv_dt_fx * v_fx + grad_q_phys_fx
+    tau_test_source_v_fx = tau_test_conv_fx - fenicsx["rho"] * inv_dt_fx * v_fx
+    tau_res_static_conv_fx = fenicsx["rho"] * ufl.dot(grad_u_phys_fx, conv_velocity_fx)
+    tau_res_static_pres_fx = grad_p_phys_fx
+    tau_dres_static_conv_1_fx = fenicsx["rho"] * ufl.dot(grad_du_phys_fx, conv_velocity_fx)
+
+    add_velocity_residual_fx = (
+        J_fx * ufl.dot(fenicsx["body_force"] + old_uss_term_fx, v_fx) * dx_fx
+        + J_fx * tau_one_fx * ufl.dot(tau_test_source_v_fx, add_velocity_source_fx) * dx_fx
+        + J_fx * tau_one_fx * ufl.dot(grad_q_phys_fx, add_velocity_source_fx) * dx_fx
+        - J_fx * ((tau_two_fx + tau_p_fx) * fenicsx["mass_projection"] * div_v_phys_fx) * dx_fx
+        - J_fx * (tau_p_fx * fenicsx["old_mass_residual"] * div_v_phys_fx) * dx_fx
+        - J_fx * fenicsx["rho"] * ufl.dot(ufl.dot(grad_u_phys_fx, conv_velocity_fx), v_fx) * dx_fx
+        - J_fx * tau_one_fx * ufl.dot(tau_test_source_v_fx, tau_res_static_conv_fx) * dx_fx
+        - J_fx * tau_one_fx * ufl.dot(tau_test_conv_fx, tau_res_static_pres_fx) * dx_fx
+        + J_fx * tau_one_fx * ufl.dot(fenicsx["rho"] * inv_dt_fx * v_fx, tau_res_static_pres_fx) * dx_fx
+        + ufl.inner(cof_F_fx, ufl.grad(v_fx)) * p_k_fx * dx_fx
+        - J_fx * tau_one_fx * ufl.dot(grad_q_phys_fx, tau_res_static_conv_fx) * dx_fx
+        - ufl.inner(cof_F_fx, ufl.grad(u_k_fx)) * q_fx * dx_fx
+        - J_fx * tau_one_fx * ufl.dot(grad_q_phys_fx, tau_res_static_pres_fx) * dx_fx
+        - J_fx * ((tau_two_fx + tau_p_fx) * div_u_phys_fx * div_v_phys_fx) * dx_fx
+        - ufl.inner(J_fx * ufl.dot(viscous_sigma_fx, Finv_fx.T), ufl.grad(v_fx)) * dx_fx
+    )
+    add_velocity_jacobian_fx = (
+        J_fx * fenicsx["rho"] * ufl.dot(ufl.dot(grad_du_phys_fx, conv_velocity_fx), v_fx) * dx_fx
+        + J_fx * tau_one_fx * ufl.dot(tau_test_source_v_fx, tau_dres_static_conv_1_fx) * dx_fx
+        + J_fx * tau_one_fx * ufl.dot(tau_test_conv_fx, grad_dp_phys_fx) * dx_fx
+        - J_fx * tau_one_fx * ufl.dot(fenicsx["rho"] * inv_dt_fx * v_fx, grad_dp_phys_fx) * dx_fx
+        - ufl.inner(cof_F_fx, ufl.grad(v_fx)) * dp_fx * dx_fx
+        + J_fx * tau_one_fx * ufl.dot(grad_q_phys_fx, tau_dres_static_conv_1_fx) * dx_fx
+        + ufl.inner(cof_F_fx, ufl.grad(du_fx)) * q_fx * dx_fx
+        + J_fx * tau_one_fx * ufl.dot(grad_q_phys_fx, grad_dp_phys_fx) * dx_fx
+        + J_fx * ((tau_two_fx + tau_p_fx) * div_du_phys_fx * div_v_phys_fx) * dx_fx
+        + ufl.inner(J_fx * ufl.dot(viscous_sigma_du_fx, Finv_fx.T), ufl.grad(v_fx)) * dx_fx
+    )
+
+    bossak_mam_fx = (1.0 - fenicsx["bossak_alpha"]) * fenicsx["bossak_ma0"]
+    mass_lhs_fx = J_fx * fenicsx["rho"] * ufl.dot(du_fx, v_fx) * dx_fx
+    mass_stabilization_fx = J_fx * tau_one_fx * ufl.dot(tau_test_mass_fx, fenicsx["rho"] * du_fx) * dx_fx
+    mass_stabilization_action_fx = J_fx * tau_one_fx * ufl.dot(tau_test_mass_fx, fenicsx["rho"] * a_scheme_fx) * dx_fx
+    system_residual_fx = (
+        add_velocity_residual_fx
+        - J_fx * fenicsx["rho"] * ufl.dot(a_scheme_fx, v_fx) * dx_fx
+        - mass_stabilization_action_fx
+    )
+    system_jacobian_fx = (
+        add_velocity_jacobian_fx
+        + J_fx * bossak_mam_fx * fenicsx["rho"] * ufl.dot(du_fx, v_fx) * dx_fx
+        + J_fx * bossak_mam_fx * tau_one_fx * ufl.dot(tau_test_mass_fx, fenicsx["rho"] * du_fx) * dx_fx
+    )
+
+    terms = {
+        "NIRB DVMS add-velocity residual": {"pc": forms_pc.add_velocity_residual, "fx": add_velocity_residual_fx, "mat": False},
+        "NIRB DVMS add-velocity jacobian": {"pc": forms_pc.add_velocity_jacobian, "fx": add_velocity_jacobian_fx, "mat": True},
+        "NIRB DVMS mass lhs": {"pc": forms_pc.mass_lhs, "fx": mass_lhs_fx, "mat": True},
+        "NIRB DVMS mass stabilization": {"pc": forms_pc.mass_stabilization, "fx": mass_stabilization_fx, "mat": True},
+        "NIRB DVMS system residual": {"pc": forms_pc.system_residual, "fx": system_residual_fx, "mat": False},
+        "NIRB DVMS system jacobian": {"pc": forms_pc.system_jacobian, "fx": system_jacobian_fx, "mat": True},
+    }
+
+    filter_terms = os.environ.get("COMP_FENICS_TERMS")
+    if filter_terms:
+        allowed = _parse_filter_terms(filter_terms)
+        terms = {name: spec for name, spec in terms.items() if name in allowed}
+        print(f"Running filtered NIRB DVMS terms only: {sorted(terms)}")
+    else:
+        print(f"Running NIRB DVMS terms: {sorted(terms)}")
+
+    fenics_ref = {}
+    for name, spec in terms.items():
+        form_fx = dolfinx.fem.form(spec["fx"])
+        if spec["mat"]:
+            A = dolfinx.fem.petsc.assemble_matrix(form_fx)
+            A.assemble()
+            indptr, indices, data = A.getValuesCSR()
+            fenics_ref[name] = csr_matrix((data, indices, indptr), shape=A.getSize()).toarray()
+        else:
+            vec = dolfinx.fem.petsc.assemble_vector(form_fx)
+            fenics_ref[name] = np.asarray(vec.array, dtype=float).copy()
+
+    success_count = 0
+    failed_tests = []
+    try:
+        for backend_type in _requested_backends("python,jit,cpp"):
+            print("\n" + "=" * 70)
+            print(f"COMPARISON (problem=nirb_dvms_local, backend={backend_type})")
+            print("=" * 70)
+            for name, spec in terms.items():
+                print(f"Compiling/assembling '{name}' [backend={backend_type}]")
+                if spec["mat"]:
+                    J_pc, _ = assemble_form(
+                        Equation(spec["pc"], None),
+                        dof_handler_pc,
+                        quad_degree=qdeg_pc,
+                        bcs=[],
+                        backend=backend_type,
+                    )
+                    R_pc = None
+                    J_fx_ref = fenics_ref[name]
+                    R_fx_ref = None
+                else:
+                    _, R_pc = assemble_form(
+                        Equation(None, spec["pc"]),
+                        dof_handler_pc,
+                        quad_degree=qdeg_pc,
+                        bcs=[],
+                        backend=backend_type,
+                    )
+                    J_pc = None
+                    J_fx_ref = None
+                    R_fx_ref = fenics_ref[name]
+
+                is_success = compare_term(
+                    f"{name} [backend={backend_type}]",
+                    J_pc,
+                    R_pc,
+                    J_fx_ref,
+                    R_fx_ref,
+                    P_map,
+                    dof_handler_pc,
+                    W_fx,
+                    rtol=1.0e-12,
+                    atol=1.0e-12,
+                )
+                if is_success:
+                    success_count += 1
+                else:
+                    failed_tests.append(_failure_label(name, backend_type))
+    except KeyboardInterrupt:
+        print("\n⛔ KeyboardInterrupt (Ctrl+C). Showing summary so far...")
+        print_test_summary(success_count, failed_tests)
+        _print_global_summary()
+        sys.exit(130)
+
     print_test_summary(success_count, failed_tests)
 
 
@@ -6369,6 +6870,7 @@ if run_all_suites:
     run_poro_comparison()
     run_component_semantics_comparison()
     run_multiplication_semantics_comparison()
+    run_nirb_dvms_local_comparison()
     # The script will now naturally fall through to run the fluid comparison below
 
 def run_fluid_comparison():
@@ -6400,6 +6902,10 @@ def run_fluid_comparison():
             sys.exit(0)
         if problem.startswith("multiplication") or problem.startswith("product_semantics") or problem.startswith("product-semantics"):
             run_multiplication_semantics_comparison()
+            _print_global_summary()
+            sys.exit(0)
+        if problem.startswith("nirb_dvms") or problem.startswith("nirb-dvms") or problem.startswith("dvms_local") or problem.startswith("dvms-local"):
+            run_nirb_dvms_local_comparison()
             _print_global_summary()
             sys.exit(0)
         if problem.startswith("fluid_full") or problem.startswith("example2_full") or problem.startswith("nirb_full"):

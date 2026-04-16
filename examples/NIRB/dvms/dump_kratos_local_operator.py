@@ -66,7 +66,112 @@ def parse_args() -> argparse.Namespace:
         default="solved",
         help="Dump the local operator before SolveSolutionStep() ('predicted') or after the first solved step ('solved').",
     )
+    parser.add_argument(
+        "--state-npz",
+        type=Path,
+        default=None,
+        help=(
+            "Optional saved fluid state npz. When provided, the model is initialized and "
+            "the nodal/current geometry state is injected from this file instead of rerunning "
+            "the nonlinear solve."
+        ),
+    )
     return parser.parse_args()
+
+
+def _safe_np_array(state: dict[str, np.ndarray], key: str, *, default=None):
+    value = state.get(str(key), default)
+    if value is None:
+        return None
+    return np.asarray(value)
+
+
+def _load_state_npz(path: Path) -> dict[str, np.ndarray]:
+    with np.load(Path(path).resolve(), allow_pickle=False) as data:
+        payload: dict[str, np.ndarray] = {}
+        for key in data.files:
+            payload[str(key)] = np.asarray(data[key])
+    return payload
+
+
+def _set_step_scalar(node, variable, value: float, *, step: int = 0) -> None:
+    try:
+        node.SetSolutionStepValue(variable, int(step), float(value))
+    except Exception:
+        node.SetValue(variable, float(value))
+
+
+def _set_step_vec2(node, var_x, var_y, values, *, step: int = 0) -> None:
+    values_arr = np.asarray(values, dtype=float).reshape(-1)
+    x_val = float(values_arr[0]) if values_arr.size >= 1 else 0.0
+    y_val = float(values_arr[1]) if values_arr.size >= 2 else 0.0
+    _set_step_scalar(node, var_x, x_val, step=int(step))
+    _set_step_scalar(node, var_y, y_val, step=int(step))
+
+
+def _array_inf_norm(values) -> float:
+    arr = np.asarray(values, dtype=float)
+    return float(np.max(np.abs(arr))) if arr.size else 0.0
+
+
+def _apply_state_npz_to_model(*, KM, model_part, state: dict[str, np.ndarray], dt: float) -> None:
+    node_ids = _safe_np_array(state, "node_ids")
+    if node_ids is None:
+        raise KeyError("State npz does not contain 'node_ids'.")
+    coords_ref = _safe_np_array(state, "node_coords_ref")
+    if coords_ref is None:
+        coords_ref = _safe_np_array(state, "coords_ref")
+    coords_cur = _safe_np_array(state, "node_coords_cur")
+    if coords_cur is None:
+        coords_cur = _safe_np_array(state, "coords_cur", default=coords_ref)
+    velocity = _safe_np_array(state, "velocity")
+    velocity_prev = _safe_np_array(state, "velocity_prev")
+    acceleration = _safe_np_array(state, "acceleration")
+    mesh_velocity = _safe_np_array(state, "mesh_velocity")
+    pressure = _safe_np_array(state, "pressure")
+    reaction = _safe_np_array(state, "reaction")
+    advproj = _safe_np_array(state, "advproj")
+    divproj = _safe_np_array(state, "divproj")
+    mesh_displacement = _safe_np_array(state, "mesh_displacement")
+    if mesh_displacement is None and coords_ref is not None and coords_cur is not None:
+        mesh_displacement = np.asarray(coords_cur, dtype=float) - np.asarray(coords_ref, dtype=float)
+    mesh_displacement_prev = None
+    if mesh_displacement is not None and mesh_velocity is not None:
+        mesh_displacement_prev = np.asarray(mesh_displacement, dtype=float) - float(dt) * np.asarray(mesh_velocity, dtype=float)
+
+    index_by_node = {int(nid): idx for idx, nid in enumerate(np.asarray(node_ids, dtype=int).reshape(-1).tolist())}
+    for node in model_part.Nodes:
+        node_id = int(node.Id)
+        idx = index_by_node.get(node_id)
+        if idx is None:
+            continue
+        if coords_ref is not None:
+            node.X0 = float(coords_ref[idx, 0])
+            node.Y0 = float(coords_ref[idx, 1])
+        if coords_cur is not None:
+            node.X = float(coords_cur[idx, 0])
+            node.Y = float(coords_cur[idx, 1])
+        if velocity is not None:
+            _set_step_vec2(node, KM.VELOCITY_X, KM.VELOCITY_Y, velocity[idx], step=0)
+        if velocity_prev is not None:
+            _set_step_vec2(node, KM.VELOCITY_X, KM.VELOCITY_Y, velocity_prev[idx], step=1)
+        if acceleration is not None:
+            _set_step_vec2(node, KM.ACCELERATION_X, KM.ACCELERATION_Y, acceleration[idx], step=0)
+        if mesh_velocity is not None:
+            _set_step_vec2(node, KM.MESH_VELOCITY_X, KM.MESH_VELOCITY_Y, mesh_velocity[idx], step=0)
+            _set_step_vec2(node, KM.MESH_VELOCITY_X, KM.MESH_VELOCITY_Y, mesh_velocity[idx], step=1)
+        if mesh_displacement is not None:
+            _set_step_vec2(node, KM.MESH_DISPLACEMENT_X, KM.MESH_DISPLACEMENT_Y, mesh_displacement[idx], step=0)
+        if mesh_displacement_prev is not None:
+            _set_step_vec2(node, KM.MESH_DISPLACEMENT_X, KM.MESH_DISPLACEMENT_Y, mesh_displacement_prev[idx], step=1)
+        if pressure is not None:
+            _set_step_scalar(node, KM.PRESSURE, float(pressure[idx]), step=0)
+        if reaction is not None:
+            _set_step_vec2(node, KM.REACTION_X, KM.REACTION_Y, reaction[idx], step=0)
+        if advproj is not None:
+            _set_step_vec2(node, KM.ADVPROJ_X, KM.ADVPROJ_Y, advproj[idx], step=0)
+        if divproj is not None:
+            _set_step_scalar(node, KM.DIVPROJ, float(divproj[idx]), step=0)
 
 
 def _dump_local_operator(
@@ -75,6 +180,7 @@ def _dump_local_operator(
     KFD,
     root_model_part,
     model_part,
+    scheme,
     output_stem: str,
     run_dir: Path,
     element_id: int | None,
@@ -98,8 +204,14 @@ def _dump_local_operator(
     velocity_rhs = KM.Vector()
     system_lhs = KM.Matrix()
     system_rhs = KM.Vector()
+    scheme_lhs = KM.Matrix()
+    scheme_rhs = KM.Vector()
+    scheme_eq_ids = KM.Vector()
     elem.CalculateLocalVelocityContribution(velocity_lhs, velocity_rhs, process_info)
     elem.CalculateLocalSystem(system_lhs, system_rhs, process_info)
+    scheme_contrib_available = hasattr(scheme, "CalculateSystemContributions")
+    if bool(scheme_contrib_available):
+        scheme.CalculateSystemContributions(elem, scheme_lhs, scheme_rhs, scheme_eq_ids, process_info)
     if str(mode) == "velocity":
         lhs, rhs = velocity_lhs, velocity_rhs
     elif str(mode) == "system":
@@ -210,6 +322,9 @@ def _dump_local_operator(
         velocity_rhs=np.asarray(velocity_rhs, dtype=float),
         system_lhs=np.asarray(system_lhs, dtype=float),
         system_rhs=np.asarray(system_rhs, dtype=float),
+        scheme_lhs=np.asarray(scheme_lhs, dtype=float),
+        scheme_rhs=np.asarray(scheme_rhs, dtype=float),
+        scheme_equation_ids=np.asarray(scheme_eq_ids, dtype=int),
         dof_equation_ids=np.asarray([int(item["equation_id"]) for item in dof_info], dtype=int),
     )
     if extra_matrices:
@@ -241,16 +356,22 @@ def _dump_local_operator(
                 "mode": str(mode),
                 "velocity_lhs_shape": [int(velocity_lhs.Size1()), int(velocity_lhs.Size2())],
                 "velocity_rhs_size": int(velocity_rhs.Size()),
-                "velocity_lhs_inf_norm": float(np.max(np.abs(np.asarray(velocity_lhs, dtype=float)))),
+                "velocity_lhs_inf_norm": _array_inf_norm(velocity_lhs),
                 "velocity_rhs_inf_norm": float(np.max(np.abs(np.asarray(velocity_rhs, dtype=float)))) if velocity_rhs.Size() else 0.0,
                 "system_lhs_shape": [int(system_lhs.Size1()), int(system_lhs.Size2())],
                 "system_rhs_size": int(system_rhs.Size()),
-                "system_lhs_inf_norm": float(np.max(np.abs(np.asarray(system_lhs, dtype=float)))),
+                "system_lhs_inf_norm": _array_inf_norm(system_lhs),
                 "system_rhs_inf_norm": float(np.max(np.abs(np.asarray(system_rhs, dtype=float)))) if system_rhs.Size() else 0.0,
+                "scheme_lhs_shape": [int(scheme_lhs.Size1()), int(scheme_lhs.Size2())],
+                "scheme_rhs_size": int(scheme_rhs.Size()),
+                "scheme_lhs_inf_norm": _array_inf_norm(scheme_lhs),
+                "scheme_rhs_inf_norm": float(np.max(np.abs(np.asarray(scheme_rhs, dtype=float)))) if scheme_rhs.Size() else 0.0,
+                "scheme_contrib_available": bool(scheme_contrib_available),
+                "scheme_equation_ids": np.asarray(scheme_eq_ids, dtype=int).tolist(),
                 "dofs": dof_info,
                 "lhs_shape": [int(lhs.Size1()), int(lhs.Size2())],
                 "rhs_size": int(rhs.Size()),
-                "lhs_inf_norm": float(np.max(np.abs(np.asarray(lhs, dtype=float)))),
+                "lhs_inf_norm": _array_inf_norm(lhs),
                 "rhs_inf_norm": float(np.max(np.abs(np.asarray(rhs, dtype=float)))) if rhs.Size() else 0.0,
                 "extra_matrices": {
                     key: {
@@ -276,6 +397,8 @@ def _dump_local_operator(
 
 def main() -> None:
     args = parse_args()
+    if args.state_npz is not None:
+        args.state_npz = Path(args.state_npz).resolve()
 
     try:
         import KratosMultiphysics as KM
@@ -315,17 +438,27 @@ def main() -> None:
             analysis.time = new_time
         analysis.InitializeSolutionStep()
         solver.Predict()
-
-        if str(args.stage) == "solved":
+        if args.state_npz is not None:
+            root_process_info = model["FluidModelPart"].ProcessInfo
+            dt_value = float(root_process_info[KM.DELTA_TIME]) if root_process_info.Has(KM.DELTA_TIME) else float(args.end_time)
+            _apply_state_npz_to_model(
+                KM=KM,
+                model_part=model["FluidModelPart.FluidParts_FluidPart"],
+                state=_load_state_npz(Path(args.state_npz)),
+                dt=float(dt_value),
+            )
+        elif str(args.stage) == "solved":
             solver.SolveSolutionStep()
 
         root_model_part = model["FluidModelPart"]
         model_part = model["FluidModelPart.FluidParts_FluidPart"]
+        scheme = solver.fluid_solver._GetScheme()
         npz_path, json_path = _dump_local_operator(
             KM=KM,
             KFD=KFD,
             root_model_part=root_model_part,
             model_part=model_part,
+            scheme=scheme,
             output_stem=str(args.output_stem),
             run_dir=run_dir,
             element_id=args.element_id,

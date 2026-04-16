@@ -94,8 +94,17 @@ def _load_manifest(path: Path) -> list[dict[str, Any]]:
     return list(data.get("records", []))
 
 
-def _find_npz(manifest: list[dict[str, Any]], *, stage: str, iteration: int, monitor_dir: Path) -> Path | None:
+def _find_npz(
+    manifest: list[dict[str, Any]],
+    *,
+    stage: str,
+    iteration: int,
+    monitor_dir: Path,
+    step: int | None = None,
+) -> Path | None:
     for record in manifest:
+        if step is not None and int(record.get("step", -1)) != int(step):
+            continue
         if str(record.get("stage")) != str(stage):
             continue
         if int(record.get("iteration", -1)) != int(iteration):
@@ -118,6 +127,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Compare local Example 2 interface traces against a monitored Kratos coupling run.")
     parser.add_argument("--local-output-dir", type=Path, required=True)
     parser.add_argument("--kratos-monitor-dir", type=Path, required=True)
+    parser.add_argument("--step", type=int, default=1)
     parser.add_argument("--structure-stage", type=str, default="after_sync_output_structure")
     parser.add_argument("--fluid-stage", type=str, default="after_sync_output_fluid")
     parser.add_argument("--output-path", type=Path, default=None)
@@ -137,23 +147,48 @@ def main() -> None:
 
     manifest = _load_manifest(kratos_monitor_dir / "manifest.json")
     local_coords = np.load(co_sim_dir / "coords_interf.npy")
+    local_coords_fluid = (
+        np.load(co_sim_dir / "coords_interf_fluid.npy")
+        if (co_sim_dir / "coords_interf_fluid.npy").exists()
+        else local_coords
+    )
     local_disp = _load_matrix(co_sim_dir / "interface_disp_data.npy")
     local_vel = _load_matrix(co_sim_dir / "interface_velocity_data.npy")
-    local_load = _load_matrix(co_sim_dir / "load_return_data.npy")
-    if local_load is None:
-        local_load = _load_matrix(co_sim_dir / "load_data.npy")
-    local_guess = _load_matrix(co_sim_dir / "load_guess_data.npy")
+    local_load_return = _load_matrix(co_sim_dir / "load_return_data.npy")
+    if local_load_return is None:
+        local_load_return = _load_matrix(co_sim_dir / "load_data.npy")
+    local_load_guess = _load_matrix(co_sim_dir / "load_guess_data.npy")
+    local_fluid_load_guess = _load_matrix(co_sim_dir / "fluid_load_guess_data.npy")
+    local_fluid_load_return = _load_matrix(co_sim_dir / "fluid_load_return_data.npy")
     local_reaction = _load_matrix(co_sim_dir / "load_reaction_data.npy")
     local_stress = _load_matrix(co_sim_dir / "load_stress_data.npy")
 
-    iterations = sorted({int(record["iteration"]) for record in manifest if int(record.get("iteration", 0)) > 0})
+    iterations = sorted(
+        {
+            int(record["iteration"])
+            for record in manifest
+            if int(record.get("iteration", 0)) > 0 and int(record.get("step", -1)) == int(args.step)
+        }
+    )
     rows: list[dict[str, Any]] = []
 
     for iteration in iterations:
         row: dict[str, Any] = {"iteration": int(iteration)}
 
-        struct_npz = _find_npz(manifest, stage=str(args.structure_stage), iteration=iteration, monitor_dir=kratos_monitor_dir)
-        fluid_npz = _find_npz(manifest, stage=str(args.fluid_stage), iteration=iteration, monitor_dir=kratos_monitor_dir)
+        struct_npz = _find_npz(
+            manifest,
+            stage=str(args.structure_stage),
+            iteration=iteration,
+            monitor_dir=kratos_monitor_dir,
+            step=int(args.step),
+        )
+        fluid_npz = _find_npz(
+            manifest,
+            stage=str(args.fluid_stage),
+            iteration=iteration,
+            monitor_dir=kratos_monitor_dir,
+            step=int(args.step),
+        )
 
         if struct_npz is not None:
             try:
@@ -176,20 +211,62 @@ def main() -> None:
                         row[f"fluid_velocity_{key}"] = value
             except KeyError:
                 pass
-
+        if struct_npz is not None:
             try:
-                ref_coords, ref_load = _npz_field(fluid_npz, solver="fluid", field="load")
+                ref_coords_guess, ref_load_guess = _npz_field(struct_npz, solver="fluid", field="load")
+                local_snapshot = _load_local_snapshot(
+                    local_fluid_load_guess if local_fluid_load_guess is not None else local_load_guess,
+                    local_coords_fluid if local_fluid_load_guess is not None else local_coords,
+                    iteration,
+                )
+                if local_snapshot is not None:
+                    local_guess_coords, local_values = local_snapshot
+                    for key, value in _compare_fields(
+                        ref_coords_guess,
+                        ref_load_guess,
+                        local_guess_coords,
+                        local_values,
+                    ).items():
+                        row[f"fluid_load_guess_{key}"] = value
+            except KeyError:
+                pass
+
+        if fluid_npz is not None:
+            try:
+                ref_coords_return, ref_load_return = _npz_field(fluid_npz, solver="fluid", field="load")
+                # Prefer the local fluid-side traces when available. The
+                # structure-side traces are still useful diagnostics, but they
+                # include the extra fluid->structure mapper path and are not a
+                # like-for-like compare to the monitored Kratos fluid load.
+                fluid_return_snapshot = _load_local_snapshot(
+                    local_fluid_load_return if local_fluid_load_return is not None else local_load_return,
+                    local_coords_fluid if local_fluid_load_return is not None else local_coords,
+                    iteration,
+                )
+                if fluid_return_snapshot is not None:
+                    local_return_coords, local_values = fluid_return_snapshot
+                    for key, value in _compare_fields(
+                        ref_coords_return,
+                        ref_load_return,
+                        local_return_coords,
+                        local_values,
+                    ).items():
+                        row["fluid_load_return_" + key] = value
+
                 for label, matrix in (
-                    ("load_return", local_load),
-                    ("load_guess", local_guess),
-                    ("load_reaction", local_reaction),
-                    ("load_stress", local_stress),
+                    ("fluid_load_reaction", local_reaction),
+                    ("fluid_load_stress", local_stress),
                 ):
                     local_snapshot = _load_local_snapshot(matrix, local_coords, iteration)
                     if local_snapshot is None:
                         continue
-                    _, local_values = local_snapshot
-                    for key, value in _compare_fields(ref_coords, ref_load, local_coords, local_values).items():
+                    local_struct_coords, local_values = local_snapshot
+                    for key, value in _compare_fields(
+                        ref_coords_return,
+                        ref_load_return,
+                        local_struct_coords,
+                        -1.0 * local_values,
+                    ).items():
                         row[f"{label}_{key}"] = value
             except KeyError:
                 pass
@@ -199,6 +276,7 @@ def main() -> None:
     summary = {
         "local_output_dir": str(local_output_dir),
         "kratos_monitor_dir": str(kratos_monitor_dir),
+        "step": int(args.step),
         "structure_stage": str(args.structure_stage),
         "fluid_stage": str(args.fluid_stage),
         "iterations": rows,

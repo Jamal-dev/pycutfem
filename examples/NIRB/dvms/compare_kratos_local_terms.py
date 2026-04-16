@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 
 from pycutfem.ufl.compilers import FormCompiler
-from pycutfem.ufl.expressions import TestFunction, TrialFunction, VectorTestFunction, VectorTrialFunction
+from pycutfem.ufl.expressions import Constant, TestFunction, TrialFunction, VectorTestFunction, VectorTrialFunction
 from pycutfem.ufl.forms import Equation
 from pycutfem.ufl.measures import dx
 from pycutfem.ufl.spaces import FunctionSpace
@@ -15,7 +15,11 @@ from pycutfem.ufl.spaces import FunctionSpace
 from examples.NIRB.example2_local_setup import load_example2_local_setup
 from examples.NIRB.run_example2_local import _build_fluid_problem, _load_reference_partitioned_meshes
 from examples.NIRB.dvms.symbolics import build_fluid_dvms_kratos_split_forms
-from examples.NIRB.dvms.helpers import _bossak_coefficients, _kratos_dvms_element_size_coefficient
+from examples.NIRB.dvms.helpers import (
+    _bossak_coefficients,
+    _kratos_dvms_current_element_size_array,
+    _kratos_dvms_element_size_coefficient,
+)
 
 
 _GROUPED_TO_INTERLEAVED_TRI3 = np.asarray([0, 3, 6, 1, 4, 7, 2, 5, 8], dtype=int)
@@ -77,7 +81,14 @@ def _assemble_single_term(*, compiler, form, eid: int, dh):
     return _compress_single_fluid_block(dh, batch)
 
 
-def _set_local_fields_from_dump(*, fluid: dict[str, object], eid: int, dump, dt: float) -> None:
+def _set_local_fields_from_dump(
+    *,
+    fluid: dict[str, object],
+    eid: int,
+    dump,
+    dt: float,
+    zero_previous_history: bool = False,
+) -> None:
     ux_g = np.asarray(fluid["dh"].element_maps["ux"][eid], dtype=int)
     uy_g = np.asarray(fluid["dh"].element_maps["uy"][eid], dtype=int)
     p_g = np.asarray(fluid["dh"].element_maps["p"][eid], dtype=int)
@@ -97,16 +108,41 @@ def _set_local_fields_from_dump(*, fluid: dict[str, object], eid: int, dump, dt:
     fluid["u_k"].components[1].set_nodal_values(uy_g, velocity[:, 1])
     fluid["u_prev"].components[0].set_nodal_values(ux_g, velocity_prev[:, 0])
     fluid["u_prev"].components[1].set_nodal_values(uy_g, velocity_prev[:, 1])
-    fluid["a_prev"].components[0].set_nodal_values(ux_g, acceleration[:, 0])
-    fluid["a_prev"].components[1].set_nodal_values(uy_g, acceleration[:, 1])
     fluid["p_k"].set_nodal_values(p_g, pressure)
 
     disp = coords_cur - coords_ref
-    disp_prev = disp - float(dt) * mesh_velocity
+    if bool(zero_previous_history):
+        acc_prev = np.zeros_like(acceleration)
+        disp_prev = np.zeros_like(disp)
+        mesh_vel_prev = np.zeros_like(mesh_velocity)
+        mesh_acc_prev = np.zeros_like(mesh_velocity)
+        disp_prev2 = np.zeros_like(disp)
+    else:
+        bossak = _bossak_coefficients(alpha=-0.3, dt=float(dt))
+        # Kratos dumps the current-step ACCELERATION. The local operator,
+        # however, expects the previous-step history field a_prev. Recover it
+        # from the Bossak recurrence instead of reusing the current value.
+        acc_prev = (
+            np.asarray(acceleration, dtype=float)
+            - float(bossak["ma0"]) * (np.asarray(velocity, dtype=float) - np.asarray(velocity_prev, dtype=float))
+        ) / float(bossak["ma2"])
+        disp_prev = disp - float(dt) * mesh_velocity
+        mesh_vel_prev = mesh_velocity
+        mesh_acc_prev = np.zeros_like(mesh_velocity)
+        disp_prev2 = disp_prev
+
+    fluid["a_prev"].components[0].set_nodal_values(ux_g, acc_prev[:, 0])
+    fluid["a_prev"].components[1].set_nodal_values(uy_g, acc_prev[:, 1])
     fluid["d_mesh"].components[0].set_nodal_values(mx_g, disp[:, 0])
     fluid["d_mesh"].components[1].set_nodal_values(my_g, disp[:, 1])
     fluid["d_prev"].components[0].set_nodal_values(mx_g, disp_prev[:, 0])
     fluid["d_prev"].components[1].set_nodal_values(my_g, disp_prev[:, 1])
+    fluid["d_prev2"].components[0].set_nodal_values(mx_g, disp_prev2[:, 0])
+    fluid["d_prev2"].components[1].set_nodal_values(my_g, disp_prev2[:, 1])
+    fluid["w_mesh_prev"].components[0].set_nodal_values(mx_g, mesh_vel_prev[:, 0])
+    fluid["w_mesh_prev"].components[1].set_nodal_values(my_g, mesh_vel_prev[:, 1])
+    fluid["a_mesh_prev"].components[0].set_nodal_values(mx_g, mesh_acc_prev[:, 0])
+    fluid["a_mesh_prev"].components[1].set_nodal_values(my_g, mesh_acc_prev[:, 1])
 
 
 def _set_dvms_state_from_dump(*, fluid: dict[str, object], eid: int, dump) -> None:
@@ -214,6 +250,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rho", type=float, default=1000.0)
     parser.add_argument("--mu", type=float, default=None)
     parser.add_argument("--backend", choices=("python", "jit", "cpp"), default="cpp")
+    parser.add_argument(
+        "--zero-previous-history",
+        action="store_true",
+        help="Inject zero a_prev / d_prev / d_prev2 / mesh-history fields. Use this for first-step solved-state dumps.",
+    )
     return parser.parse_args()
 
 
@@ -234,7 +275,13 @@ def main() -> None:
         else float(setup.material.density * setup.material.kinematic_viscosity)
     )
 
-    _set_local_fields_from_dump(fluid=fluid, eid=eid, dump=dump, dt=float(args.dt))
+    _set_local_fields_from_dump(
+        fluid=fluid,
+        eid=eid,
+        dump=dump,
+        dt=float(args.dt),
+        zero_previous_history=bool(args.zero_previous_history),
+    )
     _set_dvms_state_from_dump(fluid=fluid, eid=eid, dump=dump)
 
     du, dp, v, q = _local_trial_test_functions(fluid["dh"])
@@ -255,7 +302,16 @@ def main() -> None:
         rho=float(args.rho),
         mu=float(mu_value),
         dt=float(args.dt),
-        h=_kratos_dvms_element_size_coefficient(mesh_f),
+        h=Constant(
+            float(
+                _kratos_dvms_current_element_size_array(
+                    mesh_f,
+                    fluid["dh"],
+                    fluid["d_mesh"],
+                    element_ids=np.asarray([eid], dtype=int),
+                )[0]
+            )
+        ),
         bossak_ma0=float(bossak["ma0"]),
         bossak_ma2=float(bossak["ma2"]),
         bossak_alpha=float(bossak["alpha"]),
@@ -376,6 +432,17 @@ def main() -> None:
         "projection_inf_norms": {
             "advproj_nodal_inf": float(np.max(np.abs(np.asarray(dump["advproj"], dtype=float)))),
             "divproj_nodal_inf": float(np.max(np.abs(np.asarray(dump["divproj"], dtype=float)))),
+        },
+        "element_size": {
+            "reference_h": float(_kratos_dvms_element_size_coefficient(mesh_f).values[int(eid)]),
+            "current_h": float(
+                _kratos_dvms_current_element_size_array(
+                    mesh_f,
+                    fluid["dh"],
+                    fluid["d_mesh"],
+                    element_ids=np.asarray([eid], dtype=int),
+                )[0]
+            ),
         },
         "bossak_mam": float(bossak_mam),
     }

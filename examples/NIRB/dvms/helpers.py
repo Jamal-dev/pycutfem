@@ -86,6 +86,57 @@ def _kratos_dvms_element_size_coefficient(mesh: Mesh) -> ElementWiseConstant:
     return ElementWiseConstant(_kratos_dvms_element_size_array(mesh))
 
 
+def _kratos_dvms_current_element_size_array(
+    mesh: Mesh,
+    dh: DofHandler,
+    d_mesh: VectorFunction,
+    *,
+    element_ids: np.ndarray | None = None,
+) -> np.ndarray:
+    eids = (
+        np.arange(int(mesh.n_elements), dtype=int)
+        if element_ids is None
+        else np.asarray(element_ids, dtype=int).reshape(-1)
+    )
+    conn_all = np.asarray(mesh.elements_connectivity, dtype=int)
+    conn = conn_all[eids]
+    coords_ref = np.asarray(mesh.nodes_x_y_pos[conn], dtype=float)
+    if coords_ref.ndim != 3 or coords_ref.shape[1:] != (3, 2):
+        return _kratos_dvms_element_size_array(mesh)[eids]
+
+    mx_name = d_mesh.components[0].field_name
+    my_name = d_mesh.components[1].field_name
+    mx_all = _field_values_on_global_dofs(dh, mx_name, d_mesh.components[0].nodal_values)
+    my_all = _field_values_on_global_dofs(dh, my_name, d_mesh.components[1].nodal_values)
+    mx_local = np.asarray(mx_all[np.asarray(dh.element_maps[mx_name], dtype=int)[eids]], dtype=float)
+    my_local = np.asarray(my_all[np.asarray(dh.element_maps[my_name], dtype=int)[eids]], dtype=float)
+
+    coords_cur = np.asarray(coords_ref, dtype=float).copy()
+    coords_cur[:, :, 0] += mx_local
+    coords_cur[:, :, 1] += my_local
+
+    edge01 = np.linalg.norm(coords_cur[:, 0, :] - coords_cur[:, 1, :], axis=1)
+    edge12 = np.linalg.norm(coords_cur[:, 1, :] - coords_cur[:, 2, :], axis=1)
+    edge20 = np.linalg.norm(coords_cur[:, 2, :] - coords_cur[:, 0, :], axis=1)
+    max_edge = np.maximum.reduce([edge01, edge12, edge20])
+    twice_area = np.abs(
+        (coords_cur[:, 1, 0] - coords_cur[:, 0, 0]) * (coords_cur[:, 2, 1] - coords_cur[:, 0, 1])
+        - (coords_cur[:, 2, 0] - coords_cur[:, 0, 0]) * (coords_cur[:, 1, 1] - coords_cur[:, 0, 1])
+    )
+    h = np.sqrt(np.maximum(0.5 * twice_area, 1.0e-30))
+    mask = max_edge > 1.0e-30
+    h[mask] = twice_area[mask] / max_edge[mask]
+    return h
+
+
+def _kratos_dvms_current_element_size_coefficient(
+    mesh: Mesh,
+    dh: DofHandler,
+    d_mesh: VectorFunction,
+) -> ElementWiseConstant:
+    return ElementWiseConstant(_kratos_dvms_current_element_size_array(mesh, dh, d_mesh))
+
+
 def _find_element_containing_point(mesh: Mesh, point: np.ndarray) -> int:
     xy = np.asarray(point, dtype=float)
     for elem in mesh.elements_list:
@@ -146,4 +197,6 @@ __all__ = [
     "_kratos_dvms_element_size",
     "_kratos_dvms_element_size_array",
     "_kratos_dvms_element_size_coefficient",
+    "_kratos_dvms_current_element_size_array",
+    "_kratos_dvms_current_element_size_coefficient",
 ]

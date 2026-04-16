@@ -447,8 +447,9 @@ def test_symbolic_fused_local_operator_applies_quadrature_state_updates(monkeypa
             return np.asarray([eid, eid + 1], dtype=int)
 
     class _FakeCompiler:
-        def assemble_local_contributions(self, form_or_equation, *, entity_ids=None):
+        def assemble_local_contributions(self, form_or_equation, *, entity_ids=None, need_matrix=True, need_vector=True):
             del form_or_equation
+            del need_matrix, need_vector
             eids = np.asarray(entity_ids, dtype=int)
             return type(
                 "Batch",

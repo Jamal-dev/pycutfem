@@ -54,6 +54,7 @@ class FluidDVMSPredictorSymbolics:
     grad_p_phys: Expression
     a_curr: Expression
     a_relaxed: Expression
+    a_scheme: Expression
     static_residual: Expression
 
 
@@ -116,6 +117,7 @@ def build_fluid_dvms_kinematics(
     d: VectorFunction,
     d_prev: VectorFunction,
     d_prev2: VectorFunction | None = None,
+    mesh_v: VectorFunction | None = None,
     mesh_v_prev: VectorFunction | None = None,
     mesh_a_prev: VectorFunction | None = None,
     bossak_alpha=None,
@@ -128,7 +130,9 @@ def build_fluid_dvms_kinematics(
     Finv = cof_F.T / J
     grad_u_phys = dot(grad(u), Finv)
     div_u_phys = inner(cof_F, grad(u)) / J
-    if mesh_v_prev is not None and mesh_a_prev is not None and bossak_alpha is not None:
+    if mesh_v is not None:
+        w_mesh = mesh_v
+    elif mesh_v_prev is not None and mesh_a_prev is not None and bossak_alpha is not None:
         alpha_expr = _as_expression(bossak_alpha)
         gamma_expr = Constant(0.5) - alpha_expr
         beta_expr = Constant(0.25) * (Constant(1.0) - alpha_expr) * (Constant(1.0) - alpha_expr)
@@ -160,9 +164,15 @@ def build_fluid_dvms_old_mass_residual(
     *,
     u_prev: VectorFunction,
     d_prev: VectorFunction,
+    d_geo: VectorFunction | None = None,
 ) -> Expression:
-    F_old = Identity(2) + grad(d_prev)
-    return -(inner(cof(F_old), grad(u_prev)) / det(F_old))
+    # Kratos evaluates the "old" divergence residual with the current element
+    # geometry (current DN_DX / N) while sampling the previous-step velocity and
+    # old divergence projection values. On moving meshes the current ALE map is
+    # therefore the correct geometry for this term.
+    geom_disp = d_prev if d_geo is None else d_geo
+    F_geo = Identity(2) + grad(geom_disp)
+    return -(inner(cof(F_geo), grad(u_prev)) / det(F_geo))
 
 
 def build_fluid_dvms_predictor_symbolics(
@@ -174,6 +184,7 @@ def build_fluid_dvms_predictor_symbolics(
     d_mesh: VectorFunction,
     d_prev: VectorFunction,
     d_prev2: VectorFunction | None = None,
+    mesh_v: VectorFunction | None = None,
     mesh_v_prev: VectorFunction | None = None,
     mesh_a_prev: VectorFunction | None = None,
     dt,
@@ -189,6 +200,7 @@ def build_fluid_dvms_predictor_symbolics(
         d=d_mesh,
         d_prev=d_prev,
         d_prev2=d_prev2,
+        mesh_v=mesh_v,
         mesh_v_prev=mesh_v_prev,
         mesh_a_prev=mesh_a_prev,
         bossak_alpha=bossak_alpha,
@@ -200,11 +212,15 @@ def build_fluid_dvms_predictor_symbolics(
     rho_expr = _as_expression(rho)
     dt_expr = _as_expression(dt)
 
+    # The predictor/velocity contribution uses the current acceleration a_n
+    # reconstructed from the Bossak recurrence. The monolithic mass action,
+    # however, must use the scheme acceleration a_{n+alpha}.
     a_curr = bossak_ma0_expr * (u_k - u_prev) + bossak_ma2_expr * a_prev
-    a_relaxed = (Constant(1.0) - bossak_alpha_expr) * a_curr + bossak_alpha_expr * a_prev
+    a_relaxed = a_curr
+    a_scheme = (Constant(1.0) - bossak_alpha_expr) * a_curr + bossak_alpha_expr * a_prev
     grad_p_phys = dot(kin.Finv.T, grad(p_k))
-    # The predictor update uses the Bossak-relaxed acceleration field in the
-    # static momentum residual together with the old-subscale time-history term.
+    # The predictor update uses the same Bossak acceleration variable that
+    # Kratos stores in ACCELERATION together with the old-subscale history term.
     static_residual = -(
         rho_expr * a_relaxed
         + rho_expr * dot(kin.grad_u_phys, kin.resolved_conv_velocity)
@@ -217,6 +233,7 @@ def build_fluid_dvms_predictor_symbolics(
         grad_p_phys=grad_p_phys,
         a_curr=a_curr,
         a_relaxed=a_relaxed,
+        a_scheme=a_scheme,
         static_residual=static_residual,
     )
 
@@ -230,6 +247,7 @@ def build_fluid_dvms_predictor_iteration_symbolics(
     d_mesh: VectorFunction,
     d_prev: VectorFunction,
     d_prev2: VectorFunction | None = None,
+    mesh_v: VectorFunction | None = None,
     mesh_v_prev: VectorFunction | None = None,
     mesh_a_prev: VectorFunction | None = None,
     dt,
@@ -251,6 +269,7 @@ def build_fluid_dvms_predictor_iteration_symbolics(
         d_mesh=d_mesh,
         d_prev=d_prev,
         d_prev2=d_prev2,
+        mesh_v=mesh_v,
         mesh_v_prev=mesh_v_prev,
         mesh_a_prev=mesh_a_prev,
         dt=dt,
@@ -296,6 +315,7 @@ def build_fluid_dvms_local_forms(
     d_mesh: VectorFunction,
     d_prev: VectorFunction,
     d_prev2: VectorFunction | None = None,
+    mesh_v: VectorFunction | None = None,
     mesh_v_prev: VectorFunction | None = None,
     mesh_a_prev: VectorFunction | None = None,
     dx_measure,
@@ -331,6 +351,7 @@ def build_fluid_dvms_local_forms(
         d_mesh=d_mesh,
         d_prev=d_prev,
         d_prev2=d_prev2,
+        mesh_v=mesh_v,
         mesh_v_prev=mesh_v_prev,
         mesh_a_prev=mesh_a_prev,
         dt=dt_expr,
@@ -426,26 +447,27 @@ def build_fluid_dvms_local_forms(
 
     bossak_mam = (Constant(1.0) - bossak_alpha_expr) * bossak_ma0_expr
     mass_lhs = kin.J * rho_expr * dot(du, v) * dx_measure
+    scheme_acceleration = predictor.a_scheme
     if bool(use_oss):
         mass_stabilization = Constant(0.0) * dot(du, v) * dx_measure
         mass_stabilization_action = Constant(0.0) * dot(body_expr, v) * dx_measure
         system_mass_stabilization = Constant(0.0) * dot(du, v) * dx_measure
     else:
         mass_stabilization = kin.J * tau_one * dot(tau_test_mass, rho_expr * du) * dx_measure
-        mass_stabilization_action = kin.J * tau_one * dot(tau_test_mass, rho_expr * predictor.a_relaxed) * dx_measure
+        mass_stabilization_action = kin.J * tau_one * dot(tau_test_mass, rho_expr * scheme_acceleration) * dx_measure
         system_mass_stabilization = kin.J * bossak_mam * tau_one * dot(tau_test_mass, rho_expr * du) * dx_measure
 
     system_mass_lhs = kin.J * bossak_mam * rho_expr * dot(du, v) * dx_measure
     # Kratos' Bossak scheme combines the exact local DVMS blocks as:
     #   LHS = D + mam * M
-    #   RHS = velocity_rhs - M * a_relaxed
+    #   RHS = velocity_rhs - M * a_{n+alpha}
     # where D is CalculateLocalVelocityContribution and M is the full mass
     # matrix returned by CalculateMassMatrix (including AddMassStabilization
     # when OSS is disabled). The local symbolic "system" form must therefore
     # subtract the mass action from the RHS rather than add it.
     system_residual = (
         add_velocity_residual
-        - kin.J * rho_expr * dot(predictor.a_relaxed, v) * dx_measure
+        - kin.J * rho_expr * dot(scheme_acceleration, v) * dx_measure
         - mass_stabilization_action
     )
     system_jacobian = add_velocity_jacobian + system_mass_lhs + system_mass_stabilization
@@ -492,7 +514,7 @@ def build_fluid_dvms_local_forms(
         tau_test_hidden_dot_adv = tau_test_hidden_0 * tau_res_static_conv[0] + tau_test_hidden_1 * tau_res_static_conv[1]
         tau_test_source_dot_hidden = tau_test_source_v[0] * tau_res_hidden_0 + tau_test_source_v[1] * tau_res_hidden_1
         tau_test_hidden_dot_pressure = tau_test_hidden_0 * tau_res_static_pres[0] + tau_test_hidden_1 * tau_res_static_pres[1]
-        tau_test_hidden_dot_mass = tau_test_hidden_0 * (rho_expr * predictor.a_relaxed[0]) + tau_test_hidden_1 * (rho_expr * predictor.a_relaxed[1])
+        tau_test_hidden_dot_mass = tau_test_hidden_0 * (rho_expr * scheme_acceleration[0]) + tau_test_hidden_1 * (rho_expr * scheme_acceleration[1])
         grad_q_dot_hidden = grad_q_phys[0] * tau_res_hidden_0 + grad_q_phys[1] * tau_res_hidden_1
         return (
             kin.J * tau_one * tau_test_hidden_dot_source * dx_measure
@@ -537,6 +559,7 @@ def build_fluid_dvms_kratos_split_forms(
     d_mesh: VectorFunction,
     d_prev: VectorFunction,
     d_prev2: VectorFunction | None = None,
+    mesh_v: VectorFunction | None = None,
     mesh_v_prev: VectorFunction | None = None,
     mesh_a_prev: VectorFunction | None = None,
     dx_measure,
@@ -571,6 +594,9 @@ def build_fluid_dvms_kratos_split_forms(
         d_mesh=d_mesh,
         d_prev=d_prev,
         d_prev2=d_prev2,
+        mesh_v=mesh_v,
+        mesh_v_prev=mesh_v_prev,
+        mesh_a_prev=mesh_a_prev,
         dt=dt_expr,
         bossak_ma0=bossak_ma0_expr,
         bossak_ma2=bossak_ma2_expr,
@@ -654,6 +680,7 @@ def build_fluid_dvms_kratos_split_forms(
         d_mesh=d_mesh,
         d_prev=d_prev,
         d_prev2=d_prev2,
+        mesh_v=mesh_v,
         mesh_v_prev=mesh_v_prev,
         mesh_a_prev=mesh_a_prev,
         dx_measure=dx_measure,

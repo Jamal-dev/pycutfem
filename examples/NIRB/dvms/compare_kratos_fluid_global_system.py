@@ -172,7 +172,17 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Compare the pycutfem assembled global fluid system against a Kratos dump.")
     parser.add_argument("--kratos-dump", type=Path, required=True)
     parser.add_argument("--backend", choices=("python", "jit", "cpp"), default="cpp")
-    parser.add_argument("--quad-order", type=int, default=6)
+    parser.add_argument(
+        "--state-backend",
+        choices=("python", "jit", "cpp"),
+        default=None,
+        help=(
+            "Backend for the already-closed DVMS state updates "
+            "(_update_fluid_dvms_state_from_previous_step / predicted_subscale). "
+            "Defaults to --backend."
+        ),
+    )
+    parser.add_argument("--quad-order", type=int, default=1)
     parser.add_argument("--bossak-alpha", type=float, default=-0.3)
     parser.add_argument("--dynamic-tau", type=float, default=1.0)
     parser.add_argument(
@@ -185,6 +195,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    state_backend = str(args.backend if args.state_backend is None else args.state_backend)
     with np.load(Path(args.kratos_dump).resolve(), allow_pickle=False) as data:
         A_raw_ref = _unpack_csr("A_raw", data)
         A_constrained_ref = _unpack_csr("A_constrained", data)
@@ -209,7 +220,14 @@ def main() -> None:
 
     _assign_vector_field(fluid["u_k"], fluid["dh"], coords=node_coords_ref, values=velocity)
     _assign_vector_field(fluid["u_prev"], fluid["dh"], coords=node_coords_ref, values=velocity_prev)
-    _assign_vector_field(fluid["a_prev"], fluid["dh"], coords=node_coords_ref, values=acceleration)
+    # Kratos dumps the current-step ACCELERATION. The local DVMS operator expects
+    # the previous-step acceleration in a_prev; on the first step that history is
+    # identically zero.
+    if float(np.max(np.abs(np.asarray(velocity_prev, dtype=float)))) <= 1.0e-14:
+        a_prev_values = np.zeros_like(np.asarray(acceleration, dtype=float))
+    else:
+        a_prev_values = np.asarray(acceleration, dtype=float)
+    _assign_vector_field(fluid["a_prev"], fluid["dh"], coords=node_coords_ref, values=a_prev_values)
     _assign_scalar_field(fluid["p_k"], fluid["dh"], coords=node_coords_ref, values=pressure)
 
     zero_disp = np.zeros_like(node_coords_ref)
@@ -222,25 +240,36 @@ def main() -> None:
         mesh=mesh_f,
         u_prev=fluid["u_prev"],
         d_prev=fluid["d_prev"],
-        backend=str(args.backend),
+        d_geo=fluid["d_mesh"],
+        backend=state_backend,
     )
-    _update_fluid_dvms_predicted_subscale(
-        state=fluid["dvms_state"],
-        dh=fluid["dh"],
-        mesh=mesh_f,
-        u_k=fluid["u_k"],
-        u_prev=fluid["u_prev"],
-        a_prev=fluid["a_prev"],
-        p_k=fluid["p_k"],
-        d_mesh=fluid["d_mesh"],
-        d_prev=fluid["d_prev"],
-        rho_f=float(setup.material.density),
-        mu_f=mu_f,
-        dt=dt,
-        bossak_alpha=float(args.bossak_alpha),
-        dynamic_tau=float(args.dynamic_tau),
-        backend=str(args.backend),
-    )
+    if str(stage).strip().lower() == "predicted":
+        # Kratos' pre-solve Build() evaluates the first predictor system with
+        # the old-step subscale history. Refreshing the current-step predicted
+        # subscale here injects a reproducible inlet-strip mismatch on step 1.
+        fluid["dvms_state"].predicted_subscale_velocity[:, :] = np.asarray(
+            fluid["dvms_state"].old_subscale_velocity,
+            dtype=float,
+        )
+        fluid["dvms_state"].sync_coefficient("predicted_subscale_velocity")
+    else:
+        _update_fluid_dvms_predicted_subscale(
+            state=fluid["dvms_state"],
+            dh=fluid["dh"],
+            mesh=mesh_f,
+            u_k=fluid["u_k"],
+            u_prev=fluid["u_prev"],
+            a_prev=fluid["a_prev"],
+            p_k=fluid["p_k"],
+            d_mesh=fluid["d_mesh"],
+            d_prev=fluid["d_prev"],
+            rho_f=float(setup.material.density),
+            mu_f=mu_f,
+            dt=dt,
+            bossak_alpha=float(args.bossak_alpha),
+            dynamic_tau=float(args.dynamic_tau),
+            backend=state_backend,
+        )
 
     zero_iface = CoordinateLookup(np.asarray([[0.0, 0.0]], dtype=float), np.zeros((1, 2), dtype=float), dim=2)
 
@@ -248,7 +277,7 @@ def main() -> None:
         del x
         return setup.geometry.inlet_velocity(y, dt, reference_velocity=float(setup.material.max_velocity))
 
-    bcs, _ = _fluid_boundary_conditions(
+    bcs, bcs_homog = _fluid_boundary_conditions(
         iface_velocity=zero_iface,
         inlet_lookup=inlet_profile,
         interface_tag=setup.geometry.interface_tag,
@@ -270,7 +299,7 @@ def main() -> None:
         apply_dirichlet_lift=False,
         backend=str(args.backend),
     )
-    bc_map = fluid["dh"].get_dirichlet_data(bcs) or {}
+    bc_map = fluid["dh"].get_dirichlet_data(bcs_homog) or {}
     A_constrained_local, b_constrained_local = _apply_pycutfem_dirichlet(A_raw_local, b_raw_local, bc_map)
 
     py_dof_map = _pycutfem_full_dof_map(fluid, mesh_f)
@@ -290,6 +319,7 @@ def main() -> None:
         "kratos_dump": str(Path(args.kratos_dump).resolve()),
         "stage": stage,
         "backend": str(args.backend),
+        "state_backend": state_backend,
         "raw_matrix": _sparse_diff_stats(A_raw_perm, A_raw_ref),
         "constrained_matrix": _sparse_diff_stats(A_constrained_perm, A_constrained_ref),
         "raw_rhs": _diff_stats(b_raw_perm, b_raw_ref),

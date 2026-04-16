@@ -1,6 +1,6 @@
 # pycutfem/jit/__init__.py
 import re
-from pycutfem.ufl.helpers import required_multi_indices
+from pycutfem.ufl.helpers import _all_fields, _trial_test, required_multi_indices
 from .visitor import IRGenerator
 from .codegen import NumbaCodeGen
 from .cache import KernelCache
@@ -135,6 +135,324 @@ def _fields_from_param_order(param_order: list, me) -> tuple[str, ...]:
     if not seen:
         return tuple()
     return tuple([f for f in me_order if f in seen])
+
+
+def _measure_metadata_signature(md: dict | None) -> tuple:
+    items = []
+    for k, v in sorted((md or {}).items(), key=lambda kv: str(kv[0])):
+        kk = str(k)
+        if isinstance(v, (int, float, str, bool, type(None))):
+            items.append((kk, v))
+        else:
+            items.append((kk, (type(v).__name__, int(id(v)))))
+    return tuple(items)
+
+
+def _integrand_field_signature(expr, *, mixed_element) -> tuple[str, ...] | None:
+    """
+    Return the MixedElement-ordered field footprint referenced by ``expr``.
+
+    Shared-loop C++ fusion must keep kernels with different local field unions
+    apart; otherwise the generated runner/codegen inflates every integral to the
+    largest union in the group, which can dominate assembly time.
+    """
+    me_order = tuple(getattr(mixed_element, "field_names", ()))
+    if not me_order:
+        return tuple()
+
+    fields = set(str(f) for f in (_all_fields(expr) or []))
+    trial, test = _trial_test(expr)
+    for tt in (trial, test):
+        if tt is None:
+            continue
+        if hasattr(tt, "field_names"):
+            fields.update(str(f) for f in (getattr(tt, "field_names", []) or []))
+            continue
+        fld = getattr(tt, "field_name", None)
+        if fld:
+            fields.add(str(fld))
+
+    if not fields:
+        return None
+    return tuple(f for f in me_order if f in fields)
+
+
+def _integral_execution_signature(intg, *, compiler, p_geo: int) -> tuple | None:
+    """
+    Return the backend execution signature for loop-sharing decisions.
+
+    This intentionally ignores form rank so an equation-level planner can see
+    that residual and Jacobian integrals would traverse the same element/QP
+    loops even when they produce different local outputs.
+    """
+    dom = intg.measure.domain_type
+    level_set = getattr(intg.measure, "level_set", None)
+    rank = _form_rank(intg.integrand)
+    if level_set is None and rank > 0 and dom in {"volume", "interior_facet", "exterior_facet"}:
+        qdeg0 = int(compiler._find_q_order(intg)) + 2 * max(0, int(p_geo) - 1)
+        md0 = intg.measure.metadata or {}
+        return (
+            str(dom),
+            bool(intg.measure.on_facet),
+            int(qdeg0),
+            int(id(getattr(intg.measure, "defined_on", None))),
+            int(id(getattr(intg.measure, "deformation", None))),
+            _measure_metadata_signature(md0),
+        )
+    return None
+
+
+def _integral_fusion_key(intg, *, compiler, p_geo: int, backend: str) -> tuple:
+    exec_sig = _integral_execution_signature(intg, compiler=compiler, p_geo=p_geo)
+    rank = _form_rank(intg.integrand)
+    if exec_sig is not None and rank > 0:
+        if backend in {"cpp", "c++"}:
+            mixed_element = getattr(compiler, "me", None)
+            if mixed_element is None:
+                dh = getattr(compiler, "dh", None)
+                mixed_element = getattr(dh, "mixed_element", None)
+            field_sig = _integrand_field_signature(
+                intg.integrand,
+                mixed_element=mixed_element,
+            )
+            if field_sig is None:
+                return ("single", int(id(intg)))
+            return ("fuse", exec_sig, int(rank), field_sig)
+        return ("fuse", exec_sig, int(rank))
+    return ("single", int(id(intg)))
+
+
+def _integral_is_exact_zero(intg) -> bool:
+    from pycutfem.ufl.expressions import Integral as _IntegralExpr
+    from pycutfem.ufl.expressions import _is_zero_expression_exact
+
+    if not isinstance(intg, _IntegralExpr):
+        return False
+    return bool(_is_zero_expression_exact(getattr(intg, "integrand", None)))
+
+
+@dataclass(frozen=True)
+class _FusedIntegralGroup:
+    """
+    Compilation unit for backends that can execute multiple integrals in one loop.
+    """
+
+    integrals: tuple[Any, ...]
+    measure: Any
+    integrand: Any
+
+
+@dataclass(frozen=True)
+class _EquationAssemblyStage:
+    """
+    One ordered assembly stage for an Equation.
+
+    Stages are target-specific today (`vector` then `matrix`), but the shared
+    execution signature is preserved so a later direct-CSR backend can run both
+    outputs inside one loop nest.
+    """
+
+    target: str
+    is_rhs: bool
+    units: tuple[Any, ...]
+
+
+@dataclass(frozen=True)
+class _EquationAssemblyPlan:
+    stages: tuple[_EquationAssemblyStage, ...]
+    vector_units: tuple[Any, ...]
+    matrix_units: tuple[Any, ...]
+
+
+def _cpp_shared_loop_enabled() -> bool:
+    """
+    Return True when the robust shared-loop C++ fusion path should be used.
+
+    This path keeps per-integral IR programs but executes them inside one
+    shared element/quadrature loop, which is the durable design for plain
+    volume fusion. Keep an env escape hatch for targeted debugging.
+    """
+    return os.getenv("PYCUTFEM_CPP_FUSE_INTEGRALS", "1").lower() not in {"0", "false", "no"}
+
+
+def _integral_fusion_enabled(*, backend: str) -> bool:
+    if backend in {"cpp", "c++"}:
+        return _cpp_shared_loop_enabled()
+    return os.getenv("PYCUTFEM_FUSE_INTEGRALS", "1").lower() not in {"0", "false", "no"}
+
+
+def _can_use_cpp_shared_loop(grp: list[Any]) -> bool:
+    if not grp:
+        return False
+    intg0 = grp[0]
+    return (
+        str(getattr(intg0.measure, "domain_type", "")) == "volume"
+        and getattr(intg0.measure, "level_set", None) is None
+        and not bool(getattr(intg0.measure, "on_facet", False))
+    )
+
+
+def _plan_integral_execution_units(
+    integrals,
+    *,
+    compiler,
+    p_geo: int,
+    backend: str,
+):
+    """
+    Group compatible integrals into backend execution units while preserving
+    original source order.
+
+    For the C++ backend, plain volume groups become `_FusedIntegralGroup`
+    objects so codegen can emit one shared element/QP loop with multiple
+    integral bodies inside. Other backends keep the older symbolic-fusion path.
+    """
+    from pycutfem.ufl.expressions import Integral as _IntegralExpr
+
+    integral_list = [
+        intg
+        for intg in list(integrals or [])
+        if isinstance(intg, _IntegralExpr) and not _integral_is_exact_zero(intg)
+    ]
+    if not integral_list:
+        return []
+    if len(integral_list) <= 1 or not _integral_fusion_enabled(backend=backend):
+        return integral_list
+
+    groups: dict[tuple, list[Any]] = {}
+    order: list[tuple] = []
+    for intg in integral_list:
+        key = _integral_fusion_key(
+            intg,
+            compiler=compiler,
+            p_geo=p_geo,
+            backend=backend,
+        )
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(intg)
+
+    planned_units: list[Any] = []
+    for key in order:
+        grp = groups[key]
+        if len(grp) == 1:
+            planned_units.append(grp[0])
+            continue
+
+        integrand_sum = grp[0].integrand
+        for other in grp[1:]:
+            integrand_sum = integrand_sum + other.integrand
+
+        if backend in {"cpp", "c++"} and _can_use_cpp_shared_loop(grp):
+            planned_units.append(
+                _FusedIntegralGroup(
+                    integrals=tuple(grp),
+                    measure=grp[0].measure,
+                    integrand=integrand_sum,
+                )
+            )
+            continue
+
+        fused = _IntegralExpr(integrand_sum, grp[0].measure)
+        if hasattr(fused, "__dict__"):
+            fused._fused_from = [int(id(x)) for x in grp]
+        planned_units.append(fused)
+
+    return planned_units
+
+
+def _form_integrals(form) -> list[Any]:
+    from pycutfem.ufl.expressions import Integral as _IntegralExpr
+    from pycutfem.ufl.forms import Equation as _Equation
+
+    if form is None:
+        return []
+    if isinstance(form, _Equation):
+        return _form_integrals(form.a) + _form_integrals(form.L)
+    if isinstance(form, _IntegralExpr):
+        return [] if _integral_is_exact_zero(form) else [form]
+    return [
+        intg
+        for intg in list(getattr(form, "integrals", []))
+        if isinstance(intg, _IntegralExpr) and not _integral_is_exact_zero(intg)
+    ]
+
+
+def _plan_equation_assembly(
+    equation,
+    *,
+    compiler,
+    p_geo: int,
+    backend: str,
+    need_vector: bool = True,
+    need_matrix: bool = True,
+    vector_first: bool = True,
+) -> _EquationAssemblyPlan:
+    """
+    Build an ordered equation-level assembly plan.
+
+    This is the durable entry point for residual-first scheduling and for a
+    later direct-CSR C++ path that writes `F` and `K` from one shared execution
+    plan instead of treating them as unrelated top-level passes.
+    """
+    from pycutfem.ufl.forms import Equation as _Equation
+
+    if not isinstance(equation, _Equation):
+        raise TypeError(
+            "_plan_equation_assembly expects a pycutfem.ufl.forms.Equation."
+        )
+
+    vector_units: tuple[Any, ...] = tuple()
+    matrix_units: tuple[Any, ...] = tuple()
+
+    if bool(need_vector) and equation.L is not None:
+        vector_ints = _form_integrals(equation.L)
+        vector_units = tuple(
+            vector_ints
+            if backend == "python"
+            else _plan_integral_execution_units(
+                vector_ints,
+                compiler=compiler,
+                p_geo=p_geo,
+                backend=backend,
+            )
+        )
+
+    if bool(need_matrix) and equation.a is not None:
+        matrix_ints = _form_integrals(equation.a)
+        matrix_units = tuple(
+            matrix_ints
+            if backend == "python"
+            else _plan_integral_execution_units(
+                matrix_ints,
+                compiler=compiler,
+                p_geo=p_geo,
+                backend=backend,
+            )
+        )
+
+    stages: list[_EquationAssemblyStage] = []
+    ordered = (
+        (("vector", True, vector_units), ("matrix", False, matrix_units))
+        if bool(vector_first)
+        else (("matrix", False, matrix_units), ("vector", True, vector_units))
+    )
+    for target, is_rhs, units in ordered:
+        if units:
+            stages.append(
+                _EquationAssemblyStage(
+                    target=str(target),
+                    is_rhs=bool(is_rhs),
+                    units=tuple(units),
+                )
+            )
+
+    return _EquationAssemblyPlan(
+        stages=tuple(stages),
+        vector_units=tuple(vector_units),
+        matrix_units=tuple(matrix_units),
+    )
 
 
 def _compress_static_for_active(static: dict[str, Any],
@@ -435,6 +753,7 @@ class KernelRunner:
         self._param_set = set(param_order or [])
         self.dof_handler = dof_handler
         self._jit_param = None
+        self._full_vec_cache: dict[object, np.ndarray] = {}
         
         # Identify which function coefficients are needed from the IR
         from pycutfem.jit.ir import LoadVariable
@@ -675,6 +994,21 @@ class KernelRunner:
             kernel_args["node_coords"] = self.dof_handler.get_all_dof_coords()
 
         gdofs_map = kernel_args["gdofs_map"]          # ndarray, safe to use
+        gdofs_safe = static_args.get("_jit_gdofs_safe")
+        gdofs_valid = static_args.get("_jit_gdofs_valid")
+        if (
+            not isinstance(gdofs_safe, np.ndarray)
+            or gdofs_safe.shape != gdofs_map.shape
+            or gdofs_safe.dtype.kind not in {"i", "u"}
+            or not isinstance(gdofs_valid, np.ndarray)
+            or gdofs_valid.shape != gdofs_map.shape
+            or gdofs_valid.dtype != np.bool_
+        ):
+            gdofs_valid = np.asarray(gdofs_map >= 0, dtype=np.bool_)
+            gdofs_safe = np.where(gdofs_valid, np.asarray(gdofs_map, dtype=np.int64), 0)
+            static_args["_jit_gdofs_valid"] = gdofs_valid
+            static_args["_jit_gdofs_safe"] = gdofs_safe
+        gdofs_has_invalid = bool(np.any(~gdofs_valid))
 
         # ------------------------------------------------------------------
         # C)  inject coefficient blocks for every Function
@@ -687,19 +1021,48 @@ class KernelRunner:
         # helper ------------------------------------------------------------
         n_union = gdofs_map.shape[1]
         total_dofs = self.dof_handler.total_dofs
-        full_cache: dict[int, np.ndarray] = {}
 
         def _gather(full_vec: np.ndarray, side_map, tag, name):
             if side_map is None:
                 return
-            # side_map is (n_elem, n_side) with union indices (‑1 = padding)
-            coeff = np.zeros((side_map.shape[0], n_union), dtype=full_vec.dtype)
-            for e in range(side_map.shape[0]):
-                idx = side_map[e]
-                m = idx >= 0
-                if np.any(m):
-                    coeff[e, idx[m]] = full_vec[gdofs_map[e, idx[m]]]
-            kernel_args[f"u_{name}__{tag}_loc"] = coeff   #  **double “__”**
+            side_idx_key = f"_jit_side_gather_index_{tag}"
+            side_safe_key = f"_jit_side_gather_safe_{tag}"
+            side_valid_key = f"_jit_side_gather_valid_{tag}"
+            gather_idx = static_args.get(side_idx_key)
+            gather_safe = static_args.get(side_safe_key)
+            gather_valid = static_args.get(side_valid_key)
+            if (
+                not isinstance(gather_idx, np.ndarray)
+                or gather_idx.shape != (int(side_map.shape[0]), n_union)
+                or not isinstance(gather_safe, np.ndarray)
+                or gather_safe.shape != gather_idx.shape
+                or not isinstance(gather_valid, np.ndarray)
+                or gather_valid.shape != gather_idx.shape
+            ):
+                gather_idx = -np.ones((int(side_map.shape[0]), n_union), dtype=np.int64)
+                for e in range(int(side_map.shape[0])):
+                    idx = np.asarray(side_map[e], dtype=np.int64).ravel()
+                    m = idx >= 0
+                    if np.any(m):
+                        gather_idx[e, idx[m]] = np.asarray(gdofs_map[e], dtype=np.int64)[idx[m]]
+                gather_valid = np.asarray(gather_idx >= 0, dtype=np.bool_)
+                gather_safe = np.where(gather_valid, gather_idx, 0)
+                static_args[side_idx_key] = gather_idx
+                static_args[side_safe_key] = gather_safe
+                static_args[side_valid_key] = gather_valid
+            coeff_name = f"u_{name}__{tag}_loc"
+            coeff = static_args.get(coeff_name)
+            if (
+                not isinstance(coeff, np.ndarray)
+                or coeff.shape != gather_safe.shape
+                or coeff.dtype != full_vec.dtype
+            ):
+                coeff = np.empty(gather_safe.shape, dtype=full_vec.dtype)
+                static_args[coeff_name] = coeff
+            np.take(full_vec, gather_safe, out=coeff)
+            if np.any(~gather_valid):
+                coeff[~gather_valid] = 0
+            kernel_args[coeff_name] = coeff   #  **double “__”**
 
 
         for name in self.func_names:                  # 'u_k', 'p'
@@ -735,33 +1098,45 @@ class KernelRunner:
             base = getattr(f, "_parent_vector", None)
             source = base if base is not None else f
             cache_key = id(source)
-            full_vec = full_cache.get(cache_key)
+            full_vec = self._full_vec_cache.get(cache_key)
             if full_vec is None:
                 full_vec = np.zeros(total_dofs, dtype=source.nodal_values.dtype)
-                if hasattr(source, "_g_dofs") and source._g_dofs.size:
-                    full_vec[source._g_dofs] = source.nodal_values
-                else:
-                    # Fallback: populate via mapping dict (rare path)
-                    g2l = getattr(source, "_g2l", {})
-                    if g2l:
-                        local_vals = source.nodal_values
-                        for gdof, lidx in g2l.items():
-                            full_vec[gdof] = local_vals[lidx]
-                full_cache[cache_key] = full_vec
+                self._full_vec_cache[cache_key] = full_vec
+            if hasattr(source, "_g_dofs") and source._g_dofs.size:
+                full_vec[source._g_dofs] = source.nodal_values
+            else:
+                # Fallback: populate via mapping dict (rare path)
+                g2l = getattr(source, "_g2l", {})
+                if g2l:
+                    local_vals = source.nodal_values
+                    for gdof, lidx in g2l.items():
+                        full_vec[gdof] = local_vals[lidx]
 
             # 2a) volume coefficients  u_<name>_loc -------------------------
             if base is not None and base is not f:
                 comp_key = (cache_key, f.field_name)
-                comp_vec = full_cache.get(comp_key)
+                comp_vec = self._full_vec_cache.get(comp_key)
                 if comp_vec is None:
                     comp_vec = np.zeros_like(full_vec)
-                    fld_slice = self.dof_handler.get_field_slice(f.field_name)
-                    comp_vec[fld_slice] = full_vec[fld_slice]
-                    full_cache[comp_key] = comp_vec
+                    self._full_vec_cache[comp_key] = comp_vec
+                fld_slice = self.dof_handler.get_field_slice(f.field_name)
+                comp_vec[fld_slice] = full_vec[fld_slice]
                 target_vec = comp_vec
             else:
                 target_vec = full_vec
-            kernel_args[f"u_{name}_loc"] = target_vec[gdofs_map]
+            coeff_name = f"u_{name}_loc"
+            coeff = static_args.get(coeff_name)
+            if (
+                not isinstance(coeff, np.ndarray)
+                or coeff.shape != gdofs_safe.shape
+                or coeff.dtype != target_vec.dtype
+            ):
+                coeff = np.empty(gdofs_safe.shape, dtype=target_vec.dtype)
+                static_args[coeff_name] = coeff
+            np.take(target_vec, gdofs_safe, out=coeff)
+            if gdofs_has_invalid:
+                coeff[~gdofs_valid] = 0
+            kernel_args[coeff_name] = coeff
 
             # 2b) ghost/interface  u_<name>_pos_loc / _neg_loc --------------
             _gather(target_vec, pos_map, "pos", name)
@@ -1142,8 +1517,6 @@ def compile_multi(form, *, dof_handler, mixed_element,
             f"compile_multi supports backend='jit' or 'cpp'; got backend={backend!r}. "
             "Use FormCompiler(backend='python') for the pure-Python path."
         )
-    from pycutfem.ufl.measures import Integral
-    from pycutfem.ufl.forms    import Equation
     from pycutfem.jit.kernel_args import _build_jit_kernel_args
     from pycutfem.ufl.compilers import FormCompiler
 
@@ -1162,20 +1535,17 @@ def compile_multi(form, *, dof_handler, mixed_element,
         gdofs_cache = {}
 
     def _append_kernel(kernel, integral):
-        kernel.integral_id = id(integral)
+        if isinstance(integral, _FusedIntegralGroup):
+            source_ids = [int(id(item)) for item in integral.integrals]
+            kernel.integral_id = source_ids[0] if source_ids else id(integral)
+            kernel.fused_integral_ids = source_ids
+        else:
+            kernel.integral_id = id(integral)
         kernels.append(kernel)
 
-    # Normalize to a list of Integrals
-    if isinstance(form, Equation):   # (a, L)
-        integrals = []
-        if form.a is not None:
-            integrals += form.a.integrals
-        if form.L is not None:
-            integrals += form.L.integrals
-    elif isinstance(form, Integral):
-        integrals = [form]
-    else:
-        integrals = form.integrals
+    # Normalize to a list of buildable Integrals. Structurally exact-zero terms
+    # are dropped here so they never produce kernels or distort fusion groups.
+    integrals = _form_integrals(form)
 
     mesh = mixed_element.mesh
     p_geo  = int(getattr(mesh, "poly_order", 1))
@@ -1187,81 +1557,12 @@ def compile_multi(form, *, dof_handler, mixed_element,
     # share the same measure (dx/ds/dS metadata). Compiling/scattering each
     # integral separately can dominate startup time for small problems.
     #
-    # Fusion is disabled for functional (rank-0) integrals because callers
-    # may rely on per-integral `integral_id` bookkeeping to separate totals.
-    fuse = os.getenv("PYCUTFEM_FUSE_INTEGRALS", "1").lower() not in {"0", "false", "no"}
-    # Keep C++ on the per-integral path by default.
-    #
-    # The fused-kernel optimization is beneficial for setup time, but large mixed
-    # H(div) solver forms still hit brittle Eigen/value-category lowering in the
-    # monolithic generated kernels. Standalone assembly already uses the stable
-    # per-integral lowering and matches Python/FEniCSx there, so the robust
-    # default for C++ is to compile the same unfused kernels in solver paths too.
-    #
-    # Opt back in explicitly when auditing fused-kernel codegen:
-    #   PYCUTFEM_CPP_FUSE_INTEGRALS=1
-    if backend in {"cpp", "c++"}:
-        fuse = os.getenv("PYCUTFEM_CPP_FUSE_INTEGRALS", "0").lower() in {"1", "true", "yes"}
-
-    def _meta_sig(md: dict) -> tuple:
-        items = []
-        for k, v in sorted((md or {}).items(), key=lambda kv: str(kv[0])):
-            kk = str(k)
-            if isinstance(v, (int, float, str, bool, type(None))):
-                items.append((kk, v))
-            else:
-                items.append((kk, (type(v).__name__, int(id(v)))))
-        return tuple(items)
-
-    if fuse and len(integrals) > 1:
-        from pycutfem.ufl.expressions import Integral as _IntegralExpr
-
-        groups: dict[tuple, list] = {}
-        order: list[tuple] = []
-        for intg in integrals:
-            dom = intg.measure.domain_type
-            level_set = getattr(intg.measure, "level_set", None)
-            rank = _form_rank(intg.integrand)
-            if (
-                level_set is None
-                and rank > 0
-                and dom in {"volume", "interior_facet", "exterior_facet"}
-            ):
-                qdeg0 = int(fc._find_q_order(intg)) + 2 * max(0, p_geo - 1)
-                md0 = intg.measure.metadata or {}
-                key = (
-                    "fuse",
-                    str(dom),
-                    int(rank),
-                    bool(intg.measure.on_facet),
-                    int(qdeg0),
-                    int(id(getattr(intg.measure, "defined_on", None))),
-                    int(id(getattr(intg.measure, "deformation", None))),
-                    _meta_sig(md0),
-                )
-            else:
-                key = ("single", int(id(intg)))
-
-            if key not in groups:
-                groups[key] = []
-                order.append(key)
-            groups[key].append(intg)
-
-        fused_integrals: list = []
-        for key in order:
-            grp = groups[key]
-            if len(grp) == 1:
-                fused_integrals.append(grp[0])
-                continue
-            integrand_sum = grp[0].integrand
-            for other in grp[1:]:
-                integrand_sum = integrand_sum + other.integrand
-            fused = _IntegralExpr(integrand_sum, grp[0].measure)
-            if hasattr(fused, "__dict__"):
-                fused._fused_from = [int(id(x)) for x in grp]
-            fused_integrals.append(fused)
-
-        integrals = fused_integrals
+    integrals = _plan_integral_execution_units(
+        integrals,
+        compiler=fc,
+        p_geo=p_geo,
+        backend=backend,
+    )
 
     def _ensure_mesh(ls_obj, *, need_interface_segments: bool = False) -> None:
         """
@@ -1544,8 +1845,21 @@ def compile_multi(form, *, dof_handler, mixed_element,
 
         n_loc  = me_kernel.n_dofs_per_elem
 
-        # Compile the backend once; reuse for all subsets of this integral
-        runner, ir = fc._compile_backend(intg.integrand, dof_handler, me_kernel, on_facet=on_facet)
+        # Compile the backend once; reuse for all subsets of this integral.
+        # C++ fusion keeps the original per-integral IR programs and concatenates
+        # them into one shared loop, which is more robust than symbolically
+        # summing the integrands before lowering.
+        if isinstance(intg, _FusedIntegralGroup) and backend in {"cpp", "c++"}:
+            from pycutfem.jit.cpp_backend import compile_backend_cpp_group
+
+            runner, ir = compile_backend_cpp_group(
+                [item.integrand for item in intg.integrals],
+                dof_handler,
+                me_kernel,
+                on_facet=on_facet,
+            )
+        else:
+            runner, ir = fc._compile_backend(intg.integrand, dof_handler, me_kernel, on_facet=on_facet)
         active_fields = _active_field_order(ir, me_kernel)
 
         # Prefer an explicit hint from the runner/codegen when present.

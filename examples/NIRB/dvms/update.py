@@ -7,7 +7,11 @@ from pycutfem.core.mesh import Mesh
 from pycutfem.ufl.compilers import FormCompiler
 from pycutfem.ufl.expressions import Function, VectorFunction
 
-from .helpers import _bossak_coefficients, _field_values_on_global_dofs, _kratos_dvms_element_size_array
+from .helpers import (
+    _bossak_coefficients,
+    _field_values_on_global_dofs,
+    _kratos_dvms_current_element_size_array,
+)
 from .state import FluidDVMSState
 from .symbolics import build_fluid_dvms_old_mass_residual, build_fluid_dvms_predictor_symbolics
 
@@ -136,38 +140,40 @@ def _update_fluid_dvms_state_from_previous_step(
     mesh: Mesh,
     u_prev: VectorFunction,
     d_prev: VectorFunction,
+    d_geo: VectorFunction | None = None,
     backend: str | None = None,
 ) -> None:
     if int(state.sample_count) == 0:
         return
     fast = _dvms_fast_p1_tri_cache(state, dh, mesh)
     if fast is not None:
+        geom_disp = d_prev if d_geo is None else d_geo
         ux_prev = _scalar_locals(dh, "ux", u_prev.components[0].nodal_values, fast["element_maps"]["ux"])
         uy_prev = _scalar_locals(dh, "uy", u_prev.components[1].nodal_values, fast["element_maps"]["uy"])
-        mx_prev = _scalar_locals(dh, "mx", d_prev.components[0].nodal_values, fast["element_maps"]["mx"])
-        my_prev = _scalar_locals(dh, "my", d_prev.components[1].nodal_values, fast["element_maps"]["my"])
+        mx_geo = _scalar_locals(dh, "mx", geom_disp.components[0].nodal_values, fast["element_maps"]["mx"])
+        my_geo = _scalar_locals(dh, "my", geom_disp.components[1].nodal_values, fast["element_maps"]["my"])
         grad_phi_u = _grad_phi_phys(fast["grad_ref"]["ux"], fast["J_inv"])
         grad_phi_mx = _grad_phi_phys(fast["grad_ref"]["mx"], fast["J_inv"])
         grad_phi_my = _grad_phi_phys(fast["grad_ref"]["my"], fast["J_inv"])
         grad_ux = np.einsum("el,elk->ek", ux_prev, grad_phi_u, optimize=True)
         grad_uy = np.einsum("el,elk->ek", uy_prev, grad_phi_u, optimize=True)
-        grad_mx = np.einsum("el,elk->ek", mx_prev, grad_phi_mx, optimize=True)
-        grad_my = np.einsum("el,elk->ek", my_prev, grad_phi_my, optimize=True)
-        F_old = np.zeros((int(state.n_elements), 2, 2), dtype=float)
-        F_old[:, 0, 0] = 1.0 + grad_mx[:, 0]
-        F_old[:, 0, 1] = grad_mx[:, 1]
-        F_old[:, 1, 0] = grad_my[:, 0]
-        F_old[:, 1, 1] = 1.0 + grad_my[:, 1]
-        detF = F_old[:, 0, 0] * F_old[:, 1, 1] - F_old[:, 0, 1] * F_old[:, 1, 0]
+        grad_mx = np.einsum("el,elk->ek", mx_geo, grad_phi_mx, optimize=True)
+        grad_my = np.einsum("el,elk->ek", my_geo, grad_phi_my, optimize=True)
+        F_geo = np.zeros((int(state.n_elements), 2, 2), dtype=float)
+        F_geo[:, 0, 0] = 1.0 + grad_mx[:, 0]
+        F_geo[:, 0, 1] = grad_mx[:, 1]
+        F_geo[:, 1, 0] = grad_my[:, 0]
+        F_geo[:, 1, 1] = 1.0 + grad_my[:, 1]
+        detF = F_geo[:, 0, 0] * F_geo[:, 1, 1] - F_geo[:, 0, 1] * F_geo[:, 1, 0]
         bad = np.argwhere(~np.isfinite(detF) | (np.abs(detF) <= 1.0e-14))
         if bad.size:
             raise RuntimeError(f"Singular previous ALE deformation gradient on element {int(bad[0, 0])}.")
-        cof = np.zeros_like(F_old)
-        cof[:, 0, 0] = F_old[:, 1, 1]
-        cof[:, 0, 1] = -F_old[:, 0, 1]
-        cof[:, 1, 0] = -F_old[:, 1, 0]
-        cof[:, 1, 1] = F_old[:, 0, 0]
-        grad_u = np.zeros_like(F_old)
+        cof = np.zeros_like(F_geo)
+        cof[:, 0, 0] = F_geo[:, 1, 1]
+        cof[:, 0, 1] = -F_geo[:, 0, 1]
+        cof[:, 1, 0] = -F_geo[:, 1, 0]
+        cof[:, 1, 1] = F_geo[:, 0, 0]
+        grad_u = np.zeros_like(F_geo)
         grad_u[:, 0, :] = grad_ux
         grad_u[:, 1, :] = grad_uy
         old_mass = -np.einsum("eij,eij->e", cof, grad_u, optimize=True) / detF
@@ -176,7 +182,7 @@ def _update_fluid_dvms_state_from_previous_step(
         return
 
     compiler = _quadrature_expression_compiler(state, dh, backend=backend)
-    expr = build_fluid_dvms_old_mass_residual(u_prev=u_prev, d_prev=d_prev)
+    expr = build_fluid_dvms_old_mass_residual(u_prev=u_prev, d_prev=d_prev, d_geo=d_geo)
     values = compiler.evaluate_volume_expressions_on_quadrature(
         {"old_mass_residual": expr},
         layout=state.quadrature_layout,
@@ -203,6 +209,7 @@ def _update_fluid_dvms_predicted_subscale(
     d_mesh: VectorFunction,
     d_prev: VectorFunction,
     d_prev2: VectorFunction | None = None,
+    mesh_v: VectorFunction | None = None,
     mesh_v_prev: VectorFunction | None = None,
     mesh_a_prev: VectorFunction | None = None,
     rho_f: float,
@@ -244,6 +251,12 @@ def _update_fluid_dvms_predicted_subscale(
         my_k = _scalar_locals(dh, "my", d_mesh.components[1].nodal_values, fast["element_maps"]["my"])
         mx_prev = _scalar_locals(dh, "mx", d_prev.components[0].nodal_values, fast["element_maps"]["mx"])
         my_prev = _scalar_locals(dh, "my", d_prev.components[1].nodal_values, fast["element_maps"]["my"])
+        if mesh_v is not None:
+            mx_vel = _scalar_locals(dh, "mx", mesh_v.components[0].nodal_values, fast["element_maps"]["mx"])
+            my_vel = _scalar_locals(dh, "my", mesh_v.components[1].nodal_values, fast["element_maps"]["my"])
+        else:
+            mx_vel = np.zeros_like(mx_prev)
+            my_vel = np.zeros_like(my_prev)
         if mesh_v_prev is not None and mesh_a_prev is not None:
             mx_vel_prev = _scalar_locals(dh, "mx", mesh_v_prev.components[0].nodal_values, fast["element_maps"]["mx"])
             my_vel_prev = _scalar_locals(dh, "my", mesh_v_prev.components[1].nodal_values, fast["element_maps"]["my"])
@@ -296,6 +309,13 @@ def _update_fluid_dvms_predicted_subscale(
             ],
             axis=2,
         )
+        mesh_v_q = np.stack(
+            [
+                np.einsum("el,ql->eq", mx_vel, basis_u, optimize=True),
+                np.einsum("el,ql->eq", my_vel, basis_u, optimize=True),
+            ],
+            axis=2,
+        )
         mesh_v_prev_q = np.stack(
             [
                 np.einsum("el,ql->eq", mx_vel_prev, basis_u, optimize=True),
@@ -341,7 +361,9 @@ def _update_fluid_dvms_predicted_subscale(
         Finv[:, 1, 1] = F[:, 0, 0] / detF
         grad_u_phys = np.einsum("eij,ejk->eik", grad_u, Finv, optimize=True)
         grad_p_phys = np.einsum("eji,ej->ei", Finv, grad_p, optimize=True)
-        if mesh_v_prev is not None and mesh_a_prev is not None:
+        if mesh_v is not None:
+            w_mesh_q = mesh_v_q
+        elif mesh_v_prev is not None and mesh_a_prev is not None:
             beta = float(bossak["beta"])
             gamma = float(bossak["gamma"])
             a_mesh_q = (
@@ -355,7 +377,7 @@ def _update_fluid_dvms_predicted_subscale(
             w_mesh_q = (1.5 * d_mesh_q - 2.0 * d_prev_q + 0.5 * d_prev2_q) / dt_value
         resolved_conv_velocity = u_k_q - w_mesh_q
         a_curr = float(bossak["ma0"]) * (u_k_q - u_prev_q) + float(bossak["ma2"]) * a_prev_q
-        a_relaxed = (1.0 - float(bossak["alpha"])) * a_curr + float(bossak["alpha"]) * a_prev_q
+        a_relaxed = a_curr
         momentum_projection = np.asarray(state.momentum_projection, dtype=float).reshape(n_elem, n_q, 2)
         old_subscale = np.asarray(state.old_subscale_velocity, dtype=float).reshape(n_elem, n_q, 2)
         static_residual = -(
@@ -365,7 +387,7 @@ def _update_fluid_dvms_predicted_subscale(
             + momentum_projection
         ) + (rho_value / dt_value) * old_subscale
 
-        h_e = _kratos_dvms_element_size_array(mesh).reshape(-1)
+        h_e = _kratos_dvms_current_element_size_array(mesh, dh, d_mesh).reshape(-1)
         if h_e.shape[0] != n_elem:
             raise RuntimeError(f"DVMS predictor element-size mismatch: expected {n_elem}, got {h_e.shape[0]}.")
         predicted = np.asarray(state.predicted_subscale_velocity, dtype=float).reshape(n_elem, n_q, 2).copy()
@@ -389,22 +411,38 @@ def _update_fluid_dvms_predicted_subscale(
             linearization = rho_value * grad_u_phys_q.copy()
             linearization[:, :, 0, 0] += inv_tau
             linearization[:, :, 1, 1] += inv_tau
-            solved, ok = _solve_2x2_batched(linearization.reshape(-1, 2, 2), static_residual.reshape(-1, 2))
-            solved = solved.reshape(n_elem, n_q, 2)
+            newton_rhs = static_residual - np.einsum("eqij,eqj->eqi", linearization, predicted, optimize=True)
+            delta, ok = _solve_2x2_batched(linearization.reshape(-1, 2, 2), newton_rhs.reshape(-1, 2))
+            delta = delta.reshape(n_elem, n_q, 2)
             ok = ok.reshape(n_elem, n_q)
-            valid = active & ok & np.all(np.isfinite(solved), axis=2)
+            valid = active & ok & np.all(np.isfinite(delta), axis=2)
             invalid = active & ~valid
             if np.any(invalid):
                 failed[invalid] = True
                 predicted[invalid, :] = 0.0
             if not np.any(valid):
                 continue
-            delta = solved[valid, :] - predicted[valid, :]
-            predicted[valid, :] = solved[valid, :]
-            err = np.linalg.norm(delta, axis=1)
-            norm_u = np.linalg.norm(predicted[valid, :], axis=1)
-            rel_err = np.divide(err, norm_u, out=np.full_like(err, np.inf, dtype=float), where=norm_u > 0.0)
-            converged_now = (err <= abs_tol_value) | ((norm_u > rel_tol_value) & (rel_err <= rel_tol_value))
+            predicted[valid, :] = predicted[valid, :] + delta[valid, :]
+            velocity_error = np.einsum("ij,ij->i", delta[valid, :], delta[valid, :], optimize=True)
+            velocity_norm = np.einsum(
+                "ij,ij->i",
+                predicted[valid, :],
+                predicted[valid, :],
+                optimize=True,
+            )
+            velocity_error = np.divide(
+                velocity_error,
+                velocity_norm,
+                out=velocity_error.copy(),
+                where=velocity_norm > rel_tol_value,
+            )
+            residual_norm = np.einsum(
+                "ij,ij->i",
+                newton_rhs[valid, :],
+                newton_rhs[valid, :],
+                optimize=True,
+            )
+            converged_now = (velocity_error <= rel_tol_value) | (residual_norm <= abs_tol_value)
             valid_idx = np.argwhere(valid)
             if valid_idx.size:
                 converged[valid_idx[converged_now, 0], valid_idx[converged_now, 1]] = True
@@ -430,6 +468,7 @@ def _update_fluid_dvms_predicted_subscale(
         d_mesh=d_mesh,
         d_prev=d_prev,
         d_prev2=d_prev2,
+        mesh_v=mesh_v,
         mesh_v_prev=mesh_v_prev,
         mesh_a_prev=mesh_a_prev,
         dt=dt_value,
@@ -465,7 +504,7 @@ def _update_fluid_dvms_predicted_subscale(
     ):
         raise RuntimeError("DVMS predictor evaluation produced non-finite quadrature data.")
 
-    h_e = _kratos_dvms_element_size_array(mesh).reshape(-1)
+    h_e = _kratos_dvms_current_element_size_array(mesh, dh, d_mesh).reshape(-1)
     if h_e.shape[0] != int(state.n_elements):
         raise RuntimeError(
             f"DVMS predictor element-size mismatch: expected {state.n_elements}, got {h_e.shape[0]}."
@@ -513,9 +552,10 @@ def _update_fluid_dvms_predicted_subscale(
         pred_flat = predicted.reshape(-1, 2)
         linearization_flat = linearization.reshape(-1, 2, 2)
         static_flat = static_residual.reshape(-1, 2)
+        rhs_flat = static_flat - np.einsum("nij,nj->ni", linearization_flat, pred_flat, optimize=True)
         solved_active, solved_ok = _solve_batched(
             linearization_flat[active_flat],
-            static_flat[active_flat],
+            rhs_flat[active_flat],
         )
         valid_active = solved_ok & np.all(np.isfinite(solved_active), axis=1)
         invalid_idx = active_flat[~valid_active]
@@ -525,19 +565,28 @@ def _update_fluid_dvms_predicted_subscale(
         if not np.any(valid_active):
             continue
         solved_idx = active_flat[valid_active]
-        delta = solved_active[valid_active] - pred_flat[solved_idx, :]
-        pred_flat[solved_idx, :] = solved_active[valid_active]
-        err = np.linalg.norm(delta, axis=1)
-        norm_u = np.linalg.norm(pred_flat[solved_idx, :], axis=1)
-        rel_err = np.divide(
-            err,
-            norm_u,
-            out=np.full_like(err, np.inf, dtype=float),
-            where=norm_u > 0.0,
+        delta = solved_active[valid_active]
+        pred_flat[solved_idx, :] = pred_flat[solved_idx, :] + delta
+        velocity_error = np.einsum("ij,ij->i", delta, delta, optimize=True)
+        velocity_norm = np.einsum(
+            "ij,ij->i",
+            pred_flat[solved_idx, :],
+            pred_flat[solved_idx, :],
+            optimize=True,
         )
-        converged_now = (err <= abs_tol_value) | (
-            (norm_u > rel_tol_value) & (rel_err <= rel_tol_value)
+        velocity_error = np.divide(
+            velocity_error,
+            velocity_norm,
+            out=velocity_error.copy(),
+            where=velocity_norm > rel_tol_value,
         )
+        residual_norm = np.einsum(
+            "ij,ij->i",
+            rhs_flat[solved_idx, :],
+            rhs_flat[solved_idx, :],
+            optimize=True,
+        )
+        converged_now = (velocity_error <= rel_tol_value) | (residual_norm <= abs_tol_value)
         converged.reshape(-1)[solved_idx[converged_now]] = True
 
     remaining = ~(failed | converged)

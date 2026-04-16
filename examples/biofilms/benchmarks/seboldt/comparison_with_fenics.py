@@ -216,13 +216,20 @@ def _fenics_audit_diffuse_traction_exprs(mesh):
 def _initialize_problem(problem: dict[str, object], *, enable_phi_evolution: bool, full_ratio_free_state: bool) -> None:
     problem["v_k"].set_values_from_function(lambda x, y: np.array([0.18 + 0.04 * x - 0.03 * y, -0.06 + 0.02 * x + 0.015 * y]))
     problem["v_n"].set_values_from_function(lambda x, y: np.array([0.11 + 0.03 * x - 0.02 * y, -0.03 + 0.015 * x + 0.010 * y]))
+    if problem.get("vP_k") is not None:
+        problem["vP_k"].set_values_from_function(
+            lambda x, y: np.array([0.07 + 0.03 * x - 0.02 * y, -0.04 + 0.015 * x + 0.012 * y])
+        )
+        problem["vP_n"].set_values_from_function(
+            lambda x, y: np.array([0.04 + 0.02 * x - 0.015 * y, -0.02 + 0.010 * x + 0.008 * y])
+        )
     problem["vS_k"].set_values_from_function(lambda x, y: np.array([0.05 + 0.02 * x - 0.01 * y, -0.03 + 0.01 * x + 0.015 * y]))
     problem["vS_n"].set_values_from_function(lambda x, y: np.array([0.03 + 0.01 * x - 0.008 * y, -0.015 + 0.008 * x + 0.010 * y]))
     problem["u_k"].set_values_from_function(lambda x, y: np.array([0.015 + 0.010 * x * (1.0 - x), -0.008 + 0.006 * y * (1.0 - y / 1.5)]))
     problem["u_n"].set_values_from_function(lambda x, y: np.array([0.010 + 0.006 * x * (1.0 - x), -0.005 + 0.004 * y * (1.0 - y / 1.5)]))
     problem["p_k"].set_values_from_function(lambda x, y: 0.25 + 0.10 * x - 0.05 * y)
     problem["p_n"].set_values_from_function(lambda x, y: 0.12 + 0.04 * x - 0.03 * y)
-    if bool(full_ratio_free_state) and problem.get("p_pore_k") is not None:
+    if problem.get("p_pore_k") is not None:
         problem["p_pore_k"].set_values_from_function(lambda x, y: 0.16 + 0.06 * x - 0.04 * y)
         problem["p_pore_n"].set_values_from_function(lambda x, y: 0.09 + 0.03 * x - 0.02 * y)
     if problem.get("p_mean_k") is not None:
@@ -230,17 +237,22 @@ def _initialize_problem(problem: dict[str, object], *, enable_phi_evolution: boo
         problem["p_mean_n"].nodal_values[:] = 0.0
     problem["alpha_k"].set_values_from_function(lambda x, y: 0.58 + 0.015 * x + 0.010 * y)
     problem["alpha_n"].set_values_from_function(lambda x, y: 0.54 + 0.010 * x + 0.008 * y)
-    problem["mu_k"].set_values_from_function(lambda x, y: 0.10 + 0.020 * x - 0.015 * y)
-    problem["mu_n"].set_values_from_function(lambda x, y: 0.07 + 0.015 * x - 0.010 * y)
+    if problem.get("mu_k") is not None:
+        problem["mu_k"].set_values_from_function(lambda x, y: 0.10 + 0.020 * x - 0.015 * y)
+        problem["mu_n"].set_values_from_function(lambda x, y: 0.07 + 0.015 * x - 0.010 * y)
     if bool(enable_phi_evolution):
-        if bool(full_ratio_free_state):
+        if bool(full_ratio_free_state) and problem.get("B_k") is not None:
             problem["B_k"].set_values_from_function(lambda x, y: 0.18 + 0.02 * x - 0.01 * y)
             problem["B_n"].set_values_from_function(lambda x, y: 0.16 + 0.015 * x - 0.008 * y)
         else:
             problem["phi_k"].set_values_from_function(lambda x, y: 0.68 + 0.04 * x - 0.03 * y)
             problem["phi_n"].set_values_from_function(lambda x, y: 0.66 + 0.03 * x - 0.02 * y)
-        problem["S_k"].set_values_from_function(lambda x, y: 0.20 + 0.02 * x + 0.01 * y)
-        problem["S_n"].set_values_from_function(lambda x, y: 0.17 + 0.015 * x + 0.008 * y)
+        if problem.get("S_k") is not None:
+            problem["S_k"].set_values_from_function(lambda x, y: 0.20 + 0.02 * x + 0.01 * y)
+            problem["S_n"].set_values_from_function(lambda x, y: 0.17 + 0.015 * x + 0.008 * y)
+    if problem.get("rho_s_k") is not None:
+        problem["rho_s_k"].set_values_from_function(lambda x, y: 1.05 + 0.04 * x - 0.03 * y)
+        problem["rho_s_n"].set_values_from_function(lambda x, y: 1.02 + 0.03 * x - 0.02 * y)
 
 
 def _field_to_func(problem: dict[str, object], *, enable_phi_evolution: bool, full_ratio_free_state: bool) -> dict[str, object]:
@@ -253,10 +265,16 @@ def _field_to_func(problem: dict[str, object], *, enable_phi_evolution: bool, fu
         "u_x": problem["u_k"].components[0],
         "u_y": problem["u_k"].components[1],
         "alpha": problem["alpha_k"],
-        "mu_alpha": problem["mu_k"],
     }
-    if bool(full_ratio_free_state) and problem.get("p_pore_k") is not None:
+    if problem.get("mu_k") is not None:
+        out["mu_alpha"] = problem["mu_k"]
+    if problem.get("p_pore_k") is not None:
         out["p_pore"] = problem["p_pore_k"]
+    if problem.get("vP_k") is not None:
+        out["vP_x"] = problem["vP_k"].components[0]
+        out["vP_y"] = problem["vP_k"].components[1]
+    if problem.get("rho_s_k") is not None:
+        out["rho_s"] = problem["rho_s_k"]
     if problem.get("lambda_drag_k") is not None:
         out["lambda_drag_x"] = problem["lambda_drag_k"].components[0]
         out["lambda_drag_y"] = problem["lambda_drag_k"].components[1]
@@ -269,7 +287,8 @@ def _field_to_func(problem: dict[str, object], *, enable_phi_evolution: bool, fu
         )
         if scalar_name is not None:
             out[scalar_name] = problem[f"{scalar_name}_k"]
-        out["S"] = problem["S_k"]
+        if problem.get("S_k") is not None:
+            out["S"] = problem["S_k"]
     if problem.get("alpha_latent_k") is not None:
         out["alpha_latent"] = problem["alpha_latent_k"]
     if bool(enable_phi_evolution) and (not bool(full_ratio_free_state)) and problem.get("phi_latent_k") is not None:
@@ -341,9 +360,13 @@ def _build_benchmark_case(
     stored_support_content_mode: str = "evolve_B",
     p_pore_fluid_gauge: bool = True,
     p_pore_fluid_gauge_strength: float = 1.0,
+    one_domain_formulation: str = "legacy",
 ) -> tuple[dict[str, object], object, dict[str, object], int]:
     poly_order, pressure_order, scalar_order = _resolved_orders(poly_order, pressure_order, scalar_order)
     qdeg = max(6, 2 * int(poly_order) + 2)
+    formulation_key = str(one_domain_formulation or "legacy").strip().lower().replace("-", "_")
+    use_final_form = formulation_key == "final_form"
+    use_ratio_free_state = False if bool(use_final_form) else bool(full_ratio_free_state)
     problem = _create_problem(
         Lx=float(Lx),
         Ly=float(Ly),
@@ -355,6 +378,7 @@ def _build_benchmark_case(
         fluid_space="cg",
         fluid_hdiv_order=0,
         enable_phi_evolution=bool(enable_phi_evolution),
+        one_domain_formulation=str(formulation_key),
         latent_bounded_transport=bool(latent_bounded_transport),
         latent_bounded_fields=tuple(latent_bounded_fields),
         latent_bounded_map=str(latent_bounded_map),
@@ -362,7 +386,7 @@ def _build_benchmark_case(
         pressure_mean_constraint=bool(pressure_mean_constraint),
         solid_volumetric_split=bool(solid_volumetric_split),
         drag_formulation="mixed_lm",
-        full_ratio_free_state=bool(full_ratio_free_state),
+        full_ratio_free_state=bool(use_ratio_free_state),
         stored_support_content_mode=str(stored_support_content_mode),
     )
     _initialize_problem(
@@ -477,7 +501,7 @@ def _build_benchmark_case(
     )
     problem["_audit_phi_b"] = 0.18
     problem["_audit_enable_phi_evolution"] = bool(enable_phi_evolution)
-    problem["_audit_full_ratio_free_state"] = bool(full_ratio_free_state)
+    problem["_audit_full_ratio_free_state"] = bool(use_ratio_free_state)
     problem["_audit_Lx"] = float(Lx)
     problem["_audit_Ly"] = float(Ly)
     problem["_audit_nx"] = int(nx)
@@ -509,6 +533,7 @@ def _build_benchmark_case(
     problem["_audit_include_skeleton_acceleration"] = bool(include_skeleton_acceleration)
     problem["_audit_rho_s0_tilde"] = float(rho_s0_tilde)
     problem["_audit_storativity_c0"] = float(storativity_c0)
+    problem["_audit_one_domain_formulation"] = str(formulation_key)
     problem["_audit_latent_bounded_transport"] = bool(latent_bounded_transport)
     problem["_audit_latent_bounded_fields"] = tuple(problem.get("latent_bounded_fields", tuple()) or tuple())
     problem["_audit_latent_bounded_map"] = str(latent_bounded_map)
@@ -575,7 +600,7 @@ def _build_benchmark_case(
         "solid_volumetric_penalty": float(solid_volumetric_penalty),
         "mechanics_nondim_mode": str(mechanics_nondim_mode),
         "kinematics_scale": float(problem.get("_audit_form_params", {}).get("kinematics_scale", 1.0)),
-        "full_ratio_free_state": bool(full_ratio_free_state),
+        "full_ratio_free_state": bool(use_ratio_free_state),
         "stored_support_content_mode": str(stored_support_content_mode),
         "p_pore_fluid_gauge": bool(p_pore_fluid_gauge),
         "p_pore_fluid_gauge_strength": float(p_pore_fluid_gauge_strength),
@@ -586,11 +611,13 @@ def _build_benchmark_case(
         "k_d": 0.0,
         "Y": 1.0,
         "rho_s_star": 1.0,
+        "one_domain_formulation": str(formulation_key),
+        "rho_s_fluid_gauge_strength": 1.0,
     }
     return problem, forms, _field_to_func(
         problem,
         enable_phi_evolution=bool(enable_phi_evolution),
-        full_ratio_free_state=bool(full_ratio_free_state),
+        full_ratio_free_state=bool(use_ratio_free_state),
     ), int(qdeg)
 
 
@@ -612,6 +639,7 @@ def _directional_fd_audit(
     fd_eps: float = 1.0e-6,
 ) -> tuple[float, dict[str, float]]:
     dh = problem["dh"]
+    final_form = bool(problem.get("final_form", False))
     K, _ = assemble_form(
         Equation(forms.jacobian_form, forms.residual_form),
         dof_handler=dh,
@@ -621,12 +649,16 @@ def _directional_fd_audit(
     )
     K = K.tocsr()
     ndofs = int(K.shape[1])
-    probe_fields = ["v_x", "v_y", "p", "vS_x", "vS_y", "u_x", "u_y", "alpha", "mu_alpha"]
+    probe_fields = ["v_x", "v_y", "p", "vS_x", "vS_y", "u_x", "u_y", "alpha"]
+    if problem.get("mu_k") is not None:
+        probe_fields.append("mu_alpha")
+    if bool(final_form):
+        probe_fields.extend(["p_pore", "vP_x", "vP_y", "rho_s", "phi"])
     if problem.get("lambda_drag_k") is not None:
         probe_fields.extend(["lambda_drag_x", "lambda_drag_y"])
     if problem.get("p_mean_k") is not None:
         probe_fields.append("p_mean")
-    if bool(enable_phi_evolution):
+    if bool(enable_phi_evolution) and not bool(final_form):
         scalar_name = _transport_scalar_name(
             enable_phi_evolution=bool(enable_phi_evolution),
             full_ratio_free_state=bool(problem.get("_audit_full_ratio_free_state", False)),
@@ -656,10 +688,15 @@ def _directional_fd_audit(
         _field_direction("alpha_latent_only", ["alpha_latent"])
     _field_direction("v_only", ["v_x", "v_y"])
     _field_direction("vS_only", ["vS_x", "vS_y"])
+    if bool(final_form):
+        _field_direction("vP_only", ["vP_x", "vP_y"])
+        _field_direction("p_pore_only", ["p_pore"])
+        _field_direction("rho_s_only", ["rho_s"])
+        _field_direction("phi_only", ["phi"])
     if problem.get("lambda_drag_k") is not None:
         _field_direction("lambda_drag_only", ["lambda_drag_x", "lambda_drag_y"])
     _field_direction("u_only", ["u_x", "u_y"])
-    if bool(enable_phi_evolution):
+    if bool(enable_phi_evolution) and not bool(final_form):
         scalar_name = _transport_scalar_name(
             enable_phi_evolution=bool(enable_phi_evolution),
             full_ratio_free_state=bool(problem.get("_audit_full_ratio_free_state", False)),
@@ -1703,6 +1740,327 @@ def _load_fenics_full_state(
     w_k.x.scatter_forward()
     w_n.x.scatter_forward()
     return w_k, w_n
+
+
+def _build_fenics_final_form_system(
+    *,
+    Lx: float,
+    Ly: float,
+    nx: int,
+    ny: int,
+    poly_order: int,
+    pressure_order: int,
+    scalar_order: int,
+):
+    mesh_fx = dolfinx.mesh.create_rectangle(
+        MPI.COMM_WORLD,
+        [np.array([0.0, 0.0], dtype=float), np.array([float(Lx), float(Ly)], dtype=float)],
+        [int(nx), int(ny)],
+        cell_type=dolfinx.mesh.CellType.quadrilateral,
+    )
+    gdim = mesh_fx.geometry.dim
+    p_family = "DQ" if int(pressure_order) == 0 else "Lagrange"
+    s_family = "DQ" if int(scalar_order) == 0 else "Lagrange"
+    V_el = basix.ufl.element("Lagrange", "quadrilateral", int(poly_order), shape=(gdim,))
+    P_el = basix.ufl.element(p_family, "quadrilateral", int(pressure_order))
+    A_el = basix.ufl.element(s_family, "quadrilateral", int(scalar_order))
+    W_el = mixed_element([V_el, P_el, P_el, V_el, V_el, V_el, A_el, V_el, A_el, A_el])
+    if hasattr(dolfinx.fem, "functionspace"):
+        W = dolfinx.fem.functionspace(mesh_fx, W_el)
+    else:
+        W = dolfinx.fem.FunctionSpace(mesh_fx, W_el)
+    return mesh_fx, W
+
+
+def _audit_final_form_layout() -> list[tuple[str, int, int | None]]:
+    return [
+        ("v_x", 0, 0),
+        ("v_y", 0, 1),
+        ("p", 1, None),
+        ("p_pore", 2, None),
+        ("vS_x", 3, 0),
+        ("vS_y", 3, 1),
+        ("u_x", 4, 0),
+        ("u_y", 4, 1),
+        ("vP_x", 5, 0),
+        ("vP_y", 5, 1),
+        ("rho_s", 6, None),
+        ("lambda_drag_x", 7, 0),
+        ("lambda_drag_y", 7, 1),
+        ("alpha", 8, None),
+        ("phi", 9, None),
+    ]
+
+
+def _map_pycutfem_to_fenics_final_form(problem, W) -> dict[str, np.ndarray]:
+    dh = problem["dh"]
+    mapping: dict[str, np.ndarray] = {}
+    for fld, sub_idx, comp in _audit_final_form_layout():
+        if comp is None:
+            parent, coords_fx = _fenics_parent_dofs_for_scalar(W, int(sub_idx))
+        else:
+            parent, coords_fx = _fenics_parent_dofs_for_component(W, int(sub_idx), int(comp))
+        coords_pc = np.asarray(dh.get_dof_coords(fld), dtype=float)
+        mapping[fld] = parent[_one_to_one_map_coords(coords_pc, coords_fx)]
+    return mapping
+
+
+def _load_fenics_final_form_state(problem, W, mapping: dict[str, np.ndarray]):
+    w_k = dolfinx.fem.Function(W, name="w_k")
+    w_n = dolfinx.fem.Function(W, name="w_n")
+    fields_k = [
+        ("v_x", problem["v_k"].components[0]),
+        ("v_y", problem["v_k"].components[1]),
+        ("p", problem["p_k"]),
+        ("p_pore", problem["p_pore_k"]),
+        ("vS_x", problem["vS_k"].components[0]),
+        ("vS_y", problem["vS_k"].components[1]),
+        ("u_x", problem["u_k"].components[0]),
+        ("u_y", problem["u_k"].components[1]),
+        ("vP_x", problem["vP_k"].components[0]),
+        ("vP_y", problem["vP_k"].components[1]),
+        ("rho_s", problem["rho_s_k"]),
+        ("lambda_drag_x", problem["lambda_drag_k"].components[0]),
+        ("lambda_drag_y", problem["lambda_drag_k"].components[1]),
+        ("alpha", problem["alpha_k"]),
+        ("phi", problem["phi_k"]),
+    ]
+    fields_n = [
+        ("v_x", problem["v_n"].components[0]),
+        ("v_y", problem["v_n"].components[1]),
+        ("p", problem["p_n"]),
+        ("p_pore", problem["p_pore_n"]),
+        ("vS_x", problem["vS_n"].components[0]),
+        ("vS_y", problem["vS_n"].components[1]),
+        ("u_x", problem["u_n"].components[0]),
+        ("u_y", problem["u_n"].components[1]),
+        ("vP_x", problem["vP_n"].components[0]),
+        ("vP_y", problem["vP_n"].components[1]),
+        ("rho_s", problem["rho_s_n"]),
+        ("lambda_drag_x", problem["lambda_drag_n"].components[0]),
+        ("lambda_drag_y", problem["lambda_drag_n"].components[1]),
+        ("alpha", problem["alpha_n"]),
+        ("phi", problem["phi_n"]),
+    ]
+    for fld, func in fields_k:
+        w_k.x.array[mapping[fld]] = np.asarray(func.nodal_values, dtype=float)
+    for fld, func in fields_n:
+        w_n.x.array[mapping[fld]] = np.asarray(func.nodal_values, dtype=float)
+    w_k.x.scatter_forward()
+    w_n.x.scatter_forward()
+    return w_k, w_n
+
+
+def _fenics_final_form_forms(
+    *,
+    W,
+    w_k,
+    w_n,
+    qdeg: int,
+    params: dict[str, object],
+):
+    mesh = W.mesh
+    gdim = int(mesh.geometry.dim)
+    dw = ufl.TrialFunction(W)
+    wtest = ufl.TestFunction(W)
+    (
+        dv_fx,
+        dp_fx,
+        dp_pore_fx,
+        dvS_fx,
+        du_fx,
+        dvP_fx,
+        drho_s_fx,
+        dlambda_drag_fx,
+        dalpha_fx,
+        dphi_fx,
+    ) = ufl.split(dw)
+    (
+        v_test_fx,
+        q_test_fx,
+        q_pore_test_fx,
+        vS_test_fx,
+        u_test_fx,
+        vP_test_fx,
+        rho_s_test_fx,
+        lambda_drag_test_fx,
+        alpha_test_fx,
+        phi_test_fx,
+    ) = ufl.split(wtest)
+    (
+        v_k_fx,
+        p_k_fx,
+        p_pore_k_fx,
+        vS_k_fx,
+        u_k_fx,
+        vP_k_fx,
+        rho_s_k_fx,
+        lambda_drag_k_fx,
+        alpha_k_fx,
+        phi_k_fx,
+    ) = ufl.split(w_k)
+    (
+        v_n_fx,
+        p_n_fx,
+        p_pore_n_fx,
+        vS_n_fx,
+        u_n_fx,
+        vP_n_fx,
+        rho_s_n_fx,
+        lambda_drag_n_fx,
+        alpha_n_fx,
+        phi_n_fx,
+    ) = ufl.split(w_n)
+    del dp_fx, dp_pore_fx, dvS_fx, du_fx, dvP_fx, drho_s_fx, dlambda_drag_fx, dalpha_fx, dphi_fx
+
+    def _const(val: float):
+        return dolfinx.fem.Constant(mesh, float(val))
+
+    def _eps(v):
+        return ufl.sym(ufl.grad(v))
+
+    def _one_minus(expr):
+        return 1.0 - expr
+
+    def _solid_stress(u_expr):
+        solid_model_key = str(params.get("solid_model", "linear")).strip().lower().replace("-", "_")
+        I_fx = ufl.Identity(gdim)
+        if solid_model_key in {"neo_hookean", "neo_hookean_seboldt", "seboldt_neo_hookean"}:
+            return _sigma_neo_hookean_seboldt_fx(u_expr, mu_s_fx, lambda_s_fx, dim=gdim)
+        eps_u_fx = _eps(u_expr)
+        return 2.0 * mu_s_fx * eps_u_fx + lambda_s_fx * ufl.div(u_expr) * I_fx
+
+    dx_fx = ufl.dx(metadata={"quadrature_degree": int(qdeg)})
+    I_fx = ufl.Identity(gdim)
+    dt_fx = _const(float(params["dt"]))
+    inv_dt_fx = 1.0 / dt_fx
+    rho_f_fx = _const(float(params["rho_f"]))
+    mu_f_fx = _const(float(params["mu_f"]))
+    kappa_inv_fx = _const(float(params["kappa_inv"]))
+    mu_s_fx = _const(float(params["mu_s"]))
+    lambda_s_fx = _const(float(params["lambda_s"]))
+    eta_s_fx = _const(float(params.get("solid_visco_eta", 0.0)))
+    rho_s_gauge_fx = _const(float(params.get("rho_s_fluid_gauge_strength", 1.0)))
+
+    F_k_fx = _one_minus(alpha_k_fx)
+    one_m_phi_k_fx = _one_minus(phi_k_fx)
+    one_m_phi_n_fx = _one_minus(phi_n_fx)
+    sigma_f_k_fx = 2.0 * mu_f_fx * _eps(v_k_fx) - p_k_fx * I_fx
+    sigma_p_k_fx = -p_pore_k_fx * I_fx
+    sigma_s_k_fx = _solid_stress(u_k_fx)
+    grad_alpha_fx = ufl.grad(alpha_k_fx)
+    grad_alpha_eps_fx = _const(1.0e-12)
+    grad_alpha_mag_fx = ufl.sqrt(ufl.dot(grad_alpha_fx, grad_alpha_fx) + grad_alpha_eps_fx * grad_alpha_eps_fx)
+    n_alpha_fx = grad_alpha_fx / grad_alpha_mag_fx
+    t_alpha_fx = ufl.as_vector((-n_alpha_fx[1], n_alpha_fx[0]))
+
+    fluid_conv_key = str(params.get("fluid_convection", "full")).strip().lower().replace("-", "_")
+    pore_conv_key = str(params.get("pore_convection", "full")).strip().lower().replace("-", "_")
+    solid_conv_key = str(params.get("skeleton_inertia_convection", "full")).strip().lower().replace("-", "_")
+
+    r_mom_f_fx = F_k_fx * rho_f_fx * ufl.dot((v_k_fx - v_n_fx) * inv_dt_fx, v_test_fx) * dx_fx
+    if fluid_conv_key != "off":
+        conv_f_k_fx = ufl.dot(ufl.grad(v_k_fx), v_k_fx)
+        r_mom_f_fx += F_k_fx * rho_f_fx * ufl.dot(conv_f_k_fx, v_test_fx) * dx_fx
+    r_mom_f_fx += F_k_fx * 2.0 * mu_f_fx * ufl.inner(_eps(v_k_fx), _eps(v_test_fx)) * dx_fx
+    r_mom_f_fx += -(F_k_fx * p_k_fx) * ufl.div(v_test_fx) * dx_fx
+    r_mom_f_bulk_fx = r_mom_f_fx
+
+    pore_coeff_k_fx = alpha_k_fx * phi_k_fx
+    r_mom_p_fx = pore_coeff_k_fx * rho_f_fx * ufl.dot((vP_k_fx - vP_n_fx) * inv_dt_fx, vP_test_fx) * dx_fx
+    if pore_conv_key != "off":
+        conv_p_k_fx = ufl.dot(ufl.grad(vP_k_fx), vP_k_fx)
+        r_mom_p_fx += pore_coeff_k_fx * rho_f_fx * ufl.dot(conv_p_k_fx, vP_test_fx) * dx_fx
+    r_mom_p_fx += alpha_k_fx * phi_k_fx * ufl.inner(sigma_p_k_fx, ufl.grad(vP_test_fx)) * dx_fx
+    r_mom_p_fx += -(alpha_k_fx * p_pore_k_fx) * ufl.dot(ufl.grad(phi_k_fx), vP_test_fx) * dx_fx
+    drag_coeff_k_fx = alpha_k_fx * phi_k_fx * phi_k_fx * kappa_inv_fx
+    rel_p_k_fx = vP_k_fx - vS_k_fx
+    r_mom_p_fx += drag_coeff_k_fx * ufl.dot(rel_p_k_fx, vP_test_fx) * dx_fx
+    r_mom_p_bulk_fx = r_mom_p_fx
+
+    solid_coeff_k_fx = alpha_k_fx * rho_s_k_fx * one_m_phi_k_fx
+    r_skel_fx = solid_coeff_k_fx * ufl.dot((vS_k_fx - vS_n_fx) * inv_dt_fx, vS_test_fx) * dx_fx
+    if solid_conv_key != "off":
+        conv_s_k_fx = ufl.dot(ufl.grad(vS_k_fx), vS_k_fx)
+        r_skel_fx += solid_coeff_k_fx * ufl.dot(conv_s_k_fx, vS_test_fx) * dx_fx
+    r_skel_fx += -(alpha_k_fx * one_m_phi_k_fx) * ufl.inner(sigma_s_k_fx, ufl.grad(vS_test_fx)) * dx_fx
+    if float(params.get("solid_visco_eta", 0.0)) != 0.0:
+        r_skel_fx += alpha_k_fx * one_m_phi_k_fx * 2.0 * eta_s_fx * ufl.inner(_eps(vS_k_fx), _eps(vS_test_fx)) * dx_fx
+    r_skel_fx += (alpha_k_fx * p_pore_k_fx) * ufl.dot(ufl.grad(phi_k_fx), vS_test_fx) * dx_fx
+    r_skel_fx += -drag_coeff_k_fx * ufl.dot(rel_p_k_fx, vS_test_fx) * dx_fx
+    r_skel_bulk_fx = r_skel_fx
+
+    mass_jump_k_fx = v_k_fx - phi_k_fx * vP_k_fx - one_m_phi_k_fx * vS_k_fx
+    r_mass_fx = q_test_fx * (F_k_fx * ufl.div(v_k_fx)) * dx_fx
+    pore_flux_bulk_k_fx = phi_k_fx * ufl.div(vP_k_fx) + ufl.dot(ufl.grad(phi_k_fx), vP_k_fx)
+    r_pore_mass_fx = phi_test_fx * (alpha_k_fx * ((phi_k_fx - phi_n_fx) * inv_dt_fx + pore_flux_bulk_k_fx)) * dx_fx
+    rho_rate_k_fx = (rho_s_k_fx - rho_s_n_fx) * inv_dt_fx + ufl.dot(vS_k_fx, ufl.grad(rho_s_k_fx))
+    solid_flux_bulk_k_fx = one_m_phi_k_fx * ufl.div(vS_k_fx) + ufl.dot(ufl.grad(one_m_phi_k_fx), vS_k_fx)
+    solid_mass_bulk_k_fx = (
+        -rho_s_k_fx * ((phi_k_fx - phi_n_fx) * inv_dt_fx)
+        + one_m_phi_k_fx * rho_rate_k_fx
+        + rho_s_k_fx * solid_flux_bulk_k_fx
+    )
+    r_solid_mass_fx = rho_s_test_fx * (alpha_k_fx * solid_mass_bulk_k_fx) * dx_fx
+    r_mass_interface_porous_fx = phi_test_fx * ufl.dot(ufl.grad(alpha_k_fx), mass_jump_k_fx) * dx_fx
+    r_phi_fx = r_pore_mass_fx + r_solid_mass_fx + r_mass_interface_porous_fx
+
+    r_kin_fx = alpha_k_fx * ufl.dot((u_k_fx - u_n_fx) * inv_dt_fx + ufl.dot(ufl.grad(u_k_fx), vS_k_fx) - vS_k_fx, u_test_fx) * dx_fx
+    r_alpha_fx = alpha_test_fx * ((alpha_k_fx - alpha_n_fx) * inv_dt_fx + ufl.dot(vS_k_fx, ufl.grad(alpha_k_fx))) * dx_fx
+
+    one_m_alpha4_k_fx = F_k_fx * F_k_fx
+    one_m_alpha4_k_fx = one_m_alpha4_k_fx * one_m_alpha4_k_fx
+    one_m_alpha8_k_fx = one_m_alpha4_k_fx * one_m_alpha4_k_fx
+    rho_s_gauge_weight_k_fx = one_m_alpha8_k_fx * one_m_alpha8_k_fx
+    r_rho_s_gauge_fx = rho_s_gauge_fx * rho_s_gauge_weight_k_fx * (rho_s_k_fx - rho_s_n_fx) * rho_s_test_fx * dx_fx
+    r_phi_fx += r_rho_s_gauge_fx
+
+    porous_stress_k_fx = phi_k_fx * sigma_p_k_fx + one_m_phi_k_fx * sigma_s_k_fx
+    porous_if_fx = ufl.dot(porous_stress_k_fx, ufl.grad(alpha_k_fx))
+    fluid_if_fx = ufl.dot(sigma_f_k_fx, ufl.grad(alpha_k_fx))
+    r_interface_traction_f_fx = ufl.dot(porous_if_fx, v_test_fx) * dx_fx
+    fluid_normal_trac_fx = ufl.dot(n_alpha_fx, fluid_if_fx)
+    solid_normal_trac_fx = ufl.dot(n_alpha_fx, ufl.dot(sigma_s_k_fx, n_alpha_fx))
+    fluid_tang_trac_fx = ufl.dot(t_alpha_fx, fluid_if_fx)
+    solid_tang_trac_fx = ufl.dot(t_alpha_fx, ufl.dot(sigma_s_k_fx, n_alpha_fx))
+    normal_traction_jump_fx = fluid_normal_trac_fx + phi_k_fx * p_pore_k_fx - one_m_phi_k_fx * solid_normal_trac_fx
+    tangential_traction_jump_fx = fluid_tang_trac_fx - one_m_phi_k_fx * solid_tang_trac_fx
+    tangential_solid_test_fx = ufl.dot(t_alpha_fx, vS_test_fx)
+    r_interface_traction_p_fx = grad_alpha_mag_fx * normal_traction_jump_fx * q_pore_test_fx * dx_fx
+    r_interface_traction_s_fx = -(grad_alpha_mag_fx * tangential_traction_jump_fx * tangential_solid_test_fx) * dx_fx
+    r_mom_f_fx += r_interface_traction_f_fx
+    r_skel_fx += r_interface_traction_s_fx
+
+    r_lambda_drag_fx = _const(0.0) * ufl.dot(lambda_drag_k_fx, lambda_drag_test_fx) * dx_fx
+    r_total_fx = (
+        r_mom_f_fx
+        + r_mom_p_fx
+        + r_mass_fx
+        + r_interface_traction_p_fx
+        + r_skel_fx
+        + r_kin_fx
+        + r_phi_fx
+        + r_alpha_fx
+        + r_lambda_drag_fx
+    )
+    a_total_fx = ufl.derivative(r_total_fx, w_k, dw)
+    return r_total_fx, a_total_fx, {
+        "momentum": r_mom_f_fx,
+        "pore_momentum": r_mom_p_fx,
+        "mass": r_mass_fx,
+        "skeleton": r_skel_fx,
+        "kinematics": r_kin_fx,
+        "phi": r_phi_fx,
+        "alpha": r_alpha_fx,
+        "pore_row": _const(0.0) * q_test_fx * dx_fx,
+        "momentum_terms": {
+            "free_bulk": r_mom_f_bulk_fx,
+            "pore_bulk": r_mom_p_bulk_fx,
+            "solid_bulk": r_skel_bulk_fx,
+            "interface_traction_free": r_interface_traction_f_fx,
+            "interface_traction_pore": r_interface_traction_p_fx,
+        },
+    }
 
 
 def _fenics_full_forms(
@@ -3019,6 +3377,114 @@ def _fenics_full_forms_ratio_free(
 def _pycutfem_full_system_compare(problem, forms, *, qdeg: int, backend: str):
     if str(problem.get("fluid_space", "cg")).strip().lower() != "cg":
         return None
+    if str(problem.get("_audit_one_domain_formulation", "legacy")).strip().lower() == "final_form":
+        params = dict(problem["_audit_form_params"])
+        params["dt"] = float(problem["_audit_dt"])
+        params["theta"] = float(problem["_audit_theta"])
+        mesh_fx, W_fx = _build_fenics_final_form_system(
+            Lx=float(problem["_audit_Lx"]),
+            Ly=float(problem["_audit_Ly"]),
+            nx=int(problem["_audit_nx"]),
+            ny=int(problem["_audit_ny"]),
+            poly_order=int(problem["_audit_poly_order"]),
+            pressure_order=int(problem["_audit_pressure_order"]),
+            scalar_order=int(problem["_audit_scalar_order"]),
+        )
+        mapping = _map_pycutfem_to_fenics_final_form(problem, W_fx)
+        w_k_fx, w_n_fx = _load_fenics_final_form_state(problem, W_fx, mapping)
+        r_total_fx, a_total_fx, _ = _fenics_final_form_forms(
+            W=W_fx,
+            w_k=w_k_fx,
+            w_n=w_n_fx,
+            qdeg=int(qdeg),
+            params=params,
+        )
+        form_r_fx = dolfinx.fem.form(r_total_fx)
+        vec_fx = dolfinx.fem.petsc.assemble_vector(form_r_fx)
+        r_fx_arr = np.asarray(vec_fx.array, dtype=float).copy()
+        form_a_fx = dolfinx.fem.form(a_total_fx)
+        A_fx = dolfinx.fem.petsc.assemble_matrix(form_a_fx)
+        A_fx.assemble()
+        indptr, indices, data = A_fx.getValuesCSR()
+        J_fx = csr_matrix((data, indices, indptr), shape=A_fx.getSize()).tocsr()
+
+        dh = problem["dh"]
+        _, r_pc = assemble_form(Equation(None, forms.residual_form), dof_handler=dh, bcs=[], quad_order=int(qdeg), backend=str(backend))
+        J_pc, _ = assemble_form(Equation(forms.jacobian_form, None), dof_handler=dh, bcs=[], quad_order=int(qdeg), backend=str(backend))
+        r_pc = np.asarray(r_pc, dtype=float)
+        J_pc = J_pc.tocsr().toarray()
+
+        order_pc_to_fx = np.empty_like(r_pc, dtype=int)
+        for fld, _, _ in _audit_final_form_layout():
+            sl = np.asarray(dh.get_field_slice(fld), dtype=int)
+            order_pc_to_fx[sl] = np.asarray(mapping[fld], dtype=int)
+
+        r_fx_reordered = r_fx_arr[order_pc_to_fx]
+        J_fx_reordered = J_fx[order_pc_to_fx, :][:, order_pc_to_fx].toarray()
+        full_res_max_abs, full_res_rel = _compare_dense(r_pc, r_fx_reordered)
+        full_jac_max_abs, full_jac_rel = _compare_dense(J_pc, J_fx_reordered)
+
+        block_rows = {
+            "momentum": np.concatenate(
+                [
+                    np.asarray(dh.get_field_slice("v_x"), dtype=int),
+                    np.asarray(dh.get_field_slice("v_y"), dtype=int),
+                ]
+            ),
+            "mass": np.asarray(dh.get_field_slice("p"), dtype=int),
+            "pore": np.asarray(dh.get_field_slice("p_pore"), dtype=int),
+            "skeleton": np.concatenate(
+                [
+                    np.asarray(dh.get_field_slice("vS_x"), dtype=int),
+                    np.asarray(dh.get_field_slice("vS_y"), dtype=int),
+                ]
+            ),
+            "kinematics": np.concatenate(
+                [
+                    np.asarray(dh.get_field_slice("u_x"), dtype=int),
+                    np.asarray(dh.get_field_slice("u_y"), dtype=int),
+                ]
+            ),
+            "pore_momentum": np.concatenate(
+                [
+                    np.asarray(dh.get_field_slice("vP_x"), dtype=int),
+                    np.asarray(dh.get_field_slice("vP_y"), dtype=int),
+                ]
+            ),
+            "rho_s": np.asarray(dh.get_field_slice("rho_s"), dtype=int),
+            "lambda_drag": np.concatenate(
+                [
+                    np.asarray(dh.get_field_slice("lambda_drag_x"), dtype=int),
+                    np.asarray(dh.get_field_slice("lambda_drag_y"), dtype=int),
+                ]
+            ),
+            "alpha": np.asarray(dh.get_field_slice("alpha"), dtype=int),
+            "phi": np.asarray(dh.get_field_slice("phi"), dtype=int),
+        }
+        block_metrics: dict[str, dict[str, float]] = {}
+        for name, rows in block_rows.items():
+            res_abs, res_rel = _compare_dense(r_pc[rows], r_fx_reordered[rows])
+            jac_abs, jac_rel = _compare_dense(J_pc[rows, :], J_fx_reordered[rows, :])
+            jac_self_abs, jac_self_rel = _compare_dense(
+                J_pc[rows, :][:, rows],
+                J_fx_reordered[rows, :][:, rows],
+            )
+            block_metrics[str(name)] = {
+                "res_max_abs": float(res_abs),
+                "res_rel": float(res_rel),
+                "jac_max_abs": float(jac_abs),
+                "jac_rel": float(jac_rel),
+                "jac_self_max_abs": float(jac_self_abs),
+                "jac_self_rel": float(jac_self_rel),
+            }
+        return {
+            "full_res_max_abs": float(full_res_max_abs),
+            "full_res_rel": float(full_res_rel),
+            "full_jac_max_abs": float(full_jac_max_abs),
+            "full_jac_rel": float(full_jac_rel),
+            "full_blocks": block_metrics,
+        }
+
     enable_phi_evolution = bool(problem["_audit_enable_phi_evolution"])
     full_ratio_free_state = bool(problem.get("_audit_full_ratio_free_state", False))
     requested_latent_fields = tuple(problem.get("_audit_latent_bounded_fields", tuple()) or tuple())
@@ -3275,6 +3741,7 @@ def main() -> None:
     ap.add_argument("--pressure-mean-constraint", action=argparse.BooleanOptionalAction, default=False)
     ap.add_argument("--solid-volumetric-split", action=argparse.BooleanOptionalAction, default=False)
     ap.add_argument("--solid-volumetric-penalty", type=float, default=1.0)
+    ap.add_argument("--one-domain-formulation", type=str, default="legacy", choices=("legacy", "final_form"))
     ap.add_argument(
         "--mechanics-nondim-mode",
         type=str,
@@ -3346,14 +3813,20 @@ def main() -> None:
         type=str,
         nargs="+",
         default=("stored_support_adv_ns_darcy",),
-        choices=("stored_support_adv", "stored_support_adv_ns_darcy"),
+        choices=("stored_support_adv", "stored_support_adv_ns_darcy", "final_form"),
     )
     args = ap.parse_args()
 
-    all_cases = [
-        ("stored_support_adv", "vS", "advective", "stored_support", 0.0, 0.0, 0.0, 0.0, "whole_domain", 1.0),
-        ("stored_support_adv_ns_darcy", "vS", "advective", "stored_support", 0.0, 0.0, 0.0, 0.0, "whole_domain", 1.0),
-    ]
+    formulation_key = str(args.one_domain_formulation).strip().lower().replace("-", "_")
+    if formulation_key == "final_form":
+        all_cases = [
+            ("final_form", "vS", "advective", "stored_support", 0.0, 0.0, 0.0, 0.0, "whole_domain", 1.0),
+        ]
+    else:
+        all_cases = [
+            ("stored_support_adv", "vS", "advective", "stored_support", 0.0, 0.0, 0.0, 0.0, "whole_domain", 1.0),
+            ("stored_support_adv_ns_darcy", "vS", "advective", "stored_support", 0.0, 0.0, 0.0, 0.0, "whole_domain", 1.0),
+        ]
     wanted = set(args.cases)
     cases = [item for item in all_cases if item[0] in wanted]
     latent_field_set = []
@@ -3440,6 +3913,7 @@ def main() -> None:
             stored_support_content_mode=str(args.stored_support_content_mode),
             p_pore_fluid_gauge=bool(args.p_pore_fluid_gauge),
             p_pore_fluid_gauge_strength=float(args.p_pore_fluid_gauge_strength),
+            one_domain_formulation=str(formulation_key),
         )
         directional_fd_max_rel, directional_fd_per_case = _directional_fd_audit(
             problem,

@@ -7607,45 +7607,54 @@ class CppCodeGen:
                     raise NotImplementedError(f"AtanhOp not implemented for kind={a.kind!r}.")
             elif isinstance(op, Store):
                 a = stack.pop()
+                emit_line("{")
                 if op.store_type == "matrix":
                     if a.kind == "scalar":
                         emit_line(f"for (ssize_t i=0;i<n_union;++i) for (ssize_t j=0;j<n_union;++j) K_view(e,i,j)+= {a.name} * qw_view(e,q);")
                     elif a.kind == "mixed" and len(a.shape) == 3 and a.shape[0] == 1:
                         emit_line(f"for (ssize_t i=0;i<n_union;++i) for (ssize_t j=0;j<n_union;++j) K_view(e,i,j)+= {a.name}[0](i,j) * qw_view(e,q);")
                     elif a.kind == "grad":
-                        emit_line(f"Eigen::MatrixXd _tmpK = Eigen::MatrixXd::Zero(n_union, n_union);")
+                        tmp_k = new_tmp("tmpK")
+                        cols_name = new_tmp("cols")
+                        emit_line(f"Eigen::MatrixXd {tmp_k} = Eigen::MatrixXd::Zero(n_union, n_union);")
                         emit_line(f"for (auto& _m : {a.name}) {{")
-                        emit_line(f"    Eigen::Index _cols = std::min<Eigen::Index>(_m.cols(), n_union);")
+                        emit_line(f"    Eigen::Index {cols_name} = std::min<Eigen::Index>(_m.cols(), n_union);")
                         emit_line(f"    for (ssize_t _i=0; _i<n_union; ++_i) {{")
-                        emit_line(f"        for (Eigen::Index _j=0; _j<_cols; ++_j) _tmpK(_i,_j) += _m(_i,_j);")
+                        emit_line(f"        for (Eigen::Index _j=0; _j<{cols_name}; ++_j) {tmp_k}(_i,_j) += _m(_i,_j);")
                         emit_line("    }")
                         emit_line("}")
-                        emit_line(f"for (ssize_t i=0;i<n_union;++i) for (ssize_t j=0;j<n_union;++j) K_view(e,i,j)+= _tmpK(i,j) * qw_view(e,q);")
+                        emit_line(f"for (ssize_t i=0;i<n_union;++i) for (ssize_t j=0;j<n_union;++j) K_view(e,i,j)+= {tmp_k}(i,j) * qw_view(e,q);")
                     else:
                         emit_line(f"for (ssize_t i=0;i<n_union;++i) for (ssize_t j=0;j<n_union;++j) K_view(e,i,j)+= {a.name}(i,j) * qw_view(e,q);")
                 elif op.store_type == "vector":
                     if a.kind == "scalar":
                         emit_line(f"for (ssize_t i=0;i<n_union;++i) F_view(e,i)+= {a.name} * qw_view(e,q);")
                     elif a.kind == "mat":
-                        emit_line(f"Eigen::VectorXd _tmpF = Eigen::VectorXd::Zero(n_union);")
-                        emit_line(f"Eigen::Index _rows = {a.name}.rows();")
-                        emit_line(f"Eigen::Index _cols = {a.name}.cols();")
-                        emit_line(f"if (_cols == n_union) {{")
-                        emit_line(f"    _tmpF = {a.name}.colwise().sum().transpose();")
-                        emit_line("} else if (_rows == n_union) {")
-                        emit_line(f"    _tmpF = {a.name}.rowwise().sum();")
+                        tmp_f = new_tmp("tmpF")
+                        rows_name = new_tmp("rows")
+                        cols_name = new_tmp("cols")
+                        limit_name = new_tmp("limit")
+                        emit_line(f"Eigen::VectorXd {tmp_f} = Eigen::VectorXd::Zero(n_union);")
+                        emit_line(f"Eigen::Index {rows_name} = {a.name}.rows();")
+                        emit_line(f"Eigen::Index {cols_name} = {a.name}.cols();")
+                        emit_line(f"if ({cols_name} == n_union) {{")
+                        emit_line(f"    {tmp_f} = {a.name}.colwise().sum().transpose();")
+                        emit_line(f"}} else if ({rows_name} == n_union) {{")
+                        emit_line(f"    {tmp_f} = {a.name}.rowwise().sum();")
                         emit_line("} else {")
-                        emit_line(f"    Eigen::Index _limit = std::min<Eigen::Index>(n_union, _rows);")
-                        emit_line(f"    for (Eigen::Index _i=0; _i<_limit; ++_i) _tmpF(_i) = {a.name}(_i,0);")
+                        emit_line(f"    Eigen::Index {limit_name} = std::min<Eigen::Index>(n_union, {rows_name});")
+                        emit_line(f"    for (Eigen::Index _i=0; _i<{limit_name}; ++_i) {tmp_f}(_i) = {a.name}(_i,0);")
                         emit_line("}")
-                        emit_line(f"for (ssize_t i=0;i<n_union;++i) F_view(e,i)+= _tmpF(i) * qw_view(e,q);")
+                        emit_line(f"for (ssize_t i=0;i<n_union;++i) F_view(e,i)+= {tmp_f}(i) * qw_view(e,q);")
                     elif a.kind == "grad":
-                        emit_line(f"Eigen::VectorXd _tmpF = Eigen::VectorXd::Zero(n_union);")
+                        tmp_f = new_tmp("tmpF")
+                        cols_name = new_tmp("cols")
+                        emit_line(f"Eigen::VectorXd {tmp_f} = Eigen::VectorXd::Zero(n_union);")
                         emit_line(f"for (auto& _m : {a.name}) {{")
-                        emit_line(f"    Eigen::Index _cols = _m.cols();")
-                        emit_line(f"    for (ssize_t _i=0; _i<n_union; ++_i) for (Eigen::Index _j=0; _j<_cols; ++_j) _tmpF(_i) += _m(_i,_j);")
+                        emit_line(f"    Eigen::Index {cols_name} = _m.cols();")
+                        emit_line(f"    for (ssize_t _i=0; _i<n_union; ++_i) for (Eigen::Index _j=0; _j<{cols_name}; ++_j) {tmp_f}(_i) += _m(_i,_j);")
                         emit_line("    }")
-                        emit_line(f"for (ssize_t i=0;i<n_union;++i) F_view(e,i)+= _tmpF(i) * qw_view(e,q);")
+                        emit_line(f"for (ssize_t i=0;i<n_union;++i) F_view(e,i)+= {tmp_f}(i) * qw_view(e,q);")
                     else:
                         emit_line(f"for (ssize_t i=0;i<n_union;++i) F_view(e,i)+= {a.name}(i) * qw_view(e,q);")
                 elif op.store_type == "functional":
@@ -7679,6 +7688,7 @@ class CppCodeGen:
                             emit_line(f"J_out(e,0) += {a.name} * qw_view(e,q);")
                 else:
                     raise NotImplementedError(f"Store type {op.store_type}")
+                emit_line("}")
             else:
                     raise NotImplementedError(f"Opcode {type(op).__name__} not handled in C++ backend")
 

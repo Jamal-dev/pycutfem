@@ -642,6 +642,7 @@ class SymbolicLocalAssemblyOperator(LocalAssemblyOperator):
         batch = compiler.assemble_local_contributions(
             self.form_or_equation,
             entity_ids=entity_ids,
+            need_matrix=bool(workset.need_matrix),
         )
         return LocalAssemblyResult(
             K_elem=batch.K_elem if workset.need_matrix else None,
@@ -834,6 +835,7 @@ class SymbolicFusedLocalAssemblyOperator(FusedLocalAssemblyOperator):
         batch = compiler.assemble_local_contributions(
             self.form_or_equation,
             entity_ids=entity_ids,
+            need_matrix=bool(workset.need_matrix),
         )
         state_updates: list[LocalStateUpdate] = []
         if self.quadrature_state_updates:

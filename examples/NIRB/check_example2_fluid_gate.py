@@ -4,8 +4,6 @@ import argparse
 from pathlib import Path
 
 import numpy as np
-import pyvista as pv
-
 from examples.NIRB.common import dump_json
 from examples.NIRB.dvms import (
     _update_fluid_dvms_predicted_subscale,
@@ -75,6 +73,8 @@ def _compare_point_fields(
 
 
 def _load_fluid_step1_reference(vtk_path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    import pyvista as pv
+
     mesh = pv.read(vtk_path)
     coords = np.asarray(mesh.points[:, :2], dtype=float)
     velocity = np.asarray(mesh.point_data["VELOCITY"], dtype=float)[:, :2]
@@ -133,7 +133,7 @@ def parse_args() -> argparse.Namespace:
         default=Path("examples/NIRB/artifacts/kratos_example2_monitor_20260407/coupling_monitor/step0001_iter0001_after_sync_output_fluid.npz"),
     )
     parser.add_argument("--backend", choices=("python", "jit", "cpp"), default="cpp")
-    parser.add_argument("--quad-order", type=int, default=6)
+    parser.add_argument("--quad-order", type=int, default=1)
     parser.add_argument("--bossak-alpha", type=float, default=-0.3)
     parser.add_argument("--dynamic-tau", type=float, default=1.0)
     parser.add_argument("--pressure-gauge", type=float, default=1.0e-5)
@@ -184,6 +184,7 @@ def main() -> None:
         mesh=mesh_f,
         u_prev=fluid["u_prev"],
         d_prev=fluid["d_prev"],
+        d_geo=fluid["d_mesh"],
         backend=str(args.backend),
     )
     _update_fluid_dvms_predicted_subscale(
@@ -222,6 +223,7 @@ def main() -> None:
         bossak_alpha=float(args.bossak_alpha),
         need_matrix=False,
         contribution_mode="system",
+        apply_dirichlet_lift=False,
         backend=str(args.backend),
     )
     raw_residual = np.asarray(raw_residual, dtype=float)

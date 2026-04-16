@@ -206,29 +206,23 @@ class CppKernelCache:
             if cache_key in self.in_memory_cache:
                 return self.in_memory_cache[cache_key]
 
-            # Generate source if needed (or if stale ABI is detected).
-            regenerate = True
-            if source_file.exists():
-                try:
-                    text = source_file.read_text(encoding="utf-8")
-                except OSError:
-                    text = ""
-                regenerate = f'CODEGEN_ABI") = "{CODEGEN_ABI_CPP}"' not in text
+            # Always regenerate the current source so codegen changes cannot
+            # silently reuse a stale `.cpp` file when the IR hash is unchanged.
+            src, _, param_order = codegen.generate_source(
+                ir_sequence, "kernel", module_name=module_name
+            )
+            source_digest = hashlib.sha256(src.encode("utf-8")).hexdigest()
 
-            if regenerate:
-                src, _, param_order = codegen.generate_source(
-                    ir_sequence, "kernel", module_name=module_name
-                )
+            existing_source = None
+            try:
+                existing_source = source_file.read_text(encoding="utf-8")
+            except OSError:
+                existing_source = None
+
+            if existing_source != src:
                 source_file.write_text(src, encoding="utf-8")
                 built_module.unlink(missing_ok=True)
                 digest_file.unlink(missing_ok=True)
-            else:
-                param_order = None
-
-            try:
-                source_digest = hashlib.sha256(source_file.read_bytes()).hexdigest()
-            except OSError:
-                source_digest = ""
 
             force_reload = False
             digest_matches = False

@@ -9,9 +9,14 @@ from pycutfem.ufl.compilers import FormCompiler
 from pycutfem.ufl.forms import Equation
 from pycutfem.ufl.measures import dx
 from pycutfem.ufl.spaces import FunctionSpace
-from pycutfem.ufl.expressions import Constant, Function, TrialFunction, VectorFunction, VectorTestFunction, VectorTrialFunction, TestFunction
+from pycutfem.ufl.expressions import Constant, ElementWiseConstant, Function, TrialFunction, VectorFunction, VectorTestFunction, VectorTrialFunction, TestFunction
 
-from .helpers import _bossak_coefficients, _kratos_dvms_element_size_coefficient
+from .helpers import (
+    _bossak_coefficients,
+    _kratos_dvms_current_element_size_array,
+    _kratos_dvms_current_element_size_coefficient,
+    _kratos_dvms_element_size_coefficient,
+)
 from .state import FluidDVMSState
 from .symbolics import build_fluid_dvms_local_forms
 from .update import _dvms_fast_p1_tri_cache, _grad_phi_phys, _scalar_locals, _update_fluid_dvms_predicted_subscale
@@ -151,6 +156,7 @@ def _dvms_condensed_hidden_state_correction_batch(
     d_mesh: VectorFunction,
     d_prev: VectorFunction,
     d_prev2: VectorFunction | None,
+    mesh_v: VectorFunction | None,
     mesh_v_prev: VectorFunction | None,
     mesh_a_prev: VectorFunction | None,
     state: FluidDVMSState,
@@ -189,7 +195,12 @@ def _dvms_condensed_hidden_state_correction_batch(
     grad_phi_my = _grad_phi_phys(fast["grad_ref"]["my"], np.asarray(fast["J_inv"], dtype=float)[eids])
     detJ_geo = np.asarray(fast["detJ"], dtype=float)[eids]
     ref_weights = np.asarray(state.quadrature_layout.reference_weights, dtype=float).reshape(1, -1)
-    h_e = np.asarray([float(mesh.element_char_length(int(eid))) for eid in eids], dtype=float)
+    h_e = _kratos_dvms_current_element_size_array(
+        mesh,
+        dh,
+        d_mesh,
+        element_ids=eids,
+    )
 
     ux_map = np.asarray(fast["element_maps"]["ux"], dtype=int)[eids]
     uy_map = np.asarray(fast["element_maps"]["uy"], dtype=int)[eids]
@@ -208,6 +219,12 @@ def _dvms_condensed_hidden_state_correction_batch(
     my_k = _scalar_locals(dh, "my", d_mesh.components[1].nodal_values, my_map)
     mx_prev = _scalar_locals(dh, "mx", d_prev.components[0].nodal_values, mx_map)
     my_prev = _scalar_locals(dh, "my", d_prev.components[1].nodal_values, my_map)
+    if mesh_v is not None:
+        mx_vel = _scalar_locals(dh, "mx", mesh_v.components[0].nodal_values, mx_map)
+        my_vel = _scalar_locals(dh, "my", mesh_v.components[1].nodal_values, my_map)
+    else:
+        mx_vel = np.zeros_like(mx_prev)
+        my_vel = np.zeros_like(my_prev)
     if mesh_v_prev is not None and mesh_a_prev is not None:
         mx_vel_prev = _scalar_locals(dh, "mx", mesh_v_prev.components[0].nodal_values, mx_map)
         my_vel_prev = _scalar_locals(dh, "my", mesh_v_prev.components[1].nodal_values, my_map)
@@ -260,6 +277,13 @@ def _dvms_condensed_hidden_state_correction_batch(
         ],
         axis=2,
     )
+    mesh_v_q = np.stack(
+        [
+            np.einsum("el,ql->eq", mx_vel, basis_u, optimize=True),
+            np.einsum("el,ql->eq", my_vel, basis_u, optimize=True),
+        ],
+        axis=2,
+    )
     mesh_v_prev_q = np.stack(
         [
             np.einsum("el,ql->eq", mx_vel_prev, basis_u, optimize=True),
@@ -308,7 +332,9 @@ def _dvms_condensed_hidden_state_correction_batch(
     grad_phi_u_phys = grad_phi_u
     grad_phi_p_phys = grad_phi_p
 
-    if mesh_v_prev is not None and mesh_a_prev is not None:
+    if mesh_v is not None:
+        w_mesh_q = mesh_v_q
+    elif mesh_v_prev is not None and mesh_a_prev is not None:
         beta = float(bossak["beta"])
         gamma = float(bossak["gamma"])
         a_mesh_q = (
@@ -322,7 +348,7 @@ def _dvms_condensed_hidden_state_correction_batch(
         w_mesh_q = (1.5 * d_mesh_q - 2.0 * d_prev_q + 0.5 * d_prev2_q) / dt_value
     resolved_conv = u_k_q - w_mesh_q
     a_curr = float(bossak["ma0"]) * (u_k_q - u_prev_q) + float(bossak["ma2"]) * a_prev_q
-    a_relaxed = (1.0 - float(bossak["alpha"])) * a_curr + float(bossak["alpha"]) * a_prev_q
+    a_relaxed = a_curr
 
     n_q = int(state.n_qp_per_element)
     predicted = np.asarray(state.predicted_subscale_velocity, dtype=float).reshape(int(state.n_elements), n_q, 2)[eids]
@@ -465,6 +491,7 @@ def _build_fluid_dvms_form_or_equation(
     d_mesh: VectorFunction,
     d_prev: VectorFunction,
     d_prev2: VectorFunction | None,
+    mesh_v: VectorFunction | None,
     mesh_v_prev: VectorFunction | None,
     mesh_a_prev: VectorFunction | None,
     state: FluidDVMSState | None,
@@ -476,6 +503,7 @@ def _build_fluid_dvms_form_or_equation(
     body_force: np.ndarray | None,
     use_oss: bool,
     contribution_mode: str,
+    h_coefficient: ElementWiseConstant | None = None,
 ):
     mode = _normalize_contribution_mode(contribution_mode)
     if mode in {"system", "system_condensed"} and (u_prev is None or a_prev is None):
@@ -497,13 +525,14 @@ def _build_fluid_dvms_form_or_equation(
         d_mesh=d_mesh,
         d_prev=d_prev,
         d_prev2=d_prev2,
+        mesh_v=mesh_v,
         mesh_v_prev=mesh_v_prev,
         mesh_a_prev=mesh_a_prev,
         dx_measure=dx(metadata={"q": qorder}),
         rho=Constant(float(rho_f)),
         mu=Constant(float(mu_f)),
         dt=Constant(max(float(dt), 1.0e-14)),
-        h=_kratos_dvms_element_size_coefficient(mesh),
+        h=_kratos_dvms_element_size_coefficient(mesh) if h_coefficient is None else h_coefficient,
         bossak_ma0=Constant(float(bossak["ma0"])),
         bossak_ma2=Constant(float(bossak["ma2"])),
         bossak_alpha=Constant(float(bossak["alpha"])),
@@ -537,6 +566,7 @@ def assemble_fluid_dvms_local_contribution_batch(
     d_mesh: VectorFunction,
     d_prev: VectorFunction,
     d_prev2: VectorFunction | None = None,
+    mesh_v: VectorFunction | None = None,
     mesh_v_prev: VectorFunction | None = None,
     mesh_a_prev: VectorFunction | None = None,
     state: FluidDVMSState | None,
@@ -566,6 +596,7 @@ def assemble_fluid_dvms_local_contribution_batch(
         d_mesh=d_mesh,
         d_prev=d_prev,
         d_prev2=d_prev2,
+        mesh_v=mesh_v,
         mesh_v_prev=mesh_v_prev,
         mesh_a_prev=mesh_a_prev,
         state=state,
@@ -577,6 +608,7 @@ def assemble_fluid_dvms_local_contribution_batch(
         body_force=body_force,
         use_oss=bool(use_oss),
         contribution_mode=contribution_mode,
+        h_coefficient=_kratos_dvms_current_element_size_coefficient(mesh, dh, d_mesh),
     )
     return compiler.assemble_volume_local_contributions(form_or_equation, element_ids=element_ids)
 
@@ -834,6 +866,7 @@ class FluidDVMSLocalVelocityContributionOperator(LocalAssemblyOperator):
         d_mesh: VectorFunction,
         d_prev: VectorFunction,
         d_prev2: VectorFunction | None = None,
+        mesh_v: VectorFunction | None = None,
         mesh_v_prev: VectorFunction | None = None,
         mesh_a_prev: VectorFunction | None = None,
         state: FluidDVMSState | None,
@@ -857,6 +890,7 @@ class FluidDVMSLocalVelocityContributionOperator(LocalAssemblyOperator):
         self.d_mesh = d_mesh
         self.d_prev = d_prev
         self.d_prev2 = d_prev2
+        self.mesh_v = mesh_v
         self.mesh_v_prev = mesh_v_prev
         self.mesh_a_prev = mesh_a_prev
         self.state = state
@@ -874,6 +908,7 @@ class FluidDVMSLocalVelocityContributionOperator(LocalAssemblyOperator):
         self.use_oss = bool(use_oss)
         self.apply_dirichlet_lift = bool(apply_dirichlet_lift)
         self.contribution_mode = _normalize_contribution_mode(contribution_mode)
+        self.h_coefficient = _kratos_dvms_current_element_size_coefficient(self.mesh, self.dh, self.d_mesh)
         self._compiler_cache: dict[str, FormCompiler] = {}
         self._form_or_equation_cache = None
         self._fluid_gdofs_map = _local_grouped_gdofs_batch(self.dh, self.element_ids)
@@ -907,6 +942,7 @@ class FluidDVMSLocalVelocityContributionOperator(LocalAssemblyOperator):
             d_mesh=self.d_mesh,
             d_prev=self.d_prev,
             d_prev2=self.d_prev2,
+            mesh_v=self.mesh_v,
             mesh_v_prev=self.mesh_v_prev,
             mesh_a_prev=self.mesh_a_prev,
             state=self.state,
@@ -918,12 +954,21 @@ class FluidDVMSLocalVelocityContributionOperator(LocalAssemblyOperator):
             body_force=self.body_force,
             use_oss=self.use_oss,
             contribution_mode=self.contribution_mode,
+            h_coefficient=self.h_coefficient,
         )
         self._form_or_equation_cache = cached
         return cached
 
+    def _refresh_element_size_coefficient(self) -> None:
+        self.h_coefficient.values[...] = _kratos_dvms_current_element_size_array(
+            self.mesh,
+            self.dh,
+            self.d_mesh,
+        )
+
     def build_local_workset(self, *, solver, coeffs, need_matrix: bool):
         del coeffs
+        self._refresh_element_size_coefficient()
         payload: dict[str, np.ndarray] = {}
         if self.apply_dirichlet_lift:
             bcs_apply = getattr(solver, "_current_bcs", None)
@@ -1022,12 +1067,15 @@ FluidDVMSAddVelocityLocalOperator = FluidDVMSLocalVelocityContributionOperator
 
 class FluidDVMSCondensedLocalSystemOperator(FluidDVMSLocalVelocityContributionOperator):
     """
-    Exact local DVMS system operator with hidden-state Schur-complement correction.
+    Backward-compatible exact local DVMS system operator.
 
-    The compiled local FE block still provides the base discrete system. This
-    operator refreshes the predicted subscale on the current iterate and then
-    adds the batched condensed correction associated with the eliminated
-    quadrature-level DVMS subscale.
+    The class name is historical. For Kratos parity the assembled monolithic
+    fluid system is the velocity contribution plus the Bossak mass blocks; the
+    extra symbolic hidden-state Schur correction is not part of the Kratos
+    local operator and introduces a measurable interface-row mismatch.
+
+    This wrapper therefore keeps only the predictor refresh behavior and, by
+    default, assembles the plain Kratos-matched ``system`` block.
     """
 
     def __init__(
@@ -1038,7 +1086,7 @@ class FluidDVMSCondensedLocalSystemOperator(FluidDVMSLocalVelocityContributionOp
         **kwargs,
     ) -> None:
         kwargs = dict(kwargs)
-        kwargs.setdefault("contribution_mode", "system_condensed")
+        kwargs.setdefault("contribution_mode", "system")
         super().__init__(**kwargs)
         self.dynamic_tau = float(dynamic_tau)
         self.refresh_predicted_subscale = bool(refresh_predicted_subscale)
@@ -1060,6 +1108,7 @@ class FluidDVMSCondensedLocalSystemOperator(FluidDVMSLocalVelocityContributionOp
                 d_mesh=self.d_mesh,
                 d_prev=self.d_prev,
                 d_prev2=self.d_prev2,
+                mesh_v=self.mesh_v,
                 mesh_v_prev=self.mesh_v_prev,
                 mesh_a_prev=self.mesh_a_prev,
                 rho_f=self.rho_f,

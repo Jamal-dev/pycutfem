@@ -24,6 +24,7 @@ from examples.NIRB.dvms import (
     assemble_dvms_calculate_local_system_p1_tri,
     assemble_dvms_calculate_local_velocity_contribution_p1_tri,
     _update_fluid_dvms_predicted_subscale,
+    _kratos_dvms_current_element_size_array,
     _kratos_dvms_element_size,
 )
 from examples.NIRB.dvms.local_operator import (
@@ -1055,6 +1056,142 @@ def test_fluid_interface_reaction_loads_matches_kratos_constrained_rhs_sign(monk
     assert np.allclose(captured["global_values"], np.array([-1.0, 0.0, 0.0, 4.0]))
 
 
+def test_fluid_interface_reaction_loads_refreshes_predicted_subscale_before_assembly(monkeypatch) -> None:
+    observed: dict[str, object] = {}
+
+    def _fake_update_fluid_dvms_predicted_subscale(
+        *,
+        state,
+        dh,
+        mesh,
+        u_k,
+        u_prev,
+        a_prev,
+        p_k,
+        d_mesh,
+        d_prev,
+        d_prev2=None,
+        mesh_v_prev=None,
+        mesh_a_prev=None,
+        rho_f,
+        mu_f,
+        dt,
+        bossak_alpha,
+        dynamic_tau,
+        backend,
+    ):
+        observed["called"] = True
+        observed["state"] = state
+        observed["dh"] = dh
+        observed["mesh"] = mesh
+        observed["u_k"] = u_k
+        observed["u_prev"] = u_prev
+        observed["a_prev"] = a_prev
+        observed["p_k"] = p_k
+        observed["d_mesh"] = d_mesh
+        observed["d_prev"] = d_prev
+        observed["rho_f"] = float(rho_f)
+        observed["mu_f"] = float(mu_f)
+        observed["dt"] = float(dt)
+        observed["bossak_alpha"] = float(bossak_alpha)
+        observed["dynamic_tau"] = float(dynamic_tau)
+        observed["backend"] = str(backend)
+
+    def _fake_assemble_fluid_local_velocity_contribution_raw(
+        *,
+        prob,
+        rho_f,
+        mu_f,
+        dt,
+        quad_order,
+        bossak_alpha=-0.3,
+        need_matrix=False,
+        contribution_mode="system",
+        apply_dirichlet_lift=False,
+        backend="python",
+    ):
+        del prob, rho_f, mu_f, dt, quad_order, bossak_alpha, need_matrix, contribution_mode, apply_dirichlet_lift, backend
+        assert observed.get("called") is True
+        return None, np.array([0.0, 0.0])
+
+    def _fake_boundary_vector_from_global_values(dh, *, vector, tag, global_values):
+        del dh, vector, tag, global_values
+        return np.zeros((1, 2), dtype=float), np.zeros((1, 2), dtype=float)
+
+    class _FakeMixedElement:
+        mesh = object()
+
+    class _FakeDH:
+        mixed_element = _FakeMixedElement()
+
+        def get_dirichlet_data(self, bcs):
+            del bcs
+            return {}
+
+    monkeypatch.setattr(
+        "examples.NIRB.run_example2_local._update_fluid_dvms_predicted_subscale",
+        _fake_update_fluid_dvms_predicted_subscale,
+    )
+    monkeypatch.setattr(
+        "examples.NIRB.run_example2_local._assemble_fluid_local_velocity_contribution_raw",
+        _fake_assemble_fluid_local_velocity_contribution_raw,
+    )
+    monkeypatch.setattr(
+        "examples.NIRB.run_example2_local._fluid_interface_velocity_dofs",
+        lambda prob, *, interface_tag: np.array([0, 1], dtype=int),
+    )
+    monkeypatch.setattr(
+        "examples.NIRB.run_example2_local._boundary_vector_from_global_values",
+        _fake_boundary_vector_from_global_values,
+    )
+
+    fake_state = object()
+    fake_u_k = object()
+    fake_u_prev = object()
+    fake_a_prev = object()
+    fake_p_k = object()
+    fake_d_mesh = object()
+    fake_d_prev = object()
+    prob = {
+        "dh": _FakeDH(),
+        "dvms_state": fake_state,
+        "u_k": fake_u_k,
+        "u_prev": fake_u_prev,
+        "a_prev": fake_a_prev,
+        "p_k": fake_p_k,
+        "d_mesh": fake_d_mesh,
+        "d_prev": fake_d_prev,
+        "_current_bcs": [],
+    }
+
+    _fluid_interface_reaction_loads(
+        prob=prob,
+        rho_f=2.0,
+        mu_f=3.0,
+        dt=4.0,
+        quad_order=2,
+        bossak_alpha=-0.2,
+        dynamic_tau=5.0,
+        interface_tag="interface",
+        backend="cpp",
+    )
+
+    assert observed["called"] is True
+    assert observed["state"] is fake_state
+    assert observed["u_k"] is fake_u_k
+    assert observed["u_prev"] is fake_u_prev
+    assert observed["a_prev"] is fake_a_prev
+    assert observed["p_k"] is fake_p_k
+    assert observed["d_mesh"] is fake_d_mesh
+    assert observed["d_prev"] is fake_d_prev
+    assert observed["rho_f"] == pytest.approx(2.0)
+    assert observed["mu_f"] == pytest.approx(3.0)
+    assert observed["dt"] == pytest.approx(4.0)
+    assert observed["bossak_alpha"] == pytest.approx(-0.2)
+    assert observed["dynamic_tau"] == pytest.approx(5.0)
+    assert observed["backend"] == "cpp"
+
+
 def test_state_snapshot_restore_preserves_prev_time_level(tmp_path: Path) -> None:
     pytest.importorskip("gmsh")
 
@@ -1205,6 +1342,56 @@ def test_negate_lookup_flips_interface_load_sign() -> None:
     negated = _negate_lookup(CoordinateLookup(coords, values, dim=2))
     assert np.allclose(negated.coords, coords)
     assert np.allclose(negated.values, -values)
+
+
+def test_current_dvms_element_size_uses_moved_geometry() -> None:
+    setup = load_example2_local_setup()
+    mesh_f, _ = _load_reference_partitioned_meshes(setup=setup)
+    fluid = _build_fluid_problem(mesh_f, poly_order=1, pressure_order=1, quadrature_order=1)
+
+    eid = 0
+    conn = np.asarray(mesh_f.elements_connectivity[eid], dtype=int)
+    mx_ids = np.asarray(fluid["dh"].element_maps["mx"][eid], dtype=int)
+    my_ids = np.asarray(fluid["dh"].element_maps["my"][eid], dtype=int)
+    dx_vals = np.asarray([0.0, 2.5e-4, -1.5e-4], dtype=float)
+    dy_vals = np.asarray([0.0, -1.0e-4, 2.0e-4], dtype=float)
+    fluid["d_mesh"].components[0].set_nodal_values(mx_ids, dx_vals)
+    fluid["d_mesh"].components[1].set_nodal_values(my_ids, dy_vals)
+
+    coords_ref = np.asarray(mesh_f.nodes_x_y_pos[conn], dtype=float)
+    coords_cur = coords_ref + np.column_stack([dx_vals, dy_vals])
+    area = 0.5 * abs(
+        np.linalg.det(
+            np.asarray(
+                [
+                    coords_cur[1] - coords_cur[0],
+                    coords_cur[2] - coords_cur[0],
+                ],
+                dtype=float,
+            )
+        )
+    )
+    edges = np.asarray(
+        [
+            np.linalg.norm(coords_cur[0] - coords_cur[1]),
+            np.linalg.norm(coords_cur[1] - coords_cur[2]),
+            np.linalg.norm(coords_cur[2] - coords_cur[0]),
+        ],
+        dtype=float,
+    )
+    expected = float((2.0 * area) / np.max(edges))
+    h_ref = float(_kratos_dvms_element_size(mesh_f, eid))
+    h_cur = float(
+        _kratos_dvms_current_element_size_array(
+            mesh_f,
+            fluid["dh"],
+            fluid["d_mesh"],
+            element_ids=np.asarray([eid], dtype=int),
+        )[0]
+    )
+
+    assert h_cur == pytest.approx(expected)
+    assert h_cur != pytest.approx(h_ref)
 
 
 def test_local_driver_forms_use_named_jit_constants(tmp_path: Path) -> None:

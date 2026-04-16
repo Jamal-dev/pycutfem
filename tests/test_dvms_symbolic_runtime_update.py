@@ -4,13 +4,18 @@ import math
 
 import numpy as np
 import pytest
+import scipy.sparse as sp
 
 from examples.NIRB.dvms import (
     FluidDVMSSolverOperator,
     _bossak_coefficients,
     _build_fluid_dvms_state,
 )
-from examples.NIRB.dvms.local_operator import assemble_fluid_dvms_local_contribution_batch
+from examples.NIRB.dvms.local_operator import (
+    _compress_batch_to_fluid_block,
+    assemble_dvms_calculate_local_system,
+    assemble_fluid_dvms_local_contribution_batch,
+)
 from examples.NIRB.dvms.symbolics import (
     build_fluid_dvms_old_mass_residual,
     build_fluid_dvms_predictor_symbolics,
@@ -19,6 +24,8 @@ from examples.NIRB.dvms.update import (
     _update_fluid_dvms_predicted_subscale,
     _update_fluid_dvms_state_from_previous_step,
 )
+from pycutfem.operators import LocalAssemblyResult
+from pycutfem.solvers.nonlinear_solver import NewtonSolver
 from pycutfem.core.dofhandler import DofHandler
 from pycutfem.core.mesh import Mesh
 from pycutfem.fem import transform
@@ -28,12 +35,19 @@ from pycutfem.ufl.expressions import Function, VectorFunction
 from pycutfem.utils.meshgen import structured_triangles
 
 
-def _make_dvms_problem(*, poly_order: int = 2, pressure_order: int = 1, quadrature_order: int = 3):
+def _make_dvms_problem(
+    *,
+    poly_order: int = 2,
+    pressure_order: int = 1,
+    quadrature_order: int = 3,
+    nx_quads: int = 1,
+    ny_quads: int = 1,
+):
     nodes, elems, edges, corners = structured_triangles(
         1.0,
         1.0,
-        nx_quads=1,
-        ny_quads=1,
+        nx_quads=int(nx_quads),
+        ny_quads=int(ny_quads),
         poly_order=poly_order,
     )
     mesh = Mesh(
@@ -82,6 +96,69 @@ def _make_dvms_problem(*, poly_order: int = 2, pressure_order: int = 1, quadratu
     state.old_mass_residual[:] = -0.05 + 0.02 * xy[:, 0]
     state.sync_coefficients_from_samples()
     return mesh, dh, state, u_k, u_prev, a_prev, p_k, d_mesh, d_prev
+
+
+def _assemble_global_fluid_block_for_mode(
+    *,
+    mesh,
+    dh,
+    state,
+    u_k,
+    u_prev,
+    a_prev,
+    p_k,
+    d_mesh,
+    d_prev,
+    rho_f: float,
+    mu_f: float,
+    dt: float,
+    bossak_alpha: float,
+    quadrature_order: int,
+    contribution_mode: str,
+    backend: str,
+):
+    batch = assemble_fluid_dvms_local_contribution_batch(
+        mesh=mesh,
+        dh=dh,
+        u_k=u_k,
+        u_prev=u_prev,
+        a_prev=a_prev,
+        p_k=p_k,
+        d_mesh=d_mesh,
+        d_prev=d_prev,
+        state=state,
+        rho_f=float(rho_f),
+        mu_f=float(mu_f),
+        dt=float(dt),
+        bossak_alpha=float(bossak_alpha),
+        quadrature_order=int(quadrature_order),
+        element_ids=np.arange(int(mesh.n_elements), dtype=int),
+        contribution_mode=str(contribution_mode),
+        backend=str(backend),
+    )
+    K_elem, F_elem, gdofs_map = _compress_batch_to_fluid_block(
+        dh,
+        LocalAssemblyResult(
+            K_elem=None if batch.K_elem is None else np.asarray(batch.K_elem, dtype=float),
+            F_elem=None if batch.F_elem is None else np.asarray(batch.F_elem, dtype=float),
+            element_ids=np.asarray(batch.element_ids, dtype=int),
+            gdofs_map=np.asarray(batch.gdofs_map, dtype=int),
+        ),
+    )
+
+    ndof = int(dh.total_dofs)
+    R_full = np.zeros((ndof,), dtype=float)
+    scatter_owner = NewtonSolver.__new__(NewtonSolver)
+    A_sparse, R_full = NewtonSolver.scatter_element_contribs_full(
+        scatter_owner,
+        K_elem=K_elem,
+        F_elem=F_elem,
+        element_ids=np.asarray(batch.element_ids, dtype=int),
+        gdofs_map=np.asarray(gdofs_map, dtype=int),
+        A_full=None if K_elem is None else sp.lil_matrix((ndof, ndof), dtype=float),
+        R_full=R_full,
+    )
+    return (None if A_sparse is None else A_sparse.toarray()), np.asarray(R_full, dtype=float)
 
 
 def _eval_scalar_with_grad_on_sample(*, state, dh, mesh, scalar, sample_idx: int):
@@ -599,3 +676,200 @@ def test_dvms_symbolic_local_batches_compiled_backends_match_python(
     np.testing.assert_array_equal(batch_backend.gdofs_map, batch_ref.gdofs_map)
     np.testing.assert_allclose(batch_backend.K_elem, batch_ref.K_elem, rtol=1.0e-11, atol=1.0e-11)
     np.testing.assert_allclose(batch_backend.F_elem, batch_ref.F_elem, rtol=1.0e-11, atol=1.0e-11)
+
+
+@pytest.mark.parametrize("backend", ["python", "cpp"])
+def test_dvms_local_system_batch_matches_single_element_on_structured_2x2(
+    backend: str,
+    tmp_path,
+    monkeypatch,
+) -> None:
+    if backend == "cpp":
+        pytest.importorskip("pybind11")
+        monkeypatch.setenv("PYCUTFEM_CACHE_DIR", str(tmp_path / "cpp_dvms_local_system_structured_2x2"))
+
+    mesh_ref, dh_ref, state_ref, u_k_ref, u_prev_ref, a_prev_ref, p_k_ref, d_mesh_ref, d_prev_ref = _make_dvms_problem(
+        poly_order=1,
+        pressure_order=1,
+        quadrature_order=1,
+        nx_quads=2,
+        ny_quads=2,
+    )
+    kwargs = dict(
+        mesh=mesh_ref,
+        dh=dh_ref,
+        u_k=u_k_ref,
+        u_prev=u_prev_ref,
+        a_prev=a_prev_ref,
+        p_k=p_k_ref,
+        d_mesh=d_mesh_ref,
+        d_prev=d_prev_ref,
+        state=state_ref,
+        rho_f=1.5,
+        mu_f=0.05,
+        dt=0.2,
+        bossak_alpha=-0.2,
+        quadrature_order=1,
+        contribution_mode="system",
+    )
+
+    element_ids = np.arange(int(mesh_ref.n_elements), dtype=int)
+    batch = assemble_fluid_dvms_local_contribution_batch(**kwargs, element_ids=element_ids, backend=backend)
+    K_batch, F_batch, gdofs_batch = _compress_batch_to_fluid_block(dh_ref, batch)
+
+    for idx, eid in enumerate(element_ids.tolist()):
+        K_elem, F_elem, gdofs_elem = assemble_dvms_calculate_local_system(
+            mesh=mesh_ref,
+            dh=dh_ref,
+            eid=int(eid),
+            u_k=u_k_ref,
+            u_prev=u_prev_ref,
+            a_prev=a_prev_ref,
+            p_k=p_k_ref,
+            d_mesh=d_mesh_ref,
+            d_prev=d_prev_ref,
+            state=state_ref,
+            rho_f=1.5,
+            mu_f=0.05,
+            dt=0.2,
+            bossak_alpha=-0.2,
+            quadrature_order=1,
+            backend=backend,
+        )
+        np.testing.assert_array_equal(gdofs_batch[idx], gdofs_elem)
+        np.testing.assert_allclose(K_batch[idx], K_elem, rtol=1.0e-12, atol=1.0e-12)
+        np.testing.assert_allclose(F_batch[idx], F_elem, rtol=1.0e-12, atol=1.0e-12)
+
+
+@pytest.mark.parametrize("backend", ["python", "cpp"])
+def test_dvms_system_rhs_uses_bossak_scheme_acceleration(
+    backend: str,
+    tmp_path,
+    monkeypatch,
+) -> None:
+    if backend == "cpp":
+        pytest.importorskip("pybind11")
+        monkeypatch.setenv("PYCUTFEM_CACHE_DIR", str(tmp_path / "cpp_dvms_system_rhs_bossak"))
+
+    mesh, dh, state, u_k, u_prev, a_prev, p_k, d_mesh, d_prev = _make_dvms_problem(
+        poly_order=1,
+        pressure_order=1,
+        quadrature_order=1,
+        nx_quads=2,
+        ny_quads=2,
+    )
+    rho_f = 1.5
+    mu_f = 0.05
+    dt = 0.2
+    alpha = -0.2
+    bossak = _bossak_coefficients(alpha=alpha, dt=dt)
+
+    A_vel, b_vel = _assemble_global_fluid_block_for_mode(
+        mesh=mesh,
+        dh=dh,
+        state=state,
+        u_k=u_k,
+        u_prev=u_prev,
+        a_prev=a_prev,
+        p_k=p_k,
+        d_mesh=d_mesh,
+        d_prev=d_prev,
+        rho_f=rho_f,
+        mu_f=mu_f,
+        dt=dt,
+        bossak_alpha=alpha,
+        quadrature_order=1,
+        contribution_mode="velocity",
+        backend=backend,
+    )
+    A_sys, b_sys = _assemble_global_fluid_block_for_mode(
+        mesh=mesh,
+        dh=dh,
+        state=state,
+        u_k=u_k,
+        u_prev=u_prev,
+        a_prev=a_prev,
+        p_k=p_k,
+        d_mesh=d_mesh,
+        d_prev=d_prev,
+        rho_f=rho_f,
+        mu_f=mu_f,
+        dt=dt,
+        bossak_alpha=alpha,
+        quadrature_order=1,
+        contribution_mode="system",
+        backend=backend,
+    )
+    A_mass_lhs, _ = _assemble_global_fluid_block_for_mode(
+        mesh=mesh,
+        dh=dh,
+        state=state,
+        u_k=u_k,
+        u_prev=u_prev,
+        a_prev=a_prev,
+        p_k=p_k,
+        d_mesh=d_mesh,
+        d_prev=d_prev,
+        rho_f=rho_f,
+        mu_f=mu_f,
+        dt=dt,
+        bossak_alpha=alpha,
+        quadrature_order=1,
+        contribution_mode="mass_lhs",
+        backend=backend,
+    )
+    A_mass_stab, _ = _assemble_global_fluid_block_for_mode(
+        mesh=mesh,
+        dh=dh,
+        state=state,
+        u_k=u_k,
+        u_prev=u_prev,
+        a_prev=a_prev,
+        p_k=p_k,
+        d_mesh=d_mesh,
+        d_prev=d_prev,
+        rho_f=rho_f,
+        mu_f=mu_f,
+        dt=dt,
+        bossak_alpha=alpha,
+        quadrature_order=1,
+        contribution_mode="mass_stabilization",
+        backend=backend,
+    )
+
+    a_scheme = np.zeros((int(dh.total_dofs),), dtype=float)
+    ux_ids = np.asarray(dh.get_field_slice("ux"), dtype=int)
+    uy_ids = np.asarray(dh.get_field_slice("uy"), dtype=int)
+    ux_curr = np.asarray(u_k.components[0].get_nodal_values(ux_ids), dtype=float)
+    uy_curr = np.asarray(u_k.components[1].get_nodal_values(uy_ids), dtype=float)
+    ux_prev = np.asarray(u_prev.components[0].get_nodal_values(ux_ids), dtype=float)
+    uy_prev = np.asarray(u_prev.components[1].get_nodal_values(uy_ids), dtype=float)
+    ax_prev = np.asarray(a_prev.components[0].get_nodal_values(ux_ids), dtype=float)
+    ay_prev = np.asarray(a_prev.components[1].get_nodal_values(uy_ids), dtype=float)
+    ax_curr = float(bossak["ma0"]) * (ux_curr - ux_prev) + float(bossak["ma2"]) * ax_prev
+    ay_curr = float(bossak["ma0"]) * (uy_curr - uy_prev) + float(bossak["ma2"]) * ay_prev
+    a_scheme[ux_ids] = (1.0 - alpha) * ax_curr + alpha * ax_prev
+    a_scheme[uy_ids] = (1.0 - alpha) * ay_curr + alpha * ay_prev
+
+    mass_matrix = np.asarray(A_mass_lhs, dtype=float) + np.asarray(A_mass_stab, dtype=float)
+    expected_delta = -mass_matrix @ a_scheme
+    np.testing.assert_allclose(
+        np.asarray(b_sys, dtype=float) - np.asarray(b_vel, dtype=float),
+        expected_delta,
+        rtol=1.0e-11,
+        atol=1.0e-11,
+    )
+
+    current_acc = np.zeros_like(a_scheme)
+    current_acc[ux_ids] = ax_curr
+    current_acc[uy_ids] = ay_curr
+    wrong_delta = -mass_matrix @ current_acc
+    assert float(np.max(np.abs(expected_delta - wrong_delta))) > 1.0e-6
+
+    bossak_mam = float(bossak["mam"])
+    np.testing.assert_allclose(
+        np.asarray(A_sys, dtype=float),
+        np.asarray(A_vel, dtype=float) + bossak_mam * mass_matrix,
+        rtol=1.0e-11,
+        atol=1.0e-11,
+    )

@@ -38,7 +38,7 @@ from pycutfem.solvers.nonlinear_solver import (
     PdasNewtonSolver,
     VIParameters,
 )
-from pycutfem.ufl.expressions import Constant
+from pycutfem.ufl.expressions import Constant, Function, HdivFunction, VectorFunction
 from pycutfem.ufl.forms import BoundaryCondition
 
 
@@ -74,31 +74,101 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     split_parser.add_argument(
         "--outer-it",
         type=int,
-        default=1,
+        default=8,
         help=(
-            "Number of split sweeps per time step. The Seboldt-style split is single-sweep by default; "
-            "values > 1 repeat that split as a nonlinear accelerator rather than following the paper verbatim."
+            "Maximum number of staggered fixed-point sweeps per time step. "
+            "The default mirrors the NIRB-style outer coupling loop and gives the split solve "
+            "enough room to settle smoothly."
         ),
     )
     split_parser.add_argument(
         "--outer-tol",
         type=float,
         default=1.0e-2,
-        help="Scaled coupling-field sweep-to-sweep convergence threshold.",
+        help="Scaled coupling-field fixed-point residual threshold.",
+    )
+    split_parser.add_argument(
+        "--outer-abs-tol",
+        type=float,
+        default=0.0,
+        help=(
+            "Optional absolute coupling-field fixed-point residual threshold. "
+            "Set <= 0 to disable the absolute check."
+        ),
+    )
+    split_parser.add_argument(
+        "--outer-update",
+        type=str,
+        default="aitken",
+        choices=("constant", "aitken", "iqn_ils", "iqln"),
+        help="Outer fixed-point update used after each staggered sweep.",
+    )
+    split_parser.add_argument(
+        "--outer-history",
+        type=int,
+        default=6,
+        help="History length used by the IQN/IQLN-style outer coupling update.",
+    )
+    split_parser.add_argument(
+        "--outer-regularization",
+        type=float,
+        default=1.0e-10,
+        help="Tikhonov regularization used in the outer IQN/IQLN least-squares system.",
     )
     split_parser.add_argument(
         "--outer-relaxation",
         type=float,
+        default=0.5,
+        help="Base fixed-point relaxation used by the outer coupling update.",
+    )
+    split_parser.add_argument(
+        "--outer-relaxation-min",
+        type=float,
+        default=1.0e-3,
+        help="Minimum relaxation allowed by the outer fixed-point update.",
+    )
+    split_parser.add_argument(
+        "--outer-relaxation-max",
+        type=float,
         default=1.0,
-        help="Optional under-relaxation applied after each full staggered sweep.",
+        help="Maximum relaxation allowed by the outer fixed-point update.",
+    )
+    split_parser.add_argument(
+        "--stage-newton-tol",
+        type=float,
+        default=None,
+        help=(
+            "Absolute residual tolerance used by the staggered stage solvers. "
+            "Defaults to --newton-tol when unset."
+        ),
+    )
+    split_parser.add_argument(
+        "--stage-newton-rtol",
+        type=float,
+        default=0.0,
+        help=(
+            "Relative residual tolerance used by the staggered stage solvers. "
+            "Defaults to 0 so the split stages stop on an absolute residual threshold."
+        ),
+    )
+    split_parser.add_argument(
+        "--stage-accept-nonconverged-atol-factor",
+        type=float,
+        default=1.0,
+        help=(
+            "Relaxed near-tolerance acceptance factor for staggered stage solvers. "
+            "Defaults to 1 so best-effort globalization is only accepted when the "
+            "updated residual is already within the absolute Newton tolerance."
+        ),
     )
     split_parser.add_argument(
         "--stage-order",
         type=str,
-        default="solid,flow,transport",
+        default="flow,solid,transport",
         help=(
             "Comma-separated Gauss-Seidel stage order using each of flow, solid, transport exactly once. "
-            "Default: solid,flow,transport."
+            "Default: flow,solid,transport. With post-accept transport enabled, the leading flow/solid pair "
+            "defines the fixed-point coupling order and transport is updated after the coupled sweep accepts."
         ),
     )
     split_parser.add_argument(
@@ -115,7 +185,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=2000.0,
         help=(
-            "Generalized Robin combination parameter L used on the solid stage. "
+            "Generalized Robin combination parameter L used in the split free-fluid / poro-solid coupling. "
             "This is distinct from the physical fluid-entry resistance delta passed by --interface-entry-delta."
         ),
     )
@@ -124,7 +194,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=str,
         default="newton",
         choices=("newton", "pdas", "ipm"),
-        help="Nonlinear solver used on the solid/reference-map stage.",
+        help="Nonlinear solver used on the poro-solid/reference-map stage.",
     )
     split_parser.add_argument(
         "--transport-solver",
@@ -138,7 +208,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=str,
         default="newton",
         choices=("newton", "pdas", "ipm"),
-        help="Nonlinear solver used on the flow/pore-pressure stage.",
+        help="Nonlinear solver used on the free-fluid stage.",
     )
     split_parser.add_argument(
         "--solid-max-it",
@@ -158,6 +228,66 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Optional Newton/VI iteration cap for the flow stage. Defaults to --max-it.",
     )
+    split_parser.add_argument(
+        "--transport-post-accept",
+        dest="transport_post_accept",
+        action="store_true",
+        help=(
+            "Freeze transport during the fluid/poro-solid fixed-point and update it once after the coupled "
+            "sweep accepts. This matches the intended two-solver interface map."
+        ),
+    )
+    split_parser.add_argument(
+        "--no-transport-post-accept",
+        dest="transport_post_accept",
+        action="store_false",
+        help=argparse.SUPPRESS,
+    )
+    split_parser.set_defaults(transport_post_accept=True)
+    split_parser.add_argument(
+        "--startup-preload-sweeps",
+        type=int,
+        default=0,
+        help=(
+            "Before the first strict split step, run this many relaxed staggered preload sweeps "
+            "to build a smoother startup guess. Set 0 to disable."
+        ),
+    )
+    split_parser.add_argument(
+        "--startup-preload-accept-factor",
+        type=float,
+        default=5.0e3,
+        help=(
+            "Temporary Newton near-tolerance accept factor used only during the first-step preload "
+            "sweeps so the split startup can keep materially improved stage states."
+        ),
+    )
+    split_parser.add_argument(
+        "--startup-flow-scales",
+        type=str,
+        default="0.025,0.1,0.25,0.5,1.0",
+        help=(
+            "Comma-separated continuation scales used for every first-step flow stage solve, "
+            "including preload sweeps. The final value is forced to 1.0."
+        ),
+    )
+    split_parser.add_argument(
+        "--startup-preload-prev-blend",
+        type=float,
+        default=1.0,
+        help=(
+            "After the first-step preload, keep the transport fields but blend the remaining "
+            "fields back toward the previous accepted state. 1.0 keeps the staged state."
+        ),
+    )
+    split_parser.add_argument(
+        "--freeze-B-total-mixture-continuity-diagnostic",
+        action="store_true",
+        help=(
+            "Diagnostic switch: keep B frozen and replace the split porous p_pore row "
+            "by the total-mixture continuity div(F v + q + alpha vS)=0 in the poro-solid stage."
+        ),
+    )
     split_args, remaining = split_parser.parse_known_args(raw_argv)
     args = _base_parse_args(remaining)
 
@@ -165,22 +295,33 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         (("--outdir",), "outdir", "out/benchmark7_seboldt_staggered"),
         (("--full-ratio-free-state", "--no-full-ratio-free-state"), "full_ratio_free_state", True),
         (("--enable-phi-evolution", "--no-enable-phi-evolution"), "enable_phi_evolution", True),
+        (("--split-primary-darcy-flux", "--no-split-primary-darcy-flux"), "split_primary_darcy_flux", True),
         (("--fluid-space",), "fluid_space", "cg"),
         (("--support-physics",), "support_physics", "stored_support"),
+        (("--geometry-indicator-beta",), "geometry_indicator_beta", 12.0),
         (("--solid-bc-mode",), "solid_bc_mode", "lateral_clamped"),
+        (("--drag-formulation",), "drag_formulation", "mixed_lm"),
         (("--alpha-regularization",), "alpha_regularization", "none"),
         (("--alpha-advect-with",), "alpha_advect_with", "vS"),
         (("--alpha-advection-form",), "alpha_advection_form", "advective"),
         (("--storativity-c0",), "storativity_c0", 1.0e-3),
         (("--alpha-box-constraints", "--no-alpha-box-constraints"), "alpha_box_constraints", True),
+        (("--pressure-mean-constraint", "--no-pressure-mean-constraint"), "pressure_mean_constraint", True),
+        (("--pressure-mean-gauge", "--no-pressure-mean-gauge"), "pressure_mean_gauge", False),
         (("--pressure-interface-closure", "--no-pressure-interface-closure"), "pressure_interface_closure", False),
         (("--p-pore-fluid-gauge", "--no-p-pore-fluid-gauge"), "p_pore_fluid_gauge", True),
         (("--interface-entry-closure", "--no-interface-entry-closure"), "interface_entry_closure", True),
-        (("--interface-bjs-closure", "--no-interface-bjs-closure"), "interface_bjs_closure", True),
+        (("--interface-bjs-closure", "--no-interface-bjs-closure"), "interface_bjs_closure", False),
+        (
+            ("--interface-velocity-continuity-closure", "--no-interface-velocity-continuity-closure"),
+            "interface_velocity_continuity_closure",
+            True,
+        ),
+        (("--interface-velocity-tangential-strength",), "interface_velocity_tangential_strength", 0.0),
         (
             ("--interface-traction-continuity-closure", "--no-interface-traction-continuity-closure"),
             "interface_traction_continuity_closure",
-            True,
+            False,
         ),
         (("--interface-traction-normal-strength",), "interface_traction_normal_strength", 1.0),
         (("--interface-traction-tangential-strength",), "interface_traction_tangential_strength", 0.0),
@@ -213,12 +354,18 @@ def _validate_supported_configuration(args: argparse.Namespace) -> None:
     if str(getattr(args, "fluid_space", "cg")).strip().lower() != "cg":
         raise NotImplementedError(
             "The staggered Benchmark 7 driver currently supports only --fluid-space=cg because "
-            "the diffuse Robin interface closures are implemented on the CG velocity branch."
+            "the explicit interface traction-transfer form is currently wired on the CG velocity branch."
         )
     if not bool(getattr(args, "full_ratio_free_state", False)):
         raise ValueError(
-            "The staggered Benchmark 7 driver is wired for the full ratio-free stored-support branch "
+            "The staggered Benchmark 7 driver is wired for the full ratio-free stored-support q-primary branch "
             "with split pressures p/p_pore."
+        )
+    if not bool(mono._split_primary_darcy_flux_enabled(args)):
+        raise ValueError(
+            "The staggered Benchmark 7 driver requires --split-primary-darcy-flux on the full ratio-free "
+            "stored-support branch so the free-fluid stage solves only (v,p) while the poro-solid stage owns "
+            "(p_pore,q,vS,u)."
         )
 
 
@@ -228,6 +375,32 @@ def _filter_bcs_by_fields(
 ) -> list[BoundaryCondition]:
     allowed = {str(name) for name in list(field_names or [])}
     return [bc for bc in list(bcs_in or []) if str(getattr(bc, "field", "")) in allowed]
+
+
+def _scaled_dirichlet_bcs(
+    bcs_in: list[BoundaryCondition],
+    *,
+    scale: float,
+    scaled_fields: tuple[str, ...] = ("v", "v_x", "v_y"),
+) -> list[BoundaryCondition]:
+    theta = float(scale)
+    targets = {str(name) for name in tuple(scaled_fields)}
+    out: list[BoundaryCondition] = []
+    for bc in list(bcs_in or []):
+        if str(getattr(bc, "method", "")).lower() != "dirichlet" or str(getattr(bc, "field", "")) not in targets:
+            out.append(bc)
+            continue
+        value_fn = bc.value
+        if callable(value_fn):
+            def _scaled_value(x, y, _f=value_fn, _theta=theta):
+                return float(_theta) * float(_f(x, y))
+        else:
+            raw = float(value_fn)
+            def _scaled_value(x, y, _raw=raw, _theta=theta):
+                del x, y
+                return float(_theta) * float(_raw)
+        out.append(BoundaryCondition(bc.field, bc.method, bc.domain_tag, _scaled_value))
+    return out
 
 
 def _sum_forms(*parts):
@@ -249,6 +422,314 @@ def _find_named_function(funcs_in, template):
 
 def _snapshot_function_values(functions) -> tuple[np.ndarray, ...]:
     return tuple(np.asarray(func.nodal_values, dtype=float).copy() for func in list(functions or []))
+
+
+def _clone_function_like(template, *, name: str):
+    if isinstance(template, VectorFunction):
+        return VectorFunction(name, list(template.field_names), template._dof_handler)
+    if isinstance(template, HdivFunction):
+        return HdivFunction(name, template.field_name, template._dof_handler)
+    if isinstance(template, Function):
+        return Function(name, template.field_name, template._dof_handler)
+    raise TypeError(f"Unsupported function template type: {type(template)!r}")
+
+
+def _copy_function_values(source, target) -> None:
+    src = np.asarray(source.nodal_values, dtype=float).ravel()
+    dst = np.asarray(target.nodal_values, dtype=float).ravel()
+    if src.size != dst.size:
+        raise ValueError(
+            f"Cannot copy function values: size mismatch {src.size} -> {dst.size} for "
+            f"{getattr(source, 'name', '?')} -> {getattr(target, 'name', '?')}."
+        )
+    target.nodal_values[:] = src
+
+
+def _copy_function_list_values(sources, targets) -> None:
+    src_list = list(sources or [])
+    dst_list = list(targets or [])
+    if len(src_list) != len(dst_list):
+        raise ValueError("Cannot copy function list values: source/target count mismatch.")
+    for source, target in zip(src_list, dst_list):
+        _copy_function_values(source, target)
+
+
+def _build_flow_coupling_state(problem: dict[str, object]) -> None:
+    flow_coupling_v = _clone_function_like(problem["v_n"], name="v_flow_coupling")
+    flow_coupling_p = _clone_function_like(problem["p_n"], name="p_flow_coupling")
+    _copy_function_values(problem["v_n"], flow_coupling_v)
+    _copy_function_values(problem["p_n"], flow_coupling_p)
+    problem["_staggered_flow_coupling_v"] = flow_coupling_v
+    problem["_staggered_flow_coupling_p"] = flow_coupling_p
+    problem["_staggered_flow_coupling_scale"] = mono._named_constant("b7_staggered_flow_coupling_scale", 1.0)
+
+
+def _build_interface_transfer_state(problem: dict[str, object]) -> None:
+    template = problem["p_n"]
+    problem["_staggered_if_entry_drive"] = _clone_function_like(template, name="if_entry_drive")
+    problem["_staggered_if_entry_drive_candidate"] = _clone_function_like(template, name="if_entry_drive_candidate")
+    problem["_staggered_if_porous_flux_n"] = _clone_function_like(template, name="if_porous_flux_n")
+    problem["_staggered_if_porous_flux_n_candidate"] = _clone_function_like(template, name="if_porous_flux_n_candidate")
+    problem["_staggered_if_porous_traction_n"] = _clone_function_like(template, name="if_porous_traction_n")
+    problem["_staggered_if_porous_traction_n_candidate"] = _clone_function_like(template, name="if_porous_traction_n_candidate")
+    problem["_staggered_if_free_traction_n"] = _clone_function_like(template, name="if_free_traction_n")
+    problem["_staggered_if_free_traction_n_candidate"] = _clone_function_like(template, name="if_free_traction_n_candidate")
+    problem["_staggered_if_free_flux_n"] = _clone_function_like(template, name="if_free_flux_n")
+    problem["_staggered_if_free_flux_n_candidate"] = _clone_function_like(template, name="if_free_flux_n_candidate")
+    for key in (
+        "_staggered_if_entry_drive",
+        "_staggered_if_entry_drive_candidate",
+        "_staggered_if_porous_flux_n",
+        "_staggered_if_porous_flux_n_candidate",
+        "_staggered_if_porous_traction_n",
+        "_staggered_if_porous_traction_n_candidate",
+        "_staggered_if_free_traction_n",
+        "_staggered_if_free_traction_n_candidate",
+        "_staggered_if_free_flux_n",
+        "_staggered_if_free_flux_n_candidate",
+    ):
+        problem[key].nodal_values[:] = 0.0
+
+
+def _commit_flow_interface_response(problem: dict[str, object]) -> None:
+    for state_key, candidate_key in (
+        ("_staggered_if_free_traction_n", "_staggered_if_free_traction_n_candidate"),
+        ("_staggered_if_free_flux_n", "_staggered_if_free_flux_n_candidate"),
+    ):
+        state = problem.get(state_key)
+        candidate = problem.get(candidate_key)
+        if state is None or candidate is None:
+            continue
+        _copy_function_values(candidate, state)
+
+
+def _commit_porous_interface_response(problem: dict[str, object]) -> None:
+    for state_key, candidate_key in (
+        ("_staggered_if_porous_traction_n", "_staggered_if_porous_traction_n_candidate"),
+    ):
+        state = problem.get(state_key)
+        candidate = problem.get(candidate_key)
+        if state is None or candidate is None:
+            continue
+        _copy_function_values(candidate, state)
+
+
+def _interface_state_functions(problem: dict[str, object]) -> list[object]:
+    funcs: list[object] = []
+    if bool(problem.get("_staggered_state_use_porous_flux_n", True)) and problem.get("_staggered_if_porous_flux_n") is not None:
+        funcs.append(problem["_staggered_if_porous_flux_n"])
+    if bool(problem.get("_staggered_state_use_porous_traction_n", False)) and problem.get("_staggered_if_porous_traction_n") is not None:
+        funcs.append(problem["_staggered_if_porous_traction_n"])
+    if bool(problem.get("_staggered_state_use_free_traction_n", False)) and problem.get("_staggered_if_free_traction_n") is not None:
+        funcs.append(problem["_staggered_if_free_traction_n"])
+    if bool(problem.get("_staggered_state_use_free_flux_n", False)) and problem.get("_staggered_if_free_flux_n") is not None:
+        funcs.append(problem["_staggered_if_free_flux_n"])
+    return funcs
+
+
+def _interface_candidate_functions(problem: dict[str, object]) -> list[object]:
+    funcs: list[object] = []
+    if bool(problem.get("_staggered_state_use_porous_flux_n", True)) and problem.get("_staggered_if_porous_flux_n_candidate") is not None:
+        funcs.append(problem["_staggered_if_porous_flux_n_candidate"])
+    if bool(problem.get("_staggered_state_use_porous_traction_n", False)) and problem.get("_staggered_if_porous_traction_n_candidate") is not None:
+        funcs.append(problem["_staggered_if_porous_traction_n_candidate"])
+    if bool(problem.get("_staggered_state_use_free_traction_n", False)) and problem.get("_staggered_if_free_traction_n_candidate") is not None:
+        funcs.append(problem["_staggered_if_free_traction_n_candidate"])
+    if bool(problem.get("_staggered_state_use_free_flux_n", False)) and problem.get("_staggered_if_free_flux_n_candidate") is not None:
+        funcs.append(problem["_staggered_if_free_flux_n_candidate"])
+    return funcs
+
+
+def _compute_interface_diag(
+    *,
+    args: argparse.Namespace,
+    problem: dict[str, object],
+    eps_alpha: float,
+    interface_entry_delta: float,
+) -> dict[str, object]:
+    return mono._compute_interface_probe_diagnostics(
+        problem=problem,
+        Lx=float(args.Lx),
+        y_interface=float(args.y_interface),
+        y_profile=float(args.y_profile),
+        eps_alpha=float(eps_alpha),
+        mu_f=float(args.mu_f),
+        mu_s=float(args.mu_s),
+        lambda_s=float(args.lambda_s),
+        solid_visco_eta=float(args.solid_visco_eta),
+        solid_model=str(args.solid_model),
+        skeleton_pressure_mode=str(args.skeleton_pressure_mode),
+        alpha_biot=(None if args.alpha_biot is None else float(args.alpha_biot)),
+        interface_entry_delta=float(interface_entry_delta),
+        interface_bjs_gamma=float(getattr(args, "interface_bjs_gamma", 1.0e3)),
+    )
+
+
+def _profile_rows_to_xy(rows: list[dict[str, float]], value_key: str) -> tuple[np.ndarray, np.ndarray]:
+    if not rows:
+        return np.zeros((0,), dtype=float), np.zeros((0,), dtype=float)
+    buckets: dict[float, list[float]] = {}
+    for row in list(rows):
+        try:
+            x_val = float(row.get("x", float("nan")))
+            y_val = float(row.get(value_key, float("nan")))
+        except Exception:
+            continue
+        if not (np.isfinite(x_val) and np.isfinite(y_val)):
+            continue
+        buckets.setdefault(float(x_val), []).append(float(y_val))
+    if not buckets:
+        return np.zeros((0,), dtype=float), np.zeros((0,), dtype=float)
+    x_sorted = np.asarray(sorted(buckets), dtype=float)
+    y_sorted = np.asarray([float(np.mean(buckets[float(xv)])) for xv in x_sorted], dtype=float)
+    return x_sorted, y_sorted
+
+
+def _interface_transfer_rows(interface_diag: dict[str, object]) -> list[dict[str, float]]:
+    rows = list(interface_diag.get("interface_profile_rows") or [])
+    if rows:
+        return rows
+    return list(interface_diag.get("interface_line_rows") or [])
+
+
+def _set_scalar_function_from_profile(target, *, x_samples: np.ndarray, values: np.ndarray) -> None:
+    coords = np.asarray(target._dof_handler.get_dof_coords(target.field_name), dtype=float)
+    out = np.zeros((coords.shape[0],), dtype=float)
+    x_samples = np.asarray(x_samples, dtype=float).ravel()
+    values = np.asarray(values, dtype=float).ravel()
+    if x_samples.size > 0 and values.size == x_samples.size:
+        out[:] = np.interp(coords[:, 0], x_samples, values, left=float(values[0]), right=float(values[-1]))
+    target.nodal_values[:] = out
+
+
+def _update_interface_transfer_function_from_rows(problem: dict[str, object], *, target_key: str, rows: list[dict[str, float]], value_key: str) -> None:
+    target = problem.get(target_key)
+    if target is None:
+        return
+    x_samples, y_samples = _profile_rows_to_xy(list(rows or []), value_key)
+    _set_scalar_function_from_profile(target, x_samples=x_samples, values=y_samples)
+
+
+def _refresh_flow_to_solid_transfer(
+    *,
+    args: argparse.Namespace,
+    problem: dict[str, object],
+    eps_alpha: float,
+    interface_entry_delta: float,
+) -> dict[str, object]:
+    interface_diag = _compute_interface_diag(
+        args=args,
+        problem=problem,
+        eps_alpha=float(eps_alpha),
+        interface_entry_delta=float(interface_entry_delta),
+    )
+    _update_interface_transfer_function_from_rows(
+        problem,
+        target_key="_staggered_if_free_traction_n_candidate",
+        rows=_interface_transfer_rows(interface_diag),
+        value_key="traction_free_n",
+    )
+    _update_interface_transfer_function_from_rows(
+        problem,
+        target_key="_staggered_if_free_flux_n_candidate",
+        rows=_interface_transfer_rows(interface_diag),
+        value_key="free_flux_n",
+    )
+    return interface_diag
+
+
+def _refresh_solid_interface_candidate(
+    *,
+    args: argparse.Namespace,
+    problem: dict[str, object],
+    eps_alpha: float,
+    interface_entry_delta: float,
+) -> dict[str, object]:
+    interface_diag = _compute_interface_diag(
+        args=args,
+        problem=problem,
+        eps_alpha=float(eps_alpha),
+        interface_entry_delta=float(interface_entry_delta),
+    )
+    _update_interface_transfer_function_from_rows(
+        problem,
+        target_key="_staggered_if_entry_drive_candidate",
+        rows=_interface_transfer_rows(interface_diag),
+        value_key="entry_drive",
+    )
+    _update_interface_transfer_function_from_rows(
+        problem,
+        target_key="_staggered_if_porous_flux_n_candidate",
+        rows=_interface_transfer_rows(interface_diag),
+        value_key="porous_flux_n",
+    )
+    _update_interface_transfer_function_from_rows(
+        problem,
+        target_key="_staggered_if_porous_traction_n_candidate",
+        rows=_interface_transfer_rows(interface_diag),
+        value_key="traction_porous_support_n",
+    )
+    return interface_diag
+
+
+def _interface_transfer_field_scales(
+    problem: dict[str, object],
+    *,
+    interface_diag: dict[str, object],
+) -> dict[str, float]:
+    summary = dict(interface_diag.get("summary", {}) or {})
+    v_scale = max(
+        1.0e-12,
+        float(np.max(np.abs(problem["v_k"].nodal_values))),
+        float(np.max(np.abs(problem["vS_k"].nodal_values))),
+        float(np.max(np.abs(problem["q_flux_k"].nodal_values))) if problem.get("q_flux_k") is not None else 0.0,
+        abs(float(summary.get("centerline_at_y_interface_free_flux_n", 0.0))),
+        abs(float(summary.get("centerline_at_y_interface_q_n", 0.0))),
+    )
+    p_scale = max(
+        1.0e-12,
+        float(np.max(np.abs(problem["p_k"].nodal_values))),
+        float(np.max(np.abs(problem["p_pore_k"].nodal_values))) if problem.get("p_pore_k") is not None else 0.0,
+        abs(float(summary.get("centerline_at_y_interface_traction_free_n", 0.0))),
+        abs(float(summary.get("centerline_at_y_interface_p_pore_support", 0.0))),
+    )
+    return {
+        "if_entry_drive": float(p_scale),
+        "if_porous_flux_n": float(v_scale),
+        "if_porous_traction_n": float(p_scale),
+        "if_free_traction_n": float(p_scale),
+        "if_free_flux_n": float(v_scale),
+    }
+
+
+def _interface_state_delta(
+    problem: dict[str, object],
+    *,
+    interface_diag: dict[str, object],
+) -> tuple[float, float, dict[str, float], np.ndarray, np.ndarray]:
+    state_funcs = _interface_state_functions(problem)
+    candidate_funcs = _interface_candidate_functions(problem)
+    if len(state_funcs) != len(candidate_funcs):
+        raise ValueError("Interface state/candidate count mismatch.")
+    scales = _interface_transfer_field_scales(problem, interface_diag=interface_diag)
+    by_field: dict[str, float] = {}
+    max_scaled = 0.0
+    max_abs = 0.0
+    for state_func, candidate_func in zip(state_funcs, candidate_funcs):
+        name = str(getattr(state_func, "name", ""))
+        state_vals = np.asarray(state_func.nodal_values, dtype=float).ravel()
+        cand_vals = np.asarray(candidate_func.nodal_values, dtype=float).ravel()
+        if state_vals.size != cand_vals.size:
+            raise ValueError(f"Interface state size mismatch for {name!r}.")
+        abs_delta = float(np.max(np.abs(cand_vals - state_vals))) if state_vals.size else 0.0
+        scale = max(float(scales.get(name, 1.0) or 1.0), 1.0e-30)
+        scaled = float(abs_delta / scale)
+        by_field[name] = scaled
+        max_scaled = max(max_scaled, scaled)
+        max_abs = max(max_abs, abs_delta)
+    x_curr = _functions_to_vector(state_funcs)
+    residual_vec = _functions_to_vector(candidate_funcs) - x_curr
+    return float(max_scaled), float(max_abs), by_field, residual_vec, x_curr
 
 
 def _restore_function_values(functions, snapshot: tuple[np.ndarray, ...]) -> None:
@@ -276,8 +757,362 @@ def _max_snapshot_delta(functions, snapshot: tuple[np.ndarray, ...]) -> float:
     return max_delta
 
 
+def _flow_solution_functions(problem: dict[str, object]) -> list[object]:
+    return [problem["v_k"], problem["p_k"]]
+
+
+def _flow_coupling_functions(problem: dict[str, object]) -> list[object]:
+    funcs: list[object] = []
+    if problem.get("_staggered_flow_coupling_v") is not None:
+        funcs.append(problem["_staggered_flow_coupling_v"])
+    if problem.get("_staggered_flow_coupling_p") is not None:
+        funcs.append(problem["_staggered_flow_coupling_p"])
+    return funcs
+
+
+def _reset_flow_coupling_from_previous(problem: dict[str, object]) -> None:
+    coupling_funcs = _flow_coupling_functions(problem)
+    if not coupling_funcs:
+        return
+    _copy_function_list_values([problem["v_n"], problem["p_n"]], coupling_funcs)
+
+
+def _commit_flow_coupling_from_current(problem: dict[str, object]) -> None:
+    coupling_funcs = _flow_coupling_functions(problem)
+    if not coupling_funcs:
+        return
+    _copy_function_list_values(_flow_solution_functions(problem), coupling_funcs)
+
+
+def _copy_flow_coupling_into_current(problem: dict[str, object]) -> None:
+    coupling_funcs = _flow_coupling_functions(problem)
+    if not coupling_funcs:
+        return
+    _copy_function_list_values(coupling_funcs, _flow_solution_functions(problem))
+
+
+def _set_flow_coupling_scale(problem: dict[str, object], *, scale: float) -> None:
+    target = problem.get("_staggered_flow_coupling_scale")
+    if target is not None:
+        target.value = float(scale)
+
+
+def _relax_flow_coupling_toward_current(problem: dict[str, object], *, omega: float) -> None:
+    theta = float(np.clip(float(omega), 0.0, 1.0))
+    if theta <= 0.0:
+        return
+    current_funcs = _flow_solution_functions(problem)
+    coupling_funcs = _flow_coupling_functions(problem)
+    if len(current_funcs) != len(coupling_funcs):
+        raise ValueError("Cannot relax flow coupling state: source/target count mismatch.")
+    for current, coupling in zip(current_funcs, coupling_funcs):
+        old = np.asarray(coupling.nodal_values, dtype=float).ravel()
+        cur = np.asarray(current.nodal_values, dtype=float).ravel()
+        if old.size != cur.size:
+            raise ValueError(
+                f"Cannot relax flow coupling state: size mismatch {old.size} vs {cur.size} for "
+                f"{getattr(current, 'name', '?')}."
+            )
+        coupling.nodal_values[:] = old + theta * (cur - old)
+
+
+def _flow_coupling_delta(
+    problem: dict[str, object],
+    *,
+    field_scales: dict[str, float] | None = None,
+) -> tuple[float, float, dict[str, float], np.ndarray]:
+    current_funcs = _flow_solution_functions(problem)
+    coupling_snapshot = _snapshot_function_values(_flow_coupling_functions(problem))
+    delta_inf, delta_abs_inf, delta_by_field = _scaled_snapshot_delta(
+        current_funcs,
+        coupling_snapshot,
+        field_scales=field_scales,
+    )
+    residual_vec = _functions_to_vector(current_funcs) - _snapshot_to_vector(current_funcs, coupling_snapshot)
+    return delta_inf, delta_abs_inf, delta_by_field, residual_vec
+
+
+def _set_function_vector(functions, values: np.ndarray) -> None:
+    flat = np.asarray(values, dtype=float).ravel()
+    offset = 0
+    for func in list(functions or []):
+        cur = np.asarray(func.nodal_values, dtype=float).ravel()
+        size = int(cur.size)
+        if offset + size > flat.size:
+            raise ValueError("Cannot scatter vector into functions: input vector too short.")
+        func.nodal_values[:] = flat[offset : offset + size]
+        offset += size
+    if offset != flat.size:
+        raise ValueError("Cannot scatter vector into functions: input vector has trailing entries.")
+
+
+def _set_selected_function_vector(
+    functions,
+    values: np.ndarray,
+    *,
+    field_names: set[str] | list[str] | tuple[str, ...] | None = None,
+) -> None:
+    selected = None if field_names is None else {str(name) for name in set(field_names)}
+    flat = np.asarray(values, dtype=float).ravel()
+    offset = 0
+    for func in list(functions or []):
+        func_name = str(getattr(func, "name", ""))
+        if selected is not None and func_name not in selected:
+            continue
+        cur = np.asarray(func.nodal_values, dtype=float).ravel()
+        size = int(cur.size)
+        if offset + size > flat.size:
+            raise ValueError("Cannot scatter vector into selected functions: input vector too short.")
+        func.nodal_values[:] = flat[offset : offset + size]
+        offset += size
+    if offset != flat.size:
+        raise ValueError("Cannot scatter vector into selected functions: input vector has trailing entries.")
+
+
+def _iqn_ils_candidate(
+    *,
+    x_curr: np.ndarray,
+    residual_curr: np.ndarray,
+    x_history: list[np.ndarray],
+    residual_history: list[np.ndarray],
+    omega: float,
+    regularization: float,
+    max_history: int,
+) -> np.ndarray | None:
+    x_curr = np.asarray(x_curr, dtype=float).ravel()
+    residual_curr = np.asarray(residual_curr, dtype=float).ravel()
+    if x_curr.size == 0 or residual_curr.size != x_curr.size:
+        return None
+    if len(x_history) < 2 or len(residual_history) < 2:
+        return None
+    use = max(0, min(int(max_history), len(x_history) - 1))
+    if use <= 0:
+        return None
+    x_sel = [np.asarray(vec, dtype=float).ravel() for vec in x_history[-(use + 1) :]]
+    r_sel = [np.asarray(vec, dtype=float).ravel() for vec in residual_history[-(use + 1) :]]
+    if any(vec.size != x_curr.size for vec in x_sel) or any(vec.size != residual_curr.size for vec in r_sel):
+        return None
+    dx_cols = [x_sel[i + 1] - x_sel[i] for i in range(len(x_sel) - 1)]
+    dr_cols = [r_sel[i + 1] - r_sel[i] for i in range(len(r_sel) - 1)]
+    if not dx_cols or not dr_cols:
+        return None
+    dx_mat = np.column_stack(dx_cols)
+    dr_mat = np.column_stack(dr_cols)
+    if dx_mat.shape != dr_mat.shape or dx_mat.shape[1] == 0:
+        return None
+    lhs = dr_mat.T @ dr_mat
+    reg = max(float(regularization), 0.0)
+    if reg > 0.0:
+        lhs = lhs + reg * np.identity(lhs.shape[0], dtype=float)
+    rhs = -(dr_mat.T @ residual_curr)
+    try:
+        gamma = np.linalg.solve(lhs, rhs)
+    except np.linalg.LinAlgError:
+        gamma, *_ = np.linalg.lstsq(dr_mat, -residual_curr, rcond=None)
+    base = x_curr + float(omega) * residual_curr
+    candidate = base + (dx_mat + float(omega) * dr_mat) @ gamma
+    if not np.all(np.isfinite(candidate)):
+        return None
+    return np.asarray(candidate, dtype=float).ravel()
+
+
+def _outer_interface_physics(
+    *,
+    args: argparse.Namespace,
+    problem: dict[str, object],
+    eps_alpha: float,
+    interface_entry_delta: float,
+) -> tuple[float, dict[str, float]]:
+    interface_diag = mono._compute_interface_probe_diagnostics(
+        problem=problem,
+        Lx=float(args.Lx),
+        y_interface=float(args.y_interface),
+        y_profile=float(args.y_profile),
+        eps_alpha=float(eps_alpha),
+        mu_f=float(args.mu_f),
+        mu_s=float(args.mu_s),
+        lambda_s=float(args.lambda_s),
+        solid_visco_eta=float(args.solid_visco_eta),
+        solid_model=str(args.solid_model),
+        skeleton_pressure_mode=str(args.skeleton_pressure_mode),
+        alpha_biot=(None if args.alpha_biot is None else float(args.alpha_biot)),
+        interface_entry_delta=float(interface_entry_delta),
+        interface_bjs_gamma=float(getattr(args, "interface_bjs_gamma", 1.0e3)),
+    )
+    summary = dict(interface_diag.get("summary", {}) or {})
+    rows = _interface_transfer_rows(interface_diag)
+    v_scale = max(
+        1.0e-12,
+        float(np.max(np.abs(problem["v_k"].nodal_values))),
+        float(np.max(np.abs(problem["vS_k"].nodal_values))),
+        float(np.max(np.abs(problem["q_flux_k"].nodal_values))) if problem.get("q_flux_k") is not None else 0.0,
+        abs(float(summary.get("centerline_at_y_interface_free_flux_n", 0.0))),
+        abs(float(summary.get("centerline_at_y_interface_q_n", 0.0))),
+    )
+    p_scale = max(
+        1.0e-12,
+        float(np.max(np.abs(problem["p_k"].nodal_values))),
+        float(np.max(np.abs(problem["p_pore_k"].nodal_values))) if problem.get("p_pore_k") is not None else 0.0,
+        abs(float(summary.get("centerline_at_y_interface_traction_free_n", 0.0))),
+        abs(float(summary.get("centerline_at_y_interface_traction_porous_support_n", 0.0))),
+        abs(float(summary.get("centerline_at_y_interface_p", 0.0))),
+        abs(float(summary.get("centerline_at_y_interface_p_pore_support", 0.0))),
+    )
+    metrics: dict[str, float] = {}
+    for key in ("mass_flux_jump_n", "traction_jump_n", "traction_jump_t", "entry_residual"):
+        values = np.asarray([float(row.get(key, float("nan"))) for row in rows], dtype=float)
+        values = values[np.isfinite(values)]
+        metrics[f"{key}_maxabs"] = float(np.max(np.abs(values))) if values.size else 0.0
+    scaled = {
+        "physics_mass": metrics["mass_flux_jump_n_maxabs"] / v_scale,
+        "physics_traction_n": metrics["traction_jump_n_maxabs"] / p_scale,
+        "physics_traction_t": metrics["traction_jump_t_maxabs"] / p_scale,
+        "physics_entry": metrics["entry_residual_maxabs"] / p_scale,
+    }
+    include = [scaled["physics_mass"], scaled["physics_traction_n"]]
+    if bool(getattr(args, "interface_entry_closure", False)):
+        include.append(scaled["physics_entry"])
+    if bool(getattr(args, "interface_bjs_closure", False)):
+        include.append(scaled["physics_traction_t"])
+    return float(max(include) if include else 0.0), {**metrics, **scaled}
+
+
+def _outer_interface_residual_vector(
+    *,
+    args: argparse.Namespace,
+    problem: dict[str, object],
+    eps_alpha: float,
+    interface_entry_delta: float,
+) -> np.ndarray:
+    interface_diag = mono._compute_interface_probe_diagnostics(
+        problem=problem,
+        Lx=float(args.Lx),
+        y_interface=float(args.y_interface),
+        y_profile=float(args.y_profile),
+        eps_alpha=float(eps_alpha),
+        mu_f=float(args.mu_f),
+        mu_s=float(args.mu_s),
+        lambda_s=float(args.lambda_s),
+        solid_visco_eta=float(args.solid_visco_eta),
+        solid_model=str(args.solid_model),
+        skeleton_pressure_mode=str(args.skeleton_pressure_mode),
+        alpha_biot=(None if args.alpha_biot is None else float(args.alpha_biot)),
+        interface_entry_delta=float(interface_entry_delta),
+        interface_bjs_gamma=float(getattr(args, "interface_bjs_gamma", 1.0e3)),
+    )
+    rows = _interface_transfer_rows(interface_diag)
+    if not rows:
+        return np.zeros((0,), dtype=float)
+    summary = dict(interface_diag.get("summary", {}) or {})
+    v_scale = max(
+        1.0e-12,
+        float(np.max(np.abs(problem["v_k"].nodal_values))),
+        float(np.max(np.abs(problem["vS_k"].nodal_values))),
+        float(np.max(np.abs(problem["q_flux_k"].nodal_values))) if problem.get("q_flux_k") is not None else 0.0,
+        abs(float(summary.get("centerline_at_y_interface_free_flux_n", 0.0))),
+        abs(float(summary.get("centerline_at_y_interface_q_n", 0.0))),
+    )
+    p_scale = max(
+        1.0e-12,
+        float(np.max(np.abs(problem["p_k"].nodal_values))),
+        float(np.max(np.abs(problem["p_pore_k"].nodal_values))) if problem.get("p_pore_k") is not None else 0.0,
+        abs(float(summary.get("centerline_at_y_interface_traction_free_n", 0.0))),
+        abs(float(summary.get("centerline_at_y_interface_traction_porous_support_n", 0.0))),
+        abs(float(summary.get("centerline_at_y_interface_p", 0.0))),
+        abs(float(summary.get("centerline_at_y_interface_p_pore_support", 0.0))),
+    )
+    pieces: list[np.ndarray] = []
+    for key, scale in (
+        ("mass_flux_jump_n", v_scale),
+        ("traction_jump_n", p_scale),
+        ("entry_residual", p_scale),
+        ("bjs_residual", p_scale),
+    ):
+        if key == "bjs_residual" and not bool(getattr(args, "interface_bjs_closure", False)):
+            continue
+        values = np.asarray([float(row.get(key, 0.0)) for row in rows], dtype=float)
+        if values.size == 0:
+            continue
+        pieces.append(values / float(scale))
+    if not pieces:
+        return np.zeros((0,), dtype=float)
+    return np.hstack(pieces)
+
+
+def _candidate_outer_omegas(
+    *,
+    omega_seed: float,
+    omega_min: float,
+    omega_max: float,
+) -> list[float]:
+    lo = float(max(1.0e-6, omega_min))
+    hi = float(np.clip(float(omega_max), lo, 1.0))
+    seed = float(np.clip(float(omega_seed), lo, hi))
+    candidates: list[float] = [hi, seed]
+    trial = seed
+    for _ in range(6):
+        trial *= 0.5
+        if trial < lo:
+            break
+        candidates.append(float(trial))
+    candidates.append(lo)
+    unique: list[float] = []
+    seen: set[int] = set()
+    for value in candidates:
+        clipped = float(np.clip(float(value), lo, hi))
+        key = int(round(clipped * 1.0e12))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(clipped)
+    return unique
+
+
+def _choose_outer_relaxation_by_physics(
+    *,
+    args: argparse.Namespace,
+    problem: dict[str, object],
+    current_functions,
+    sweep_snapshot: tuple[np.ndarray, ...],
+    raw_iterate_snapshot: tuple[np.ndarray, ...],
+    field_names: set[str] | list[str] | tuple[str, ...],
+    omega_seed: float,
+    eps_alpha: float,
+    interface_entry_delta: float,
+) -> tuple[float, float, dict[str, float]]:
+    best_omega = float(np.clip(float(omega_seed), 0.0, 1.0))
+    best_physics = float("inf")
+    best_metrics: dict[str, float] = {}
+    for omega in _candidate_outer_omegas(
+        omega_seed=float(omega_seed),
+        omega_min=float(getattr(args, "outer_relaxation_min", 1.0e-3)),
+        omega_max=float(getattr(args, "outer_relaxation_max", 1.0)),
+    ):
+        _restore_function_values(current_functions, raw_iterate_snapshot)
+        _blend_toward_snapshot(
+            current_functions,
+            sweep_snapshot,
+            omega=float(omega),
+            field_names=field_names,
+        )
+        physics_inf, physics_metrics = _outer_interface_physics(
+            args=args,
+            problem=problem,
+            eps_alpha=float(eps_alpha),
+            interface_entry_delta=float(interface_entry_delta),
+        )
+        if not np.isfinite(physics_inf):
+            continue
+        if physics_inf < best_physics:
+            best_omega = float(omega)
+            best_physics = float(physics_inf)
+            best_metrics = dict(physics_metrics)
+    _restore_function_values(current_functions, raw_iterate_snapshot)
+    return float(best_omega), float(best_physics), dict(best_metrics)
+
+
 def _stage_order(args: argparse.Namespace) -> tuple[str, str, str]:
-    raw = str(getattr(args, "stage_order", "solid,flow,transport") or "solid,flow,transport")
+    raw = str(getattr(args, "stage_order", "flow,solid,transport") or "flow,solid,transport")
     raw = raw.replace("->", ",")
     names = tuple(str(token).strip().lower() for token in raw.split(",") if str(token).strip())
     if len(names) != 3 or set(names) != {"flow", "solid", "transport"}:
@@ -286,6 +1121,54 @@ def _stage_order(args: argparse.Namespace) -> tuple[str, str, str]:
             f"(received {raw!r})."
         )
     return names
+
+
+def _parse_scale_schedule(raw: str | None, *, default: tuple[float, ...]) -> tuple[float, ...]:
+    text = str(raw or "").strip()
+    if not text:
+        return tuple(float(v) for v in tuple(default))
+    values: list[float] = []
+    for token in text.replace(";", ",").split(","):
+        piece = str(token).strip()
+        if not piece:
+            continue
+        value = float(piece)
+        if not np.isfinite(value) or value <= 0.0:
+            raise ValueError(f"Invalid continuation scale {piece!r}; expected a positive finite number.")
+        values.append(float(np.clip(value, 1.0e-8, 1.0)))
+    if not values:
+        return (1.0,)
+    ordered: list[float] = []
+    for value in values:
+        if ordered and abs(float(value) - float(ordered[-1])) <= 1.0e-12:
+            continue
+        ordered.append(float(value))
+    if ordered[-1] < 1.0 - 1.0e-14:
+        ordered.append(1.0)
+    return tuple(float(v) for v in ordered)
+
+
+def _startup_flow_scale_schedule(args: argparse.Namespace, *, step_no: int) -> tuple[float, ...]:
+    if int(step_no) != 0:
+        return (1.0,)
+    return _parse_scale_schedule(
+        getattr(args, "startup_flow_scales", None),
+        default=(0.025, 0.1, 0.25, 0.5, 1.0),
+    )
+
+
+def _scaled_bc_schedule(
+    bcs_now: list[BoundaryCondition],
+    *,
+    scales: tuple[float, ...],
+) -> tuple[tuple[float, list[BoundaryCondition]], ...]:
+    out: list[tuple[float, list[BoundaryCondition]]] = []
+    for scale in tuple(scales or (1.0,)):
+        if float(scale) < 1.0 - 1.0e-14:
+            out.append((float(scale), _scaled_dirichlet_bcs(bcs_now, scale=float(scale))))
+        else:
+            out.append((1.0, bcs_now))
+    return tuple(out)
 
 
 def _scaled_snapshot_delta(
@@ -321,6 +1204,66 @@ def _scaled_snapshot_delta(
     return max_scaled, max_abs, by_field
 
 
+def _functions_to_vector(
+    functions,
+    *,
+    field_names: set[str] | list[str] | tuple[str, ...] | None = None,
+) -> np.ndarray:
+    selected = None if field_names is None else {str(name) for name in set(field_names)}
+    parts: list[np.ndarray] = []
+    for func in list(functions or []):
+        func_name = str(getattr(func, "name", ""))
+        if selected is not None and func_name not in selected:
+            continue
+        parts.append(np.asarray(func.nodal_values, dtype=float).ravel())
+    if not parts:
+        return np.zeros((0,), dtype=float)
+    return np.hstack(parts)
+
+
+def _snapshot_to_vector(
+    functions,
+    snapshot: tuple[np.ndarray, ...],
+    *,
+    field_names: set[str] | list[str] | tuple[str, ...] | None = None,
+) -> np.ndarray:
+    selected = None if field_names is None else {str(name) for name in set(field_names)}
+    parts: list[np.ndarray] = []
+    for func, values in zip(list(functions or []), list(snapshot or [])):
+        func_name = str(getattr(func, "name", ""))
+        if selected is not None and func_name not in selected:
+            continue
+        parts.append(np.asarray(values, dtype=float).ravel())
+    if not parts:
+        return np.zeros((0,), dtype=float)
+    return np.hstack(parts)
+
+
+def _aitken_relaxation_factor(
+    *,
+    omega_prev: float,
+    residual_prev: np.ndarray | None,
+    residual_curr: np.ndarray,
+    omega_min: float,
+    omega_max: float,
+) -> float:
+    omega = float(np.clip(float(omega_prev), float(omega_min), float(omega_max)))
+    if residual_prev is None:
+        return omega
+    r_prev = np.asarray(residual_prev, dtype=float).ravel()
+    r_curr = np.asarray(residual_curr, dtype=float).ravel()
+    if r_prev.size != r_curr.size or r_curr.size == 0:
+        return omega
+    delta = r_curr - r_prev
+    denom = float(np.dot(delta, delta))
+    if denom <= 1.0e-30 or not np.isfinite(denom):
+        return omega
+    omega_new = -omega * float(np.dot(r_prev, delta)) / denom
+    if not np.isfinite(omega_new):
+        return omega
+    return float(np.clip(omega_new, float(omega_min), float(omega_max)))
+
+
 def _outer_coupling_function_names(problem: dict[str, object]) -> set[str]:
     names = {
         str(problem["vS_k"].name),
@@ -339,20 +1282,67 @@ def _outer_coupling_function_names(problem: dict[str, object]) -> set[str]:
     return names
 
 
-def _blend_toward_snapshot(functions, snapshot: tuple[np.ndarray, ...], *, omega: float) -> None:
+def _poro_solid_coupling_function_names(problem: dict[str, object]) -> set[str]:
+    names = {
+        str(problem["vS_k"].name),
+        str(problem["u_k"].name),
+    }
+    if problem.get("p_pore_k") is not None:
+        names.add(str(problem["p_pore_k"].name))
+    if problem.get("pi_s_k") is not None:
+        names.add(str(problem["pi_s_k"].name))
+    if problem.get("lambda_drag_k") is not None:
+        names.add(str(problem["lambda_drag_k"].name))
+    return names
+
+
+def _blend_toward_snapshot(
+    functions,
+    snapshot: tuple[np.ndarray, ...],
+    *,
+    omega: float,
+    field_names: set[str] | list[str] | tuple[str, ...] | None = None,
+) -> None:
     theta = min(max(float(omega), 0.0), 1.0)
     if theta >= 1.0 - 1.0e-14:
         return
+    selected = None if field_names is None else {str(name) for name in set(field_names)}
     for func, values in zip(list(functions or []), list(snapshot or [])):
+        func_name = str(getattr(func, "name", ""))
+        if selected is not None and func_name not in selected:
+            continue
         old = np.asarray(values, dtype=float).ravel()
         cur = np.asarray(func.nodal_values, dtype=float).ravel()
         func.nodal_values[:] = old + theta * (cur - old)
 
 
+def _relax_preload_toward_previous(
+    current_functions,
+    previous_functions,
+    *,
+    keep_fields: list[str] | tuple[str, ...],
+    blend: float,
+) -> bool:
+    theta = float(np.clip(float(blend), 0.0, 1.0))
+    if theta >= 1.0 - 1.0e-14:
+        return False
+    keep = {str(name) for name in list(keep_fields or [])}
+    changed = False
+    for cur, prev in zip(list(current_functions or []), list(previous_functions or [])):
+        field_name = str(getattr(cur, "field_name", "") or getattr(cur, "name", "") or "")
+        if field_name in keep:
+            continue
+        cur_vals = np.asarray(cur.nodal_values, dtype=float).ravel()
+        prev_vals = np.asarray(prev.nodal_values, dtype=float).ravel()
+        if cur_vals.size != prev_vals.size:
+            continue
+        changed = changed or bool(np.any(np.abs(cur_vals - prev_vals) > 1.0e-14))
+        cur.nodal_values[:] = prev_vals + theta * (cur_vals - prev_vals)
+    return bool(changed)
+
+
 def _flow_stage_fields(problem: dict[str, object]) -> list[str]:
     fields = ["v_x", "v_y", "p"]
-    if problem.get("p_pore_k") is not None:
-        fields.append("p_pore")
     if problem.get("p_mean_k") is not None:
         fields.append("p_mean")
     return fields
@@ -360,7 +1350,7 @@ def _flow_stage_fields(problem: dict[str, object]) -> list[str]:
 
 def _transport_stage_fields(problem: dict[str, object]) -> list[str]:
     fields = ["alpha", "mu_alpha"]
-    if problem.get("B_k") is not None:
+    if problem.get("B_k") is not None and not bool(problem.get("_freeze_B_total_mixture_continuity_diagnostic", False)):
         fields.append("B")
     if problem.get("alpha_mass_lm_k") is not None:
         fields.append("alpha_mass_lm")
@@ -373,6 +1363,8 @@ def _transport_stage_fields(problem: dict[str, object]) -> list[str]:
 
 def _solid_stage_fields(problem: dict[str, object]) -> list[str]:
     fields = ["vS_x", "vS_y", "u_x", "u_y"]
+    if problem.get("p_pore_k") is not None:
+        fields.append("p_pore")
     if problem.get("pi_s_k") is not None:
         fields.append("pi_s")
     if problem.get("lambda_drag_k") is not None:
@@ -392,21 +1384,36 @@ def _build_staggered_interface_forms(
     solid_model: str,
     skeleton_pressure_mode: str,
     alpha_biot: float | None,
-    interface_robin_l: float,
+    interface_entry_closure: bool,
+    interface_entry_closure_strength: float,
+    interface_entry_delta: float,
+    interface_velocity_continuity_closure: bool,
+    interface_traction_continuity_closure: bool,
+    interface_velocity_normal_strength: float,
+    interface_traction_normal_strength: float,
 ) -> None:
-    problem["_staggered_solid_robin_residual_form"] = None
-    problem["_staggered_solid_robin_jacobian_form"] = None
-    if problem.get("p_pore_n") is None:
+    problem["_staggered_flow_transfer_residual_form"] = None
+    problem["_staggered_flow_transfer_jacobian_form"] = None
+    problem["_staggered_solid_transfer_residual_form"] = None
+    problem["_staggered_solid_transfer_jacobian_form"] = None
+    problem["_staggered_state_use_porous_flux_n"] = bool(interface_velocity_continuity_closure)
+    # Outer relaxation acts only on porous-side data. The free-fluid traces are
+    # direct responses of the current flow solve and are committed
+    # Gauss-Seidel-style before the porous stage runs.
+    problem["_staggered_state_use_free_traction_n"] = False
+    problem["_staggered_state_use_free_flux_n"] = False
+    problem["_staggered_state_use_porous_traction_n"] = bool(interface_traction_continuity_closure)
+    if problem.get("p_pore_k") is None:
         return
-    if abs(float(interface_robin_l)) <= 0.0:
-        return
-    solid_model_key = mono._benchmark7_solid_model_key(solid_model)
+    if problem.get("q_flux_k") is None or problem.get("dq_flux") is None or problem.get("q_flux_test") is None:
+        raise ValueError("The staggered interface-transfer split requires the q-primary Darcy flux fields.")
+    geometry_indicator_beta = float(problem.get("geometry_indicator_beta", 0.0) or 0.0)
     interface_eta = max(1.0e-12, 1.0e-3 * float(eps_alpha))
     interface_weight_scale = 1.0 / max(float(eps_alpha), 1.0e-12)
-    alpha_if = problem["alpha_n"]
     interface_corner_taper = problem.get("interface_corner_taper")
     if interface_corner_taper is None:
         interface_corner_taper = Constant(1.0)
+    alpha_if = mono._geometry_indicator_expr(problem["alpha_k"], beta=geometry_indicator_beta)
     interface_weight = (
         mono._named_constant("b7_staggered_interface_weight_scale", interface_weight_scale)
         * interface_corner_taper
@@ -415,17 +1422,21 @@ def _build_staggered_interface_forms(
         * (Constant(1.0) - alpha_if)
     )
     n_if = mono._interface_unit_normal_2d(alpha_if, eta=interface_eta)
-    rel_n_test = mono._dot_basis_2d(problem["v_test"], n_if) - mono._dot_basis_2d(problem["vS_test"], n_if)
+    v_n_k = mono._dot_basis_2d(problem["v_k"], n_if)
+    dv_n = mono._dot_basis_2d(problem["dv"], n_if)
+    v_n_test = mono._dot_basis_2d(problem["v_test"], n_if)
+    vS_n_k = mono._dot_basis_2d(problem["vS_k"], n_if)
+    dvS_n = mono._dot_basis_2d(problem["dvS"], n_if)
+    q_n_k = mono._dot_basis_2d(problem["q_flux_k"], n_if)
+    d_q_n = mono._dot_basis_2d(problem["dq_flux"], n_if)
+    q_n_test = mono._dot_basis_2d(problem["q_flux_test"], n_if)
+    q_pore_test = problem.get("q_pore_test", q_n_test)
+    solid_n_test = mono._dot_basis_2d(problem["vS_test"], n_if)
     mu_f_c = mono._named_constant("b7_staggered_mu_f", float(mu_f))
+    visc_n_k = mono._normal_viscous_traction_scalar_2d(problem["v_k"], mu_f_c, n_if)
     mu_s_c = mono._named_constant("b7_staggered_mu_s", float(mu_s))
     lambda_s_c = mono._named_constant("b7_staggered_lambda_s", float(lambda_s))
-    robin_l_c = mono._named_constant("b7_staggered_interface_robin_l", float(interface_robin_l))
-    skel_press_key = str(skeleton_pressure_mode).strip().lower().replace("-", "_")
-    if skel_press_key == "whole_domain" and alpha_biot is None and problem.get("B_n") is not None:
-        pore_coeff_n = problem["B_n"]
-    else:
-        pore_coeff_n = Constant(float(1.0 if alpha_biot is None else alpha_biot)) * alpha_if
-    pore_interface_pressure_n = pore_coeff_n * problem["p_pore_n"]
+    solid_model_key = mono._benchmark7_solid_model_key(solid_model)
     if solid_model_key in {"linear", "small_strain", "linear_elastic"}:
         eps_u_k = Constant(0.5) * (mono.grad(problem["u_k"]) + mono.grad(problem["u_k"]).T)
         eps_du = Constant(0.5) * (mono.grad(problem["du"]) + mono.grad(problem["du"]).T)
@@ -446,48 +1457,194 @@ def _build_staggered_interface_forms(
     dsolid_visc_n = mono._normal_viscous_traction_scalar_2d(problem["dvS"], eta_s_c, n_if)
     solid_trac_n_k = mono._normal_tensor_traction_scalar_2d(solid_sig_k, n_if)
     dsolid_trac_n = mono._normal_tensor_traction_scalar_2d(dsolid_sig, n_if)
-    porous_trac_n_k = alpha_if * (solid_trac_n_k + solid_visc_n_k) - pore_interface_pressure_n
-    dporous_trac_n = alpha_if * (dsolid_trac_n + dsolid_visc_n)
-    free_visc_n_n = mono._normal_viscous_traction_scalar_2d(problem["v_n"], mu_f_c, n_if)
-    free_trac_n_n = -problem["p_n"] + free_visc_n_n
-    vS_n_k = mono._dot_basis_2d(problem["vS_k"], n_if)
-    vS_n_n = mono._dot_basis_2d(problem["vS_n"], n_if)
-    dvS_n = mono._dot_basis_2d(problem["dvS"], n_if)
-    robin_residual = porous_trac_n_k - free_trac_n_n + robin_l_c * (vS_n_k - vS_n_n)
-    drobin_residual = dporous_trac_n + robin_l_c * dvS_n
+    pore_interface_coeff_c = mono._named_constant(
+        "b7_staggered_pore_interface_coeff",
+        float(1.0 if alpha_biot is None else alpha_biot),
+    )
+    entry_delta_c = mono._named_constant("b7_staggered_interface_entry_delta", float(interface_entry_delta))
+    pore_interface_pressure_k = pore_interface_coeff_c * problem["p_pore_k"]
+    d_pore_interface_pressure = pore_interface_coeff_c * problem["dp_pore"]
+    pressure_q_drive_k = pore_interface_pressure_k + entry_delta_c * q_n_k
+    d_pressure_q_drive = d_pore_interface_pressure + entry_delta_c * d_q_n
+    entry_robin_drive_k = entry_delta_c * q_n_k
+    d_entry_robin_drive = entry_delta_c * d_q_n
+    porous_support_trac_n_current = solid_trac_n_k + solid_visc_n_k
+    free_trac_n_current = -problem["p_k"] + visc_n_k
+    dfree_trac_n_current = -problem["dp"] + mono._normal_viscous_traction_scalar_2d(problem["dv"], mu_f_c, n_if)
+    free_trac_n_transfer = (
+        problem["_staggered_if_free_traction_n"]
+        if problem.get("_staggered_if_free_traction_n") is not None
+        else free_trac_n_current
+    )
+    porous_support_trac_n_transfer = (
+        problem["_staggered_if_porous_traction_n"]
+        if problem.get("_staggered_if_porous_traction_n") is not None
+        else porous_support_trac_n_current
+    )
+
+    flow_residual = None
+    flow_jacobian = None
+    solid_residual = None
+    solid_jacobian = None
     dx_q = mono.dx(metadata={"q": int(qdeg)})
-    problem["_staggered_solid_robin_residual_form"] = interface_weight * robin_residual * rel_n_test * dx_q
-    problem["_staggered_solid_robin_jacobian_form"] = interface_weight * drobin_residual * rel_n_test * dx_q
+
+    if (
+        bool(interface_velocity_continuity_closure)
+        and problem.get("_staggered_if_porous_flux_n") is not None
+        and float(interface_velocity_normal_strength) != 0.0
+    ):
+        vel_n_strength_c = mono._named_constant(
+            "b7_staggered_interface_velocity_normal_strength_flow",
+            float(interface_velocity_normal_strength),
+        )
+        # Fluid stage: lagged Dirichlet-type transfer of the porous normal
+        # interface velocity (vS + q).
+        flow_vel_residual = (
+            vel_n_strength_c
+            * interface_weight
+            * (v_n_k - problem["_staggered_if_porous_flux_n"])
+            * v_n_test
+            * dx_q
+        )
+        flow_vel_jacobian = vel_n_strength_c * interface_weight * dv_n * v_n_test * dx_q
+        flow_residual = flow_vel_residual if flow_residual is None else flow_residual + flow_vel_residual
+        flow_jacobian = flow_vel_jacobian if flow_jacobian is None else flow_jacobian + flow_vel_jacobian
+
+    if bool(interface_velocity_continuity_closure) and problem.get("_staggered_if_free_flux_n") is not None:
+        vel_n_strength_c = mono._named_constant(
+            "b7_staggered_interface_velocity_normal_strength_solid",
+            float(interface_velocity_normal_strength),
+        )
+        solid_vel_residual = vel_n_strength_c * interface_weight * (
+            problem["_staggered_if_free_flux_n"] - vS_n_k - q_n_k
+        ) * q_pore_test * dx_q
+        solid_vel_jacobian = vel_n_strength_c * interface_weight * (-(dvS_n + d_q_n)) * q_pore_test * dx_q
+        solid_residual = solid_vel_residual if solid_residual is None else solid_residual + solid_vel_residual
+        solid_jacobian = solid_vel_jacobian if solid_jacobian is None else solid_jacobian + solid_vel_jacobian
+
+    if (
+        bool(interface_entry_closure)
+        and float(interface_entry_closure_strength) != 0.0
+    ):
+        entry_strength_c = mono._named_constant(
+            "b7_staggered_interface_entry_closure_strength_solid",
+            float(interface_entry_closure_strength),
+        )
+        # Keep the porous-side entry law only on the Darcy/flux row. In the
+        # staggered split the solid stage already carries:
+        #   1. Biot pore-pressure loading in the bulk skeleton operator, and
+        #   2. explicit free-fluid Neumann traction transfer below.
+        # Re-inserting -p_P * (vS_test.n) here double-counts the normal pore
+        # pressure on the porous momentum stage and was the main source of the
+        # outer-sweep solid blow-up.
+        if problem.get("_staggered_if_free_traction_n") is not None:
+            # On the staggered split the Darcy trace must carry the full scalar
+            # entry law against the lagged free-fluid traction:
+            #   t_F,n + p_P + delta q_n = 0.
+            # The free traction is explicit interface data, while p_P and q_n
+            # remain current porous unknowns, so only the porous part enters
+            # the stage Jacobian.
+            q_row_drive_k = free_trac_n_transfer + pressure_q_drive_k
+            d_q_row_drive = d_pressure_q_drive
+        else:
+            q_row_drive_k = pressure_q_drive_k
+            d_q_row_drive = d_pressure_q_drive
+        solid_entry_q_residual = entry_strength_c * interface_weight * q_row_drive_k * q_n_test * dx_q
+        solid_entry_q_jacobian = entry_strength_c * interface_weight * d_q_row_drive * q_n_test * dx_q
+        solid_residual = solid_entry_q_residual if solid_residual is None else solid_residual + solid_entry_q_residual
+        solid_jacobian = solid_entry_q_jacobian if solid_jacobian is None else solid_jacobian + solid_entry_q_jacobian
+
+    if (
+        bool(interface_traction_continuity_closure)
+        and float(interface_traction_normal_strength) != 0.0
+    ):
+        tr_n_strength_c = mono._named_constant(
+            "b7_staggered_interface_traction_normal_strength_flow",
+            float(interface_traction_normal_strength),
+        )
+        flow_trac_residual = (
+            tr_n_strength_c
+            * interface_weight
+            * (porous_support_trac_n_transfer - free_trac_n_current - pore_interface_pressure_k)
+            * v_n_test
+            * dx_q
+        )
+        flow_trac_jacobian = (
+            tr_n_strength_c
+            * interface_weight
+            * (-(dfree_trac_n_current + d_pore_interface_pressure))
+            * v_n_test
+            * dx_q
+        )
+        flow_residual = flow_trac_residual if flow_residual is None else flow_residual + flow_trac_residual
+        flow_jacobian = flow_trac_jacobian if flow_jacobian is None else flow_jacobian + flow_trac_jacobian
+
+    if (
+        float(interface_traction_normal_strength) != 0.0
+        and not bool(interface_traction_continuity_closure)
+    ):
+        tr_n_strength_c = mono._named_constant(
+            "b7_staggered_interface_neumann_normal_strength",
+            float(interface_traction_normal_strength),
+        )
+        # Match the monolithic traction-jump split: the fluid contribution to
+        # the solid test enters with the same sign as the free-traction part of
+        # (traction_porous - traction_free) * (v_test.n - vS_test.n).
+        solid_neumann_residual = (
+            tr_n_strength_c
+            * interface_weight
+            * free_trac_n_transfer
+            * solid_n_test
+            * dx_q
+        )
+        solid_residual = solid_neumann_residual if solid_residual is None else solid_residual + solid_neumann_residual
+
+    if (
+        bool(interface_traction_continuity_closure)
+        and float(interface_traction_normal_strength) != 0.0
+    ):
+        tr_n_strength_c = mono._named_constant(
+            "b7_staggered_interface_traction_normal_strength",
+            float(interface_traction_normal_strength),
+        )
+        solid_trac_residual = tr_n_strength_c * interface_weight * (
+            (free_trac_n_transfer + pore_interface_pressure_k - porous_support_trac_n_current) * solid_n_test
+        ) * dx_q
+        solid_trac_jacobian = tr_n_strength_c * interface_weight * (
+            (d_pore_interface_pressure - (dsolid_trac_n + dsolid_visc_n)) * solid_n_test
+        ) * dx_q
+        solid_residual = solid_trac_residual if solid_residual is None else solid_residual + solid_trac_residual
+        solid_jacobian = solid_trac_jacobian if solid_jacobian is None else solid_jacobian + solid_trac_jacobian
+
+    problem["_staggered_flow_transfer_residual_form"] = flow_residual
+    problem["_staggered_flow_transfer_jacobian_form"] = flow_jacobian
+    problem["_staggered_solid_transfer_residual_form"] = solid_residual
+    problem["_staggered_solid_transfer_jacobian_form"] = solid_jacobian
 
 
 def _build_stage_forms(problem: dict[str, object], forms) -> SimpleNamespace:
     flow_fields = _flow_stage_fields(problem)
     transport_fields = _transport_stage_fields(problem)
     solid_fields = _solid_stage_fields(problem)
+    freeze_B_total_mass = bool(problem.get("_freeze_B_total_mixture_continuity_diagnostic", False))
 
+    full_residual = forms.residual_form
+    full_jacobian = forms.jacobian_form
     flow_residual = _sum_forms(
         forms.r_momentum,
         forms.r_mass,
-        getattr(forms, "r_pore", None),
         problem.get("_pressure_mean_residual_form"),
-        problem.get("_p_pore_fluid_gauge_residual_form"),
-        problem.get("_entry_interface_residual_form"),
-        problem.get("_traction_interface_residual_form"),
-        problem.get("_bjs_interface_residual_form"),
+        problem.get("_staggered_flow_transfer_residual_form"),
     )
     flow_jacobian = _sum_forms(
         forms.a_momentum,
         forms.a_mass,
-        getattr(forms, "a_pore", None),
         problem.get("_pressure_mean_jacobian_form"),
-        problem.get("_p_pore_fluid_gauge_jacobian_form"),
-        problem.get("_entry_interface_jacobian_form"),
-        problem.get("_traction_interface_jacobian_form"),
-        problem.get("_bjs_interface_jacobian_form"),
+        problem.get("_staggered_flow_transfer_jacobian_form"),
     )
     transport_residual = _sum_forms(
         getattr(forms, "r_alpha", None),
-        getattr(forms, "r_B", None),
+        (None if freeze_B_total_mass else getattr(forms, "r_B", None)),
         getattr(forms, "r_mu_alpha", None),
         problem.get("_alpha_mass_constraint_residual_form"),
         getattr(forms, "r_phi", None),
@@ -495,23 +1652,27 @@ def _build_stage_forms(problem: dict[str, object], forms) -> SimpleNamespace:
     )
     transport_jacobian = _sum_forms(
         getattr(forms, "a_alpha", None),
-        getattr(forms, "a_B", None),
+        (None if freeze_B_total_mass else getattr(forms, "a_B", None)),
         getattr(forms, "a_mu_alpha", None),
         problem.get("_alpha_mass_constraint_jacobian_form"),
         getattr(forms, "a_phi", None),
         getattr(forms, "a_substrate", None),
     )
+    solid_mass_residual = getattr(forms, "r_total_mass", None) if freeze_B_total_mass else getattr(forms, "r_pore", None)
+    solid_mass_jacobian = getattr(forms, "a_total_mass", None) if freeze_B_total_mass else getattr(forms, "a_pore", None)
     solid_residual = _sum_forms(
         forms.r_skeleton,
         forms.r_kinematics,
-        problem.get("_staggered_solid_robin_residual_form"),
-        problem.get("_bjs_interface_residual_form"),
+        solid_mass_residual,
+        problem.get("_p_pore_fluid_gauge_residual_form"),
+        problem.get("_staggered_solid_transfer_residual_form"),
     )
     solid_jacobian = _sum_forms(
         forms.a_skeleton,
         forms.a_kinematics,
-        problem.get("_staggered_solid_robin_jacobian_form"),
-        problem.get("_bjs_interface_jacobian_form"),
+        solid_mass_jacobian,
+        problem.get("_p_pore_fluid_gauge_jacobian_form"),
+        problem.get("_staggered_solid_transfer_jacobian_form"),
     )
     return SimpleNamespace(
         flow=SimpleNamespace(
@@ -608,20 +1769,26 @@ def _make_stage_solver(
     max_it = getattr(args, f"{stage.name}_max_it")
     if max_it is None:
         max_it = int(args.max_it)
-    # The split stages do not need monolithic-grade nonlinear solves; use a
-    # looser floor so the outer Robin iteration, not direct-solve polishing,
-    # does the remaining work.
-    stage_newton_tol = max(float(getattr(args, "newton_tol", 1.0e-8) or 1.0e-8), 5.0e-5)
+    stage_newton_tol_raw = getattr(args, "stage_newton_tol", None)
+    if stage_newton_tol_raw is None:
+        stage_newton_tol = max(float(getattr(args, "newton_tol", 1.0e-8) or 1.0e-8), 1.0e-16)
+    else:
+        stage_newton_tol = max(float(stage_newton_tol_raw), 1.0e-16)
+    stage_newton_rtol = max(float(getattr(args, "stage_newton_rtol", 0.0) or 0.0), 0.0)
+    stage_accept_factor = max(
+        float(getattr(args, "stage_accept_nonconverged_atol_factor", 0.0) or 0.0),
+        0.0,
+    )
     relaxed_stage_ginf = max(1.0e3 * stage_newton_tol, 1.0e-6)
     if stage.name == "transport":
         relaxed_stage_ginf = max(relaxed_stage_ginf, 5.0e-2)
     newton_params = NewtonParameters(
         newton_tol=float(stage_newton_tol),
-        newton_rtol=float(args.newton_rtol),
+        newton_rtol=float(stage_newton_rtol),
         max_newton_iter=int(max_it),
         ls_mode=str(args.ls_mode),
         globalization=str(getattr(args, "newton_globalization", "line_search")),
-        accept_nonconverged_atol_factor=10.0,
+        accept_nonconverged_atol_factor=float(stage_accept_factor),
         tr_max_iter=int(getattr(args, "trust_max_it", 8)),
         tr_radius_init=float(getattr(args, "trust_radius_init", 1.0)),
         tr_radius_max=float(getattr(args, "trust_radius_max", 1.0e3)),
@@ -801,6 +1968,26 @@ def _stage_function_lists(problem: dict[str, object]) -> tuple[list[object], lis
         aux_functions["reg_weight"] = problem["reg_weight"]
     if problem.get("interface_corner_taper") is not None:
         aux_functions["interface_corner_taper"] = problem["interface_corner_taper"]
+    if problem.get("_staggered_flow_coupling_v") is not None:
+        aux_functions["v_flow_coupling"] = problem["_staggered_flow_coupling_v"]
+    if problem.get("_staggered_flow_coupling_p") is not None:
+        aux_functions["p_flow_coupling"] = problem["_staggered_flow_coupling_p"]
+    if problem.get("_staggered_flow_coupling_scale") is not None:
+        aux_functions["flow_coupling_scale"] = problem["_staggered_flow_coupling_scale"]
+    for key, aux_name in (
+        ("_staggered_if_entry_drive", "if_entry_drive"),
+        ("_staggered_if_entry_drive_candidate", "if_entry_drive_candidate"),
+        ("_staggered_if_porous_flux_n", "if_porous_flux_n"),
+        ("_staggered_if_porous_flux_n_candidate", "if_porous_flux_n_candidate"),
+        ("_staggered_if_porous_traction_n", "if_porous_traction_n"),
+        ("_staggered_if_porous_traction_n_candidate", "if_porous_traction_n_candidate"),
+        ("_staggered_if_free_traction_n", "if_free_traction_n"),
+        ("_staggered_if_free_traction_n_candidate", "if_free_traction_n_candidate"),
+        ("_staggered_if_free_flux_n", "if_free_flux_n"),
+        ("_staggered_if_free_flux_n_candidate", "if_free_flux_n_candidate"),
+    ):
+        if problem.get(key) is not None:
+            aux_functions[aux_name] = problem[key]
     return current_functions, previous_functions, aux_functions
 
 
@@ -849,6 +2036,8 @@ def _write_interface_diagnostics(outdir: Path, interface_diag: dict[str, object]
     suffix = "_latest" if latest else ""
     if interface_diag.get("band_rows"):
         mono._write_timeseries_csv(outdir / f"interface_band_diagnostics{suffix}.csv", interface_diag["band_rows"])
+    if interface_diag.get("interface_profile_rows"):
+        mono._write_timeseries_csv(outdir / f"interface_profile_diagnostics{suffix}.csv", interface_diag["interface_profile_rows"])
     if interface_diag.get("interface_line_rows"):
         mono._write_timeseries_csv(outdir / f"interface_line_diagnostics{suffix}.csv", interface_diag["interface_line_rows"])
     if interface_diag.get("centerline_rows"):
@@ -878,6 +2067,9 @@ def _record_step(
     step_no: int,
     outer_sweeps: int,
     outer_delta_inf: float,
+    outer_delta_abs_inf: float,
+    outer_converged: bool,
+    outer_last_omega: float,
     stage_iters: dict[str, int],
     interface_entry_delta: float,
 ) -> dict[str, object]:
@@ -898,6 +2090,7 @@ def _record_step(
         skeleton_pressure_mode=str(args.skeleton_pressure_mode),
         alpha_biot=(None if args.alpha_biot is None else float(args.alpha_biot)),
         interface_entry_delta=float(interface_entry_delta),
+        interface_bjs_gamma=float(getattr(args, "interface_bjs_gamma", 1.0e3)),
     )
     interface_summary = dict(interface_diag.get("summary", {}) or {})
     row = {
@@ -906,6 +2099,9 @@ def _record_step(
         "dt": float(dt_now),
         "outer_sweeps": float(outer_sweeps),
         "outer_delta_inf": float(outer_delta_inf),
+        "outer_delta_abs_inf": float(outer_delta_abs_inf),
+        "outer_converged": float(1.0 if bool(outer_converged) else 0.0),
+        "outer_last_omega": float(outer_last_omega),
         "solid_iters": float(stage_iters.get("solid", 0)),
         "transport_iters": float(stage_iters.get("transport", 0)),
         "flow_iters": float(stage_iters.get("flow", 0)),
@@ -1014,10 +2210,112 @@ def _record_step(
     return interface_diag
 
 
+def _temporarily_relax_stage_solvers(
+    stage_solvers: dict[str, object],
+    *,
+    accept_factor: float,
+) -> list[tuple[object, float, int, float, float, float, float]]:
+    saved: list[tuple[object, float, int, float, float, float, float]] = []
+    for solver in list(stage_solvers.values()):
+        np_params = getattr(solver, "np", None)
+        if np_params is None:
+            continue
+        saved.append(
+            (
+                solver,
+                float(getattr(np_params, "accept_nonconverged_atol_factor", 0.0) or 0.0),
+                int(getattr(np_params, "stall_window", 0) or 0),
+                float(getattr(np_params, "stall_min_abs_decrease_inf", 0.0) or 0.0),
+                float(getattr(np_params, "stall_min_rel_decrease_inf", 0.0) or 0.0),
+                float(getattr(np_params, "tr_min_abs_decrease_inf", 0.0) or 0.0),
+                float(getattr(np_params, "tr_min_rel_decrease_inf", 0.0) or 0.0),
+            )
+        )
+        np_params.accept_nonconverged_atol_factor = max(
+            float(getattr(np_params, "accept_nonconverged_atol_factor", 0.0) or 0.0),
+            float(accept_factor),
+        )
+        np_params.stall_window = 0
+        np_params.stall_min_abs_decrease_inf = 0.0
+        np_params.stall_min_rel_decrease_inf = 0.0
+        np_params.tr_min_abs_decrease_inf = 0.0
+        np_params.tr_min_rel_decrease_inf = 0.0
+    return saved
+
+
+def _restore_stage_solver_relaxation(saved: list[tuple[object, float, int, float, float, float, float]]) -> None:
+    for solver, accept_factor, stall_window, stall_abs, stall_rel, tr_abs, tr_rel in list(saved or []):
+        np_params = getattr(solver, "np", None)
+        if np_params is None:
+            continue
+        np_params.accept_nonconverged_atol_factor = float(accept_factor)
+        np_params.stall_window = int(stall_window)
+        np_params.stall_min_abs_decrease_inf = float(stall_abs)
+        np_params.stall_min_rel_decrease_inf = float(stall_rel)
+        np_params.tr_min_abs_decrease_inf = float(tr_abs)
+        np_params.tr_min_rel_decrease_inf = float(tr_rel)
+
+
+def _run_stage_with_bc_scales(
+    *,
+    args: argparse.Namespace,
+    problem: dict[str, object],
+    stage_name: str,
+    solver,
+    stage_bcs_base: list[BoundaryCondition],
+    current_functions,
+    previous_functions,
+    aux_functions: dict[str, object],
+    t_now: float,
+    dt_try: float,
+    step_no: int,
+    outer_it: int | None = None,
+    preload_it: int | None = None,
+    apply_startup_flow_scales: bool = True,
+) -> int:
+    bc_scales = (1.0,)
+    if bool(apply_startup_flow_scales) and str(stage_name) == "flow":
+        bc_scales = _startup_flow_scale_schedule(args, step_no=int(step_no))
+    stage_nit_total = 0
+    for bc_scale in tuple(bc_scales):
+        stage_bcs_now = (
+            _scaled_dirichlet_bcs(stage_bcs_base, scale=float(bc_scale))
+            if float(bc_scale) < 1.0 - 1.0e-14
+            else stage_bcs_base
+        )
+        problem["dh"].apply_bcs(stage_bcs_now, *current_functions)
+        solver._current_t = float(t_now)
+        solver._current_dt = float(dt_try)
+        solver._current_step_no = int(step_no + 1)
+        if str(stage_name) == "flow" and len(tuple(bc_scales)) > 1:
+            context_bits = [f"step={int(step_no) + 1}"]
+            if preload_it is not None:
+                context_bits.append(f"preload={int(preload_it)}")
+            if outer_it is not None:
+                context_bits.append(f"outer={int(outer_it)}")
+            context_bits.append(f"scale={float(bc_scale):.3f}")
+            print("    [flow-continuation] " + " ".join(context_bits), flush=True)
+        _, converged, nit = solver._newton_loop(
+            current_functions,
+            previous_functions,
+            aux_functions,
+            stage_bcs_now,
+        )
+        stage_nit_total += int(nit)
+        if not bool(converged):
+            where = f"outer sweep {int(outer_it)}" if outer_it is not None else f"preload sweep {int(preload_it)}"
+            raise RuntimeError(f"{stage_name} stage did not converge on {where}")
+        if str(stage_name) == "flow":
+            _commit_flow_coupling_from_current(problem)
+    return int(stage_nit_total)
+
+
 def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> mono.CaseResult:
     _validate_supported_configuration(args)
     io_root = mono._mpi_io_root()
     stage_order = _stage_order(args)
+    transport_post_accept = bool(getattr(args, "transport_post_accept", True))
+    coupling_stage_order = tuple(name for name in stage_order if str(name) != "transport")
     flow_solid_substeps = max(1, int(getattr(args, "flow_solid_substeps", 1)))
     use_flow_solid_inner = (
         len(stage_order) == 3
@@ -1073,9 +2371,19 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> mono.C
         drag_formulation=str(args.drag_formulation),
         full_ratio_free_state=bool(getattr(args, "full_ratio_free_state", False)),
     )
+    if problem.get("q_flux_k") is None and problem.get("lambda_drag_k") is not None:
+        problem["q_flux_k"] = problem.get("lambda_drag_k")
+        problem["q_flux_n"] = problem.get("lambda_drag_n")
+        problem["dq_flux"] = problem.get("dlambda_drag")
+        problem["q_flux_test"] = problem.get("lambda_drag_test")
     problem["_effective_gamma_div"] = float(effective_gamma_div)
+    problem["_interface_entry_delta"] = float(entry_delta_eff)
+    problem["_interface_bjs_gamma"] = float(getattr(args, "interface_bjs_gamma", 1.0e3))
+    problem["_interface_bjs_closure_enabled"] = bool(getattr(args, "interface_bjs_closure", False))
     dt_c = mono._named_constant("b7_dt", float(args.dt))
     problem["_dt_constant"] = dt_c
+    _build_flow_coupling_state(problem)
+    _build_interface_transfer_state(problem)
 
     reg_mask_meta = mono._configure_regularization_mask(
         problem=problem,
@@ -1122,6 +2430,9 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> mono.C
         B_init = (1.0 - float(args.phi_b)) * np.asarray(problem["alpha_n"].nodal_values, dtype=float)
         problem["B_n"].nodal_values[:] = B_init
         problem["B_k"].nodal_values[:] = B_init
+    problem["_freeze_B_total_mixture_continuity_diagnostic"] = bool(
+        getattr(args, "freeze_B_total_mixture_continuity_diagnostic", False)
+    )
     if problem.get("mu_n") is not None:
         problem["mu_n"].nodal_values[:] = 0.0
         problem["mu_k"].nodal_values[:] = 0.0
@@ -1228,7 +2539,13 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> mono.C
         solid_model=str(args.solid_model),
         skeleton_pressure_mode=str(args.skeleton_pressure_mode),
         alpha_biot=(None if args.alpha_biot is None else float(args.alpha_biot)),
-        interface_robin_l=float(interface_robin_l),
+        interface_entry_closure=bool(getattr(args, "interface_entry_closure", True)),
+        interface_entry_closure_strength=float(getattr(args, "interface_entry_closure_strength", 1.0)),
+        interface_entry_delta=float(entry_delta_eff),
+        interface_velocity_continuity_closure=bool(getattr(args, "interface_velocity_continuity_closure", True)),
+        interface_traction_continuity_closure=bool(getattr(args, "interface_traction_continuity_closure", False)),
+        interface_velocity_normal_strength=float(getattr(args, "interface_velocity_normal_strength", 1.0)),
+        interface_traction_normal_strength=float(getattr(args, "interface_traction_normal_strength", 1.0)),
     )
 
     bcs = mono._build_bcs(
@@ -1313,74 +2630,332 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> mono.C
             while True:
                 dt_c.value = float(dt_try)
                 _copy_previous_into_current(current_functions, previous_functions)
+                _reset_flow_coupling_from_previous(problem)
+                _set_flow_coupling_scale(problem, scale=1.0)
                 t_bc = float(t_now + dt_try)
                 bcs_now = NewtonSolver._freeze_bcs(bcs, t_bc)
                 problem["dh"].apply_bcs(bcs_now, *current_functions)
+                if int(step_no) == 0 and int(getattr(args, "startup_preload_sweeps", 0) or 0) > 0:
+                    preload_snapshot = _snapshot_function_values(current_functions)
+                    preload_saved = _temporarily_relax_stage_solvers(
+                        stage_solvers,
+                        accept_factor=float(getattr(args, "startup_preload_accept_factor", 5.0e3)),
+                    )
+                    preload_sweeps_done = 0
+                    preload_stage_sequence = [
+                        name
+                        for name in (
+                            coupling_stage_order
+                            if bool(transport_post_accept)
+                            else stage_order
+                        )
+                        if str(name) in stage_solvers
+                    ]
+                    preload_bc_schedule = _scaled_bc_schedule(
+                        bcs_now,
+                        scales=_startup_flow_scale_schedule(args, step_no=int(step_no)),
+                    )
+                    try:
+                        for preload_it in range(1, int(getattr(args, "startup_preload_sweeps", 0)) + 1):
+                            for startup_scale, preload_bcs_now in preload_bc_schedule:
+                                _set_flow_coupling_scale(problem, scale=float(startup_scale))
+                                if len(preload_bc_schedule) > 1:
+                                    print(
+                                        "    [startup-continuation] "
+                                        f"step=1 preload={int(preload_it)} scale={float(startup_scale):.3f}",
+                                        flush=True,
+                                    )
+                                for stage_name in preload_stage_sequence:
+                                    stage = getattr(stage_forms, stage_name)
+                                    solver = stage_solvers[stage_name]
+                                    stage_bcs_now = _filter_bcs_by_fields(preload_bcs_now, stage.active_fields)
+                                    try:
+                                        _run_stage_with_bc_scales(
+                                            args=args,
+                                            problem=problem,
+                                            stage_name=str(stage_name),
+                                            solver=solver,
+                                            stage_bcs_base=stage_bcs_now,
+                                            current_functions=current_functions,
+                                            previous_functions=previous_functions,
+                                            aux_functions=aux_functions,
+                                            t_now=float(t_now),
+                                            dt_try=float(dt_try),
+                                            step_no=int(step_no),
+                                            preload_it=int(preload_it),
+                                            apply_startup_flow_scales=False,
+                                        )
+                                    except Exception as preload_exc:
+                                        print(
+                                            "    [startup-preload] "
+                                            f"stage={stage_name} sweep={int(preload_it)} "
+                                            f"kept best available iterate after: {preload_exc}",
+                                            flush=True,
+                                        )
+                                        break
+                                    if str(stage_name) == "flow":
+                                        _refresh_flow_to_solid_transfer(
+                                            args=args,
+                                            problem=problem,
+                                            eps_alpha=float(eps_alpha_eff),
+                                            interface_entry_delta=float(entry_delta_eff),
+                                        )
+                                    problem["dh"].apply_bcs(preload_bcs_now, *current_functions)
+                            _commit_flow_coupling_from_current(problem)
+                            _set_flow_coupling_scale(problem, scale=1.0)
+                            preload_sweeps_done = int(preload_it)
+                    finally:
+                        _restore_stage_solver_relaxation(preload_saved)
+                    preload_relaxed = _relax_preload_toward_previous(
+                        current_functions,
+                        previous_functions,
+                        keep_fields=_transport_stage_fields(problem),
+                        blend=float(getattr(args, "startup_preload_prev_blend", 1.0)),
+                    )
+                    preload_delta_inf, preload_delta_abs_inf, _ = _scaled_snapshot_delta(
+                        current_functions,
+                        preload_snapshot,
+                        field_scales=problem.get("_condition_balanced_field_scales", {}),
+                        field_names=outer_coupling_fields,
+                    )
+                    if preload_sweeps_done > 0:
+                        print(
+                            "    [startup-preload] "
+                            f"sweeps={int(preload_sweeps_done)} "
+                            f"rel={float(preload_delta_inf):.3e} "
+                            f"abs={float(preload_delta_abs_inf):.3e}"
+                            + (
+                                f" blend_prev={float(getattr(args, 'startup_preload_prev_blend', 1.0)):.3f}"
+                                if bool(preload_relaxed)
+                                else ""
+                            ),
+                            flush=True,
+                        )
+                    problem["dh"].apply_bcs(bcs_now, *current_functions)
+                _refresh_flow_to_solid_transfer(
+                    args=args,
+                    problem=problem,
+                    eps_alpha=float(eps_alpha_eff),
+                    interface_entry_delta=float(entry_delta_eff),
+                )
+                _refresh_solid_interface_candidate(
+                    args=args,
+                    problem=problem,
+                    eps_alpha=float(eps_alpha_eff),
+                    interface_entry_delta=float(entry_delta_eff),
+                )
+                _commit_flow_interface_response(problem)
+                _copy_function_list_values(
+                    _interface_candidate_functions(problem),
+                    _interface_state_functions(problem),
+                )
                 stage_iters = {"solid": 0, "transport": 0, "flow": 0}
                 outer_delta_inf = float("inf")
                 outer_delta_abs_inf = float("inf")
                 outer_delta_by_field: dict[str, float] = {}
+                outer_physics_inf = float("inf")
+                outer_physics_by_field: dict[str, float] = {}
                 outer_sweeps = 0
+                outer_converged = False
+                base_outer_omega = float(
+                    np.clip(
+                        float(getattr(args, "outer_relaxation", 1.0)),
+                        float(getattr(args, "outer_relaxation_min", 1.0e-3)),
+                        float(getattr(args, "outer_relaxation_max", 1.0)),
+                    )
+                )
+                outer_last_omega = float(base_outer_omega)
+                prev_outer_residual_vec: np.ndarray | None = None
+                outer_x_history: list[np.ndarray] = []
+                outer_residual_history: list[np.ndarray] = []
+                outer_saved = []
                 try:
-                    for outer_it in range(1, int(args.outer_it) + 1):
-                        sweep_snapshot = _snapshot_function_values(current_functions)
-                        stage_sequence: list[str] = []
-                        if use_flow_solid_inner:
-                            for _ in range(flow_solid_substeps):
-                                stage_sequence.extend(stage_order[:2])
-                            stage_sequence.append("transport")
-                        else:
-                            stage_sequence.extend(stage_order)
-                        for stage_name in stage_sequence:
-                            stage = getattr(stage_forms, stage_name)
-                            solver = stage_solvers[stage_name]
-                            stage_bcs_now = _filter_bcs_by_fields(bcs_now, stage.active_fields)
-                            problem["dh"].apply_bcs(stage_bcs_now, *current_functions)
-                            solver._current_t = float(t_now)
-                            solver._current_dt = float(dt_try)
-                            solver._current_step_no = int(step_no + 1)
-                            _, converged, nit = solver._newton_loop(
-                                current_functions,
-                                previous_functions,
-                                aux_functions,
-                                stage_bcs_now,
-                            )
-                            stage_iters[stage_name] += int(nit)
-                            if not bool(converged):
-                                raise RuntimeError(
-                                    f"{stage_name} stage did not converge on outer sweep {outer_it}"
-                                )
+                    try:
+                        for outer_it in range(1, int(args.outer_it) + 1):
+                            sweep_snapshot = _snapshot_function_values(_interface_state_functions(problem))
+                            stage_sequence: list[str] = []
+                            outer_bc_schedule = ((1.0, bcs_now),)
+                            if int(step_no) == 0:
+                                if int(outer_it) == 1:
+                                    print(
+                                        "    [startup-order] "
+                                        f"step=1 using {' -> '.join(coupling_stage_order)}"
+                                        + (" with post-accept transport." if bool(transport_post_accept) else "."),
+                                        flush=True,
+                                    )
+                                    outer_bc_schedule = _scaled_bc_schedule(
+                                        bcs_now,
+                                        scales=_startup_flow_scale_schedule(args, step_no=int(step_no)),
+                                    )
+                            if bool(transport_post_accept):
+                                if use_flow_solid_inner:
+                                    for _ in range(flow_solid_substeps):
+                                        stage_sequence.extend(coupling_stage_order)
+                                else:
+                                    stage_sequence.extend(coupling_stage_order)
+                            elif use_flow_solid_inner:
+                                for _ in range(flow_solid_substeps):
+                                    stage_sequence.extend(stage_order[:2])
+                                stage_sequence.append("transport")
+                            else:
+                                stage_sequence.extend(stage_order)
+                            for startup_scale, scaled_bcs_now in outer_bc_schedule:
+                                _set_flow_coupling_scale(problem, scale=float(startup_scale))
+                                if int(step_no) == 0 and len(tuple(outer_bc_schedule)) > 1:
+                                    print(
+                                        "    [startup-continuation] "
+                                        f"step=1 outer={int(outer_it)} scale={float(startup_scale):.3f}",
+                                        flush=True,
+                                    )
+                                for stage_name in stage_sequence:
+                                    stage = getattr(stage_forms, stage_name)
+                                    solver = stage_solvers[stage_name]
+                                    stage_bcs_base = _filter_bcs_by_fields(scaled_bcs_now, stage.active_fields)
+                                    stage_nit_total = _run_stage_with_bc_scales(
+                                        args=args,
+                                        problem=problem,
+                                        stage_name=str(stage_name),
+                                        solver=solver,
+                                        stage_bcs_base=stage_bcs_base,
+                                        current_functions=current_functions,
+                                        previous_functions=previous_functions,
+                                        aux_functions=aux_functions,
+                                        t_now=float(t_now),
+                                        dt_try=float(dt_try),
+                                        step_no=int(step_no),
+                                        outer_it=int(outer_it),
+                                        apply_startup_flow_scales=False,
+                                    )
+                                    stage_iters[stage_name] += int(stage_nit_total)
+                                    if str(stage_name) == "flow":
+                                        _refresh_flow_to_solid_transfer(
+                                            args=args,
+                                            problem=problem,
+                                            eps_alpha=float(eps_alpha_eff),
+                                            interface_entry_delta=float(entry_delta_eff),
+                                        )
+                                        _commit_flow_interface_response(problem)
+                                    problem["dh"].apply_bcs(scaled_bcs_now, *current_functions)
+                            _set_flow_coupling_scale(problem, scale=1.0)
                             problem["dh"].apply_bcs(bcs_now, *current_functions)
-                        _blend_toward_snapshot(
-                            current_functions,
-                            sweep_snapshot,
-                            omega=float(args.outer_relaxation),
-                        )
-                        problem["dh"].apply_bcs(bcs_now, *current_functions)
-                        outer_delta_inf, outer_delta_abs_inf, outer_delta_by_field = _scaled_snapshot_delta(
-                            current_functions,
-                            sweep_snapshot,
-                            field_scales=problem.get("_condition_balanced_field_scales", {}),
-                            field_names=outer_coupling_fields,
-                        )
-                        outer_sweeps = int(outer_it)
-                        if outer_delta_inf <= float(args.outer_tol):
-                            break
-                    if int(args.outer_it) > 1 and outer_delta_inf > float(args.outer_tol):
-                        top_fields = ", ".join(
-                            f"{name}={value:.3e}"
-                            for name, value in sorted(
-                                outer_delta_by_field.items(),
-                                key=lambda item: float(item[1]),
-                                reverse=True,
-                            )[:5]
-                        )
-                        raise RuntimeError(
-                            f"staggered outer loop stalled at |delta|_inf={outer_delta_inf:.3e} "
-                            f"(abs={outer_delta_abs_inf:.3e}) "
-                            f"[top: {top_fields}] "
-                            f"after {int(args.outer_it)} sweeps"
-                        )
+                            interface_diag_current = _refresh_solid_interface_candidate(
+                                args=args,
+                                problem=problem,
+                                eps_alpha=float(eps_alpha_eff),
+                                interface_entry_delta=float(entry_delta_eff),
+                            )
+                            (
+                                outer_delta_inf,
+                                outer_delta_abs_inf,
+                                outer_delta_by_field,
+                                outer_residual_vec,
+                                x_input,
+                            ) = _interface_state_delta(
+                                problem,
+                                interface_diag=interface_diag_current,
+                            )
+                            outer_physics_inf, outer_physics_by_field = _outer_interface_physics(
+                                args=args,
+                                problem=problem,
+                                eps_alpha=float(eps_alpha_eff),
+                                interface_entry_delta=float(entry_delta_eff),
+                            )
+                            outer_sweeps = int(outer_it)
+                            update_key = str(getattr(args, "outer_update", "constant")).strip().lower()
+                            omega_outer = float(base_outer_omega)
+                            if update_key == "aitken":
+                                omega_outer = _aitken_relaxation_factor(
+                                    omega_prev=float(outer_last_omega),
+                                    residual_prev=prev_outer_residual_vec,
+                                    residual_curr=outer_residual_vec,
+                                    omega_min=float(getattr(args, "outer_relaxation_min", 1.0e-3)),
+                                    omega_max=float(getattr(args, "outer_relaxation_max", 1.0)),
+                                )
+                            outer_last_omega = float(omega_outer)
+                            rel_ok = bool(np.isfinite(outer_delta_inf) and outer_delta_inf <= float(args.outer_tol))
+                            abs_tol = float(getattr(args, "outer_abs_tol", 0.0) or 0.0)
+                            abs_ok = bool(abs_tol > 0.0 and np.isfinite(outer_delta_abs_inf) and outer_delta_abs_inf <= abs_tol)
+                            physics_ok = bool(np.isfinite(outer_physics_inf) and outer_physics_inf <= float(args.outer_tol))
+                            outer_converged = bool((rel_ok or abs_ok) and physics_ok)
+                            ranked_fields = dict(outer_delta_by_field)
+                            ranked_fields.update(outer_physics_by_field)
+                            top_fields = ", ".join(
+                                f"{name}={value:.3e}"
+                                for name, value in sorted(ranked_fields.items(), key=lambda item: float(item[1]), reverse=True)[:6]
+                            )
+                            print(
+                                "    [fixed-point] "
+                                f"step={int(step_no) + 1} iter={int(outer_it)}/{int(args.outer_it)} "
+                                f"rel={outer_delta_inf:.3e} abs={outer_delta_abs_inf:.3e} "
+                                f"physics={outer_physics_inf:.3e} "
+                                f"omega={float(outer_last_omega):.3e} "
+                                f"converged={int(bool(outer_converged))}"
+                                + (f" [top: {top_fields}]" if top_fields else ""),
+                                flush=True,
+                            )
+                            if outer_converged:
+                                break
+                            x_next: np.ndarray | None = None
+                            if update_key in {"iqn_ils", "iqln"}:
+                                outer_x_history.append(np.asarray(x_input, dtype=float).copy())
+                                outer_residual_history.append(np.asarray(outer_residual_vec, dtype=float).copy())
+                                max_keep = max(2, int(getattr(args, "outer_history", 6) or 6) + 1)
+                                if len(outer_x_history) > max_keep:
+                                    outer_x_history = outer_x_history[-max_keep:]
+                                    outer_residual_history = outer_residual_history[-max_keep:]
+                                candidate = _iqn_ils_candidate(
+                                    x_curr=np.asarray(x_input, dtype=float),
+                                    residual_curr=np.asarray(outer_residual_vec, dtype=float),
+                                    x_history=outer_x_history,
+                                    residual_history=outer_residual_history,
+                                    omega=(float(base_outer_omega) if update_key == "iqn_ils" else 0.0),
+                                    regularization=float(getattr(args, "outer_regularization", 1.0e-10)),
+                                    max_history=int(getattr(args, "outer_history", 6)),
+                                )
+                                if candidate is not None:
+                                    x_next = candidate
+                                    outer_last_omega = float(base_outer_omega if update_key == "iqn_ils" else 0.0)
+                            if x_next is None:
+                                _set_function_vector(
+                                    _interface_state_functions(problem),
+                                    np.asarray(x_input, dtype=float) + float(outer_last_omega) * np.asarray(outer_residual_vec, dtype=float),
+                                )
+                            else:
+                                _set_function_vector(_interface_state_functions(problem), x_next)
+                            prev_outer_residual_vec = np.asarray(outer_residual_vec, dtype=float).copy()
+                        if bool(transport_post_accept) and bool(outer_converged) and "transport" in stage_solvers:
+                            stage = getattr(stage_forms, "transport")
+                            solver = stage_solvers["transport"]
+                            stage_bcs_base = _filter_bcs_by_fields(bcs_now, stage.active_fields)
+                            stage_nit_total = _run_stage_with_bc_scales(
+                                args=args,
+                                problem=problem,
+                                stage_name="transport",
+                                solver=solver,
+                                stage_bcs_base=stage_bcs_base,
+                                current_functions=current_functions,
+                                previous_functions=previous_functions,
+                                aux_functions=aux_functions,
+                                t_now=float(t_now),
+                                dt_try=float(dt_try),
+                                step_no=int(step_no),
+                                apply_startup_flow_scales=False,
+                            )
+                            stage_iters["transport"] += int(stage_nit_total)
+                            problem["dh"].apply_bcs(bcs_now, *current_functions)
+                        if int(args.outer_it) > 1 and not bool(outer_converged):
+                            top_fields = ", ".join(
+                                f"{name}={value:.3e}"
+                                for name, value in sorted({**outer_delta_by_field, **outer_physics_by_field}.items(), key=lambda item: float(item[1]), reverse=True)[:6]
+                            )
+                            raise RuntimeError(
+                                f"staggered outer loop stalled at |delta|_inf={outer_delta_inf:.3e} "
+                                f"(abs={outer_delta_abs_inf:.3e}, physics={outer_physics_inf:.3e}) "
+                                f"[top: {top_fields}] "
+                                f"after {int(args.outer_it)} sweeps"
+                            )
+                    finally:
+                        _restore_stage_solver_relaxation(outer_saved)
                 except Exception as exc:
                     if bool(getattr(args, "no_dt_reduction", False)):
                         raise RuntimeError(str(exc)) from exc
@@ -1398,6 +2973,7 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> mono.C
                 t_now = float(t_now + dt_try)
                 dt_step = float(dt_try)
                 _copy_current_into_previous(current_functions, previous_functions)
+                _commit_flow_coupling_from_current(problem)
                 last_interface_diag = _record_step(
                     args=args,
                     problem=problem,
@@ -1416,6 +2992,9 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> mono.C
                     step_no=int(step_no),
                     outer_sweeps=int(outer_sweeps),
                     outer_delta_inf=float(outer_delta_inf),
+                    outer_delta_abs_inf=float(outer_delta_abs_inf),
+                    outer_converged=bool(outer_converged),
+                    outer_last_omega=float(outer_last_omega),
                     stage_iters=stage_iters,
                     interface_entry_delta=float(entry_delta_eff),
                 )
@@ -1424,6 +3003,7 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> mono.C
         solve_error = str(exc)
         print(f"[warn] staggered solve terminated early: {solve_error}", flush=True)
         _copy_previous_into_current(current_functions, previous_functions)
+        _reset_flow_coupling_from_previous(problem)
     solve_seconds = time.perf_counter() - t_start
 
     alpha_diag_final = alpha_diagnostics.evaluate({problem["alpha_k"].name: problem["alpha_k"]})
@@ -1446,6 +3026,7 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> mono.C
             skeleton_pressure_mode=str(args.skeleton_pressure_mode),
             alpha_biot=(None if args.alpha_biot is None else float(args.alpha_biot)),
             interface_entry_delta=float(entry_delta_eff),
+            interface_bjs_gamma=float(getattr(args, "interface_bjs_gamma", 1.0e3)),
         )
     )
     interface_summary_final = dict(interface_diag_final.get("summary", {}) or {})
@@ -1505,7 +3086,12 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> mono.C
         "split_scheme": "_".join(stage_order),
         "outer_it": float(args.outer_it),
         "outer_tol": float(args.outer_tol),
+        "outer_abs_tol": float(getattr(args, "outer_abs_tol", 0.0)),
+        "outer_update": str(getattr(args, "outer_update", "constant")),
         "outer_relaxation": float(args.outer_relaxation),
+        "outer_relaxation_min": float(getattr(args, "outer_relaxation_min", 1.0e-3)),
+        "outer_relaxation_max": float(getattr(args, "outer_relaxation_max", 1.0)),
+        "transport_post_accept": float(1.0 if bool(getattr(args, "transport_post_accept", True)) else 0.0),
         "flow_solid_substeps": float(flow_solid_substeps),
         "solid_solver": str(args.solid_solver),
         "transport_solver": str(args.transport_solver),
@@ -1645,9 +3231,13 @@ def _print_run_settings(args: argparse.Namespace, *, kappa: float, case_outdir: 
         f"alpha_equation={mono._benchmark7_alpha_equation_label(args)}; "
         f"scheme={stage_order}; "
         f"stage_solvers=(solid={args.solid_solver}, transport={args.transport_solver}, flow={args.flow_solver}); "
+        f"transport_post_accept={int(bool(getattr(args, 'transport_post_accept', True)))}; "
         f"flow_solid_substeps={max(1, int(getattr(args, 'flow_solid_substeps', 1)))}; "
         f"outer_it={int(args.outer_it)}; "
         f"outer_tol={float(args.outer_tol):.1e}; "
+        f"outer_abs_tol={float(getattr(args, 'outer_abs_tol', 0.0)):.1e}; "
+        f"outer_update={str(getattr(args, 'outer_update', 'constant'))}; "
+        f"outer_relaxation={float(getattr(args, 'outer_relaxation', 1.0)):.3e}; "
         f"storativity_c0={float(args.storativity_c0):.3e}; "
         f"entry_closure={int(bool(args.interface_entry_closure))}; "
         f"bjs_closure={int(bool(args.interface_bjs_closure))}.",

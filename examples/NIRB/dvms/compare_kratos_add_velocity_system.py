@@ -43,7 +43,7 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path("examples/NIRB/artifacts/compare_kratos_add_velocity_system.json"),
     )
-    parser.add_argument("--quadrature-order", type=int, default=6)
+    parser.add_argument("--quadrature-order", type=int, default=1)
     parser.add_argument("--dt", type=float, default=0.008)
     parser.add_argument("--bossak-alpha", type=float, default=-0.3)
     parser.add_argument("--rho", type=float, default=1000.0)

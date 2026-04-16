@@ -22,6 +22,7 @@ import json
 import math
 import os
 import time
+import traceback
 from dataclasses import dataclass, replace
 from pathlib import Path
 import sys
@@ -53,6 +54,7 @@ for _k in (
 ):
     os.environ[_k] = "0"
 
+from pycutfem.linalg import SparseSubsolverSpec, lumped_schur_complement
 from pycutfem.core.dofhandler import DofHandler
 from pycutfem.core.mesh import Mesh
 from pycutfem.fem.mixedelement import MixedElement
@@ -91,11 +93,16 @@ from pycutfem.ufl.forms import BoundaryCondition, Equation, assemble_form
 from pycutfem.ufl.helpers import analyze_active_dofs
 from pycutfem.ufl.measures import dS, ds, dx
 from pycutfem.ufl.spaces import FunctionSpace
+from pycutfem.utils.adaptive_mesh_ls_numba import structured_quad_levelset_adaptive
 from pycutfem.utils.meshgen import structured_quad
 from pycutfem.utils.functionals import NamedFunctionalEvaluator
 from pycutfem.utils.mpi import barrier, get_mpi_context
 
 from examples.utils.biofilm.deformation_only import build_deformation_only_forms
+from examples.utils.biofilm.final_form_tensor import build_biofilm_one_domain_final_form
+from examples.utils.biofilm.final_form_decomposed import (
+    build_biofilm_one_domain_final_form as build_biofilm_one_domain_final_form_decomposed,
+)
 from examples.utils.biofilm.one_domain import build_biofilm_one_domain_forms
 from examples.utils.shared.nonlinear_solid_refmap import (
     dsigma_neo_hookean_seboldt,
@@ -138,21 +145,61 @@ class CaseResult:
     fixed_metrics: ProfileMetrics | None
 
 
+_B7_NAMED_CONSTANT_CACHE: dict[tuple[str, int, tuple[int, ...], tuple[float, ...]], Constant] = {}
+
+
 def _named_constant(name: str, value, *, dim: int | None = None) -> Constant:
-    const = value if isinstance(value, Constant) else Constant(value, dim=dim)
+    if isinstance(value, Constant):
+        raw_value = value.value
+        source_dim = int(getattr(value, "dim", np.asarray(raw_value).ndim))
+        target_dim = source_dim if dim is None else int(dim)
+    else:
+        raw_value = value
+        target_dim = int(np.asarray(raw_value).ndim) if dim is None else int(dim)
+    raw_array = np.asarray(raw_value, dtype=float)
+    flat_key = (float(raw_array),) if raw_array.ndim == 0 else tuple(float(v) for v in raw_array.ravel())
+    shape_key = tuple(int(v) for v in raw_array.shape)
+    cache_key = (str(name), int(target_dim), shape_key, flat_key)
+    const = _B7_NAMED_CONSTANT_CACHE.get(cache_key)
+    if const is None:
+        if isinstance(value, Constant) and source_dim == target_dim:
+            const = value
+        else:
+            const = Constant(raw_value, dim=target_dim)
+        _B7_NAMED_CONSTANT_CACHE[cache_key] = const
     setattr(const, "_jit_name", str(name))
+    setattr(const, "_name", str(name))
     return const
 
 
+def _constant_scalar_value(value) -> float:
+    raw_value = value.value if isinstance(value, Constant) else value
+    raw_array = np.asarray(raw_value, dtype=float).ravel()
+    if raw_array.size != 1:
+        raise ValueError("Expected a scalar constant value.")
+    return float(raw_array[0])
+
+
+_B7_ZERO = _named_constant("b7_zero", 0.0)
+_B7_HALF = _named_constant("b7_half", 0.5)
+_B7_ONE = _named_constant("b7_one", 1.0)
+_B7_TWO = _named_constant("b7_two", 2.0)
+_B7_FOUR = _named_constant("b7_four", 4.0)
+_B7_SIXTEEN = _named_constant("b7_sixteen", 16.0)
+_B7_NEG_HALF = _named_constant("b7_neg_half", -0.5)
+_B7_BASIS_X = _named_constant("b7_basis_x", [1.0, 0.0], dim=1)
+_B7_BASIS_Y = _named_constant("b7_basis_y", [0.0, 1.0], dim=1)
+
+
 def _sqrt_expr(expr):
-    return expr ** Constant(0.5)
+    return expr ** _B7_HALF
 
 
 def _vector_component_expr(vec_expr, idx: int):
     try:
         return vec_expr[idx]
     except Exception:
-        basis = Constant([1.0, 0.0] if int(idx) == 0 else [0.0, 1.0], dim=1)
+        basis = _B7_BASIS_X if int(idx) == 0 else _B7_BASIS_Y
         return dot(vec_expr, basis)
 
 
@@ -168,13 +215,17 @@ def _epsilon_component_expr(v_expr, i: int, j: int):
     vj = _vector_component_expr(v_expr, int(j))
     if int(i) == int(j):
         return grad(vi)[int(j)]
-    return Constant(0.5) * (grad(vi)[int(j)] + grad(vj)[int(i)])
+    return _B7_HALF * (grad(vi)[int(j)] + grad(vj)[int(i)])
 
 
 def _interface_unit_normal_2d(alpha_expr, *, eta: float = 1.0e-12):
     g0 = grad(alpha_expr)[0]
     g1 = grad(alpha_expr)[1]
-    denom_inv = (g0 * g0 + g1 * g1 + Constant(float(eta * eta))) ** Constant(-0.5)
+    denom_inv = (
+        g0 * g0
+        + g1 * g1
+        + _named_constant("b7_interface_unit_normal_eta_sq", float(eta * eta))
+    ) ** _B7_NEG_HALF
     return (
         g0 * denom_inv,
         g1 * denom_inv,
@@ -186,11 +237,11 @@ def _interface_tangent_from_normal_2d(n_if):
 
 
 def _normal_viscous_traction_scalar_2d(v_expr, mu_expr, n_if):
-    acc = Constant(0.0)
+    acc = _B7_ZERO
     for i in range(2):
         for j in range(2):
             acc += (
-                Constant(2.0)
+                _B7_TWO
                 * mu_expr
                 * _epsilon_component_expr(v_expr, i, j)
                 * n_if[i]
@@ -200,7 +251,7 @@ def _normal_viscous_traction_scalar_2d(v_expr, mu_expr, n_if):
 
 
 def _normal_tensor_traction_scalar_2d(sig_expr, n_if):
-    acc = Constant(0.0)
+    acc = _B7_ZERO
     for i in range(2):
         for j in range(2):
             acc += sig_expr[i, j] * n_if[i] * n_if[j]
@@ -209,7 +260,7 @@ def _normal_tensor_traction_scalar_2d(sig_expr, n_if):
 
 def _tangential_tensor_traction_scalar_2d(sig_expr, n_if):
     t_if = _interface_tangent_from_normal_2d(n_if)
-    acc = Constant(0.0)
+    acc = _B7_ZERO
     for i in range(2):
         for j in range(2):
             acc += sig_expr[i, j] * t_if[i] * n_if[j]
@@ -218,11 +269,11 @@ def _tangential_tensor_traction_scalar_2d(sig_expr, n_if):
 
 def _tangential_viscous_traction_scalar_2d(v_expr, mu_expr, n_if):
     t_if = _interface_tangent_from_normal_2d(n_if)
-    acc = Constant(0.0)
+    acc = _B7_ZERO
     for i in range(2):
         for j in range(2):
             acc += (
-                Constant(2.0)
+                _B7_TWO
                 * mu_expr
                 * _epsilon_component_expr(v_expr, i, j)
                 * t_if[i]
@@ -323,11 +374,37 @@ def _full_ratio_free_state_enabled(args: argparse.Namespace) -> bool:
     return bool(getattr(args, "enable_phi_evolution", False)) and bool(getattr(args, "full_ratio_free_state", False))
 
 
+def _final_form_enabled(args: argparse.Namespace) -> bool:
+    return str(getattr(args, "one_domain_formulation", "legacy")).strip().lower().replace("-", "_") == "final_form"
+
+
+def _final_form_phi_mode_key(raw) -> str:
+    key = str(raw or "auto").strip().lower().replace("-", "_")
+    if key not in {"auto", "transport", "alpha_closure"}:
+        raise ValueError(
+            f"Unsupported final_form_phi_mode={raw!r}. Use 'auto', 'transport', or 'alpha_closure'."
+        )
+    return key
+
+
+def _final_form_implementation_key(raw) -> str:
+    key = str(raw or "tensor").strip().lower().replace("-", "_")
+    if key not in {"tensor", "decomposed"}:
+        raise ValueError(
+            f"Unsupported final_form_implementation={raw!r}. Use 'tensor' or 'decomposed'."
+        )
+    return key
+
+
 def _split_primary_darcy_flux_enabled(args: argparse.Namespace) -> bool:
+    if _final_form_enabled(args):
+        return False
     return bool(_full_ratio_free_state_enabled(args)) and bool(getattr(args, "split_primary_darcy_flux", False))
 
 
 def _one_pressure_primary_darcy_flux_enabled(args: argparse.Namespace) -> bool:
+    if _final_form_enabled(args):
+        return False
     return (
         bool(getattr(args, "enable_phi_evolution", False))
         and not bool(getattr(args, "full_ratio_free_state", False))
@@ -554,6 +631,118 @@ def _parse_args() -> argparse.Namespace:
         help="Linear algebra backend used inside the Newton/PDAS solve.",
     )
     ap.add_argument(
+        "--newton-block-schur-solve",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Use the pycutfem.linalg 2-block primal/multiplier Schur solve on the active reduced system. "
+            "All active multiplier fields are grouped into one block and preconditioned with a lumped Schur approximation."
+        ),
+    )
+    ap.add_argument(
+        "--newton-block-schur-method",
+        type=str,
+        default="gmres",
+        choices=("gmres", "lgmres", "bicgstab", "minres", "uzawa"),
+        help="Outer pycutfem.linalg method used by the block-Schur solve.",
+    )
+    ap.add_argument(
+        "--newton-block-schur-preconditioner",
+        type=str,
+        default="lower_triangular",
+        choices=("lower_triangular", "upper_triangular", "diagonal", "uzawa", "none"),
+        help="Block preconditioner used by the pycutfem.linalg Schur solve.",
+    )
+    ap.add_argument(
+        "--newton-block-schur-multiplier-fields",
+        type=str,
+        default="",
+        help=(
+            "Optional comma-separated multiplier fields used for the pycutfem.linalg multiplier block. "
+            "Defaults to the active constraint and Lagrange-multiplier fields on this branch."
+        ),
+    )
+    ap.add_argument(
+        "--newton-block-schur-primal-subsolver",
+        type=str,
+        default="direct",
+        choices=("direct", "ilu", "diag"),
+        help="Subsolver used for the primal block in the pycutfem.linalg block-Schur preconditioner.",
+    )
+    ap.add_argument(
+        "--newton-block-schur-multiplier-subsolver",
+        type=str,
+        default="direct",
+        choices=("direct", "ilu", "diag"),
+        help="Subsolver used for the multiplier Schur approximation block.",
+    )
+    ap.add_argument(
+        "--newton-block-schur-shift",
+        type=float,
+        default=1.0e-8,
+        help="Diagonal shift added to the lumped multiplier Schur approximation.",
+    )
+    ap.add_argument(
+        "--newton-block-schur-subsolver-shift",
+        type=float,
+        default=0.0,
+        help="Optional diagonal shift passed into the pycutfem.linalg sparse block subsolvers.",
+    )
+    ap.add_argument(
+        "--newton-block-schur-drop-tol",
+        type=float,
+        default=1.0e-4,
+        help="ILU drop tolerance used by the pycutfem.linalg block subsolvers when kind=ilu.",
+    )
+    ap.add_argument(
+        "--newton-block-schur-fill-factor",
+        type=float,
+        default=20.0,
+        help="ILU fill factor used by the pycutfem.linalg block subsolvers when kind=ilu.",
+    )
+    ap.add_argument(
+        "--newton-block-schur-rtol",
+        type=float,
+        default=None,
+        help="Optional relative tolerance override for the pycutfem.linalg block-Schur solve.",
+    )
+    ap.add_argument(
+        "--newton-block-schur-maxit",
+        type=int,
+        default=None,
+        help="Optional iteration-budget override for the pycutfem.linalg block-Schur solve.",
+    )
+    ap.add_argument(
+        "--newton-block-schur-restart",
+        type=int,
+        default=60,
+        help="GMRES restart used by the pycutfem.linalg block-Schur solve.",
+    )
+    ap.add_argument(
+        "--newton-block-schur-inner-m",
+        type=int,
+        default=30,
+        help="LGMRES inner subspace size used by the pycutfem.linalg block-Schur solve.",
+    )
+    ap.add_argument(
+        "--newton-block-schur-outer-k",
+        type=int,
+        default=3,
+        help="LGMRES recycle dimension used by the pycutfem.linalg block-Schur solve.",
+    )
+    ap.add_argument(
+        "--newton-block-schur-relaxation",
+        type=float,
+        default=1.0,
+        help="Uzawa relaxation used when --newton-block-schur-method=uzawa.",
+    )
+    ap.add_argument(
+        "--newton-block-schur-trace",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Print the pycutfem.linalg block-solver report for each linear solve.",
+    )
+    ap.add_argument(
         "--petsc-distributed",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -613,6 +802,30 @@ def _parse_args() -> argparse.Namespace:
     )
     ap.add_argument("--nx", type=int, default=20, help="Cells in x. h=0.05 corresponds to nx=20.")
     ap.add_argument("--ny", type=int, default=30, help="Cells in y. h=0.05 on Ly=1.5 corresponds to ny=30.")
+    ap.add_argument(
+        "--adaptive-interface-target-cells",
+        type=float,
+        default=0.0,
+        help=(
+            "If > 0, locally refine the Seboldt mesh around y_interface so the diffuse band "
+            "has at least this many cells across 2*eps_alpha in the y-direction."
+        ),
+    )
+    ap.add_argument(
+        "--adaptive-interface-band-halfwidth-factor",
+        type=float,
+        default=10.0,
+        help=(
+            "Half-width of the interface-refinement band in multiples of eps_alpha. "
+            "Used only when adaptive-interface-target-cells > 0."
+        ),
+    )
+    ap.add_argument(
+        "--adaptive-interface-max-ref",
+        type=int,
+        default=4,
+        help="Maximum per-parent tensor refinement depth used for adaptive interface band refinement.",
+    )
     ap.add_argument("--dt", type=float, default=1.0e-3)
     ap.add_argument("--t-final", type=float, default=3.0)
     ap.add_argument("--theta", type=float, default=1.0)
@@ -677,6 +890,41 @@ def _parse_args() -> argparse.Namespace:
         help="Use the full one-domain phi-transport model. Disable only for reduced fixed-phi_b debugging runs.",
     )
     ap.add_argument(
+        "--final-form-phi-mode",
+        type=str,
+        default="auto",
+        choices=("auto", "transport", "alpha_closure"),
+        help=(
+            "How phi is treated on one_domain_formulation=final_form. "
+            "'transport' keeps the full phi transport row; "
+            "'alpha_closure' enforces phi = 1 - (1-phi_b) alpha as a benchmark constitutive closure; "
+            "'auto' selects the recommended mode for the active branch."
+        ),
+    )
+    ap.add_argument(
+        "--final-form-implementation",
+        type=str,
+        default="tensor",
+        choices=("tensor", "decomposed"),
+        help=(
+            "Implementation used on one_domain_formulation=final_form. "
+            "'tensor' uses the clean tensor/dot-based closure; "
+            "'decomposed' keeps the archived componentwise interface algebra for A/B checks."
+        ),
+    )
+    ap.add_argument(
+        "--one-domain-formulation",
+        type=str,
+        default="legacy",
+        choices=("legacy", "final_form"),
+        help=(
+            "One-domain formulation family. "
+            "'legacy' keeps the historical alpha/B/phi branches; "
+            "'final_form' activates the bulk/interface-separated v_f,v_p,v_s,rho_s,p_p,p,alpha,phi formulation "
+            "from examples/biofilms/benchmarks/seboldt/final_form.md."
+        ),
+    )
+    ap.add_argument(
         "--full-ratio-free-state",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -694,6 +942,31 @@ def _parse_args() -> argparse.Namespace:
             "On the full ratio-free stored-support split-pressure branch, solve a primary Darcy flux q "
             "using the auxiliary vector slot and assemble the pore mass/interface laws in terms of q "
             "instead of the legacy derived flux P(v-vS)."
+        ),
+    )
+    ap.add_argument(
+        "--split-pore-flux-model",
+        type=str,
+        default="exact_total_continuity",
+        choices=("direct_darcy", "exact_conservative_p", "exact_total_continuity", "reduced_divq"),
+        help=(
+            "Non-q split-pressure pore-row model on the full ratio-free stored-support branch. "
+            "'exact_conservative_p' uses d_t(alpha-B) + div((alpha-B) vS - alpha K/mu grad(p_pore)); "
+            "'exact_total_continuity' uses div((1-alpha) v + alpha vS - alpha K/mu grad(p_pore)); "
+            "'direct_darcy' eliminates q with -div(alpha K/mu grad(p_pore)); "
+            "'reduced_divq' keeps the older reduced surrogate div(P (v-vS)). "
+            "Ignored when --split-primary-darcy-flux is enabled."
+        ),
+    )
+    ap.add_argument(
+        "--split-pore-momentum-model",
+        type=str,
+        default="band_alpha",
+        choices=("weighted_divP", "band_alpha"),
+        help=(
+            "How p_pore loads the liquid momentum row on the non-q split-pressure branch. "
+            "'weighted_divP' keeps the legacy -p_pore div(P w) term; "
+            "'band_alpha' uses only the diffuse interface band term -p_pore grad(alpha)·w."
         ),
     )
     ap.add_argument(
@@ -717,6 +990,15 @@ def _parse_args() -> argparse.Namespace:
         help="Porous-region effective viscosity model inside the one-domain momentum block.",
     )
     ap.add_argument("--phi-b", type=float, default=0.18)
+    ap.add_argument(
+        "--uniform-initial-phi",
+        type=float,
+        default=float("nan"),
+        help=(
+            "Debug override for the initial phi field on branches with an explicit phi unknown. "
+            "When finite, sets phi_n = phi_k = this constant instead of deriving phi from alpha at t=0."
+        ),
+    )
     ap.add_argument("--mu-s", type=float, default=1.67785e5)
     ap.add_argument(
         "--lambda-s",
@@ -782,6 +1064,15 @@ def _parse_args() -> argparse.Namespace:
         help="Extension mode for u outside the porous body.",
     )
     ap.add_argument("--gamma-u-pin", type=float, default=0.0, help="Optional pin for grad-mode u extension.")
+    ap.add_argument(
+        "--interface-band-extension-gamma",
+        type=float,
+        default=0.0,
+        help=(
+            "Small symmetric H1 regularization on phi, u, and vS inside the diffuse interface band, "
+            "weighted by 4*chi(alpha)*(1-chi(alpha))."
+        ),
+    )
     ap.add_argument("--u-cip", type=float, default=0.0, help="Interior-facet CIP stabilization for u transport.")
     ap.add_argument(
         "--u-cip-weight",
@@ -800,6 +1091,105 @@ def _parse_args() -> argparse.Namespace:
         help="Optional vS extension mode; defaults to u_extension.",
     )
     ap.add_argument("--gamma-vS-pin", type=float, default=None, help="Optional pin for grad-mode vS extension.")
+    ap.add_argument(
+        "--final-form-solid-interface-weight",
+        type=float,
+        default=1.0,
+        help=(
+            "Debug weight on the solid contribution in the final_form interface traction law. "
+            "1 keeps the physical law, 0 removes the solid traction from the interface residual."
+        ),
+    )
+    ap.add_argument(
+        "--final-form-disable-interface-physics",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Debug: remove all explicit grad(alpha)-driven interface laws and transpose couplings on the "
+            "final_form branch, while pinning the interface multiplier fields to zero."
+        ),
+    )
+    ap.add_argument(
+        "--final-form-disable-normal-interface",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Debug: disable only the explicit normal traction interface law on the final_form branch, "
+            "while leaving the mass, tangential, and kinematic interface rows active."
+        ),
+    )
+    ap.add_argument(
+        "--final-form-mass-interface-weight",
+        type=float,
+        default=1.0,
+        help=(
+            "Weight on the explicit mass-transfer interface law on the final_form branch. "
+            "1 keeps the exact law, 0 pins mu_mass to zero and removes its transpose couplings."
+        ),
+    )
+    ap.add_argument(
+        "--final-form-mass-interface-homotopy",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Use the frozen-transport / predictor-corrector startup continuation to ramp the final_form "
+            "mass-transfer interface law from a pinned mu_mass row to the requested exact weight."
+        ),
+    )
+    ap.add_argument(
+        "--final-form-mass-interface-start-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Initial startup weight used for the final_form mass-transfer interface law before "
+            "continuing back to --final-form-mass-interface-weight."
+        ),
+    )
+    ap.add_argument(
+        "--final-form-normal-interface-weight",
+        type=float,
+        default=1.0,
+        help=(
+            "Weight on the explicit normal traction interface law on the final_form branch. "
+            "1 keeps the exact law, 0 pins mu_normal to zero and removes its transpose couplings."
+        ),
+    )
+    ap.add_argument(
+        "--final-form-normal-interface-homotopy",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Use predictor-corrector P2 continuation to ramp the final_form normal interface law "
+            "from a pinned mu_normal row to the requested exact weight."
+        ),
+    )
+    ap.add_argument(
+        "--final-form-normal-interface-start-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Initial predictor-corrector P2 weight used for the final_form normal interface law "
+            "before continuing back to --final-form-normal-interface-weight."
+        ),
+    )
+    ap.add_argument(
+        "--final-form-mass-lm-aug-gamma",
+        type=float,
+        default=1.0,
+        help=(
+            "Augmented-Lagrangian primal weight for the final_form mass-transfer multiplier row. "
+            "Positive values add a localized primal mass-jump penalty."
+        ),
+    )
+    ap.add_argument(
+        "--final-form-normal-lm-aug-gamma",
+        type=float,
+        default=1.0,
+        help=(
+            "Augmented-Lagrangian primal weight for the final_form normal traction multiplier row. "
+            "Positive values add a localized primal normal-traction penalty."
+        ),
+    )
     ap.add_argument("--D-phi", type=float, default=0.0, help="Optional porosity diffusion coefficient used only for regularization tests.")
     ap.add_argument(
         "--phi-diffusion-weight",
@@ -809,6 +1199,103 @@ def _parse_args() -> argparse.Namespace:
         help="Weight for the optional D_phi regularization term in the porosity equation.",
     )
     ap.add_argument("--gamma-phi", type=float, default=5.0, help="Penalty enforcing phi->1 in the free-fluid region.")
+    ap.add_argument("--gamma-v", type=float, default=0.0, help="Free-fluid velocity extension penalty in the porous region.")
+    ap.add_argument(
+        "--v-extension",
+        type=str,
+        default="h1",
+        choices=("l2", "mass", "grad", "h1"),
+        help="Inactive-domain extension mode for the free-fluid velocity v in the porous region.",
+    )
+    ap.add_argument("--gamma-v-pin", type=float, default=0.0, help="Optional pin for grad-mode v extension.")
+    ap.add_argument("--gamma-p", type=float, default=0.0, help="Free-fluid pressure extension penalty in the porous region.")
+    ap.add_argument(
+        "--p-extension",
+        type=str,
+        default="h1",
+        choices=("l2", "mass", "grad", "h1"),
+        help="Inactive-domain extension mode for the free-fluid pressure p in the porous region.",
+    )
+    ap.add_argument("--gamma-p-pin", type=float, default=0.0, help="Optional pin for grad-mode p extension.")
+    ap.add_argument("--gamma-vP", type=float, default=0.0, help="Pore-velocity extension penalty in the free-fluid region.")
+    ap.add_argument(
+        "--vP-extension",
+        type=str,
+        default="h1",
+        choices=("l2", "mass", "grad", "h1"),
+        help="Inactive-domain extension mode for the pore velocity vP in the free-fluid region.",
+    )
+    ap.add_argument("--gamma-vP-pin", type=float, default=0.0, help="Optional pin for grad-mode vP extension.")
+    ap.add_argument("--gamma-p-pore", type=float, default=0.0, help="Pore-pressure extension penalty in the free-fluid region.")
+    ap.add_argument(
+        "--p-pore-extension",
+        type=str,
+        default="h1",
+        choices=("l2", "mass", "grad", "h1"),
+        help="Inactive-domain extension mode for the pore pressure p_pore in the free-fluid region.",
+    )
+    ap.add_argument("--gamma-p-pore-pin", type=float, default=0.0, help="Optional pin for grad-mode p_pore extension.")
+    ap.add_argument("--gamma-rho-s", type=float, default=0.0, help="Solid-density extension penalty in the free-fluid region.")
+    ap.add_argument(
+        "--rho-s-extension",
+        type=str,
+        default="h1",
+        choices=("l2", "mass", "grad", "h1"),
+        help="Inactive-domain extension mode for rho_s in the free-fluid region.",
+    )
+    ap.add_argument("--gamma-rho-s-pin", type=float, default=0.0, help="Optional pin for grad-mode rho_s extension.")
+    ap.add_argument(
+        "--final-form-constant-rho-s",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use rho_s = rho_s0_tilde as a physical constant on the final_form branch and remove rho_s from the reduced solve.",
+    )
+    ap.add_argument(
+        "--final-form-freeze-rho-s",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Diagnostic: keep rho_s fixed at rho_s0_tilde on the final_form branch.",
+    )
+    ap.add_argument(
+        "--final-form-inactive-domains",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Diagnostic: deactivate free-fluid fields deep in the support region and porous/support fields "
+            "deep in the free-fluid region on the final_form branch."
+        ),
+    )
+    ap.add_argument(
+        "--final-form-domain-lm",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Add bulk-domain Lagrange multipliers that weakly suppress cross-domain contamination on the "
+            "final_form branch by enforcing alpha*v_f=0, alpha*p=0, (1-alpha)*(vP,vS,p_pore,u)=0, "
+            "and (1-alpha)*(phi-1)=0 with complementary off-domain pinning of the multipliers."
+        ),
+    )
+    ap.add_argument(
+        "--final-form-domain-lm-aug-gamma",
+        type=float,
+        default=1.0,
+        help=(
+            "Augmented-Lagrangian penalty added to the primal target rows of the final_form bulk "
+            "domain-LM constraints. Ignored unless --final-form-domain-lm is enabled."
+        ),
+    )
+    ap.add_argument(
+        "--final-form-inactive-alpha-low",
+        type=float,
+        default=0.05,
+        help="Low-alpha threshold for deactivating porous/support fields in final_form-inactive-domains mode.",
+    )
+    ap.add_argument(
+        "--final-form-inactive-alpha-high",
+        type=float,
+        default=0.95,
+        help="High-alpha threshold for deactivating free-fluid fields in final_form-inactive-domains mode.",
+    )
     ap.add_argument("--phi-supg", type=float, default=0.0, help="SUPG stabilization for phi advection in full-model mode.")
     ap.add_argument(
         "--phi-cip",
@@ -1030,6 +1517,26 @@ def _parse_args() -> argparse.Namespace:
         help="If set, override eps_alpha with eps_alpha_over_h * h_char, h_char=max(Lx/nx,Ly/ny).",
     )
     ap.add_argument(
+        "--geometry-indicator-beta",
+        type=float,
+        default=0.0,
+        help=(
+            "Optional smooth-Heaviside sharpening used to reconstruct a geometry/support indicator chi(alpha) "
+            "for the Seboldt interface/support terms. 0 keeps the legacy raw alpha."
+        ),
+    )
+    ap.add_argument(
+        "--geometry-indicator-mode",
+        type=str,
+        default="raw",
+        choices=("raw", "tanh", "parabolic_envelope"),
+        help=(
+            "Geometry/support indicator used in the diffuse bulk occupancy. "
+            "'raw' keeps chi(alpha)=alpha, 'tanh' uses the smooth-Heaviside beta sharpening, "
+            "and 'parabolic_envelope' uses alpha*4(alpha-0.5)^2 so bulk terms fade inside the interface band."
+        ),
+    )
+    ap.add_argument(
         "--kappa-inv-model",
         type=str,
         default="refmap",
@@ -1145,10 +1652,20 @@ def _parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=False,
         help=(
-            "Run a fully porous bulk diagnostic with alpha fixed to 1 everywhere, no interface closures, "
-            "uniform Darcy discharge prescribed on the left boundary, p_pore=0 on the right boundary, "
-            "and q·n=0 on the top/bottom walls. This removes the free-fluid/interface layer entirely and "
-            "tests only the q-primary Darcy/pore-pressure/solid bulk formulation."
+            "Run an alpha=1 porous-only diagnostic. On the split q-primary branch this prescribes uniform Darcy "
+            "discharge on the left boundary with p_pore=0 on the right boundary and q·n=0 on the top/bottom walls. "
+            "On one_domain_formulation=final_form this instead prescribes the benchmark bottom-inlet profile on vP, "
+            "keeps p_pore=0 on the drained top boundary, and freezes the free-fluid/interface block."
+        ),
+    )
+    ap.add_argument(
+        "--all-fluid-freeflow-diagnostic",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Run an alpha=0 fluid-only diagnostic. This freezes alpha=0 everywhere, sets phi=1 where present, "
+            "zeros the porous/solid/interface fields, and solves only the free-fluid block under the benchmark "
+            "bottom inlet with p=0 on the top boundary."
         ),
     )
     ap.add_argument(
@@ -1174,7 +1691,7 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     ap.add_argument("--newton-tol", type=float, default=1.0e-6)
-    ap.add_argument("--newton-rtol", type=float, default=1.0e-6)
+    ap.add_argument("--newton-rtol", type=float, default=0.0)
     ap.add_argument("--max-it", type=int, default=12)
     ap.add_argument(
         "--alpha-box-constraints",
@@ -1454,8 +1971,9 @@ def _parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=False,
         help=(
-            "Experimental diffuse velocity-continuity penalty. Disabled on the monolithic "
-            "one-domain stored-support branch."
+            "Experimental diffuse normal mass-transfer closure. Keep this disabled on the clean "
+            "monolithic one-domain stored-support branch unless you are explicitly testing an "
+            "additional diffuse interface law."
         ),
     )
     ap.add_argument(
@@ -2159,12 +2677,21 @@ def _parse_args() -> argparse.Namespace:
     return ap.parse_args()
 
 
-def _configure_benchmark7_cpp_fuse_integrals(*, backend: str, enabled: bool | None) -> str | None:
+def _configure_benchmark7_cpp_fuse_integrals(
+    *,
+    backend: str,
+    enabled: bool | None,
+    final_form_enabled: bool = False,
+) -> str | None:
     backend_key = str(backend).strip().lower()
     if backend_key not in {"cpp", "c++"}:
         return os.environ.get("PYCUTFEM_CPP_FUSE_INTEGRALS")
     prev = os.environ.get("PYCUTFEM_CPP_FUSE_INTEGRALS")
     if enabled is None:
+        # Shared-loop C++ fusion is now the default Benchmark 7 path, including
+        # the final_form branch. Keep an explicit opt-out via
+        # `--no-cpp-fuse-integrals` or the environment for targeted debugging.
+        _ = final_form_enabled
         os.environ.setdefault("PYCUTFEM_CPP_FUSE_INTEGRALS", "1")
     else:
         os.environ["PYCUTFEM_CPP_FUSE_INTEGRALS"] = "1" if bool(enabled) else "0"
@@ -2173,6 +2700,195 @@ def _configure_benchmark7_cpp_fuse_integrals(*, backend: str, enabled: bool | No
 
 def _characteristic_h(*, Lx: float, Ly: float, nx: int, ny: int) -> float:
     return max(float(Lx) / float(nx), float(Ly) / float(ny))
+
+
+def _flat_interface_signed_distance(points: np.ndarray, *, y_interface: float) -> np.ndarray:
+    pts = np.asarray(points, dtype=float)
+    if pts.ndim == 1:
+        pts = pts.reshape(1, -1)
+    return np.asarray(pts[:, 1] - float(y_interface), dtype=float)
+
+
+def _flat_interface_band_marker(
+    points: np.ndarray,
+    *,
+    y_interface: float,
+    band_halfwidth: float,
+    line_spacing: float,
+) -> np.ndarray:
+    pts = np.asarray(points, dtype=float)
+    if pts.ndim == 1:
+        pts = pts.reshape(1, -1)
+    y = np.asarray(pts[:, 1], dtype=float)
+    band = max(float(band_halfwidth), 0.0)
+    spacing = max(float(line_spacing), 1.0e-14)
+    if band <= 0.0:
+        return _flat_interface_signed_distance(pts, y_interface=float(y_interface))
+    n_lines = max(int(math.ceil((2.0 * band) / spacing)), 1)
+    levels = np.linspace(
+        float(y_interface) - band,
+        float(y_interface) + band,
+        n_lines + 1,
+        dtype=float,
+    )
+    vals = np.ones_like(y, dtype=float)
+    for level in levels.tolist():
+        vals *= (y - float(level))
+    return vals
+
+
+def _mesh_interface_band_resolution_stats(
+    mesh: Mesh,
+    *,
+    y_interface: float,
+    eps_alpha: float,
+    band_halfwidth: float,
+) -> dict[str, float]:
+    stats = {
+        "mesh_element_count": float(len(getattr(mesh, "elements_list", ()))),
+        "mesh_node_count": float(len(getattr(mesh, "nodes_list", ()))),
+        "band_element_count": float(0.0),
+        "band_min_dy": float("nan"),
+        "band_max_dy": float("nan"),
+        "band_min_dx": float("nan"),
+        "band_max_dx": float("nan"),
+        "cells_across_2eps_min": float("nan"),
+        "cells_across_2eps_max": float("nan"),
+        "cells_across_band_min": float("nan"),
+        "cells_across_band_max": float("nan"),
+    }
+    corners = np.asarray(getattr(mesh, "corner_connectivity", None), dtype=int)
+    if corners.ndim != 2 or corners.shape[0] == 0:
+        return stats
+    coords = np.asarray(mesh.nodes_x_y_pos, dtype=float)[corners]
+    ex0 = coords[:, :, 0].min(axis=1)
+    ex1 = coords[:, :, 0].max(axis=1)
+    ey0 = coords[:, :, 1].min(axis=1)
+    ey1 = coords[:, :, 1].max(axis=1)
+    dx_vals = ex1 - ex0
+    dy_vals = ey1 - ey0
+    halfwidth = max(float(band_halfwidth), 1.0e-14)
+    mask = (ey1 >= float(y_interface) - halfwidth) & (ey0 <= float(y_interface) + halfwidth)
+    if not np.any(mask):
+        return stats
+    dx_band = np.asarray(dx_vals[mask], dtype=float)
+    dy_band = np.asarray(dy_vals[mask], dtype=float)
+    dy_max = float(np.max(dy_band))
+    dy_min = float(np.min(dy_band))
+    band_width = 2.0 * halfwidth
+    two_eps = 2.0 * max(float(eps_alpha), 1.0e-14)
+    stats.update(
+        {
+            "band_element_count": float(np.count_nonzero(mask)),
+            "band_min_dy": dy_min,
+            "band_max_dy": dy_max,
+            "band_min_dx": float(np.min(dx_band)),
+            "band_max_dx": float(np.max(dx_band)),
+            "cells_across_2eps_min": float(two_eps / max(dy_max, 1.0e-14)),
+            "cells_across_2eps_max": float(two_eps / max(dy_min, 1.0e-14)),
+            "cells_across_band_min": float(band_width / max(dy_max, 1.0e-14)),
+            "cells_across_band_max": float(band_width / max(dy_min, 1.0e-14)),
+        }
+    )
+    return stats
+
+
+def _build_benchmark7_mesh(
+    *,
+    Lx: float,
+    Ly: float,
+    nx: int,
+    ny: int,
+    poly_order: int,
+    y_interface: float,
+    eps_alpha: float,
+    adaptive_interface_target_cells: float = 0.0,
+    adaptive_interface_band_halfwidth_factor: float = 1.0,
+    adaptive_interface_max_ref: int = 4,
+) -> tuple[Mesh, dict[str, float | str]]:
+    nodes, elems, _, corners = structured_quad(
+        float(Lx),
+        float(Ly),
+        nx=int(nx),
+        ny=int(ny),
+        poly_order=int(poly_order),
+    )
+    mesh = Mesh(
+        nodes=nodes,
+        element_connectivity=elems,
+        elements_corner_nodes=corners,
+        element_type="quad",
+        poly_order=int(poly_order),
+    )
+
+    band_halfwidth = max(
+        float(adaptive_interface_band_halfwidth_factor) * max(float(eps_alpha), 0.0),
+        0.0,
+    )
+    adaptive_meta: dict[str, float | str] = {
+        "mode": "structured",
+        "target_cells": float(adaptive_interface_target_cells),
+        "band_halfwidth": float(band_halfwidth),
+        "target_h": float("nan"),
+        "marked_parent_count": float(0.0),
+        "refined_parent_count": float(0.0),
+        "max_rx": float(0.0),
+        "max_ry": float(0.0),
+        "used_refine_level": float(0.0),
+    }
+
+    if float(adaptive_interface_target_cells) > 0.0 and float(eps_alpha) > 0.0:
+        target_h = (2.0 * float(eps_alpha)) / max(float(adaptive_interface_target_cells), 1.0e-14)
+        base_dx = float(Lx) / max(int(nx), 1)
+        base_dy = float(Ly) / max(int(ny), 1)
+        required_refine_level = max(
+            int(math.ceil(math.log2(max(base_dx / max(target_h, 1.0e-14), 1.0)))),
+            int(math.ceil(math.log2(max(base_dy / max(target_h, 1.0e-14), 1.0)))),
+        )
+        used_refine_level = min(max(required_refine_level, 0), max(int(adaptive_interface_max_ref), 0))
+        adaptive_meta.update(
+            {
+                "target_h": float(target_h),
+                "used_refine_level": float(used_refine_level),
+            }
+        )
+        if used_refine_level > 0:
+            line_spacing = max(float(target_h), 1.0e-14)
+            level_set = lambda pts: _flat_interface_band_marker(
+                np.asarray(pts, dtype=float),
+                y_interface=float(y_interface),
+                band_halfwidth=float(max(band_halfwidth, eps_alpha)),
+                line_spacing=float(line_spacing),
+            )
+            nodes, elems, _, corners = structured_quad_levelset_adaptive(
+                float(Lx),
+                float(Ly),
+                nx=int(nx),
+                ny=int(ny),
+                poly_order=int(poly_order),
+                level_set=level_set,
+                max_refine_level=int(used_refine_level),
+                parallel=True,
+            )
+            mesh = Mesh(
+                nodes=nodes,
+                element_connectivity=elems,
+                elements_corner_nodes=corners,
+                element_type="quad",
+                poly_order=int(poly_order),
+            )
+            adaptive_meta["mode"] = "adaptive_interface_band_numba"
+
+    _tag_rectangle_boundaries(mesh, Lx=float(Lx), Ly=float(Ly))
+    adaptive_meta.update(
+        _mesh_interface_band_resolution_stats(
+            mesh,
+            y_interface=float(y_interface),
+            eps_alpha=float(eps_alpha),
+            band_halfwidth=float(max(band_halfwidth, eps_alpha)),
+        )
+    )
+    return mesh, adaptive_meta
 
 
 def _resolved_orders(args: argparse.Namespace) -> tuple[int, int, int]:
@@ -2473,6 +3189,191 @@ def _parse_csv_fields(raw: str | None) -> tuple[str, ...]:
         if item:
             parts.append(item)
     return tuple(parts)
+
+
+def _solver_reduced_unique_field_names(target_solver) -> tuple[str, ...]:
+    field_names = np.asarray(getattr(target_solver, "_reduced_field_names", np.asarray([], dtype=object)), dtype=object)
+    active_dofs = np.asarray(getattr(target_solver, "active_dofs", np.asarray([], dtype=int)), dtype=int)
+    if field_names.shape != (int(active_dofs.size),):
+        refresh = getattr(target_solver, "_refresh_reduced_field_names", None)
+        if callable(refresh):
+            field_names = np.asarray(refresh(), dtype=object)
+        else:
+            field_names = np.asarray([], dtype=object)
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw_name in field_names.tolist():
+        name = str(raw_name or "").strip()
+        if (not name) or (name in seen):
+            continue
+        seen.add(name)
+        out.append(name)
+    return tuple(out)
+
+
+def _benchmark7_block_schur_enabled(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "newton_block_schur_solve", False))
+
+
+def _final_form_interface_lm_active_fields(problem: dict[str, object]) -> list[str]:
+    fields: list[str] = []
+    for name, key in (
+        ("mu_mass", "mu_mass_k"),
+        ("mu_normal", "mu_normal_k"),
+        ("mu_tangent", "mu_tangent_k"),
+    ):
+        if problem.get(key) is not None:
+            fields.append(name)
+    if problem.get("mu_kin_k") is not None:
+        fields.extend(["mu_kin_x", "mu_kin_y"])
+    return fields
+
+
+def _benchmark7_default_block_multiplier_fields(problem: dict[str, object]) -> tuple[str, ...]:
+    fields: list[str] = []
+    if problem.get("alpha_mass_lm_k") is not None:
+        fields.append("alpha_mass_lm")
+    if problem.get("p_mean_k") is not None:
+        fields.append("p_mean")
+    fields.extend(_final_form_interface_lm_active_fields(problem))
+    fields.extend(_final_form_domain_lm_active_fields(problem))
+    keep: list[str] = []
+    seen: set[str] = set()
+    for name in fields:
+        key = str(name).strip()
+        if (not key) or (key in seen):
+            continue
+        seen.add(key)
+        keep.append(key)
+    return tuple(keep)
+
+
+def _benchmark7_block_subsolver_spec(
+    *,
+    kind: str,
+    shift: float,
+    drop_tol: float,
+    fill_factor: float,
+) -> SparseSubsolverSpec:
+    return SparseSubsolverSpec(
+        kind=str(kind),
+        shift=float(shift),
+        drop_tol=float(drop_tol),
+        fill_factor=float(fill_factor),
+    )
+
+
+def _configure_benchmark7_block_linear_solver(
+    *,
+    args: argparse.Namespace,
+    problem: dict[str, object],
+    target_solver,
+) -> None:
+    if not _benchmark7_block_schur_enabled(args):
+        clear = getattr(target_solver, "clear_block_linear_solver", None)
+        if callable(clear):
+            clear()
+        target_solver._benchmark7_refresh_block_linear_solver = None
+        target_solver._benchmark7_block_linear_signature = None
+        return
+
+    requested_multiplier_fields = _parse_csv_fields(
+        getattr(args, "newton_block_schur_multiplier_fields", "")
+    ) or _benchmark7_default_block_multiplier_fields(problem)
+
+    primal_spec = _benchmark7_block_subsolver_spec(
+        kind=str(getattr(args, "newton_block_schur_primal_subsolver", "direct") or "direct"),
+        shift=float(getattr(args, "newton_block_schur_subsolver_shift", 0.0) or 0.0),
+        drop_tol=float(getattr(args, "newton_block_schur_drop_tol", 1.0e-4) or 1.0e-4),
+        fill_factor=float(getattr(args, "newton_block_schur_fill_factor", 20.0) or 20.0),
+    )
+    multiplier_spec = _benchmark7_block_subsolver_spec(
+        kind=str(getattr(args, "newton_block_schur_multiplier_subsolver", "direct") or "direct"),
+        shift=float(getattr(args, "newton_block_schur_subsolver_shift", 0.0) or 0.0),
+        drop_tol=float(getattr(args, "newton_block_schur_drop_tol", 1.0e-4) or 1.0e-4),
+        fill_factor=float(getattr(args, "newton_block_schur_fill_factor", 20.0) or 20.0),
+    )
+    schur_shift = float(getattr(args, "newton_block_schur_shift", 1.0e-8) or 1.0e-8)
+
+    def _refresh_block_linear_solver() -> None:
+        available_fields = _solver_reduced_unique_field_names(target_solver)
+        if not available_fields:
+            clear = getattr(target_solver, "clear_block_linear_solver", None)
+            if callable(clear):
+                clear()
+            target_solver._benchmark7_block_linear_signature = None
+            return
+        available_set = set(available_fields)
+        multiplier_fields = tuple(name for name in requested_multiplier_fields if name in available_set)
+        primal_fields = tuple(name for name in available_fields if name not in set(multiplier_fields))
+        signature = (primal_fields, multiplier_fields)
+        if signature == getattr(target_solver, "_benchmark7_block_linear_signature", None):
+            return
+        clear = getattr(target_solver, "clear_block_linear_solver", None)
+        if callable(clear):
+            clear()
+        target_solver._benchmark7_block_linear_signature = signature
+        if (not primal_fields) or (not multiplier_fields):
+            if bool(getattr(args, "newton_block_schur_trace", False)):
+                if multiplier_fields:
+                    print(
+                        "    [solver] block-Schur fallback to the native linear backend because the current "
+                        f"active reduced system has no primal fields outside the multiplier block {multiplier_fields}.",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        "    [solver] block-Schur fallback to the native linear backend because the current "
+                        "active reduced system has no active multiplier fields.",
+                        flush=True,
+                    )
+            return
+        target_solver.set_block_linear_solver(
+            blocks=(
+                ("primal", primal_fields),
+                ("multiplier", multiplier_fields),
+            ),
+            method=str(getattr(args, "newton_block_schur_method", "gmres") or "gmres"),
+            preconditioner=str(getattr(args, "newton_block_schur_preconditioner", "lower_triangular") or "lower_triangular"),
+            include_remaining=False,
+            default_subsolver=primal_spec,
+            block_subsolvers={
+                "primal": primal_spec,
+                "multiplier": multiplier_spec,
+            },
+            block_approximations={
+                "multiplier": (
+                    lambda system, shift=schur_shift: lumped_schur_complement(
+                        system,
+                        primal_block="primal",
+                        multiplier_block="multiplier",
+                        shift=float(shift),
+                    )
+                )
+            },
+            rtol=getattr(args, "newton_block_schur_rtol", None),
+            maxiter=getattr(args, "newton_block_schur_maxit", None),
+            restart=int(getattr(args, "newton_block_schur_restart", 60) or 60),
+            inner_m=int(getattr(args, "newton_block_schur_inner_m", 30) or 30),
+            outer_k=int(getattr(args, "newton_block_schur_outer_k", 3) or 3),
+            uzawa_primal_block="primal",
+            uzawa_multiplier_block="multiplier",
+            uzawa_relaxation=float(getattr(args, "newton_block_schur_relaxation", 1.0) or 1.0),
+            trace=bool(getattr(args, "newton_block_schur_trace", False)),
+        )
+        print(
+            "    [solver] enabling pycutfem.linalg block-Schur solve "
+            f"(primal={primal_fields}, multiplier={multiplier_fields}, "
+            f"method={str(getattr(args, 'newton_block_schur_method', 'gmres') or 'gmres')}, "
+            f"preconditioner={str(getattr(args, 'newton_block_schur_preconditioner', 'lower_triangular') or 'lower_triangular')}, "
+            f"shift={float(schur_shift):.1e}, "
+            f"primal_subsolver={str(getattr(args, 'newton_block_schur_primal_subsolver', 'direct') or 'direct')}, "
+            f"multiplier_subsolver={str(getattr(args, 'newton_block_schur_multiplier_subsolver', 'direct') or 'direct')})."
+        )
+
+    target_solver._benchmark7_refresh_block_linear_solver = _refresh_block_linear_solver
+    target_solver._benchmark7_block_linear_signature = None
+    _refresh_block_linear_solver()
 
 
 def _effective_logistic_bounded_fields(args: argparse.Namespace) -> tuple[str, ...]:
@@ -2858,6 +3759,7 @@ def _tag_inactive_fields_below_alpha(
     problem: dict[str, object],
     *,
     alpha_threshold: float | None,
+    field_names: list[str] | tuple[str, ...] | None = None,
     alpha_state_key: str = "alpha_k",
 ) -> dict[str, int]:
     if alpha_threshold is None:
@@ -2890,10 +3792,13 @@ def _tag_inactive_fields_below_alpha(
         elem_mask[eid] = bool(np.all(nodal <= thr))
     counts: dict[str, int] = {}
     selected_all: set[int] = set()
-    fields = ["u_x", "u_y", "vS_x", "vS_y"]
-    fields.extend(_primary_darcy_field_names(problem))
-    if "phi" in getattr(dh, "field_names", ()):
-        fields.append("phi")
+    if field_names is None:
+        fields = ["u_x", "u_y", "vS_x", "vS_y"]
+        fields.extend(_primary_darcy_field_names(problem))
+        if "phi" in getattr(dh, "field_names", ()):
+            fields.append("phi")
+    else:
+        fields = [str(name) for name in list(field_names or []) if str(name).strip()]
     for field in fields:
         if field not in getattr(dh, "field_names", ()):
             counts[field] = 0
@@ -2906,6 +3811,59 @@ def _tag_inactive_fields_below_alpha(
     problem["_inactive_alpha_threshold_element_count"] = int(np.count_nonzero(elem_mask))
     problem["_inactive_alpha_threshold_counts"] = dict(counts)
     problem["_inactive_alpha_threshold_tagged_dofs"] = set(selected_all)
+    return counts
+
+
+def _tag_inactive_fields_above_alpha(
+    problem: dict[str, object],
+    *,
+    alpha_threshold: float | None,
+    field_names: list[str] | tuple[str, ...] | None = None,
+    alpha_state_key: str = "alpha_k",
+) -> dict[str, int]:
+    if alpha_threshold is None:
+        return {}
+    thr = float(alpha_threshold)
+    if not np.isfinite(thr):
+        return {}
+    dh = problem["dh"]
+    mesh = problem["mesh"]
+    prev_tagged = set(int(d) for d in list(problem.get("_inactive_alpha_high_tagged_dofs", set()) or set()))
+    inactive_base = set(int(d) for d in list(getattr(dh, "dof_tags", {}).get("inactive", set()) or set()))
+    inactive_base.difference_update(prev_tagged)
+    dh.dof_tags["inactive"] = inactive_base
+    alpha_func = problem.get(alpha_state_key) or problem.get("alpha_k") or problem.get("alpha_n")
+    if alpha_func is None or "alpha" not in getattr(dh, "field_names", ()):
+        return {}
+    alpha_global = _function_global_values(alpha_func, total_dofs=int(dh.total_dofs))
+    elem_maps = list(getattr(dh, "element_maps", {}).get("alpha", []) or [])
+    n_elem = int(getattr(mesh, "n_elements", len(getattr(mesh, "elements_list", []))))
+    elem_mask = np.zeros((n_elem,), dtype=bool)
+    for eid, gds in enumerate(elem_maps):
+        if eid >= n_elem:
+            break
+        g_arr = np.asarray(gds, dtype=int).ravel()
+        if g_arr.size == 0:
+            continue
+        nodal = np.asarray(alpha_global[g_arr], dtype=float)
+        if nodal.size == 0 or not np.all(np.isfinite(nodal)):
+            continue
+        elem_mask[eid] = bool(np.all(nodal >= thr))
+    counts: dict[str, int] = {}
+    selected_all: set[int] = set()
+    fields = [str(name) for name in list(field_names or []) if str(name).strip()]
+    for field in fields:
+        if field not in getattr(dh, "field_names", ()):
+            counts[field] = 0
+            continue
+        selected = dh.tag_dofs_from_element_bitset("inactive", field, elem_mask, strict=True)
+        selected_set = set(int(g) for g in selected)
+        counts[field] = int(len(selected_set))
+        selected_all.update(selected_set)
+    problem["_inactive_alpha_high_threshold"] = float(thr)
+    problem["_inactive_alpha_high_threshold_element_count"] = int(np.count_nonzero(elem_mask))
+    problem["_inactive_alpha_high_counts"] = dict(counts)
+    problem["_inactive_alpha_high_tagged_dofs"] = set(selected_all)
     return counts
 
 
@@ -2952,6 +3910,12 @@ def _refresh_solver_inactive_solid_interface_band(
             if str(name).strip()
         ) or None
         target_solver.set_active_dofs(_solver_requested_active_dofs(target_solver, requested_fields))
+        block_refresh_cb = getattr(target_solver, "_benchmark7_refresh_block_linear_solver", None)
+        if callable(block_refresh_cb):
+            block_refresh_cb()
+        refresh_cb = getattr(target_solver, "_benchmark7_refresh_active_field_constraints", None)
+        if callable(refresh_cb):
+            refresh_cb()
         target_solver._benchmark7_inactive_solid_signature = signature
     return counts
 
@@ -2963,10 +3927,15 @@ def _set_solver_active_fields_with_tracking(target_solver, active_fields) -> np.
     refresh_cb = getattr(target_solver, "_benchmark7_refresh_active_field_constraints", None)
     if callable(refresh_cb):
         refresh_cb()
+    block_refresh_cb = getattr(target_solver, "_benchmark7_refresh_block_linear_solver", None)
+    if callable(block_refresh_cb):
+        block_refresh_cb()
     return active_dofs
 
 
 def _primary_darcy_field_names(problem: dict[str, object]) -> list[str]:
+    if bool(problem.get("final_form", False)) and problem.get("vP_k") is not None:
+        return ["vP_x", "vP_y"]
     if not bool(problem.get("primary_darcy_flux", False)):
         return []
     dh_fields = tuple(getattr(problem.get("dh"), "field_names", tuple()) or tuple())
@@ -2975,6 +3944,73 @@ def _primary_darcy_field_names(problem: dict[str, object]) -> list[str]:
     if problem.get("lambda_drag_k") is not None:
         return ["lambda_drag_x", "lambda_drag_y"]
     return []
+
+
+def _final_form_domain_lm_active_fields(problem: dict[str, object]) -> list[str]:
+    if not bool(problem.get("final_form_domain_lm", False)):
+        return []
+    fields: list[str] = []
+    for names, key in (
+        (("lm_vf_x", "lm_vf_y"), "lm_vf_k"),
+        (("lm_p",), "lm_p_k"),
+        (("lm_vP_x", "lm_vP_y"), "lm_vP_k"),
+        (("lm_vS_x", "lm_vS_y"), "lm_vS_k"),
+        (("lm_p_pore",), "lm_p_pore_k"),
+        (("lm_phi",), "lm_phi_k"),
+        (("lm_u_x", "lm_u_y"), "lm_u_k"),
+    ):
+        if problem.get(key) is not None:
+            fields.extend(list(names))
+    return fields
+
+
+def _final_form_domain_lm_flow_stage_fields(problem: dict[str, object]) -> list[str]:
+    if not bool(problem.get("final_form_domain_lm", False)):
+        return []
+    fields: list[str] = []
+    for names, key in (
+        (("lm_vf_x", "lm_vf_y"), "lm_vf_k"),
+        (("lm_p",), "lm_p_k"),
+        (("lm_vP_x", "lm_vP_y"), "lm_vP_k"),
+        (("lm_p_pore",), "lm_p_pore_k"),
+    ):
+        if problem.get(key) is not None:
+            fields.extend(list(names))
+    return fields
+
+
+def _final_form_domain_lm_transport_stage_fields(problem: dict[str, object]) -> list[str]:
+    if not bool(problem.get("final_form_domain_lm", False)):
+        return []
+    return ["lm_phi"] if problem.get("lm_phi_k") is not None else []
+
+
+def _final_form_domain_lm_solid_stage_fields(problem: dict[str, object]) -> list[str]:
+    if not bool(problem.get("final_form_domain_lm", False)):
+        return []
+    fields: list[str] = []
+    for names, key in (
+        (("lm_vS_x", "lm_vS_y"), "lm_vS_k"),
+        (("lm_u_x", "lm_u_y"), "lm_u_k"),
+    ):
+        if problem.get(key) is not None:
+            fields.extend(list(names))
+    return fields
+
+
+def _zero_final_form_domain_lm(problem: dict[str, object], *, suffixes: tuple[str, ...] = ("k", "n")) -> None:
+    for suffix in tuple(suffixes):
+        for key in (
+            f"lm_vf_{suffix}",
+            f"lm_p_{suffix}",
+            f"lm_vP_{suffix}",
+            f"lm_vS_{suffix}",
+            f"lm_p_pore_{suffix}",
+            f"lm_phi_{suffix}",
+            f"lm_u_{suffix}",
+        ):
+            if problem.get(key) is not None:
+                problem[key].nodal_values[:] = 0.0
 
 
 def _rigid_support_diagnostic_active_fields(problem: dict[str, object]) -> list[str]:
@@ -2988,6 +4024,28 @@ def _rigid_support_diagnostic_active_fields(problem: dict[str, object]) -> list[
         fields.append("p_mean")
     fields.extend(_primary_darcy_field_names(problem))
     return fields
+
+
+def _final_form_freeze_rho_s(problem: dict[str, object]) -> bool:
+    return bool(problem.get("final_form_freeze_rho_s", False))
+
+
+def _final_form_constant_rho_s(problem: dict[str, object]) -> bool:
+    return bool(problem.get("final_form_constant_rho_s", False))
+
+
+def _post_accept_lag_phi_in_main(problem: dict[str, object]) -> bool:
+    if not bool(problem.get("final_form", False)):
+        return True
+    # On the constant-density final_form branch the post_accept split is the
+    # only robust path. Keeping phi active in the main flow/solid Newton solve
+    # leaves the exact step dominated by the coupled (vP, phi) block, while the
+    # accepted-step transport update is already responsible for restoring the
+    # bounded transport state. Lag phi consistently there and update it together
+    # with alpha after the mechanics step accepts.
+    if _final_form_constant_rho_s(problem):
+        return True
+    return False
 
 
 def _solid_only_diagnostic_active_fields(problem: dict[str, object]) -> list[str]:
@@ -3015,11 +4073,29 @@ def _all_porous_sideflow_diagnostic_active_fields(problem: dict[str, object]) ->
     if problem.get("p_pore_k") is not None:
         fields.append("p_pore")
     fields.extend(_primary_darcy_field_names(problem))
+    if problem.get("final_form", False) and problem.get("phi_k") is not None:
+        fields.append("phi")
     fields.extend(["vS_x", "vS_y", "u_x", "u_y"])
-    if problem.get("B_k") is not None:
+    if (
+        problem.get("rho_s_k") is not None
+        and not _final_form_freeze_rho_s(problem)
+        and not _final_form_constant_rho_s(problem)
+    ):
+        fields.append("rho_s")
+    if (not bool(problem.get("final_form", False))) and problem.get("B_k") is not None:
         fields.append("B")
     if problem.get("pi_s_k") is not None:
         fields.append("pi_s")
+    return fields
+
+
+def _all_fluid_freeflow_diagnostic_active_fields(problem: dict[str, object]) -> list[str]:
+    if str(problem["fluid_space"]).strip().lower() == "hdiv":
+        fields = ["v", "p"]
+    else:
+        fields = ["v_x", "v_y", "p"]
+    if problem.get("p_mean_k") is not None:
+        fields.append("p_mean")
     return fields
 
 
@@ -3177,6 +4253,111 @@ def _benchmark7_requires_constrained_solver(args: argparse.Namespace) -> bool:
 
 def _normalize_benchmark7_solver_choice(args: argparse.Namespace) -> argparse.Namespace:
     solver_key = str(getattr(args, "nonlinear_solver", "pdas")).strip().lower()
+    if _final_form_enabled(args):
+        final_form_phi_mode_key = _final_form_phi_mode_key(getattr(args, "final_form_phi_mode", "auto"))
+        if final_form_phi_mode_key == "auto":
+            print("[info] forcing final_form_phi_mode=transport on one_domain_formulation=final_form.")
+            args.final_form_phi_mode = "transport"
+        if not bool(getattr(args, "enable_phi_evolution", False)):
+            print("[info] enabling enable_phi_evolution for one_domain_formulation=final_form.")
+            args.enable_phi_evolution = True
+        if bool(getattr(args, "full_ratio_free_state", False)):
+            print("[info] disabling full_ratio_free_state on one_domain_formulation=final_form.")
+            args.full_ratio_free_state = False
+        if bool(getattr(args, "split_primary_darcy_flux", False)):
+            print("[info] disabling split_primary_darcy_flux on one_domain_formulation=final_form.")
+            args.split_primary_darcy_flux = False
+        if bool(getattr(args, "one_pressure_primary_darcy_flux", False)):
+            print("[info] disabling one_pressure_primary_darcy_flux on one_domain_formulation=final_form.")
+            args.one_pressure_primary_darcy_flux = False
+        if str(getattr(args, "fluid_space", "cg")).strip().lower() != "cg":
+            print("[info] forcing fluid_space=cg on one_domain_formulation=final_form.")
+            args.fluid_space = "cg"
+        if float(getattr(args, "theta", 1.0)) != 1.0:
+            print("[info] forcing theta=1 on one_domain_formulation=final_form.")
+            args.theta = 1.0
+        if str(getattr(args, "alpha_regularization", "none")).strip().lower() != "none":
+            print("[info] forcing alpha_regularization=none on one_domain_formulation=final_form.")
+            args.alpha_regularization = "none"
+        if float(getattr(args, "D_phi", 0.0) or 0.0) != 0.0:
+            print("[info] forcing D_phi=0 on one_domain_formulation=final_form.")
+            args.D_phi = 0.0
+        if bool(getattr(args, "pressure_mean_constraint", False)):
+            print("[info] disabling pressure_mean_constraint on one_domain_formulation=final_form.")
+            args.pressure_mean_constraint = False
+        if bool(getattr(args, "pressure_interface_closure", False)):
+            print("[info] disabling pressure_interface_closure on one_domain_formulation=final_form.")
+            args.pressure_interface_closure = False
+        if bool(getattr(args, "p_pore_fluid_gauge", False)):
+            print(
+                "[info] keeping p_pore_fluid_gauge on one_domain_formulation=final_form; "
+                "it is used only to suppress nonphysical whole-domain p_pore extension in alpha≈0 regions."
+            )
+        for name in (
+            "interface_entry_closure",
+            "interface_velocity_continuity_closure",
+            "interface_traction_continuity_closure",
+        ):
+            if bool(getattr(args, name, False)):
+                print(f"[info] disabling {name} on one_domain_formulation=final_form.")
+                setattr(args, name, False)
+        if bool(getattr(args, "startup_bootstrap", False)):
+            print("[info] disabling startup_bootstrap on one_domain_formulation=final_form.")
+            args.startup_bootstrap = False
+        if bool(getattr(args, "final_form_domain_lm", False)) and bool(getattr(args, "predictor_corrector_startup", False)):
+            print(
+                "[info] disabling predictor_corrector_startup on one_domain_formulation=final_form with "
+                "final_form_domain_lm so the constrained PDAS mixed step is used directly."
+            )
+            args.predictor_corrector_startup = False
+        elif bool(getattr(args, "predictor_corrector_startup", False)):
+            print(
+                "[info] keeping predictor_corrector_startup on one_domain_formulation=final_form so "
+                "the P2 continuation can relax the normal interface law before the exact corrector."
+            )
+        if bool(getattr(args, "stall_frozen_transport_restart", False)):
+            print("[info] disabling stall_frozen_transport_restart on one_domain_formulation=final_form.")
+            args.stall_frozen_transport_restart = False
+        transport_mode_key = _transport_update_mode_key(getattr(args, "transport_update_mode", "auto"))
+        if transport_mode_key == "auto":
+            if bool(getattr(args, "final_form_constant_rho_s", False)):
+                print(
+                    "[info] forcing transport_update_mode=post_accept on constant-density "
+                    "one_domain_formulation=final_form."
+                )
+                args.transport_update_mode = "post_accept"
+            else:
+                print("[info] forcing transport_update_mode=monolithic on one_domain_formulation=final_form.")
+                args.transport_update_mode = "monolithic"
+        elif transport_mode_key == "post_accept":
+            print("[info] honoring transport_update_mode=post_accept on one_domain_formulation=final_form.")
+        solver_key = str(getattr(args, "nonlinear_solver", "pdas")).strip().lower()
+        if solver_key in {"pdas", "ipm"}:
+            if not bool(getattr(args, "alpha_box_constraints", False)):
+                print("[info] enabling alpha_box_constraints on one_domain_formulation=final_form for constrained solve.")
+                args.alpha_box_constraints = True
+            if not bool(getattr(args, "phi_box_constraints", False)):
+                print("[info] enabling phi_box_constraints on one_domain_formulation=final_form for constrained solve.")
+                args.phi_box_constraints = True
+        if bool(getattr(args, "final_form_constant_rho_s", False)):
+            if float(getattr(args, "gamma_phi", 0.0)) == 0.0:
+                print("[info] enabling gamma_phi=1 on constant-density final_form to drive phi->1 on the free-fluid side.")
+                args.gamma_phi = 1.0
+            if float(getattr(args, "gamma_v", 0.0)) == 0.0:
+                print("[info] enabling gamma_v=1 on constant-density final_form to neutralize free-fluid velocity inside the support.")
+                args.gamma_v = 1.0
+            if float(getattr(args, "gamma_p", 0.0)) == 0.0:
+                print("[info] enabling gamma_p=1 on constant-density final_form to neutralize free-fluid pressure inside the support.")
+                args.gamma_p = 1.0
+            if float(getattr(args, "gamma_vP", 0.0)) == 0.0:
+                print("[info] enabling gamma_vP=1 on constant-density final_form to neutralize pore velocity in the free-fluid region.")
+                args.gamma_vP = 1.0
+            if float(getattr(args, "gamma_p_pore", 0.0)) == 0.0:
+                print("[info] enabling gamma_p_pore=1 on constant-density final_form to neutralize pore pressure in the free-fluid region.")
+                args.gamma_p_pore = 1.0
+            if abs(float(getattr(args, "phi_b", 0.18)) - 0.18) < 1.0e-12:
+                print("[info] promoting phi_b from the legacy default 0.18 to 0.30 on constant-density final_form startup.")
+                args.phi_b = 0.30
     ratio_free_full_state = _full_ratio_free_state_enabled(args)
     split_primary_darcy_flux = _split_primary_darcy_flux_enabled(args)
     one_pressure_primary_darcy_flux = _one_pressure_primary_darcy_flux_enabled(args)
@@ -3186,6 +4367,7 @@ def _normalize_benchmark7_solver_choice(args: argparse.Namespace) -> argparse.Na
     solid_only_diagnostic = bool(getattr(args, "solid_only_diagnostic", False))
     fixed_fluid_poro_solid_diagnostic = bool(getattr(args, "fixed_fluid_poro_solid_diagnostic", False))
     all_porous_sideflow_diagnostic = bool(getattr(args, "all_porous_sideflow_diagnostic", False))
+    all_fluid_freeflow_diagnostic = bool(getattr(args, "all_fluid_freeflow_diagnostic", False))
     if solid_only_diagnostic:
         if not bool(getattr(args, "enable_phi_evolution", False)):
             print("[info] enabling enable_phi_evolution for solid_only_diagnostic.")
@@ -3282,22 +4464,38 @@ def _normalize_benchmark7_solver_choice(args: argparse.Namespace) -> argparse.Na
             )
             args.solid_only_diagnostic = False
     if all_porous_sideflow_diagnostic:
-        if str(getattr(args, "nonlinear_solver", "pdas")).strip().lower() != "pdas":
+        if _final_form_enabled(args):
+            if str(getattr(args, "nonlinear_solver", "pdas")).strip().lower() != "newton":
+                print("[info] forcing nonlinear_solver=newton for final_form all_porous_sideflow_diagnostic.")
+                args.nonlinear_solver = "newton"
+            if bool(getattr(args, "alpha_box_constraints", False)):
+                print("[info] disabling alpha_box_constraints for final_form all_porous_sideflow_diagnostic.")
+                args.alpha_box_constraints = False
+            if bool(getattr(args, "phi_box_constraints", False)):
+                print("[info] disabling phi_box_constraints for final_form all_porous_sideflow_diagnostic.")
+                args.phi_box_constraints = False
+        elif str(getattr(args, "nonlinear_solver", "pdas")).strip().lower() != "pdas":
             print("[info] forcing nonlinear_solver=pdas for all_porous_sideflow_diagnostic.")
             args.nonlinear_solver = "pdas"
         if not bool(getattr(args, "enable_phi_evolution", False)):
             print("[info] enabling enable_phi_evolution for all_porous_sideflow_diagnostic.")
             args.enable_phi_evolution = True
-        if not bool(getattr(args, "full_ratio_free_state", False)):
-            print("[info] enabling full_ratio_free_state for all_porous_sideflow_diagnostic.")
-            args.full_ratio_free_state = True
-        ratio_free_full_state = _full_ratio_free_state_enabled(args)
-        if not bool(getattr(args, "split_primary_darcy_flux", False)):
-            print("[info] enabling split_primary_darcy_flux for all_porous_sideflow_diagnostic.")
-            args.split_primary_darcy_flux = True
-        split_primary_darcy_flux = _split_primary_darcy_flux_enabled(args)
-        one_pressure_primary_darcy_flux = _one_pressure_primary_darcy_flux_enabled(args)
-        primary_darcy_flux = bool(split_primary_darcy_flux or one_pressure_primary_darcy_flux)
+        if _final_form_enabled(args):
+            ratio_free_full_state = False
+            split_primary_darcy_flux = False
+            one_pressure_primary_darcy_flux = False
+            primary_darcy_flux = False
+        else:
+            if not bool(getattr(args, "full_ratio_free_state", False)):
+                print("[info] enabling full_ratio_free_state for all_porous_sideflow_diagnostic.")
+                args.full_ratio_free_state = True
+            ratio_free_full_state = _full_ratio_free_state_enabled(args)
+            if not bool(getattr(args, "split_primary_darcy_flux", False)):
+                print("[info] enabling split_primary_darcy_flux for all_porous_sideflow_diagnostic.")
+                args.split_primary_darcy_flux = True
+            split_primary_darcy_flux = _split_primary_darcy_flux_enabled(args)
+            one_pressure_primary_darcy_flux = _one_pressure_primary_darcy_flux_enabled(args)
+            primary_darcy_flux = bool(split_primary_darcy_flux or one_pressure_primary_darcy_flux)
         if str(getattr(args, "support_physics", "stored_support")).strip().lower() != "stored_support":
             print("[info] forcing support_physics=stored_support for all_porous_sideflow_diagnostic.")
             args.support_physics = "stored_support"
@@ -3337,6 +4535,37 @@ def _normalize_benchmark7_solver_choice(args: argparse.Namespace) -> argparse.Na
         if bool(getattr(args, "fixed_fluid_poro_solid_diagnostic", False)):
             print("[info] disabling fixed_fluid_poro_solid_diagnostic for all_porous_sideflow_diagnostic.")
             args.fixed_fluid_poro_solid_diagnostic = False
+        if bool(getattr(args, "all_fluid_freeflow_diagnostic", False)):
+            print("[info] disabling all_fluid_freeflow_diagnostic for all_porous_sideflow_diagnostic.")
+            args.all_fluid_freeflow_diagnostic = False
+    if all_fluid_freeflow_diagnostic:
+        if str(getattr(args, "nonlinear_solver", "pdas")).strip().lower() != "newton":
+            print("[info] forcing nonlinear_solver=newton for all_fluid_freeflow_diagnostic.")
+            args.nonlinear_solver = "newton"
+        if bool(getattr(args, "alpha_box_constraints", False)):
+            print("[info] disabling alpha_box_constraints for all_fluid_freeflow_diagnostic.")
+            args.alpha_box_constraints = False
+        if bool(getattr(args, "phi_box_constraints", False)):
+            print("[info] disabling phi_box_constraints for all_fluid_freeflow_diagnostic.")
+            args.phi_box_constraints = False
+        if bool(getattr(args, "pressure_mean_constraint", False)):
+            print("[info] disabling pressure_mean_constraint for all_fluid_freeflow_diagnostic.")
+            args.pressure_mean_constraint = False
+        if bool(getattr(args, "pressure_mean_gauge", False)):
+            print("[info] disabling pressure_mean_gauge for all_fluid_freeflow_diagnostic.")
+            args.pressure_mean_gauge = False
+        if bool(getattr(args, "rigid_support_diagnostic", False)):
+            print("[info] disabling rigid_support_diagnostic for all_fluid_freeflow_diagnostic.")
+            args.rigid_support_diagnostic = False
+        if bool(getattr(args, "solid_only_diagnostic", False)):
+            print("[info] disabling solid_only_diagnostic for all_fluid_freeflow_diagnostic.")
+            args.solid_only_diagnostic = False
+        if bool(getattr(args, "fixed_fluid_poro_solid_diagnostic", False)):
+            print("[info] disabling fixed_fluid_poro_solid_diagnostic for all_fluid_freeflow_diagnostic.")
+            args.fixed_fluid_poro_solid_diagnostic = False
+        if bool(getattr(args, "all_porous_sideflow_diagnostic", False)):
+            print("[info] disabling all_porous_sideflow_diagnostic for all_fluid_freeflow_diagnostic.")
+            args.all_porous_sideflow_diagnostic = False
     reduced_alpha_B_mode = _reduced_support_uses_B(
         enable_phi_evolution=bool(getattr(args, "enable_phi_evolution", False)),
         reduced_support_state=getattr(args, "reduced_support_state", "alpha_B"),
@@ -3375,7 +4604,11 @@ def _normalize_benchmark7_solver_choice(args: argparse.Namespace) -> argparse.Na
             "the Seboldt-style normal interface closure only applies when both p and p_pore exist."
         )
         args.interface_entry_closure = False
-    if bool(getattr(args, "interface_bjs_closure", False)) and not bool(ratio_free_full_state):
+    if (
+        bool(getattr(args, "interface_bjs_closure", False))
+        and not bool(ratio_free_full_state)
+        and str(getattr(args, "one_domain_formulation", "split_pressure")).strip().lower() != "final_form"
+    ):
         print(
             "[info] disabling interface_bjs_closure on the legacy single-pressure branch; "
             "the Seboldt-style tangential interface closure is only wired on the split-pressure branch."
@@ -3386,12 +4619,15 @@ def _normalize_benchmark7_solver_choice(args: argparse.Namespace) -> argparse.Na
         and str(getattr(args, "support_physics", "stored_support")).strip().lower() == "stored_support"
         and str(getattr(args, "skeleton_pressure_mode", "whole_domain")).strip().lower() == "seboldt"
         and bool(getattr(args, "interface_bjs_closure", False))
+        and str(getattr(args, "one_domain_formulation", "split_pressure")).strip().lower() != "final_form"
+        and not bool(split_primary_darcy_flux)
         and not bool(getattr(args, "_allow_one_domain_interface_bjs_closure", False))
     ):
         print(
             "[info] disabling interface_bjs_closure on the one-domain stored-support Seboldt branch because "
-            "the interface-condition study found the explicit diffuse BJS term to be the main conditioning "
-            "defect, while the scalar entry closure carries the needed normal coupling."
+            "the non-q-primary diffuse BJS term was the main conditioning defect there. "
+            "The split q-primary branch keeps BJS available because tangential slip is not replaced by the "
+            "normal mass-continuity closure."
         )
         args.interface_bjs_closure = False
     if (
@@ -3428,17 +4664,41 @@ def _normalize_benchmark7_solver_choice(args: argparse.Namespace) -> argparse.Na
                 "implementation reuses the auxiliary vector slot as the Darcy flux field."
             )
             args.drag_formulation = "mixed_lm"
-        if bool(getattr(args, "all_porous_sideflow_diagnostic", False)):
-            pass
-        elif not bool(getattr(args, "interface_velocity_continuity_closure", False)):
+        fluid_space_key = str(getattr(args, "fluid_space", "cg")).strip().lower()
+        darcy_flux_space_key = str(getattr(args, "darcy_flux_space", "auto") or "auto").strip().lower().replace("-", "_")
+        if fluid_space_key == "cg" and darcy_flux_space_key == "auto":
             print(
-                "[info] enabling interface_velocity_continuity_closure on the q-primary split branch so the "
-                "pore row receives the sharp mass-flux data v.n = (vS + q).n through a diffuse interface term."
+                "[info] promoting darcy_flux_space=hdiv on the q-primary split branch so the free fluid keeps "
+                "its CG traction representation while the Darcy discharge q uses a conservative RT normal trace."
             )
-            args.interface_velocity_continuity_closure = True
-            args.interface_velocity_tangential_strength = float(
-                getattr(args, "interface_velocity_tangential_strength", 0.0) or 0.0
+            args.darcy_flux_space = "hdiv"
+            darcy_flux_space_key = "hdiv"
+        if not bool(getattr(args, "interface_velocity_continuity_closure", False)):
+            print(
+                "[info] leaving interface_velocity_continuity_closure disabled on the q-primary split branch. "
+                "Use it only when you explicitly want the extra diffuse mass-transfer model; the clean "
+                "monolithic baseline should rely on the bulk weak form instead."
             )
+        if (
+            bool(getattr(args, "interface_velocity_continuity_closure", False))
+            and str(getattr(args, "interface_velocity_method", "penalty")).strip().lower() == "penalty"
+        ):
+            print(
+                "[info] switching interface_velocity_method to 'nitsche' on the q-primary split branch because "
+                "the legacy penalty path over-drives the Darcy/interface mass transfer, while the Nitsche path "
+                "adds the consistent boundary correction to the pore-balance row."
+            )
+            args.interface_velocity_method = "nitsche"
+        if (
+            bool(getattr(args, "interface_traction_continuity_closure", False))
+            and str(getattr(args, "interface_traction_method", "penalty")).strip().lower() == "penalty"
+        ):
+            print(
+                "[info] switching interface_traction_method to 'nitsche' on the q-primary split branch because "
+                "the corrected Darcy q-row should receive the porous pore-pressure boundary power directly, not "
+                "a diffuse mesh-penalty surrogate."
+            )
+            args.interface_traction_method = "nitsche"
     elif bool(one_pressure_primary_darcy_flux):
         if str(getattr(args, "drag_formulation", "mixed_lm")).strip().lower().replace("-", "_") != "mixed_lm":
             print(
@@ -3473,21 +4733,33 @@ def _normalize_benchmark7_solver_choice(args: argparse.Namespace) -> argparse.Na
     if bool(getattr(args, "interface_velocity_continuity_closure", False)) and bool(
         getattr(args, "interface_bjs_closure", False)
     ):
-        print(
-            "[info] disabling interface_bjs_closure because interface_velocity_continuity_closure "
-            "supersedes the diffuse slip law."
-        )
-        args.interface_bjs_closure = False
+        vel_t_strength = float(getattr(args, "interface_velocity_tangential_strength", 0.0) or 0.0)
+        if abs(vel_t_strength) > 0.0:
+            print(
+                "[info] disabling interface_bjs_closure because interface_velocity_continuity_closure already "
+                "uses a nonzero tangential velocity penalty. Keep interface_velocity_tangential_strength=0 and "
+                "use interface_bjs_closure for the Seboldt tangential slip law."
+            )
+            args.interface_bjs_closure = False
     if (
         bool(getattr(args, "interface_traction_continuity_closure", False))
         and bool(getattr(args, "interface_entry_closure", False))
         and not bool(getattr(args, "_allow_seboldt_interface_split_combo", False))
     ):
-        print(
-            "[info] disabling interface_entry_closure because interface_traction_continuity_closure "
-            "supersedes the scalar entry-resistance surrogate."
-        )
-        args.interface_entry_closure = False
+        if bool(split_primary_darcy_flux):
+            print(
+                "[info] keeping interface_entry_closure together with interface_traction_continuity_closure on "
+                "the q-primary split branch because the entry law now contributes only the explicit Darcy Robin "
+                "resistance delta q_n, while traction continuity carries the momentum transfer and q-row "
+                "pore-pressure boundary power."
+            )
+        else:
+            print(
+                "[info] disabling interface_entry_closure because interface_traction_continuity_closure "
+                "supersedes the scalar entry-resistance surrogate."
+            )
+            args.interface_entry_closure = False
+    prefer_physical_free_pressure_reference = _prefer_physical_free_pressure_reference(args)
     if bool(ratio_free_full_state):
         if str(getattr(args, "support_physics", "stored_support")).strip().lower() != "stored_support":
             print("[info] forcing support_physics=stored_support for the full ratio-free state.")
@@ -3529,14 +4801,15 @@ def _normalize_benchmark7_solver_choice(args: argparse.Namespace) -> argparse.Na
             if str(getattr(args, "skeleton_pressure_mode", "whole_domain")).strip().lower() != "seboldt":
                 print(
                     "[info] forcing skeleton_pressure_mode=seboldt on the split q-primary stored-support branch "
-                    "because the pore row, Darcy row, and interface traction law now use the exact alpha-weighted "
-                    "Biot loading. The legacy whole_domain B-weighted surrogate is inconsistent there."
+                    "because the pore row and skeleton pressure block use the exact Biot loading while the "
+                    "interface law uses the reconstructed Gamma(alpha) transfer without alpha-weakening. "
+                    "The legacy whole_domain B-weighted surrogate is inconsistent there."
                 )
                 args.skeleton_pressure_mode = "seboldt"
             if getattr(args, "alpha_biot", None) is None:
                 print(
                     "[info] setting alpha_biot=1 on the split q-primary stored-support branch so the pore row, "
-                    "skeleton pressure block, and interface pressure loading share the same alpha-weighted Biot coefficient."
+                    "skeleton pressure block, and interface pressure transfer share the same Biot coefficient."
                 )
                 args.alpha_biot = 1.0
         elif (
@@ -3643,7 +4916,12 @@ def _normalize_benchmark7_solver_choice(args: argparse.Namespace) -> argparse.Na
             print("[info] forcing transport_update_mode=monolithic for fixed_fluid_poro_solid_diagnostic.")
             args.transport_update_mode = "monolithic"
     if bool(getattr(args, "all_porous_sideflow_diagnostic", False)):
-        if not bool(ratio_free_full_state):
+        if _final_form_enabled(args):
+            print(
+                "[info] all_porous_sideflow_diagnostic on one_domain_formulation=final_form uses the porous-only "
+                "alpha=1 startup with bottom vP inlet and drained top p_pore=0."
+            )
+        elif not bool(ratio_free_full_state):
             print(
                 "[info] all_porous_sideflow_diagnostic is intended for the full ratio-free split-pressure branch; "
                 "the current normalization has enabled that branch automatically."
@@ -3659,6 +4937,23 @@ def _normalize_benchmark7_solver_choice(args: argparse.Namespace) -> argparse.Na
             args.stall_frozen_transport_restart = False
         if _transport_update_mode_key(getattr(args, "transport_update_mode", "auto")) != "monolithic":
             print("[info] forcing transport_update_mode=monolithic for all_porous_sideflow_diagnostic.")
+            args.transport_update_mode = "monolithic"
+    if bool(getattr(args, "all_fluid_freeflow_diagnostic", False)):
+        print(
+            "[info] all_fluid_freeflow_diagnostic freezes alpha=0 everywhere, keeps only the free-fluid block "
+            "active, and uses the benchmark bottom inflow with p=0 on the top boundary."
+        )
+        if bool(getattr(args, "startup_bootstrap", False)):
+            print("[info] disabling startup_bootstrap for all_fluid_freeflow_diagnostic.")
+            args.startup_bootstrap = False
+        if bool(getattr(args, "predictor_corrector_startup", False)):
+            print("[info] disabling predictor_corrector_startup for all_fluid_freeflow_diagnostic.")
+            args.predictor_corrector_startup = False
+        if bool(getattr(args, "stall_frozen_transport_restart", False)):
+            print("[info] disabling stall_frozen_transport_restart for all_fluid_freeflow_diagnostic.")
+            args.stall_frozen_transport_restart = False
+        if _transport_update_mode_key(getattr(args, "transport_update_mode", "auto")) != "monolithic":
+            print("[info] forcing transport_update_mode=monolithic for all_fluid_freeflow_diagnostic.")
             args.transport_update_mode = "monolithic"
     post_accept_transport_update = bool(_use_post_accept_transport_update(args))
     if post_accept_transport_update:
@@ -3911,11 +5206,27 @@ def _normalize_benchmark7_solver_choice(args: argparse.Namespace) -> argparse.Na
 def _benchmark7_formulation_label(args: argparse.Namespace) -> str:
     if _full_ratio_free_state_enabled(args):
         content_mode = _stored_support_content_mode_key(getattr(args, "stored_support_content_mode", "evolve_B"))
+        if _split_primary_darcy_flux_enabled(args):
+            pore_label = "q"
+        else:
+            pore_label = (
+                "p_pore(exact_conservative_p)"
+                if _split_pore_flux_model_key(args) == "exact_conservative_p"
+                else (
+                    "p_pore(exact_total_continuity)"
+                    if _split_pore_flux_model_key(args) == "exact_total_continuity"
+                    else (
+                    "p_pore(direct_darcy)"
+                    if _split_pore_flux_model_key(args) == "direct_darcy"
+                    else "p_pore(reduced_divq)"
+                    )
+                )
+            )
         if content_mode == "evolve_b":
-            return "stored_support(alpha + B)"
+            return f"stored_support(alpha + B + {pore_label})"
         if content_mode == "freeze_b":
-            return "stored_support(alpha + B, freeze_B)"
-        return "stored_support(alpha + frozen_phi_b)"
+            return f"stored_support(alpha + B + {pore_label}, freeze_B)"
+        return f"stored_support(alpha + frozen_phi_b + {pore_label})"
     if (
         str(getattr(args, "support_physics", "legacy_exchange")).strip().lower() == "stored_support"
         and _reduced_support_uses_B(
@@ -4120,13 +5431,58 @@ def _latent_bounded_formulation_key(obj) -> str:
     return str(raw or "embedded").strip().lower()
 
 
+def _split_pore_flux_model_key(obj) -> str:
+    raw = getattr(obj, "split_pore_flux_model", None) if not isinstance(obj, dict) else obj.get("split_pore_flux_model", None)
+    key = str(raw or "exact_total_continuity").strip().lower().replace("-", "_")
+    if key in {"direct", "direct_darcy", "darcy", "grad_p", "darcy_grad_p", "pressure_diffusion"}:
+        return "direct_darcy"
+    if key in {
+        "exact_conservative_p",
+        "exact_conservative",
+        "conservative_p",
+        "p_conservative",
+        "p_balance",
+        "exact_p",
+    }:
+        return "exact_conservative_p"
+    if key in {
+        "exact_total_continuity",
+        "total_continuity",
+        "total_continuity_p",
+        "band_mass_darcy",
+        "stoter_band_darcy",
+    }:
+        return "exact_total_continuity"
+    if key in {"reduced", "reduced_divq", "divq", "legacy", "derived_flux"}:
+        return "reduced_divq"
+    raise ValueError(
+        f"Unsupported split_pore_flux_model={raw!r}. Use 'direct_darcy', 'exact_conservative_p', 'exact_total_continuity', or 'reduced_divq'."
+    )
+
+
+def _split_pore_momentum_model_key(obj) -> str:
+    raw = (
+        getattr(obj, "split_pore_momentum_model", None)
+        if not isinstance(obj, dict)
+        else obj.get("split_pore_momentum_model", None)
+    )
+    key = str(raw or "band_alpha").strip().lower().replace("-", "_")
+    if key in {"weighted_divp", "weighted_div_p", "divp", "legacy", "weighted_p"}:
+        return "weighted_divp"
+    if key in {"band_alpha", "interface_band", "band_only", "band_p"}:
+        return "band_alpha"
+    raise ValueError(
+        f"Unsupported split_pore_momentum_model={raw!r}. Use 'weighted_divP' or 'band_alpha'."
+    )
+
+
 def _latent_map_expr(z, *, map_kind: str):
     key = str(map_kind).strip().lower()
-    one = Constant(1.0)
+    one = _B7_ONE
     if key == "algebraic":
-        return Constant(0.5) * (one + z / ((one + z * z) ** Constant(0.5)))
+        return _B7_HALF * (one + z / ((one + z * z) ** _B7_HALF))
     if key == "tanh":
-        return Constant(0.5) * (one + tanh(z))
+        return _B7_HALF * (one + tanh(z))
     if key != "sigmoid":
         raise ValueError(f"Unsupported latent bounded map '{map_kind}'.")
     exp_neg = exp(-z)
@@ -4136,12 +5492,12 @@ def _latent_map_expr(z, *, map_kind: str):
 def _latent_map_prime_expr(z, *, map_kind: str):
     key = str(map_kind).strip().lower()
     if key == "algebraic":
-        return Constant(0.5) * ((Constant(1.0) + z * z) ** Constant(-1.5))
+        return _B7_HALF * ((_B7_ONE + z * z) ** _named_constant("b7_neg_three_halves", -1.5))
     if key == "tanh":
         th = tanh(z)
-        return Constant(0.5) * (Constant(1.0) - th * th)
+        return _B7_HALF * (_B7_ONE - th * th)
     sig = _latent_map_expr(z, map_kind=key)
-    return sig * (Constant(1.0) - sig)
+    return sig * (_B7_ONE - sig)
 
 
 def _latent_inverse_array(values, *, eps: float, map_kind: str) -> np.ndarray:
@@ -4177,6 +5533,75 @@ def _latent_forward_array(values, *, map_kind: str) -> np.ndarray:
         ez = np.exp(zz[~pos])
         out[~pos] = ez / (1.0 + ez)
     return out
+
+def _geometry_indicator_mode_key(raw) -> str:
+    key = str(raw or "raw").strip().lower().replace("-", "_")
+    if key not in {"raw", "tanh", "parabolic_envelope"}:
+        raise ValueError(
+            f"Unsupported geometry_indicator_mode={raw!r}. Use 'raw', 'tanh', or 'parabolic_envelope'."
+        )
+    return key
+
+
+def _parabolic_interface_envelope_expr(alpha_expr):
+    delta = alpha_expr - _B7_HALF
+    return _named_constant("b7_geometry_indicator_quad4", 4.0) * delta * delta
+
+
+def _parabolic_interface_envelope_prime_expr(alpha_expr):
+    return _named_constant("b7_geometry_indicator_quad8", 8.0) * (alpha_expr - _B7_HALF)
+
+
+def _geometry_indicator_expr(alpha_expr, *, beta: float, mode: str = "raw") -> object:
+    mode_key = _geometry_indicator_mode_key(mode)
+    if mode_key == "parabolic_envelope":
+        envelope = _parabolic_interface_envelope_expr(alpha_expr)
+        return alpha_expr * envelope
+    beta_val = float(beta)
+    if beta_val <= 0.0:
+        return alpha_expr
+    z = _named_constant("b7_geometry_indicator_beta", beta_val) * (alpha_expr - _B7_HALF)
+    return _B7_HALF * (_B7_ONE + tanh(z))
+
+
+def _geometry_indicator_prime_expr(alpha_expr, *, beta: float, mode: str = "raw") -> object:
+    mode_key = _geometry_indicator_mode_key(mode)
+    if mode_key == "parabolic_envelope":
+        envelope = _parabolic_interface_envelope_expr(alpha_expr)
+        denvelope = _parabolic_interface_envelope_prime_expr(alpha_expr)
+        return envelope + alpha_expr * denvelope
+    beta_val = float(beta)
+    if beta_val <= 0.0:
+        return _B7_ONE
+    z = _named_constant("b7_geometry_indicator_beta", beta_val) * (alpha_expr - _B7_HALF)
+    th = tanh(z)
+    return _named_constant("b7_geometry_indicator_half_beta", 0.5 * beta_val) * (_B7_ONE - th * th)
+
+
+def _geometry_indicator_array(values, *, beta: float, mode: str = "raw") -> np.ndarray:
+    vals = np.asarray(values, dtype=float)
+    mode_key = _geometry_indicator_mode_key(mode)
+    if mode_key == "parabolic_envelope":
+        envelope = 4.0 * np.square(vals - 0.5)
+        return vals * envelope
+    beta_val = float(beta)
+    if beta_val <= 0.0:
+        return vals
+    return 0.5 * (1.0 + np.tanh(beta_val * (vals - 0.5)))
+
+
+def _geometry_indicator_prime_array(values, *, beta: float, mode: str = "raw") -> np.ndarray:
+    vals = np.asarray(values, dtype=float)
+    mode_key = _geometry_indicator_mode_key(mode)
+    if mode_key == "parabolic_envelope":
+        envelope = 4.0 * np.square(vals - 0.5)
+        denvelope = 8.0 * (vals - 0.5)
+        return envelope + vals * denvelope
+    beta_val = float(beta)
+    if beta_val <= 0.0:
+        return np.ones_like(vals, dtype=float)
+    th = np.tanh(beta_val * (vals - 0.5))
+    return 0.5 * beta_val * (1.0 - th * th)
 
 
 def _latent_mass_return_shift(
@@ -4693,14 +6118,32 @@ def _compute_interface_probe_diagnostics(
     y = xy[:, 1]
 
     alpha_vals, grad_alpha = _eval_scalar_with_grad_from_cache(problem, f_scalar=problem["alpha_k"], cache=cache)
-    grad_alpha_norm = np.linalg.norm(grad_alpha, axis=1)
+    geometry_indicator_beta = float(problem.get("geometry_indicator_beta", 0.0) or 0.0)
+    geometry_indicator_mode = str(problem.get("geometry_indicator_mode", "raw") or "raw")
+    alpha_support_vals = _geometry_indicator_array(
+        alpha_vals,
+        beta=geometry_indicator_beta,
+        mode=geometry_indicator_mode,
+    )
+    alpha_support_prime = _geometry_indicator_prime_array(
+        alpha_vals,
+        beta=geometry_indicator_beta,
+        mode=geometry_indicator_mode,
+    )
+    grad_alpha_support = alpha_support_prime[:, None] * grad_alpha
+    grad_alpha_norm = np.linalg.norm(grad_alpha_support, axis=1)
     normal = np.zeros_like(grad_alpha)
     valid_normal = grad_alpha_norm > 1.0e-12
-    normal[valid_normal] = grad_alpha[valid_normal] / grad_alpha_norm[valid_normal, None]
+    normal[valid_normal] = grad_alpha_support[valid_normal] / grad_alpha_norm[valid_normal, None]
     tangent = np.column_stack((normal[:, 1], -normal[:, 0]))
 
     v_vals, grad_v = _eval_vector_with_grad_from_cache(problem, f_vec=problem["v_k"], cache=cache)
     vS_vals, grad_vS = _eval_vector_with_grad_from_cache(problem, f_vec=problem["vS_k"], cache=cache)
+    if problem.get("vP_k") is not None:
+        vP_vals, grad_vP = _eval_vector_with_grad_from_cache(problem, f_vec=problem["vP_k"], cache=cache)
+    else:
+        vP_vals = np.asarray(v_vals, dtype=float)
+        grad_vP = np.asarray(grad_v, dtype=float)
     u_vals, grad_u = _eval_vector_with_grad_from_cache(problem, f_vec=problem["u_k"], cache=cache)
     p_vals, _ = _eval_scalar_with_grad_from_cache(problem, f_scalar=problem["p_k"], cache=cache)
 
@@ -4711,9 +6154,15 @@ def _compute_interface_probe_diagnostics(
     P_prev_vals = np.full(alpha_vals.shape, np.nan, dtype=float)
     phi_vals = np.full(alpha_vals.shape, np.nan, dtype=float)
     phi_prev_vals = np.full(alpha_vals.shape, np.nan, dtype=float)
+    rho_s_vals = np.full(alpha_vals.shape, float(problem.get("rho_s0_tilde", 1.0)), dtype=float)
     alpha_n_eff_vals = np.full(alpha_vals.shape, np.nan, dtype=float)
     if problem.get("alpha_n") is not None:
         alpha_n_eff_vals, _ = _eval_scalar_with_grad_from_cache(problem, f_scalar=problem["alpha_n"], cache=cache)
+    alpha_support_prev_vals = _geometry_indicator_array(
+        alpha_n_eff_vals,
+        beta=geometry_indicator_beta,
+        mode=geometry_indicator_mode,
+    )
 
     if problem.get("B_k") is not None:
         B_vals, grad_B = _eval_scalar_with_grad_from_cache(problem, f_scalar=problem["B_k"], cache=cache)
@@ -4727,6 +6176,8 @@ def _compute_interface_probe_diagnostics(
         phi_vals, grad_phi = _eval_scalar_with_grad_from_cache(problem, f_scalar=problem["phi_k"], cache=cache)
         if problem.get("phi_n") is not None:
             phi_prev_vals, _ = _eval_scalar_with_grad_from_cache(problem, f_scalar=problem["phi_n"], cache=cache)
+        if problem.get("rho_s_k") is not None:
+            rho_s_vals, _ = _eval_scalar_with_grad_from_cache(problem, f_scalar=problem["rho_s_k"], cache=cache)
         P_vals = alpha_vals * phi_vals
         P_prev_vals = alpha_n_eff_vals * phi_prev_vals
         B_vals = alpha_vals - P_vals
@@ -4758,21 +6209,15 @@ def _compute_interface_probe_diagnostics(
     pore_coeff = np.full(alpha_vals.shape, np.nan, dtype=float)
     if problem.get("p_pore_k") is not None:
         biot = 1.0 if alpha_biot is None else float(alpha_biot)
-        pore_balance_coeff = float(biot) * np.asarray(alpha_vals, dtype=float)
-        if skel_press_key == "whole_domain" and alpha_biot is None and problem.get("B_k") is not None:
-            # Legacy whole-domain surrogate used by the skeleton/interface
-            # loading diagnostics. This is intentionally distinct from the
-            # alpha-weighted pore continuity coefficient above.
-            pore_coeff = np.asarray(B_vals, dtype=float)
-        else:
-            pore_coeff = float(biot) * np.asarray(alpha_vals, dtype=float)
+        pore_balance_coeff = float(biot) * np.asarray(alpha_support_vals, dtype=float)
+        pore_coeff = float(biot) * np.ones_like(alpha_vals, dtype=float)
     pore_interface_pressure = pore_coeff * p_pore_vals
     # Single-pressure support-bearing porous pressure surrogate used by the
     # assembled skeleton block:
     #   legacy branch: -(p, div(B eta))      <=>  support traction  -B p n
     #   q-primary branch: -(p, div(alpha eta)) <=>  support traction -alpha p n
     if bool(problem.get("one_pressure_primary_darcy_flux", False)):
-        singlep_support_pressure = np.asarray(alpha_vals * p_vals, dtype=float)
+        singlep_support_pressure = np.asarray(alpha_support_vals * p_vals, dtype=float)
     else:
         singlep_support_pressure = np.asarray(B_vals * p_vals, dtype=float)
 
@@ -4794,7 +6239,7 @@ def _compute_interface_probe_diagnostics(
     sigma_solid_visc = (2.0 * float(solid_visco_eta)) * eps_vS
     sigma_porous_raw = sigma_solid + sigma_solid_visc - pore_interface_pressure[:, None, None] * I[None, :, :]
     sigma_porous_support = (
-        alpha_vals[:, None, None] * (sigma_solid + sigma_solid_visc)
+        alpha_support_vals[:, None, None] * (sigma_solid + sigma_solid_visc)
         - pore_interface_pressure[:, None, None] * I[None, :, :]
     )
 
@@ -4819,8 +6264,8 @@ def _compute_interface_probe_diagnostics(
 
     solid_traction = np.einsum("nij,nj->ni", sigma_solid, normal)
     solid_visc_traction = np.einsum("nij,nj->ni", sigma_solid_visc, normal)
-    solid_traction_support = alpha_vals[:, None] * solid_traction
-    solid_visc_traction_support = alpha_vals[:, None] * solid_visc_traction
+    solid_traction_support = alpha_support_vals[:, None] * solid_traction
+    solid_visc_traction_support = alpha_support_vals[:, None] * solid_visc_traction
     fluid_pressure_traction = (-p_vals)[:, None] * normal
     fluid_visc_traction = traction_free - fluid_pressure_traction
     pore_pressure_traction = (-pore_interface_pressure)[:, None] * normal
@@ -4849,18 +6294,29 @@ def _compute_interface_probe_diagnostics(
     rel = v_vals - vS_vals
     rel_n = np.einsum("ni,ni->n", rel, normal)
     rel_t = np.einsum("ni,ni->n", rel, tangent)
-    if bool(primary_darcy_flux) and q_flux_vals is not None:
+    if bool(problem.get("final_form", False)):
+        free_flux_n = float(problem.get("rho_f", 1.0)) * v_n
+        porous_mix_n = rho_s_vals * (phi_vals * np.einsum("ni,ni->n", vP_vals, normal) + (1.0 - phi_vals) * vS_n)
+        mass_flux_jump_n = free_flux_n - porous_mix_n
+        mass_transfer_target_q_n = porous_mix_n
+        mass_transfer_residual_n = mass_flux_jump_n
+        q_vec_vals = np.asarray(vP_vals, dtype=float)
+        q_n = np.einsum("ni,ni->n", vP_vals, normal)
+        vP_n = q_n
+    elif bool(primary_darcy_flux) and q_flux_vals is not None:
         q_vec_vals = np.asarray(q_flux_vals, dtype=float)
         q_n = np.einsum("ni,ni->n", q_flux_vals, normal)
         porous_mix_n = vS_n + q_n
         mass_flux_jump_n = v_n - porous_mix_n
+        free_flux_n = v_n
     else:
         q_vec_vals = P_vals[:, None] * rel
         q_n = P_vals * rel_n
         porous_mix_n = (1.0 - phi_vals) * vS_n + phi_vals * v_n
         mass_flux_jump_n = v_n - porous_mix_n
-    mass_transfer_target_q_n = rel_n
-    mass_transfer_residual_n = q_n - mass_transfer_target_q_n
+        free_flux_n = v_n
+        mass_transfer_target_q_n = rel_n
+        mass_transfer_residual_n = q_n - mass_transfer_target_q_n
 
     visc_n_free = np.einsum("ni,ni->n", traction_free, normal) + p_vals
     traction_free_n = np.einsum("ni,ni->n", traction_free, normal)
@@ -4906,7 +6362,7 @@ def _compute_interface_probe_diagnostics(
     pore_storage_term = pore_balance_coeff * float(problem.get("storativity_c0", 0.0) or 0.0) * pore_p_skel_rate
     pore_divvS_term = pore_balance_coeff * div_vS
     pore_row_balance = pore_divvS_term + pore_divQ_term - pore_source_term + pore_storage_term
-    one_m_alpha = 1.0 - alpha_vals
+    one_m_alpha = 1.0 - alpha_support_vals
     p_pore_fluid_w4 = one_m_alpha * one_m_alpha
     p_pore_fluid_w4 = p_pore_fluid_w4 * p_pore_fluid_w4
     p_pore_fluid_w8 = p_pore_fluid_w4 * p_pore_fluid_w4
@@ -4921,7 +6377,7 @@ def _compute_interface_probe_diagnostics(
     lambda_drag_t = np.einsum("ni,ni->n", lambda_drag_vals, tangent)
     fluid_visc_diss_density = 2.0 * float(mu_f) * np.sum(eps_v * eps_v, axis=(1, 2))
     solid_visc_diss_density = 2.0 * float(solid_visco_eta) * np.sum(eps_vS * eps_vS, axis=(1, 2))
-    support_solid_visc_diss_density = alpha_vals * solid_visc_diss_density
+    support_solid_visc_diss_density = alpha_support_vals * solid_visc_diss_density
 
     interface_corner_taper = None
     if problem.get("interface_corner_taper") is not None:
@@ -4944,11 +6400,11 @@ def _compute_interface_probe_diagnostics(
     wall_distance_x = np.minimum(x, float(Lx) - x)
     wall_distance_x = np.where(np.isfinite(wall_distance_x), np.maximum(wall_distance_x, 0.0), np.nan)
 
-    band_weight_base = 4.0 * alpha_vals * (1.0 - alpha_vals)
+    band_weight_base = 4.0 * alpha_support_vals * (1.0 - alpha_support_vals)
     band_weight_base = np.where(valid_normal, np.maximum(band_weight_base, 0.0), 0.0)
     band_weight = band_weight_base * corner_taper
     band_delta_weight = band_weight / max(float(eps_alpha), 1.0e-12)
-    band_mask_raw = valid_normal & (alpha_vals > 1.0e-4) & (alpha_vals < (1.0 - 1.0e-4))
+    band_mask_raw = valid_normal & (alpha_support_vals > 1.0e-4) & (alpha_support_vals < (1.0 - 1.0e-4))
     band_mask = band_mask_raw & corner_active
     band_weight_masked = np.where(band_mask, band_weight, 0.0)
     band_delta_weight_masked = np.where(band_mask, band_delta_weight, 0.0)
@@ -4963,8 +6419,10 @@ def _compute_interface_probe_diagnostics(
         "x": x,
         "y": y,
         "alpha": alpha_vals,
-        "alpha_grad_x": grad_alpha[:, 0],
-        "alpha_grad_y": grad_alpha[:, 1],
+        "alpha_support": alpha_support_vals,
+        "alpha_support_prev": alpha_support_prev_vals,
+        "alpha_grad_x": grad_alpha_support[:, 0],
+        "alpha_grad_y": grad_alpha_support[:, 1],
         "alpha_grad_norm": grad_alpha_norm,
         "normal_x": normal[:, 0],
         "normal_y": normal[:, 1],
@@ -4990,7 +6448,7 @@ def _compute_interface_probe_diagnostics(
         "u_x": u_vals[:, 0],
         "u_y": u_vals[:, 1],
         "u_mag": np.linalg.norm(u_vals, axis=1),
-        "free_flux_n": v_n,
+        "free_flux_n": free_flux_n,
         "porous_flux_n": porous_mix_n,
         "mass_flux_jump_n": mass_flux_jump_n,
         "mass_transfer_target_q_n": mass_transfer_target_q_n,
@@ -5078,6 +6536,68 @@ def _compute_interface_probe_diagnostics(
         rows: list[dict[str, float]] = []
         for ii in idx:
             rows.append({key: float(np.asarray(val, dtype=float)[ii]) for key, val in data_map.items()})
+        return rows
+
+    def _profile_rows_from_band(
+        mask: np.ndarray,
+        *,
+        group_key: str,
+        weight_key: str,
+        round_digits: int = 12,
+    ) -> list[dict[str, float]]:
+        idx = np.flatnonzero(mask)
+        if idx.size == 0:
+            return []
+        weights_all = np.asarray(data_map.get(weight_key, np.ones_like(x)), dtype=float)
+        group_vals = np.asarray(data_map[group_key], dtype=float)
+        numeric_keys: list[str] = []
+        numeric_arrays: dict[str, np.ndarray] = {}
+        for key, values in data_map.items():
+            arr = np.asarray(values, dtype=float)
+            if arr.shape == group_vals.shape:
+                numeric_keys.append(str(key))
+                numeric_arrays[str(key)] = arr
+        groups: dict[float, dict[str, float]] = {}
+        for ii in idx:
+            x_val = float(group_vals[ii])
+            w_val = float(weights_all[ii])
+            if not np.isfinite(x_val):
+                continue
+            if not np.isfinite(w_val) or w_val <= 0.0:
+                continue
+            bucket_key = round(x_val, int(round_digits))
+            bucket = groups.setdefault(
+                bucket_key,
+                {
+                    "weight_sum": 0.0,
+                    "sample_count": 0.0,
+                },
+            )
+            bucket["weight_sum"] += w_val
+            bucket["sample_count"] += 1.0
+            for key in numeric_keys:
+                val = float(numeric_arrays[key][ii])
+                if not np.isfinite(val):
+                    continue
+                bucket[key] = bucket.get(key, 0.0) + w_val * val
+        rows: list[dict[str, float]] = []
+        for bucket_key in sorted(groups):
+            bucket = groups[bucket_key]
+            wsum = float(bucket.get("weight_sum", 0.0))
+            if not np.isfinite(wsum) or wsum <= 0.0:
+                continue
+            row: dict[str, float] = {
+                "weight_sum": float(wsum),
+                "sample_count": float(bucket.get("sample_count", 0.0)),
+            }
+            for key in numeric_keys:
+                accum = float(bucket.get(key, float("nan")))
+                row[key] = float(accum / wsum) if np.isfinite(accum) else float("nan")
+            if "x" in row and np.isfinite(float(row["x"])):
+                row["x"] = float(bucket_key)
+            else:
+                row["x"] = float(bucket_key)
+            rows.append(row)
         return rows
 
     summary: dict[str, object] = {
@@ -5219,6 +6739,30 @@ def _compute_interface_probe_diagnostics(
     summary.update(_weighted_metric_summary(lambda_drag_n[line_mask], line_weights[line_mask], prefix="interface_line_lambda_drag_n"))
     summary.update(_weighted_metric_summary(lambda_drag_t[line_mask], line_weights[line_mask], prefix="interface_line_lambda_drag_t"))
 
+    interface_profile_rows = _profile_rows_from_band(
+        band_mask_raw,
+        group_key="x",
+        weight_key="band_delta_weight",
+    )
+    if interface_profile_rows:
+        unit_weights = np.ones((len(interface_profile_rows),), dtype=float)
+        for key, prefix in (
+            ("mass_flux_jump_n", "interface_profile_mass_flux_jump_n"),
+            ("traction_jump_n", "interface_profile_traction_jump_n"),
+            ("traction_jump_t", "interface_profile_traction_jump_t"),
+            ("traction_jump_mag", "interface_profile_traction_jump_mag"),
+            ("entry_residual", "interface_profile_entry_residual"),
+            ("free_flux_n", "interface_profile_free_flux_n"),
+            ("porous_flux_n", "interface_profile_porous_flux_n"),
+            ("q_n", "interface_profile_q_n"),
+            ("traction_free_n", "interface_profile_traction_free_n"),
+            ("traction_porous_singlep_support_n", "interface_profile_traction_porous_singlep_support_n"),
+        ):
+            values = np.asarray([float(row.get(key, float("nan"))) for row in interface_profile_rows], dtype=float)
+            summary.update(_weighted_metric_summary(values, unit_weights, prefix=prefix))
+        x_vals = np.asarray([float(row.get("x", float("nan"))) for row in interface_profile_rows], dtype=float)
+        summary["interface_profile_point_count"] = float(np.count_nonzero(np.isfinite(x_vals)))
+
     center_rows = _rows_from_mask(center_mask, sort_keys=("y", "x"))
     if center_rows:
         y_center = np.asarray([row["y"] for row in center_rows], dtype=float)
@@ -5277,6 +6821,7 @@ def _compute_interface_probe_diagnostics(
     return {
         "summary": summary,
         "band_rows": _rows_from_mask(band_mask_raw, sort_keys=("y", "x")),
+        "interface_profile_rows": interface_profile_rows,
         "interface_line_rows": _rows_from_mask(line_mask_raw, sort_keys=("x", "y")),
         "centerline_rows": center_rows,
     }
@@ -5446,6 +6991,7 @@ def _create_problem(
     fluid_hdiv_order: int = 0,
     darcy_flux_space: str = "auto",
     enable_phi_evolution: bool,
+    one_domain_formulation: str = "legacy",
     reduced_support_state: str = "alpha_B",
     latent_bounded_transport: bool = False,
     latent_bounded_fields: tuple[str, ...] | None = None,
@@ -5457,14 +7003,32 @@ def _create_problem(
     drag_formulation: str = "direct",
     full_ratio_free_state: bool = False,
     split_primary_darcy_flux: bool = False,
+    split_pore_flux_model: str = "exact_conservative_p",
+    split_pore_momentum_model: str = "band_alpha",
+    fluid_mass_model: str = "transported_free_content",
     one_pressure_primary_darcy_flux: bool = False,
     stored_support_content_mode: str = "evolve_B",
     transport_update_mode: str = "auto",
+    final_form_phi_mode: str = "auto",
+    final_form_implementation: str = "tensor",
+    final_form_constant_rho_s: bool = False,
+    final_form_domain_lm: bool = False,
+    final_form_domain_lm_aug_gamma: float = 10.0,
+    final_form_mass_lm_aug_gamma: float = 1.0,
+    final_form_normal_lm_aug_gamma: float = 1.0,
+    y_interface: float = 1.0,
+    eps_alpha: float = 0.0,
+    adaptive_interface_target_cells: float = 0.0,
+    adaptive_interface_band_halfwidth_factor: float = 1.0,
+    adaptive_interface_max_ref: int = 4,
 ) -> dict[str, object]:
+    formulation_key = str(one_domain_formulation or "legacy").strip().lower().replace("-", "_")
+    use_final_form = formulation_key == "final_form"
+    use_final_form_constant_rho_s = bool(use_final_form) and bool(final_form_constant_rho_s)
     fluid_space_key = str(fluid_space).strip().lower()
     if fluid_space_key not in {"cg", "hdiv"}:
         raise ValueError(f"Unsupported fluid_space={fluid_space!r}.")
-    use_ratio_free_full_state = bool(enable_phi_evolution) and bool(full_ratio_free_state)
+    use_ratio_free_full_state = bool(enable_phi_evolution) and bool(full_ratio_free_state) and not bool(use_final_form)
     use_split_primary_darcy_flux = bool(use_ratio_free_full_state) and bool(split_primary_darcy_flux)
     use_one_pressure_primary_darcy_flux = (
         bool(enable_phi_evolution)
@@ -5484,9 +7048,13 @@ def _create_problem(
         )
     use_hdiv_primary_darcy_flux = bool(use_primary_darcy_flux) and darcy_flux_space_key == "hdiv"
     use_pressure_mean_constraint = bool(pressure_mean_constraint) and bool(use_ratio_free_full_state)
-    reduced_support_uses_B = _reduced_support_uses_B(
-        enable_phi_evolution=bool(enable_phi_evolution),
-        reduced_support_state=reduced_support_state,
+    reduced_support_uses_B = (
+        False
+        if bool(use_final_form)
+        else _reduced_support_uses_B(
+            enable_phi_evolution=bool(enable_phi_evolution),
+            reduced_support_state=reduced_support_state,
+        )
     ) or use_ratio_free_full_state
     latent_field_set = {
         str(name).strip()
@@ -5498,19 +7066,22 @@ def _create_problem(
         if str(name).strip()
     }
 
-    nodes, elems, _, corners = structured_quad(float(Lx), float(Ly), nx=int(nx), ny=int(ny), poly_order=int(poly_order))
-    mesh = Mesh(
-        nodes=nodes,
-        element_connectivity=elems,
-        elements_corner_nodes=corners,
-        element_type="quad",
+    mesh, mesh_adaptivity_meta = _build_benchmark7_mesh(
+        Lx=float(Lx),
+        Ly=float(Ly),
+        nx=int(nx),
+        ny=int(ny),
         poly_order=int(poly_order),
+        y_interface=float(y_interface),
+        eps_alpha=float(eps_alpha),
+        adaptive_interface_target_cells=float(adaptive_interface_target_cells),
+        adaptive_interface_band_halfwidth_factor=float(adaptive_interface_band_halfwidth_factor),
+        adaptive_interface_max_ref=int(adaptive_interface_max_ref),
     )
-    _tag_rectangle_boundaries(mesh, Lx=float(Lx), Ly=float(Ly))
 
     field_specs = {
         "p": int(pressure_order),
-        **({"p_pore": int(pressure_order)} if bool(use_ratio_free_full_state) else {}),
+        **({"p_pore": int(pressure_order)} if (bool(use_ratio_free_full_state) or bool(use_final_form)) else {}),
         **({"p_mean": ":number:"} if bool(use_pressure_mean_constraint) else {}),
         **({"alpha_mass_lm": ":number:"} if bool(alpha_mass_constraint) and not bool(latent_bounded_transport) else {}),
         **({"pi_s": int(pressure_order)} if bool(solid_volumetric_split) else {}),
@@ -5518,6 +7089,41 @@ def _create_problem(
         "vS_y": int(poly_order),
         "u_x": int(poly_order),
         "u_y": int(poly_order),
+        **(
+            {
+                "vP_x": int(poly_order),
+                "vP_y": int(poly_order),
+                # The explicit diffuse-interface multipliers are local carrier
+                # fields. Keeping them discontinuous cellwise avoids dragging
+                # continuous LM traces across pure-domain cells and reduces the
+                # size of the interface saddle block.
+                "mu_mass": ("DG", 0),
+                "mu_normal": ("DG", 0),
+                "mu_tangent": ("DG", 0),
+                "mu_kin_x": ("DG", 0),
+                "mu_kin_y": ("DG", 0),
+                **(
+                    {
+                        "lm_vf_x": ("DG", 0),
+                        "lm_vf_y": ("DG", 0),
+                        "lm_p": ("DG", 0),
+                        "lm_vP_x": ("DG", 0),
+                        "lm_vP_y": ("DG", 0),
+                        "lm_vS_x": ("DG", 0),
+                        "lm_vS_y": ("DG", 0),
+                        "lm_p_pore": ("DG", 0),
+                        "lm_phi": ("DG", 0),
+                        "lm_u_x": ("DG", 0),
+                        "lm_u_y": ("DG", 0),
+                    }
+                    if bool(final_form_domain_lm)
+                    else {}
+                ),
+            }
+            if bool(use_final_form)
+            else {}
+        ),
+        **({"rho_s": int(scalar_order)} if bool(use_final_form) and not bool(use_final_form_constant_rho_s) else {}),
         **(
             (
                 {"q": ("RT", int(fluid_hdiv_order))}
@@ -5529,7 +7135,7 @@ def _create_problem(
         ),
         "alpha": int(scalar_order),
         **({"B": int(scalar_order)} if bool(reduced_support_uses_B) else {}),
-        "mu_alpha": int(scalar_order),
+        **({"mu_alpha": int(scalar_order)} if not bool(use_final_form) else {}),
     }
     if fluid_space_key == "cg":
         field_specs = {"v_x": int(poly_order), "v_y": int(poly_order), **field_specs}
@@ -5537,8 +7143,9 @@ def _create_problem(
         field_specs = {"v": ("RT", int(fluid_hdiv_order)), **field_specs}
     if bool(enable_phi_evolution) and not bool(use_ratio_free_full_state):
         field_specs["phi"] = int(scalar_order)
-        field_specs["S"] = int(scalar_order)
-    elif bool(enable_phi_evolution):
+        if not bool(use_final_form):
+            field_specs["S"] = int(scalar_order)
+    elif bool(enable_phi_evolution) and not bool(use_final_form):
         field_specs["S"] = int(scalar_order)
     if bool(latent_bounded_transport):
         if "alpha" in latent_field_set:
@@ -5550,6 +7157,28 @@ def _create_problem(
 
     VS = FunctionSpace("VS", ["vS_x", "vS_y"], dim=1)
     U = FunctionSpace("U", ["u_x", "u_y"], dim=1)
+    VP = FunctionSpace("VP", ["vP_x", "vP_y"], dim=1) if bool(use_final_form) else None
+    MU_KIN = FunctionSpace("MU_KIN", ["mu_kin_x", "mu_kin_y"], dim=1) if bool(use_final_form) else None
+    LM_VF = (
+        FunctionSpace("LM_VF", ["lm_vf_x", "lm_vf_y"], dim=1)
+        if bool(use_final_form) and bool(final_form_domain_lm)
+        else None
+    )
+    LM_VP = (
+        FunctionSpace("LM_VP", ["lm_vP_x", "lm_vP_y"], dim=1)
+        if bool(use_final_form) and bool(final_form_domain_lm)
+        else None
+    )
+    LM_VS = (
+        FunctionSpace("LM_VS", ["lm_vS_x", "lm_vS_y"], dim=1)
+        if bool(use_final_form) and bool(final_form_domain_lm)
+        else None
+    )
+    LM_U = (
+        FunctionSpace("LM_U", ["lm_u_x", "lm_u_y"], dim=1)
+        if bool(use_final_form) and bool(final_form_domain_lm)
+        else None
+    )
     lambda_drag_space = None
     lambda_drag_hdiv_field = None
     if "lambda_drag_x" in field_specs:
@@ -5571,6 +7200,7 @@ def _create_problem(
 
     problem: dict[str, object] = {
         "mesh": mesh,
+        "_mesh_adaptivity_meta": dict(mesh_adaptivity_meta),
         "me": me,
         "dh": dh,
         "fluid_space": fluid_space_key,
@@ -5579,43 +7209,70 @@ def _create_problem(
         "dv": dv,
         "dvS": VectorTrialFunction(space=VS, dof_handler=dh),
         "du": VectorTrialFunction(space=U, dof_handler=dh),
+        "dvP": (None if VP is None else VectorTrialFunction(space=VP, dof_handler=dh)),
         "dlambda_drag": (
             HdivTrialFunction(lambda_drag_hdiv_field)
             if lambda_drag_hdiv_field is not None
             else (None if lambda_drag_space is None else VectorTrialFunction(space=lambda_drag_space, dof_handler=dh))
         ),
         "dp": TrialFunction("p", dof_handler=dh),
-        "dp_pore": (TrialFunction("p_pore", dof_handler=dh) if bool(use_ratio_free_full_state) else None),
+        "dp_pore": (TrialFunction("p_pore", dof_handler=dh) if (bool(use_ratio_free_full_state) or bool(use_final_form)) else None),
         "dp_mean": (TrialFunction("p_mean", dof_handler=dh) if bool(use_pressure_mean_constraint) else None),
         "dalpha_mass_lm": (TrialFunction("alpha_mass_lm", dof_handler=dh) if "alpha_mass_lm" in field_specs else None),
         "dpi_s": (TrialFunction("pi_s", dof_handler=dh) if bool(solid_volumetric_split) else None),
         "dalpha": TrialFunction("alpha", dof_handler=dh),
         "dB": (TrialFunction("B", dof_handler=dh) if bool(reduced_support_uses_B) else None),
-        "dmu": TrialFunction("mu_alpha", dof_handler=dh),
+        "dmu": (TrialFunction("mu_alpha", dof_handler=dh) if "mu_alpha" in field_specs else None),
+        "drho_s": (TrialFunction("rho_s", dof_handler=dh) if "rho_s" in field_specs else None),
+        "dmu_mass": (TrialFunction("mu_mass", dof_handler=dh) if bool(use_final_form) else None),
+        "dmu_normal": (TrialFunction("mu_normal", dof_handler=dh) if bool(use_final_form) else None),
+        "dmu_tangent": (TrialFunction("mu_tangent", dof_handler=dh) if bool(use_final_form) else None),
+        "dmu_kin": (None if MU_KIN is None else VectorTrialFunction(space=MU_KIN, dof_handler=dh)),
+        "dlm_vf": (None if LM_VF is None else VectorTrialFunction(space=LM_VF, dof_handler=dh)),
+        "dlm_p": (TrialFunction("lm_p", dof_handler=dh) if "lm_p" in field_specs else None),
+        "dlm_vP": (None if LM_VP is None else VectorTrialFunction(space=LM_VP, dof_handler=dh)),
+        "dlm_vS": (None if LM_VS is None else VectorTrialFunction(space=LM_VS, dof_handler=dh)),
+        "dlm_p_pore": (TrialFunction("lm_p_pore", dof_handler=dh) if "lm_p_pore" in field_specs else None),
+        "dlm_phi": (TrialFunction("lm_phi", dof_handler=dh) if "lm_phi" in field_specs else None),
+        "dlm_u": (None if LM_U is None else VectorTrialFunction(space=LM_U, dof_handler=dh)),
         "v_test": v_test,
         "vS_test": VectorTestFunction(space=VS, dof_handler=dh),
         "u_test": VectorTestFunction(space=U, dof_handler=dh),
+        "vP_test": (None if VP is None else VectorTestFunction(space=VP, dof_handler=dh)),
+        "mu_kin_test": (None if MU_KIN is None else VectorTestFunction(space=MU_KIN, dof_handler=dh)),
+        "lm_vf_test": (None if LM_VF is None else VectorTestFunction(space=LM_VF, dof_handler=dh)),
+        "lm_p_test": (TestFunction("lm_p", dof_handler=dh) if "lm_p" in field_specs else None),
+        "lm_vP_test": (None if LM_VP is None else VectorTestFunction(space=LM_VP, dof_handler=dh)),
+        "lm_vS_test": (None if LM_VS is None else VectorTestFunction(space=LM_VS, dof_handler=dh)),
+        "lm_p_pore_test": (TestFunction("lm_p_pore", dof_handler=dh) if "lm_p_pore" in field_specs else None),
+        "lm_phi_test": (TestFunction("lm_phi", dof_handler=dh) if "lm_phi" in field_specs else None),
+        "lm_u_test": (None if LM_U is None else VectorTestFunction(space=LM_U, dof_handler=dh)),
         "lambda_drag_test": (
             HdivTestFunction(lambda_drag_hdiv_field)
             if lambda_drag_hdiv_field is not None
             else (None if lambda_drag_space is None else VectorTestFunction(space=lambda_drag_space, dof_handler=dh))
         ),
         "q_test": TestFunction("p", dof_handler=dh),
-        "q_pore_test": (TestFunction("p_pore", dof_handler=dh) if bool(use_ratio_free_full_state) else None),
+        "q_pore_test": (TestFunction("p_pore", dof_handler=dh) if (bool(use_ratio_free_full_state) or bool(use_final_form)) else None),
         "p_mean_test": (TestFunction("p_mean", dof_handler=dh) if bool(use_pressure_mean_constraint) else None),
         "alpha_mass_lm_test": (TestFunction("alpha_mass_lm", dof_handler=dh) if "alpha_mass_lm" in field_specs else None),
         "pi_s_test": (TestFunction("pi_s", dof_handler=dh) if bool(solid_volumetric_split) else None),
         "alpha_test": TestFunction("alpha", dof_handler=dh),
         "B_test": (TestFunction("B", dof_handler=dh) if bool(reduced_support_uses_B) else None),
-        "mu_test": TestFunction("mu_alpha", dof_handler=dh),
+        "mu_test": (TestFunction("mu_alpha", dof_handler=dh) if "mu_alpha" in field_specs else None),
+        "rho_s_test": (TestFunction("rho_s", dof_handler=dh) if "rho_s" in field_specs else None),
+        "mu_mass_test": (TestFunction("mu_mass", dof_handler=dh) if bool(use_final_form) else None),
+        "mu_normal_test": (TestFunction("mu_normal", dof_handler=dh) if bool(use_final_form) else None),
+        "mu_tangent_test": (TestFunction("mu_tangent", dof_handler=dh) if bool(use_final_form) else None),
         "v_k": v_k,
         "p_k": Function("p_k", "p", dof_handler=dh),
-        "p_pore_k": (Function("p_pore_k", "p_pore", dof_handler=dh) if bool(use_ratio_free_full_state) else None),
+        "p_pore_k": (Function("p_pore_k", "p_pore", dof_handler=dh) if (bool(use_ratio_free_full_state) or bool(use_final_form)) else None),
         "p_mean_k": (Function("p_mean_k", "p_mean", dof_handler=dh) if bool(use_pressure_mean_constraint) else None),
         "alpha_mass_lm_k": (Function("alpha_mass_lm_k", "alpha_mass_lm", dof_handler=dh) if "alpha_mass_lm" in field_specs else None),
         "pi_s_k": (Function("pi_s_k", "pi_s", dof_handler=dh) if bool(solid_volumetric_split) else None),
         "vS_k": VectorFunction("vS_k", ["vS_x", "vS_y"], dof_handler=dh),
         "u_k": VectorFunction("u_k", ["u_x", "u_y"], dof_handler=dh),
+        "vP_k": (None if VP is None else VectorFunction("vP_k", ["vP_x", "vP_y"], dof_handler=dh)),
         "lambda_drag_k": (
             HdivFunction("lambda_drag_k", lambda_drag_hdiv_field, dof_handler=dh)
             if lambda_drag_hdiv_field is not None
@@ -5627,15 +7284,42 @@ def _create_problem(
         ),
         "alpha_k": Function("alpha_k", "alpha", dof_handler=dh),
         "B_k": (Function("B_k", "B", dof_handler=dh) if bool(reduced_support_uses_B) else None),
-        "mu_k": Function("mu_k", "mu_alpha", dof_handler=dh),
+        "mu_k": (Function("mu_k", "mu_alpha", dof_handler=dh) if "mu_alpha" in field_specs else None),
+        "rho_s_k": (Function("rho_s_k", "rho_s", dof_handler=dh) if "rho_s" in field_specs else None),
+        "mu_mass_k": (Function("mu_mass_k", "mu_mass", dof_handler=dh) if bool(use_final_form) else None),
+        "mu_normal_k": (Function("mu_normal_k", "mu_normal", dof_handler=dh) if bool(use_final_form) else None),
+        "mu_tangent_k": (Function("mu_tangent_k", "mu_tangent", dof_handler=dh) if bool(use_final_form) else None),
+        "mu_kin_k": (
+            None
+            if MU_KIN is None
+            else VectorFunction("mu_kin_k", ["mu_kin_x", "mu_kin_y"], dof_handler=dh)
+        ),
+        "lm_vf_k": (
+            None if LM_VF is None else VectorFunction("lm_vf_k", ["lm_vf_x", "lm_vf_y"], dof_handler=dh)
+        ),
+        "lm_p_k": (Function("lm_p_k", "lm_p", dof_handler=dh) if "lm_p" in field_specs else None),
+        "lm_vP_k": (
+            None if LM_VP is None else VectorFunction("lm_vP_k", ["lm_vP_x", "lm_vP_y"], dof_handler=dh)
+        ),
+        "lm_vS_k": (
+            None if LM_VS is None else VectorFunction("lm_vS_k", ["lm_vS_x", "lm_vS_y"], dof_handler=dh)
+        ),
+        "lm_p_pore_k": (
+            Function("lm_p_pore_k", "lm_p_pore", dof_handler=dh) if "lm_p_pore" in field_specs else None
+        ),
+        "lm_phi_k": (Function("lm_phi_k", "lm_phi", dof_handler=dh) if "lm_phi" in field_specs else None),
+        "lm_u_k": (
+            None if LM_U is None else VectorFunction("lm_u_k", ["lm_u_x", "lm_u_y"], dof_handler=dh)
+        ),
         "v_n": v_n,
         "p_n": Function("p_n", "p", dof_handler=dh),
-        "p_pore_n": (Function("p_pore_n", "p_pore", dof_handler=dh) if bool(use_ratio_free_full_state) else None),
+        "p_pore_n": (Function("p_pore_n", "p_pore", dof_handler=dh) if (bool(use_ratio_free_full_state) or bool(use_final_form)) else None),
         "p_mean_n": (Function("p_mean_n", "p_mean", dof_handler=dh) if bool(use_pressure_mean_constraint) else None),
         "alpha_mass_lm_n": (Function("alpha_mass_lm_n", "alpha_mass_lm", dof_handler=dh) if "alpha_mass_lm" in field_specs else None),
         "pi_s_n": (Function("pi_s_n", "pi_s", dof_handler=dh) if bool(solid_volumetric_split) else None),
         "vS_n": VectorFunction("vS_n", ["vS_x", "vS_y"], dof_handler=dh),
         "u_n": VectorFunction("u_n", ["u_x", "u_y"], dof_handler=dh),
+        "vP_n": (None if VP is None else VectorFunction("vP_n", ["vP_x", "vP_y"], dof_handler=dh)),
         "lambda_drag_n": (
             HdivFunction("lambda_drag_n", lambda_drag_hdiv_field, dof_handler=dh)
             if lambda_drag_hdiv_field is not None
@@ -5647,7 +7331,33 @@ def _create_problem(
         ),
         "alpha_n": Function("alpha_n", "alpha", dof_handler=dh),
         "B_n": (Function("B_n", "B", dof_handler=dh) if bool(reduced_support_uses_B) else None),
-        "mu_n": Function("mu_n", "mu_alpha", dof_handler=dh),
+        "mu_n": (Function("mu_n", "mu_alpha", dof_handler=dh) if "mu_alpha" in field_specs else None),
+        "rho_s_n": (Function("rho_s_n", "rho_s", dof_handler=dh) if "rho_s" in field_specs else None),
+        "mu_mass_n": (Function("mu_mass_n", "mu_mass", dof_handler=dh) if bool(use_final_form) else None),
+        "mu_normal_n": (Function("mu_normal_n", "mu_normal", dof_handler=dh) if bool(use_final_form) else None),
+        "mu_tangent_n": (Function("mu_tangent_n", "mu_tangent", dof_handler=dh) if bool(use_final_form) else None),
+        "mu_kin_n": (
+            None
+            if MU_KIN is None
+            else VectorFunction("mu_kin_n", ["mu_kin_x", "mu_kin_y"], dof_handler=dh)
+        ),
+        "lm_vf_n": (
+            None if LM_VF is None else VectorFunction("lm_vf_n", ["lm_vf_x", "lm_vf_y"], dof_handler=dh)
+        ),
+        "lm_p_n": (Function("lm_p_n", "lm_p", dof_handler=dh) if "lm_p" in field_specs else None),
+        "lm_vP_n": (
+            None if LM_VP is None else VectorFunction("lm_vP_n", ["lm_vP_x", "lm_vP_y"], dof_handler=dh)
+        ),
+        "lm_vS_n": (
+            None if LM_VS is None else VectorFunction("lm_vS_n", ["lm_vS_x", "lm_vS_y"], dof_handler=dh)
+        ),
+        "lm_p_pore_n": (
+            Function("lm_p_pore_n", "lm_p_pore", dof_handler=dh) if "lm_p_pore" in field_specs else None
+        ),
+        "lm_phi_n": (Function("lm_phi_n", "lm_phi", dof_handler=dh) if "lm_phi" in field_specs else None),
+        "lm_u_n": (
+            None if LM_U is None else VectorFunction("lm_u_n", ["lm_u_x", "lm_u_y"], dof_handler=dh)
+        ),
         "latent_bounded_transport": bool(latent_bounded_transport),
         "latent_bounded_fields": tuple(latent_field_set),
         "latent_bounded_map": str(latent_bounded_map),
@@ -5655,15 +7365,28 @@ def _create_problem(
         "alpha_mass_constraint": bool(bool(alpha_mass_constraint) and not bool(latent_bounded_transport)),
         "pressure_mean_constraint": bool(use_pressure_mean_constraint),
         "solid_volumetric_split": bool(solid_volumetric_split),
+        "one_domain_formulation": str(formulation_key),
+        "final_form": bool(use_final_form),
         "drag_formulation": str(drag_formulation_key),
         "primary_darcy_flux": bool(use_primary_darcy_flux),
         "split_primary_darcy_flux": bool(use_split_primary_darcy_flux),
+        "split_pore_flux_model": _split_pore_flux_model_key({"split_pore_flux_model": split_pore_flux_model}),
+        "split_pore_momentum_model": _split_pore_momentum_model_key(
+            {"split_pore_momentum_model": split_pore_momentum_model}
+        ),
         "one_pressure_primary_darcy_flux": bool(use_one_pressure_primary_darcy_flux),
         "primary_darcy_hdiv": bool(use_hdiv_primary_darcy_flux),
         "reduced_support_state": _reduced_support_state_key(reduced_support_state),
         "full_ratio_free_state": bool(use_ratio_free_full_state),
         "stored_support_content_mode": _stored_support_content_mode_key(stored_support_content_mode),
         "transport_update_mode": _transport_update_mode_key(transport_update_mode),
+        "final_form_phi_mode": _final_form_phi_mode_key(final_form_phi_mode),
+        "final_form_implementation": _final_form_implementation_key(final_form_implementation),
+        "final_form_constant_rho_s": bool(use_final_form_constant_rho_s),
+        "final_form_domain_lm": bool(use_final_form) and bool(final_form_domain_lm),
+        "final_form_domain_lm_aug_gamma": float(final_form_domain_lm_aug_gamma),
+        "final_form_mass_lm_aug_gamma": float(final_form_mass_lm_aug_gamma),
+        "final_form_normal_lm_aug_gamma": float(final_form_normal_lm_aug_gamma),
         "enable_phi_evolution": bool(enable_phi_evolution),
         "support_physics": "",
         "_alpha_mass_constraint_residual_form": None,
@@ -5696,10 +7419,10 @@ def _create_problem(
     if bool(enable_phi_evolution):
         problem.update(
             {
-                "dS": TrialFunction("S", dof_handler=dh),
-                "S_test": TestFunction("S", dof_handler=dh),
-                "S_k": Function("S_k", "S", dof_handler=dh),
-                "S_n": Function("S_n", "S", dof_handler=dh),
+                "dS": (None if bool(use_final_form) else TrialFunction("S", dof_handler=dh)),
+                "S_test": (None if bool(use_final_form) else TestFunction("S", dof_handler=dh)),
+                "S_k": (None if bool(use_final_form) else Function("S_k", "S", dof_handler=dh)),
+                "S_n": (None if bool(use_final_form) else Function("S_n", "S", dof_handler=dh)),
                 "reg_weight": None,
                 "dphi": (None if bool(use_ratio_free_full_state) else TrialFunction("phi", dof_handler=dh)),
                 "phi_test": (None if bool(use_ratio_free_full_state) else TestFunction("phi", dof_handler=dh)),
@@ -5745,7 +7468,7 @@ def _create_problem(
         )
     problem["interface_corner_taper"] = None
     problem["_interface_corner_taper_meta"] = {}
-    for key in ("v_k", "vS_k", "u_k", "lambda_drag_k", "v_n", "vS_n", "u_n", "lambda_drag_n"):
+    for key in ("v_k", "vP_k", "vS_k", "u_k", "lambda_drag_k", "v_n", "vP_n", "vS_n", "u_n", "lambda_drag_n"):
         if problem.get(key) is not None:
             problem[key].nodal_values[:] = 0.0
     for key in (
@@ -5761,6 +7484,30 @@ def _create_problem(
         "B_n",
         "mu_k",
         "mu_n",
+        "rho_s_k",
+        "rho_s_n",
+        "mu_mass_k",
+        "mu_mass_n",
+        "mu_normal_k",
+        "mu_normal_n",
+        "mu_tangent_k",
+        "mu_tangent_n",
+        "mu_kin_k",
+        "mu_kin_n",
+        "lm_vf_k",
+        "lm_vf_n",
+        "lm_p_k",
+        "lm_p_n",
+        "lm_vP_k",
+        "lm_vP_n",
+        "lm_vS_k",
+        "lm_vS_n",
+        "lm_p_pore_k",
+        "lm_p_pore_n",
+        "lm_phi_k",
+        "lm_phi_n",
+        "lm_u_k",
+        "lm_u_n",
         "phi_k",
         "phi_n",
         "S_k",
@@ -5800,6 +7547,7 @@ def _build_forms(
     gamma_u: float,
     u_extension_mode: str,
     gamma_u_pin: float,
+    interface_band_extension_gamma: float = 0.0,
     u_cip: float,
     u_cip_weight: str,
     vS_cip: float,
@@ -5809,6 +7557,26 @@ def _build_forms(
     D_phi: float,
     phi_diffusion_weight: str,
     gamma_phi: float,
+    gamma_v: float,
+    v_extension_mode: str,
+    gamma_v_pin: float,
+    gamma_p: float,
+    p_extension_mode: str,
+    gamma_p_pin: float,
+    gamma_vP: float,
+    vP_extension_mode: str,
+    gamma_vP_pin: float,
+    gamma_p_pore: float,
+    p_pore_extension_mode: str,
+    gamma_p_pore_pin: float,
+    gamma_rho_s: float,
+    rho_s_extension_mode: str,
+    gamma_rho_s_pin: float,
+    final_form_constant_rho_s: bool = False,
+    final_form_domain_lm: bool = False,
+    final_form_domain_lm_aug_gamma: float = 10.0,
+    final_form_mass_lm_aug_gamma: float = 1.0,
+    final_form_normal_lm_aug_gamma: float = 1.0,
     phi_supg: float,
     phi_cip: float,
     alpha_supg: float,
@@ -5857,6 +7625,9 @@ def _build_forms(
     reduced_support_state: str = "alpha_B",
     full_ratio_free_state: bool = False,
     split_primary_darcy_flux: bool = False,
+    split_pore_flux_model: str = "exact_conservative_p",
+    split_pore_momentum_model: str = "band_alpha",
+    fluid_mass_model: str = "transported_free_content",
     one_pressure_primary_darcy_flux: bool = False,
     stored_support_content_mode: str = "evolve_B",
     pressure_interface_closure: bool = False,
@@ -5869,6 +7640,11 @@ def _build_forms(
     interface_bjs_closure: bool = False,
     interface_bjs_closure_strength: float = 1.0,
     interface_bjs_gamma: float = 1.0e3,
+    final_form_solid_interface_weight: float | None = None,
+    final_form_mass_interface_weight: float | Constant | None = None,
+    final_form_normal_interface_weight: float | Constant | None = None,
+    final_form_disable_interface_physics: bool = False,
+    final_form_disable_normal_interface: bool = False,
     interface_velocity_continuity_closure: bool = False,
     interface_velocity_method: str = "penalty",
     interface_velocity_normal_strength: float = 1.0,
@@ -5878,6 +7654,63 @@ def _build_forms(
     interface_traction_normal_strength: float = 1.0,
     interface_traction_tangential_strength: float = 1.0,
 ):
+    if final_form_solid_interface_weight is None:
+        final_form_solid_interface_weight = float(problem.get("final_form_solid_interface_weight", 1.0))
+    if final_form_mass_interface_weight is None:
+        final_form_mass_interface_weight = problem.get(
+            "final_form_mass_interface_weight_c",
+            problem.get("final_form_mass_interface_weight", 1.0),
+        )
+    if final_form_normal_interface_weight is None:
+        final_form_normal_interface_weight = problem.get(
+            "final_form_normal_interface_weight_c",
+            problem.get("final_form_normal_interface_weight", 1.0),
+        )
+    final_form_mass_interface_weight_expr = final_form_mass_interface_weight
+    final_form_mass_interface_weight_c = problem.get("final_form_mass_interface_weight_c")
+    if isinstance(final_form_mass_interface_weight, Constant):
+        final_form_mass_interface_weight_val = _constant_scalar_value(final_form_mass_interface_weight)
+        final_form_mass_interface_weight_c = final_form_mass_interface_weight
+        final_form_mass_interface_weight_expr = final_form_mass_interface_weight_c
+    elif np.isscalar(final_form_mass_interface_weight):
+        final_form_mass_interface_weight_val = float(final_form_mass_interface_weight)
+        if isinstance(final_form_mass_interface_weight_c, Constant):
+            final_form_mass_interface_weight_c.value = float(final_form_mass_interface_weight_val)
+        else:
+            final_form_mass_interface_weight_c = _named_constant(
+                "b7_final_form_mass_interface_weight",
+                float(final_form_mass_interface_weight_val),
+            )
+        final_form_mass_interface_weight_expr = final_form_mass_interface_weight_c
+    else:
+        final_form_mass_interface_weight_val = float(problem.get("final_form_mass_interface_weight", 1.0))
+    final_form_normal_interface_weight_expr = final_form_normal_interface_weight
+    final_form_normal_interface_weight_c = problem.get("final_form_normal_interface_weight_c")
+    if isinstance(final_form_normal_interface_weight, Constant):
+        final_form_normal_interface_weight_val = _constant_scalar_value(final_form_normal_interface_weight)
+        final_form_normal_interface_weight_c = final_form_normal_interface_weight
+        final_form_normal_interface_weight_expr = final_form_normal_interface_weight_c
+    elif np.isscalar(final_form_normal_interface_weight):
+        final_form_normal_interface_weight_val = float(final_form_normal_interface_weight)
+        if isinstance(final_form_normal_interface_weight_c, Constant):
+            final_form_normal_interface_weight_c.value = float(final_form_normal_interface_weight_val)
+        else:
+            final_form_normal_interface_weight_c = _named_constant(
+                "b7_final_form_normal_interface_weight",
+                float(final_form_normal_interface_weight_val),
+            )
+        final_form_normal_interface_weight_expr = final_form_normal_interface_weight_c
+    else:
+        final_form_normal_interface_weight_val = float(problem.get("final_form_normal_interface_weight", 1.0))
+    problem["final_form_solid_interface_weight"] = float(final_form_solid_interface_weight)
+    problem["final_form_mass_interface_weight"] = float(final_form_mass_interface_weight_val)
+    if final_form_mass_interface_weight_c is not None:
+        problem["final_form_mass_interface_weight_c"] = final_form_mass_interface_weight_c
+    problem["final_form_normal_interface_weight"] = float(final_form_normal_interface_weight_val)
+    if final_form_normal_interface_weight_c is not None:
+        problem["final_form_normal_interface_weight_c"] = final_form_normal_interface_weight_c
+    problem["final_form_disable_interface_physics"] = bool(final_form_disable_interface_physics)
+    problem["final_form_disable_normal_interface"] = bool(final_form_disable_normal_interface)
     solid_model_key = _benchmark7_solid_model_key(solid_model)
     reduced_support_uses_B = _reduced_support_uses_B(
         enable_phi_evolution=bool(enable_phi_evolution),
@@ -5894,6 +7727,8 @@ def _build_forms(
             bool(split_primary_darcy_flux) or bool(one_pressure_primary_darcy_flux),
         )
     )
+    split_pore_flux_model_key = _split_pore_flux_model_key(problem)
+    split_pore_momentum_model_key = _split_pore_momentum_model_key(problem)
     use_one_pressure_primary_darcy_flux = bool(
         problem.get("one_pressure_primary_darcy_flux", one_pressure_primary_darcy_flux)
     )
@@ -5938,6 +7773,34 @@ def _build_forms(
             phi_k_eff = _latent_map_expr(problem["phi_latent_k"], map_kind=latent_map_kind)
             phi_n_eff = _latent_map_expr(problem["phi_latent_n"], map_kind=latent_map_kind)
             dphi_eff = _latent_map_prime_expr(problem["phi_latent_k"], map_kind=latent_map_kind) * problem["dphi_latent"]
+    geometry_indicator_beta = float(problem.get("geometry_indicator_beta", 0.0) or 0.0)
+    geometry_indicator_mode = str(problem.get("geometry_indicator_mode", "raw") or "raw")
+    geometry_indicator_support_mode = "tanh" if _geometry_indicator_mode_key(geometry_indicator_mode) == "tanh" else "raw"
+    alpha_support_k_eff = _geometry_indicator_expr(
+        alpha_k_eff,
+        beta=geometry_indicator_beta,
+        mode=geometry_indicator_mode,
+    )
+    alpha_support_n_eff = _geometry_indicator_expr(
+        alpha_n_eff,
+        beta=geometry_indicator_beta,
+        mode=geometry_indicator_mode,
+    )
+    dalpha_support_eff = _geometry_indicator_prime_expr(
+        alpha_k_eff,
+        beta=geometry_indicator_beta,
+        mode=geometry_indicator_mode,
+    ) * dalpha_eff
+    alpha_support_stab_k_eff = _geometry_indicator_expr(
+        alpha_k_eff,
+        beta=geometry_indicator_beta,
+        mode=geometry_indicator_support_mode,
+    )
+    dalpha_support_stab_eff = _geometry_indicator_prime_expr(
+        alpha_k_eff,
+        beta=geometry_indicator_beta,
+        mode=geometry_indicator_support_mode,
+    ) * dalpha_eff
     theta_c = _named_constant("b7_theta", float(theta))
     rho_f_c = _named_constant("b7_rho_f", float(rho_f))
     mu_f_c = _named_constant("b7_mu_f", float(mu_f))
@@ -5946,6 +7809,214 @@ def _build_forms(
     mu_s_c = _named_constant("b7_mu_s", float(mu_s))
     lambda_s_c = _named_constant("b7_lambda_s", float(lambda_s))
     rho_s0_tilde_c = _named_constant("b7_rho_s0_tilde", float(rho_s0_tilde))
+    if bool(problem.get("final_form", False)):
+        if problem.get("vP_k") is None or problem.get("p_pore_k") is None:
+            raise ValueError("one_domain_formulation=final_form requires vP and p_pore fields.")
+        if (not bool(final_form_constant_rho_s)) and problem.get("rho_s_k") is None:
+            raise ValueError("variable-density one_domain_formulation=final_form requires the rho_s field.")
+        final_form_builder = (
+            build_biofilm_one_domain_final_form_decomposed
+            if _final_form_implementation_key(problem.get("final_form_implementation", "tensor")) == "decomposed"
+            else build_biofilm_one_domain_final_form
+        )
+        forms = final_form_builder(
+            v_k=problem["v_k"],
+            p_k=problem["p_k"],
+            vP_k=problem["vP_k"],
+            p_pore_k=problem["p_pore_k"],
+            vS_k=problem["vS_k"],
+            u_k=problem["u_k"],
+            alpha_k=alpha_k_eff,
+            phi_k=phi_k_eff,
+            rho_s_k=problem["rho_s_k"],
+            v_n=problem["v_n"],
+            p_n=problem["p_n"],
+            vP_n=problem["vP_n"],
+            p_pore_n=problem["p_pore_n"],
+            vS_n=problem["vS_n"],
+            u_n=problem["u_n"],
+            alpha_n=alpha_n_eff,
+            phi_n=phi_n_eff,
+            rho_s_n=problem["rho_s_n"],
+            dv=problem["dv"],
+            dp=problem["dp"],
+            dvP=problem["dvP"],
+            dp_pore=problem["dp_pore"],
+            dvS=problem["dvS"],
+            du=problem["du"],
+            dalpha=dalpha_eff,
+            dphi=dphi_eff,
+            drho_s=problem["drho_s"],
+            dpi_s=problem["dpi_s"],
+            dmu_mass=problem["dmu_mass"],
+            dmu_normal=problem["dmu_normal"],
+            dmu_tangent=problem["dmu_tangent"],
+            dmu_kin=problem["dmu_kin"],
+            v_test=problem["v_test"],
+            q_test=problem["q_test"],
+            q_pore_test=problem["q_pore_test"],
+            vP_test=problem["vP_test"],
+            vS_test=problem["vS_test"],
+            u_test=problem["u_test"],
+            alpha_test=alpha_transport_test,
+            phi_test=phi_transport_test,
+            rho_s_test=problem["rho_s_test"],
+            pi_s_test=problem["pi_s_test"],
+            mu_mass_test=problem["mu_mass_test"],
+            mu_normal_test=problem["mu_normal_test"],
+            mu_tangent_test=problem["mu_tangent_test"],
+            mu_kin_test=problem["mu_kin_test"],
+            lm_vf_test=problem["lm_vf_test"],
+            lm_p_test=problem["lm_p_test"],
+            lm_vP_test=problem["lm_vP_test"],
+            lm_vS_test=problem["lm_vS_test"],
+            lm_p_pore_test=problem["lm_p_pore_test"],
+            lm_phi_test=problem["lm_phi_test"],
+            lm_u_test=problem["lm_u_test"],
+            pi_s_k=problem["pi_s_k"],
+            pi_s_n=problem["pi_s_n"],
+            mu_mass_k=problem["mu_mass_k"],
+            mu_normal_k=problem["mu_normal_k"],
+            mu_tangent_k=problem["mu_tangent_k"],
+            mu_kin_k=problem["mu_kin_k"],
+            lm_vf_k=problem["lm_vf_k"],
+            lm_p_k=problem["lm_p_k"],
+            lm_vP_k=problem["lm_vP_k"],
+            lm_vS_k=problem["lm_vS_k"],
+            lm_p_pore_k=problem["lm_p_pore_k"],
+            lm_phi_k=problem["lm_phi_k"],
+            lm_u_k=problem["lm_u_k"],
+            dlm_vf=problem["dlm_vf"],
+            dlm_p=problem["dlm_p"],
+            dlm_vP=problem["dlm_vP"],
+            dlm_vS=problem["dlm_vS"],
+            dlm_p_pore=problem["dlm_p_pore"],
+            dlm_phi=problem["dlm_phi"],
+            dlm_u=problem["dlm_u"],
+            dx=dx(metadata={"q": int(qdeg)}),
+            dt=dt_c,
+            rho_f=rho_f_c,
+            mu_f=mu_f_c,
+            mu_b=mu_b_c,
+            mu_b_model=str(mu_b_model),
+            kappa_inv=kappa_inv_c,
+            mu_s=mu_s_c,
+            lambda_s=lambda_s_c,
+            solid_visco_eta=float(solid_visco_eta),
+            gamma_phi=float(gamma_phi),
+            gamma_v=float(gamma_v),
+            v_extension_mode=str(v_extension_mode),
+            gamma_v_pin=float(gamma_v_pin),
+            gamma_p=float(gamma_p),
+            p_extension_mode=str(p_extension_mode),
+            gamma_p_pin=float(gamma_p_pin),
+            gamma_vP=float(gamma_vP),
+            vP_extension_mode=str(vP_extension_mode),
+            gamma_vP_pin=float(gamma_vP_pin),
+            gamma_p_pore=float(gamma_p_pore),
+            p_pore_extension_mode=str(p_pore_extension_mode),
+            gamma_p_pore_pin=float(gamma_p_pore_pin),
+            gamma_rho_s=float(gamma_rho_s),
+            rho_s_extension_mode=str(rho_s_extension_mode),
+            gamma_rho_s_pin=float(gamma_rho_s_pin),
+            rho_s_ref=float(rho_s0_tilde),
+            constant_rho_s=bool(final_form_constant_rho_s),
+            domain_lm=bool(final_form_domain_lm),
+            domain_lm_aug_gamma=float(final_form_domain_lm_aug_gamma),
+            mass_lm_aug_gamma=float(final_form_mass_lm_aug_gamma),
+            normal_lm_aug_gamma=float(final_form_normal_lm_aug_gamma),
+            gamma_u=float(gamma_u),
+            u_extension_mode=str(u_extension_mode),
+            gamma_u_pin=float(gamma_u_pin),
+            interface_band_extension_gamma=float(interface_band_extension_gamma),
+            u_cip=float(u_cip),
+            u_cip_weight=str(u_cip_weight),
+            gamma_vS=gamma_vS,
+            vS_extension_mode=vS_extension_mode,
+            gamma_vS_pin=gamma_vS_pin,
+            vS_cip=float(vS_cip),
+            ds_cip=ds(metadata={"q": int(qdeg)}),
+            fluid_convection=str(fluid_convection),
+            pore_convection=str(fluid_convection),
+            skeleton_inertia_convection=str(skeleton_inertia_convection),
+            solid_model=str(solid_model_key),
+            solid_volumetric_split=bool(solid_volumetric_split),
+            solid_volumetric_penalty=float(solid_volumetric_penalty),
+            phi_mode=(
+                "transport"
+                if _final_form_phi_mode_key(problem.get("final_form_phi_mode", "auto")) == "auto"
+                else _final_form_phi_mode_key(problem.get("final_form_phi_mode", "auto"))
+            ),
+            phi_b=float(phi_b),
+            bjs_coefficient=(
+                float(interface_bjs_gamma)
+                if bool(interface_bjs_closure) and float(interface_bjs_closure_strength) != 0.0
+                else 0.0
+            ),
+            solid_interface_traction_weight=float(
+                problem.get("final_form_solid_interface_weight", 1.0)
+            ),
+            mass_interface_weight=final_form_mass_interface_weight_expr,
+            normal_interface_weight=final_form_normal_interface_weight_expr,
+            disable_interface_physics=bool(
+                problem.get("final_form_disable_interface_physics", False)
+            ),
+            disable_normal_interface=bool(
+                problem.get("final_form_disable_normal_interface", False)
+            ),
+            support_indicator_beta=float(geometry_indicator_beta),
+            support_indicator_mode=str(geometry_indicator_mode),
+        )
+        if (
+            bool(p_pore_fluid_gauge)
+            and float(p_pore_fluid_gauge_strength) != 0.0
+            and problem.get("p_pore_k") is not None
+            and problem.get("dp_pore") is not None
+            and problem.get("q_pore_test") is not None
+        ):
+            # final_form represents p_pore on the whole mesh but the physical pore
+            # pressure only lives on the support side. Without a weak off-support
+            # extension gauge, the solve can park arbitrarily large p_pore values
+            # in alpha≈0 regions where they do not contribute physical porous
+            # traction. This is an extension control, not an external pressure law.
+            p_pore_fluid_gauge_strength_c = _named_constant(
+                "b7_p_pore_fluid_gauge_strength",
+                float(p_pore_fluid_gauge_strength),
+            )
+            dx_q = dx(metadata={"q": int(qdeg)})
+            one_m_alpha_k = _B7_ONE - alpha_support_stab_k_eff
+            p_pore_fluid_w4_k = one_m_alpha_k * one_m_alpha_k
+            p_pore_fluid_w4_k = p_pore_fluid_w4_k * p_pore_fluid_w4_k
+            p_pore_fluid_w8_k = p_pore_fluid_w4_k * p_pore_fluid_w4_k
+            p_pore_fluid_w_k = p_pore_fluid_w8_k * p_pore_fluid_w8_k
+            one_m_alpha3_k = one_m_alpha_k * one_m_alpha_k * one_m_alpha_k
+            d_p_pore_fluid_w = (
+                -_B7_SIXTEEN * (p_pore_fluid_w8_k * p_pore_fluid_w4_k * one_m_alpha3_k)
+            ) * dalpha_support_stab_eff
+            r_p_pore_fluid_gauge = (
+                p_pore_fluid_gauge_strength_c
+                * p_pore_fluid_w_k
+                * problem["p_pore_k"]
+                * problem["q_pore_test"]
+            ) * dx_q
+            a_p_pore_fluid_gauge = (
+                p_pore_fluid_gauge_strength_c
+                * (
+                    d_p_pore_fluid_w * problem["p_pore_k"]
+                    + p_pore_fluid_w_k * problem["dp_pore"]
+                )
+                * problem["q_pore_test"]
+            ) * dx_q
+            residual_form = forms.residual_form + r_p_pore_fluid_gauge
+            jacobian_form = forms.jacobian_form + a_p_pore_fluid_gauge
+            problem["_p_pore_fluid_gauge_residual_form"] = r_p_pore_fluid_gauge
+            problem["_p_pore_fluid_gauge_jacobian_form"] = a_p_pore_fluid_gauge
+            forms = replace(
+                forms,
+                residual_form=residual_form,
+                jacobian_form=jacobian_form,
+            )
+        return forms
     common_kwargs = {
         "dt": dt_c,
         "theta": theta_c,
@@ -6054,6 +8125,11 @@ def _build_forms(
         "skeleton_inertia_lagged_weight": skeleton_inertia_lagged_weight,
         "storativity_c0": float(storativity_c0),
         "primary_darcy_flux": bool(use_primary_darcy_flux),
+        "split_pore_flux_model": str(split_pore_flux_model_key),
+        "split_pore_momentum_model": str(split_pore_momentum_model_key),
+        "fluid_mass_model": str(fluid_mass_model),
+        "support_indicator_beta": float(geometry_indicator_beta),
+        "support_indicator_mode": str(geometry_indicator_mode),
     }
     single_pressure_stored_support_core = bool(
         (not bool(enable_phi_evolution))
@@ -6383,6 +8459,8 @@ def _build_forms(
     problem["_p_pore_fluid_gauge_jacobian_form"] = None
     problem["_entry_interface_residual_form"] = None
     problem["_entry_interface_jacobian_form"] = None
+    problem["_exact_interface_pressure_residual_form"] = None
+    problem["_exact_interface_pressure_jacobian_form"] = None
     problem["_bjs_interface_residual_form"] = None
     problem["_bjs_interface_jacobian_form"] = None
     problem["_velocity_interface_residual_form"] = None
@@ -6450,26 +8528,17 @@ def _build_forms(
         and problem.get("dp_pore") is not None
         and problem.get("q_pore_test") is not None
     ):
-        # The split-pressure pore field lives on the whole mesh, but the
-        # skeleton only feels the support-bearing coefficient-weighted load.
-        # Keep the interface closures aligned with that same effective pressure;
-        # otherwise the solver can satisfy them with large off-support p_pore
-        # values that never load the porous solid.
-        skel_press_key = str(skeleton_pressure_mode).strip().lower().replace("-", "_")
-        if skel_press_key == "whole_domain" and alpha_biot is None:
-            # Legacy whole-domain surrogate: the interface penalties track the
-            # same B-weighted pore-loading extension used by the skeleton
-            # pressure block, not the alpha-weighted pore continuity row.
-            pore_interface_coeff_k = problem.get("B_k")
-            d_pore_interface_coeff = problem.get("dB")
-            if pore_interface_coeff_k is None or d_pore_interface_coeff is None:
-                raise ValueError(
-                    "Full ratio-free whole-domain split-pressure closures require B to define the pore-loading coefficient."
-                )
-        else:
-            pore_interface_coeff_c = Constant(float(1.0 if alpha_biot is None else alpha_biot))
-            pore_interface_coeff_k = pore_interface_coeff_c * alpha_k_eff
-            d_pore_interface_coeff = pore_interface_coeff_c * dalpha_eff
+        # alpha is the geometry carrier for the reconstructed interface. The
+        # sharp porous traction law uses sigma'_S - alpha_B p_pore I on Gamma,
+        # not alpha-weighted interface loads. Keep the bulk support weighting
+        # inside the domain rows, but expose the physical pore pressure itself
+        # to the interface closures.
+        pore_interface_coeff_c = _named_constant(
+            "b7_pore_interface_coeff",
+            float(1.0 if alpha_biot is None else alpha_biot),
+        )
+        pore_interface_coeff_k = pore_interface_coeff_c
+        d_pore_interface_coeff = _B7_ZERO
         pore_interface_pressure_k = pore_interface_coeff_k * problem["p_pore_k"]
         d_pore_interface_pressure = (
             d_pore_interface_coeff * problem["p_pore_k"] + pore_interface_coeff_k * problem["dp_pore"]
@@ -6488,8 +8557,8 @@ def _build_forms(
             P_interface_k = alpha_k_eff - B_interface_k
             dP_interface = dalpha_eff - dB_interface
     elif bool(use_one_pressure_primary_darcy_flux):
-        pore_interface_pressure_k = alpha_k_eff * problem["p_k"]
-        d_pore_interface_pressure = dalpha_eff * problem["p_k"] + alpha_k_eff * problem["dp"]
+        pore_interface_pressure_k = alpha_support_k_eff * problem["p_k"]
+        d_pore_interface_pressure = dalpha_support_eff * problem["p_k"] + alpha_support_k_eff * problem["dp"]
         P_interface_k = None
         dP_interface = None
     else:
@@ -6516,12 +8585,12 @@ def _build_forms(
         )
         interface_corner_taper = problem.get("interface_corner_taper")
         if interface_corner_taper is None:
-            interface_corner_taper = Constant(1.0)
+            interface_corner_taper = _B7_ONE
         pressure_interface_weight_k = (
-            interface_corner_taper * Constant(4.0) * alpha_k_eff * (Constant(1.0) - alpha_k_eff)
+            interface_corner_taper * _B7_FOUR * alpha_support_k_eff * (_B7_ONE - alpha_support_k_eff)
         )
-        d_pressure_interface_weight = interface_corner_taper * Constant(4.0) * (
-            (Constant(1.0) - Constant(2.0) * alpha_k_eff) * dalpha_eff
+        d_pressure_interface_weight = interface_corner_taper * _B7_FOUR * (
+            (_B7_ONE - _B7_TWO * alpha_support_k_eff) * dalpha_support_eff
         )
         pressure_jump_k = problem["p_k"] - pore_interface_pressure_k
         d_pressure_jump = problem["dp"] - d_pore_interface_pressure
@@ -6569,14 +8638,14 @@ def _build_forms(
             "b7_p_pore_fluid_gauge_strength",
             float(p_pore_fluid_gauge_strength),
         )
-        one_m_alpha_k = Constant(1.0) - alpha_k_eff
+        one_m_alpha_k = _B7_ONE - alpha_support_k_eff
         p_pore_fluid_w4_k = one_m_alpha_k * one_m_alpha_k
         p_pore_fluid_w4_k = p_pore_fluid_w4_k * p_pore_fluid_w4_k
         p_pore_fluid_w8_k = p_pore_fluid_w4_k * p_pore_fluid_w4_k
         p_pore_fluid_w_k = p_pore_fluid_w8_k * p_pore_fluid_w8_k
         one_m_alpha3_k = one_m_alpha_k * one_m_alpha_k * one_m_alpha_k
         d_p_pore_fluid_w = (
-            -Constant(16.0) * (p_pore_fluid_w8_k * p_pore_fluid_w4_k * one_m_alpha3_k)
+            -_B7_SIXTEEN * (p_pore_fluid_w8_k * p_pore_fluid_w4_k * one_m_alpha3_k)
         ) * dalpha_eff
         r_p_pore_fluid_gauge = (
             p_pore_fluid_gauge_strength_c
@@ -6625,10 +8694,10 @@ def _build_forms(
                     "The H(div) branch does not expose a tangential fluid-velocity trace; "
                     "diffuse BJS/tangential-slip closures are not implemented there."
                 )
-            if bool(interface_entry_closure):
+            if bool(interface_entry_closure) and not (bool(use_primary_darcy_flux) and not bool(use_one_pressure_primary_darcy_flux)):
                 raise NotImplementedError(
-                    "The H(div) branch currently uses a pressure-only normal traction transfer; "
-                    "the viscous entry closure is not implemented there."
+                    "The H(div) branch currently supports interface_entry_closure only on the split q-primary "
+                    "branch, where the entry resistance is assembled as a Darcy q-row Robin term."
                 )
         if bool(use_one_pressure_primary_darcy_flux) and (
             bool(interface_entry_closure) or bool(interface_bjs_closure)
@@ -6660,35 +8729,36 @@ def _build_forms(
             or bool(interface_bjs_closure)
             or bool(interface_velocity_continuity_closure)
             or bool(interface_traction_continuity_closure)
+            or (bool(use_primary_darcy_flux) and not bool(use_one_pressure_primary_darcy_flux))
         )
     ):
         interface_eta = max(1.0e-12, 1.0e-3 * float(eps_alpha))
         interface_weight_scale = 1.0 / max(float(eps_alpha), 1.0e-12)
         interface_corner_taper = problem.get("interface_corner_taper")
         if interface_corner_taper is None:
-            interface_corner_taper = Constant(1.0)
+            interface_corner_taper = _B7_ONE
         interface_weight_n = (
             _named_constant("b7_interface_weight_scale", interface_weight_scale)
             * interface_corner_taper
-            * Constant(4.0)
-            * alpha_n_eff
-            * (Constant(1.0) - alpha_n_eff)
+            * _B7_FOUR
+            * alpha_support_n_eff
+            * (_B7_ONE - alpha_support_n_eff)
         )
         interface_weight_k = (
             _named_constant("b7_interface_weight_scale", interface_weight_scale)
             * interface_corner_taper
-            * Constant(4.0)
-            * alpha_k_eff
-            * (Constant(1.0) - alpha_k_eff)
+            * _B7_FOUR
+            * alpha_support_k_eff
+            * (_B7_ONE - alpha_support_k_eff)
         )
         d_interface_weight = (
             _named_constant("b7_interface_weight_scale", interface_weight_scale)
             * interface_corner_taper
-            * Constant(4.0)
-            * (Constant(1.0) - Constant(2.0) * alpha_k_eff)
-            * dalpha_eff
+            * _B7_FOUR
+            * (_B7_ONE - _B7_TWO * alpha_support_k_eff)
+            * dalpha_support_eff
         )
-        n_if = _interface_unit_normal_2d(alpha_n_eff, eta=interface_eta)
+        n_if = _interface_unit_normal_2d(alpha_support_n_eff, eta=interface_eta)
         t_if = _interface_tangent_from_normal_2d(n_if)
         rel_n_k = _dot_basis_2d(problem["v_k"], n_if) - _dot_basis_2d(problem["vS_k"], n_if)
         rel_t_k = _dot_basis_2d(problem["v_k"], t_if) - _dot_basis_2d(problem["vS_k"], t_if)
@@ -6723,6 +8793,37 @@ def _build_forms(
             mass_jump_n_k = rel_n_k
             d_mass_jump_n = d_rel_n
             mass_jump_n_test = rel_n_test
+        if bool(use_primary_darcy_flux) and not bool(use_one_pressure_primary_darcy_flux):
+            # Interface-consistent split-q transfer from
+            # examples/biofilms/fpsi_interface_fix.tex:
+            #
+            #   <p_P, (w-wS).n_if>_Gamma + <p_P, r.n_if>_Gamma.
+            #
+            # This is the clean monolithic pressure communication generated by
+            # the alpha-defined interface. It is not the reduced Robin entry
+            # law and must be present even when all optional extra interface
+            # models are disabled.
+            r_exact_interface_pressure = (
+                interface_weight_n * pore_interface_pressure_k * rel_n_test
+                + interface_weight_k * pore_interface_pressure_k * q_n_test
+            ) * dx_q
+            a_exact_interface_pressure = (
+                interface_weight_n * d_pore_interface_pressure * rel_n_test
+                + (
+                    d_interface_weight * pore_interface_pressure_k
+                    + interface_weight_k * d_pore_interface_pressure
+                )
+                * q_n_test
+            ) * dx_q
+            residual_form = residual_form + r_exact_interface_pressure
+            jacobian_form = jacobian_form + a_exact_interface_pressure
+            problem["_exact_interface_pressure_residual_form"] = r_exact_interface_pressure
+            problem["_exact_interface_pressure_jacobian_form"] = a_exact_interface_pressure
+            forms = replace(
+                forms,
+                residual_form=residual_form,
+                jacobian_form=jacobian_form,
+            )
         if bool(interface_velocity_continuity_closure):
             vel_n_strength = float(interface_velocity_normal_strength)
             vel_t_strength = float(interface_velocity_tangential_strength)
@@ -6739,8 +8840,8 @@ def _build_forms(
                 mesh_scaled_vel_n_strength = 1.0 / max(float(eps_alpha), 1.0e-12) ** 2
                 if abs(vel_n_strength - 1.0) <= 1.0e-12:
                     vel_n_strength = float(mesh_scaled_vel_n_strength)
-            r_velocity_interface = Constant(0.0) * mass_jump_n_k * mass_jump_n_test * dx_q
-            a_velocity_interface = Constant(0.0) * d_mass_jump_n * mass_jump_n_test * dx_q
+            r_velocity_interface = _B7_ZERO * mass_jump_n_k * mass_jump_n_test * dx_q
+            a_velocity_interface = _B7_ZERO * d_mass_jump_n * mass_jump_n_test * dx_q
             if vel_n_strength != 0.0:
                 vel_n_strength_c = _named_constant(
                     "b7_interface_velocity_normal_strength",
@@ -6797,10 +8898,10 @@ def _build_forms(
             )
         if bool(interface_traction_continuity_closure):
             if solid_model_key in {"linear", "small_strain", "linear_elastic"}:
-                eps_u_k = Constant(0.5) * (grad(problem["u_k"]) + grad(problem["u_k"]).T)
-                eps_du = Constant(0.5) * (grad(problem["du"]) + grad(problem["du"]).T)
-                solid_sig_k = Constant(2.0) * mu_s_c * eps_u_k + lambda_s_c * div(problem["u_k"]) * Identity(2)
-                dsolid_sig = Constant(2.0) * mu_s_c * eps_du + lambda_s_c * div(problem["du"]) * Identity(2)
+                eps_u_k = _B7_HALF * (grad(problem["u_k"]) + grad(problem["u_k"]).T)
+                eps_du = _B7_HALF * (grad(problem["du"]) + grad(problem["du"]).T)
+                solid_sig_k = _B7_TWO * mu_s_c * eps_u_k + lambda_s_c * div(problem["u_k"]) * Identity(2)
+                dsolid_sig = _B7_TWO * mu_s_c * eps_du + lambda_s_c * div(problem["du"]) * Identity(2)
             elif solid_model_key in {"neo_hookean_seboldt", "seboldt_neo_hookean"}:
                 solid_sig_k = sigma_neo_hookean_seboldt(problem["u_k"], mu_s_c, lambda_s_c, dim=2)
                 dsolid_sig = dsigma_neo_hookean_seboldt(problem["u_k"], problem["du"], mu_s_c, lambda_s_c, dim=2)
@@ -6829,34 +8930,25 @@ def _build_forms(
                 # with the available trace structure.
                 free_trac_n_k = -problem["p_k"]
                 dfree_trac_n = -problem["dp"]
-                free_trac_t_k = Constant(0.0)
-                dfree_trac_t = Constant(0.0)
+                free_trac_t_k = _B7_ZERO
+                dfree_trac_t = _B7_ZERO
             else:
                 free_trac_n_k = -problem["p_k"] + visc_n_k
                 dfree_trac_n = -problem["dp"] + d_visc_n
                 free_trac_t_k = visc_t_k
                 dfree_trac_t = d_visc_t
-            porous_trac_n_k = alpha_k_eff * (solid_trac_n_k + solid_visc_n_k) - pore_interface_pressure_k
-            dporous_trac_n = (
-                dalpha_eff * (solid_trac_n_k + solid_visc_n_k)
-                + alpha_k_eff * (dsolid_trac_n + dsolid_visc_n)
-                - d_pore_interface_pressure
-            )
-            porous_trac_t_k = alpha_k_eff * (solid_trac_t_k + solid_visc_t_k)
-            dporous_trac_t = (
-                dalpha_eff * (solid_trac_t_k + solid_visc_t_k)
-                + alpha_k_eff * (dsolid_trac_t + dsolid_visc_t)
-            )
+            porous_trac_n_k = (solid_trac_n_k + solid_visc_n_k) - pore_interface_pressure_k
+            dporous_trac_n = dsolid_trac_n + dsolid_visc_n - d_pore_interface_pressure
+            porous_trac_t_k = solid_trac_t_k + solid_visc_t_k
+            dporous_trac_t = dsolid_trac_t + dsolid_visc_t
             traction_jump_n_k = porous_trac_n_k - free_trac_n_k
             dtraction_jump_n = dporous_trac_n - dfree_trac_n
             traction_jump_t_k = porous_trac_t_k - free_trac_t_k
             dtraction_jump_t = dporous_trac_t - dfree_trac_t
-            traction_data_n_k = free_trac_n_k - alpha_k_eff * (solid_trac_n_k + solid_visc_n_k)
-            dtraction_data_n = (
-                dfree_trac_n
-                - dalpha_eff * (solid_trac_n_k + solid_visc_n_k)
-                - alpha_k_eff * (dsolid_trac_n + dsolid_visc_n)
-            )
+            traction_data_n_k = free_trac_n_k - (solid_trac_n_k + solid_visc_n_k)
+            dtraction_data_n = dfree_trac_n - (dsolid_trac_n + dsolid_visc_n)
+            traction_data_t_k = free_trac_t_k - (solid_trac_t_k + solid_visc_t_k)
+            dtraction_data_t = dfree_trac_t - (dsolid_trac_t + dsolid_visc_t)
             tr_n_strength = float(interface_traction_normal_strength)
             tr_t_strength = float(interface_traction_tangential_strength)
             if fluid_space_key_local == "hdiv" and tr_t_strength != 0.0:
@@ -6864,62 +8956,75 @@ def _build_forms(
                     "The H(div) interface traction closure currently supports the normal pressure-transfer law only; "
                     "set interface_traction_tangential_strength=0."
                 )
-            # In the q-primary mixed Darcy branch the bulk row is assembled on
-            # the porous-domain outward normal. The diffuse interface normal
-            # n_if points from free fluid to porous support, i.e. it is the
-            # opposite of the porous outward normal. After integration by parts
-            # the missing boundary power on the q-row is therefore
-            #   -<alpha p_P, z.n_if>.
+            # On the split q-primary branch the mixed Darcy row is assembled as
+            #   \int alpha mu K^{-1} q · z - \int p_P div(alpha z),
+            # with the remaining interface boundary power supplied here.
             #
-            # Using traction continuity on that shared normal,
-            #   t_F = alpha sigma'_S - alpha p_P n_if,
-            # gives
-            #   -alpha p_P = t_F - alpha sigma'_S.
+            # The interface-consistent weak form in
+            # examples/biofilms/fpsi_interface_fix.tex adds the porous
+            # pore-pressure boundary term directly on the Darcy test:
+            #   <alpha_B p_P, z · n_if>_Gamma.
             #
-            # So the q-row must receive only the external load
-            #   t_F.n_if - alpha sigma'_S.n_if,
-            # not the full porous traction jump that still contains -alpha p_P.
-            # Otherwise the interface term double-counts the pore-pressure
-            # traction and can flip the split-pressure sign.
+            # Do not substitute the free/solid traction balance into this row.
+            # That replacement makes the q-row depend on an approximate
+            # traction jump instead of the porous pressure itself, which was
+            # the remaining sign/conditioning defect on the monolithic Seboldt
+            # branch.
             traction_n_test = q_n_test if bool(use_primary_darcy_flux) else rel_n_test
             traction_t_test = solid_t_test if bool(use_primary_darcy_flux) else rel_t_test
-            r_traction_interface = Constant(0.0) * traction_jump_n_k * traction_n_test * dx_q
-            a_traction_interface = Constant(0.0) * dtraction_jump_n * traction_n_test * dx_q
+            r_traction_interface = _B7_ZERO * traction_jump_n_k * traction_n_test * dx_q
+            a_traction_interface = _B7_ZERO * dtraction_jump_n * traction_n_test * dx_q
             if tr_n_strength != 0.0:
                 tr_n_strength_c = _named_constant(
                     "b7_interface_traction_normal_strength",
                     tr_n_strength,
                 )
-                traction_weight_expr = interface_weight_k
-                dtraction_weight_expr = d_interface_weight
-                if bool(use_primary_darcy_flux) and interface_traction_method_key == "nitsche":
-                    # Consistent Darcy boundary-power replacement:
-                    #   -<alpha p_P, z.n_if>_Gamma -> <t_F.n_if - alpha sigma'_S.n_if, z.n_if>_Gamma.
-                    # Use the external traction data only; the -alpha p_P part
-                    # is already represented by the mixed bulk row
-                    # -\int p_P div(alpha z).
+                if bool(use_primary_darcy_flux):
+                    # On the split-q branch the clean monolithic pressure
+                    # communication <p_P,(w-wS).n> + <p_P,r.n> is assembled
+                    # separately above. The experimental traction block may
+                    # only add the remaining mechanical traction mismatch.
+                    r_traction_interface = r_traction_interface + (
+                        tr_n_strength_c * interface_weight_n * traction_data_n_k * rel_n_test
+                    ) * dx_q
+                    a_traction_interface = a_traction_interface + tr_n_strength_c * (
+                        interface_weight_n * dtraction_data_n * rel_n_test
+                    ) * dx_q
+                else:
                     traction_weight_expr = interface_weight_k
                     dtraction_weight_expr = d_interface_weight
-                normal_traction_residual_k = traction_data_n_k if bool(use_primary_darcy_flux) else traction_jump_n_k
-                dnormal_traction_residual = dtraction_data_n if bool(use_primary_darcy_flux) else dtraction_jump_n
-                r_traction_interface = r_traction_interface + (
-                    tr_n_strength_c * traction_weight_expr * normal_traction_residual_k * traction_n_test
-                ) * dx_q
-                a_traction_interface = a_traction_interface + tr_n_strength_c * (
-                    (dtraction_weight_expr * normal_traction_residual_k + traction_weight_expr * dnormal_traction_residual)
-                    * traction_n_test
-                ) * dx_q
+                    normal_traction_residual_k = traction_jump_n_k
+                    dnormal_traction_residual = dtraction_jump_n
+                    r_traction_interface = r_traction_interface + (
+                        tr_n_strength_c * traction_weight_expr * normal_traction_residual_k * traction_n_test
+                    ) * dx_q
+                    a_traction_interface = a_traction_interface + tr_n_strength_c * (
+                        (
+                            dtraction_weight_expr * normal_traction_residual_k
+                            + traction_weight_expr * dnormal_traction_residual
+                        )
+                        * traction_n_test
+                    ) * dx_q
             if tr_t_strength != 0.0:
                 tr_t_strength_c = _named_constant(
                     "b7_interface_traction_tangential_strength",
                     tr_t_strength,
                 )
-                r_traction_interface = r_traction_interface + (
-                    tr_t_strength_c * interface_weight_k * traction_jump_t_k * traction_t_test
-                ) * dx_q
-                a_traction_interface = a_traction_interface + tr_t_strength_c * (
-                    (d_interface_weight * traction_jump_t_k + interface_weight_k * dtraction_jump_t) * traction_t_test
-                ) * dx_q
+                if bool(use_primary_darcy_flux):
+                    r_traction_interface = r_traction_interface + (
+                        tr_t_strength_c * interface_weight_n * traction_data_t_k * rel_t_test
+                    ) * dx_q
+                    a_traction_interface = a_traction_interface + tr_t_strength_c * (
+                        interface_weight_n * dtraction_data_t * rel_t_test
+                    ) * dx_q
+                else:
+                    r_traction_interface = r_traction_interface + (
+                        tr_t_strength_c * interface_weight_k * traction_jump_t_k * traction_t_test
+                    ) * dx_q
+                    a_traction_interface = a_traction_interface + tr_t_strength_c * (
+                        (d_interface_weight * traction_jump_t_k + interface_weight_k * dtraction_jump_t)
+                        * traction_t_test
+                    ) * dx_q
             residual_form = residual_form + r_traction_interface
             jacobian_form = jacobian_form + a_traction_interface
             problem["_traction_interface_residual_form"] = r_traction_interface
@@ -6935,31 +9040,50 @@ def _build_forms(
                 float(interface_entry_closure_strength),
             )
             entry_delta_c = _named_constant("b7_interface_entry_delta", float(interface_entry_delta))
-            # Diffuse normal traction / pore-pressure communication law:
-            #   -n.sigma_F.n - p_pore = delta * q_n,   q_n = P (v-vS).n.
-            #
-            # This sharp law enters the weak form through the interface
-            # traction term on the fluid / skeleton momentum tests:
-            #   (p_pore + delta q_n) * (w - wS).n.
-            # It does not generate an additional scalar q_pore-test penalty.
-            # The pore-pressure field remains coupled through the support-
-            # bearing interface traction and through the bulk split-pressure
-            # pore row.
-            #
-            # Keep the entry law on the same support-bearing pore-pressure
-            # extension used by the skeleton/interface loading blocks.
-            # Otherwise the diffuse interface can couple the unweighted
-            # whole-domain p_pore extension back into the fluid momentum,
-            # even though the stored-support mechanics only feel the
-            # coefficient-weighted pore pressure.
-            entry_drive_k = pore_interface_pressure_k + entry_delta_c * q_n_k
-            d_entry_drive = d_pore_interface_pressure + entry_delta_c * d_q_n
-            r_entry_interface = entry_strength_c * interface_weight_n * (
-                entry_drive_k * rel_n_test
-            ) * dx_q
-            a_entry_interface = entry_strength_c * interface_weight_n * (
-                d_entry_drive * rel_n_test
-            ) * dx_q
+            if bool(use_primary_darcy_flux) and not bool(use_one_pressure_primary_darcy_flux):
+                # On the split q-primary branch, the interface-consistent weak
+                # form from examples/biofilms/fpsi_interface_fix.tex contributes
+                #
+                #   <p_P, (w-wS).n_if>_Gamma + <p_P, r.n_if>_Gamma,
+                #
+                # i.e. pore-pressure communication on the momentum-side normal
+                # test and the porous pore-pressure boundary power on the Darcy
+                # q trace. Those clean monolithic terms are assembled above. A
+                # reduced Robin entry model, when requested, is an additional
+                # constitutive term
+                #
+                #   <delta q_n, r.n_if>_Gamma,
+                #
+                # not a replacement for the p_P transfer itself. Therefore
+                # this block contributes only the optional Darcy Robin
+                # resistance delta q_n on the q-row.
+                pressure_q_drive_k = entry_delta_c * q_n_k
+                d_pressure_q_drive = entry_delta_c * d_q_n
+                r_entry_interface = entry_strength_c * (
+                    interface_weight_k * pressure_q_drive_k * q_n_test
+                ) * dx_q
+                a_entry_interface = entry_strength_c * (
+                    (
+                        d_interface_weight * pressure_q_drive_k
+                        + interface_weight_k * d_pressure_q_drive
+                    )
+                    * q_n_test
+                ) * dx_q
+            else:
+                # Diffuse normal traction / pore-pressure communication law:
+                #   -n.sigma_F.n - p_pore = delta * q_n,   q_n = P (v-vS).n.
+                #
+                # This momentum-side Robin loading is kept only on the
+                # non-q-primary branches, where the Darcy trace is not exposed
+                # as an independent unknown.
+                entry_drive_k = pore_interface_pressure_k + entry_delta_c * q_n_k
+                d_entry_drive = d_pore_interface_pressure + entry_delta_c * d_q_n
+                r_entry_interface = entry_strength_c * interface_weight_n * (
+                    entry_drive_k * rel_n_test
+                ) * dx_q
+                a_entry_interface = entry_strength_c * interface_weight_n * (
+                    d_entry_drive * rel_n_test
+                ) * dx_q
             residual_form = residual_form + r_entry_interface
             jacobian_form = jacobian_form + a_entry_interface
             problem["_entry_interface_residual_form"] = r_entry_interface
@@ -6998,11 +9122,11 @@ def _build_forms(
         and problem.get("dp_mean") is not None
     ):
         if bool(problem.get("full_ratio_free_state", False)) and problem.get("alpha_k") is not None:
-            pressure_mean_weight_k = Constant(1.0) - problem["alpha_k"]
-            d_pressure_mean_weight = -problem["dalpha"]
+            pressure_mean_weight_k = _B7_ONE - alpha_support_k_eff
+            d_pressure_mean_weight = -dalpha_support_eff
         else:
-            pressure_mean_weight_k = Constant(1.0)
-            d_pressure_mean_weight = Constant(0.0) * problem["dp"]
+            pressure_mean_weight_k = _B7_ONE
+            d_pressure_mean_weight = _B7_ZERO * problem["dp"]
         r_pressure_mean = (
             problem["p_mean_k"] * pressure_mean_weight_k * problem["q_test"]
             + pressure_mean_weight_k * problem["p_k"] * problem["p_mean_test"]
@@ -7043,10 +9167,12 @@ def _build_bcs(
     latent_bounded_eps: float = 1.0e-8,
     latent_bounded_map: str = "sigmoid",
     pressure_mean_constraint: bool = False,
+    one_domain_formulation: str = "legacy",
     full_ratio_free_state: bool = False,
     split_primary_darcy_flux: bool = False,
     one_pressure_primary_darcy_flux: bool = False,
 ) -> list[BoundaryCondition]:
+    final_form = str(one_domain_formulation or "legacy").strip().lower().replace("-", "_") == "final_form"
     use_pressure_mean_constraint = bool(pressure_mean_constraint) and bool(full_ratio_free_state)
     use_primary_darcy_flux = bool(split_primary_darcy_flux) or bool(one_pressure_primary_darcy_flux)
     darcy_flux_space_key = str(darcy_flux_space or "auto").strip().lower().replace("-", "_")
@@ -7091,6 +9217,13 @@ def _build_bcs(
                     BoundaryCondition("v_y", "dirichlet", tag, _as_float_time(zero)),
                 ]
             )
+        if bool(final_form):
+            # The pore-velocity field is a physical unknown on the final-form
+            # branch. Leaving it free on the support-side walls lets the scalar
+            # pore balance close through lateral extension leakage instead of
+            # building pore pressure. The vertical walls are impermeable, so
+            # enforce only the normal component there.
+            bcs.append(BoundaryCondition("vP_x", "dirichlet", tag, _as_float_time(zero)))
         if bool(use_primary_darcy_flux):
             if darcy_flux_space_key == "hdiv":
                 bcs.append(BoundaryCondition("q", "dirichlet", tag, _as_bc_time(zero_vec)))
@@ -7112,13 +9245,15 @@ def _build_bcs(
                     BoundaryCondition("u_y", "dirichlet", tag, _as_float_time(zero)),
                 ]
             )
-        if alpha_bc_mode_key == "equilibrium":
+        if alpha_bc_mode_key == "equilibrium" and not bool(final_form):
             bcs.extend(
                 [
                     BoundaryCondition("alpha", "dirichlet", tag, _as_float_time(alpha_bc)),
                     BoundaryCondition("mu_alpha", "dirichlet", tag, _as_float_time(zero)),
                 ]
             )
+        elif alpha_bc_mode_key == "equilibrium":
+            bcs.append(BoundaryCondition("alpha", "dirichlet", tag, _as_float_time(alpha_bc)))
         if bool(enable_phi_evolution) and phi_bc_mode_key == "equilibrium":
             bcs.append(BoundaryCondition("phi", "dirichlet", tag, _as_float_time(phi_eq)))
         if bool(alpha_solid_dirichlet_sides):
@@ -7142,26 +9277,34 @@ def _build_bcs(
             BoundaryCondition("u_y", "dirichlet", "bottom", _as_float_time(zero)),
         ]
     )
-    if alpha_bc_mode_key == "equilibrium":
+    if bool(final_form):
+        # The lower boundary is an external wall for the pore-velocity
+        # extension field. Enforce the normal component to zero there as well.
+        bcs.append(BoundaryCondition("vP_y", "dirichlet", "bottom", _as_float_time(zero)))
+    if alpha_bc_mode_key == "equilibrium" and not bool(final_form):
         bcs.extend(
             [
                 BoundaryCondition("alpha", "dirichlet", "bottom", _as_float_time(alpha_bc)),
                 BoundaryCondition("mu_alpha", "dirichlet", "bottom", _as_float_time(zero)),
             ]
         )
+    elif alpha_bc_mode_key == "equilibrium":
+        bcs.append(BoundaryCondition("alpha", "dirichlet", "bottom", _as_float_time(alpha_bc)))
     if bool(alpha_solid_dirichlet_bottom):
         bcs.append(BoundaryCondition("alpha", "dirichlet", "bottom", _as_float_time(alpha_one)))
     if not bool(use_pressure_mean_constraint):
         bcs.append(BoundaryCondition("p", "dirichlet", "top", _as_float_time(zero)))
-    if bool(full_ratio_free_state):
+    if bool(full_ratio_free_state) or bool(final_form):
         bcs.append(BoundaryCondition("p_pore", "dirichlet", "top", _as_float_time(zero)))
-    if alpha_bc_mode_key == "equilibrium":
+    if alpha_bc_mode_key == "equilibrium" and not bool(final_form):
         bcs.extend(
             [
                 BoundaryCondition("alpha", "dirichlet", "top", _as_float_time(alpha_bc)),
                 BoundaryCondition("mu_alpha", "dirichlet", "top", _as_float_time(zero)),
             ]
         )
+    elif alpha_bc_mode_key == "equilibrium":
+        bcs.append(BoundaryCondition("alpha", "dirichlet", "top", _as_float_time(alpha_bc)))
     if bool(enable_phi_evolution) and phi_bc_mode_key == "equilibrium":
         bcs.append(BoundaryCondition("phi", "dirichlet", "top", _as_float_time(phi_eq)))
     latent_field_set = {str(name).strip() for name in tuple(latent_bounded_fields or tuple()) if str(name).strip()}
@@ -7232,10 +9375,10 @@ def _write_profile_csv(path: Path, *, x: np.ndarray, u_y: np.ndarray) -> None:
 
 def _build_alpha_diagnostics(problem: dict[str, object], *, quad_order: int, backend: str) -> NamedFunctionalEvaluator:
     alpha_k = problem["alpha_k"]
-    one = Constant(1.0)
+    one = _B7_ONE
     forms = {
         "alpha_area": alpha_k * dx(metadata={"q": int(quad_order)}),
-        "alpha_band": (Constant(4.0) * alpha_k * (one - alpha_k)) * dx(metadata={"q": int(quad_order)}),
+        "alpha_band": (_B7_FOUR * alpha_k * (one - alpha_k)) * dx(metadata={"q": int(quad_order)}),
     }
     return NamedFunctionalEvaluator(
         forms=forms,
@@ -7749,6 +9892,7 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         fluid_hdiv_order=int(args.fluid_hdiv_order),
         darcy_flux_space=str(getattr(args, "darcy_flux_space", "auto")),
         enable_phi_evolution=bool(args.enable_phi_evolution),
+        one_domain_formulation=str(getattr(args, "one_domain_formulation", "legacy")),
         reduced_support_state=str(getattr(args, "reduced_support_state", "alpha_B")),
         latent_bounded_transport=bool(args.latent_bounded_transport),
         latent_bounded_fields=_latent_bounded_fields(
@@ -7762,12 +9906,72 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         solid_volumetric_split=bool(args.solid_volumetric_split),
         drag_formulation=str(args.drag_formulation),
         full_ratio_free_state=bool(getattr(args, "full_ratio_free_state", False)),
-        split_primary_darcy_flux=bool(getattr(args, "split_primary_darcy_flux", False)),
-        one_pressure_primary_darcy_flux=bool(getattr(args, "one_pressure_primary_darcy_flux", False)),
+            split_primary_darcy_flux=bool(getattr(args, "split_primary_darcy_flux", False)),
+            split_pore_flux_model=str(getattr(args, "split_pore_flux_model", "exact_conservative_p")),
+            split_pore_momentum_model=str(getattr(args, "split_pore_momentum_model", "band_alpha")),
+            fluid_mass_model=str(getattr(args, "fluid_mass_model", "transported_free_content")),
+            one_pressure_primary_darcy_flux=bool(getattr(args, "one_pressure_primary_darcy_flux", False)),
         stored_support_content_mode=str(getattr(args, "stored_support_content_mode", "evolve_B")),
         transport_update_mode=str(getattr(args, "transport_update_mode", "auto")),
+        final_form_phi_mode=str(getattr(args, "final_form_phi_mode", "auto")),
+        final_form_implementation=str(getattr(args, "final_form_implementation", "tensor")),
+        final_form_constant_rho_s=bool(getattr(args, "final_form_constant_rho_s", False)),
+        final_form_domain_lm=bool(getattr(args, "final_form_domain_lm", False)),
+        final_form_domain_lm_aug_gamma=float(getattr(args, "final_form_domain_lm_aug_gamma", 10.0)),
+        final_form_mass_lm_aug_gamma=float(getattr(args, "final_form_mass_lm_aug_gamma", 1.0)),
+        y_interface=float(args.y_interface),
+        eps_alpha=float(eps_alpha_eff),
+        adaptive_interface_target_cells=float(getattr(args, "adaptive_interface_target_cells", 0.0) or 0.0),
+        adaptive_interface_band_halfwidth_factor=float(
+            getattr(args, "adaptive_interface_band_halfwidth_factor", 1.0) or 1.0
+        ),
+        adaptive_interface_max_ref=int(getattr(args, "adaptive_interface_max_ref", 4) or 4),
     )
+    mesh_adaptivity_meta = dict(problem.get("_mesh_adaptivity_meta", {}) or {})
+    if str(mesh_adaptivity_meta.get("mode", "structured")) != "structured":
+        print(
+            "[setup] adaptive interface mesh: "
+            f"mode={mesh_adaptivity_meta.get('mode')} "
+            f"ref_level={int(mesh_adaptivity_meta.get('used_refine_level', 0.0) or 0.0)} "
+            f"target_cells={float(mesh_adaptivity_meta.get('target_cells', float('nan'))):.3g} "
+            f"target_h={float(mesh_adaptivity_meta.get('target_h', float('nan'))):.3e} "
+            f"band_halfwidth={float(mesh_adaptivity_meta.get('band_halfwidth', float('nan'))):.3e} "
+            f"band_dy=[{float(mesh_adaptivity_meta.get('band_min_dy', float('nan'))):.3e}, "
+            f"{float(mesh_adaptivity_meta.get('band_max_dy', float('nan'))):.3e}] "
+            f"cells_across_2eps_min={float(mesh_adaptivity_meta.get('cells_across_2eps_min', float('nan'))):.3f}."
+        )
     problem["support_physics"] = str(args.support_physics)
+    problem["geometry_indicator_beta"] = float(getattr(args, "geometry_indicator_beta", 0.0) or 0.0)
+    problem["geometry_indicator_mode"] = str(getattr(args, "geometry_indicator_mode", "raw") or "raw")
+    problem["final_form_solid_interface_weight"] = float(
+        getattr(args, "final_form_solid_interface_weight", 1.0) or 0.0
+    )
+    problem["final_form_mass_interface_weight"] = float(
+        getattr(args, "final_form_mass_interface_weight", 1.0) or 0.0
+    )
+    problem["final_form_mass_interface_weight_c"] = _named_constant(
+        "b7_final_form_mass_interface_weight",
+        float(problem["final_form_mass_interface_weight"]),
+    )
+    problem["final_form_normal_interface_weight"] = float(
+        getattr(args, "final_form_normal_interface_weight", 1.0) or 0.0
+    )
+    problem["final_form_normal_interface_weight_c"] = _named_constant(
+        "b7_final_form_normal_interface_weight",
+        float(problem["final_form_normal_interface_weight"]),
+    )
+    problem["final_form_disable_interface_physics"] = bool(
+        getattr(args, "final_form_disable_interface_physics", False)
+    )
+    problem["final_form_disable_normal_interface"] = bool(
+        getattr(args, "final_form_disable_normal_interface", False)
+    )
+    problem["final_form_mass_lm_aug_gamma"] = float(
+        getattr(args, "final_form_mass_lm_aug_gamma", 1.0) or 0.0
+    )
+    problem["final_form_normal_lm_aug_gamma"] = float(
+        getattr(args, "final_form_normal_lm_aug_gamma", 1.0) or 0.0
+    )
     problem["transport_update_mode_effective"] = _benchmark7_transport_update_label(args)
     if (
         mechanics_nondim_key == "condition_balanced"
@@ -7826,17 +10030,35 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         problem["B_n"].nodal_values[:] = B_init
         problem["B_k"].nodal_values[:] = B_init
     if problem["phi_n"] is not None:
-        phi_init = np.clip(
-            1.0 - (1.0 - float(args.phi_b)) * np.asarray(problem["alpha_n"].nodal_values, dtype=float),
-            0.0,
-            1.0,
-        )
+        uniform_initial_phi = float(getattr(args, "uniform_initial_phi", float("nan")))
+        if np.isfinite(uniform_initial_phi):
+            phi_init = np.full_like(
+                np.asarray(problem["alpha_n"].nodal_values, dtype=float),
+                np.clip(uniform_initial_phi, 0.0, 1.0),
+                dtype=float,
+            )
+        else:
+            phi_init = np.clip(
+                1.0 - (1.0 - float(args.phi_b)) * np.asarray(problem["alpha_n"].nodal_values, dtype=float),
+                0.0,
+                1.0,
+            )
         problem["phi_n"].nodal_values[:] = phi_init
         problem["phi_k"].nodal_values[:] = phi_init
-        a0 = np.asarray(problem["alpha_n"].nodal_values, dtype=float)
-        Wp = 2.0 * a0 * (1.0 - a0) * (1.0 - 2.0 * a0)
-        problem["mu_n"].nodal_values[:] = float(args.gamma_alpha / max(float(eps_alpha_eff), 1.0e-12)) * Wp
-        problem["mu_k"].nodal_values[:] = problem["mu_n"].nodal_values[:]
+        if problem.get("mu_n") is not None:
+            a0 = np.asarray(problem["alpha_n"].nodal_values, dtype=float)
+            Wp = 2.0 * a0 * (1.0 - a0) * (1.0 - 2.0 * a0)
+            problem["mu_n"].nodal_values[:] = float(args.gamma_alpha / max(float(eps_alpha_eff), 1.0e-12)) * Wp
+            problem["mu_k"].nodal_values[:] = problem["mu_n"].nodal_values[:]
+    if problem.get("rho_s_n") is not None:
+        problem["rho_s_n"].nodal_values[:] = float(args.rho_s0_tilde)
+        problem["rho_s_k"].nodal_values[:] = float(args.rho_s0_tilde)
+    problem["final_form_constant_rho_s"] = bool(
+        bool(problem.get("final_form", False)) and bool(getattr(args, "final_form_constant_rho_s", False))
+    )
+    problem["final_form_freeze_rho_s"] = bool(
+        bool(problem.get("final_form", False)) and bool(getattr(args, "final_form_freeze_rho_s", False))
+    )
     if bool(problem.get("latent_bounded_transport", False)):
         latent_eps = float(getattr(args, "latent_bounded_eps", 1.0e-8))
         latent_map_kind = _latent_bounded_map_key(problem)
@@ -8040,6 +10262,65 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             f"vS_y={inactive_alpha_threshold_counts.get('vS_y', 0)})."
         )
 
+    final_form_inactive_domain_counts: dict[str, dict[str, int]] = {}
+    if bool(problem.get("final_form", False)) and bool(getattr(args, "final_form_inactive_domains", False)):
+        porous_fields: list[str] = []
+        if problem.get("p_pore_k") is not None:
+            porous_fields.append("p_pore")
+        porous_fields.extend(_primary_darcy_field_names(problem))
+        for name in ("phi", "rho_s", "vS_x", "vS_y", "u_x", "u_y"):
+            if name in getattr(problem["dh"], "field_names", ()):
+                porous_fields.append(name)
+        if bool(problem.get("final_form_domain_lm", False)):
+            for name in ("lm_vf_x", "lm_vf_y", "lm_p"):
+                if name in getattr(problem["dh"], "field_names", ()):
+                    porous_fields.append(name)
+        for name in ("mu_mass", "mu_normal", "mu_tangent", "mu_kin_x", "mu_kin_y"):
+            if name in getattr(problem["dh"], "field_names", ()):
+                porous_fields.append(name)
+        fluid_fields: list[str]
+        if str(problem["fluid_space"]).strip().lower() == "hdiv":
+            fluid_fields = ["v", "p"]
+        else:
+            fluid_fields = ["v_x", "v_y", "p"]
+        if bool(problem.get("final_form_domain_lm", False)):
+            for name in (
+                "lm_vP_x",
+                "lm_vP_y",
+                "lm_vS_x",
+                "lm_vS_y",
+                "lm_p_pore",
+                "lm_phi",
+                "lm_u_x",
+                "lm_u_y",
+            ):
+                if name in getattr(problem["dh"], "field_names", ()):
+                    fluid_fields.append(name)
+        for name in ("mu_mass", "mu_normal", "mu_tangent", "mu_kin_x", "mu_kin_y"):
+            if name in getattr(problem["dh"], "field_names", ()):
+                fluid_fields.append(name)
+        low_counts = _tag_inactive_fields_below_alpha(
+            problem,
+            alpha_threshold=float(getattr(args, "final_form_inactive_alpha_low", 0.05)),
+            field_names=porous_fields,
+        )
+        high_counts = _tag_inactive_fields_above_alpha(
+            problem,
+            alpha_threshold=float(getattr(args, "final_form_inactive_alpha_high", 0.95)),
+            field_names=fluid_fields,
+        )
+        final_form_inactive_domain_counts = {
+            "porous_in_free_fluid": dict(low_counts),
+            "fluid_in_support": dict(high_counts),
+        }
+        print(
+            "[setup] final_form_inactive_domains: deactivating porous/support fields on alpha <= "
+            f"{float(getattr(args, 'final_form_inactive_alpha_low', 0.05)):.6g} and free-fluid fields on alpha >= "
+            f"{float(getattr(args, 'final_form_inactive_alpha_high', 0.95)):.6g}: "
+            f"porous/support={sum(int(v) for v in low_counts.values())}, fluid={sum(int(v) for v in high_counts.values())}."
+        )
+    problem["_final_form_inactive_domain_counts"] = dict(final_form_inactive_domain_counts)
+
     rigid_support_diagnostic = bool(getattr(args, "rigid_support_diagnostic", False))
     if rigid_support_diagnostic:
         for key in ("vS_k", "u_k", "pi_s_k", "vS_n", "u_n", "pi_s_n"):
@@ -8076,6 +10357,7 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         gamma_u=float(args.gamma_u),
         u_extension_mode=str(args.u_extension),
         gamma_u_pin=float(args.gamma_u_pin),
+        interface_band_extension_gamma=float(args.interface_band_extension_gamma),
         u_cip=float(args.u_cip),
         u_cip_weight=str(args.u_cip_weight),
         vS_cip=float(args.vS_cip),
@@ -8085,6 +10367,26 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         D_phi=float(args.D_phi),
         phi_diffusion_weight=str(args.phi_diffusion_weight),
         gamma_phi=float(args.gamma_phi),
+        gamma_v=float(args.gamma_v),
+        v_extension_mode=str(args.v_extension),
+        gamma_v_pin=float(args.gamma_v_pin),
+        gamma_p=float(args.gamma_p),
+        p_extension_mode=str(args.p_extension),
+        gamma_p_pin=float(args.gamma_p_pin),
+        gamma_vP=float(args.gamma_vP),
+        vP_extension_mode=str(args.vP_extension),
+        gamma_vP_pin=float(args.gamma_vP_pin),
+        gamma_p_pore=float(args.gamma_p_pore),
+        p_pore_extension_mode=str(args.p_pore_extension),
+        gamma_p_pore_pin=float(args.gamma_p_pore_pin),
+        gamma_rho_s=float(args.gamma_rho_s),
+        rho_s_extension_mode=str(args.rho_s_extension),
+        gamma_rho_s_pin=float(args.gamma_rho_s_pin),
+        final_form_constant_rho_s=bool(args.final_form_constant_rho_s),
+        final_form_domain_lm=bool(getattr(args, "final_form_domain_lm", False)),
+        final_form_domain_lm_aug_gamma=float(getattr(args, "final_form_domain_lm_aug_gamma", 10.0)),
+        final_form_mass_lm_aug_gamma=float(getattr(args, "final_form_mass_lm_aug_gamma", 1.0)),
+        final_form_normal_lm_aug_gamma=float(getattr(args, "final_form_normal_lm_aug_gamma", 1.0)),
         phi_supg=float(args.phi_supg),
         phi_cip=float(args.phi_cip),
         alpha_supg=float(args.alpha_supg),
@@ -8105,8 +10407,11 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         stored_support_content_mode=str(getattr(args, "stored_support_content_mode", "evolve_B")),
         drag_formulation=str(args.drag_formulation),
         full_ratio_free_state=bool(getattr(args, "full_ratio_free_state", False)),
-        split_primary_darcy_flux=bool(getattr(args, "split_primary_darcy_flux", False)),
-        one_pressure_primary_darcy_flux=bool(getattr(args, "one_pressure_primary_darcy_flux", False)),
+            split_primary_darcy_flux=bool(getattr(args, "split_primary_darcy_flux", False)),
+            split_pore_flux_model=str(getattr(args, "split_pore_flux_model", "exact_conservative_p")),
+            split_pore_momentum_model=str(getattr(args, "split_pore_momentum_model", "band_alpha")),
+            fluid_mass_model=str(getattr(args, "fluid_mass_model", "transported_free_content")),
+            one_pressure_primary_darcy_flux=bool(getattr(args, "one_pressure_primary_darcy_flux", False)),
         pressure_interface_closure=bool(getattr(args, "pressure_interface_closure", False)),
         pressure_interface_closure_strength=float(getattr(args, "pressure_interface_closure_strength", 1.0)),
         p_pore_fluid_gauge=bool(getattr(args, "p_pore_fluid_gauge", True)),
@@ -8144,6 +10449,7 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         fluid_space=str(args.fluid_space),
         darcy_flux_space=str(getattr(args, "darcy_flux_space", "auto")),
         enable_phi_evolution=bool(args.enable_phi_evolution),
+        one_domain_formulation=str(getattr(args, "one_domain_formulation", "legacy")),
         full_ratio_free_state=bool(getattr(args, "full_ratio_free_state", False)),
         split_primary_darcy_flux=bool(getattr(args, "split_primary_darcy_flux", False)),
         one_pressure_primary_darcy_flux=bool(getattr(args, "one_pressure_primary_darcy_flux", False)),
@@ -8353,11 +10659,16 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
     base_vi_anderson_ginf_max = float(
         getattr(getattr(solver, "vi_params", None), "anderson_ginf_max", 0.0) or 0.0
     ) if "solver" in locals() else 0.0
+    base_solver_newton_tol = float(
+        getattr(getattr(solver, "np", None), "newton_tol", float(args.newton_tol)) or float(args.newton_tol)
+    ) if "solver" in locals() else float(args.newton_tol)
     startup_monolithic_budget = int(_startup_monolithic_max_it(args))
 
     def _restore_base_monolithic_controls() -> None:
         if int(getattr(solver.np, "max_newton_iter", base_solver_max_newton_iter)) != int(base_solver_max_newton_iter):
             solver.np.max_newton_iter = int(base_solver_max_newton_iter)
+        if float(getattr(solver.np, "newton_tol", base_solver_newton_tol) or base_solver_newton_tol) != float(base_solver_newton_tol):
+            solver.np.newton_tol = float(base_solver_newton_tol)
         if getattr(solver, "vi_params", None) is not None:
             relaxed_now = float(getattr(solver.vi_params, "relaxed_filter_accept_ginf", 0.0) or 0.0)
             if relaxed_now != float(base_solver_relaxed_accept_ginf):
@@ -8420,6 +10731,9 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
     def _record_step(functions) -> None:
         nonlocal last_interface_diag
         step_no = int(getattr(solver, "_current_step_no", len(timeseries_rows) + 1))
+        if int(step_no) == 1 and bool(startup_retry_state.get("step1_relaxed_mechanics_tol_active", False)):
+            _restore_base_monolithic_controls()
+            startup_retry_state["step1_relaxed_mechanics_tol_active"] = False
         t_now = float(getattr(solver, "_current_t", 0.0) + getattr(solver, "_current_dt", float(args.dt)))
         delta_inf_raw = getattr(solver, "_last_accepted_step_delta_inf", None)
         if delta_inf_raw is None:
@@ -8561,12 +10875,18 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                 "v": problem["v_k"],
                 "p": problem["p_k"],
                 **({"p_pore": problem["p_pore_k"]} if problem.get("p_pore_k") is not None else {}),
+                **({"vP": problem["vP_k"]} if problem.get("vP_k") is not None else {}),
+                **({"rho_s": problem["rho_s_k"]} if problem.get("rho_s_k") is not None else {}),
                 **({"q": problem["q_flux_k"]} if problem.get("q_flux_k") is not None else {}),
                 "vS": problem["vS_k"],
                 "u": problem["u_k"],
                 "alpha": problem["alpha_k"],
                 **({"B": problem["B_k"]} if problem.get("B_k") is not None else {}),
-                "mu_alpha": problem["mu_k"],
+                **({"mu_alpha": problem["mu_k"]} if problem.get("mu_k") is not None else {}),
+                **({"mu_mass": problem["mu_mass_k"]} if problem.get("mu_mass_k") is not None else {}),
+                **({"mu_normal": problem["mu_normal_k"]} if problem.get("mu_normal_k") is not None else {}),
+                **({"mu_tangent": problem["mu_tangent_k"]} if problem.get("mu_tangent_k") is not None else {}),
+                **({"mu_kin": problem["mu_kin_k"]} if problem.get("mu_kin_k") is not None else {}),
             }
             if problem["phi_k"] is not None:
                 vtk_functions["phi"] = problem["phi_k"]
@@ -8589,12 +10909,18 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             "v": problem["v_k"],
             "p": problem["p_k"],
             **({"p_pore": problem["p_pore_k"]} if problem.get("p_pore_k") is not None else {}),
+            **({"vP": problem["vP_k"]} if problem.get("vP_k") is not None else {}),
+            **({"rho_s": problem["rho_s_k"]} if problem.get("rho_s_k") is not None else {}),
             **({"q": problem["q_flux_k"]} if problem.get("q_flux_k") is not None else {}),
             "vS": problem["vS_k"],
             "u": problem["u_k"],
             "alpha": problem["alpha_k"],
             **({"B": problem["B_k"]} if problem.get("B_k") is not None else {}),
-            "mu_alpha": problem["mu_k"],
+            **({"mu_alpha": problem["mu_k"]} if problem.get("mu_k") is not None else {}),
+            **({"mu_mass": problem["mu_mass_k"]} if problem.get("mu_mass_k") is not None else {}),
+            **({"mu_normal": problem["mu_normal_k"]} if problem.get("mu_normal_k") is not None else {}),
+            **({"mu_tangent": problem["mu_tangent_k"]} if problem.get("mu_tangent_k") is not None else {}),
+            **({"mu_kin": problem["mu_kin_k"]} if problem.get("mu_kin_k") is not None else {}),
         }
         if problem["phi_k"] is not None:
             vtk_functions["phi"] = problem["phi_k"]
@@ -8804,6 +11130,16 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                         hi=1.0,
                     )
                 any_box_bounds = True
+            if problem.get("rho_s_k") is not None:
+                _apply_field_box_bounds(
+                    lower_full,
+                    upper_full,
+                    dof_handler=problem["dh"],
+                    field_name="rho_s",
+                    lo=0.0,
+                    hi=None,
+                )
+                any_box_bounds = True
             if any_box_bounds:
                 target_solver.set_box_bounds(lower=lower_full, upper=upper_full)
 
@@ -8884,6 +11220,14 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             ptc_late_operator_mode=str(getattr(args, "newton_ptc_late_operator_mode", "")),
         )
         newton_params.line_search = bool(args.line_search)
+        effective_linear_backend = str(args.linear_backend)
+        if _benchmark7_block_schur_enabled(args):
+            if str(effective_linear_backend).strip().lower() != "scipy":
+                print(
+                    "    [solver] overriding the native linear backend "
+                    f"'{str(effective_linear_backend)}' with the pycutfem.linalg block-Schur path."
+                )
+            effective_linear_backend = "scipy"
         common_solver_kwargs = dict(
             dof_handler=problem["dh"],
             mixed_element=problem["me"],
@@ -8891,13 +11235,13 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             bcs_homog=(bcs_homog if bcs_homog_in is None else bcs_homog_in),
             newton_params=newton_params,
             lin_params=LinearSolverParameters(
-                backend=str(args.linear_backend),
+                backend=str(effective_linear_backend),
                 tol=float(args.lin_tol),
                 maxit=int(args.lin_maxit),
                 distributed=bool(
                     MPI_CTX.enabled
                     and bool(getattr(args, "petsc_distributed", True))
-                    and str(args.linear_backend).strip().lower() == "petsc"
+                    and str(effective_linear_backend).strip().lower() == "petsc"
                 ),
             ),
             quad_order=int(qdeg),
@@ -9072,7 +11416,7 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                     print("    [solver] skipping weighted pressure mean-value gauge because the clean p_mean constraint is active.")
                 else:
                     if bool(problem.get("full_ratio_free_state", False)) and problem.get("alpha_k") is not None:
-                        p_weight_test = (Constant(1.0) - problem["alpha_k"]) * problem["q_test"]
+                        p_weight_test = (_B7_ONE - problem["alpha_k"]) * problem["q_test"]
                     else:
                         p_weight_test = problem["q_test"]
                     p_weights_full = _assemble_field_integral_weights(
@@ -9128,6 +11472,11 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                     prev_pre_cb(funcs)
 
             target_solver.pre_cb = _refmap_pre_cb
+        _configure_benchmark7_block_linear_solver(
+            args=args,
+            problem=problem,
+            target_solver=target_solver,
+        )
         _bind_solver_inactive_solid_interface_retagging(
             problem=problem,
             target_solver=target_solver,
@@ -9196,6 +11545,35 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                 _sync_alpha_from_refmap()
             if getattr(target_solver, "constraints", None) is not None:
                 target_solver._enforce_constraints_on_functions(funcs)
+            else:
+                # On the post_accept split branch, plain Newton transport stages
+                # are materially cheaper than a full bounded VI solve on the
+                # refined Seboldt meshes. If physical box bounds were requested
+                # but the active stage solver is unconstrained, project the
+                # accepted alpha/phi state back into the admissible interval
+                # here so later steps do not start from unphysical transport
+                # values.
+                if bool(getattr(args, "alpha_box_constraints", False)) and not bool(alpha_from_refmap_enabled):
+                    alpha_ref = _find_named_function(funcs, problem["alpha_k"])
+                    if alpha_ref is not None:
+                        alpha_ref.nodal_values[:] = np.clip(
+                            np.asarray(alpha_ref.nodal_values, dtype=float),
+                            0.0,
+                            1.0,
+                        )
+                if (
+                    bool(getattr(args, "phi_box_constraints", False))
+                    and bool(getattr(args, "enable_phi_evolution", False))
+                    and not bool(problem.get("full_ratio_free_state", False))
+                    and problem.get("phi_k") is not None
+                ):
+                    phi_ref = _find_named_function(funcs, problem["phi_k"])
+                    if phi_ref is not None:
+                        phi_ref.nodal_values[:] = np.clip(
+                            np.asarray(phi_ref.nodal_values, dtype=float),
+                            0.0,
+                            1.0,
+                        )
             reset_bounds_cb = getattr(target_solver, "_reset_benchmark7_vi_bounds_freeze", None)
             if callable(reset_bounds_cb):
                 reset_bounds_cb()
@@ -9222,6 +11600,7 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             f"{float(main_accept_factor):.0f}·atol on the refmap phi-only logistic startup branch."
         )
     transport_update_post_accept = bool(_use_post_accept_transport_update(args, problem))
+    mesh_mode = str(problem.get("_mesh_adaptivity_meta", {}).get("mode", "structured"))
     if bool(transport_update_post_accept):
         # The lagged flow/solid solve consistently reduces the exact residual by
         # O(10^2) on this branch, but the frozen-transport split rarely reaches a
@@ -9229,6 +11608,23 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         # transport update takes over. Use a relative stop criterion there and
         # do not widen it further with the generic near-tolerance accept factor.
         main_accept_factor = min(float(main_accept_factor), 1.0)
+        if mesh_mode != "structured":
+            relaxed_accept = 20.0
+            if mesh_mode == "adaptive_interface_band_numba":
+                # The conforming numba-generated band mesh removes hanging-node
+                # constraints, but the main flow/solid solve still reaches a
+                # shallow residual plateau around O(1e-4) before the bounded
+                # post-accept transport update finishes the step. Accepting in
+                # that band is materially cheaper than burning many extra
+                # Newton iterations on the same plateau.
+                relaxed_accept = 100.0
+            main_accept_factor = max(float(main_accept_factor), float(relaxed_accept))
+            print(
+                "    [solver] allowing nonconverged exact accepts up to "
+                f"{float(relaxed_accept):.0f}·tol on the adaptive-interface post_accept branch "
+                "because the bounded transport update is responsible for restoring the "
+                "physical alpha/phi state after the materially improved mechanics step."
+            )
 
     solver = _make_solver(
         forms,
@@ -9239,14 +11635,15 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         freeze_support_phi_bounds=True,
     )
     if bool(transport_update_post_accept):
-        default_newton_rtol = 1.0e-6
-        if abs(float(getattr(args, "newton_rtol", default_newton_rtol)) - default_newton_rtol) <= 1.0e-15:
-            solver.np.newton_rtol = max(float(solver.np.newton_rtol), 2.0e-2)
+        solver.np.newton_rtol = max(float(getattr(args, "newton_rtol", 0.0) or 0.0), 0.0)
+        if mesh_mode == "adaptive_interface_band_numba" and float(solver.np.newton_rtol) == 0.0:
             print(
-                "    [solver] using newton_rtol=2e-2 for the lagged main flow/solid solve so the "
-                "post-accept split stops on strong relative reduction instead of chasing an absolute 1e-6 floor."
+                "    [solver] keeping a strict absolute Newton tolerance on the conforming "
+                "adaptive-interface branch; the relaxed accept handles the useful "
+                "plateau without inflating tol_eff via a relative threshold."
             )
         main_active_fields: list[str] = []
+        lag_phi_in_main = _post_accept_lag_phi_in_main(problem)
         transport_fields_preview: list[str] = ["alpha", "mu_alpha"]
         if problem.get("B_k") is not None:
             transport_fields_preview.append("B")
@@ -9254,7 +11651,7 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             transport_fields_preview.append("alpha_mass_lm")
         if problem.get("alpha_latent_k") is not None:
             transport_fields_preview.append("alpha_latent")
-        if problem["phi_k"] is not None:
+        if lag_phi_in_main and problem["phi_k"] is not None:
             transport_fields_preview.append("phi")
             if problem.get("phi_latent_k") is not None:
                 transport_fields_preview.append("phi_latent")
@@ -9270,17 +11667,46 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             main_active_fields.append("p_mean")
         main_active_fields.extend(["vS_x", "vS_y", "u_x", "u_y"])
         main_active_fields.extend(_primary_darcy_field_names(problem))
+        if (
+            bool(problem.get("final_form", False))
+            and problem.get("rho_s_k") is not None
+            and not _final_form_freeze_rho_s(problem)
+            and not _final_form_constant_rho_s(problem)
+        ):
+            main_active_fields.append("rho_s")
+        if (not lag_phi_in_main) and problem["phi_k"] is not None:
+            main_active_fields.append("phi")
+            if problem.get("phi_latent_k") is not None:
+                main_active_fields.append("phi_latent")
         if problem.get("pi_s_k") is not None:
             main_active_fields.append("pi_s")
+        if bool(problem.get("final_form", False)):
+            for name, key in (
+                ("mu_mass", "mu_mass_k"),
+                ("mu_normal", "mu_normal_k"),
+                ("mu_tangent", "mu_tangent_k"),
+            ):
+                if problem.get(key) is not None:
+                    main_active_fields.append(name)
+            if problem.get("mu_kin_k") is not None:
+                main_active_fields.extend(["mu_kin_x", "mu_kin_y"])
+            main_active_fields.extend(_final_form_domain_lm_active_fields(problem))
         main_active_fields = _latent_transformed_active_fields(main_active_fields)
         _set_solver_active_fields_with_tracking(solver, main_active_fields)
         if hasattr(solver, "set_linear_equalities"):
             solver.set_linear_equalities([])
-        print(
-            "    [solver] lagging transport during the main Newton solve: active fields "
-            f"{tuple(main_active_fields)}; transport fields {tuple(transport_fields_preview)} "
-            "are updated once in post_step_refiner after the accepted flow/solid step."
-        )
+        if lag_phi_in_main:
+            print(
+                "    [solver] lagging transport during the main Newton solve: active fields "
+                f"{tuple(main_active_fields)}; transport fields {tuple(transport_fields_preview)} "
+                "are updated once in post_step_refiner after the accepted flow/solid step."
+            )
+        else:
+            print(
+                "    [solver] lagging only alpha-side transport during the main Newton solve: active fields "
+                f"{tuple(main_active_fields)}; lagged transport fields {tuple(transport_fields_preview)} "
+                "are updated once in post_step_refiner after the accepted flow/solid step."
+            )
     elif (
         bool(problem.get("latent_bounded_transport", False))
         and _latent_bounded_formulation_key(problem) == "transformed"
@@ -9609,21 +12035,47 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         problem["v_k"],
         problem["p_k"],
         *([problem["p_pore_k"]] if problem.get("p_pore_k") is not None else []),
+        *([problem["vP_k"]] if problem.get("vP_k") is not None else []),
         problem["vS_k"],
         problem["u_k"],
         problem["alpha_k"],
+        *([problem["rho_s_k"]] if problem.get("rho_s_k") is not None else []),
+        *([problem["mu_mass_k"]] if problem.get("mu_mass_k") is not None else []),
+        *([problem["mu_normal_k"]] if problem.get("mu_normal_k") is not None else []),
+        *([problem["mu_tangent_k"]] if problem.get("mu_tangent_k") is not None else []),
+        *([problem["mu_kin_k"]] if problem.get("mu_kin_k") is not None else []),
+        *([problem["lm_vf_k"]] if problem.get("lm_vf_k") is not None else []),
+        *([problem["lm_p_k"]] if problem.get("lm_p_k") is not None else []),
+        *([problem["lm_vP_k"]] if problem.get("lm_vP_k") is not None else []),
+        *([problem["lm_vS_k"]] if problem.get("lm_vS_k") is not None else []),
+        *([problem["lm_p_pore_k"]] if problem.get("lm_p_pore_k") is not None else []),
+        *([problem["lm_phi_k"]] if problem.get("lm_phi_k") is not None else []),
+        *([problem["lm_u_k"]] if problem.get("lm_u_k") is not None else []),
         *( [problem["B_k"]] if problem.get("B_k") is not None else [] ),
-        problem["mu_k"],
+        *( [problem["mu_k"]] if problem.get("mu_k") is not None else [] ),
     ]
     previous_functions = [
         problem["v_n"],
         problem["p_n"],
         *([problem["p_pore_n"]] if problem.get("p_pore_n") is not None else []),
+        *([problem["vP_n"]] if problem.get("vP_n") is not None else []),
         problem["vS_n"],
         problem["u_n"],
         problem["alpha_n"],
+        *([problem["rho_s_n"]] if problem.get("rho_s_n") is not None else []),
+        *([problem["mu_mass_n"]] if problem.get("mu_mass_n") is not None else []),
+        *([problem["mu_normal_n"]] if problem.get("mu_normal_n") is not None else []),
+        *([problem["mu_tangent_n"]] if problem.get("mu_tangent_n") is not None else []),
+        *([problem["mu_kin_n"]] if problem.get("mu_kin_n") is not None else []),
+        *([problem["lm_vf_n"]] if problem.get("lm_vf_n") is not None else []),
+        *([problem["lm_p_n"]] if problem.get("lm_p_n") is not None else []),
+        *([problem["lm_vP_n"]] if problem.get("lm_vP_n") is not None else []),
+        *([problem["lm_vS_n"]] if problem.get("lm_vS_n") is not None else []),
+        *([problem["lm_p_pore_n"]] if problem.get("lm_p_pore_n") is not None else []),
+        *([problem["lm_phi_n"]] if problem.get("lm_phi_n") is not None else []),
+        *([problem["lm_u_n"]] if problem.get("lm_u_n") is not None else []),
         *( [problem["B_n"]] if problem.get("B_n") is not None else [] ),
-        problem["mu_n"],
+        *( [problem["mu_n"]] if problem.get("mu_n") is not None else [] ),
     ]
     if problem.get("p_mean_k") is not None:
         current_functions.insert(2, problem["p_mean_k"])
@@ -9709,11 +12161,15 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         "pc_last_successful_lambda": None,
         "last_accepted_step_no": None,
         "last_accepted_delta_inf": None,
+        "step1_relaxed_mechanics_tol_active": False,
+        "step1_transport_predictor_snapshot": None,
+        "step1_transport_predictor_vi_state": None,
     }
     bootstrap_solver_cache: dict[str, object] = {}
     startup_stage_solver_cache: dict[str, object] = {}
     startup_stage_relaxed_ginf = float(_startup_stage_relaxed_accept_ginf(args))
     post_accept_transport_history: list[dict[str, float]] = []
+    step1_relaxed_mechanics_tol = 5.0e-3
 
     def _copy_prev_into_current(funcs, prev_funcs) -> None:
         for f, f_prev in zip(list(funcs or []), list(prev_funcs or [])):
@@ -9723,6 +12179,13 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         for f, f_prev in zip(list(funcs or []), list(prev_funcs or [])):
             f_prev.nodal_values[:] = f.nodal_values[:]
 
+    def _copy_selected_current_into_prev(funcs, prev_funcs, field_names) -> None:
+        selected = {str(name).strip() for name in list(field_names or []) if str(name).strip()}
+        for f, f_prev in zip(list(funcs or []), list(prev_funcs or [])):
+            name = str(getattr(f, "name", "")).strip()
+            if name in selected:
+                f_prev.nodal_values[:] = f.nodal_values[:]
+
     def _snapshot_function_values(funcs):
         return tuple(np.asarray(f.nodal_values, dtype=float).copy() for f in list(funcs or []))
 
@@ -9731,6 +12194,29 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             return
         for f, values in zip(list(funcs or []), list(snapshot or [])):
             f.nodal_values[:] = np.asarray(values, dtype=float)
+
+    def _snapshot_selected_function_values(funcs, field_names) -> dict[str, np.ndarray]:
+        selected = {str(name).strip() for name in list(field_names or []) if str(name).strip()}
+        snapshot: dict[str, np.ndarray] = {}
+        for f in list(funcs or []):
+            name = str(getattr(f, "name", "")).strip()
+            field_name = str(getattr(f, "field_name", "") or "").strip()
+            key = field_name or name
+            if key in selected or name in selected:
+                snapshot[key] = np.asarray(f.nodal_values, dtype=float).copy()
+        return snapshot
+
+    def _restore_selected_function_values(funcs, snapshot_by_name: dict[str, np.ndarray] | None) -> None:
+        if not snapshot_by_name:
+            return
+        for f in list(funcs or []):
+            name = str(getattr(f, "name", "")).strip()
+            field_name = str(getattr(f, "field_name", "") or "").strip()
+            values = snapshot_by_name.get(field_name, None)
+            if values is None:
+                values = snapshot_by_name.get(name, None)
+            if values is not None:
+                f.nodal_values[:] = np.asarray(values, dtype=float)
 
     def _current_alpha_mass_relative_defect(*, funcs, prev_funcs) -> float:
         try:
@@ -9970,6 +12456,78 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         allowed = {str(name) for name in list(field_names or [])}
         return [bc for bc in list(bcs_in or []) if str(getattr(bc, "field", "")) in allowed]
 
+    def _post_accept_lag_phi_enabled() -> bool:
+        return _post_accept_lag_phi_in_main(problem)
+
+    def _set_final_form_mass_interface_weight(weight: float) -> None:
+        weight_c = problem.get("final_form_mass_interface_weight_c", None)
+        if isinstance(weight_c, Constant):
+            weight_c.value = float(weight)
+
+    def _set_final_form_normal_interface_weight(weight: float) -> None:
+        weight_c = problem.get("final_form_normal_interface_weight_c", None)
+        if isinstance(weight_c, Constant):
+            weight_c.value = float(weight)
+
+    def _frozen_transport_mass_interface_homotopy_info() -> dict[str, float | bool]:
+        exact_weight = max(
+            0.0,
+            min(1.0, float(problem.get("final_form_mass_interface_weight", 1.0) or 0.0)),
+        )
+        if bool(problem.get("final_form_disable_interface_physics", False)):
+            exact_weight = 0.0
+        enabled = (
+            bool(problem.get("final_form", False))
+            and isinstance(problem.get("final_form_mass_interface_weight_c", None), Constant)
+            and bool(getattr(args, "final_form_mass_interface_homotopy", True))
+            and (not bool(problem.get("final_form_disable_interface_physics", False)))
+            and exact_weight > 0.0
+        )
+        start_weight = exact_weight
+        if enabled:
+            start_weight = max(
+                0.0,
+                min(1.0, float(getattr(args, "final_form_mass_interface_start_weight", 0.0) or 0.0)),
+            )
+            enabled = start_weight < exact_weight - 1.0e-15
+        return {
+            "enabled": bool(enabled),
+            "start": float(start_weight),
+            "exact": float(exact_weight),
+        }
+
+    def _frozen_transport_normal_interface_homotopy_info() -> dict[str, float | bool]:
+        exact_weight = max(
+            0.0,
+            min(1.0, float(problem.get("final_form_normal_interface_weight", 1.0) or 0.0)),
+        )
+        if bool(problem.get("final_form_disable_normal_interface", False)):
+            exact_weight = 0.0
+        enabled = (
+            bool(problem.get("final_form", False))
+            and isinstance(problem.get("final_form_normal_interface_weight_c", None), Constant)
+            and bool(getattr(args, "final_form_normal_interface_homotopy", True))
+            and (not bool(problem.get("final_form_disable_interface_physics", False)))
+            and exact_weight > 0.0
+        )
+        start_weight = exact_weight
+        if enabled:
+            start_weight = max(
+                0.0,
+                min(1.0, float(getattr(args, "final_form_normal_interface_start_weight", 0.0) or 0.0)),
+            )
+            enabled = start_weight < exact_weight - 1.0e-15
+        return {
+            "enabled": bool(enabled),
+            "start": float(start_weight),
+            "exact": float(exact_weight),
+        }
+
+    def _extend_unique_startup_fields(fields: list[str], extras: list[str]) -> None:
+        for name in list(extras or []):
+            if name not in fields:
+                fields.append(name)
+
     def _startup_flow_stage_fields() -> list[str]:
         if str(problem["fluid_space"]).strip().lower() == "hdiv":
             fields = ["v", "p"]
@@ -9977,37 +12535,83 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             fields = ["v_x", "v_y", "p"]
         if problem.get("p_pore_k") is not None:
             fields.append("p_pore")
+        if problem.get("vP_k") is not None:
+            fields.extend(["vP_x", "vP_y"])
         if problem.get("p_mean_k") is not None:
             fields.append("p_mean")
         fields.extend(_primary_darcy_field_names(problem))
+        for name, key in (
+            ("mu_mass", "mu_mass_k"),
+            ("mu_normal", "mu_normal_k"),
+            ("mu_tangent", "mu_tangent_k"),
+        ):
+            if problem.get(key) is not None:
+                fields.append(name)
+        _extend_unique_startup_fields(fields, _final_form_domain_lm_flow_stage_fields(problem))
         return fields
 
-    def _startup_transport_stage_fields() -> list[str]:
+    def _startup_transport_stage_fields(*, include_phi: bool = True) -> list[str]:
         fields = ["alpha", "mu_alpha"]
+        if problem.get("mu_k") is None:
+            fields = ["alpha"]
         if problem.get("B_k") is not None:
             fields.append("B")
+        if (
+            problem.get("rho_s_k") is not None
+            and not _final_form_freeze_rho_s(problem)
+            and not _final_form_constant_rho_s(problem)
+        ):
+            fields.append("rho_s")
         if problem.get("alpha_mass_lm_k") is not None:
             fields.append("alpha_mass_lm")
         if problem.get("alpha_latent_k") is not None:
             fields.append("alpha_latent")
-        if problem["phi_k"] is not None:
+        if include_phi and problem["phi_k"] is not None:
             fields.append("phi")
             if problem.get("phi_latent_k") is not None:
                 fields.append("phi_latent")
             if problem.get("S_k") is not None:
                 fields.append("S")
+            _extend_unique_startup_fields(fields, _final_form_domain_lm_transport_stage_fields(problem))
         return _latent_transformed_active_fields(fields)
 
     def _startup_fluid_stage_fields() -> list[str]:
         fields = _startup_flow_stage_fields()
-        fields.extend(_startup_transport_stage_fields())
+        fields.extend(_startup_transport_stage_fields(include_phi=_post_accept_lag_phi_enabled()))
         return _latent_transformed_active_fields(fields)
 
     def _startup_solid_stage_fields() -> list[str]:
         fields = ["vS_x", "vS_y", "u_x", "u_y"]
+        if problem.get("mu_kin_k") is not None:
+            fields.extend(["mu_kin_x", "mu_kin_y"])
+        # Keep phi at the transport-updated state during the startup solid stage.
+        #
+        # On the final_form branch the step-1 G-anchor predictor runs
+        # flow -> alpha/phi transport -> solid. Re-solving the bounded phi row
+        # inside the solid stage makes the startup PDAS active set grow
+        # monotonically from the transport-updated basin, even when the explicit
+        # interface laws are disabled. The solid predictor should therefore use
+        # the transport-updated phi as frozen data and leave the exact
+        # phi/interface recoupling to the subsequent P1/P2 or full monolithic
+        # solve.
+        if (
+            problem.get("rho_s_k") is not None
+            and not _final_form_freeze_rho_s(problem)
+            and not _final_form_constant_rho_s(problem)
+        ):
+            fields.append("rho_s")
         fields.extend(_primary_darcy_field_names(problem))
         if problem.get("pi_s_k") is not None:
             fields.append("pi_s")
+        if bool(problem.get("final_form", False)):
+            for name, key in (
+                ("mu_mass", "mu_mass_k"),
+                ("mu_normal", "mu_normal_k"),
+                ("mu_tangent", "mu_tangent_k"),
+            ):
+                if problem.get(key) is not None:
+                    fields.append(name)
+        _extend_unique_startup_fields(fields, _final_form_domain_lm_solid_stage_fields(problem))
         return _latent_transformed_active_fields(fields)
 
     def _startup_predictor_p1_fields() -> list[str]:
@@ -10021,10 +12625,17 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             "mu_alpha": "mu_k",
             "alpha_mass_lm": "alpha_mass_lm_k",
             "alpha_latent": "alpha_latent_k",
+            "mu_mass": "mu_mass_k",
+            "mu_normal": "mu_normal_k",
+            "mu_tangent": "mu_tangent_k",
         }
         for name, key in field_keys.items():
             if problem.get(key) is not None and name not in fields:
                 fields.append(name)
+        if problem.get("mu_kin_k") is not None:
+            for name in ("mu_kin_x", "mu_kin_y"):
+                if name not in fields:
+                    fields.append(name)
         return _latent_transformed_active_fields(fields)
 
     def _startup_predictor_p2_fields() -> list[str]:
@@ -10034,6 +12645,8 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             ("v_y", "v_k"),
             ("p", "p_k"),
             ("p_pore", "p_pore_k"),
+            ("vP_x", "vP_k"),
+            ("vP_y", "vP_k"),
             ("p_mean", "p_mean_k"),
             ("alpha_mass_lm", "alpha_mass_lm_k"),
             ("pi_s", "pi_s_k"),
@@ -10042,6 +12655,12 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             ("u_x", "u_k"),
             ("u_y", "u_k"),
             ("alpha", "alpha_k"),
+            ("rho_s", "rho_s_k"),
+            ("mu_mass", "mu_mass_k"),
+            ("mu_normal", "mu_normal_k"),
+            ("mu_tangent", "mu_tangent_k"),
+            ("mu_kin_x", "mu_kin_k"),
+            ("mu_kin_y", "mu_kin_k"),
             ("B", "B_k"),
             ("mu_alpha", "mu_k"),
             ("alpha_latent", "alpha_latent_k"),
@@ -10050,6 +12669,8 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             ("S", "S_k"),
         )
         for name, key in ordered_keys:
+            if name == "rho_s" and (_final_form_freeze_rho_s(problem) or _final_form_constant_rho_s(problem)):
+                continue
             if problem.get(key) is not None and name not in fields:
                 fields.append(name)
         for name in _primary_darcy_field_names(problem):
@@ -10118,6 +12739,19 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             # instead of failing the whole time step after the physics-carrying
             # split solve has already converged.
             stage_relaxed_accept_ginf = max(stage_relaxed_accept_ginf, 5.5e-2)
+        if (
+            stage_name == "solid"
+            and bool(problem.get("final_form", False))
+            and problem.get("phi_k") is not None
+        ):
+            # The final_form startup split now freezes phi at the transport-updated
+            # state before the solid predictor. That removes the pathological
+            # bounded-phi PDAS blow-up, but the remaining solid-only startup
+            # subproblem can still stall while polishing from O(1e-3) toward the
+            # exact Newton tolerance. Keep the materially improved basin once the
+            # stage residual is in that range and let the following exact
+            # monolithic/P1/P2 solves recouple phi and interface physics.
+            stage_relaxed_accept_ginf = max(stage_relaxed_accept_ginf, 2.0e-3)
         target_solver = _make_solver(
             SimpleNamespace(residual_form=residual_form, jacobian_form=jacobian_form),
             postproc_cb=None,
@@ -10161,6 +12795,8 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         flow_fields = _startup_flow_stage_fields()
         transport_fields = _startup_transport_stage_fields()
         solid_fields = _startup_solid_stage_fields()
+        r_mom_terms = getattr(forms, "r_momentum_terms", None) or {}
+        a_mom_terms = getattr(forms, "a_momentum_terms", None) or {}
         flow_solver = _make_startup_stage_solver(
             stage_name="flow",
             residual_form=_sum_stage_forms(
@@ -10199,21 +12835,43 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         )
         solid_solver = _make_startup_stage_solver(
             stage_name="solid",
-            residual_form=forms.r_skeleton + forms.r_kinematics,
-            jacobian_form=forms.a_skeleton + forms.a_kinematics,
+            residual_form=_sum_stage_forms(
+                forms.r_skeleton,
+                forms.r_kinematics,
+                getattr(forms, "r_phi", None),
+                r_mom_terms.get("interface_mass_constraint", None),
+                r_mom_terms.get("interface_normal_constraint", None),
+                r_mom_terms.get("interface_tangential_constraint", None),
+            ),
+            jacobian_form=_sum_stage_forms(
+                forms.a_skeleton,
+                forms.a_kinematics,
+                getattr(forms, "a_phi", None),
+                a_mom_terms.get("interface_mass_constraint", None),
+                a_mom_terms.get("interface_normal_constraint", None),
+                a_mom_terms.get("interface_tangential_constraint", None),
+            ),
             active_fields=solid_fields,
+            max_newton_iter_override=(
+                5
+                if bool(problem.get("final_form", False)) and problem.get("phi_k") is not None
+                else None
+            ),
         )
         startup_stage_solver_cache["flow"] = flow_solver
         startup_stage_solver_cache["transport"] = transport_solver
         startup_stage_solver_cache["solid"] = solid_solver
         return flow_solver, transport_solver, solid_solver
 
-    def _get_post_accept_transport_solver():
-        cache_key = "post_accept_transport"
+    def _get_post_accept_transport_solver(*, include_phi: bool | None = None):
+        if include_phi is None:
+            include_phi = bool(_post_accept_lag_phi_enabled())
+        include_phi = bool(include_phi)
+        cache_key = f"post_accept_transport:phi={int(include_phi)}"
         target_solver = startup_stage_solver_cache.get(cache_key)
         if target_solver is not None:
             return target_solver
-        transport_fields = _startup_transport_stage_fields()
+        transport_fields = _startup_transport_stage_fields(include_phi=include_phi)
         if not transport_fields:
             return None
         if not _forms_support_startup_staggered(forms):
@@ -10225,16 +12883,16 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                 getattr(forms, "r_B", None),
                 getattr(forms, "r_mu_alpha", None),
                 problem.get("_alpha_mass_constraint_residual_form"),
-                getattr(forms, "r_phi", None),
-                getattr(forms, "r_substrate", None),
+                (getattr(forms, "r_phi", None) if include_phi else None),
+                (getattr(forms, "r_substrate", None) if include_phi else None),
             ),
             jacobian_form=_sum_stage_forms(
                 getattr(forms, "a_alpha", None),
                 getattr(forms, "a_B", None),
                 getattr(forms, "a_mu_alpha", None),
                 problem.get("_alpha_mass_constraint_jacobian_form"),
-                getattr(forms, "a_phi", None),
-                getattr(forms, "a_substrate", None),
+                (getattr(forms, "a_phi", None) if include_phi else None),
+                (getattr(forms, "a_substrate", None) if include_phi else None),
             ),
             active_fields=transport_fields,
             max_newton_iter_override=max(
@@ -10401,6 +13059,8 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         import_vi_state = getattr(solver, "import_vi_state", None)
         if completed_outer > 0 and callable(import_vi_state) and transport_vi_state is not None:
             import_vi_state(transport_vi_state, force_once=True)
+            if int(step_no) == 1:
+                startup_retry_state["step1_transport_predictor_vi_state"] = transport_vi_state
         reset_bounds_cb = getattr(solver, "_reset_benchmark7_vi_bounds_freeze", None)
         if callable(reset_bounds_cb):
             reset_bounds_cb()
@@ -11012,6 +13672,14 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         p2_easy_skeleton_lagged = _named_constant("pc_p2_easy_skeleton_lagged", 0.0)
         p2_exact_skeleton_full = _named_constant("pc_p2_exact_skeleton_full", 0.0)
         p2_exact_skeleton_lagged = _named_constant("pc_p2_exact_skeleton_lagged", 0.0)
+        p2_easy_final_form_normal_interface_weight = _named_constant(
+            "pc_p2_easy_final_form_normal_interface_weight",
+            1.0,
+        )
+        p2_exact_final_form_normal_interface_weight = _named_constant(
+            "pc_p2_exact_final_form_normal_interface_weight",
+            1.0,
+        )
         p2_forms = _build_forms(
             problem,
             qdeg=int(qdeg),
@@ -11036,6 +13704,7 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             gamma_u=float(args.gamma_u),
             u_extension_mode=str(args.u_extension),
             gamma_u_pin=float(args.gamma_u_pin),
+            interface_band_extension_gamma=float(args.interface_band_extension_gamma),
             u_cip=float(args.u_cip),
             u_cip_weight=str(args.u_cip_weight),
             vS_cip=float(args.vS_cip),
@@ -11045,6 +13714,26 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             D_phi=float(args.D_phi),
             phi_diffusion_weight=str(args.phi_diffusion_weight),
             gamma_phi=float(args.gamma_phi),
+            gamma_v=float(args.gamma_v),
+            v_extension_mode=str(args.v_extension),
+            gamma_v_pin=float(args.gamma_v_pin),
+            gamma_p=float(args.gamma_p),
+            p_extension_mode=str(args.p_extension),
+            gamma_p_pin=float(args.gamma_p_pin),
+            gamma_vP=float(args.gamma_vP),
+            vP_extension_mode=str(args.vP_extension),
+            gamma_vP_pin=float(args.gamma_vP_pin),
+            gamma_p_pore=float(args.gamma_p_pore),
+            p_pore_extension_mode=str(args.p_pore_extension),
+            gamma_p_pore_pin=float(args.gamma_p_pore_pin),
+            gamma_rho_s=float(args.gamma_rho_s),
+            rho_s_extension_mode=str(args.rho_s_extension),
+            gamma_rho_s_pin=float(args.gamma_rho_s_pin),
+            final_form_constant_rho_s=bool(args.final_form_constant_rho_s),
+            final_form_domain_lm=bool(getattr(args, "final_form_domain_lm", False)),
+            final_form_domain_lm_aug_gamma=float(getattr(args, "final_form_domain_lm_aug_gamma", 10.0)),
+            final_form_mass_lm_aug_gamma=float(getattr(args, "final_form_mass_lm_aug_gamma", 1.0)),
+            final_form_normal_lm_aug_gamma=float(getattr(args, "final_form_normal_lm_aug_gamma", 1.0)),
             phi_supg=float(args.phi_supg),
             phi_cip=float(args.phi_cip),
             alpha_supg=float(args.alpha_supg),
@@ -11077,6 +13766,10 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             interface_bjs_closure=bool(getattr(args, "interface_bjs_closure", False)),
             interface_bjs_closure_strength=float(getattr(args, "interface_bjs_closure_strength", 1.0)),
             interface_bjs_gamma=float(getattr(args, "interface_bjs_gamma", 1.0e3)),
+            final_form_normal_interface_weight=(
+                one_minus_p2_lambda * p2_easy_final_form_normal_interface_weight
+                + p2_lambda * p2_exact_final_form_normal_interface_weight
+            ),
             interface_velocity_continuity_closure=bool(getattr(args, "interface_velocity_continuity_closure", False)),
             interface_velocity_method=str(getattr(args, "interface_velocity_method", "penalty")),
             interface_velocity_normal_strength=float(getattr(args, "interface_velocity_normal_strength", 1.0)),
@@ -11155,6 +13848,8 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             "easy_skeleton_lagged": p2_easy_skeleton_lagged,
             "exact_skeleton_full": p2_exact_skeleton_full,
             "exact_skeleton_lagged": p2_exact_skeleton_lagged,
+            "easy_final_form_normal_interface_weight": p2_easy_final_form_normal_interface_weight,
+            "exact_final_form_normal_interface_weight": p2_exact_final_form_normal_interface_weight,
         }
         startup_stage_solver_cache[cache_key] = target_solver
         return target_solver
@@ -11170,6 +13865,29 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             exact_fluid = _pc_fluid_convection_selectors(str(getattr(args, "pc_p2_fluid_convection", "lagged")))
             easy_skeleton = _pc_skeleton_inertia_selectors("lagged")
             exact_skeleton = _pc_skeleton_inertia_selectors(str(getattr(args, "pc_p2_skeleton_inertia_convection", "lagged")))
+            exact_final_form_normal = max(
+                0.0,
+                min(1.0, float(getattr(args, "final_form_normal_interface_weight", 1.0) or 1.0)),
+            )
+            if bool(getattr(args, "final_form_disable_normal_interface", False)):
+                exact_final_form_normal = 0.0
+            use_final_form_normal_homotopy = (
+                bool(problem.get("final_form", False))
+                and bool(getattr(args, "final_form_normal_interface_homotopy", True))
+                and (not bool(getattr(args, "final_form_disable_interface_physics", False)))
+                and exact_final_form_normal > 0.0
+            )
+            easy_final_form_normal = (
+                max(
+                    0.0,
+                    min(
+                        1.0,
+                        float(getattr(args, "final_form_normal_interface_start_weight", 0.0) or 0.0),
+                    ),
+                )
+                if use_final_form_normal_homotopy
+                else exact_final_form_normal
+            )
             mode_constants["easy_fluid_full"].value = float(easy_fluid["full"])
             mode_constants["easy_fluid_lagged"].value = float(easy_fluid["lagged"])
             mode_constants["easy_fluid_imex"].value = float(easy_fluid["imex"])
@@ -11186,11 +13904,29 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             mode_constants["easy_skeleton_lagged"].value = float(easy_skeleton["lagged"])
             mode_constants["exact_skeleton_full"].value = float(exact_skeleton["full"])
             mode_constants["exact_skeleton_lagged"].value = float(exact_skeleton["lagged"])
+            mode_constants["easy_final_form_normal_interface_weight"].value = float(
+                easy_final_form_normal
+            )
+            mode_constants["exact_final_form_normal_interface_weight"].value = float(
+                exact_final_form_normal
+            )
         return {
             "anchor_dt": float(_pc_p2_easy_dt_value(args, float(dt_now))),
             "fluid_convection": str(getattr(args, "startup_bootstrap_fluid_convection", "off")),
             "include_skeleton_acceleration": float(
                 1.0 if bool(getattr(args, "startup_bootstrap_include_skeleton_acceleration", False)) else 0.0
+            ),
+            "final_form_normal_interface_start_weight": float(
+                mode_constants["easy_final_form_normal_interface_weight"].value
+                if isinstance(mode_constants, dict)
+                and mode_constants.get("easy_final_form_normal_interface_weight") is not None
+                else float(getattr(args, "final_form_normal_interface_weight", 1.0) or 1.0)
+            ),
+            "final_form_normal_interface_exact_weight": float(
+                mode_constants["exact_final_form_normal_interface_weight"].value
+                if isinstance(mode_constants, dict)
+                and mode_constants.get("exact_final_form_normal_interface_weight") is not None
+                else float(getattr(args, "final_form_normal_interface_weight", 1.0) or 1.0)
             ),
         }
 
@@ -11758,6 +14494,19 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                             "final": dict(best_stats),
                             "stages": stage_log,
                         }
+                    g_anchor_ratio = float(best_stats["raw_inf"]) / max(float(initial_stats["raw_inf"]), 1.0e-30)
+                    if bool(problem.get("final_form", False)) and np.isfinite(g_anchor_ratio) and g_anchor_ratio <= 1.0e-1:
+                        _restore_function_values(funcs, best_snapshot)
+                        print(
+                            "    [pc] keeping the strong G-anchor basin on the final_form branch because the "
+                            "exact probe did not improve it and the later predictor stages are dominated by the "
+                            "same stalled exact residual."
+                        )
+                        return {
+                            "initial": dict(initial_stats),
+                            "final": dict(best_stats),
+                            "stages": stage_log,
+                        }
                     _restore_function_values(funcs, best_snapshot)
                     if _logistic_refmap_phi_only_mode(args):
                         print(
@@ -12149,6 +14898,8 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                 f"G0_dt={float(p2_easy_info['anchor_dt']):.3e}, "
                 f"G_fluid={str(p2_easy_info['fluid_convection'])}, "
                 f"G_skel_accel={int(bool(p2_easy_info['include_skeleton_acceleration']))}, "
+                f"G_if_n={float(p2_easy_info['final_form_normal_interface_start_weight']):.3f}, "
+                f"F_if_n={float(p2_easy_info['final_form_normal_interface_exact_weight']):.3f}, "
                 f"F_fluid={str(getattr(args, 'pc_p2_fluid_convection', 'lagged'))}, "
                 f"F_skeleton={str(getattr(args, 'pc_p2_skeleton_inertia_convection', 'lagged'))}."
             )
@@ -12192,6 +14943,12 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             n_outer = max(1, int(getattr(args, "stall_frozen_transport_outer_it", 1)))
         else:
             n_outer = max(1, int(outer_it_override))
+        mass_interface_h_info = _frozen_transport_mass_interface_homotopy_info()
+        normal_interface_h_info = _frozen_transport_normal_interface_homotopy_info()
+        if bool(mass_interface_h_info["enabled"]) and n_outer < 3:
+            n_outer = 3
+        if bool(normal_interface_h_info["enabled"]) and n_outer < 2:
+            n_outer = 2
         flow_hist: list[int] = []
         solid_hist: list[int] = []
         before_norm = _current_monolithic_raw_residual_inf(
@@ -12212,6 +14969,37 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         aa_pairs: list[dict[str, np.ndarray]] = []
         best_norm = float(before_norm)
         best_snapshot = _snapshot_function_values(funcs)
+        exact_interface_eval = bool(mass_interface_h_info["enabled"]) or bool(normal_interface_h_info["enabled"])
+
+        def _current_exact_problem_raw_residual(
+            *,
+            stage_mass_weight: float,
+            stage_normal_weight: float,
+        ) -> float:
+            if not bool(exact_interface_eval):
+                return float(
+                    _current_monolithic_raw_residual_inf(
+                        funcs=funcs,
+                        prev_funcs=prev_funcs,
+                        aux_funcs=aux_funcs,
+                        bcs_now=bcs_now,
+                    )
+                )
+            _set_final_form_mass_interface_weight(float(mass_interface_h_info["exact"]))
+            _set_final_form_normal_interface_weight(float(normal_interface_h_info["exact"]))
+            try:
+                return float(
+                    _current_monolithic_raw_residual_inf(
+                        funcs=funcs,
+                        prev_funcs=prev_funcs,
+                        aux_funcs=aux_funcs,
+                        bcs_now=bcs_now,
+                    )
+                )
+            finally:
+                _set_final_form_mass_interface_weight(float(stage_mass_weight))
+                _set_final_form_normal_interface_weight(float(stage_normal_weight))
+
         vi_state_before = None
         export_vi_state = getattr(solver, "export_vi_state", None)
         if callable(export_vi_state):
@@ -12219,7 +15007,44 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         completed_outer = 0
         partial_reason: str | None = None
         try:
+            if bool(mass_interface_h_info["enabled"]):
+                print(
+                    "    [startup] frozen-transport mass-interface homotopy "
+                    f"{float(mass_interface_h_info['start']):.3f} -> "
+                    f"{float(mass_interface_h_info['exact']):.3f} over {int(n_outer)} outer sweep(s)."
+                )
+            if bool(normal_interface_h_info["enabled"]):
+                print(
+                    "    [startup] frozen-transport normal-interface homotopy "
+                    f"{float(normal_interface_h_info['start']):.3f} -> "
+                    f"{float(normal_interface_h_info['exact']):.3f} over {int(n_outer)} outer sweep(s)."
+                )
             for outer_it in range(n_outer):
+                if bool(mass_interface_h_info["enabled"]):
+                    if n_outer <= 1:
+                        stage_mass_weight = float(mass_interface_h_info["start"])
+                    else:
+                        lam_stage = float(outer_it) / float(max(1, n_outer - 1))
+                        stage_mass_weight = (
+                            (1.0 - lam_stage) * float(mass_interface_h_info["start"])
+                            + lam_stage * float(mass_interface_h_info["exact"])
+                        )
+                    _set_final_form_mass_interface_weight(stage_mass_weight)
+                else:
+                    stage_mass_weight = float(mass_interface_h_info["exact"])
+                    _set_final_form_mass_interface_weight(stage_mass_weight)
+                if bool(normal_interface_h_info["enabled"]):
+                    if n_outer <= 1:
+                        stage_weight = float(normal_interface_h_info["start"])
+                    else:
+                        lam_stage = float(outer_it) / float(max(1, n_outer - 1))
+                        stage_weight = (
+                            (1.0 - lam_stage) * float(normal_interface_h_info["start"])
+                            + lam_stage * float(normal_interface_h_info["exact"])
+                        )
+                    _set_final_form_normal_interface_weight(stage_weight)
+                else:
+                    _set_final_form_normal_interface_weight(float(normal_interface_h_info["exact"]))
                 input_snapshot = _snapshot_function_values(funcs)
                 try:
                     _set_solver_newton_trace_context(
@@ -12239,6 +15064,26 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                             f"frozen-transport flow solve did not converge on outer sweep {int(outer_it) + 1}"
                         )
                     flow_hist.append(int(flow_iters))
+                    if (
+                        bool(mass_interface_h_info["enabled"])
+                        and float(stage_mass_weight) <= 1.0e-14
+                        and problem.get("mu_mass_k") is not None
+                    ):
+                        if int(outer_it) == 0:
+                            print(
+                                "    [startup] projecting mu_mass to zero on the relaxed mass-interface anchor sweep."
+                            )
+                        problem["mu_mass_k"].nodal_values[:] = 0.0
+                    if (
+                        bool(normal_interface_h_info["enabled"])
+                        and float(stage_weight) <= 1.0e-14
+                        and problem.get("mu_normal_k") is not None
+                    ):
+                        if int(outer_it) == 0:
+                            print(
+                                "    [startup] projecting mu_normal to zero on the relaxed normal-interface anchor sweep."
+                            )
+                        problem["mu_normal_k"].nodal_values[:] = 0.0
                     _set_solver_newton_trace_context(
                         solid_solver,
                         label=f"frozen-transport:solid[o{int(outer_it) + 1}]",
@@ -12258,11 +15103,9 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                     solid_hist.append(int(solid_iters))
                 except Exception as stage_exc:
                     candidate_snapshot = _snapshot_function_values(funcs)
-                    candidate_norm = _current_monolithic_raw_residual_inf(
-                        funcs=funcs,
-                        prev_funcs=prev_funcs,
-                        aux_funcs=aux_funcs,
-                        bcs_now=bcs_now,
+                    candidate_norm = _current_exact_problem_raw_residual(
+                        stage_mass_weight=float(stage_mass_weight),
+                        stage_normal_weight=float(stage_weight),
                     )
                     if (
                         np.isfinite(candidate_norm)
@@ -12322,12 +15165,18 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                             except Exception:
                                 _restore_function_values(funcs, trial_snapshot)
                 _restore_function_values(funcs, kept_snapshot)
+                exact_kept_norm = _current_exact_problem_raw_residual(
+                    stage_mass_weight=float(stage_mass_weight),
+                    stage_normal_weight=float(stage_weight),
+                )
                 if not np.isfinite(best_norm) or (
-                    np.isfinite(kept_norm) and (not np.isfinite(best_norm) or kept_norm < best_norm)
+                    np.isfinite(exact_kept_norm) and (not np.isfinite(best_norm) or exact_kept_norm < best_norm)
                 ):
-                    best_norm = float(kept_norm)
+                    best_norm = float(exact_kept_norm)
                     best_snapshot = _snapshot_function_values(funcs)
         finally:
+            _set_final_form_mass_interface_weight(float(mass_interface_h_info["exact"]))
+            _set_final_form_normal_interface_weight(float(normal_interface_h_info["exact"]))
             if prev_accept is None:
                 os.environ.pop(accept_key, None)
             else:
@@ -12358,38 +15207,112 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
     ) -> dict[str, float] | None:
         if not bool(transport_update_post_accept):
             return None
-        target_solver = _get_post_accept_transport_solver()
+        include_phi = bool(_post_accept_lag_phi_enabled())
+        target_solver = _get_post_accept_transport_solver(include_phi=include_phi)
         if target_solver is None:
             return None
-        transport_fields = _startup_transport_stage_fields()
+        transport_fields = _startup_transport_stage_fields(include_phi=include_phi)
         if not transport_fields:
             return None
         transport_bcs_now = _filter_bcs_by_fields(bcs_now, transport_fields)
         stage_t = float(getattr(solver, "_current_t", 0.0) + getattr(solver, "_current_dt", float(args.dt)))
         stage_dt = float(getattr(solver, "_current_dt", float(args.dt)))
-        target_solver._current_t = float(stage_t)
-        target_solver._current_dt = float(stage_dt)
         target_solver._current_step_no = int(step_no)
-        _set_solver_newton_trace_context(
-            target_solver,
-            label=f"post-accept-transport[{int(step_no)}]",
-            global_bcs_now=bcs_now,
-        )
-        problem["dh"].apply_bcs(transport_bcs_now, *funcs)
+
+        def _run_transport_stage(*, dt_local: float, t_local: float, label: str) -> int:
+            target_solver._current_t = float(t_local)
+            target_solver._current_dt = float(dt_local)
+            _set_solver_newton_trace_context(
+                target_solver,
+                label=str(label),
+                global_bcs_now=bcs_now,
+            )
+            problem["dh"].apply_bcs(transport_bcs_now, *funcs)
+            _, local_converged, local_iters = target_solver._newton_loop(
+                funcs,
+                prev_funcs,
+                aux_solver_functions,
+                transport_bcs_now,
+            )
+            if not bool(local_converged):
+                raise RuntimeError(
+                    f"post-accept transport update did not converge on step {int(step_no)}"
+                )
+            return int(local_iters)
+
+        predictor_vi_state = startup_retry_state.get("step1_transport_predictor_vi_state", None)
+        if int(step_no) == 1 and predictor_vi_state is not None:
+            import_vi_state = getattr(target_solver, "import_vi_state", None)
+            if callable(import_vi_state):
+                import_vi_state(predictor_vi_state, force_once=True)
+                print(
+                    "    [startup] importing the predictor-corrector transport VI state into the "
+                    "accepted step-1 post_accept transport update."
+                )
+        if int(step_no) == 1 and bool(problem.get("final_form", False)) and _final_form_constant_rho_s(problem):
+            print(
+                "    [startup] reusing the predictor-corrector alpha/phi snapshot for the first "
+                "post_accept transport update."
+            )
+        transport_snapshot = _snapshot_selected_function_values(funcs, transport_fields)
+        prev_transport_snapshot = _snapshot_selected_function_values(prev_funcs, transport_fields)
         _write_post_accept_stage_snapshot(
             step_no=int(step_no),
             label="pre_transport",
         )
-        _, transport_converged, transport_iters = target_solver._newton_loop(
-            funcs,
-            prev_funcs,
-            aux_solver_functions,
-            transport_bcs_now,
-        )
-        if not bool(transport_converged):
-            raise RuntimeError(
-                f"post-accept transport update did not converge on step {int(step_no)}"
+        transport_iters = 0
+        dt_saved = float(dt_c.value)
+        try:
+            transport_iters = int(
+                _run_transport_stage(
+                    dt_local=float(stage_dt),
+                    t_local=float(stage_t),
+                    label=f"post-accept-transport[{int(step_no)}]",
+                )
             )
+        except Exception as transport_exc:
+            eligible_subcycling = (
+                bool(problem.get("final_form", False))
+                and _final_form_constant_rho_s(problem)
+            )
+            if not eligible_subcycling:
+                raise
+            n_sub = max(2, int(np.ceil(float(stage_dt) / max(float(args.dt_min), 1.0e-16))))
+            max_n_sub = max(int(n_sub), 64)
+            stage_t_start = float(stage_t - stage_dt)
+            subcycling_exc = transport_exc
+            while int(n_sub) <= int(max_n_sub):
+                _restore_selected_function_values(funcs, transport_snapshot)
+                _restore_selected_function_values(prev_funcs, prev_transport_snapshot)
+                sub_dt = float(stage_dt) / float(n_sub)
+                print(
+                    "    [transport] post-accept transport solve stalled at the full accepted step; "
+                    f"retrying the transport block with {int(n_sub)} substeps of dt={float(sub_dt):.3e}. "
+                    f"Original failure: {subcycling_exc}"
+                )
+                total_iters = 0
+                dt_c.value = float(sub_dt)
+                try:
+                    for sub_idx in range(int(n_sub)):
+                        sub_t = float(stage_t_start + (sub_idx + 1) * sub_dt)
+                        total_iters += int(
+                            _run_transport_stage(
+                                dt_local=float(sub_dt),
+                                t_local=float(sub_t),
+                                label=f"post-accept-transport[{int(step_no)}:{int(sub_idx) + 1}/{int(n_sub)}]",
+                            )
+                        )
+                        _copy_selected_current_into_prev(funcs, prev_funcs, transport_fields)
+                    transport_iters = int(total_iters)
+                    subcycling_exc = None
+                    break
+                except Exception as sub_exc:
+                    subcycling_exc = sub_exc
+                    n_sub *= 2
+            if subcycling_exc is not None:
+                raise subcycling_exc
+        finally:
+            dt_c.value = float(dt_saved)
         _write_post_accept_stage_snapshot(
             step_no=int(step_no),
             label="post_transport",
@@ -12657,6 +15580,7 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             gamma_u=float(args.gamma_u),
             u_extension_mode=str(args.u_extension),
             gamma_u_pin=float(args.gamma_u_pin),
+            interface_band_extension_gamma=float(args.interface_band_extension_gamma),
             u_cip=float(args.u_cip),
             u_cip_weight=str(args.u_cip_weight),
             vS_cip=float(args.vS_cip),
@@ -12666,6 +15590,26 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             D_phi=float(args.D_phi),
             phi_diffusion_weight=str(args.phi_diffusion_weight),
             gamma_phi=float(args.gamma_phi),
+            gamma_v=float(args.gamma_v),
+            v_extension_mode=str(args.v_extension),
+            gamma_v_pin=float(args.gamma_v_pin),
+            gamma_p=float(args.gamma_p),
+            p_extension_mode=str(args.p_extension),
+            gamma_p_pin=float(args.gamma_p_pin),
+            gamma_vP=float(args.gamma_vP),
+            vP_extension_mode=str(args.vP_extension),
+            gamma_vP_pin=float(args.gamma_vP_pin),
+            gamma_p_pore=float(args.gamma_p_pore),
+            p_pore_extension_mode=str(args.p_pore_extension),
+            gamma_p_pore_pin=float(args.gamma_p_pore_pin),
+            gamma_rho_s=float(args.gamma_rho_s),
+            rho_s_extension_mode=str(args.rho_s_extension),
+            gamma_rho_s_pin=float(args.gamma_rho_s_pin),
+            final_form_constant_rho_s=bool(args.final_form_constant_rho_s),
+            final_form_domain_lm=bool(getattr(args, "final_form_domain_lm", False)),
+            final_form_domain_lm_aug_gamma=float(getattr(args, "final_form_domain_lm_aug_gamma", 10.0)),
+            final_form_mass_lm_aug_gamma=float(getattr(args, "final_form_mass_lm_aug_gamma", 1.0)),
+            final_form_normal_lm_aug_gamma=float(getattr(args, "final_form_normal_lm_aug_gamma", 1.0)),
             phi_supg=float(args.phi_supg),
             phi_cip=float(args.phi_cip),
             alpha_supg=float(args.alpha_supg),
@@ -12829,6 +15773,7 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                 ("pressure_interface_closure", problem.get("_pressure_interface_residual_form")),
                 ("p_pore_fluid_gauge", problem.get("_p_pore_fluid_gauge_residual_form")),
                 ("velocity_interface_closure", problem.get("_velocity_interface_residual_form")),
+                ("exact_interface_pressure_transfer", problem.get("_exact_interface_pressure_residual_form")),
                 ("traction_interface_closure", problem.get("_traction_interface_residual_form")),
                 ("entry_interface_closure", problem.get("_entry_interface_residual_form")),
                 ("bjs_interface_closure", problem.get("_bjs_interface_residual_form")),
@@ -13083,6 +16028,9 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             exception_text=str(exc_text),
         )
         if bool(transport_update_post_accept):
+            if bool(startup_retry_state.get("step1_relaxed_mechanics_tol_active", False)):
+                _restore_base_monolithic_controls()
+                startup_retry_state["step1_relaxed_mechanics_tol_active"] = False
             solver._ls_alpha_prev = 1.0
             if hasattr(solver, "_tr_radius_prev"):
                 solver._tr_radius_prev = None
@@ -13446,13 +16394,88 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                 if startup_retry_state.get("post_accept_startup_guess_signature", None) != startup_signature:
                     startup_retry_state["post_accept_startup_guess_signature"] = startup_signature
                     startup_snapshot = _snapshot_function_values(funcs)
+                    lagged_transport_snapshot = _snapshot_selected_function_values(
+                        funcs,
+                        transport_fields_preview,
+                    )
                     before_norm = _current_monolithic_raw_residual_inf(
                         funcs=funcs,
                         prev_funcs=prev_funcs,
                         aux_funcs=aux_funcs,
                         bcs_now=bcs_now,
                     )
+                    startup_improved = False
+                    if _predictor_corrector_startup_enabled(args, problem):
+                        try:
+                            print(
+                                "    [startup] building post_accept step-1 predictor-corrector initial guess "
+                                "for the mechanics/interface fields; lagged transport fields will be restored "
+                                "to time level n before the main split solve."
+                            )
+                            pc_stats = _run_predictor_corrector_startup_guess(
+                                funcs=funcs,
+                                prev_funcs=prev_funcs,
+                                aux_funcs=aux_funcs,
+                                bcs_now=bcs_now,
+                                step_no=int(step_no),
+                                t_fail=float(t_now),
+                                dt_fail=float(dt_now),
+                            )
+                            startup_retry_state["step1_transport_predictor_snapshot"] = _snapshot_selected_function_values(
+                                funcs,
+                                transport_fields_preview,
+                            )
+                            _restore_selected_function_values(funcs, lagged_transport_snapshot)
+                            problem["dh"].apply_bcs(bcs_now, *funcs)
+                            after_norm = _current_monolithic_raw_residual_inf(
+                                funcs=funcs,
+                                prev_funcs=prev_funcs,
+                                aux_funcs=aux_funcs,
+                                bcs_now=bcs_now,
+                            )
+                            startup_improved = (
+                                np.isfinite(before_norm)
+                                and np.isfinite(after_norm)
+                                and float(after_norm) < float(before_norm)
+                            )
+                            if startup_improved:
+                                print(
+                                    "    [startup] post_accept predictor-corrector initial guess improved the "
+                                    "main mechanics/interface residual while restoring lagged transport fields "
+                                    f"(|R_raw|_∞ {float(before_norm):.3e} -> {float(after_norm):.3e}; "
+                                    f"PC exact |R_raw|_∞ {float(pc_stats['initial']['raw_inf']):.3e} -> "
+                                    f"{float(pc_stats['final']['raw_inf']):.3e})."
+                                )
+                                if (
+                                    bool(problem.get("final_form", False))
+                                    and _final_form_constant_rho_s(problem)
+                                    and np.isfinite(float(after_norm))
+                                    and float(after_norm) <= float(step1_relaxed_mechanics_tol)
+                                ):
+                                    solver.np.newton_tol = max(
+                                        float(base_solver_newton_tol),
+                                        float(step1_relaxed_mechanics_tol),
+                                    )
+                                    startup_retry_state["step1_relaxed_mechanics_tol_active"] = True
+                                    print(
+                                        "    [startup] step-1 mechanics solve will accept the kept post_accept "
+                                        "predictor-corrector basin once it stays within the relaxed exact residual "
+                                        f"band |R|_∞<={float(step1_relaxed_mechanics_tol):.3e}; later steps "
+                                        "restore the base Newton tolerance."
+                                    )
+                            else:
+                                _restore_function_values(funcs, startup_snapshot)
+                                startup_retry_state["step1_transport_predictor_snapshot"] = None
+                        except Exception as pc_exc:
+                            _restore_function_values(funcs, startup_snapshot)
+                            startup_retry_state["step1_transport_predictor_snapshot"] = None
+                            print(f"    [startup] post_accept predictor-corrector initial guess failed: {pc_exc}")
+                    if startup_improved:
+                        return None
                     try:
+                        outer_override = int(getattr(args, "stall_frozen_transport_outer_it", 1))
+                        if int(outer_override) <= 0:
+                            raise RuntimeError("post_accept step-1 mechanics initializer disabled")
                         restart_stats = _run_frozen_transport_restart(
                             funcs=funcs,
                             prev_funcs=prev_funcs,
@@ -13461,9 +16484,7 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                             step_no=int(step_no),
                             t_fail=float(t_now),
                             dt_fail=float(dt_now),
-                            outer_it_override=max(
-                                2, int(getattr(args, "stall_frozen_transport_outer_it", 1))
-                            ),
+                            outer_it_override=int(outer_override),
                         )
                         after_norm = float(restart_stats.get("residual_after", float("nan")))
                         improved = (
@@ -13684,6 +16705,7 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
     }
     all_porous_sideflow_diag_info: dict[str, object] = {
         "enabled": float(1.0 if bool(getattr(args, "all_porous_sideflow_diagnostic", False)) else 0.0),
+        "mode": "",
         "phase_active_fields": "",
         "phase_exact_converged": float("nan"),
         "phase_accepted": float("nan"),
@@ -13693,17 +16715,53 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         "phase_full_raw_residual_inf": float("nan"),
         "q_inlet_now": float("nan"),
         "predicted_p_left": float("nan"),
+        "vp_inlet_peak_now": float("nan"),
+        "predicted_p_bottom_centerline": float("nan"),
+    }
+    all_fluid_freeflow_diag_info: dict[str, object] = {
+        "enabled": float(1.0 if bool(getattr(args, "all_fluid_freeflow_diagnostic", False)) else 0.0),
+        "phase_active_fields": "",
+        "phase_exact_converged": float("nan"),
+        "phase_accepted": float("nan"),
+        "phase_iterations": float("nan"),
+        "phase_active_norm": float("nan"),
+        "phase_active_label": "",
+        "phase_full_raw_residual_inf": float("nan"),
+        "v_inlet_peak_now": float("nan"),
     }
     t_start = time.perf_counter()
 
     def _post_step_refiner(step, bcs_now, functions, prev_functions) -> None:
         if bool(transport_update_post_accept):
+            step_no = int(step) + 1
+            predictor_transport_snapshot = startup_retry_state.get("step1_transport_predictor_snapshot", None)
+            if int(step_no) == 1 and predictor_transport_snapshot:
+                _restore_selected_function_values(functions, predictor_transport_snapshot)
+                problem["dh"].apply_bcs(bcs_now, *functions)
+                print(
+                    "    [startup] preloading the accepted step-1 post_accept transport update with the "
+                    "predictor-corrector transport snapshot."
+                )
+                if bool(problem.get("final_form", False)) and _final_form_constant_rho_s(problem):
+                    print(
+                        "    [startup] keeping the predictor-corrector transport state on step 1 and "
+                        "skipping the redundant first post_accept transport solve on the constant-density "
+                        "final_form branch."
+                    )
+                    startup_retry_state["step1_transport_predictor_snapshot"] = None
+                    startup_retry_state["step1_transport_predictor_vi_state"] = None
+                    if alpha_from_refmap_enabled:
+                        _sync_alpha_from_refmap()
+                    return
             _run_post_accept_transport_update(
-                step_no=int(step) + 1,
+                step_no=int(step_no),
                 bcs_now=bcs_now,
                 funcs=functions,
                 prev_funcs=prev_functions,
             )
+            if int(step_no) == 1:
+                startup_retry_state["step1_transport_predictor_snapshot"] = None
+                startup_retry_state["step1_transport_predictor_vi_state"] = None
         if alpha_from_refmap_enabled:
             _sync_alpha_from_refmap()
 
@@ -13756,10 +16814,66 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             problem["p_mean_k"].nodal_values[:] = 0.0
             problem["p_mean_n"].nodal_values[:] = 0.0
 
+    def _set_all_fluid_freeflow_reference_state() -> float:
+        drive_now = float(_cosine_ramp_value(float(args.dt), float(args.t_ramp))) * float(args.v_in)
+        _set_fixed_free_fluid_reference_state()
+        for key in ("alpha_k", "alpha_n"):
+            if problem.get(key) is not None:
+                problem[key].set_values_from_function(lambda x, y: 0.0)
+        for key in ("mu_k", "mu_n"):
+            if problem.get(key) is not None:
+                problem[key].nodal_values[:] = 0.0
+        for key in (
+            "mu_mass_k",
+            "mu_mass_n",
+            "mu_normal_k",
+            "mu_normal_n",
+            "mu_tangent_k",
+            "mu_tangent_n",
+            "mu_kin_k",
+            "mu_kin_n",
+        ):
+            if problem.get(key) is not None:
+                problem[key].nodal_values[:] = 0.0
+        _zero_final_form_domain_lm(problem, suffixes=("k", "n"))
+        if problem.get("phi_k") is not None:
+            for key in ("phi_k", "phi_n"):
+                problem[key].set_values_from_function(lambda x, y: 1.0)
+        if problem.get("B_k") is not None:
+            for key in ("B_k", "B_n"):
+                problem[key].set_values_from_function(lambda x, y: 0.0)
+        for key in ("p_pore_k", "p_pore_n"):
+            if problem.get(key) is not None:
+                problem[key].nodal_values[:] = 0.0
+        if problem.get("lambda_drag_k") is not None:
+            for key in ("lambda_drag_k", "lambda_drag_n"):
+                problem[key].set_values_from_function(lambda x, y: np.asarray([0.0, 0.0], dtype=float))
+        if problem.get("vP_k") is not None:
+            for key in ("vP_k", "vP_n"):
+                problem[key].set_values_from_function(lambda x, y: np.asarray([0.0, 0.0], dtype=float))
+        for key in ("vS_k", "vS_n", "u_k", "u_n"):
+            if problem.get(key) is not None:
+                problem[key].set_values_from_function(lambda x, y: np.asarray([0.0, 0.0], dtype=float))
+        if problem.get("rho_s_k") is not None:
+            problem["rho_s_k"].nodal_values[:] = problem["rho_s_n"].nodal_values[:]
+        if problem.get("pi_s_k") is not None:
+            problem["pi_s_k"].nodal_values[:] = 0.0
+            problem["pi_s_n"].nodal_values[:] = 0.0
+        if problem.get("S_k") is not None:
+            problem["S_k"].nodal_values[:] = 0.0
+            problem["S_n"].nodal_values[:] = 0.0
+        return drive_now
+
     def _set_all_porous_sideflow_reference_state() -> tuple[float, float]:
-        q_in_now = float(_cosine_ramp_value(float(args.dt), float(args.t_ramp))) * float(args.v_in)
+        drive_now = float(_cosine_ramp_value(float(args.dt), float(args.t_ramp))) * float(args.v_in)
         kappa_eff = max(float(kappa), 1.0e-30)
-        p_left = float(args.mu_f) * q_in_now * float(args.Lx) / kappa_eff
+        if bool(problem.get("final_form", False)):
+            # In the alpha=1 final_form debug startup the whole domain behaves as
+            # porous support, driven by the benchmark bottom inflow profile on vP.
+            # The centerline Darcy drop therefore scales like phi_b * v_in * Ly / K.
+            p_ref = float(args.phi_b) * drive_now * float(args.Ly) / kappa_eff
+        else:
+            p_ref = float(args.mu_f) * drive_now * float(args.Lx) / kappa_eff
 
         for key in ("alpha_k", "alpha_n"):
             if problem.get(key) is not None:
@@ -13767,6 +16881,19 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         for key in ("mu_k", "mu_n"):
             if problem.get(key) is not None:
                 problem[key].nodal_values[:] = 0.0
+        for key in (
+            "mu_mass_k",
+            "mu_mass_n",
+            "mu_normal_k",
+            "mu_normal_n",
+            "mu_tangent_k",
+            "mu_tangent_n",
+            "mu_kin_k",
+            "mu_kin_n",
+        ):
+            if problem.get(key) is not None:
+                problem[key].nodal_values[:] = 0.0
+        _zero_final_form_domain_lm(problem, suffixes=("k", "n"))
         for key in ("p_k", "p_n"):
             if problem.get(key) is not None:
                 problem[key].nodal_values[:] = 0.0
@@ -13777,18 +16904,31 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             B0 = max(0.0, min(1.0, 1.0 - float(args.phi_b)))
             for key in ("B_k", "B_n"):
                 problem[key].set_values_from_function(lambda x, y, B0=B0: float(B0))
+        if problem.get("phi_k") is not None:
+            for key in ("phi_k", "phi_n"):
+                problem[key].set_values_from_function(lambda x, y: float(args.phi_b))
         if problem.get("p_pore_k") is not None:
-            def _p_pore_guess(x, y, *, p_left_val=p_left):
-                return max(float(p_left_val) * (1.0 - (float(x) / max(float(args.Lx), 1.0e-30))), 0.0)
+            if bool(problem.get("final_form", False)):
+                def _p_pore_guess(x, y, *, p_ref_val=p_ref):
+                    return max(float(p_ref_val) * (1.0 - (float(y) / max(float(args.Ly), 1.0e-30))), 0.0)
+            else:
+                def _p_pore_guess(x, y, *, p_ref_val=p_ref):
+                    return max(float(p_ref_val) * (1.0 - (float(x) / max(float(args.Lx), 1.0e-30))), 0.0)
 
             for key in ("p_pore_k", "p_pore_n"):
                 problem[key].set_values_from_function(_p_pore_guess)
         if problem.get("lambda_drag_k") is not None:
-            def _q_guess(x, y, *, q_in_val=q_in_now):
+            def _q_guess(x, y, *, q_in_val=drive_now):
                 return np.asarray([float(q_in_val), 0.0], dtype=float)
 
             for key in ("lambda_drag_k", "lambda_drag_n"):
                 problem[key].set_values_from_function(_q_guess)
+        if bool(problem.get("final_form", False)) and problem.get("vP_k") is not None:
+            def _vp_guess(x, y, *, v_in_now=drive_now):
+                return np.asarray([0.0, 4.0 * float(v_in_now) * float(x) * (1.0 - float(x))], dtype=float)
+
+            for key in ("vP_k", "vP_n"):
+                problem[key].set_values_from_function(_vp_guess)
         for key in ("v_k", "v_n"):
             if problem.get(key) is not None:
                 problem[key].set_values_from_function(lambda x, y: np.asarray([0.0, 0.0], dtype=float))
@@ -13801,7 +16941,7 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         if problem.get("S_k") is not None:
             problem["S_k"].nodal_values[:] = 0.0
             problem["S_n"].nodal_values[:] = 0.0
-        return q_in_now, p_left
+        return drive_now, p_ref
 
     def _build_all_porous_sideflow_phase_bcs() -> list[BoundaryCondition]:
         zero = lambda x, y, t: 0.0
@@ -13809,9 +16949,24 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         q_in_x = lambda x, y, t: float(_cosine_ramp_value(float(t), float(args.t_ramp))) * float(args.v_in)
         q_in_vec = lambda x, y, t: np.asarray([q_in_x(x, y, t), 0.0], dtype=float)
         phase_bcs: list[BoundaryCondition] = []
-        if problem.get("p_pore_k") is not None:
+        if bool(problem.get("final_form", False)):
+            vp_in_y = lambda x, y, t: float(
+                _cosine_ramp_value(float(t), float(args.t_ramp))
+                * _bottom_inlet(np.asarray(x), np.asarray(y), float(t), v_in=float(args.v_in)).reshape(())
+            )
+            phase_bcs.extend(
+                [
+                    BoundaryCondition("vP_x", "dirichlet", "left", zero),
+                    BoundaryCondition("vP_x", "dirichlet", "right", zero),
+                    BoundaryCondition("vP_x", "dirichlet", "bottom", zero),
+                    BoundaryCondition("vP_y", "dirichlet", "bottom", vp_in_y),
+                ]
+            )
+            if problem.get("p_pore_k") is not None:
+                phase_bcs.append(BoundaryCondition("p_pore", "dirichlet", "top", zero))
+        elif problem.get("p_pore_k") is not None:
             phase_bcs.append(BoundaryCondition("p_pore", "dirichlet", "right", zero))
-        if problem.get("lambda_drag_k") is not None:
+        if (not bool(problem.get("final_form", False))) and problem.get("lambda_drag_k") is not None:
             if "q" in tuple(getattr(problem["dh"], "field_names", tuple()) or tuple()):
                 phase_bcs.extend(
                     [
@@ -14029,56 +17184,221 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             _all_porous_sideflow_diagnostic_active_fields(problem)
         )
         all_porous_sideflow_diag_info["phase_active_fields"] = ",".join(phase_fields)
-        q_in_now, p_left_pred = _set_all_porous_sideflow_reference_state()
-        all_porous_sideflow_diag_info["q_inlet_now"] = float(q_in_now)
-        all_porous_sideflow_diag_info["predicted_p_left"] = float(p_left_pred)
+        drive_now, p_ref_pred = _set_all_porous_sideflow_reference_state()
+        if bool(problem.get("final_form", False)):
+            all_porous_sideflow_diag_info["mode"] = "final_form_bottom_vP"
+            all_porous_sideflow_diag_info["vp_inlet_peak_now"] = float(drive_now)
+            all_porous_sideflow_diag_info["predicted_p_bottom_centerline"] = float(p_ref_pred)
+        else:
+            all_porous_sideflow_diag_info["mode"] = "split_q_sideflow"
+            all_porous_sideflow_diag_info["q_inlet_now"] = float(drive_now)
+            all_porous_sideflow_diag_info["predicted_p_left"] = float(p_ref_pred)
         timeseries_rows.clear()
         last_interface_diag = None
         _restore_base_monolithic_controls()
-        _set_solver_active_fields_with_tracking(solver, phase_fields)
         phase_bcs = _build_all_porous_sideflow_phase_bcs()
-        phase_bcs_now = solver._freeze_bcs(phase_bcs, float(args.theta) * float(args.dt))
-        print(
-            "    [solver] all_porous_sideflow_diagnostic: alpha is frozen to 1 everywhere, q_x is prescribed on the "
-            "left boundary, p_pore=0 is imposed on the right boundary, and q·n=0 is imposed on the top/bottom walls "
-            f"while solving the porous bulk fields {tuple(phase_fields)}."
-        )
-        print(
-            "    [solver] all_porous_sideflow_diagnostic reference: "
-            f"q_in={float(q_in_now):.6g}, predicted Darcy p_left≈{float(p_left_pred):.6g} "
-            f"for mu_f={float(args.mu_f):.6g}, kappa={float(kappa):.6g}, Lx={float(args.Lx):.6g}."
-        )
-        solver._current_t = 0.0
-        solver._current_dt = float(args.dt)
-        solver._current_step_no = 1
+        phase_solver = solver
+        if bool(problem.get("final_form", False)):
+            phase_solver_key = f"all_porous_final_form:{','.join(phase_fields)}"
+            phase_solver = startup_stage_solver_cache.get(phase_solver_key)
+            if phase_solver is None:
+                t_phase_solver = time.perf_counter()
+                print(
+                    "    [solver] building dedicated final_form porous-only stage solver "
+                    f"for fields {tuple(phase_fields)}."
+                )
+                phase_bcs_homog = [
+                    BoundaryCondition(b.field, b.method, b.domain_tag, (lambda x, y: 0.0))
+                    for b in phase_bcs
+                ]
+                phase_solver = _make_solver(
+                    SimpleNamespace(
+                        residual_form=_sum_stage_forms(
+                            getattr(forms, "r_pore", None),
+                            getattr(forms, "r_phi", None),
+                            getattr(forms, "r_skeleton", None),
+                            getattr(forms, "r_kinematics", None),
+                        ),
+                        jacobian_form=_sum_stage_forms(
+                            getattr(forms, "a_pore", None),
+                            getattr(forms, "a_phi", None),
+                            getattr(forms, "a_skeleton", None),
+                            getattr(forms, "a_kinematics", None),
+                        ),
+                    ),
+                    postproc_cb=None,
+                    solver_kind="newton",
+                    bcs_in=phase_bcs,
+                    bcs_homog_in=phase_bcs_homog,
+                )
+                if hasattr(phase_solver, "np"):
+                    phase_solver.np.stall_window = 0
+                    phase_solver.np.stall_min_abs_decrease_inf = 0.0
+                    phase_solver.np.stall_min_rel_decrease_inf = 0.0
+                    phase_solver.np.tr_min_abs_decrease_inf = 0.0
+                    phase_solver.np.tr_min_rel_decrease_inf = 0.0
+                startup_stage_solver_cache[phase_solver_key] = phase_solver
+                print(
+                    "    [solver] dedicated final_form porous-only stage solver ready in "
+                    f"{time.perf_counter() - t_phase_solver:.3f}s."
+                )
+        _set_solver_active_fields_with_tracking(phase_solver, phase_fields)
+        phase_bcs_now = phase_solver._freeze_bcs(phase_bcs, float(args.theta) * float(args.dt))
+        if bool(problem.get("final_form", False)):
+            print(
+                "    [solver] all_porous_sideflow_diagnostic(final_form): alpha is frozen to 1 everywhere, "
+                "the benchmark bottom-inlet profile is imposed on vP_y with vP_x=0, p_pore=0 is imposed on the "
+                f"drained top boundary, and the free-fluid/interface fields are frozen while solving {tuple(phase_fields)}."
+            )
+            print(
+                "    [solver] all_porous_sideflow_diagnostic(final_form) reference: "
+                f"vP_in,peak={float(drive_now):.6g}, predicted centerline p_bottom≈{float(p_ref_pred):.6g} "
+                f"for phi_b={float(args.phi_b):.6g}, kappa={float(kappa):.6g}, Ly={float(args.Ly):.6g}."
+            )
+        else:
+            print(
+                "    [solver] all_porous_sideflow_diagnostic: alpha is frozen to 1 everywhere, q_x is prescribed on the "
+                "left boundary, p_pore=0 is imposed on the right boundary, and q·n=0 is imposed on the top/bottom walls "
+                f"while solving the porous bulk fields {tuple(phase_fields)}."
+            )
+            print(
+                "    [solver] all_porous_sideflow_diagnostic reference: "
+                f"q_in={float(drive_now):.6g}, predicted Darcy p_left≈{float(p_ref_pred):.6g} "
+                f"for mu_f={float(args.mu_f):.6g}, kappa={float(kappa):.6g}, Lx={float(args.Lx):.6g}."
+            )
+        phase_solver._current_t = 0.0
+        phase_solver._current_dt = float(args.dt)
+        phase_solver._current_step_no = 1
         problem["dh"].apply_bcs(phase_bcs_now, *current_functions)
         _set_solver_newton_trace_context(
-            solver,
+            phase_solver,
             label="all-porous-sideflow-diagnostic",
             global_bcs_now=phase_bcs_now,
         )
-        _, phase_converged, phase_iters = solver._newton_loop(
+        _, phase_converged, phase_iters = phase_solver._newton_loop(
             current_functions,
             previous_functions,
             aux_solver_functions,
             phase_bcs_now,
         )
-        post_accept_cb = getattr(solver, "post_accept_cb", None)
+        post_accept_cb = getattr(phase_solver, "post_accept_cb", None)
         if callable(post_accept_cb):
             post_accept_cb(current_functions)
         _record_step(current_functions)
-        phase_accepted = bool(getattr(solver, "_last_nonlinear_accepted", False))
+        phase_accepted = bool(getattr(phase_solver, "_last_nonlinear_accepted", False))
         all_porous_sideflow_diag_info["phase_exact_converged"] = float(1.0 if bool(phase_converged) else 0.0)
         all_porous_sideflow_diag_info["phase_accepted"] = float(1.0 if bool(phase_accepted) else 0.0)
         all_porous_sideflow_diag_info["phase_iterations"] = float(int(phase_iters))
-        phase_last_norm = getattr(solver, "_last_nonlinear_norm", None)
+        phase_last_norm = getattr(phase_solver, "_last_nonlinear_norm", None)
         all_porous_sideflow_diag_info["phase_active_norm"] = (
             float(phase_last_norm) if phase_last_norm is not None else float("nan")
         )
         all_porous_sideflow_diag_info["phase_active_label"] = str(
-            getattr(solver, "_last_nonlinear_norm_label", "") or ""
+            getattr(phase_solver, "_last_nonlinear_norm_label", "") or ""
         )
         all_porous_sideflow_diag_info["phase_full_raw_residual_inf"] = float(
+            _current_monolithic_raw_residual_inf(
+                funcs=current_functions,
+                prev_funcs=previous_functions,
+                aux_funcs=aux_solver_functions,
+                bcs_now=phase_bcs,
+            )
+        )
+
+    def _run_all_fluid_freeflow_diagnostic() -> None:
+        nonlocal last_interface_diag
+        phase_fields = _latent_transformed_active_fields(
+            _all_fluid_freeflow_diagnostic_active_fields(problem)
+        )
+        all_fluid_freeflow_diag_info["phase_active_fields"] = ",".join(phase_fields)
+        drive_now = _set_all_fluid_freeflow_reference_state()
+        all_fluid_freeflow_diag_info["v_inlet_peak_now"] = float(drive_now)
+        timeseries_rows.clear()
+        last_interface_diag = None
+        _restore_base_monolithic_controls()
+        phase_bcs = _filter_bcs_by_fields(bcs, phase_fields)
+        phase_solver = solver
+        phase_solver_key = f"all_fluid_freeflow:{','.join(phase_fields)}"
+        phase_solver = startup_stage_solver_cache.get(phase_solver_key)
+        if phase_solver is None:
+            t_phase_solver = time.perf_counter()
+            print(
+                "    [solver] building dedicated fluid-only stage solver "
+                f"for fields {tuple(phase_fields)}."
+            )
+            phase_bcs_homog = [
+                BoundaryCondition(b.field, b.method, b.domain_tag, (lambda x, y: 0.0))
+                for b in phase_bcs
+            ]
+            phase_solver = _make_solver(
+                SimpleNamespace(
+                    residual_form=_sum_stage_forms(
+                        getattr(forms, "r_mom_f", None),
+                        getattr(forms, "r_mass", None),
+                    ),
+                    jacobian_form=_sum_stage_forms(
+                        getattr(forms, "a_mom_f", None),
+                        getattr(forms, "a_mass", None),
+                    ),
+                ),
+                postproc_cb=None,
+                solver_kind="newton",
+                bcs_in=phase_bcs,
+                bcs_homog_in=phase_bcs_homog,
+            )
+            if hasattr(phase_solver, "np"):
+                phase_solver.np.stall_window = 0
+                phase_solver.np.stall_min_abs_decrease_inf = 0.0
+                phase_solver.np.stall_min_rel_decrease_inf = 0.0
+                phase_solver.np.tr_min_abs_decrease_inf = 0.0
+                phase_solver.np.tr_min_rel_decrease_inf = 0.0
+            startup_stage_solver_cache[phase_solver_key] = phase_solver
+            print(
+                "    [solver] dedicated fluid-only stage solver ready in "
+                f"{time.perf_counter() - t_phase_solver:.3f}s."
+            )
+        _set_solver_active_fields_with_tracking(phase_solver, phase_fields)
+        phase_bcs_now = phase_solver._freeze_bcs(phase_bcs, float(args.theta) * float(args.dt))
+        print(
+            "    [solver] all_fluid_freeflow_diagnostic: alpha is frozen to 0 everywhere, phi is set to 1 "
+            "where present, porous/solid/interface fields are frozen, and the free-fluid block "
+            f"{tuple(phase_fields)} is driven by the benchmark bottom inflow with p=0 on the top boundary."
+        )
+        print(
+            "    [solver] all_fluid_freeflow_diagnostic reference: "
+            f"v_in,peak={float(drive_now):.6g}, top pressure reference p=0."
+        )
+        phase_solver._current_t = 0.0
+        phase_solver._current_dt = float(args.dt)
+        phase_solver._current_step_no = 1
+        problem["dh"].apply_bcs(phase_bcs_now, *current_functions)
+        _set_solver_newton_trace_context(
+            phase_solver,
+            label="all-fluid-freeflow-diagnostic",
+            global_bcs_now=phase_bcs_now,
+        )
+        _, phase_converged, phase_iters = phase_solver._newton_loop(
+            current_functions,
+            previous_functions,
+            aux_solver_functions,
+            phase_bcs_now,
+        )
+        post_accept_cb = getattr(phase_solver, "post_accept_cb", None)
+        if callable(post_accept_cb):
+            post_accept_cb(current_functions)
+        _record_step(current_functions)
+        phase_accepted = bool(getattr(phase_solver, "_last_nonlinear_accepted", False))
+        all_fluid_freeflow_diag_info["phase_exact_converged"] = float(1.0 if bool(phase_converged) else 0.0)
+        all_fluid_freeflow_diag_info["phase_accepted"] = float(1.0 if bool(phase_accepted) else 0.0)
+        all_fluid_freeflow_diag_info["phase_iterations"] = float(int(phase_iters))
+        phase_last_norm = getattr(phase_solver, "_last_nonlinear_norm", None)
+        all_fluid_freeflow_diag_info["phase_active_norm"] = (
+            float(phase_last_norm) if phase_last_norm is not None else float("nan")
+        )
+        all_fluid_freeflow_diag_info["phase_active_label"] = str(
+            getattr(phase_solver, "_last_nonlinear_norm_label", "") or ""
+        )
+        all_fluid_freeflow_diag_info["phase_full_raw_residual_inf"] = float(
             _current_monolithic_raw_residual_inf(
                 funcs=current_functions,
                 prev_funcs=previous_functions,
@@ -14094,11 +17414,14 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             _run_fixed_fluid_poro_solid_diagnostic()
         elif bool(getattr(args, "all_porous_sideflow_diagnostic", False)):
             _run_all_porous_sideflow_diagnostic()
+        elif bool(getattr(args, "all_fluid_freeflow_diagnostic", False)):
+            _run_all_fluid_freeflow_diagnostic()
         else:
             _run_time_interval(final_time=float(args.t_final))
     except Exception as exc:
         solve_error = str(exc)
         print(f"[warn] solve terminated early: {solve_error}", flush=True)
+        traceback.print_exc()
         for f, f_prev in zip(current_functions, previous_functions):
             f.nodal_values[:] = f_prev.nodal_values[:]
     solve_seconds = time.perf_counter() - t_start
@@ -14165,12 +17488,18 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         "v": problem["v_k"],
         "p": problem["p_k"],
         **({"p_pore": problem["p_pore_k"]} if problem.get("p_pore_k") is not None else {}),
+        **({"vP": problem["vP_k"]} if problem.get("vP_k") is not None else {}),
+        **({"rho_s": problem["rho_s_k"]} if problem.get("rho_s_k") is not None else {}),
         **({"q": problem["q_flux_k"]} if problem.get("q_flux_k") is not None else {}),
         "vS": problem["vS_k"],
         "u": problem["u_k"],
         "alpha": problem["alpha_k"],
         **({"B": problem["B_k"]} if problem.get("B_k") is not None else {}),
-        "mu_alpha": problem["mu_k"],
+        **({"mu_alpha": problem["mu_k"]} if problem.get("mu_k") is not None else {}),
+        **({"mu_mass": problem["mu_mass_k"]} if problem.get("mu_mass_k") is not None else {}),
+        **({"mu_normal": problem["mu_normal_k"]} if problem.get("mu_normal_k") is not None else {}),
+        **({"mu_tangent": problem["mu_tangent_k"]} if problem.get("mu_tangent_k") is not None else {}),
+        **({"mu_kin": problem["mu_kin_k"]} if problem.get("mu_kin_k") is not None else {}),
     }
     if problem["phi_k"] is not None:
         vtk_final["phi"] = problem["phi_k"]
@@ -14216,6 +17545,7 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
 
     vi_c_effective = float(getattr(getattr(solver, "vi_params", None), "c", float(args.vi_c)) or float(args.vi_c))
     vi_c_field_current = getattr(solver, "_vi_c_field_current", {}) if solver_key == "pdas" else {}
+    mesh_adaptivity_meta = dict(problem.get("_mesh_adaptivity_meta", {}) or {})
 
     summary_row: dict[str, object] = {
         "kappa": float(kappa),
@@ -14315,6 +17645,7 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         "all_porous_sideflow_diagnostic": float(
             1.0 if bool(getattr(args, "all_porous_sideflow_diagnostic", False)) else 0.0
         ),
+        "all_porous_sideflow_mode": str(all_porous_sideflow_diag_info.get("mode", "") or ""),
         "all_porous_sideflow_phase_active_fields": str(
             all_porous_sideflow_diag_info.get("phase_active_fields", "") or ""
         ),
@@ -14338,6 +17669,36 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         ),
         "all_porous_sideflow_predicted_p_left": float(
             all_porous_sideflow_diag_info.get("predicted_p_left", float("nan"))
+        ),
+        "all_porous_sideflow_vp_inlet_peak_now": float(
+            all_porous_sideflow_diag_info.get("vp_inlet_peak_now", float("nan"))
+        ),
+        "all_porous_sideflow_predicted_p_bottom_centerline": float(
+            all_porous_sideflow_diag_info.get("predicted_p_bottom_centerline", float("nan"))
+        ),
+        "all_fluid_freeflow_diagnostic": float(
+            1.0 if bool(getattr(args, "all_fluid_freeflow_diagnostic", False)) else 0.0
+        ),
+        "all_fluid_freeflow_phase_active_fields": str(
+            all_fluid_freeflow_diag_info.get("phase_active_fields", "") or ""
+        ),
+        "all_fluid_freeflow_phase_exact_converged": float(
+            all_fluid_freeflow_diag_info.get("phase_exact_converged", float("nan"))
+        ),
+        "all_fluid_freeflow_phase_accepted": float(
+            all_fluid_freeflow_diag_info.get("phase_accepted", float("nan"))
+        ),
+        "all_fluid_freeflow_phase_iterations": float(
+            all_fluid_freeflow_diag_info.get("phase_iterations", float("nan"))
+        ),
+        "all_fluid_freeflow_phase_active_norm": float(
+            all_fluid_freeflow_diag_info.get("phase_active_norm", float("nan"))
+        ),
+        "all_fluid_freeflow_phase_full_raw_residual_inf": float(
+            all_fluid_freeflow_diag_info.get("phase_full_raw_residual_inf", float("nan"))
+        ),
+        "all_fluid_freeflow_v_inlet_peak_now": float(
+            all_fluid_freeflow_diag_info.get("v_inlet_peak_now", float("nan"))
         ),
         "full_ratio_free_state": float(1.0 if bool(_full_ratio_free_state_enabled(args)) else 0.0),
         "reduced_support_state": str(getattr(args, "reduced_support_state", "alpha_B")),
@@ -14375,6 +17736,66 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         ),
         "fluid_convection": str(args.fluid_convection),
         "phi_evolution": float(1.0 if args.enable_phi_evolution else 0.0),
+        "gamma_v": float(args.gamma_v),
+        "v_extension": str(args.v_extension),
+        "gamma_v_pin": float(args.gamma_v_pin),
+        "gamma_p": float(args.gamma_p),
+        "p_extension": str(args.p_extension),
+        "gamma_p_pin": float(args.gamma_p_pin),
+        "gamma_vP": float(args.gamma_vP),
+        "vP_extension": str(args.vP_extension),
+        "gamma_vP_pin": float(args.gamma_vP_pin),
+        "gamma_p_pore": float(args.gamma_p_pore),
+        "p_pore_extension": str(args.p_pore_extension),
+        "gamma_p_pore_pin": float(args.gamma_p_pore_pin),
+        "gamma_rho_s": float(args.gamma_rho_s),
+        "rho_s_extension": str(args.rho_s_extension),
+        "gamma_rho_s_pin": float(args.gamma_rho_s_pin),
+        "final_form_constant_rho_s": float(1.0 if bool(getattr(args, "final_form_constant_rho_s", False)) else 0.0),
+        "final_form_domain_lm": float(1.0 if bool(getattr(args, "final_form_domain_lm", False)) else 0.0),
+        "final_form_domain_lm_aug_gamma": float(getattr(args, "final_form_domain_lm_aug_gamma", 10.0)),
+        "final_form_mass_lm_aug_gamma": float(getattr(args, "final_form_mass_lm_aug_gamma", 1.0)),
+        "final_form_normal_lm_aug_gamma": float(getattr(args, "final_form_normal_lm_aug_gamma", 1.0)),
+        "final_form_freeze_rho_s": float(1.0 if bool(getattr(args, "final_form_freeze_rho_s", False)) else 0.0),
+        "final_form_inactive_domains": float(1.0 if bool(getattr(args, "final_form_inactive_domains", False)) else 0.0),
+        "final_form_inactive_alpha_low": float(getattr(args, "final_form_inactive_alpha_low", 0.05)),
+        "final_form_inactive_alpha_high": float(getattr(args, "final_form_inactive_alpha_high", 0.95)),
+        "final_form_solid_interface_weight": float(getattr(args, "final_form_solid_interface_weight", 1.0)),
+        "final_form_mass_interface_weight": float(
+            getattr(args, "final_form_mass_interface_weight", 1.0)
+        ),
+        "final_form_mass_interface_homotopy": float(
+            1.0 if bool(getattr(args, "final_form_mass_interface_homotopy", True)) else 0.0
+        ),
+        "final_form_mass_interface_start_weight": float(
+            getattr(args, "final_form_mass_interface_start_weight", 0.0)
+        ),
+        "final_form_normal_interface_weight": float(
+            getattr(args, "final_form_normal_interface_weight", 1.0)
+        ),
+        "final_form_normal_interface_homotopy": float(
+            1.0 if bool(getattr(args, "final_form_normal_interface_homotopy", True)) else 0.0
+        ),
+        "final_form_normal_interface_start_weight": float(
+            getattr(args, "final_form_normal_interface_start_weight", 0.0)
+        ),
+        "final_form_disable_interface_physics": float(
+            1.0 if bool(getattr(args, "final_form_disable_interface_physics", False)) else 0.0
+        ),
+        "final_form_disable_normal_interface": float(
+            1.0 if bool(getattr(args, "final_form_disable_normal_interface", False)) else 0.0
+        ),
+        "geometry_indicator_mode": str(getattr(args, "geometry_indicator_mode", "raw")),
+        "geometry_indicator_beta": float(getattr(args, "geometry_indicator_beta", 0.0)),
+        "uniform_initial_phi": (
+            "nan"
+            if not np.isfinite(float(getattr(args, "uniform_initial_phi", float("nan"))))
+            else float(getattr(args, "uniform_initial_phi", float("nan")))
+        ),
+        "final_form_inactive_domain_counts": json.dumps(
+            dict(problem.get("_final_form_inactive_domain_counts", {}) or {}),
+            sort_keys=True,
+        ),
         "gamma_u": float(args.gamma_u),
         "u_extension": str(args.u_extension),
         "gamma_u_pin": float(args.gamma_u_pin),
@@ -14386,6 +17807,8 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         "skeleton_acceleration": float(1.0 if args.include_skeleton_acceleration else 0.0),
         "rho_s0_tilde": float(args.rho_s0_tilde),
         "storativity_c0": float(args.storativity_c0),
+        "split_pore_flux_model": str(getattr(args, "split_pore_flux_model", "exact_conservative_p")),
+        "split_pore_momentum_model": str(getattr(args, "split_pore_momentum_model", "band_alpha")),
         "skeleton_inertia_convection": str(args.skeleton_inertia_convection),
         "startup_bootstrap": float(1.0 if bool(args.startup_bootstrap) else 0.0),
         "startup_bootstrap_fluid_convection": str(args.startup_bootstrap_fluid_convection),
@@ -14467,6 +17890,26 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         "h_char": float(h_char),
         "eps_alpha": float(eps_alpha_eff),
         "eps_alpha_over_h": float(eps_alpha_eff / max(h_char, 1.0e-14)),
+        "mesh_mode": str(mesh_adaptivity_meta.get("mode", "structured")),
+        "adaptive_interface_target_cells": float(mesh_adaptivity_meta.get("target_cells", 0.0)),
+        "adaptive_interface_band_halfwidth": float(mesh_adaptivity_meta.get("band_halfwidth", float("nan"))),
+        "adaptive_interface_target_h": float(mesh_adaptivity_meta.get("target_h", float("nan"))),
+        "adaptive_interface_used_refine_level": float(
+            mesh_adaptivity_meta.get("used_refine_level", float("nan"))
+        ),
+        "adaptive_interface_marked_parent_count": float(mesh_adaptivity_meta.get("marked_parent_count", 0.0)),
+        "adaptive_interface_refined_parent_count": float(mesh_adaptivity_meta.get("refined_parent_count", 0.0)),
+        "adaptive_interface_band_element_count": float(mesh_adaptivity_meta.get("band_element_count", 0.0)),
+        "adaptive_interface_band_min_dy": float(mesh_adaptivity_meta.get("band_min_dy", float("nan"))),
+        "adaptive_interface_band_max_dy": float(mesh_adaptivity_meta.get("band_max_dy", float("nan"))),
+        "adaptive_interface_cells_across_2eps_min": float(
+            mesh_adaptivity_meta.get("cells_across_2eps_min", float("nan"))
+        ),
+        "adaptive_interface_cells_across_2eps_max": float(
+            mesh_adaptivity_meta.get("cells_across_2eps_max", float("nan"))
+        ),
+        "mesh_element_count": float(mesh_adaptivity_meta.get("mesh_element_count", float("nan"))),
+        "mesh_node_count": float(mesh_adaptivity_meta.get("mesh_node_count", float("nan"))),
         "reg_rect": float(reg_mask_meta["enabled"]),
         "reg_rect_center_x": float(reg_mask_meta["center_x"]),
         "reg_rect_center_y": float(reg_mask_meta["center_y"]),
@@ -14709,6 +18152,7 @@ def main() -> None:
     prev_cpp_fuse = _configure_benchmark7_cpp_fuse_integrals(
         backend=str(args.backend),
         enabled=getattr(args, "cpp_fuse_integrals", None),
+        final_form_enabled=_final_form_enabled(args),
     )
     if (
         str(getattr(args, "backend", "")).strip().lower() in {"cpp", "c++"}

@@ -7,24 +7,22 @@ from pycutfem.core.mesh import Mesh
 from pycutfem.operators import SymbolicPointwiseNewtonOperator
 from pycutfem.ufl.expressions import Function, VectorFunction
 
-from .helpers import _bossak_coefficients
+from .helpers import (
+    _bossak_coefficients,
+    _kratos_dvms_current_element_size_array,
+    _kratos_dvms_current_element_size_coefficient,
+)
 from .state import FluidDVMSState
 from .symbolics import build_fluid_dvms_predictor_iteration_symbolics
 from .update import _update_fluid_dvms_predicted_subscale
 
 
-def _predictor_element_char_length_coefficient(state: FluidDVMSState, mesh: Mesh):
-    from pycutfem.ufl.expressions import ElementWiseConstant
-
+def _predictor_element_char_length_coefficient(state: FluidDVMSState, mesh: Mesh, dh: DofHandler, d_mesh: VectorFunction):
     cache = getattr(state, "_predictor_element_char_length_coefficient_cache", None)
-    key = int(id(mesh))
+    key = (int(id(mesh)), int(id(dh)), int(id(d_mesh)))
     if isinstance(cache, dict) and key in cache:
         return cache[key]
-    values = np.asarray(
-        [float(mesh.element_char_length(eid)) for eid in range(int(mesh.n_elements))],
-        dtype=float,
-    )
-    coeff = ElementWiseConstant(values)
+    coeff = _kratos_dvms_current_element_size_coefficient(mesh, dh, d_mesh)
     if not isinstance(cache, dict):
         cache = {}
         state._predictor_element_char_length_coefficient_cache = cache
@@ -48,6 +46,7 @@ class FluidDVMSSolverOperator(SymbolicPointwiseNewtonOperator):
         d_mesh: VectorFunction,
         d_prev: VectorFunction,
         d_prev2: VectorFunction | None = None,
+        mesh_v: VectorFunction | None = None,
         mesh_v_prev: VectorFunction | None = None,
         mesh_a_prev: VectorFunction | None = None,
         rho_f: float,
@@ -69,6 +68,7 @@ class FluidDVMSSolverOperator(SymbolicPointwiseNewtonOperator):
         self.d_mesh = d_mesh
         self.d_prev = d_prev
         self.d_prev2 = d_prev2
+        self.mesh_v = mesh_v
         self.mesh_v_prev = mesh_v_prev
         self.mesh_a_prev = mesh_a_prev
         self.rho_f = float(rho_f)
@@ -82,6 +82,7 @@ class FluidDVMSSolverOperator(SymbolicPointwiseNewtonOperator):
 
         dt_value = max(self.dt, 1.0e-14)
         bossak = _bossak_coefficients(alpha=self.bossak_alpha, dt=dt_value)
+        self.h_coefficient = _predictor_element_char_length_coefficient(self.state, self.mesh, self.dh, self.d_mesh)
         self.symbolics = build_fluid_dvms_predictor_iteration_symbolics(
             u_k=self.u_k,
             u_prev=self.u_prev,
@@ -90,6 +91,7 @@ class FluidDVMSSolverOperator(SymbolicPointwiseNewtonOperator):
             d_mesh=self.d_mesh,
             d_prev=self.d_prev,
             d_prev2=self.d_prev2,
+            mesh_v=self.mesh_v,
             mesh_v_prev=self.mesh_v_prev,
             mesh_a_prev=self.mesh_a_prev,
             dt=dt_value,
@@ -98,7 +100,7 @@ class FluidDVMSSolverOperator(SymbolicPointwiseNewtonOperator):
             bossak_alpha=float(bossak["alpha"]),
             rho=self.rho_f,
             mu=self.mu_f,
-            h=_predictor_element_char_length_coefficient(self.state, self.mesh),
+            h=self.h_coefficient,
             predicted_subscale=self.state.coefficient("predicted_subscale_velocity"),
             old_subscale=self.state.coefficient("old_subscale_velocity"),
             momentum_projection=self.state.coefficient("momentum_projection"),
@@ -117,6 +119,7 @@ class FluidDVMSSolverOperator(SymbolicPointwiseNewtonOperator):
 
     def before_assembly(self, *, solver, coeffs, need_matrix: bool) -> None:
         del coeffs, need_matrix
+        self.h_coefficient.values[...] = _kratos_dvms_current_element_size_array(self.mesh, self.dh, self.d_mesh)
         _update_fluid_dvms_predicted_subscale(
             state=self.state,
             dh=self.dh,
@@ -128,6 +131,7 @@ class FluidDVMSSolverOperator(SymbolicPointwiseNewtonOperator):
             d_mesh=self.d_mesh,
             d_prev=self.d_prev,
             d_prev2=self.d_prev2,
+            mesh_v=self.mesh_v,
             mesh_v_prev=self.mesh_v_prev,
             mesh_a_prev=self.mesh_a_prev,
             rho_f=self.rho_f,
@@ -154,6 +158,7 @@ def build_fluid_dvms_predictor_pointwise_operator(
     d_mesh: VectorFunction,
     d_prev: VectorFunction,
     d_prev2: VectorFunction | None = None,
+    mesh_v: VectorFunction | None = None,
     mesh_v_prev: VectorFunction | None = None,
     mesh_a_prev: VectorFunction | None = None,
     rho_f: float,
@@ -179,6 +184,7 @@ def build_fluid_dvms_predictor_pointwise_operator(
         int(id(d_mesh)),
         int(id(d_prev)),
         int(id(d_prev2)) if d_prev2 is not None else -1,
+        int(id(mesh_v)) if mesh_v is not None else -1,
         int(id(mesh_v_prev)) if mesh_v_prev is not None else -1,
         int(id(mesh_a_prev)) if mesh_a_prev is not None else -1,
         float(rho_f),
@@ -204,6 +210,7 @@ def build_fluid_dvms_predictor_pointwise_operator(
         d_mesh=d_mesh,
         d_prev=d_prev,
         d_prev2=d_prev2,
+        mesh_v=mesh_v,
         mesh_v_prev=mesh_v_prev,
         mesh_a_prev=mesh_a_prev,
         rho_f=float(rho_f),

@@ -12,6 +12,7 @@ import numpy as np
 from examples.NIRB.double_flap_reference import _load_json, default_double_flap_root
 from examples.NIRB.run_kratos_example2_reference import (
     _copy_inputs,
+    _model_part_state_payload,
     _prepare_coupling_json,
     _prepare_fluid_json,
     _prepare_solid_json,
@@ -19,7 +20,7 @@ from examples.NIRB.run_kratos_example2_reference import (
 )
 
 
-def _try_get_fluid_model_part(solver_wrapper) -> Any | None:
+def _try_get_model_part(solver_wrapper) -> Any | None:
     candidates = []
     for attr in ("_analysis_stage", "analysis_stage"):
         obj = getattr(solver_wrapper, attr, None)
@@ -52,41 +53,15 @@ def _try_get_fluid_model_part(solver_wrapper) -> Any | None:
     return None
 
 
-def _dump_model_part_state(model_part, output_path: Path) -> None:
-    import KratosMultiphysics as KM
-
-    nodes = list(model_part.Nodes)
-    node_ids = np.asarray([int(node.Id) for node in nodes], dtype=int)
-    node_coords_ref = np.asarray([[float(node.X0), float(node.Y0)] for node in nodes], dtype=float)
-    node_coords_cur = np.asarray([[float(node.X), float(node.Y)] for node in nodes], dtype=float)
-    velocity = np.asarray(
-        [[float(node.GetSolutionStepValue(KM.VELOCITY)[0]), float(node.GetSolutionStepValue(KM.VELOCITY)[1])] for node in nodes],
-        dtype=float,
-    )
-    pressure = np.asarray([float(node.GetSolutionStepValue(KM.PRESSURE)) for node in nodes], dtype=float)
-    reaction = np.asarray(
-        [[float(node.GetSolutionStepValue(KM.REACTION)[0]), float(node.GetSolutionStepValue(KM.REACTION)[1])] for node in nodes],
-        dtype=float,
-    )
-    mesh_displacement = np.asarray(
-        [[float(node.GetSolutionStepValue(KM.MESH_DISPLACEMENT)[0]), float(node.GetSolutionStepValue(KM.MESH_DISPLACEMENT)[1])] for node in nodes],
-        dtype=float,
-    )
-    mesh_velocity = np.asarray(
-        [[float(node.GetSolutionStepValue(KM.MESH_VELOCITY)[0]), float(node.GetSolutionStepValue(KM.MESH_VELOCITY)[1])] for node in nodes],
-        dtype=float,
-    )
-    np.savez(
-        output_path,
-        node_ids=node_ids,
-        node_coords_ref=node_coords_ref,
-        node_coords_cur=node_coords_cur,
-        velocity=velocity,
-        pressure=pressure,
-        reaction=reaction,
-        mesh_displacement=mesh_displacement,
-        mesh_velocity=mesh_velocity,
-    )
+def _dump_model_part_state(model_part, output_path: Path, *, solver_name: str) -> None:
+    payload = _model_part_state_payload(model_part, solver_name=str(solver_name))
+    prefix = f"{solver_name}_"
+    slim_payload = {
+        str(key)[len(prefix) :]: np.asarray(value)
+        for key, value in payload.items()
+        if str(key).startswith(prefix)
+    }
+    np.savez(output_path, **slim_payload)
 
 
 def parse_args() -> argparse.Namespace:
@@ -97,6 +72,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--echo-level", type=int, default=1)
     parser.add_argument("--fluid-echo-level", type=int, default=0)
     parser.add_argument("--solid-echo-level", type=int, default=0)
+    parser.add_argument("--solver-name", choices=("fluid", "structure"), default="fluid")
     parser.add_argument("--target-stage", type=str, default="after_sync_output_fluid")
     parser.add_argument("--target-iteration", type=int, default=2)
     parser.add_argument("--output-stem", type=str, default="fluid_stage_state")
@@ -141,6 +117,7 @@ def main() -> None:
     _write_json(run_dir / "ProjectParametersCSM.json", solid_json)
 
     # Keep the coupled settings otherwise unchanged.
+    solver_name = str(args.solver_name)
     target_stage = str(args.target_stage)
     target_iteration = int(args.target_iteration)
     output_stem = str(args.output_stem)
@@ -149,11 +126,45 @@ def main() -> None:
     if getattr(cls, "_pycutfem_stage_state_dump_installed", False):
         raise RuntimeError("Stage-state dumper already installed in this Python process.")
     original = cls.SolveSolutionStep
+    stage_dump_context: dict[str, int] = {"iteration": -1}
+    original_ale = None
+    if solver_name == "fluid":
+        try:
+            from KratosMultiphysics.MeshMovingApplication.ale_fluid_solver import AleFluidSolver
+
+            original_ale = AleFluidSolver.SolveSolutionStep
+
+            def _wrapped_ale(self):
+                is_converged = True
+                for mesh_solver in self.mesh_motion_solvers:
+                    is_converged &= mesh_solver.SolveSolutionStep()
+
+                if target_stage == "after_mesh_motion_before_fluid":
+                    mp = self.GetComputingModelPart()
+                    coupling_iteration = int(stage_dump_context.get("iteration", -1))
+                    if coupling_iteration == target_iteration:
+                        _dump_model_part_state(mp, run_dir / f"{output_stem}.npz", solver_name="fluid")
+
+                if self.fluid_solver.GetComputingModelPart().ProcessInfo[KM.TIME] >= self.start_fluid_solution_time:
+                    self._AleFluidSolver__ApplyALEBoundaryCondition()
+                    if target_stage == "after_ale_boundary_before_fluid":
+                        mp = self.GetComputingModelPart()
+                        coupling_iteration = int(stage_dump_context.get("iteration", -1))
+                        if coupling_iteration == target_iteration:
+                            _dump_model_part_state(mp, run_dir / f"{output_stem}.npz", solver_name="fluid")
+                    is_converged &= self.fluid_solver.SolveSolutionStep()
+
+                return is_converged
+
+            AleFluidSolver.SolveSolutionStep = _wrapped_ale
+        except Exception:
+            original_ale = None
 
     def _wrapped(self):
         for k in range(self.num_coupling_iterations):
             self.process_info[KratosCoSim.COUPLING_ITERATION_NUMBER] += 1
             iteration = int(k + 1)
+            stage_dump_context["iteration"] = iteration
 
             for coupling_op in self.coupling_operations_dict.values():
                 coupling_op.InitializeCouplingIteration()
@@ -164,23 +175,23 @@ def main() -> None:
 
             for solver_name, solver in self.solver_wrappers.items():
                 self._SynchronizeInputData(solver_name)
-                if target_stage == f"after_sync_input_{solver_name}" and iteration == target_iteration and solver_name == "fluid":
-                    mp = _try_get_fluid_model_part(solver)
+                if target_stage == f"after_sync_input_{solver_name}" and iteration == target_iteration and solver_name == str(args.solver_name):
+                    mp = _try_get_model_part(solver)
                     if mp is None:
-                        raise RuntimeError("Could not access Kratos fluid model part for stage dump.")
-                    _dump_model_part_state(mp, run_dir / f"{output_stem}.npz")
+                        raise RuntimeError(f"Could not access Kratos {args.solver_name} model part for stage dump.")
+                    _dump_model_part_state(mp, run_dir / f"{output_stem}.npz", solver_name=str(args.solver_name))
                 solver.SolveSolutionStep()
-                if target_stage == f"after_solve_{solver_name}" and iteration == target_iteration and solver_name == "fluid":
-                    mp = _try_get_fluid_model_part(solver)
+                if target_stage == f"after_solve_{solver_name}" and iteration == target_iteration and solver_name == str(args.solver_name):
+                    mp = _try_get_model_part(solver)
                     if mp is None:
-                        raise RuntimeError("Could not access Kratos fluid model part for stage dump.")
-                    _dump_model_part_state(mp, run_dir / f"{output_stem}.npz")
+                        raise RuntimeError(f"Could not access Kratos {args.solver_name} model part for stage dump.")
+                    _dump_model_part_state(mp, run_dir / f"{output_stem}.npz", solver_name=str(args.solver_name))
                 self._SynchronizeOutputData(solver_name)
-                if target_stage == f"after_sync_output_{solver_name}" and iteration == target_iteration and solver_name == "fluid":
-                    mp = _try_get_fluid_model_part(solver)
+                if target_stage == f"after_sync_output_{solver_name}" and iteration == target_iteration and solver_name == str(args.solver_name):
+                    mp = _try_get_model_part(solver)
                     if mp is None:
-                        raise RuntimeError("Could not access Kratos fluid model part for stage dump.")
-                    _dump_model_part_state(mp, run_dir / f"{output_stem}.npz")
+                        raise RuntimeError(f"Could not access Kratos {args.solver_name} model part for stage dump.")
+                    _dump_model_part_state(mp, run_dir / f"{output_stem}.npz", solver_name=str(args.solver_name))
 
             for coupling_op in self.coupling_operations_dict.values():
                 coupling_op.FinalizeCouplingIteration()
@@ -217,12 +228,17 @@ def main() -> None:
         os.chdir(cwd)
         cls.SolveSolutionStep = original
         cls._pycutfem_stage_state_dump_installed = False
+        if original_ale is not None:
+            from KratosMultiphysics.MeshMovingApplication.ale_fluid_solver import AleFluidSolver
+
+            AleFluidSolver.SolveSolutionStep = original_ale
 
     npz_path = run_dir / f"{output_stem}.npz"
     if not npz_path.exists():
         raise RuntimeError(f"Requested stage dump was not produced: {npz_path}")
     summary = {
         "run_dir": str(run_dir),
+        "solver_name": str(args.solver_name),
         "stage": target_stage,
         "iteration": target_iteration,
         "npz_path": str(npz_path),

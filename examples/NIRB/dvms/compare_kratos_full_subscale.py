@@ -8,6 +8,7 @@ import numpy as np
 
 from examples.NIRB.example2_local_setup import load_example2_local_setup
 from examples.NIRB.run_example2_local import _build_fluid_problem, _load_reference_partitioned_meshes
+from examples.NIRB.dvms.helpers import _bossak_coefficients
 from examples.NIRB.dvms.update import _update_fluid_dvms_predicted_subscale, _update_fluid_dvms_state_from_previous_step
 
 
@@ -71,6 +72,18 @@ def _compare_fields(local_coords: np.ndarray, local_values: np.ndarray, ref_coor
     }
 
 
+def _load_kratos_subscale_samples(data) -> tuple[np.ndarray, np.ndarray]:
+    if "q_coords_ref" in data and "subscale_velocity" in data:
+        q_coords_ref = np.asarray(data["q_coords_ref"], dtype=float).reshape(-1, 2)
+        q_subscale_velocity = np.asarray(data["subscale_velocity"], dtype=float).reshape(-1, 2)
+        return q_coords_ref, q_subscale_velocity
+    if "q_coords_ref_flat" in data and "subscale_velocity_flat" in data:
+        q_coords_ref = np.asarray(data["q_coords_ref_flat"], dtype=float).reshape(-1, 2)
+        q_subscale_velocity = np.asarray(data["subscale_velocity_flat"], dtype=float).reshape(-1, 2)
+        return q_coords_ref, q_subscale_velocity
+    raise KeyError("Kratos state dump does not contain quadrature subscale coordinates/values.")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Compare the local predicted DVMS subscale field against a Kratos full-field dump.")
     parser.add_argument("--kratos-state", type=Path, required=True)
@@ -80,10 +93,15 @@ def parse_args() -> argparse.Namespace:
         default=Path("examples/NIRB/artifacts/compare_kratos_full_subscale.json"),
     )
     parser.add_argument("--backend", choices=("python", "jit", "cpp"), default="cpp")
-    parser.add_argument("--quad-order", type=int, default=6)
+    parser.add_argument("--quad-order", type=int, default=1)
     parser.add_argument("--bossak-alpha", type=float, default=-0.3)
     parser.add_argument("--dynamic-tau", type=float, default=1.0)
     parser.add_argument("--zero-predicted-subscale", action="store_true")
+    parser.add_argument(
+        "--allow-finalized",
+        action="store_true",
+        help="Allow comparing against a finalized Kratos dump. By default this is rejected because finalized DVMS dumps have already advanced the old-subscale history.",
+    )
     return parser.parse_args()
 
 
@@ -100,15 +118,36 @@ def main() -> None:
     mu_f = float(setup.material.density * setup.material.kinematic_viscosity)
     dt = float(setup.boundaries.time_step)
 
-    with np.load(Path(args.kratos_state).resolve()) as data:
+    stage: str | None = None
+    kratos_state_path = Path(args.kratos_state).resolve()
+    with np.load(kratos_state_path) as data:
+        if "stage" in data.files:
+            stage = str(np.asarray(data["stage"]).reshape(()))
         node_coords = np.asarray(data["node_coords_ref"], dtype=float)
         velocity = np.asarray(data["velocity"], dtype=float)
         pressure = np.asarray(data["pressure"], dtype=float).reshape(-1, 1)
-        q_coords_ref = np.asarray(data["q_coords_ref"], dtype=float).reshape(-1, 2)
-        q_subscale_velocity = np.asarray(data["subscale_velocity"], dtype=float).reshape(-1, 2)
+        acceleration = np.asarray(data["acceleration"], dtype=float) if "acceleration" in data.files else None
+        mesh_displacement = np.asarray(data["mesh_displacement"], dtype=float) if "mesh_displacement" in data.files else None
+        mesh_velocity = np.asarray(data["mesh_velocity"], dtype=float) if "mesh_velocity" in data.files else None
+        q_coords_ref, q_subscale_velocity = _load_kratos_subscale_samples(data)
+    if stage is None:
+        sidecar = kratos_state_path.with_suffix(".json")
+        if sidecar.exists():
+            try:
+                stage = str(json.loads(sidecar.read_text(encoding="utf-8")).get("stage") or "").strip() or None
+            except Exception:
+                stage = None
+    if stage is not None and stage.lower() == "finalized" and not bool(args.allow_finalized):
+        raise ValueError(
+            "Kratos state dump stage='finalized' is not suitable for predicted-subscale comparison. "
+            "Use a '--stage solved' or '--stage predicted' dump, or pass --allow-finalized to override."
+        )
 
     vel_lookup = PointLookup(node_coords, velocity)
     p_lookup = PointLookup(node_coords, pressure)
+    mesh_lookup = PointLookup(node_coords, mesh_displacement) if mesh_displacement is not None else None
+    mesh_velocity_lookup = PointLookup(node_coords, mesh_velocity) if mesh_velocity is not None else None
+    acceleration_lookup = PointLookup(node_coords, acceleration) if acceleration is not None else None
     _assign_vector_field_from_lookup(
         fluid["u_k"],
         fluid["dh"],
@@ -116,6 +155,48 @@ def main() -> None:
         vel_lookup,
     )
     _assign_scalar_field_from_lookup(fluid["p_k"], fluid["dh"], fluid["p_k"].field_name, p_lookup)
+    if mesh_lookup is not None:
+        _assign_vector_field_from_lookup(
+            fluid["d_mesh"],
+            fluid["dh"],
+            (fluid["d_mesh"].components[0].field_name, fluid["d_mesh"].components[1].field_name),
+            mesh_lookup,
+        )
+    if mesh_lookup is not None and mesh_velocity_lookup is not None:
+        prev_mesh_disp = PointLookup(
+            node_coords,
+            np.asarray(mesh_displacement, dtype=float) - float(dt) * np.asarray(mesh_velocity, dtype=float),
+        )
+        _assign_vector_field_from_lookup(
+            fluid["d_prev"],
+            fluid["dh"],
+            (fluid["d_prev"].components[0].field_name, fluid["d_prev"].components[1].field_name),
+            prev_mesh_disp,
+        )
+        _assign_vector_field_from_lookup(
+            fluid["d_prev2"],
+            fluid["dh"],
+            (fluid["d_prev2"].components[0].field_name, fluid["d_prev2"].components[1].field_name),
+            prev_mesh_disp,
+        )
+        _assign_vector_field_from_lookup(
+            fluid["w_mesh_prev"],
+            fluid["dh"],
+            (fluid["w_mesh_prev"].components[0].field_name, fluid["w_mesh_prev"].components[1].field_name),
+            mesh_velocity_lookup,
+        )
+    if acceleration_lookup is not None:
+        bossak = _bossak_coefficients(alpha=float(args.bossak_alpha), dt=dt)
+        a_prev_values = (
+            np.asarray(acceleration, dtype=float) - float(bossak["ma0"]) * np.asarray(velocity, dtype=float)
+        ) / float(bossak["ma2"])
+        a_prev_lookup = PointLookup(node_coords, a_prev_values)
+        _assign_vector_field_from_lookup(
+            fluid["a_prev"],
+            fluid["dh"],
+            (fluid["a_prev"].components[0].field_name, fluid["a_prev"].components[1].field_name),
+            a_prev_lookup,
+        )
 
     _update_fluid_dvms_state_from_previous_step(
         state=fluid["dvms_state"],
@@ -123,6 +204,7 @@ def main() -> None:
         mesh=mesh_f,
         u_prev=fluid["u_prev"],
         d_prev=fluid["d_prev"],
+        d_geo=fluid["d_mesh"],
         backend=str(args.backend),
     )
     _update_fluid_dvms_predicted_subscale(
@@ -151,6 +233,7 @@ def main() -> None:
     report = {
         "backend": str(args.backend),
         "quadrature_order": int(args.quad_order),
+        "kratos_stage": stage,
         "zero_predicted_subscale": bool(args.zero_predicted_subscale),
         "predicted_subscale_vs_kratos": _compare_fields(
             local_coords=local_coords,

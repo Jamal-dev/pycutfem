@@ -8,7 +8,7 @@ swap backends via an environment switch without touching the assemblers.
 from __future__ import annotations
 
 import os
-from typing import Any, Tuple
+from typing import Any, Sequence, Tuple
 
 
 def _backend_requested() -> bool:
@@ -91,6 +91,70 @@ def compile_backend_cpp(
     return runner, ir_sequence
 
 
+def compile_backend_cpp_group(
+    integral_expressions: Sequence[Any],
+    dof_handler,
+    mixed_element,
+    *,
+    on_facet: bool = False,
+) -> Tuple[Any, list]:
+    """
+    Compile multiple integrands into one C++ kernel with a shared element/QP loop.
+
+    The generated kernel keeps the original per-integral IR programs and merely
+    concatenates them, so accumulation order matches the unfused path while loop
+    overhead is paid only once.
+    """
+    from pycutfem.jit.visitor import IRGenerator
+    from pycutfem.ufl.jit_parametrization import build_jit_parametrization
+    from .codegen import CppCodeGen
+    from .runner import KernelRunnerCpp
+
+    exprs = [expr for expr in integral_expressions if expr is not None]
+    if not exprs:
+        raise ValueError("compile_backend_cpp_group requires at least one integrand.")
+
+    rank = _form_rank(exprs[0])
+    for expr in exprs[1:]:
+        expr_rank = _form_rank(expr)
+        if expr_rank != rank:
+            raise ValueError(
+                "compile_backend_cpp_group requires integrands with the same form rank; "
+                f"got {rank} and {expr_rank}."
+            )
+
+    combined_expr = exprs[0]
+    for expr in exprs[1:]:
+        combined_expr = combined_expr + expr
+    param = build_jit_parametrization(combined_expr)
+
+    cpp_codegen = CppCodeGen(
+        mixed_element=mixed_element,
+        form_rank=rank,
+        on_facet=on_facet,
+    )
+    cache = _get_cpp_kernel_cache()
+
+    from pycutfem.jit.ir import strip_side_metadata
+
+    flat_ir: list = []
+    for expr in exprs:
+        ir_generator = IRGenerator()
+        ir_sequence = ir_generator.generate(expr, jit_param=param)
+        flat_ir.extend(strip_side_metadata(ir_sequence, on_facet=on_facet))
+
+    cache_sig = (mixed_element.signature(), bool(on_facet), int(rank))
+    kernel, param_order, active_fields = cache.get_kernel(flat_ir, cpp_codegen, cache_sig)
+
+    runner = KernelRunnerCpp(kernel, param_order, flat_ir, dof_handler, fallback_runner=None)
+    try:
+        runner._delegate._jit_param = param
+    except Exception:
+        pass
+    runner.active_fields = active_fields or getattr(cpp_codegen, "active_fields", None)
+    return runner, flat_ir
+
+
 def _form_rank(expr):
     """Return 0 (functional), 1 (linear) or 2 (bilinear)."""
     from pycutfem.ufl.expressions import Function, VectorFunction
@@ -108,5 +172,6 @@ def _form_rank(expr):
 
 __all__ = [
     "compile_backend_cpp",
+    "compile_backend_cpp_group",
     "_backend_requested",
 ]

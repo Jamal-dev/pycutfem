@@ -118,6 +118,247 @@ def _interface_node_arrays(interface_data) -> tuple[np.ndarray, np.ndarray, np.n
     return ids, coords_ref, coords_cur
 
 
+def _try_get_solver_model_part(solver_wrapper, solver_name: str) -> Any | None:
+    candidates: list[Any] = []
+    for attr in ("_analysis_stage", "analysis_stage"):
+        obj = getattr(solver_wrapper, attr, None)
+        if obj is not None:
+            candidates.append(obj)
+    for obj in list(candidates):
+        for getter in ("_GetSolver", "GetSolver"):
+            fn = getattr(obj, getter, None)
+            if callable(fn):
+                try:
+                    candidates.append(fn())
+                except Exception:
+                    pass
+    for obj in list(candidates):
+        for getter in ("GetComputingModelPart", "GetFluidComputingModelPart", "GetStructureComputingModelPart"):
+            fn = getattr(obj, getter, None)
+            if callable(fn):
+                try:
+                    mp = fn()
+                    if mp is not None:
+                        return mp
+                except Exception:
+                    pass
+        for attr in ("main_model_part", "computing_model_part"):
+            mp = getattr(obj, attr, None)
+            if mp is not None:
+                return mp
+    if str(solver_name) == "fluid":
+        for obj in candidates:
+            mp = getattr(obj, "fluid_solver", None)
+            if mp is not None and hasattr(mp, "GetComputingModelPart"):
+                try:
+                    return mp.GetComputingModelPart()
+                except Exception:
+                    pass
+    return None
+
+
+def _safe_scalar_step_values(nodes, variable, step: int = 0) -> np.ndarray:
+    values = np.zeros((len(nodes), 1), dtype=float)
+    if variable is None:
+        return values
+    for i, node in enumerate(nodes):
+        try:
+            values[i, 0] = float(node.GetSolutionStepValue(variable, int(step)))
+        except Exception:
+            values[i, 0] = 0.0
+    return values
+
+
+def _safe_vector_step_values(nodes, variable, step: int = 0) -> np.ndarray:
+    values = np.zeros((len(nodes), 2), dtype=float)
+    if variable is None:
+        return values
+    for i, node in enumerate(nodes):
+        try:
+            raw = node.GetSolutionStepValue(variable, int(step))
+            arr = np.asarray(raw, dtype=float).reshape(-1)
+            if arr.size >= 2:
+                values[i, :] = arr[:2]
+            elif arr.size == 1:
+                values[i, 0] = arr[0]
+        except Exception:
+            values[i, :] = 0.0
+    return values
+
+
+def _safe_condition_vector_values(conditions, variable) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    ids = np.zeros((len(conditions),), dtype=int)
+    node_ids = np.zeros((len(conditions), 1), dtype=int)
+    values = np.zeros((len(conditions), 2), dtype=float)
+    if variable is None:
+        return ids, node_ids, values
+    for i, condition in enumerate(conditions):
+        ids[i] = int(condition.Id)
+        try:
+            geom = condition.GetGeometry()
+            if len(geom) >= 1:
+                node_ids[i, 0] = int(geom[0].Id)
+        except Exception:
+            node_ids[i, 0] = -1
+        try:
+            raw = condition.GetValue(variable)
+            arr = np.asarray(raw, dtype=float).reshape(-1)
+            if arr.size >= 2:
+                values[i, :] = arr[:2]
+            elif arr.size == 1:
+                values[i, 0] = arr[0]
+        except Exception:
+            values[i, :] = 0.0
+    return ids, node_ids, values
+
+
+def _model_part_state_payload(model_part, *, solver_name: str) -> dict[str, np.ndarray]:
+    import KratosMultiphysics as KM
+
+    try:
+        import KratosMultiphysics.StructuralMechanicsApplication as KSM  # type: ignore
+    except Exception:  # pragma: no cover - depends on env
+        KSM = None
+
+    nodes = list(model_part.Nodes)
+    ids = np.asarray([int(node.Id) for node in nodes], dtype=int)
+    coords_ref = np.asarray([[float(node.X0), float(node.Y0)] for node in nodes], dtype=float)
+    coords_cur = np.asarray([[float(node.X), float(node.Y)] for node in nodes], dtype=float)
+    payload: dict[str, np.ndarray] = {
+        f"{solver_name}_node_ids": ids,
+        f"{solver_name}_coords_ref": coords_ref,
+        f"{solver_name}_coords_cur": coords_cur,
+    }
+
+    if str(solver_name) == "fluid":
+        import KratosMultiphysics.FluidDynamicsApplication as KFD  # type: ignore
+
+        from examples.NIRB.dvms.dump_kratos_fluid_step1_state import _integration_point_coords, _resolve_integration_method
+
+        payload[f"{solver_name}_velocity_nodal_values"] = _safe_vector_step_values(nodes, KM.VELOCITY)
+        payload[f"{solver_name}_velocity_prev_nodal_values"] = _safe_vector_step_values(nodes, KM.VELOCITY, step=1)
+        payload[f"{solver_name}_acceleration_nodal_values"] = _safe_vector_step_values(nodes, KM.ACCELERATION)
+        payload[f"{solver_name}_acceleration_prev_nodal_values"] = _safe_vector_step_values(
+            nodes,
+            KM.ACCELERATION,
+            step=1,
+        )
+        payload[f"{solver_name}_pressure_nodal_values"] = _safe_scalar_step_values(nodes, KM.PRESSURE)
+        payload[f"{solver_name}_pressure_prev_nodal_values"] = _safe_scalar_step_values(
+            nodes,
+            KM.PRESSURE,
+            step=1,
+        )
+        payload[f"{solver_name}_reaction_nodal_values"] = _safe_vector_step_values(nodes, KM.REACTION)
+        payload[f"{solver_name}_mesh_displacement_nodal_values"] = _safe_vector_step_values(nodes, KM.MESH_DISPLACEMENT)
+        payload[f"{solver_name}_mesh_displacement_prev_nodal_values"] = _safe_vector_step_values(
+            nodes,
+            KM.MESH_DISPLACEMENT,
+            step=1,
+        )
+        payload[f"{solver_name}_mesh_velocity_nodal_values"] = _safe_vector_step_values(nodes, KM.MESH_VELOCITY)
+        payload[f"{solver_name}_mesh_velocity_prev_nodal_values"] = _safe_vector_step_values(
+            nodes,
+            KM.MESH_VELOCITY,
+            step=1,
+        )
+        payload[f"{solver_name}_advproj_nodal_values"] = _safe_vector_step_values(nodes, KM.ADVPROJ)
+        payload[f"{solver_name}_divproj_nodal_values"] = _safe_scalar_step_values(nodes, KM.DIVPROJ)
+
+        elements = list(model_part.Elements)
+        n_elem = len(elements)
+        node_ids_by_elem = np.zeros((n_elem, 3), dtype=int)
+        q_coords_ref_list: list[np.ndarray] = []
+        q_coords_cur_list: list[np.ndarray] = []
+        q_weights_list: list[np.ndarray] = []
+        subscale_velocity_list: list[np.ndarray] = []
+        subscale_pressure_list: list[np.ndarray] = []
+        for eidx, elem in enumerate(elements):
+            geom = elem.GetGeometry()
+            node_ids_by_elem[eidx, :] = np.asarray([int(node.Id) for node in geom], dtype=int)
+            elem_subscale_velocity = np.asarray(
+                elem.CalculateOnIntegrationPoints(KFD.SUBSCALE_VELOCITY, model_part.ProcessInfo),
+                dtype=float,
+            )[:, :2]
+            elem_subscale_pressure = np.asarray(
+                elem.CalculateOnIntegrationPoints(KFD.SUBSCALE_PRESSURE, model_part.ProcessInfo),
+                dtype=float,
+            ).reshape(-1)
+            integration_method = _resolve_integration_method(
+                KM,
+                elem,
+                geom,
+                n_qp=int(elem_subscale_velocity.shape[0]),
+            )
+            elem_q_coords_ref, elem_q_coords_cur, elem_q_weights = _integration_point_coords(
+                geom,
+                integration_method,
+                n_qp_hint=int(elem_subscale_velocity.shape[0]),
+            )
+            q_coords_ref_list.append(np.asarray(elem_q_coords_ref, dtype=float))
+            q_coords_cur_list.append(np.asarray(elem_q_coords_cur, dtype=float))
+            q_weights_list.append(np.asarray(elem_q_weights, dtype=float))
+            subscale_velocity_list.append(np.asarray(elem_subscale_velocity, dtype=float))
+            subscale_pressure_list.append(np.asarray(elem_subscale_pressure, dtype=float))
+        q_counts = np.asarray([arr.shape[0] for arr in q_coords_ref_list], dtype=int)
+        q_offsets = np.zeros((n_elem + 1,), dtype=int)
+        if q_counts.size:
+            q_offsets[1:] = np.cumsum(q_counts, dtype=int)
+        q_coords_ref_flat = (
+            np.concatenate(q_coords_ref_list, axis=0)
+            if q_coords_ref_list
+            else np.zeros((0, 2), dtype=float)
+        )
+        q_coords_cur_flat = (
+            np.concatenate(q_coords_cur_list, axis=0)
+            if q_coords_cur_list
+            else np.zeros((0, 2), dtype=float)
+        )
+        q_weights_flat = (
+            np.concatenate(q_weights_list, axis=0)
+            if q_weights_list
+            else np.zeros((0,), dtype=float)
+        )
+        subscale_velocity_flat = (
+            np.concatenate(subscale_velocity_list, axis=0)
+            if subscale_velocity_list
+            else np.zeros((0, 2), dtype=float)
+        )
+        subscale_pressure_flat = (
+            np.concatenate(subscale_pressure_list, axis=0)
+            if subscale_pressure_list
+            else np.zeros((0,), dtype=float)
+        )
+        payload[f"{solver_name}_element_node_ids"] = node_ids_by_elem
+        payload[f"{solver_name}_q_point_offsets"] = q_offsets
+        payload[f"{solver_name}_q_point_counts"] = q_counts
+        payload[f"{solver_name}_q_coords_ref_flat"] = q_coords_ref_flat
+        payload[f"{solver_name}_q_coords_cur_flat"] = q_coords_cur_flat
+        payload[f"{solver_name}_q_weights_flat"] = q_weights_flat
+        payload[f"{solver_name}_subscale_velocity_flat"] = subscale_velocity_flat
+        payload[f"{solver_name}_subscale_pressure_flat"] = subscale_pressure_flat
+        if q_counts.size and int(np.min(q_counts)) == int(np.max(q_counts)):
+            n_qp = int(q_counts[0])
+            payload[f"{solver_name}_q_coords_ref"] = q_coords_ref_flat.reshape(n_elem, n_qp, 2)
+            payload[f"{solver_name}_q_coords_cur"] = q_coords_cur_flat.reshape(n_elem, n_qp, 2)
+            payload[f"{solver_name}_q_weights"] = q_weights_flat.reshape(n_elem, n_qp)
+            payload[f"{solver_name}_subscale_velocity"] = subscale_velocity_flat.reshape(n_elem, n_qp, 2)
+            payload[f"{solver_name}_subscale_pressure"] = subscale_pressure_flat.reshape(n_elem, n_qp)
+    elif str(solver_name) == "structure":
+        point_load_var = getattr(KSM, "POINT_LOAD", None) if KSM is not None else None
+        payload[f"{solver_name}_displacement_nodal_values"] = _safe_vector_step_values(nodes, KM.DISPLACEMENT)
+        payload[f"{solver_name}_velocity_nodal_values"] = _safe_vector_step_values(nodes, KM.VELOCITY)
+        payload[f"{solver_name}_reaction_nodal_values"] = _safe_vector_step_values(nodes, KM.REACTION)
+        payload[f"{solver_name}_point_load_nodal_values"] = _safe_vector_step_values(nodes, point_load_var)
+        conditions = [cond for cond in model_part.Conditions if cond.GetGeometry().PointsNumber() == 1]
+        cond_ids, cond_node_ids, cond_values = _safe_condition_vector_values(conditions, point_load_var)
+        payload[f"{solver_name}_point_load_condition_ids"] = cond_ids
+        payload[f"{solver_name}_point_load_condition_node_ids"] = cond_node_ids
+        payload[f"{solver_name}_point_load_condition_values"] = cond_values
+
+    return payload
+
+
 def _residual_norms(residual: np.ndarray, current: np.ndarray) -> dict[str, float]:
     residual_arr = np.asarray(residual, dtype=float).reshape(-1)
     current_arr = np.asarray(current, dtype=float).reshape(-1)
@@ -212,6 +453,81 @@ class KratosCouplingMonitor:
 
     def finalize(self) -> None:
         _write_json(self.monitor_dir / "manifest.json", {"records": self.records})
+
+
+class KratosStepHistoryDumper:
+    def __init__(
+        self,
+        *,
+        step_history_dir: Path,
+        solver_names: tuple[str, ...] = ("fluid", "structure"),
+        field_names: tuple[str, ...] = ("load", "disp", "velocity"),
+        every: int = 1,
+    ) -> None:
+        self.step_history_dir = Path(step_history_dir)
+        self.step_history_dir.mkdir(parents=True, exist_ok=True)
+        self.solver_names = tuple(str(name) for name in solver_names)
+        self.field_names = tuple(str(name) for name in field_names)
+        self.every = max(int(every), 1)
+        self.records: list[dict[str, Any]] = []
+
+    def dump(self, analysis) -> None:
+        step = int(getattr(analysis, "step", 0))
+        time_value = float(getattr(analysis, "time", 0.0))
+        if step <= 0 or (step % self.every) != 0:
+            return
+        coupled_solver = analysis._GetSolver()
+        payload: dict[str, np.ndarray] = {
+            "step": np.asarray(step, dtype=int),
+            "time_s": np.asarray(time_value, dtype=float),
+        }
+        record: dict[str, Any] = {
+            "step": step,
+            "time_s": time_value,
+        }
+
+        normalized_interface_names = {
+            ("fluid", "load"): "interface_load",
+            ("structure", "disp"): "interface_disp",
+            ("fluid", "velocity"): "interface_velocity",
+        }
+
+        for solver_name in self.solver_names:
+            solver = coupled_solver.solver_wrappers.get(solver_name)
+            if solver is None or not getattr(solver, "IsDefinedOnThisRank", lambda: False)():
+                continue
+            model_part = _try_get_solver_model_part(solver, solver_name)
+            if model_part is not None:
+                payload.update(_model_part_state_payload(model_part, solver_name=str(solver_name)))
+            for field_name in self.field_names:
+                try:
+                    interface_data = solver.GetInterfaceData(field_name)
+                except Exception:
+                    continue
+                if not interface_data.IsDefinedOnThisRank():
+                    continue
+                ids, coords_ref, coords_cur = _interface_node_arrays(interface_data)
+                values = _reshape_interface_values(interface_data)
+                prefix = f"{solver_name}_{field_name}"
+                payload[f"{prefix}_node_ids"] = ids
+                payload[f"{prefix}_coords_ref"] = coords_ref
+                payload[f"{prefix}_coords_cur"] = coords_cur
+                payload[f"{prefix}_values"] = values
+                alias = normalized_interface_names.get((str(solver_name), str(field_name)))
+                if alias is not None:
+                    payload[f"{alias}_coords_ref"] = coords_ref
+                    payload[f"{alias}_coords_cur"] = coords_cur
+                    payload[f"{alias}_values"] = values
+                record[f"{prefix}_size"] = int(values.shape[0])
+                record[f"{prefix}_dim"] = int(values.shape[1])
+
+        step_path = self.step_history_dir / f"step{step:04d}.npz"
+        np.savez_compressed(step_path, **payload)
+        record["npz_path"] = str(step_path)
+        self.records.append(record)
+
+    def finalize(self) -> None:
+        _write_json(self.step_history_dir / "manifest.json", {"records": self.records})
 
 
 def _install_kratos_coupling_monitor(*, monitor: KratosCouplingMonitor) -> None:
@@ -329,6 +645,25 @@ def _install_kratos_coupling_monitor(*, monitor: KratosCouplingMonitor) -> None:
     cls._pycutfem_monitor_installed = True
 
 
+def _install_kratos_step_history_dumper(*, dumper: KratosStepHistoryDumper) -> None:
+    from KratosMultiphysics.CoSimulationApplication import co_simulation_analysis
+
+    cls = co_simulation_analysis.CoSimulationAnalysis
+    if getattr(cls, "_pycutfem_step_history_installed", False):
+        return
+
+    original = cls.OutputSolutionStep
+
+    @wraps(original)
+    def _monitored_output_solution_step(self):
+        result = original(self)
+        dumper.dump(self)
+        return result
+
+    cls.OutputSolutionStep = _monitored_output_solution_step
+    cls._pycutfem_step_history_installed = True
+
+
 def _split_csv_values(text: str | None) -> tuple[str, ...] | None:
     if text is None:
         return None
@@ -360,6 +695,11 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional comma-separated stage filter. Example: after_solve_fluid,after_sync_output_fluid,post_update",
     )
+    parser.add_argument("--dump-step-history", action="store_true", help="Dump accepted-step full-state npz files for later comparison.")
+    parser.add_argument("--step-history-dir", type=Path, default=None, help="Directory for accepted-step state dumps.")
+    parser.add_argument("--step-history-solvers", type=str, default="fluid,structure", help="Comma-separated solver names to include in step-history dumps.")
+    parser.add_argument("--step-history-fields", type=str, default="load,disp,velocity", help="Comma-separated interface data names to include in step-history dumps.")
+    parser.add_argument("--step-history-every", type=int, default=1, help="Write one accepted-step dump every N global steps when step-history dumping is enabled.")
     return parser.parse_args()
 
 
@@ -406,6 +746,7 @@ def main() -> None:
         ) from exc
 
     monitor: KratosCouplingMonitor | None = None
+    step_history: KratosStepHistoryDumper | None = None
     if bool(args.monitor_coupling):
         monitor_dir = Path(args.monitor_dir) if args.monitor_dir is not None else run_dir / "coupling_monitor"
         monitor = KratosCouplingMonitor(
@@ -415,6 +756,15 @@ def main() -> None:
             stage_filters=_split_csv_values(args.monitor_stages),
         )
         _install_kratos_coupling_monitor(monitor=monitor)
+    if bool(args.dump_step_history):
+        step_history_dir = Path(args.step_history_dir) if args.step_history_dir is not None else run_dir / "step_history"
+        step_history = KratosStepHistoryDumper(
+            step_history_dir=step_history_dir,
+            solver_names=_split_csv_values(args.step_history_solvers) or ("fluid", "structure"),
+            field_names=_split_csv_values(args.step_history_fields) or ("load", "disp", "velocity"),
+            every=int(args.step_history_every),
+        )
+        _install_kratos_step_history_dumper(dumper=step_history)
 
     with (run_dir / "DoubleFlap_fsi_parameters_ROM.json").open("r", encoding="utf-8") as f:
         parameters = KM.Parameters(f.read())
@@ -426,6 +776,8 @@ def main() -> None:
         finally:
             if monitor is not None:
                 monitor.finalize()
+            if step_history is not None:
+                step_history.finalize()
 
     summary = {
         "benchmark_root": str(benchmark_root),
@@ -443,6 +795,13 @@ def main() -> None:
         "monitor_solvers": list(_split_csv_values(args.monitor_solvers) or ("fluid", "structure")),
         "monitor_fields": list(_split_csv_values(args.monitor_fields) or ("load", "disp", "velocity")),
         "monitor_stages": list(_split_csv_values(args.monitor_stages) or []),
+        "step_history_enabled": bool(args.dump_step_history),
+        "step_history_dir": str((Path(args.step_history_dir) if args.step_history_dir is not None else run_dir / "step_history").resolve())
+        if bool(args.dump_step_history)
+        else None,
+        "step_history_solvers": list(_split_csv_values(args.step_history_solvers) or ("fluid", "structure")),
+        "step_history_fields": list(_split_csv_values(args.step_history_fields) or ("load", "disp", "velocity")),
+        "step_history_every": int(args.step_history_every),
     }
     _write_json(run_dir / "summary.json", summary)
     print(f"summary: {run_dir / 'summary.json'}")

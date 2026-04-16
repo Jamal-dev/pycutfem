@@ -190,6 +190,8 @@ def assemble_form(equation: Equation, dof_handler, bcs=[], quad_order=None,
     from pycutfem.ufl.compilers import FormCompiler
     if kwargs.get('quad_degree') is not None:
         quad_order = kwargs['quad_degree']
+    need_matrix = bool(kwargs.get("need_matrix", True))
+    need_vector = bool(kwargs.get("need_vector", True))
     
     # We no longer need to preprocess the form.
     # The compiler will handle the list of integrals directly.
@@ -197,7 +199,12 @@ def assemble_form(equation: Equation, dof_handler, bcs=[], quad_order=None,
     
     # This runs the full assembly process. K and F are created, and if hooks
     # are present, compiler.ctx['scalar_results'] is populated.
-    K, F = compiler.assemble(equation, bcs)
+    K, F = compiler.assemble(
+        equation,
+        bcs,
+        need_matrix=need_matrix,
+        need_vector=need_vector,
+    )
 
     # After assembly, check the compiler's context for scalar results.
     # If the user provided hooks and those hooks produced results, return them.

@@ -40,6 +40,7 @@ from pycutfem.ufl.expressions import (
     inner,
     jump,
     outer,
+    tanh,
     trace,
 )
 
@@ -257,6 +258,45 @@ def _apply_invperm_components(invperm_expr, vec_expr, *, dim: int):
     return tuple(acc)
 
 
+def _apply_perm_from_invperm_components(invperm_expr, vec_expr, *, dim: int, dinvperm_expr=None, dvec_expr=None):
+    dim_i = int(dim)
+    if getattr(invperm_expr, "dim", None) == 0:
+        perm_expr = tuple((_c(1.0) / invperm_expr) * _vector_component(vec_expr, i) for i in range(dim_i))
+        if dinvperm_expr is None and dvec_expr is None:
+            return perm_expr, None
+        dperm_expr = []
+        for i in range(dim_i):
+            comp = _c(0.0)
+            if dvec_expr is not None:
+                comp += (_c(1.0) / invperm_expr) * _vector_component(dvec_expr, i)
+            if dinvperm_expr is not None:
+                comp += (-(dinvperm_expr) / (invperm_expr * invperm_expr)) * _vector_component(vec_expr, i)
+            dperm_expr.append(comp)
+        return perm_expr, tuple(dperm_expr)
+    if dim_i != 2:
+        raise NotImplementedError("Primary p_pore Darcy elimination is currently implemented for scalar or 2D matrix permeability only.")
+    det_k = invperm_expr[0, 0] * invperm_expr[1, 1] - invperm_expr[0, 1] * invperm_expr[1, 0]
+    perm_expr = (
+        (invperm_expr[1, 1] * _vector_component(vec_expr, 0) - invperm_expr[0, 1] * _vector_component(vec_expr, 1)) / det_k,
+        (-invperm_expr[1, 0] * _vector_component(vec_expr, 0) + invperm_expr[0, 0] * _vector_component(vec_expr, 1)) / det_k,
+    )
+    if dinvperm_expr is None and dvec_expr is None:
+        return perm_expr, None
+    dperm_expr = [_c(0.0), _c(0.0)]
+    if dvec_expr is not None:
+        dperm_expr[0] += (
+            invperm_expr[1, 1] * _vector_component(dvec_expr, 0) - invperm_expr[0, 1] * _vector_component(dvec_expr, 1)
+        ) / det_k
+        dperm_expr[1] += (
+            -invperm_expr[1, 0] * _vector_component(dvec_expr, 0) + invperm_expr[0, 0] * _vector_component(dvec_expr, 1)
+        ) / det_k
+    if dinvperm_expr is not None:
+        dcore_rhs = _apply_invperm_components(dinvperm_expr, perm_expr, dim=dim_i)
+        dperm_expr[0] += -(invperm_expr[1, 1] * dcore_rhs[0] - invperm_expr[0, 1] * dcore_rhs[1]) / det_k
+        dperm_expr[1] += -(-invperm_expr[1, 0] * dcore_rhs[0] + invperm_expr[0, 0] * dcore_rhs[1]) / det_k
+    return perm_expr, tuple(dperm_expr)
+
+
 def _components(vec_expr, *, dim: int):
     return tuple(_vector_component(vec_expr, i) for i in range(int(dim)))
 
@@ -386,6 +426,33 @@ def _chi_b(alpha):
 
 def _chi_f(alpha):
     return _one_minus(alpha)
+
+
+def _support_indicator(alpha, *, beta: float = 0.0):
+    beta_val = float(beta)
+    if beta_val <= 0.0:
+        return alpha
+    z = _c(beta_val) * (alpha - _c(0.5))
+    return _c(0.5) * (_c(1.0) + tanh(z))
+
+
+def _support_indicator_prime(alpha, *, beta: float = 0.0):
+    beta_val = float(beta)
+    if beta_val <= 0.0:
+        return _c(1.0)
+    z = _c(beta_val) * (alpha - _c(0.5))
+    th = tanh(z)
+    return _c(0.5 * beta_val) * (_c(1.0) - th * th)
+
+
+def _support_indicator_second(alpha, *, beta: float = 0.0):
+    beta_val = float(beta)
+    if beta_val <= 0.0:
+        return _c(0.0)
+    z = _c(beta_val) * (alpha - _c(0.5))
+    th = tanh(z)
+    sech2 = _c(1.0) - th * th
+    return _c(-(beta_val * beta_val)) * th * sech2
 
 
 def _capacity(alpha, phi):
@@ -554,6 +621,45 @@ def _support_physics_key(mode: str) -> str:
     )
 
 
+def _split_pore_flux_model_key(mode: str | None) -> str:
+    key = str(mode or "direct_darcy").strip().lower().replace("-", "_")
+    if key in {"direct", "direct_darcy", "darcy", "grad_p", "darcy_grad_p", "pressure_diffusion"}:
+        return "direct_darcy"
+    if key in {
+        "exact_conservative_p",
+        "exact_conservative",
+        "conservative_p",
+        "p_conservative",
+        "p_balance",
+        "exact_p",
+    }:
+        return "exact_conservative_p"
+    if key in {
+        "exact_total_continuity",
+        "total_continuity",
+        "total_continuity_p",
+        "band_mass_darcy",
+        "stoter_band_darcy",
+    }:
+        return "exact_total_continuity"
+    if key in {"reduced", "reduced_divq", "divq", "legacy", "derived_flux"}:
+        return "reduced_divq"
+    raise ValueError(
+        f"Unknown split_pore_flux_model={mode!r}. Use 'direct_darcy', 'exact_conservative_p', 'exact_total_continuity', or 'reduced_divq'."
+    )
+
+
+def _split_pore_momentum_model_key(mode: str | None) -> str:
+    key = str(mode or "weighted_divp").strip().lower().replace("-", "_")
+    if key in {"weighted_divp", "weighted_div_p", "divp", "legacy", "weighted_p"}:
+        return "weighted_divp"
+    if key in {"band_alpha", "interface_band", "band_only", "band_p"}:
+        return "band_alpha"
+    raise ValueError(
+        f"Unknown split_pore_momentum_model={mode!r}. Use 'weighted_divP' or 'band_alpha'."
+    )
+
+
 @dataclass(frozen=True)
 class BiofilmOneDomainForms:
     jacobian_form: object
@@ -571,13 +677,16 @@ class BiofilmOneDomainForms:
     r_substrate: object
     r_B: object | None = None
     r_pore: object | None = None
+    r_total_mass: object | None = None
     r_momentum_terms: dict[str, object] | None = None
     r_kinematics_terms: dict[str, object] | None = None
     r_skeleton_terms: dict[str, object] | None = None
     # Optional per-block Jacobian contributions (useful for debugging/verification)
     a_momentum: object | None = None
+    a_momentum_terms: dict[str, object] | None = None
     a_mass: object | None = None
     a_pore: object | None = None
+    a_total_mass: object | None = None
     a_kinematics: object | None = None
     a_skeleton: object | None = None
     a_skeleton_terms: dict[str, object] | None = None
@@ -598,6 +707,10 @@ class BiofilmOneDomainForms:
     a_skeleton_pressure: object | None = None
     r_volumetric: object | None = None
     a_volumetric: object | None = None
+    r_domain_lm: object | None = None
+    a_domain_lm: object | None = None
+    r_domain_lm_terms: dict[str, object] | None = None
+    a_domain_lm_terms: dict[str, object] | None = None
 
 
 def build_biofilm_one_domain_forms(
@@ -732,15 +845,23 @@ def build_biofilm_one_domain_forms(
     phi_supg: float = 0.0,
     phi_cip: float = 0.0,
     # Optional storage coefficient for the split-pressure pore row.
-    # On the split-pressure stored-support branch the pore equation is the
-    # reduced Biot-type storage law obtained after eliminating the pore content
-    # P through the conservative B-balance:
-    #   beta * div(vS) + div(P (v-vS)) + c0 * D_s p_P = 0.
+    # On the split-pressure stored-support branch the pore equation can be
+    # assembled in two ways:
+    #
+    # - "direct_darcy":  beta * div(vS) - div(alpha K/mu grad(p_P)) + beta c0 D_s p_P = 0
+    # - "exact_conservative_p":
+    #                    d_t P + div(P vS - alpha K/mu grad(p_P)) + beta c0 D_s p_P = alpha s_v
+    #                    with P = alpha - B
+    # - "reduced_divq":  beta * div(vS) + div(P (v-vS))            + beta c0 D_s p_P = 0
+    #
     # The storage term is localized by the same support coefficient used by the
     # selected pressure-coupling mode, and it is zero by default so the legacy
     # incompressible behavior is unchanged.
     storativity_c0: float = 0.0,
     primary_darcy_flux: bool = False,
+    split_pore_flux_model: str = "direct_darcy",
+    split_pore_momentum_model: str = "weighted_divP",
+    fluid_mass_model: str = "transported_free_content",
     gamma_u: float = 0.0,
     u_extension_mode: str = "l2",
     gamma_u_pin: float = 0.0,
@@ -798,6 +919,13 @@ def build_biofilm_one_domain_forms(
     # where α≈0. Disabled when alpha_vS_gate_alpha0 <= 0.
     alpha_vS_gate_alpha0: float = 0.0,
     alpha_vS_gate_power: int = 8,
+    # Optional smooth Heaviside reconstruction used by the Seboldt staggered
+    # branch so alpha acts as a geometry carrier instead of a diffuse
+    # weakening factor in selected support/interface terms.
+    support_indicator_beta: float = 0.0,
+    # Compatibility placeholder for the benchmark-local driver. The legacy
+    # one-domain builder still uses only the beta-smoothed/raw indicator path.
+    support_indicator_mode: str = "raw",
     # How to advect α by the chosen velocity field:
     # - "advective":                  u·∇α   (indicator/level-set style)
     # - "conservative":               div(α u) = u·∇α + α div(u)
@@ -895,7 +1023,8 @@ def build_biofilm_one_domain_forms(
     # Skeleton pressure coupling mode:
     # - "whole_domain" keeps the diffuse one-domain split and uses the same
     #   support coefficient in the reduced pore-storage row and skeleton block
-    # - "seboldt" uses the sharp Biot term -(alpha_biot * alpha * p, div(eta))
+    # - "seboldt" uses the interface-consistent Biot term
+    #   -(alpha_biot * p, div(alpha * eta))
     skeleton_pressure_mode: str = "whole_domain",
     # Optional Biot-Willis coefficient override for the split-pressure pore /
     # skeleton coupling.
@@ -1070,6 +1199,31 @@ def build_biofilm_one_domain_forms(
     use_split_pore_pressure = bool(support_physics_key == "stored_support" and use_B_primary and has_all_pore_pressure_fields)
     use_primary_darcy_flux = bool(primary_darcy_flux)
     use_single_pressure_primary_darcy_flux = bool(use_primary_darcy_flux and not use_split_pore_pressure)
+    split_pore_flux_model_key = _split_pore_flux_model_key(split_pore_flux_model)
+    split_pore_momentum_model_key = _split_pore_momentum_model_key(split_pore_momentum_model)
+    use_split_pore_direct_darcy = bool(use_split_pore_pressure and (not use_primary_darcy_flux) and split_pore_flux_model_key == "direct_darcy")
+    use_split_pore_exact_conservative_p = bool(
+        use_split_pore_pressure and (not use_primary_darcy_flux) and split_pore_flux_model_key == "exact_conservative_p"
+    )
+    use_split_pore_exact_conservative_q = bool(
+        use_split_pore_pressure and bool(use_primary_darcy_flux) and split_pore_flux_model_key == "exact_conservative_p"
+    )
+    use_split_pore_exact_total_continuity = bool(
+        use_split_pore_pressure and (not use_primary_darcy_flux) and split_pore_flux_model_key == "exact_total_continuity"
+    )
+    use_split_pore_exact_total_continuity_q = bool(
+        use_split_pore_pressure and bool(use_primary_darcy_flux) and split_pore_flux_model_key == "exact_total_continuity"
+    )
+    fluid_mass_model_key = str(fluid_mass_model or "transported_free_content").strip().lower().replace("-", "_")
+    if fluid_mass_model_key in {"transported", "transported_content", "free_content", "transported_free_content"}:
+        fluid_mass_model_key = "transported_free_content"
+    elif fluid_mass_model_key in {"fixed_indicator", "rigid_geometry", "fixed_indicator_incompressibility"}:
+        fluid_mass_model_key = "fixed_indicator_incompressibility"
+    else:
+        raise ValueError(
+            f"Unknown fluid_mass_model={fluid_mass_model!r}. Use 'transported_free_content' or "
+            "'fixed_indicator_incompressibility'."
+        )
     if bool(use_split_pore_pressure) and any(val is None for val in (p_pore_k, p_pore_n, dp_pore, q_pore_test)):
         raise ValueError(
             "support_physics='stored_support' requires (p_pore_k, p_pore_n, dp_pore, q_pore_test) "
@@ -1289,6 +1443,20 @@ def build_biofilm_one_domain_forms(
     v_n_comp = _components(v_n, dim=int(dim))
     dv_comp = _components(dv, dim=int(dim))
     v_test_comp = _components(v_test, dim=int(dim))
+
+    support_indicator_beta_val = float(support_indicator_beta)
+    alpha_support_k = _support_indicator(alpha_k, beta=support_indicator_beta_val)
+    alpha_support_n = _support_indicator(alpha_n, beta=support_indicator_beta_val)
+    alpha_support_prime_k = _support_indicator_prime(alpha_k, beta=support_indicator_beta_val)
+    alpha_support_prime_n = _support_indicator_prime(alpha_n, beta=support_indicator_beta_val)
+    alpha_support_second_k = _support_indicator_second(alpha_k, beta=support_indicator_beta_val)
+    d_alpha_support_k = alpha_support_prime_k * dalpha
+    grad_alpha_support_k = alpha_support_prime_k * grad(alpha_k)
+    grad_alpha_support_n = alpha_support_prime_n * grad(alpha_n)
+    dgrad_alpha_support_k = (
+        alpha_support_second_k * dalpha * grad(alpha_k)
+        + alpha_support_prime_k * grad(dalpha)
+    )
 
     # ------------------------------------------------------------------
     # Coefficients (at n/k) and their variations (at k only)
@@ -1545,6 +1713,22 @@ def build_biofilm_one_domain_forms(
                     dkdrag_k[i] += dk_inv_k[i, j] * _vector_component(diff_k, j)
         dkdrag_k = tuple(dkdrag_k)
 
+    split_pore_direct_flux_k = None
+    split_pore_direct_flux_d = None
+    if bool(use_split_pore_direct_darcy) or bool(use_split_pore_exact_conservative_p) or bool(use_split_pore_exact_total_continuity):
+        perm_grad_p_k, dperm_grad_p_k = _apply_perm_from_invperm_components(
+            k_inv_k,
+            grad(p_pore_k),
+            dim=int(dim),
+            dinvperm_expr=dk_inv_k,
+            dvec_expr=grad(dp_pore),
+        )
+        split_pore_direct_flux_k = tuple((alpha_support_k / mu_f) * comp for comp in perm_grad_p_k)
+        split_pore_direct_flux_d = tuple(
+            (d_alpha_support_k / mu_f) * perm_grad_p_k[i] + (alpha_support_k / mu_f) * dperm_grad_p_k[i]
+            for i in range(int(dim))
+        )
+
     r_drag_lambda = None
     a_drag_lambda = None
 
@@ -1557,12 +1741,12 @@ def build_biofilm_one_domain_forms(
     # ------------------------------------------------------------------
     # Shared helper quantities for conservative forms (expanded divergence)
     # ------------------------------------------------------------------
-    F_free_k = _one_minus(alpha_k)
-    F_free_n = _one_minus(alpha_n)
-    gradF_free_k = -grad(alpha_k)
-    gradF_free_n = -grad(alpha_n)
-    dF_free_k = -dalpha
-    dgradF_free_k = -grad(dalpha)
+    F_free_k = _one_minus(alpha_support_k)
+    F_free_n = _one_minus(alpha_support_n)
+    gradF_free_k = -grad_alpha_support_k
+    gradF_free_n = -grad_alpha_support_n
+    dF_free_k = -d_alpha_support_k
+    dgradF_free_k = -dgrad_alpha_support_k
     dtimeFfree_k = dF_free_k * inv_dt
     timeFfree_k = (F_free_k - F_free_n) * inv_dt
     divFfree_k = F_free_k * div(v_k) + dot(gradF_free_k, v_k)
@@ -1570,7 +1754,8 @@ def build_biofilm_one_domain_forms(
     d_divFfree_k = dF_free_k * div(v_k) + F_free_k * div(dv) + dot(dgradF_free_k, v_k) + dot(gradF_free_k, dv)
 
     # NS/Darcy liquid momentum coefficients:
-    # only the free-fluid fraction F carries inertia and free-fluid viscosity.
+    # On the production fluid momentum row we treat the free-fluid phase
+    # explicitly, so its inertia/convection carries the free-fluid weight F.
     rho_mom_k = rho_f * F_free_k
     rho_mom_n = rho_f * F_free_n
     drho_mom = rho_f * dF_free_k
@@ -1582,12 +1767,13 @@ def build_biofilm_one_domain_forms(
 
     gradC_k_components = tuple(gradC_k[i] for i in range(int(dim)))
     gradC_n_components = tuple(gradC_n[i] for i in range(int(dim)))
+    timeP_k = (P_k - P_n) * inv_dt
     divBvS_k = B_k * div_vS_k + dot(gradB_k, vS_k)
     divBvS_n = B_n * div_vS_n + dot(gradB_n, vS_n)
     gradB_k_components = tuple(gradB_k[i] for i in range(int(dim)))
     gradB_n_components = tuple(gradB_n[i] for i in range(int(dim)))
-    div_alpha_vS_k = alpha_k * div_vS_k + dot(grad(alpha_k), vS_k)
-    div_alpha_vS_n = alpha_n * div_vS_n + dot(grad(alpha_n), vS_n)
+    div_alpha_vS_k = alpha_support_k * div_vS_k + dot(grad_alpha_support_k, vS_k)
+    div_alpha_vS_n = alpha_support_n * div_vS_n + dot(grad_alpha_support_n, vS_n)
     divCv_k = C_k * div(v_k) + dot(gradC_k, v_k)
     divCv_n = C_n * div(v_n) + dot(gradC_n, v_n)
 
@@ -1596,17 +1782,25 @@ def build_biofilm_one_domain_forms(
     div_diff_k = div(v_k) - div_vS_k
     div_diff_n = div(v_n) - div_vS_n
     div_ddiff = div(dv) - div_dvS
+    divPvS_k = P_k * div_vS_k + dot(gradP_k, vS_k)
     divQ_k = P_k * div_diff_k + dot(gradP_k, diff_k)
     divQ_n = P_n * div_diff_n + dot(gradP_n, diff_n)
 
     # Jacobian helpers for divCv_k and divBvS_k (k-part only)
-    d_div_alpha_vS_k = dalpha * div_vS_k + alpha_k * div_dvS + dot(grad(dalpha), vS_k) + dot(grad(alpha_k), dvS)
+    d_div_alpha_vS_k = (
+        d_alpha_support_k * div_vS_k
+        + alpha_support_k * div_dvS
+        + dot(dgrad_alpha_support_k, vS_k)
+        + dot(grad_alpha_support_k, dvS)
+    )
     d_divCv_k = dC_k * div(v_k) + C_k * div(dv) + dot(dgradC_k, v_k) + dot(gradC_k, dv)
     d_divBvS_k = dB_k * div_vS_k + B_k * div_dvS + dot(dgradB_k, vS_k) + dot(gradB_k, dvS)
+    d_timeP_k = dP_k * inv_dt
+    d_divPvS_k = dP_k * div_vS_k + P_k * div_dvS + dot(dgradP_k, vS_k) + dot(gradP_k, dvS)
     d_divQ_k = dP_k * div_diff_k + P_k * div_ddiff + dot(dgradP_k, diff_k) + dot(gradP_k, ddiff)
 
     # Divergence of the test fluxes and their coefficient variations.
-    div_alpha_vStest_k = alpha_k * div(vS_test) + dot(grad(alpha_k), vS_test)
+    div_alpha_vStest_k = alpha_support_k * div(vS_test) + dot(grad_alpha_support_k, vS_test)
     div_C_vtest_k = C_k * div(v_test) + dot(gradC_k, v_test)
     div_B_vStest_k = B_k * div(vS_test) + dot(gradB_k, vS_test)
     if bool(use_split_pore_pressure) or bool(use_single_pressure_primary_darcy_flux):
@@ -1618,7 +1812,7 @@ def build_biofilm_one_domain_forms(
 
     # Expand dgrad·test component-wise to avoid backend-dependent contraction
     # paths for Grad(trial-scalar) · VectorTest.
-    d_div_alpha_vStest_k = div(vS_test) * dalpha
+    d_div_alpha_vStest_k = div(vS_test) * d_alpha_support_k
     d_div_C_vtest_k = div(v_test) * dC_k
     d_div_B_vStest_k = div(vS_test) * dB_k
     if bool(use_split_pore_pressure) or bool(use_single_pressure_primary_darcy_flux):
@@ -1628,7 +1822,9 @@ def build_biofilm_one_domain_forms(
         d_div_Ffree_vtest_k = None
         d_div_P_vtest_k = None
     if int(dim) == 2:
-        d_div_alpha_vStest_k += grad(dalpha)[0] * vS_test[0] + grad(dalpha)[1] * vS_test[1]
+        d_div_alpha_vStest_k += (
+            dgrad_alpha_support_k[0] * vS_test[0] + dgrad_alpha_support_k[1] * vS_test[1]
+        )
         dgradC_k_components = (
             dgradC_k[0],
             dgradC_k[1],
@@ -1655,7 +1851,7 @@ def build_biofilm_one_domain_forms(
             )
             d_div_P_vtest_k += dgradP_k_components[0] * v_test_comp[0] + dgradP_k_components[1] * v_test_comp[1]
     else:
-        d_div_alpha_vStest_k += dot(grad(dalpha), vS_test)
+        d_div_alpha_vStest_k += dot(dgrad_alpha_support_k, vS_test)
         d_div_C_vtest_k += dot(dgradC_k, v_test)
         d_div_B_vStest_k += dot(dgradB_k, vS_test)
         if bool(use_split_pore_pressure) or bool(use_single_pressure_primary_darcy_flux):
@@ -1665,8 +1861,8 @@ def build_biofilm_one_domain_forms(
         dgradC_k_components = tuple(grad(dC_k)[i] for i in range(int(dim)))
         dgradB_k_components = tuple(grad(dB_k)[i] for i in range(int(dim)))
     if bool(use_primary_darcy_flux) and q_flux_test is not None and _is_hdiv_expr(q_flux_test):
-        div_alpha_qtest_k = alpha_k * div(q_flux_test) + dot(grad(alpha_k), q_flux_test)
-        d_div_alpha_qtest_k = dalpha * div(q_flux_test) + dot(grad(dalpha), q_flux_test)
+        div_alpha_qtest_k = alpha_support_k * div(q_flux_test) + dot(grad_alpha_support_k, q_flux_test)
+        d_div_alpha_qtest_k = d_alpha_support_k * div(q_flux_test) + dot(dgrad_alpha_support_k, q_flux_test)
         div_qtest_k = div(q_flux_test)
     else:
         div_alpha_qtest_k = None
@@ -1728,19 +1924,19 @@ def build_biofilm_one_domain_forms(
     # reduction and therefore always uses the alpha-weighted support factor.
     if bool(use_split_pore_pressure):
         pore_balance_coeff_c = _as_constant(1.0 if alpha_biot is None else alpha_biot)
-        pore_balance_coeff_k = pore_balance_coeff_c * alpha_k
-        pore_balance_coeff_n = pore_balance_coeff_c * alpha_n
-        d_pore_balance_coeff_k = pore_balance_coeff_c * dalpha
+        pore_balance_coeff_k = pore_balance_coeff_c * alpha_support_k
+        pore_balance_coeff_n = pore_balance_coeff_c * alpha_support_n
+        d_pore_balance_coeff_k = pore_balance_coeff_c * d_alpha_support_k
         if skel_press_key == "seboldt":
             pore_biot_coeff_c = _as_constant(1.0 if alpha_biot is None else alpha_biot)
-            pore_biot_coeff_k = pore_biot_coeff_c * alpha_k
-            pore_biot_coeff_n = pore_biot_coeff_c * alpha_n
-            d_pore_biot_coeff_k = pore_biot_coeff_c * dalpha
+            pore_biot_coeff_k = pore_biot_coeff_c * alpha_support_k
+            pore_biot_coeff_n = pore_biot_coeff_c * alpha_support_n
+            d_pore_biot_coeff_k = pore_biot_coeff_c * d_alpha_support_k
         elif alpha_biot is not None:
             pore_biot_coeff_c = _as_constant(alpha_biot)
-            pore_biot_coeff_k = pore_biot_coeff_c * alpha_k
-            pore_biot_coeff_n = pore_biot_coeff_c * alpha_n
-            d_pore_biot_coeff_k = pore_biot_coeff_c * dalpha
+            pore_biot_coeff_k = pore_biot_coeff_c * alpha_support_k
+            pore_biot_coeff_n = pore_biot_coeff_c * alpha_support_n
+            d_pore_biot_coeff_k = pore_biot_coeff_c * d_alpha_support_k
         else:
             pore_biot_coeff_c = None
             pore_biot_coeff_k = B_k
@@ -1800,8 +1996,7 @@ def build_biofilm_one_domain_forms(
     else:
         raise ValueError(f"Unsupported hdiv_tangential_method={hdiv_tangential_method!r}.")
 
-    # Conservative convection: div(ρ v⊗v) = ρ (v·∇)v + v div(ρ v),
-    # with ρ = ρ_f F and F = 1 - alpha the free-fluid fraction.
+    # Conservative convection: div(ρ v⊗v) = ρ (v·∇)v + v div(ρ v).
     div_rhov_k = rho_f * divFfree_k
     div_rhov_n = rho_f * divFfree_n
 
@@ -1843,27 +2038,36 @@ def build_biofilm_one_domain_forms(
         + _c(2.0) * one_m_th * mu_mom_n * inner(_epsilon(v_n), _epsilon(v_test)) * dx
     )
     r_mom += momentum_terms["viscous"]
-    # Pressure term for the mixture constraint div(C v + B vS)=... :
-    # variationally consistent fluid coupling is C grad(p), i.e.
-    #   -(p, div(C w)) = -p (C div(w) + grad(C)·w).
-    #
-    # The p * grad(C) term is NOT missing from the strong form. It cancels exactly
-    # after integration by parts:
-    #   -∫ p div(C w)
-    # = -∫ p (C div(w) + grad(C)·w)
-    # =  ∫ C grad(p)·w - ∫_{∂Ω} C p w·n.
-    #
-    # So the strong operator is C grad(p), while the weak form must keep the
-    # full div(C w) expansion to remain adjoint-consistent.
+    # Pressure is treated as a weighted stress, not as a multiplier of the
+    # weighted divergence constraint. This keeps the interface band purely
+    # stress-driven:
+    #   -∫ F p_F div(w)  ->  F grad(p_F) + p_F grad(F)
+    # so the free-fluid pressure traction -p_F grad(alpha) is present on the
+    # liquid row rather than being lost from the interface transfer.
     if bool(use_split_pore_pressure):
         if bool(use_primary_darcy_flux):
-            momentum_terms["pressure"] = -(p_k * div_Ffree_vtest_k) * dx
+            momentum_terms["pressure"] = -(F_free_k * p_k * div(v_test)) * dx
         else:
-            momentum_terms["pressure"] = -(p_k * div_Ffree_vtest_k + p_pore_k * div_P_vtest_k) * dx
+            if split_pore_momentum_model_key == "band_alpha":
+                if bool(solid_volumetric_split) and skel_press_key == "seboldt":
+                    # On the production Seboldt split-pressure branch the
+                    # porous pressure traction is carried by the alpha-weighted
+                    # support stress (via the volumetric split), not by an extra
+                    # liquid-row body-force band.
+                    momentum_terms["pressure"] = -(F_free_k * p_k * div(v_test)) * dx
+                else:
+                    momentum_terms["pressure"] = (
+                        -(F_free_k * p_k * div(v_test))
+                        + p_pore_k * dot(grad_alpha_support_k, v_test)
+                    ) * dx
+            else:
+                momentum_terms["pressure"] = -(
+                    (F_free_k * p_k + P_k * p_pore_k) * div(v_test)
+                ) * dx
     elif bool(use_single_pressure_primary_darcy_flux):
-        momentum_terms["pressure"] = -(p_k * div_Ffree_vtest_k) * dx
+        momentum_terms["pressure"] = -(F_free_k * p_k * div(v_test)) * dx
     else:
-        momentum_terms["pressure"] = -p_k * div_C_vtest_k * dx
+        momentum_terms["pressure"] = -(C_k * p_k * div(v_test)) * dx
     r_mom += momentum_terms["pressure"]
     if float(gamma_div) != 0.0 and not bool(use_split_pore_pressure) and not bool(use_single_pressure_primary_darcy_flux):
         gamma_div_c = _as_constant(gamma_div)
@@ -1926,18 +2130,13 @@ def build_biofilm_one_domain_forms(
 
     a_mom = inv_dt * (drho_mom * dot(v_k, v_test) + rho_mom_k * dot(dv, v_test)) * dx
 
-    d_divFfree_k_ap = dF_free_k * div(v_k) + dot(dgradF_free_k, v_k)
-    d_divFfree_k_v = F_free_k * div(dv) + dot(gradF_free_k, dv)
     a_mom += fluid_conv_full_w * th * (
         drho_mom * conv_full_k
         + rho_mom_k * dot(dot(grad(dv), v_k), v_test)
         + rho_mom_k * dot(dot(grad(v_k), dv), v_test)
     ) * dx
-    # Jacobian of the conservative correction v div(ρ v).
-    # Keep trial-family contributions separated to avoid mixed-role metadata
-    # leakage in the assembler (v-trial vs alpha/phi-trial pieces).
-    a_mom += fluid_conv_full_w * th * (rho_f * d_divFfree_k_ap * dot(v_k, v_test)) * dx
-    a_mom += fluid_conv_full_w * th * (rho_f * d_divFfree_k_v * dot(v_k, v_test)) * dx
+    # Jacobian of the conservative correction v div(ρ v) with ρ = ρ_f F.
+    a_mom += fluid_conv_full_w * th * ((rho_f * d_divFfree_k) * dot(v_k, v_test)) * dx
     a_mom += fluid_conv_full_w * th * (div_rhov_k * dot(dv, v_test)) * dx
     a_mom += fluid_conv_lagged_w * th * (rho_mom_n * dot(dot(grad(dv), v_n), v_test)) * dx
     a_mom += fluid_conv_lagged_w * th * (div_rhov_n * dot(dv, v_test)) * dx
@@ -1946,18 +2145,24 @@ def build_biofilm_one_domain_forms(
         + mu_mom_k * inner(_epsilon(dv), _epsilon(v_test))
     ) * dx
 
-    # δ[-p div(C w)] = -(δp) div(C w) - p δ(div(C w)),
-    # with δ(div(C w)) = δC div(w) + δgrad(C)·w for fixed test w.
+    # Jacobian of the weighted pressure-stress terms.
     if bool(use_split_pore_pressure):
         if bool(use_primary_darcy_flux):
-            a_mom += -(dp * div_Ffree_vtest_k + p_k * d_div_Ffree_vtest_k) * dx
+            a_mom += -((F_free_k * dp + p_k * dF_free_k) * div(v_test)) * dx
         else:
-            a_mom += -(dp * div_Ffree_vtest_k + p_k * d_div_Ffree_vtest_k) * dx
-            a_mom += -(dp_pore * div_P_vtest_k + p_pore_k * d_div_P_vtest_k) * dx
+            a_mom += -((F_free_k * dp + p_k * dF_free_k) * div(v_test)) * dx
+            if split_pore_momentum_model_key == "band_alpha":
+                if not (bool(solid_volumetric_split) and skel_press_key == "seboldt"):
+                    a_mom += (
+                        dp_pore * dot(grad_alpha_support_k, v_test)
+                        + p_pore_k * dot(dgrad_alpha_support_k, v_test)
+                    ) * dx
+            else:
+                a_mom += -((P_k * dp_pore + p_pore_k * dP_k) * div(v_test)) * dx
     elif bool(use_single_pressure_primary_darcy_flux):
-        a_mom += -(dp * div_Ffree_vtest_k + p_k * d_div_Ffree_vtest_k) * dx
+        a_mom += -((F_free_k * dp + p_k * dF_free_k) * div(v_test)) * dx
     else:
-        a_mom += -(dp * div_C_vtest_k + p_k * d_div_C_vtest_k) * dx
+        a_mom += -((C_k * dp + p_k * dC) * div(v_test)) * dx
     if float(gamma_div) != 0.0 and not bool(use_split_pore_pressure) and not bool(use_single_pressure_primary_darcy_flux):
         gamma_div_c = _as_constant(gamma_div)
         d_divF_k = d_divCv_k + d_divBvS_k
@@ -2162,19 +2367,29 @@ def build_biofilm_one_domain_forms(
                     comp_k += -strong_visc_k[i]
                     dcomp_k += -d_strong_visc_k[i]
 
-                    # The pressure coupling remains constraint-adjoint:
-                    # - split-pressure branch: F grad(p_F) + P grad(p_P)
-                    # - single-pressure branch: C grad(p)
-                    # The weak form stores these as -(p_F, div(F w)) -(p_P, div(P w))
-                    # or -(p, div(C w)), so the strong residual must use the
-                    # corresponding weighted pressure gradients.
+                    # Keep the residual-based stabilization aligned with the
+                    # actual momentum residual. Free-fluid pressure now enters
+                    # through the weighted stress grad(F p_F). The split
+                    # p-only variants then either add the explicit porous
+                    # traction band (+p_P grad(alpha)) or the weighted porous
+                    # stress grad(P p_P).
                     if bool(use_split_pore_pressure):
-                        comp_k += F_free_k * grad(p_k)[i] + P_k * grad(p_pore_k)[i]
+                        comp_k += F_free_k * grad(p_k)[i] + p_k * gradF_free_k[i]
                         dcomp_k += dF_free_k * grad(p_k)[i] + F_free_k * grad(dp)[i]
-                        dcomp_k += dP_k * grad(p_pore_k)[i] + P_k * grad(dp_pore)[i]
+                        dcomp_k += dp * gradF_free_k[i] + p_k * dgradF_free_k[i]
+                        if split_pore_momentum_model_key == "band_alpha":
+                            if not (bool(solid_volumetric_split) and skel_press_key == "seboldt"):
+                                comp_k += p_pore_k * grad_alpha_support_k[i]
+                                dcomp_k += dp_pore * grad_alpha_support_k[i]
+                                dcomp_k += p_pore_k * dgrad_alpha_support_k[i]
+                        else:
+                            comp_k += P_k * grad(p_pore_k)[i] + p_pore_k * gradP_k[i]
+                            dcomp_k += dP_k * grad(p_pore_k)[i] + P_k * grad(dp_pore)[i]
+                            dcomp_k += dp_pore * gradP_k[i] + p_pore_k * dgradP_k[i]
                     else:
-                        comp_k += C_k * grad(p_k)[i]
+                        comp_k += C_k * grad(p_k)[i] + p_k * gradC_k_components[i]
                         dcomp_k += dC * grad(p_k)[i] + C_k * grad(dp)[i]
+                        dcomp_k += dp * gradC_k_components[i] + p_k * dgradC_k[i]
 
                     if drag_form_key == "mixed_lm":
                         # Keep the residual-based SUPG strong form consistent with the
@@ -2250,21 +2465,78 @@ def build_biofilm_one_domain_forms(
     #     div(F_k) = α_k s_v(k),
     # consistent with taking the pressure coupling terms at the k-level.
     storativity_c0_c = _c(float(storativity_c0))
+    r_total_mass = None
+    a_total_mass = None
     if bool(use_split_pore_pressure):
-        # Exact free-fluid content balance for F = 1 - alpha:
-        #   ∂_t F + div(F v) = 0.
-        #
-        # When alpha follows the support kinematics, this is equivalent to the
-        # diffuse constituent identity
-        #   div((1-alpha) v) - (v - vS) · grad(alpha) = 0.
-        r_mass = q_test * (timeFfree_k + divFfree_k) * dx
-        a_mass = q_test * (dtimeFfree_k + d_divFfree_k) * dx
+        if fluid_mass_model_key == "fixed_indicator_incompressibility":
+            # Prescribed-geometry rigid-interface limit:
+            # the free-fluid pressure enforces incompressibility only in the
+            # free-fluid fraction F, while the interface transfer is handled by
+            # the separate total/pore continuity law rather than by advecting F.
+            r_mass = q_test * (F_free_k * div(v_k)) * dx
+            a_mass = q_test * (dF_free_k * div(v_k) + F_free_k * div(dv)) * dx
+        else:
+            # Exact free-fluid content balance for F = 1 - alpha:
+            #   ∂_t F + div(F v) = 0.
+            #
+            # When alpha follows the support kinematics, this is equivalent to the
+            # diffuse constituent identity
+            #   div((1-alpha) v) - (v - vS) · grad(alpha) = 0.
+            r_mass = q_test * (timeFfree_k + divFfree_k) * dx
+            a_mass = q_test * (dtimeFfree_k + d_divFfree_k) * dx
         pore_storage_coeff_k = pore_balance_coeff_k
         d_pore_storage_coeff_k = d_pore_balance_coeff_k
         if bool(use_primary_darcy_flux):
             div_q_flux_k = div(q_flux_k)
             div_dq_flux = div(dq_flux)
-            r_pore = q_pore_test * (pore_storage_coeff_k * div_vS_k + div_q_flux_k) * dx
+            if bool(use_split_pore_exact_conservative_q):
+                # Exact pore-content balance on the q-primary split branch:
+                #   d_t P + div(P vS + q) + beta c0 D_s p_P = alpha s_v.
+                #
+                # This is the mixed-flux counterpart of the non-q
+                # exact_conservative_p branch. It keeps q as the primary Darcy
+                # flux while retaining the conservative pore-content transport.
+                r_pore = q_pore_test * (timeP_k + divPvS_k + div_q_flux_k - alpha_support_k * s_v) * dx
+            elif bool(use_split_pore_exact_total_continuity_q):
+                # Exact total fluid-volume continuity on the q-primary split
+                # branch:
+                #   div(F v + alpha vS + q) + beta c0 D_s p_P = alpha s_v.
+                #
+                # This is the mixed-flux analogue of the non-q
+                # exact_total_continuity branch and exposes the diffuse
+                # interface mass-transfer contribution through div(F v).
+                r_pore = q_pore_test * (divFfree_k + div_alpha_vS_k + div_q_flux_k - alpha_support_k * s_v) * dx
+            else:
+                r_pore = q_pore_test * (pore_storage_coeff_k * div_vS_k + div_q_flux_k) * dx
+        elif bool(use_split_pore_exact_conservative_p):
+            # Exact pore-content balance on the non-q split branch:
+            #   d_t P + div(P vS - alpha K/mu grad(p_P)) + beta c0 D_s p_P = alpha s_v,
+            # with P = alpha - B.
+            r_pore = (
+                q_pore_test * (timeP_k + divPvS_k - alpha_support_k * s_v)
+                + _dot_components(split_pore_direct_flux_k, grad(q_pore_test), dim=int(dim))
+            ) * dx
+        elif bool(use_split_pore_exact_total_continuity):
+            # Exact total fluid-volume continuity on the non-q split branch:
+            #   div(F v + alpha vS - alpha K/mu grad(p_P)) + beta c0 D_s p_P = alpha s_v.
+            #
+            # Expanding div(F v + alpha vS) exposes the diffuse interface mass
+            # transfer term (vS - v) · grad(alpha) directly in the bulk law.
+            r_pore = (
+                q_pore_test * (divFfree_k + div_alpha_vS_k - alpha_support_k * s_v)
+                + _dot_components(split_pore_direct_flux_k, grad(q_pore_test), dim=int(dim))
+            ) * dx
+        elif bool(use_split_pore_direct_darcy):
+            # Direct split-pressure pore closure with q eliminated by Darcy's law:
+            #   beta * div(vS) - div(alpha K/mu grad(p_P)) + beta c0 D_s p_P = alpha s_v.
+            #
+            # This keeps p_P as the primary porous unknown while localizing the
+            # Darcy diffusion inside the same diffuse support field alpha that
+            # defines the monolithic interface band.
+            r_pore = (
+                q_pore_test * (pore_storage_coeff_k * div_vS_k - alpha_support_k * s_v)
+                + _dot_components(split_pore_direct_flux_k, grad(q_pore_test), dim=int(dim))
+            ) * dx
         else:
             # Reduced Biot-type pore-pressure row obtained after eliminating the
             # pore content P through the conservative B-balance:
@@ -2275,25 +2547,72 @@ def build_biofilm_one_domain_forms(
             # This continuity coefficient follows the exact constituent-balance
             # reduction and therefore remains alpha-weighted even when the skeleton
             # momentum keeps the diffuse whole-domain pressure-loading surrogate.
-            r_pore = q_pore_test * (pore_storage_coeff_k * div_vS_k + divQ_k - alpha_k * s_v) * dx
+            r_pore = q_pore_test * (pore_storage_coeff_k * div_vS_k + divQ_k - alpha_support_k * s_v) * dx
         if float(storativity_c0) != 0.0:
             # After eliminating the pore-content rate, the storage term follows
             # the skeleton material derivative D_s p_P = ∂_t p_P + vS · ∇p_P.
             p_pore_mat_rate_k = ((p_pore_k - p_pore_n) * inv_dt) + dot(vS_k, grad(p_pore_k))
             r_pore += q_pore_test * (pore_storage_coeff_k * storativity_c0_c * p_pore_mat_rate_k) * dx
         if bool(use_primary_darcy_flux):
-            a_pore = q_pore_test * (
-                d_pore_storage_coeff_k * div_vS_k
-                + pore_storage_coeff_k * div_dvS
-                + div_dq_flux
+            if bool(use_split_pore_exact_conservative_q):
+                a_pore = q_pore_test * (
+                    d_timeP_k
+                    + d_divPvS_k
+                    + div_dq_flux
+                    - d_alpha_support_k * s_v
+                    - alpha_support_k * ds_v
+                ) * dx
+            elif bool(use_split_pore_exact_total_continuity_q):
+                a_pore = q_pore_test * (
+                    d_divFfree_k
+                    + d_div_alpha_vS_k
+                    + div_dq_flux
+                    - d_alpha_support_k * s_v
+                    - alpha_support_k * ds_v
+                ) * dx
+            else:
+                a_pore = q_pore_test * (
+                    d_pore_storage_coeff_k * div_vS_k
+                    + pore_storage_coeff_k * div_dvS
+                    + div_dq_flux
+                ) * dx
+        elif bool(use_split_pore_exact_conservative_p):
+            a_pore = (
+                q_pore_test * (
+                    d_timeP_k
+                    + d_divPvS_k
+                    - d_alpha_support_k * s_v
+                    - alpha_support_k * ds_v
+                )
+                + _dot_components(split_pore_direct_flux_d, grad(q_pore_test), dim=int(dim))
+            ) * dx
+        elif bool(use_split_pore_exact_total_continuity):
+            a_pore = (
+                q_pore_test * (
+                    d_divFfree_k
+                    + d_div_alpha_vS_k
+                    - d_alpha_support_k * s_v
+                    - alpha_support_k * ds_v
+                )
+                + _dot_components(split_pore_direct_flux_d, grad(q_pore_test), dim=int(dim))
+            ) * dx
+        elif bool(use_split_pore_direct_darcy):
+            a_pore = (
+                q_pore_test * (
+                    d_pore_storage_coeff_k * div_vS_k
+                    + pore_storage_coeff_k * div_dvS
+                    - d_alpha_support_k * s_v
+                    - alpha_support_k * ds_v
+                )
+                + _dot_components(split_pore_direct_flux_d, grad(q_pore_test), dim=int(dim))
             ) * dx
         else:
             a_pore = q_pore_test * (
                 d_pore_storage_coeff_k * div_vS_k
                 + pore_storage_coeff_k * div_dvS
                 + d_divQ_k
-                - dalpha * s_v
-                - alpha_k * ds_v
+                - d_alpha_support_k * s_v
+                - alpha_support_k * ds_v
             ) * dx
         if float(storativity_c0) != 0.0:
             d_p_pore_mat_rate_k = (dp_pore * inv_dt) + dot(dvS, grad(p_pore_k)) + dot(vS_k, grad(dp_pore))
@@ -2303,6 +2622,19 @@ def build_biofilm_one_domain_forms(
                     d_pore_storage_coeff_k * p_pore_mat_rate_k
                     + pore_storage_coeff_k * d_p_pore_mat_rate_k
                 )
+            ) * dx
+        if bool(use_primary_darcy_flux):
+            # Exact total volume identity on the q-primary split branch:
+            #   div(F v + alpha vS + q) = alpha s_v.
+            # With q = P (v-vS) and C = F + P, this is equivalent to
+            #   div(C v + B vS) = alpha s_v.
+            r_total_mass = q_pore_test * (divFfree_k + div_alpha_vS_k + div_q_flux_k - alpha_support_k * s_v) * dx
+            a_total_mass = q_pore_test * (
+                d_divFfree_k
+                + d_div_alpha_vS_k
+                + div_dq_flux
+                - d_alpha_support_k * s_v
+                - alpha_support_k * ds_v
             ) * dx
     else:
         if bool(use_single_pressure_primary_darcy_flux):
@@ -2320,33 +2652,35 @@ def build_biofilm_one_domain_forms(
             #
             # One must therefore NOT write div(C v + B vS + q), because that
             # would count the pore-fluid transport twice.
-            r_mass = q_test * (divFfree_k + div_alpha_vS_k + div_q_flux_k - alpha_k * s_v) * dx
+            r_mass = q_test * (divFfree_k + div_alpha_vS_k + div_q_flux_k - alpha_support_k * s_v) * dx
             a_mass = q_test * (
                 d_divFfree_k
                 + d_div_alpha_vS_k
                 + div_dq_flux
-                - dalpha * s_v
-                - alpha_k * ds_v
+                - d_alpha_support_k * s_v
+                - alpha_support_k * ds_v
             ) * dx
         else:
-            r_mass = q_test * (divF_k - alpha_k * s_v) * dx
+            r_mass = q_test * (divF_k - alpha_support_k * s_v) * dx
             if float(storativity_c0) != 0.0:
                 # Diffuse-support version of the current-frame Biot storage term
                 # alpha * c0 * D_s p, where D_s p = ∂_t p + vS · ∇p.
                 p_mat_rate_k = ((p_k - p_n) * inv_dt) + dot(vS_k, grad(p_k))
-                r_mass += q_test * (alpha_k * storativity_c0_c * p_mat_rate_k) * dx
+                r_mass += q_test * (alpha_support_k * storativity_c0_c * p_mat_rate_k) * dx
 
             # Jacobian of divF_k (k-part only)
             # δC = (φ-1) δα + α δφ
             # δ(α s_v) = (δα) s_v + α (δs_v).
-            a_mass = q_test * (d_divCv_k + d_divBvS_k - dalpha * s_v - alpha_k * ds_v) * dx
+            a_mass = q_test * (d_divCv_k + d_divBvS_k - d_alpha_support_k * s_v - alpha_support_k * ds_v) * dx
             if float(storativity_c0) != 0.0:
                 d_p_mat_rate_k = (dp * inv_dt) + dot(dvS, grad(p_k)) + dot(vS_k, grad(dp))
                 a_mass += q_test * (
-                    storativity_c0_c * (dalpha * p_mat_rate_k + alpha_k * d_p_mat_rate_k)
+                    storativity_c0_c * (d_alpha_support_k * p_mat_rate_k + alpha_support_k * d_p_mat_rate_k)
                 ) * dx
         r_pore = None
         a_pore = None
+        r_total_mass = r_mass if bool(use_single_pressure_primary_darcy_flux) else None
+        a_total_mass = a_mass if bool(use_single_pressure_primary_darcy_flux) else None
 
     # ------------------------------------------------------------------
     # (iii) Skeleton momentum (optional inertia + linear/neo-Hookean stress)
@@ -2562,17 +2896,17 @@ def build_biofilm_one_domain_forms(
     active_dp = dp_pore if bool(use_split_pore_pressure) else dp
     if bool(use_single_pressure_primary_darcy_flux):
         alpha_biot_c = _as_constant(1.0 if alpha_biot is None else alpha_biot)
-        press_coeff_k = alpha_biot_c * alpha_k
-        press_coeff_n = alpha_biot_c * alpha_n
-        d_press_coeff_k = alpha_biot_c * dalpha
+        press_coeff_k = alpha_biot_c * alpha_support_k
+        press_coeff_n = alpha_biot_c * alpha_support_n
+        d_press_coeff_k = alpha_biot_c * d_alpha_support_k
         press_div_coeff_k = press_coeff_k
         press_div_coeff_n = press_coeff_n
         d_press_div_coeff_k = d_press_coeff_k
         active_p_k = p_k
         active_p_n = p_n
         active_dp = dp
-        r_skel_press_k = -(active_p_k * div_alpha_vStest_k)
-        r_skel_press_n = -(active_p_n * (alpha_n * div(vS_test) + dot(grad(alpha_n), vS_test)))
+        r_skel_press_k = -(alpha_biot_c * active_p_k * div_alpha_vStest_k)
+        r_skel_press_n = -(alpha_biot_c * active_p_n * (alpha_support_n * div(vS_test) + dot(grad_alpha_support_n, vS_test)))
         biot_corr_coeff_k = None
     elif skel_press_key == "seboldt":
         if bool(use_split_pore_pressure):
@@ -2582,14 +2916,14 @@ def build_biofilm_one_domain_forms(
             d_press_coeff_k = d_pore_biot_coeff_k
         else:
             alpha_biot_c = _as_constant(1.0 if alpha_biot is None else alpha_biot)
-            press_coeff_k = alpha_biot_c * alpha_k
-            press_coeff_n = alpha_biot_c * alpha_n
-            d_press_coeff_k = alpha_biot_c * dalpha
+            press_coeff_k = alpha_biot_c * alpha_support_k
+            press_coeff_n = alpha_biot_c * alpha_support_n
+            d_press_coeff_k = alpha_biot_c * d_alpha_support_k
         press_div_coeff_k = press_coeff_k
         press_div_coeff_n = press_coeff_n
         d_press_div_coeff_k = d_press_coeff_k
-        r_skel_press_k = -(active_p_k * press_coeff_k * div(vS_test))
-        r_skel_press_n = -(active_p_n * press_coeff_n * div(vS_test))
+        r_skel_press_k = -(alpha_biot_c * active_p_k * div_alpha_vStest_k)
+        r_skel_press_n = -(alpha_biot_c * active_p_n * (alpha_support_n * div(vS_test) + dot(grad_alpha_support_n, vS_test)))
         biot_corr_coeff_k = None
     else:
         r_skel_press_k = -active_p_k * div_B_vStest_k
@@ -2605,12 +2939,12 @@ def build_biofilm_one_domain_forms(
                 d_press_div_coeff_k = d_pore_biot_coeff_k
             else:
                 alpha_biot_c = _as_constant(alpha_biot)
-                biot_corr_coeff_k = alpha_biot_c * alpha_k - B_k
-                biot_corr_coeff_n = alpha_biot_c * alpha_n - B_n
-                d_press_coeff_k = alpha_biot_c * dalpha - dB_k
-                press_div_coeff_k = alpha_biot_c * alpha_k
-                press_div_coeff_n = alpha_biot_c * alpha_n
-                d_press_div_coeff_k = alpha_biot_c * dalpha
+                biot_corr_coeff_k = alpha_biot_c * alpha_support_k - B_k
+                biot_corr_coeff_n = alpha_biot_c * alpha_support_n - B_n
+                d_press_coeff_k = alpha_biot_c * d_alpha_support_k - dB_k
+                press_div_coeff_k = alpha_biot_c * alpha_support_k
+                press_div_coeff_n = alpha_biot_c * alpha_support_n
+                d_press_div_coeff_k = alpha_biot_c * d_alpha_support_k
             r_skel_press_k += -(active_p_k * biot_corr_coeff_k * div(vS_test))
             r_skel_press_n += -(active_p_n * biot_corr_coeff_n * div(vS_test))
         else:
@@ -2629,58 +2963,58 @@ def build_biofilm_one_domain_forms(
         solid_model_key in {"linear", "small_strain", "linear_elastic"} or _is_seboldt_neo_hookean_model(solid_model_key)
     ):
         vol_pen_c = _as_constant(float(solid_volumetric_penalty))
+        split_seboldt_direct_pore_stress = bool(use_split_pore_pressure) and skel_press_key == "seboldt"
         if _is_seboldt_neo_hookean_model(solid_model_key):
-            vol_drive_k = (
-                pi_s_k
-                - total_pressure_ref_inv_c * mean_dr_k
-                + total_pressure_ref_inv_c * press_div_coeff_k * active_p_k
-            )
-            d_vol_drive_k = (
-                dpi_s
-                - total_pressure_ref_inv_c * dmean_dr_k
-                + total_pressure_ref_inv_c * (d_press_div_coeff_k * active_p_k + press_div_coeff_k * active_dp)
-            )
+            vol_drive_k = pi_s_k - total_pressure_ref_inv_c * mean_dr_k
+            d_vol_drive_k = dpi_s - total_pressure_ref_inv_c * dmean_dr_k
+            if not split_seboldt_direct_pore_stress:
+                vol_drive_k += total_pressure_ref_inv_c * press_div_coeff_k * active_p_k
+                d_vol_drive_k += total_pressure_ref_inv_c * (d_press_div_coeff_k * active_p_k + press_div_coeff_k * active_dp)
         else:
-            vol_drive_k = (
-                pi_s_k
-                - drained_bulk_over_total_pressure_ref_c * div(u_k)
-                + total_pressure_ref_inv_c * press_div_coeff_k * active_p_k
-            )
-            d_vol_drive_k = (
-                dpi_s
-                - drained_bulk_over_total_pressure_ref_c * div(du)
-                + total_pressure_ref_inv_c * (d_press_div_coeff_k * active_p_k + press_div_coeff_k * active_dp)
-            )
+            vol_drive_k = pi_s_k - drained_bulk_over_total_pressure_ref_c * div(u_k)
+            d_vol_drive_k = dpi_s - drained_bulk_over_total_pressure_ref_c * div(du)
+            if not split_seboldt_direct_pore_stress:
+                vol_drive_k += total_pressure_ref_inv_c * press_div_coeff_k * active_p_k
+                d_vol_drive_k += total_pressure_ref_inv_c * (d_press_div_coeff_k * active_p_k + press_div_coeff_k * active_dp)
         r_volumetric = (
-            alpha_k * pi_s_test * vol_drive_k
-            + vol_pen_c * _one_minus(alpha_k) * pi_s_k * pi_s_test
+            alpha_support_k * pi_s_test * vol_drive_k
+            + vol_pen_c * _one_minus(alpha_support_k) * pi_s_k * pi_s_test
         ) * dx
         a_volumetric = (
-            alpha_k * pi_s_test * d_vol_drive_k
-            + dalpha * pi_s_test * vol_drive_k
-            + vol_pen_c * ((-dalpha) * pi_s_k * pi_s_test + _one_minus(alpha_k) * dpi_s * pi_s_test)
+            alpha_support_k * pi_s_test * d_vol_drive_k
+            + d_alpha_support_k * pi_s_test * vol_drive_k
+            + vol_pen_c * ((-d_alpha_support_k) * pi_s_k * pi_s_test + _one_minus(alpha_support_k) * dpi_s * pi_s_test)
         ) * dx
         if float(pressure_block_lift_scale) != 0.0:
             # Add the same constitutive relation to the mass row so the mixed
             # pressure block sees the volumetric variable instead of leaving
             # pi_s isolated in an auxiliary row.
             r_mass += pressure_block_lift_scale_c * (
-                alpha_k * q_test * vol_drive_k
-                + vol_pen_c * _one_minus(alpha_k) * pi_s_k * q_test
+                alpha_support_k * q_test * vol_drive_k
+                + vol_pen_c * _one_minus(alpha_support_k) * pi_s_k * q_test
             ) * dx
             a_mass += pressure_block_lift_scale_c * (
-                alpha_k * q_test * d_vol_drive_k
-                + dalpha * q_test * vol_drive_k
-                + vol_pen_c * ((-dalpha) * pi_s_k * q_test + _one_minus(alpha_k) * dpi_s * q_test)
+                alpha_support_k * q_test * d_vol_drive_k
+                + d_alpha_support_k * q_test * vol_drive_k
+                + vol_pen_c * ((-d_alpha_support_k) * pi_s_k * q_test + _one_minus(alpha_support_k) * dpi_s * q_test)
             ) * dx
         if bool(use_single_pressure_primary_darcy_flux):
-            r_skel_press_k = -(active_p_k * dot(grad(alpha_k), vS_test))
-            r_skel_press_n = -(active_p_n * dot(grad(alpha_n), vS_test))
+            r_skel_press_k = -(active_p_k * dot(grad_alpha_support_k, vS_test))
+            r_skel_press_n = -(active_p_n * dot(grad_alpha_support_n, vS_test))
         elif skel_press_key == "seboldt":
-            # Keep a test-function factor so the python backend does not see a
-            # pure-functional `0 * dx` residual block.
-            r_skel_press_k = _c(0.0) * dot(vS_k, vS_test)
-            r_skel_press_n = _c(0.0) * dot(vS_n, vS_test)
+            # On the split-pressure Seboldt branch, the pore pressure belongs
+            # directly in the porous momentum/stress. Keeping it only inside
+            # the volumetric constitutive relation leaves the pore traction dead
+            # and removes the corresponding grad(alpha) transfer from the
+            # alpha-weighted porous stress.
+            if split_seboldt_direct_pore_stress:
+                r_skel_press_k = -(alpha_biot_c * active_p_k * div_alpha_vStest_k)
+                r_skel_press_n = -(alpha_biot_c * active_p_n * (alpha_support_n * div(vS_test) + dot(grad_alpha_support_n, vS_test)))
+            else:
+                # Keep a test-function factor so the python backend does not see a
+                # pure-functional `0 * dx` residual block.
+                r_skel_press_k = _c(0.0) * dot(vS_k, vS_test)
+                r_skel_press_n = _c(0.0) * dot(vS_n, vS_test)
         else:
             r_skel_press_k = -(active_p_k * dot(gradB_k, vS_test))
             r_skel_press_n = -(active_p_n * dot(gradB_n, vS_test))
@@ -2689,6 +3023,19 @@ def build_biofilm_one_domain_forms(
         # Consistent augmented-Lagrangian stabilization for the mixture constraint
         # div(F)=0 with F=C v + B vS. The vS variation contributes div(B η).
         r_skel_press_k += gamma_div_c * divF_k * div_B_vStest_k
+
+    r_skel_fluid_interface_traction_k = _c(0.0) * dot(vS_k, vS_test)
+    a_skel_fluid_interface_traction = _c(0.0) * dot(dvS, vS_test) * dx
+    if bool(use_split_pore_pressure) and (not bool(use_primary_darcy_flux)) and split_pore_momentum_model_key == "band_alpha":
+        # The production Seboldt split-pressure branch still needs the explicit
+        # free-fluid traction transfer onto the support row; without it the
+        # mechanics collapses to the dead rigid state. The porous-pressure band,
+        # however, stays inside the alpha-weighted support stress / volumetric
+        # split and is not added again on the liquid row above.
+        r_skel_fluid_interface_traction_k = p_k * dot(grad_alpha_support_k, vS_test)
+        a_skel_fluid_interface_traction = (
+            dp * dot(grad_alpha_support_k, vS_test) + p_k * dot(dgrad_alpha_support_k, vS_test)
+        ) * dx
 
     # drag reaction: -β (v - vS)
     # Since beta already contains α, if we use alpha again then it would square and it won't 
@@ -2717,19 +3064,21 @@ def build_biofilm_one_domain_forms(
     sk_one_m_th = one_m_th if bool(include_skeleton_acceleration) else _c(0.0)
 
     skeleton_terms: dict[str, object] = {}
-    skeleton_terms["elastic_k"] = sk_th * alpha_k * (g_stiff_k * r_el_plus_k + r_el_minus_k) * dx
-    skeleton_terms["elastic_n"] = sk_one_m_th * alpha_n * (g_stiff_n * r_el_plus_n + r_el_minus_n) * dx
+    skeleton_terms["elastic_k"] = sk_th * alpha_support_k * (g_stiff_k * r_el_plus_k + r_el_minus_k) * dx
+    skeleton_terms["elastic_n"] = sk_one_m_th * alpha_support_n * (g_stiff_n * r_el_plus_n + r_el_minus_n) * dx
     skeleton_terms["pressure"] = (sk_th * r_skel_press_k + sk_one_m_th * r_skel_press_n) * dx
     skeleton_terms["drag"] = (sk_th * r_skel_drag_k + sk_one_m_th * r_skel_drag_n) * dx
+    skeleton_terms["fluid_interface_traction"] = sk_th * r_skel_fluid_interface_traction_k * dx
     r_skeleton = (
         skeleton_terms["elastic_k"]
         + skeleton_terms["elastic_n"]
         + skeleton_terms["pressure"]
         + skeleton_terms["drag"]
+        + skeleton_terms["fluid_interface_traction"]
     )
     r_skeleton_pressure = skeleton_terms["pressure"]
     # External body force is weighted by biofilm presence α, but not degraded by g_stiff(d).
-    skeleton_terms["body"] = -dot(alpha_k * f_u, vS_test) * dx
+    skeleton_terms["body"] = -dot(alpha_support_k * f_u, vS_test) * dx
     r_skeleton += skeleton_terms["body"]
     if dGamma is not None:
         skeleton_terms["traction_boundary"] = (
@@ -2788,7 +3137,7 @@ def build_biofilm_one_domain_forms(
         r_visc_n = inner(sig_visc_n, grad(vS_test))
         # Treat viscosity as part of the skeleton response: localize by α and apply the same stiffness
         # degradation g_stiff(d) used for elasticity.
-        skeleton_terms["viscosity"] = (th * alpha_k * g_stiff_k * r_visc_k + one_m_th * alpha_n * g_stiff_n * r_visc_n) * dx
+        skeleton_terms["viscosity"] = (th * alpha_support_k * g_stiff_k * r_visc_k + one_m_th * alpha_support_n * g_stiff_n * r_visc_n) * dx
         r_skeleton += skeleton_terms["viscosity"]
 
         # Consistent k-part Jacobian: δ[α g σ_visc(vS)] = δ(α g) r_visc + α g a_visc.
@@ -2799,30 +3148,30 @@ def build_biofilm_one_domain_forms(
         sig_dvisc = _c(2.0) * eta_s_c * _epsilon(dvS)
         a_visc = inner(sig_dvisc, grad(vS_test))
         if use_damage:
-            w_ag = dalpha * g_stiff_k + alpha_k * dg_stiff_k
+            w_ag = d_alpha_support_k * g_stiff_k + alpha_support_k * dg_stiff_k
         else:
             # Avoid mixing trial and function roles in the symbolic pipeline:
             # when damage is disabled, dg_stiff_k is exactly 0 but still carries
             # "function" metadata, and (trial + 0*function) can break assembly.
-            w_ag = dalpha * g_stiff_k
+            w_ag = d_alpha_support_k * g_stiff_k
         a_skel_visco_alpha = sk_th * (r_visc_k * w_ag) * dx
-        a_skel_visco_vS = sk_th * (alpha_k * g_stiff_k * a_visc) * dx
+        a_skel_visco_vS = sk_th * (alpha_support_k * g_stiff_k * a_visc) * dx
 
     # Optional extension penalty for vS in the free-fluid region.
     if float(gamma_vS_eff) != 0.0:
         if vS_ext_mode in {"l2", "mass"}:
             h_u = MeshSize()
             inv_h2 = _c(1.0) / (h_u * h_u)
-            skeleton_terms["extension"] = reg_weight_k * gamma_vS_c * inv_h2 * _one_minus(alpha_k) * dot(vS_k, vS_test) * dx
+            skeleton_terms["extension"] = reg_weight_k * gamma_vS_c * inv_h2 * _one_minus(alpha_support_k) * dot(vS_k, vS_test) * dx
             r_skeleton += skeleton_terms["extension"]
         elif vS_ext_mode in {"grad", "h1"}:
             # Gradient penalty does not fight rigid translations (∇vS≈0).
-            skeleton_terms["extension"] = reg_weight_k * gamma_vS_c * _one_minus(alpha_k) * inner(grad(vS_k), grad(vS_test)) * dx
+            skeleton_terms["extension"] = reg_weight_k * gamma_vS_c * _one_minus(alpha_support_k) * inner(grad(vS_k), grad(vS_test)) * dx
             r_skeleton += skeleton_terms["extension"]
             if float(gamma_vS_pin_eff) != 0.0:
                 h_u = MeshSize()
                 inv_h2 = _c(1.0) / (h_u * h_u)
-                w_pin = _one_minus(alpha_k)
+                w_pin = _one_minus(alpha_support_k)
                 w_pin_pow = w_pin
                 for _ in range(vS_pin_pow - 1):
                     w_pin_pow = w_pin_pow * w_pin
@@ -2864,10 +3213,10 @@ def build_biofilm_one_domain_forms(
         elastic_jac_k += dg_stiff_k * r_el_plus_k
 
     elastic_alpha_drive_k = (g_stiff_k * r_el_plus_k + r_el_minus_k)
-    skeleton_jac_terms["elastic"] = sk_th * (alpha_k * elastic_jac_k + elastic_alpha_drive_k * dalpha) * dx
+    skeleton_jac_terms["elastic"] = sk_th * (alpha_support_k * elastic_jac_k + elastic_alpha_drive_k * d_alpha_support_k) * dx
     if skeleton_elastic_jac_split_terms:
         for key, term in tuple(skeleton_elastic_jac_split_terms.items()):
-            skeleton_jac_terms[f"elastic_{key}"] = sk_th * alpha_k * term * dx
+            skeleton_jac_terms[f"elastic_{key}"] = sk_th * alpha_support_k * term * dx
     a_skel = skeleton_jac_terms["elastic"]
     if a_skel_visco_alpha is not None:
         skeleton_jac_terms["viscosity_alpha"] = a_skel_visco_alpha
@@ -2881,18 +3230,27 @@ def build_biofilm_one_domain_forms(
     ):
         if bool(use_single_pressure_primary_darcy_flux):
             a_skel_pressure = sk_th * (
-                -(active_dp * dot(grad(alpha_k), vS_test) + active_p_k * dot(grad(dalpha), vS_test))
+                -(active_dp * dot(grad_alpha_support_k, vS_test) + active_p_k * dot(dgrad_alpha_support_k, vS_test))
             ) * dx
         elif skel_press_key == "seboldt":
-            # Preserve both trial and test roles for the identically-zero
-            # split-Seboldt remainder so the python backend can assemble it.
-            a_skel_pressure = _c(0.0) * dot(dvS, vS_test) * dx
+            if bool(use_split_pore_pressure):
+                a_skel_pressure = sk_th * (
+                    -(alpha_biot_c * (active_dp * div_alpha_vStest_k + active_p_k * d_div_alpha_vStest_k))
+                ) * dx
+            else:
+                # Preserve both trial and test roles for the identically-zero
+                # split-Seboldt remainder so the python backend can assemble it.
+                a_skel_pressure = _c(0.0) * dot(dvS, vS_test) * dx
         else:
             a_skel_pressure = sk_th * (-(active_dp * dot(gradB_k, vS_test) + active_p_k * dot(dgradB_k, vS_test))) * dx
     elif bool(use_single_pressure_primary_darcy_flux):
-        a_skel_pressure = sk_th * (-(active_dp * div_alpha_vStest_k + active_p_k * d_div_alpha_vStest_k)) * dx
+        a_skel_pressure = sk_th * (
+            -(alpha_biot_c * (active_dp * div_alpha_vStest_k + active_p_k * d_div_alpha_vStest_k))
+        ) * dx
     elif skel_press_key == "seboldt":
-        a_skel_pressure = sk_th * (-(active_dp * press_coeff_k + active_p_k * d_press_coeff_k) * div(vS_test)) * dx
+        a_skel_pressure = sk_th * (
+            -(alpha_biot_c * (active_dp * div_alpha_vStest_k + active_p_k * d_div_alpha_vStest_k))
+        ) * dx
     else:
         a_skel_pressure = sk_th * (-(active_dp * div_B_vStest_k + active_p_k * d_div_B_vStest_k)) * dx
         if alpha_biot_c is not None:
@@ -2903,10 +3261,12 @@ def build_biofilm_one_domain_forms(
         a_skel_pressure += sk_th * gamma_div_c * (d_divF_k * div_B_vStest_k + divF_k * d_div_B_vStest_k) * dx
     skeleton_jac_terms["pressure"] = a_skel_pressure
     a_skel += a_skel_pressure
+    skeleton_jac_terms["fluid_interface_traction"] = sk_th * a_skel_fluid_interface_traction
+    a_skel += skeleton_jac_terms["fluid_interface_traction"]
     # Drag term is *not* multiplied by alpha again: beta already contains alpha (one-domain blend).
     skeleton_jac_terms["drag"] = sk_th * d_drag_term_k * dx
     a_skel += skeleton_jac_terms["drag"]
-    skeleton_jac_terms["body"] = -(dot(f_u, vS_test) * dalpha) * dx
+    skeleton_jac_terms["body"] = -(dot(f_u, vS_test) * d_alpha_support_k) * dx
     a_skel += skeleton_jac_terms["body"]
     if bool(use_primary_darcy_flux):
         q_darcy_k = tuple(mu_f * comp for comp in _apply_invperm_components(k_inv_k, q_flux_k, dim=int(dim)))
@@ -2915,9 +3275,9 @@ def build_biofilm_one_domain_forms(
             q_darcy_dk = tuple(_c(0.0) * _vector_component(q_flux_k, i) for i in range(int(dim)))
         else:
             q_darcy_dk = tuple(mu_f * comp for comp in _apply_invperm_components(dk_inv_k, q_flux_k, dim=int(dim)))
-        q_extension_k = tuple(_one_minus(alpha_k) * _vector_component(q_flux_k, i) for i in range(int(dim)))
+        q_extension_k = tuple(_one_minus(alpha_support_k) * _vector_component(q_flux_k, i) for i in range(int(dim)))
         q_extension_d = tuple(
-            (-dalpha) * _vector_component(q_flux_k, i) + _one_minus(alpha_k) * _vector_component(dq_flux, i)
+            (-d_alpha_support_k) * _vector_component(q_flux_k, i) + _one_minus(alpha_support_k) * _vector_component(dq_flux, i)
             for i in range(int(dim))
         )
         if bool(use_split_pore_pressure) and div_alpha_qtest_k is not None and d_div_alpha_qtest_k is not None:
@@ -2929,9 +3289,9 @@ def build_biofilm_one_domain_forms(
             # The top Dirichlet pore-pressure condition contributes zero on this
             # benchmark branch (p_P=0 there). The diffuse interface closures may
             # then add the remaining boundary power consistently on z·n.
-            darcy_flux_bulk_k = tuple(alpha_k * q_darcy_k[i] for i in range(int(dim)))
+            darcy_flux_bulk_k = tuple(alpha_support_k * q_darcy_k[i] for i in range(int(dim)))
             darcy_flux_bulk_d = tuple(
-                dalpha * q_darcy_k[i] + alpha_k * (q_darcy_dk[i] + q_darcy_dq[i])
+                d_alpha_support_k * q_darcy_k[i] + alpha_support_k * (q_darcy_dk[i] + q_darcy_dq[i])
                 for i in range(int(dim))
             )
             r_drag_lambda = (
@@ -2945,10 +3305,10 @@ def build_biofilm_one_domain_forms(
                 + _dot_components(q_extension_d, q_flux_test, dim=int(dim))
             ) * dx
         elif bool(use_split_pore_pressure):
-            darcy_bulk_k = tuple(alpha_k * (q_darcy_k[i] + grad(p_pore_k)[i]) for i in range(int(dim)))
+            darcy_bulk_k = tuple(alpha_support_k * (q_darcy_k[i] + grad(p_pore_k)[i]) for i in range(int(dim)))
             darcy_bulk_d = tuple(
-                dalpha * (q_darcy_k[i] + grad(p_pore_k)[i])
-                + alpha_k * (q_darcy_dk[i] + q_darcy_dq[i] + grad(dp_pore)[i])
+                d_alpha_support_k * (q_darcy_k[i] + grad(p_pore_k)[i])
+                + alpha_support_k * (q_darcy_dk[i] + q_darcy_dq[i] + grad(dp_pore)[i])
                 for i in range(int(dim))
             )
             r_drag_lambda = (
@@ -2960,9 +3320,9 @@ def build_biofilm_one_domain_forms(
                 + _dot_components(q_extension_d, q_flux_test, dim=int(dim))
             ) * dx
         elif div_qtest_k is not None:
-            darcy_flux_bulk_k = tuple(alpha_k * q_darcy_k[i] for i in range(int(dim)))
+            darcy_flux_bulk_k = tuple(alpha_support_k * q_darcy_k[i] for i in range(int(dim)))
             darcy_flux_bulk_d = tuple(
-                dalpha * q_darcy_k[i] + alpha_k * (q_darcy_dk[i] + q_darcy_dq[i])
+                d_alpha_support_k * q_darcy_k[i] + alpha_support_k * (q_darcy_dk[i] + q_darcy_dq[i])
                 for i in range(int(dim))
             )
             r_drag_lambda = (
@@ -2976,10 +3336,10 @@ def build_biofilm_one_domain_forms(
                 + _dot_components(q_extension_d, q_flux_test, dim=int(dim))
             ) * dx
         else:
-            darcy_bulk_k = tuple(alpha_k * (q_darcy_k[i] + grad(p_k)[i]) for i in range(int(dim)))
+            darcy_bulk_k = tuple(alpha_support_k * (q_darcy_k[i] + grad(p_k)[i]) for i in range(int(dim)))
             darcy_bulk_d = tuple(
-                dalpha * (q_darcy_k[i] + grad(p_k)[i])
-                + alpha_k * (q_darcy_dk[i] + q_darcy_dq[i] + grad(dp)[i])
+                d_alpha_support_k * (q_darcy_k[i] + grad(p_k)[i])
+                + alpha_support_k * (q_darcy_dk[i] + q_darcy_dq[i] + grad(dp)[i])
                 for i in range(int(dim))
             )
             r_drag_lambda = (
@@ -3049,20 +3409,20 @@ def build_biofilm_one_domain_forms(
             h_u = MeshSize()
             inv_h2 = _c(1.0) / (h_u * h_u)
             skeleton_jac_terms["extension"] = reg_weight_k * gamma_vS_c * inv_h2 * (
-                (-_c(1.0) * dalpha) * dot(vS_k, vS_test) + _one_minus(alpha_k) * dot(dvS, vS_test)
+                (-d_alpha_support_k) * dot(vS_k, vS_test) + _one_minus(alpha_support_k) * dot(dvS, vS_test)
             ) * dx
             a_skel += skeleton_jac_terms["extension"]
         elif vS_ext_mode in {"grad", "h1"}:
             skeleton_jac_terms["extension"] = reg_weight_k * gamma_vS_c * (
-                (-_c(1.0) * dalpha) * inner(grad(vS_k), grad(vS_test))
-                + _one_minus(alpha_k) * inner(grad(dvS), grad(vS_test))
+                (-d_alpha_support_k) * inner(grad(vS_k), grad(vS_test))
+                + _one_minus(alpha_support_k) * inner(grad(dvS), grad(vS_test))
             ) * dx
             a_skel += skeleton_jac_terms["extension"]
 
             if float(gamma_vS_pin_eff) != 0.0:
                 h_u = MeshSize()
                 inv_h2 = _c(1.0) / (h_u * h_u)
-                w_pin = _one_minus(alpha_k)
+                w_pin = _one_minus(alpha_support_k)
                 w_pin_pow = w_pin
                 for _ in range(vS_pin_pow - 1):
                     w_pin_pow = w_pin_pow * w_pin
@@ -3073,7 +3433,7 @@ def build_biofilm_one_domain_forms(
                     w_pin_pow_m1 = w_pin
                     for _ in range(vS_pin_pow - 2):
                         w_pin_pow_m1 = w_pin_pow_m1 * w_pin
-                dw_pin_pow = (-_c(float(vS_pin_pow)) * w_pin_pow_m1) * dalpha
+                dw_pin_pow = (-_c(float(vS_pin_pow)) * w_pin_pow_m1) * d_alpha_support_k
                 skeleton_jac_terms["extension_pin"] = reg_weight_k * gamma_vS_pin_c * inv_h2 * (
                     dw_pin_pow * dot(vS_k, vS_test) + w_pin_pow * dot(dvS, vS_test)
                 ) * dx
@@ -3083,13 +3443,15 @@ def build_biofilm_one_domain_forms(
 
     # Optional Eulerian skeleton inertia.
     #
-    # The continuous term is the conservative form
-    #   ∂t(ρ_S v^S) + div(ρ_S v^S ⊗ v^S),
-    # with ρ_S = rho_s0_tilde * α(1-φ) = rho_s0_tilde * B.
+    # Keep the interface band purely stress-driven here as well. The support
+    # fraction B belongs in the support-content transport law and in the
+    # support-localized stresses, but not in inertial transfer terms: a
+    # B-weighted conservative momentum transport would inject artificial
+    # grad(B)-driven inertia into the diffuse interface band.
     #
-    # For robustness in monolithic solves, the default is a Picard-like lagging
-    # of the convective part:
-    #   div(ρ_S v^S ⊗ v^S) ≈ div(ρ_S^n v^{S,n} ⊗ v^{S,k}).
+    # We therefore use the intrinsic support density rho_s0_tilde in the
+    # acceleration/convection terms, while B still evolves in its own
+    # conservative content equation below.
     use_parametric_skeleton_inertia = any(
         weight is not None
         for weight in (
@@ -3107,8 +3469,8 @@ def build_biofilm_one_domain_forms(
 
         rho_s0_c = rho_s0_tilde
 
-        rhoS_k = rho_s0_c * B_k
-        rhoS_n = rho_s0_c * B_n
+        rhoS_k = rho_s0_c
+        rhoS_n = rho_s0_c
 
         if use_parametric_skeleton_inertia:
             skel_accel_w = _as_scalar_expr(
@@ -3145,12 +3507,12 @@ def build_biofilm_one_domain_forms(
         grad_vS_k = grad(vS_k)
         grad_vS_n = grad(vS_n)
 
-        div_rhoS_vS_n = rho_s0_c * divBvS_n
+        div_rhoS_vS_n = rho_s0_c * div_vS_n
         advS_full_k = dot(grad_vS_k, vS_k)
         advS_full_n = dot(grad_vS_n, vS_n)
         convS_full_k = dot(advS_full_k, vS_test)
         convS_full_n = dot(advS_full_n, vS_test)
-        div_rhoS_vS_k = rho_s0_c * divBvS_k
+        div_rhoS_vS_k = rho_s0_c * div_vS_k
         # Lagged/Picard form: div(ρ^n v^n ⊗ v^k) = ρ^n (v^n·∇)v^k + v^k div(ρ^n v^n).
         advS_lagged_k = dot(grad_vS_k, vS_n)
         convS_lagged_k = dot(advS_lagged_k, vS_test)
@@ -3169,7 +3531,7 @@ def build_biofilm_one_domain_forms(
         r_skeleton += skeleton_terms["inertia_convection_n"]
 
         # Jacobian (k-part only): always include δ[ (ρ_S v^S)/dt ].
-        d_rhoS_k = rho_s0_c * dB_k
+        d_rhoS_k = _c(0.0)
         d_momS_dot_vtest = _c(0.0)
         for i in range(int(dim)):
             d_momS_dot_vtest += (
@@ -3181,7 +3543,7 @@ def build_biofilm_one_domain_forms(
         grad_dvS = grad(dvS)
         d_advS_full_k = dot(grad_dvS, vS_k) + dot(grad_vS_k, dvS)
         d_convS_full_k = dot(d_advS_full_k, vS_test)
-        d_div_rhoS_vS_k = rho_s0_c * d_divBvS_k
+        d_div_rhoS_vS_k = rho_s0_c * div_dvS
         d_advS_lagged_k = dot(grad_dvS, vS_n)
         d_convS_lagged_k = dot(d_advS_lagged_k, vS_test)
         skeleton_jac_terms["inertia_convection_density"] = (
@@ -3240,8 +3602,8 @@ def build_biofilm_one_domain_forms(
         t_adh_n = k_n_c * u_nvec_n + k_t_c * u_tvec_n + g_n_c * vS_nvec_n + g_t_c * vS_tvec_n
 
         skeleton_terms["adhesion"] = (
-            sk_th * alpha_k * a_prev * dot(t_adh_k, vS_test)
-            + sk_one_m_th * alpha_n * a_prev * dot(t_adh_n, vS_test)
+            sk_th * alpha_support_k * a_prev * dot(t_adh_k, vS_test)
+            + sk_one_m_th * alpha_support_n * a_prev * dot(t_adh_n, vS_test)
         ) * ds_adh
         r_skeleton += skeleton_terms["adhesion"]
 
@@ -3253,7 +3615,7 @@ def build_biofilm_one_domain_forms(
         dt_adh = k_n_c * du_nvec + k_t_c * du_tvec + g_n_c * dvS_nvec + g_t_c * dvS_tvec
 
         skeleton_jac_terms["adhesion"] = sk_th * (
-            dalpha * a_prev * dot(t_adh_k, vS_test) + alpha_k * a_prev * dot(dt_adh, vS_test)
+            d_alpha_support_k * a_prev * dot(t_adh_k, vS_test) + alpha_support_k * a_prev * dot(dt_adh, vS_test)
         ) * ds_adh
         a_skel += skeleton_jac_terms["adhesion"]
 
@@ -3264,7 +3626,7 @@ def build_biofilm_one_domain_forms(
         n_int = FacetNormal()
         h_F = avg(MeshSize())
         tau_cip = vS_cip_c * (h_F * h_F * h_F) * inv_dt
-        w_s = avg(alpha_n)
+        w_s = avg(alpha_support_n)
         skeleton_terms["cip"] = tau_cip * reg_weight_cip * w_s * _grad_inner_jump(vS_k, vS_test, n_int) * ds_cip
         r_skeleton += skeleton_terms["cip"]
         skeleton_jac_terms["cip"] = tau_cip * reg_weight_cip * w_s * _grad_inner_jump(dvS, vS_test, n_int) * ds_cip
@@ -3316,7 +3678,7 @@ def build_biofilm_one_domain_forms(
 
     kinematics_zero = kin_scale_c * _c(0.0) * dot(u_k, u_test) * dx
     kinematics_terms: dict[str, object] = {
-        "base": kin_scale_c * alpha_k * dot(Fkin_k, u_test) * dx,
+        "base": kin_scale_c * alpha_support_k * dot(Fkin_k, u_test) * dx,
         "supg": kinematics_zero,
         "extension": kinematics_zero,
         "cip": kinematics_zero,
@@ -3327,7 +3689,7 @@ def build_biofilm_one_domain_forms(
     dFkin_dt = du * inv_dt
     dFkin_adv_k = dot(grad(du), vS_kin_k) + dot(grad(u_k), dvS_kin) - dvS_kin
     dFkin_k = dFkin_dt + th * dFkin_adv_k
-    a_kinematics = kin_scale_c * (dalpha * dot(Fkin_k, u_test) + alpha_k * dot(dFkin_k, u_test)) * dx
+    a_kinematics = kin_scale_c * (d_alpha_support_k * dot(Fkin_k, u_test) + alpha_support_k * dot(dFkin_k, u_test)) * dx
 
     # Optional SUPG-like streamline diffusion for the u-transport (kinematic constraint).
     #
@@ -3340,7 +3702,7 @@ def build_biofilm_one_domain_forms(
         vmag = _sqrt(vmag2 + _c(1.0e-12))
         denom = h_u * vmag + (h_u * h_u) * inv_dt
         tau_u = u_supg_c * (h_u * h_u) / (denom + _c(1.0e-16))
-        w_u = alpha_n  # lagged "solid-only" localization
+        w_u = alpha_support_n  # lagged "solid-only" localization
         adv_u_k = dot(grad(u_k), vS_kin_n)
         adv_xi = dot(grad(u_test), vS_kin_n)
         kinematics_terms["supg"] = kin_scale_c * tau_u * w_u * inner(adv_u_k, adv_xi) * dx
@@ -3353,27 +3715,27 @@ def build_biofilm_one_domain_forms(
         if u_ext_mode in {"l2", "mass"}:
             h_u = MeshSize()
             inv_h2 = _c(1.0) / (h_u * h_u)
-            extension_term = kin_scale_c * reg_weight_k * gamma_u_c * inv_h2 * _one_minus(alpha_k) * dot(u_k, u_test) * dx
+            extension_term = kin_scale_c * reg_weight_k * gamma_u_c * inv_h2 * _one_minus(alpha_support_k) * dot(u_k, u_test) * dx
             kinematics_terms["extension"] = kinematics_terms["extension"] + extension_term
             r_kinematics += extension_term
             a_kinematics += kin_scale_c * reg_weight_k * gamma_u_c * inv_h2 * (
-                (-_c(1.0) * dalpha) * dot(u_k, u_test) + _one_minus(alpha_k) * dot(du, u_test)
+                (-d_alpha_support_k) * dot(u_k, u_test) + _one_minus(alpha_support_k) * dot(du, u_test)
             ) * dx
         elif u_ext_mode in {"grad", "h1"}:
-            extension_term = kin_scale_c * reg_weight_k * gamma_u_c * _one_minus(alpha_k) * inner(grad(u_k), grad(u_test)) * dx
+            extension_term = kin_scale_c * reg_weight_k * gamma_u_c * _one_minus(alpha_support_k) * inner(grad(u_k), grad(u_test)) * dx
             kinematics_terms["extension"] = kinematics_terms["extension"] + extension_term
             r_kinematics += extension_term
             a_kinematics += kin_scale_c * reg_weight_k * gamma_u_c * (
-                (-_c(1.0) * dalpha) * inner(grad(u_k), grad(u_test)) + _one_minus(alpha_k) * inner(grad(du), grad(u_test))
+                (-d_alpha_support_k) * inner(grad(u_k), grad(u_test)) + _one_minus(alpha_support_k) * inner(grad(du), grad(u_test))
             ) * dx
 
             if float(gamma_u_pin) != 0.0:
                 h_u = MeshSize()
                 inv_h2 = _c(1.0) / (h_u * h_u)
                 pin_c = _c(float(gamma_u_pin))
-                w_pin = _one_minus(alpha_k)
+                w_pin = _one_minus(alpha_support_k)
                 w_pin2 = w_pin * w_pin
-                dw_pin2 = (-_c(2.0) * w_pin) * dalpha
+                dw_pin2 = (-_c(2.0) * w_pin) * d_alpha_support_k
                 pin_term = kin_scale_c * reg_weight_k * pin_c * inv_h2 * w_pin2 * dot(u_k, u_test) * dx
                 kinematics_terms["extension"] = kinematics_terms["extension"] + pin_term
                 r_kinematics += pin_term
@@ -4858,6 +5220,7 @@ def build_biofilm_one_domain_forms(
         r_momentum_terms=momentum_terms,
         r_mass=r_mass,
         r_pore=r_pore,
+        r_total_mass=r_total_mass,
         r_kinematics=r_kinematics,
         r_kinematics_terms=kinematics_terms,
         r_skeleton=r_skeleton,
@@ -4871,6 +5234,7 @@ def build_biofilm_one_domain_forms(
         a_momentum=a_mom,
         a_mass=a_mass,
         a_pore=a_pore,
+        a_total_mass=a_total_mass,
         a_kinematics=a_kinematics,
         a_skeleton=a_skel,
         a_skeleton_terms=skeleton_jac_terms,

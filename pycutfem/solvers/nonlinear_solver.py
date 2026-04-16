@@ -33,6 +33,19 @@ from pathlib import Path
 import numpy as np
 import scipy.sparse.linalg as spla
 import scipy.sparse as sp
+from pycutfem.linalg import (
+    BlockDiagonalPreconditioner,
+    BlockLinearSystem,
+    BlockTriangularPreconditioner,
+    FieldBlockLayout,
+    KrylovOptions,
+    ScipyKrylovSolver,
+    SparseSubsolverSpec,
+    UzawaOptions,
+    UzawaPreconditioner,
+    UzawaSolver,
+    build_subsolver,
+)
 try:
     from scipy.sparse.linalg import MatrixRankWarning
 except Exception:
@@ -119,6 +132,26 @@ if _HAVE_NUMBA_REDUCED_PATTERN:
                     out[e, base + j] = _csr_find_pos(indices, s, epos, c)
         return out
 
+    @njit(cache=True)
+    def _scatter_csr_pos_flat_numba(data: np.ndarray, pos_flat: np.ndarray, values_flat: np.ndarray) -> None:
+        n_ent = int(pos_flat.shape[0])
+        n_terms = int(pos_flat.shape[1])
+        for e in range(n_ent):
+            for k in range(n_terms):
+                pos = int(pos_flat[e, k])
+                if pos >= 0:
+                    data[pos] += values_flat[e, k]
+
+    @njit(cache=True)
+    def _scatter_vec_red_map_numba(target: np.ndarray, red_map: np.ndarray, values: np.ndarray) -> None:
+        n_ent = int(red_map.shape[0])
+        n_loc = int(red_map.shape[1])
+        for e in range(n_ent):
+            for i in range(n_loc):
+                row = int(red_map[e, i])
+                if row >= 0:
+                    target[row] += values[e, i]
+
 # ---------------------------------------------------------------------------
 # Numba reduced-pattern precompile (hide first-call JIT latency)
 # ---------------------------------------------------------------------------
@@ -150,6 +183,11 @@ def _start_numba_reduced_pattern_precompile() -> None:
                 indptr = np.zeros((2,), dtype=np.int32)
                 indices = np.zeros((0,), dtype=np.int32)
                 _build_pos_flat_numba(red, indptr, indices)
+                data = np.zeros((1,), dtype=np.float64)
+                pos_flat = np.zeros((1, 1), dtype=np.int32)
+                vals = np.zeros((1, 1), dtype=np.float64)
+                _scatter_csr_pos_flat_numba(data, pos_flat, vals)
+                _scatter_vec_red_map_numba(data, red, vals)
             except Exception as exc:  # pragma: no cover - best effort
                 _NUMBA_REDUCED_PATTERN_PRECOMPILE_ERROR = exc
             finally:
@@ -596,7 +634,7 @@ def _mixed_solution_criteria_report(
 
 @dataclass
 class LinearSolverParameters:
-    """Sparse linear solver settings (expandable for PETSc/Krylov/etc.)."""
+    """Sparse linear solver settings (expandable for PETSc/Krylov/block solves)."""
 
     backend: str = ("petsc" if HAS_PETSC else "scipy")
     tol: float = 1e-12
@@ -1035,8 +1073,8 @@ class _ActiveReducer:
     # systems (full → reduced with BCs already handled in the full space)
     def reduce_system(self, A_full, R_full, dh, bcs):
         if self.constraint is None:
-            K_red = self.restrict_mat(A_full)
             F_red = self.restrict_vec(R_full)
+            K_red = None if A_full is None else self.restrict_mat(A_full)
             bc_data = dh.get_dirichlet_data(bcs)
             if bc_data:
                 rows_full = np.fromiter(bc_data.keys(), dtype=int)
@@ -1048,22 +1086,25 @@ class _ActiveReducer:
                 vals_full = vals_full[mask]
                 if rows_full.size:
                     rows_red = np.array([self.full2red[i] for i in rows_full])
+                    if K_red is not None:
+                        F_red -= K_red @ np.bincount(
+                            rows_red,
+                            weights=vals_full,
+                            minlength=self.active.size,
+                        )
 
-                    F_red -= K_red @ np.bincount(rows_red, weights=vals_full,
-                                                 minlength=self.active.size)
+                        K_red = _zero_rows_cols(K_red, rows_red)
 
-                    K_red = K_red.tolil()
-                    K_red[rows_red, :] = 0
-                    K_red[:, rows_red] = 0
-                    K_red[rows_red, rows_red] = 1.0
-                    K_red = K_red.tocsr()
-
+                    # Residual-only line-search evaluations still need the
+                    # active Dirichlet rows overridden to their prescribed
+                    # values, but they do not need the Jacobian row/column
+                    # surgery when no matrix was requested.
                     F_red[rows_red] = vals_full
             return K_red, F_red
 
         # Constraint-aware path: condense first, then apply BCs in master space
-        A_master = self.constraint.E_T @ (A_full @ self.constraint.E)
         R_master = self.constraint.E_T @ R_full
+        A_master = None if A_full is None else self.constraint.E_T @ (A_full @ self.constraint.E)
 
         bc_data_full = dh.get_dirichlet_data(bcs)
         bc_master = self.constraint.project_dirichlet(bc_data_full)
@@ -1071,12 +1112,15 @@ class _ActiveReducer:
             rows_master = np.fromiter(bc_master.keys(), dtype=int)
             vals_master = np.fromiter(bc_master.values(), dtype=float)
             if rows_master.size:
-                R_master -= A_master @ np.bincount(
-                    rows_master, weights=vals_master, minlength=self.constraint.n_master
-                )
-                A_master = _zero_rows_cols(A_master, rows_master)
+                if A_master is not None:
+                    R_master -= A_master @ np.bincount(
+                        rows_master, weights=vals_master, minlength=self.constraint.n_master
+                    )
+                    A_master = _zero_rows_cols(A_master, rows_master)
                 R_master[rows_master] = vals_master
 
+        if A_master is None:
+            return None, R_master[self.active]
         A_red = A_master.tocsr()[np.ix_(self.active, self.active)]
         R_red = R_master[self.active]
         return A_red, R_red
@@ -1293,6 +1337,9 @@ class NewtonSolver:
         self._reduced_schur_pressure_scale_value: float = 1.0
         self._reduced_schur_trace: bool = False
         self._reduced_schur_last_info: dict[str, object] = {}
+        self._block_linear_solver_config: dict[str, object] | None = None
+        self._block_linear_last_report: dict[str, object] = {}
+        self._block_linear_last_fallback_signature: tuple[tuple[str, ...], tuple[str, ...]] | None = None
         self._newton_ptc_sigma_current: float = 0.0
         self._refresh_reduced_field_names()
         self.set_runtime_operators(operators)
@@ -1411,21 +1458,30 @@ class NewtonSolver:
                 if A_work is not None and K_elem is not None and sp.isspmatrix_csr(A_work):
                     k_flat = np.asarray(K_elem, dtype=float).reshape(int(K_elem.shape[0]), -1)
                     data = A_work.data
-                    for e in range(int(pos_flat.shape[0])):
-                        pflat = np.asarray(pos_flat[e], dtype=np.int32)
-                        if pflat.size == 0:
-                            continue
-                        mask = pflat >= 0
-                        if not np.any(mask):
-                            continue
-                        data[pflat[mask]] += k_flat[e, mask]
+                    if _HAVE_NUMBA_REDUCED_PATTERN:
+                        _wait_numba_reduced_pattern_precompile()
+                        _scatter_csr_pos_flat_numba(data, np.asarray(pos_flat, dtype=np.int32), k_flat)
+                    else:
+                        for e in range(int(pos_flat.shape[0])):
+                            pflat = np.asarray(pos_flat[e], dtype=np.int32)
+                            if pflat.size == 0:
+                                continue
+                            mask = pflat >= 0
+                            if not np.any(mask):
+                                continue
+                            data[pflat[mask]] += k_flat[e, mask]
                 if R_red is not None and F_elem is not None:
-                    rm = np.asarray(red_map, dtype=np.int32).ravel()
-                    ff = np.asarray(F_elem, dtype=float).ravel()
-                    if ff.size == rm.size and ff.size:
-                        mask = rm >= 0
-                        if np.any(mask):
-                            np.add.at(R_red, rm[mask], ff[mask])
+                    ff = np.asarray(F_elem, dtype=float)
+                    if ff.shape == tuple(red_map.shape) and ff.size:
+                        if _HAVE_NUMBA_REDUCED_PATTERN:
+                            _wait_numba_reduced_pattern_precompile()
+                            _scatter_vec_red_map_numba(R_red, np.asarray(red_map, dtype=np.int32), ff)
+                        else:
+                            rm = np.asarray(red_map, dtype=np.int32).ravel()
+                            ff_flat = ff.ravel()
+                            mask = rm >= 0
+                            if np.any(mask):
+                                np.add.at(R_red, rm[mask], ff_flat[mask])
                 return A_work, R_red
             except IndexError:
                 self._pattern_stale = True
@@ -2232,6 +2288,282 @@ class NewtonSolver:
         if not out:
             return np.empty((0,), dtype=int)
         return np.unique(np.concatenate(out))
+
+    def build_reduced_field_block_layout(
+        self,
+        blocks,
+        *,
+        include_remaining: bool = True,
+        remainder_name: str = "remainder",
+    ) -> FieldBlockLayout:
+        field_names = np.asarray(getattr(self, "_reduced_field_names", np.asarray([], dtype=object)), dtype=object)
+        nred = int(np.asarray(getattr(self, "active_dofs", np.asarray([], dtype=int)), dtype=int).size)
+        if field_names.shape != (nred,):
+            field_names = self._refresh_reduced_field_names()
+        return FieldBlockLayout.from_field_names(
+            field_names,
+            blocks,
+            include_remaining=bool(include_remaining),
+            remainder_name=str(remainder_name),
+        )
+
+    def clear_block_linear_solver(self) -> None:
+        self._block_linear_solver_config = None
+        self._block_linear_last_report = {}
+        self._block_linear_last_fallback_signature = None
+
+    def set_block_linear_solver(
+        self,
+        *,
+        blocks,
+        method: str = "gmres",
+        preconditioner: str = "lower_triangular",
+        include_remaining: bool = True,
+        remainder_name: str = "remainder",
+        default_subsolver: SparseSubsolverSpec | str | dict = SparseSubsolverSpec(kind="ilu"),
+        block_subsolvers: dict | None = None,
+        block_approximations: dict | None = None,
+        rtol: float | None = None,
+        atol: float = 0.0,
+        maxiter: int | None = None,
+        restart: int | None = None,
+        inner_m: int = 30,
+        outer_k: int = 3,
+        uzawa_primal_block: int | str = 0,
+        uzawa_multiplier_block: int | str = 1,
+        uzawa_relaxation: float = 1.0,
+        trace: bool = False,
+    ) -> None:
+        self._block_linear_solver_config = {
+            "blocks": tuple(list(blocks or [])),
+            "method": str(method or "gmres").strip().lower(),
+            "preconditioner": str(preconditioner or "lower_triangular").strip().lower(),
+            "include_remaining": bool(include_remaining),
+            "remainder_name": str(remainder_name),
+            "default_subsolver": default_subsolver,
+            "block_subsolvers": dict(block_subsolvers or {}),
+            "block_approximations": dict(block_approximations or {}),
+            "rtol": float(self.lp.tol if rtol is None else rtol),
+            "atol": float(atol),
+            "maxiter": int(self.lp.maxit if maxiter is None else maxiter),
+            "restart": None if restart is None else int(restart),
+            "inner_m": int(inner_m),
+            "outer_k": int(outer_k),
+            "uzawa_primal_block": uzawa_primal_block,
+            "uzawa_multiplier_block": uzawa_multiplier_block,
+            "uzawa_relaxation": float(uzawa_relaxation),
+            "trace": bool(trace),
+        }
+        self._block_linear_last_report = {}
+
+    @staticmethod
+    def _block_linear_map_lookup(mapping: dict | None, block_idx: int, block_name: str):
+        if not mapping:
+            return None
+        if block_name in mapping:
+            return mapping[block_name]
+        if block_idx in mapping:
+            return mapping[block_idx]
+        return None
+
+    @staticmethod
+    def _normalize_block_linear_spec(raw_spec, *, index: int) -> tuple[str, tuple[str, ...]]:
+        if hasattr(raw_spec, "name") and hasattr(raw_spec, "fields"):
+            block_name = str(getattr(raw_spec, "name"))
+            raw_fields = getattr(raw_spec, "fields")
+        elif isinstance(raw_spec, str):
+            block_name = str(raw_spec)
+            raw_fields = (str(raw_spec),)
+        elif isinstance(raw_spec, tuple) and len(raw_spec) == 2 and isinstance(raw_spec[0], str):
+            block_name = str(raw_spec[0])
+            raw_fields = raw_spec[1]
+        else:
+            block_name = f"block_{int(index)}"
+            raw_fields = raw_spec
+
+        if isinstance(raw_fields, str):
+            fields = (str(raw_fields),)
+        else:
+            fields = tuple(dict.fromkeys(str(name) for name in list(raw_fields or []) if str(name)))
+        return block_name, fields
+
+    def _filter_block_linear_blocks_for_current_system(
+        self,
+        blocks,
+        *,
+        field_names: np.ndarray,
+    ) -> tuple[tuple[tuple[str, tuple[str, ...]], ...], tuple[str, ...]]:
+        available = {
+            str(name)
+            for name in np.asarray(field_names, dtype=object).reshape(-1).tolist()
+            if str(name)
+        }
+        filtered: list[tuple[str, tuple[str, ...]]] = []
+        dropped: list[str] = []
+        for idx, raw_spec in enumerate(list(blocks or [])):
+            block_name, fields = self._normalize_block_linear_spec(raw_spec, index=idx)
+            matched = tuple(name for name in fields if name in available)
+            if matched:
+                filtered.append((str(block_name), matched))
+            else:
+                dropped.append(str(block_name))
+        return tuple(filtered), tuple(dropped)
+
+    def _build_block_linear_subsolvers(
+        self,
+        system: BlockLinearSystem,
+        cfg: dict[str, object],
+    ) -> tuple[object, ...]:
+        layout = system.layout
+        default_spec = cfg.get("default_subsolver", SparseSubsolverSpec(kind="ilu"))
+        block_specs = dict(cfg.get("block_subsolvers", {}) or {})
+        block_approximations = dict(cfg.get("block_approximations", {}) or {})
+        out: list[object] = []
+        for block_idx, block_name in enumerate(layout.block_names):
+            solver_spec = self._block_linear_map_lookup(block_specs, block_idx, str(block_name))
+            if solver_spec is None:
+                solver_spec = default_spec
+            approx = self._block_linear_map_lookup(block_approximations, block_idx, str(block_name))
+            if approx is None:
+                matrix = system.diagonal_block(block_idx)
+            elif callable(approx):
+                matrix = approx(system)
+            else:
+                matrix = approx
+            out.append(build_subsolver(matrix, solver_spec))
+        return tuple(out)
+
+    def _build_block_linear_preconditioner(
+        self,
+        system: BlockLinearSystem,
+        cfg: dict[str, object],
+        block_solvers: tuple[object, ...],
+    ):
+        kind = str(cfg.get("preconditioner", "lower_triangular") or "lower_triangular").strip().lower()
+        if kind in {"none", "identity"}:
+            return None
+        if kind in {"diag", "diagonal", "block_diagonal"}:
+            return BlockDiagonalPreconditioner(system, block_solvers)
+        if kind in {"lower", "lower_triangular", "block_lower", "triangular"}:
+            return BlockTriangularPreconditioner(system, block_solvers, lower=True)
+        if kind in {"upper", "upper_triangular", "block_upper"}:
+            return BlockTriangularPreconditioner(system, block_solvers, lower=False)
+        if kind == "uzawa":
+            primal_block = cfg.get("uzawa_primal_block", 0)
+            multiplier_block = cfg.get("uzawa_multiplier_block", 1)
+            primal_idx = system.layout._normalize_key(primal_block)
+            multiplier_idx = system.layout._normalize_key(multiplier_block)
+            return UzawaPreconditioner(
+                system,
+                primal_solver=block_solvers[primal_idx],
+                schur_solver=block_solvers[multiplier_idx],
+                primal_block=primal_idx,
+                multiplier_block=multiplier_idx,
+                relaxation=float(cfg.get("uzawa_relaxation", 1.0) or 1.0),
+            )
+        raise ValueError(f"Unsupported block preconditioner '{cfg.get('preconditioner')}'.")
+
+    def _solve_linear_system_block(self, A: sp.csr_matrix, rhs: np.ndarray) -> np.ndarray:
+        cfg = dict(getattr(self, "_block_linear_solver_config", None) or {})
+        if not cfg:
+            raise RuntimeError(
+                "LinearSolverParameters.backend='block' requires set_block_linear_solver(...) to be called first."
+            )
+        field_names = np.asarray(getattr(self, "_reduced_field_names", np.asarray([], dtype=object)), dtype=object)
+        nred = int(np.asarray(getattr(self, "active_dofs", np.asarray([], dtype=int)), dtype=int).size)
+        if field_names.shape != (nred,):
+            field_names = self._refresh_reduced_field_names()
+        filtered_blocks, dropped_blocks = self._filter_block_linear_blocks_for_current_system(
+            cfg.get("blocks", tuple()),
+            field_names=np.asarray(field_names, dtype=object),
+        )
+        if int(len(filtered_blocks)) < 2:
+            fallback_signature = (
+                tuple(str(name) for name, _fields in filtered_blocks),
+                tuple(str(name) for name in dropped_blocks),
+            )
+            self._block_linear_last_report = {
+                "method": "fallback_scipy",
+                "converged": False,
+                "iterations": 0,
+                "residual_norm": float("nan"),
+                "residual_history": [],
+                "layout_blocks": fallback_signature[0],
+                "dropped_blocks": fallback_signature[1],
+            }
+            if bool(cfg.get("trace", False)) and fallback_signature != getattr(
+                self,
+                "_block_linear_last_fallback_signature",
+                None,
+            ):
+                print(
+                    "        [lin-block] fallback to scipy because the current reduced system no longer "
+                    f"supports the configured block layout; kept={fallback_signature[0]} "
+                    f"dropped={fallback_signature[1]}.",
+                    flush=True,
+                )
+            self._block_linear_last_fallback_signature = fallback_signature
+            return self._solve_linear_system_scipy(A, rhs)
+        self._block_linear_last_fallback_signature = None
+        layout = FieldBlockLayout.from_field_names(
+            np.asarray(field_names, dtype=object),
+            filtered_blocks,
+            include_remaining=bool(cfg.get("include_remaining", True)),
+            remainder_name=str(cfg.get("remainder_name", "remainder")),
+        )
+        system = BlockLinearSystem(A, rhs, layout)
+        block_solvers = self._build_block_linear_subsolvers(system, cfg)
+        method = str(cfg.get("method", "gmres") or "gmres").strip().lower()
+
+        if method == "uzawa":
+            primal_block = cfg.get("uzawa_primal_block", 0)
+            multiplier_block = cfg.get("uzawa_multiplier_block", 1)
+            primal_idx = system.layout._normalize_key(primal_block)
+            multiplier_idx = system.layout._normalize_key(multiplier_block)
+            solver = UzawaSolver(
+                system,
+                primal_solver=block_solvers[primal_idx],
+                schur_solver=block_solvers[multiplier_idx],
+                primal_block=primal_idx,
+                multiplier_block=multiplier_idx,
+                options=UzawaOptions(
+                    rtol=float(cfg.get("rtol", self.lp.tol) or self.lp.tol),
+                    maxiter=int(cfg.get("maxiter", self.lp.maxit) or self.lp.maxit),
+                    relaxation=float(cfg.get("uzawa_relaxation", 1.0) or 1.0),
+                ),
+            )
+            sol, report = solver.solve()
+        else:
+            preconditioner = self._build_block_linear_preconditioner(system, cfg, block_solvers)
+            solver = ScipyKrylovSolver(
+                KrylovOptions(
+                    method=method,
+                    rtol=float(cfg.get("rtol", self.lp.tol) or self.lp.tol),
+                    atol=float(cfg.get("atol", 0.0) or 0.0),
+                    maxiter=int(cfg.get("maxiter", self.lp.maxit) or self.lp.maxit),
+                    restart=cfg.get("restart"),
+                    inner_m=int(cfg.get("inner_m", 30) or 30),
+                    outer_k=int(cfg.get("outer_k", 3) or 3),
+                )
+            )
+            sol, report = solver.solve(system.matrix, system.rhs, preconditioner=preconditioner)
+
+        self._block_linear_last_report = {
+            "method": str(report.method),
+            "converged": bool(report.converged),
+            "iterations": int(report.iterations),
+            "residual_norm": float(report.residual_norm),
+            "residual_history": [float(v) for v in report.residual_history],
+            "layout_blocks": tuple(str(name) for name in layout.block_names),
+        }
+        if bool(cfg.get("trace", False)):
+            print(
+                "        [lin-block] "
+                f"method={report.method} blocks={layout.block_names} "
+                f"its={int(report.iterations)} |Ax-b|_inf={float(report.residual_norm):.3e}",
+                flush=True,
+            )
+        return np.asarray(sol, dtype=float).reshape(-1)
 
     def _current_field_reduced_iterate(self, coeffs, *, field_name: str, coeff_name: str | None = None) -> np.ndarray | None:
         from pycutfem.ufl.expressions import Function, VectorFunction, HdivFunction
@@ -5589,13 +5921,13 @@ class NewtonSolver:
                 + f"|dR|_inf={R_inf:.3e}, relR={R_rel:.3e}"
             )
 
-    def _assemble_full_system_python(self, apply_bcs=None):
+    def _assemble_full_system_python(self, apply_bcs=None, *, need_matrix: bool = True):
         """
         Assemble the full-space Jacobian and residual using the Python backend.
         Dirichlet conditions are applied only if *apply_bcs* is provided.
         """
         fc = self._python_form_compiler()
-        return fc.assemble(self.equation, bcs=apply_bcs)
+        return fc.assemble(self.equation, bcs=apply_bcs, need_matrix=bool(need_matrix), need_vector=True)
 
     def _assemble_system_reduced_python(self, coeffs, *, need_matrix: bool = True):
         """
@@ -5603,7 +5935,7 @@ class NewtonSolver:
         active DOFs (and optional constraints) via the existing reducer.
         """
         self._maybe_refresh_deformation(coeffs)
-        A_full, R_full = self._assemble_full_system_python(apply_bcs=None)
+        A_full, R_full = self._assemble_full_system_python(apply_bcs=None, need_matrix=need_matrix)
 
         # Prefer the time-frozen BCs when available
         bcs_apply = getattr(self, "_current_bcs", None)
@@ -5651,7 +5983,7 @@ class NewtonSolver:
         """
         if self.backend == "python":
             self._maybe_refresh_deformation(coeffs)
-            A_full, R_full = self._assemble_full_system_python(apply_bcs=None)
+            A_full, R_full = self._assemble_full_system_python(apply_bcs=None, need_matrix=need_matrix)
             return (A_full if need_matrix else None), R_full
 
         self._maybe_refresh_deformation(coeffs)
@@ -5703,7 +6035,7 @@ class NewtonSolver:
         """
         if self.backend == "python":
             self._maybe_refresh_deformation(coeffs)
-            A_glob, R_glob = self._assemble_full_system_python(apply_bcs=None)
+            A_glob, R_glob = self._assemble_full_system_python(apply_bcs=None, need_matrix=need_matrix)
             dh = self.dh
             ndof = dh.total_dofs
 
@@ -5794,6 +6126,10 @@ class NewtonSolver:
         backend = str(getattr(self.lp, "backend", "scipy") or "scipy").lower()
         if backend == "pypardiso":
             backend = "pardiso"
+        if backend == "block":
+            return self._solve_linear_system_block(A, rhs)
+        if backend == "scipy" and getattr(self, "_block_linear_solver_config", None):
+            return self._solve_linear_system_block(A, rhs)
         if (
             bool(getattr(self, "_reduced_schur_enabled", False))
             and not isinstance(self, PdasNewtonSolver)
@@ -6518,7 +6854,7 @@ class NewtonSolver:
     def set_linear_schur_fieldsplit(
         self,
         *,
-        pressure_field: str = "p",
+        pressure_field: str | tuple[str, ...] | list[str] = "p",
         schur_fact: str = "full",
         schur_pre: str = "selfp",
         outer_ksp: str | None = None,
@@ -6530,8 +6866,17 @@ class NewtonSolver:
         pressure_pc: str | None = None,
         pressure_factor_solver_type: str | None = None,
     ) -> None:
+        if isinstance(pressure_field, str):
+            fields = tuple(
+                name for name in (part.strip() for part in pressure_field.split(",")) if name
+            )
+        else:
+            fields = tuple(str(name).strip() for name in list(pressure_field or []) if str(name).strip())
+        if not fields:
+            fields = ("p",)
         self._linear_schur_cfg = {
-            "pressure_field": str(pressure_field),
+            "pressure_field": str(fields[0]),
+            "pressure_fields": fields,
             "schur_fact": str(schur_fact).lower(),
             "schur_pre": str(schur_pre).lower(),
             "outer_ksp": None if outer_ksp is None else str(outer_ksp).lower(),
@@ -6552,8 +6897,16 @@ class NewtonSolver:
         flag = str(os.getenv("PYCUTFEM_LINEAR_SCHUR", "") or "").strip().lower()
         if flag not in {"1", "true", "yes"}:
             return None
+        raw_fields = str(
+            os.getenv("PYCUTFEM_LINEAR_SCHUR_PRESSURE_FIELDS", os.getenv("PYCUTFEM_LINEAR_SCHUR_PRESSURE_FIELD", "p"))
+            or "p"
+        ).strip()
+        fields = tuple(name for name in (part.strip() for part in raw_fields.split(",")) if name)
+        if not fields:
+            fields = ("p",)
         return {
-            "pressure_field": str(os.getenv("PYCUTFEM_LINEAR_SCHUR_PRESSURE_FIELD", "p") or "p").strip(),
+            "pressure_field": str(fields[0]),
+            "pressure_fields": fields,
             "schur_fact": str(os.getenv("PYCUTFEM_LINEAR_SCHUR_FACT_TYPE", "full") or "full").strip().lower(),
             "schur_pre": str(os.getenv("PYCUTFEM_LINEAR_SCHUR_PRECONDITION", "selfp") or "selfp").strip().lower(),
             "outer_ksp": str(os.getenv("PYCUTFEM_LINEAR_KSP_TYPE", "") or "").strip().lower() or None,
@@ -6649,7 +7002,14 @@ class NewtonSolver:
         if cfg is None:
             return False
 
-        p_red = self._reduced_indices_for_field(str(cfg.get("pressure_field", "p") or "p"))
+        split_fields = cfg.get("pressure_fields", cfg.get("pressure_field", "p"))
+        if isinstance(split_fields, str):
+            split_names = tuple(name for name in (part.strip() for part in split_fields.split(",")) if name)
+        else:
+            split_names = tuple(str(name).strip() for name in list(split_fields or []) if str(name).strip())
+        if not split_names:
+            split_names = ("p",)
+        p_red = self._reduced_indices_for_fields(split_names)
         if p_red.size == 0 or p_red.size >= int(n):
             return False
         rest_red = np.setdiff1d(np.arange(int(n), dtype=int), p_red, assume_unique=False)
@@ -6686,7 +7046,8 @@ class NewtonSolver:
         if cfg.get("pressure_factor_solver_type"):
             opts["fieldsplit_p_pc_factor_mat_solver_type"] = str(cfg["pressure_factor_solver_type"])
         self._linear_schur_last_info = {
-            "pressure_field": str(cfg.get("pressure_field", "p") or "p"),
+            "pressure_field": str(split_names[0]),
+            "pressure_fields": tuple(split_names),
             "p_dofs": int(p_red.size),
             "rest_dofs": int(rest_red.size),
         }
@@ -6813,9 +7174,11 @@ class NewtonSolver:
             if os.getenv("PYCUTFEM_LINEAR_KSP_TRACE", "").lower() in {"1", "true", "yes"} and schur_applied:
                 try:
                     info = dict(getattr(self, "_linear_schur_last_info", {}) or {})
+                    split_fields = tuple(info.get("pressure_fields", tuple()) or tuple())
+                    split_label = ",".join(str(name) for name in split_fields) if split_fields else str(info.get("pressure_field", "p"))
                     print(
-                        "        [ksp-schur] pressure_field="
-                        + str(info.get("pressure_field", "p"))
+                        "        [ksp-schur] pressure_fields="
+                        + split_label
                         + f" p_dofs={int(info.get('p_dofs', 0))} rest_dofs={int(info.get('rest_dofs', 0))}"
                     )
                 except Exception:
@@ -7114,11 +7477,7 @@ class NewtonSolver:
             F_red -= K_red @ np.bincount(reduced_rows, weights=reduced_vals, minlength=len(active_dofs))
 
             # Zero out rows and columns in the reduced matrix
-            K_red_lil = K_red.tolil()
-            K_red_lil[reduced_rows, :] = 0
-            K_red_lil[:, reduced_rows] = 0
-            K_red_lil[reduced_rows, reduced_rows] = 1.0
-            K_red = K_red_lil.tocsr()
+            K_red = _zero_rows_cols(K_red, reduced_rows)
 
             # Set values in the RHS vector
             F_red[reduced_rows] = reduced_vals
@@ -7721,26 +8080,30 @@ class NewtonSolver:
                     # Dense per-entity plan: pos_list[e] has length n_loc*n_loc and
                     # matches Kloc[e].ravel(); entries are -1 for inactive pairs.
                     Kflat = np.asarray(Kloc, dtype=float).reshape(int(Kloc.shape[0]), -1)
-                    for e in range(int(pos_list.shape[0])):
-                        pflat = np.asarray(pos_list[e], dtype=np.int32)
-                        if pflat.size == 0:
-                            continue
-                        m = pflat >= 0
-                        if not np.any(m):
-                            continue
+                    try:
+                        if _HAVE_NUMBA_REDUCED_PATTERN:
+                            _wait_numba_reduced_pattern_precompile()
+                            _scatter_csr_pos_flat_numba(data, np.asarray(pos_list, dtype=np.int32), Kflat)
+                        else:
+                            for e in range(int(pos_list.shape[0])):
+                                pflat = np.asarray(pos_list[e], dtype=np.int32)
+                                if pflat.size == 0:
+                                    continue
+                                m = pflat >= 0
+                                if not np.any(m):
+                                    continue
+                                data[pflat[m]] += Kflat[e, m]
+                    except IndexError as exc:
+                        retrying = bool(getattr(self, "_reduced_fast_retrying", False))
+                        if retrying:
+                            raise
+                        self._pattern_stale = True
+                        self._reduced_fast_retrying = True
                         try:
-                            data[pflat[m]] += Kflat[e, m]
-                        except IndexError as exc:
-                            retrying = bool(getattr(self, "_reduced_fast_retrying", False))
-                            if retrying:
-                                raise
-                            self._pattern_stale = True
-                            self._reduced_fast_retrying = True
-                            try:
-                                self._build_reduced_pattern()
-                                return self._assemble_system_reduced_fast(coeffs)
-                            finally:
-                                self._reduced_fast_retrying = False
+                            self._build_reduced_pattern()
+                            return self._assemble_system_reduced_fast(coeffs)
+                        finally:
+                            self._reduced_fast_retrying = False
                 else:
                     for e, (pflat, lidx) in enumerate(zip(pos_list, lidx_list)):
                         if pflat.size == 0:
@@ -7885,14 +8248,19 @@ class NewtonSolver:
             if not has_constraints and isinstance(res_maps, list) and k_idx < len(res_maps) and isinstance(res_maps[k_idx], np.ndarray):
                 red_map = res_maps[k_idx]
                 if red_map.shape == getattr(Floc, "shape", None):
-                    rm = np.asarray(red_map, dtype=np.int32).ravel()
-                    ff = np.asarray(Floc, dtype=float).ravel()
-                    if ff.size != rm.size or ff.size == 0:
+                    ff = np.asarray(Floc, dtype=float)
+                    if ff.shape != tuple(red_map.shape) or ff.size == 0:
                         red_map = None
                     else:
-                        mask = rm >= 0
-                        if np.any(mask):
-                            np.add.at(R, rm[mask], ff[mask])
+                        if _HAVE_NUMBA_REDUCED_PATTERN:
+                            _wait_numba_reduced_pattern_precompile()
+                            _scatter_vec_red_map_numba(R, np.asarray(red_map, dtype=np.int32), ff)
+                        else:
+                            rm = np.asarray(red_map, dtype=np.int32).ravel()
+                            ff_flat = ff.ravel()
+                            mask = rm >= 0
+                            if np.any(mask):
+                                np.add.at(R, rm[mask], ff_flat[mask])
                 else:
                     red_map = None
             else:
@@ -7996,12 +8364,55 @@ class NewtonSolver:
 # ----------------------------------------------------------------------------
 
 def _zero_rows_cols(A: sp.csr_matrix, rows: np.ndarray) -> sp.csr_matrix:
-    """Zero out rows *and* columns and put 1.0 on the diagonal (in‑place)."""
-    A = A.tolil()
-    A[rows, :] = 0.0
-    A[:, rows] = 0.0
-    A[rows, rows] = 1.0
-    return A.tocsr()
+    """Zero out rows/columns and set diagonal ones without LIL fancy indexing."""
+    rows = np.unique(np.asarray(rows, dtype=int).ravel())
+    if rows.size == 0:
+        return A.tocsr(copy=True) if hasattr(A, "tocsr") else sp.csr_matrix(A)
+
+    A_csc = A.tocsc(copy=True) if hasattr(A, "tocsc") else sp.csc_matrix(A)
+    n_rows, n_cols = A_csc.shape
+    keep = (rows >= 0) & (rows < min(n_rows, n_cols))
+    rows = rows[keep]
+    if rows.size == 0:
+        return A_csc.tocsr()
+
+    c_indptr = A_csc.indptr
+    c_data = A_csc.data
+    for rr in rows.tolist():
+        start = int(c_indptr[rr])
+        end = int(c_indptr[rr + 1])
+        if end > start:
+            c_data[start:end] = 0.0
+
+    A_mod = A_csc.tocsr()
+    indptr = A_mod.indptr
+    indices = A_mod.indices
+    data = A_mod.data
+    missing_diag: list[int] = []
+
+    for rr in rows.tolist():
+        start = int(indptr[rr])
+        end = int(indptr[rr + 1])
+        if end <= start:
+            missing_diag.append(rr)
+            continue
+        data[start:end] = 0.0
+        hit = np.nonzero(indices[start:end] == rr)[0]
+        if hit.size:
+            data[start + int(hit[0])] = 1.0
+        else:
+            missing_diag.append(rr)
+
+    if missing_diag:
+        diag_rows = np.asarray(missing_diag, dtype=int)
+        diag_vals = np.ones(diag_rows.size, dtype=float)
+        A_mod = (
+            A_mod
+            + sp.csr_matrix((diag_vals, (diag_rows, diag_rows)), shape=A_mod.shape)
+        ).tocsr()
+
+    A_mod.eliminate_zeros()
+    return A_mod
 
 
 

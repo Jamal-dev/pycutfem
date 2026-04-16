@@ -862,6 +862,12 @@ class VectorFunction(Expression):
         g_dofs_list = [dof_handler.get_field_slice(f) for f in field_names]
         self._g_dofs = np.concatenate(g_dofs_list)
         self._g2l = {gd: i for i, gd in enumerate(self._g_dofs)}
+        self._component_local_slices = []
+        _offset = 0
+        for g_dofs in g_dofs_list:
+            _next = _offset + len(g_dofs)
+            self._component_local_slices.append(slice(_offset, _next))
+            _offset = _next
         self.nodal_values = np.zeros(len(self._g_dofs), dtype=float)
         self._dof_handler = dof_handler
         
@@ -886,14 +892,10 @@ class VectorFunction(Expression):
     
 
     def nodal_values_component(self, idx: int):
-        s = self._dh.get_field_slice(self.field_names[idx])
-        return self.nodal_values[[self._g2l[d] for d in s if d in self._g2l]]
+        return self.nodal_values[self._component_local_slices[idx]]
 
     def set_component_values(self, idx: int, vals):
-        s = self._dh.get_field_slice(self.field_names[idx])
-        for i, gdof in enumerate(s):
-            if gdof in self._g2l:
-                self.nodal_values[self._g2l[gdof]] = vals[i]
+        self.nodal_values[self._component_local_slices[idx]] = vals
 
     def get_nodal_values(self, global_dofs: np.ndarray) -> np.ndarray:
         """

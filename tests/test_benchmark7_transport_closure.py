@@ -26,6 +26,7 @@ from examples.biofilms.benchmarks.seboldt.paper1_benchmark7_seboldt import (
     _compute_profile_best_fit_scale,
     _effective_eps_alpha,
     _effective_logistic_bounded_fields,
+    _final_form_enabled,
     _interface_tangent_from_normal_2d,
     _interface_unit_normal_2d,
     _dot_basis_2d,
@@ -41,6 +42,7 @@ from examples.biofilms.benchmarks.seboldt.paper1_benchmark7_seboldt import (
     _pc_skeleton_inertia_selectors,
     _pc_should_prefer_exact_probe,
     _pc_should_keep_lambda_stage,
+    _post_accept_lag_phi_in_main,
     _rigid_support_diagnostic_active_fields,
     _solver_scaled_reduced_matrix,
     _predictor_corrector_startup_enabled,
@@ -68,6 +70,28 @@ from pycutfem.ufl.compilers import FormCompiler
 from pycutfem.ufl.expressions import Constant, Identity, Integral as ExprIntegral, div, dot, grad, inner
 from pycutfem.ufl.forms import Equation, Form, assemble_form
 from pycutfem.ufl.measures import dx
+
+
+def test_constant_density_final_form_post_accept_lags_phi_in_main() -> None:
+    assert bool(
+        _post_accept_lag_phi_in_main(
+            {
+                "final_form": True,
+                "final_form_constant_rho_s": True,
+            }
+        )
+    )
+
+
+def test_generic_final_form_keeps_phi_in_main_when_not_constant_density() -> None:
+    assert not bool(
+        _post_accept_lag_phi_in_main(
+            {
+                "final_form": True,
+                "final_form_constant_rho_s": False,
+            }
+        )
+    )
 
 
 def _assemble_block(problem, form, field: str) -> np.ndarray:
@@ -3266,6 +3290,24 @@ def test_benchmark7_cpp_fuse_integrals_defaults_on_for_cpp(monkeypatch) -> None:
     _configure_benchmark7_cpp_fuse_integrals(
         backend=str(args.backend),
         enabled=getattr(args, "cpp_fuse_integrals", None),
+    )
+
+    assert os.environ["PYCUTFEM_CPP_FUSE_INTEGRALS"] == "1"
+
+
+def test_benchmark7_final_form_cpp_fuse_integrals_default_on_for_cpp(monkeypatch) -> None:
+    monkeypatch.delenv("PYCUTFEM_CPP_FUSE_INTEGRALS", raising=False)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["paper1_benchmark7_seboldt.py", "--one-domain-formulation", "final_form"],
+    )
+    args = _parse_args()
+
+    _configure_benchmark7_cpp_fuse_integrals(
+        backend=str(args.backend),
+        enabled=getattr(args, "cpp_fuse_integrals", None),
+        final_form_enabled=_final_form_enabled(args),
     )
 
     assert os.environ["PYCUTFEM_CPP_FUSE_INTEGRALS"] == "1"

@@ -121,10 +121,13 @@ def main() -> None:
         builder = fluid_solver._GetBuilderAndSolver()
         scheme = fluid_solver._GetScheme()
         computing_model_part = fluid_solver.GetComputingModelPart()
+        space = KM.UblasSparseSpace()
 
         A = strategy.GetSystemMatrix()
         b = strategy.GetSystemVector()
         x = strategy.GetSolutionVector()
+        space.SetToZeroMatrix(A)
+        space.SetToZeroVector(b)
         builder.Build(scheme, computing_model_part, A, b)
         A_raw = scipy_conversion_tools.to_csr(A).copy()
         b_raw = np.asarray(b, dtype=float).copy()

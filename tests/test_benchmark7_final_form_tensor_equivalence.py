@@ -2,6 +2,8 @@ import numpy as np
 import pytest
 
 from examples.biofilms.benchmarks.seboldt.paper1_benchmark7_seboldt import _build_forms, _create_problem
+from pycutfem.jit import _form_integrals, _integral_fusion_key
+from pycutfem.ufl.compilers import FormCompiler
 from pycutfem.ufl.expressions import Constant
 from pycutfem.ufl.forms import Equation, assemble_form
 
@@ -147,6 +149,16 @@ def _assemble_matrix(problem, form, *, backend: str) -> np.ndarray:
     return np.asarray(mat, dtype=float)
 
 
+def _fusion_group_sizes(problem, form) -> list[int]:
+    compiler = FormCompiler(problem["dh"], backend="python")
+    p_geo = int(getattr(problem["dh"].mixed_element.mesh, "poly_order", 1))
+    groups: dict[tuple, list[int]] = {}
+    for idx, integral in enumerate(_form_integrals(form)):
+        key = _integral_fusion_key(integral, compiler=compiler, p_geo=p_geo)
+        groups.setdefault(key, []).append(idx)
+    return sorted(len(items) for items in groups.values())
+
+
 def test_benchmark7_tensor_final_form_matches_decomposed_reference() -> None:
     problem_tensor, forms_tensor = _build_final_form_problem(final_form_implementation="tensor")
     problem_decomp, forms_decomp = _build_final_form_problem(final_form_implementation="decomposed")
@@ -197,3 +209,25 @@ def test_benchmark7_tensor_final_form_backend_parity(backend: str) -> None:
         term_py = _assemble_vector(problem, forms.r_momentum_terms[name], backend="python")
         term_backend = _assemble_vector(problem, forms.r_momentum_terms[name], backend=backend)
         np.testing.assert_allclose(term_backend, term_py, rtol=1.0e-10, atol=1.0e-10)
+
+
+def test_benchmark7_tensor_final_form_cpp_shared_loop_backend_parity(monkeypatch) -> None:
+    monkeypatch.setenv("PYCUTFEM_CPP_FAST_COMPILE", "1")
+    monkeypatch.setenv("PYCUTFEM_CPP_FUSE_INTEGRALS", "1")
+
+    problem, forms = _build_final_form_problem(final_form_implementation="tensor")
+
+    residual_py = _assemble_vector(problem, forms.residual_form, backend="python")
+    residual_cpp = _assemble_vector(problem, forms.residual_form, backend="cpp")
+    jacobian_py = _assemble_matrix(problem, forms.jacobian_form, backend="python")
+    jacobian_cpp = _assemble_matrix(problem, forms.jacobian_form, backend="cpp")
+
+    np.testing.assert_allclose(residual_cpp, residual_py, rtol=1.0e-10, atol=1.0e-10)
+    np.testing.assert_allclose(jacobian_cpp, jacobian_py, rtol=1.0e-10, atol=1.0e-10)
+
+
+def test_benchmark7_tensor_final_form_volume_fusion_groups_stay_coarse() -> None:
+    problem, forms = _build_final_form_problem(final_form_implementation="tensor")
+
+    assert _fusion_group_sizes(problem, forms.residual_form) == [36]
+    assert _fusion_group_sizes(problem, forms.jacobian_form) == [37]

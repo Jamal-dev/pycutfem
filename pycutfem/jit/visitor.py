@@ -75,12 +75,12 @@ class IRGenerator:
         self.ir_sequence = []
         self._param = None
 
-    def generate(self, node: Expression) -> list:
+    def generate(self, node: Expression, *, jit_param=None) -> list:
         """
         Public method to generate the IR for a given UFL expression.
         """
         self.ir_sequence.clear()
-        self._param = build_jit_parametrization(node)
+        self._param = jit_param if jit_param is not None else build_jit_parametrization(node)
         form_type = _find_form_type(node)
         
         self._visit(node) # Initial call with default side=""

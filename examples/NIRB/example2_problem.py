@@ -48,6 +48,8 @@ class DoubleFlapGeometry:
     base_height: float
     arm_width: float
     inlet_ramp_end_time: float
+    inlet_modulus_ramp: str
+    inlet_modulus_steady: str
     inlet_tag: str = "inlet"
     outlet_tag: str = "outlet"
     walls_tag: str = "walls"
@@ -107,13 +109,24 @@ class DoubleFlapGeometry:
     def inlet_velocity(self, y: float, t: float, *, reference_velocity: float) -> float:
         y = float(y)
         t = float(t)
+        del reference_velocity
         if y <= 0.0 or y >= self.channel_height:
             return 0.0
-        profile = 4.0 * float(reference_velocity) * y * (self.channel_height - y) / (self.channel_height**2)
-        if t >= self.inlet_ramp_end_time:
-            return profile
-        phase = max(t, 0.0) / max(self.inlet_ramp_end_time, 1.0e-14)
-        return 0.5 * (1.0 - math.cos(math.pi * phase)) * profile
+        expr = self.inlet_modulus_steady if t >= self.inlet_ramp_end_time else self.inlet_modulus_ramp
+        safe_locals = {
+            "y": y,
+            "t": t,
+            "pi": math.pi,
+            "sin": math.sin,
+            "cos": math.cos,
+            "tan": math.tan,
+            "exp": math.exp,
+            "sqrt": math.sqrt,
+            "abs": abs,
+            "min": min,
+            "max": max,
+        }
+        return float(eval(expr, {"__builtins__": {}}, safe_locals))
 
 
 def _group_consecutive(values: np.ndarray, *, gap_tol: float) -> list[tuple[float, float]]:
@@ -184,6 +197,8 @@ def _infer_geometry_from_reference(reference: DoubleFlapReference) -> DoubleFlap
         base_height=float(base_height),
         arm_width=float(arm_width),
         inlet_ramp_end_time=float(reference.inlet_ramp_end_time),
+        inlet_modulus_ramp=str(reference.inlet_modulus_ramp),
+        inlet_modulus_steady=str(reference.inlet_modulus_steady),
     )
 
 

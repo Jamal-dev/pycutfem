@@ -9,11 +9,13 @@ from examples.NIRB.common import dump_json
 from examples.NIRB.example2_local_setup import load_example2_local_setup
 from examples.NIRB.run_example2_local import (
     CoordinateLookup,
+    _KratosLocalSolidSystemOperator,
     _ReducedResidualShiftOperator,
     _boundary_point_load_vector,
     _boundary_vector_snapshot,
     _build_solid_problem,
     _load_reference_partitioned_meshes,
+    _maybe_build_kratos_local_solid_backend,
     _solid_residual_and_jacobian,
 )
 from pycutfem.solvers.nonlinear_solver import LinearSolverParameters, NewtonParameters, NewtonSolver, TimeStepperParameters
@@ -89,7 +91,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--backend", choices=("python", "jit", "cpp"), default="cpp")
     parser.add_argument("--linear-backend", choices=("scipy", "petsc"), default="petsc")
-    parser.add_argument("--quad-order", type=int, default=6)
+    parser.add_argument("--quad-order", type=int, default=1)
     parser.add_argument("--newton-tol", type=float, default=1.0e-8)
     parser.add_argument("--max-newton-iter", type=int, default=12)
     return parser.parse_args()
@@ -100,6 +102,10 @@ def main() -> None:
     setup = load_example2_local_setup()
     _, mesh_s = _load_reference_partitioned_meshes(setup=setup)
     solid = _build_solid_problem(mesh_s, poly_order=1)
+    kratos_local_solid_backend = _maybe_build_kratos_local_solid_backend(
+        benchmark_root=Path(setup.reference.root),
+        prob=solid,
+    )
 
     with np.load(Path(args.kratos_monitor).resolve()) as data:
         ref_load_coords = np.asarray(data["structure_load_coords_ref"], dtype=float)
@@ -131,9 +137,8 @@ def main() -> None:
         newton_params=NewtonParameters(
             newton_tol=float(args.newton_tol),
             max_newton_iter=int(args.max_newton_iter),
-            line_search=True,
-            ls_mode="dealii",
-            globalization="line_search_then_trust",
+            line_search=False,
+            globalization="none",
         ),
         lin_params=LinearSolverParameters(backend=str(args.linear_backend)),
         quad_order=int(args.quad_order),
@@ -147,7 +152,16 @@ def main() -> None:
         values=local_load_values,
     )
     point_load_red = np.asarray(point_load_full[np.asarray(solver.active_dofs, dtype=int)], dtype=float)
-    solver.set_runtime_operators([_ReducedResidualShiftOperator(point_load_red)])
+    runtime_ops = []
+    if kratos_local_solid_backend is not None:
+        runtime_ops.append(
+            _KratosLocalSolidSystemOperator(
+                backend=kratos_local_solid_backend,
+                d_k=solid["d_k"],
+            )
+        )
+    runtime_ops.append(_ReducedResidualShiftOperator(point_load_red))
+    solver.set_runtime_operators(runtime_ops)
     solver.solve_time_interval(
         functions=[solid["d_k"]],
         prev_functions=[solid["d_prev"]],
