@@ -43,7 +43,7 @@ def export_vtk(
         if isinstance(obj, VectorFunction):
             vec = np.zeros((num_nodes, 3))
             for gdof, lidx in obj._g2l.items():
-                field, node_id = dof_handler._dof_to_node_map[gdof]
+                field, node_id = dof_handler._dof_to_node_map.get(int(gdof), (None, None))
                 if node_id is None:
                     continue
                 if field in obj.field_names:
@@ -57,7 +57,7 @@ def export_vtk(
             scal = np.zeros(num_nodes, dtype=float)
             assigned = np.zeros(num_nodes, dtype=bool)
             for gdof, lidx in obj._g2l.items():
-                _field, node_id = dof_handler._dof_to_node_map[gdof]
+                _field, node_id = dof_handler._dof_to_node_map.get(int(gdof), (None, None))
                 if node_id is None:
                     continue
                 scal[node_id] = obj.nodal_values[lidx]

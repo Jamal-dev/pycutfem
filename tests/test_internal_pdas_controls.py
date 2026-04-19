@@ -20,6 +20,7 @@ from pycutfem.solvers.nonlinear_solver import (
     PdasNewtonSolver,
     VIParameters,
     _PreparedLinearEqualities,
+    _vi_relaxed_accept_reason,
     _vi_filter_abs_floor,
     _vi_filter_threshold,
 )
@@ -262,6 +263,143 @@ def _build_two_field_ipm_solver(*, vi_params: VIParameters):
     )
     solver.set_box_bounds(by_field={"alpha": (0.0, 1.0), "phi": (0.0, 1.0)})
     return solver, dh, alpha_k, alpha_n, phi_k, phi_n
+
+
+def test_pdas_identified_manifold_recovery_helper_enables_local_recovery_controls() -> None:
+    solver, _dh, _alpha_k, _alpha_n, _phi_k, _phi_n = _build_two_field_vi_solver(
+        vi_params=VIParameters(
+            field_proximal_recovery_fields=("phi",),
+            ptc_fields=("alpha",),
+        )
+    )
+
+    solver.configure_identified_manifold_recovery(
+        proximal_fields=("alpha",),
+        ptc_fields=("phi",),
+        arm_initial=True,
+    )
+
+    assert bool(solver.vi_params.affine_cycle_fallback)
+    assert bool(solver.vi_params.project_each_iteration)
+    assert bool(solver.vi_params.accept_best_filtered_descent)
+    assert int(solver.vi_params.line_search_nonmonotone_window) >= 5
+    assert bool(solver.vi_params.line_search_nonmonotone_disable_filter)
+
+    assert bool(solver.vi_params.field_proximal_recovery)
+    assert tuple(solver.vi_params.field_proximal_recovery_fields) == ("phi", "alpha")
+    assert int(solver.vi_params.field_proximal_recovery_stable_iters) == 0
+    assert bool(solver.vi_params.field_proximal_recovery_identified_window)
+    assert float(solver.vi_params.field_proximal_recovery_lambda0) >= 1.0e-2
+    assert float(solver.vi_params.field_proximal_recovery_ginf_max) >= 5.0
+
+    assert bool(solver.vi_params.ptc_recovery)
+    assert tuple(solver.vi_params.ptc_fields) == ("alpha", "phi")
+    assert int(solver.vi_params.ptc_stable_iters) == 0
+    assert bool(solver.vi_params.ptc_identified_window)
+    assert not bool(solver.vi_params.ptc_freeze_complement)
+    assert float(solver.vi_params.ptc_sigma0) >= 5.0e-2
+    assert float(solver.vi_params.ptc_ginf_max) >= 5.0
+
+    assert bool(solver.vi_params.anderson_acceleration)
+    assert int(solver.vi_params.anderson_history) >= 3
+    assert float(solver.vi_params.anderson_regularization) >= 1.0e-10
+    assert float(solver.vi_params.anderson_ginf_max) >= 5.0
+    assert float(solver.vi_params.line_search_nonmonotone_ginf_trigger) >= 2.5
+
+    assert getattr(solver, "_vi_force_initial_field_prox_lambda", 0.0) == pytest.approx(
+        float(solver.vi_params.field_proximal_recovery_lambda0)
+    )
+    assert getattr(solver, "_vi_force_initial_ptc_sigma", 0.0) == pytest.approx(
+        float(solver.vi_params.ptc_sigma0)
+    )
+
+
+def test_pdas_ptc_sigma_escalates_on_repeated_accepted_stalls() -> None:
+    solver, _dh, _alpha_k, _alpha_n, _phi_k, _phi_n = _build_two_field_vi_solver(
+        vi_params=VIParameters(
+            ptc_recovery=True,
+            ptc_sigma0=5.0e-2,
+            ptc_sigma_max=1.0e3,
+            ptc_growth=5.0,
+            ptc_decay=0.5,
+            ptc_fields=("alpha",),
+            ptc_stable_iters=0,
+            ptc_ginf_trigger=5.0e-2,
+            ptc_gap_ratio=1.0,
+            ptc_eq_abs=1.0e-10,
+        )
+    )
+
+    ptc_mask = np.ones(2, dtype=bool)
+    stall_metrics = {
+        "G_inf": 1.0,
+        "inactive_res_inf": 1.0,
+        "active_gap_inf": 0.0,
+        "equality_inf": 0.0,
+    }
+
+    solver._vi_update_ptc_after_accept(
+        ptc_mask=ptc_mask,
+        metrics=stall_metrics,
+        active_stable_count=1,
+        changed=0,
+        accepted_alpha=1.0e-4,
+        merit_ratio=0.99,
+        accepted_g_ratio=0.99,
+    )
+    assert solver._vi_ptc_sigma_current == pytest.approx(5.0e-2)
+
+    solver._vi_update_ptc_after_accept(
+        ptc_mask=ptc_mask,
+        metrics=stall_metrics,
+        active_stable_count=2,
+        changed=0,
+        accepted_alpha=1.0e-4,
+        merit_ratio=0.995,
+        accepted_g_ratio=0.995,
+    )
+    assert solver._vi_ptc_sigma_current == pytest.approx(2.5e-1)
+
+    solver._vi_update_ptc_after_accept(
+        ptc_mask=ptc_mask,
+        metrics=stall_metrics,
+        active_stable_count=3,
+        changed=0,
+        accepted_alpha=1.0,
+        merit_ratio=0.5,
+        accepted_g_ratio=0.5,
+    )
+    assert solver._vi_ptc_sigma_current == pytest.approx(1.25e-1)
+
+
+def test_vi_relaxed_accept_reason_prefers_explicit_relaxed_band() -> None:
+    assert (
+        _vi_relaxed_accept_reason(
+            norm_G=2.5e-5,
+            accept_factor=20.0,
+            atol=1.0e-6,
+            relaxed_g=5.0e-2,
+        )
+        == "relaxed_filter_accept_ginf=5.000e-02"
+    )
+    assert (
+        _vi_relaxed_accept_reason(
+            norm_G=1.5e-5,
+            accept_factor=20.0,
+            atol=1.0e-6,
+            relaxed_g=0.0,
+        )
+        == "20·atol (atol=1.000e-06)"
+    )
+    assert (
+        _vi_relaxed_accept_reason(
+            norm_G=2.5e-2,
+            accept_factor=0.0,
+            atol=1.0e-6,
+            relaxed_g=1.0e-3,
+        )
+        is None
+    )
 
 
 def _build_two_field_newton_solver():
@@ -1640,6 +1778,45 @@ def test_internal_pdas_arms_guard_after_slow_identified_accept() -> None:
     )
 
 
+def test_internal_pdas_does_not_rearm_identified_guard_after_flat_accept() -> None:
+    solver = _build_scalar_vi_solver(
+        vi_params=VIParameters(
+            working_set_guard_after_affine=2,
+            field_proximal_recovery=True,
+            field_proximal_recovery_stable_iters=0,
+            field_proximal_recovery_ginf_trigger=5.0e-2,
+            field_proximal_recovery_gap_ratio=1.0,
+            field_proximal_recovery_eq_abs=1.0e-10,
+            field_proximal_recovery_identified_window=True,
+            field_proximal_recovery_ginf_max=1.0,
+        )
+    )
+
+    metrics = {
+        "G_inf": 5.0e-1,
+        "inactive_res_inf": 5.0e-1,
+        "active_gap_inf": 1.0e-12,
+        "equality_inf": 1.0e-12,
+    }
+
+    assert not solver._vi_should_arm_working_set_guard_after_accept(
+        metrics=metrics,
+        active_stable_count=1,
+        changed=0,
+        accepted_alpha=1.0,
+        merit_ratio=1.0,
+        accepted_g_ratio=1.0,
+    )
+    assert solver._vi_should_arm_working_set_guard_after_accept(
+        metrics=metrics,
+        active_stable_count=1,
+        changed=0,
+        accepted_alpha=1.0,
+        merit_ratio=0.9,
+        accepted_g_ratio=0.9,
+    )
+
+
 def test_internal_pdas_updates_field_proximal_after_identified_accept() -> None:
     solver = _build_scalar_vi_solver(
         vi_params=VIParameters(
@@ -2081,6 +2258,19 @@ def test_vi_augmented_usable_direct_solve_quality_tracks_current_vi_residual() -
 
         solver._current_newton_residual_norm = 1.0e-4
         assert not solver._direct_solve_quality_passes(4.0e-4, 4.0e-4)
+    finally:
+        solver._linear_solve_context = None
+
+
+def test_vi_augmented_usable_direct_solve_quality_accepts_mid_residual_globalization_step() -> None:
+    solver = _build_scalar_vi_solver(vi_params=VIParameters())
+    solver._linear_solve_context = "vi_augmented"
+    try:
+        solver._current_newton_residual_norm = 5.56e-1
+        assert solver._direct_solve_quality_passes(5.41e-3, 5.41e-3)
+
+        solver._current_newton_residual_norm = 1.0e-4
+        assert not solver._direct_solve_quality_passes(5.41e-3, 5.41e-3)
     finally:
         solver._linear_solve_context = None
 

@@ -54,6 +54,7 @@ except Exception:
 from pycutfem.jit.kernel_args import _build_jit_kernel_args
 from pycutfem.jit import compile_multi        
 from pycutfem.operators import OperatorManager, RuntimeOperator
+from pycutfem.ufl.autodiff import GateauxDerivativeError, linearize_form
 from pycutfem.ufl.forms import Equation
 from pycutfem.ufl.helpers import analyze_active_dofs
 from pycutfem.solvers.dt_controller import AdaptiveDtController, DtControllerParams
@@ -847,6 +848,22 @@ def _vi_filter_threshold(*, base: float, growth: float, abs_floor: float) -> flo
     return max(float(growth) * scale, float(abs_floor))
 
 
+def _vi_relaxed_accept_reason(
+    *,
+    norm_G: float,
+    accept_factor: float,
+    atol: float,
+    relaxed_g: float,
+) -> str | None:
+    if accept_factor > 0.0 and atol > 0.0 and np.isfinite(float(norm_G)):
+        accept_tol = float(accept_factor) * float(atol)
+        if float(norm_G) <= accept_tol:
+            return f"{float(accept_factor):g}·atol (atol={float(atol):.3e})"
+    if relaxed_g > 0.0 and np.isfinite(float(norm_G)) and float(norm_G) <= float(relaxed_g):
+        return f"relaxed_filter_accept_ginf={float(relaxed_g):.3e}"
+    return None
+
+
 def _project_box_with_single_linear_equality(
     x: np.ndarray,
     weights: np.ndarray,
@@ -1147,6 +1164,7 @@ class NewtonSolver:
         residual_form,
         jacobian_form,
         *,
+        linearization_pairs: Optional[Sequence[Tuple[object, object]]] = None,
         dof_handler,
         mixed_element,
         bcs: List,                       # inhomogeneous BCs  (values added)
@@ -1189,6 +1207,36 @@ class NewtonSolver:
         self._deformation_update = deformation_update
         self.operators: tuple[RuntimeOperator, ...] = tuple()
         self.operator_manager: OperatorManager | None = None
+
+        if jacobian_form is None:
+            pairs = tuple(linearization_pairs or ())
+            if not pairs:
+                raise ValueError(
+                    "NewtonSolver requires either an explicit jacobian_form or "
+                    "linearization_pairs=[(coefficient, direction), ...] for auto-linearization."
+                )
+            coeffs = [pair[0] for pair in pairs]
+            directions = [pair[1] for pair in pairs]
+            try:
+                jacobian_form = linearize_form(
+                    residual_form,
+                    coeffs,
+                    directions,
+                    strict=True,
+                )
+            except GateauxDerivativeError as exc:
+                raise ValueError(
+                    "Failed to auto-linearize the residual form for NewtonSolver."
+                ) from exc
+            if len(getattr(jacobian_form, "integrals", []) or []) == 0:
+                raise ValueError(
+                    "Auto-linearization produced an empty Jacobian form. "
+                    "This usually means the selected coefficients are not active in the residual."
+                )
+        elif linearization_pairs:
+            raise ValueError(
+                "Provide either jacobian_form or linearization_pairs, not both."
+            )
 
         # Keep original forms handy (their .integrand is needed later)
         self._residual_form = residual_form
@@ -2808,6 +2856,7 @@ class NewtonSolver:
             self._vi_eq_lambda_current = self._vi_eq_lambda_accepted.copy()
         self._refresh_solver_coordinate_transform_masks()
         self._refresh_reduced_field_names()
+        self._trace_reduced_box_bounds_summary()
         print(f"NewtonSolver: Active DOFs retargeted to {nfree}/{ndof_effective}.")
         return self.active_dofs.copy()
 
@@ -2822,6 +2871,60 @@ class NewtonSolver:
         for field in names:
             full_ids.extend(np.asarray(self.dh.get_field_slice(field), dtype=int).ravel().tolist())
         return self.set_active_dofs(np.asarray(sorted(set(full_ids)), dtype=int))
+
+    def _trace_reduced_box_bounds_summary(self) -> None:
+        if os.getenv("PYCUTFEM_TRACE_BOUNDS_FIELDS", "").lower() not in {"1", "true", "yes"}:
+            return
+        lo_full = getattr(self, "_box_lower_full", None)
+        hi_full = getattr(self, "_box_upper_full", None)
+        if lo_full is None or hi_full is None:
+            print("    [bounds] reduced active system has no box bounds configured.", flush=True)
+            return
+        active = np.asarray(getattr(self, "active_dofs", np.asarray([], dtype=int)), dtype=int).ravel()
+        if active.size == 0:
+            print("    [bounds] reduced active system has no active DOFs.", flush=True)
+            return
+        try:
+            lo_red = np.asarray(lo_full, dtype=float)[active]
+            hi_red = np.asarray(hi_full, dtype=float)[active]
+        except Exception as exc:
+            print(f"    [bounds] failed to build reduced box-bound summary: {exc}", flush=True)
+            return
+        bounded = np.isfinite(lo_red) | np.isfinite(hi_red)
+        n_bounded = int(np.count_nonzero(bounded))
+        if n_bounded <= 0:
+            print("    [bounds] reduced active system has no finite box-bounded DOFs.", flush=True)
+            return
+        field_names = np.asarray(getattr(self, "_reduced_field_names", np.asarray([], dtype=object)), dtype=object)
+        if field_names.shape != active.shape:
+            try:
+                field_names = self._refresh_reduced_field_names()
+            except Exception:
+                field_names = np.asarray([], dtype=object)
+        parts: list[str] = []
+        if field_names.shape == active.shape:
+            used = set()
+            for name in field_names[bounded].tolist():
+                key = str(name).strip()
+                if not key or key in used:
+                    continue
+                used.add(key)
+                mask = bounded & (field_names == key)
+                lo_mask = np.isfinite(lo_red) & mask
+                hi_mask = np.isfinite(hi_red) & mask
+                parts.append(
+                    f"{key}:n={int(np.count_nonzero(mask))}"
+                    f"/lo={int(np.count_nonzero(lo_mask))}"
+                    f"/hi={int(np.count_nonzero(hi_mask))}"
+                )
+        if parts:
+            print(
+                "    [bounds] reduced finite box-bounded DOFs "
+                f"n={n_bounded}: {', '.join(parts)}",
+                flush=True,
+            )
+        else:
+            print(f"    [bounds] reduced finite box-bounded DOFs n={n_bounded}.", flush=True)
 
     def _is_jit_backend(self) -> bool:
         return self.backend in {"jit", "cpp", "c++"}
@@ -6390,15 +6493,16 @@ class NewtonSolver:
                 current_vi_res = float("nan")
             # The augmented PDAS/IPM solve only needs to be accurate relative
             # to the current semismooth residual. When |G| is still O(1e-1),
-            # rejecting O(1e-4) relative solves causes expensive retry storms
-            # without materially changing the nonlinear step, but late-stage
-            # solves should tighten automatically as |G| shrinks.
-            vi_usable_atol_cap = float(os.getenv("PYCUTFEM_DIRECT_SOLVE_USABLE_ATOL_VI", "1e-5") or "1e-5")
-            vi_usable_rtol_cap = float(os.getenv("PYCUTFEM_DIRECT_SOLVE_USABLE_RTOL_VI", "1e-3") or "1e-3")
+            # rejecting O(1e-3)-O(1e-2) relative solves causes expensive retry
+            # storms without materially changing the nonlinear step, but
+            # late-stage solves should tighten automatically as |G| shrinks.
+            vi_scale_factor = float(os.getenv("PYCUTFEM_DIRECT_SOLVE_USABLE_SCALE_VI", "2e-2") or "2e-2")
+            vi_usable_atol_cap = float(os.getenv("PYCUTFEM_DIRECT_SOLVE_USABLE_ATOL_VI", "5e-2") or "5e-2")
+            vi_usable_rtol_cap = float(os.getenv("PYCUTFEM_DIRECT_SOLVE_USABLE_RTOL_VI", "5e-2") or "5e-2")
             vi_usable_atol_floor = max(10.0 * newton_tol, 1.0e-8)
             vi_usable_rtol_floor = max(10.0 * max(newton_tol, newton_rtol), 1.0e-5)
             if np.isfinite(current_vi_res) and current_vi_res > 0.0:
-                vi_scale = max(1.0e-12, 1.0e-2 * current_vi_res)
+                vi_scale = max(1.0e-12, vi_scale_factor * current_vi_res)
                 usable_atol = min(vi_usable_atol_cap, max(vi_usable_atol_floor, vi_scale))
                 usable_rtol = min(vi_usable_rtol_cap, max(vi_usable_rtol_floor, vi_scale))
             else:
@@ -8544,6 +8648,7 @@ class PetscSnesNewtonSolver(NewtonSolver):
         # store; we’ll map to reduced each step/size
         self._box_lower_full = lo_full
         self._box_upper_full = hi_full
+        self._trace_reduced_box_bounds_summary()
 
         # If we are in a constraint (hanging-node) mode, bounds on slave DOFs do
         # not map cleanly to box constraints in the reduced/master space.
@@ -9395,6 +9500,180 @@ class PdasNewtonSolver(NewtonSolver):
         self._vi_anderson_history: list[dict[str, np.ndarray]] = []
         self._vi_row_scale_current: np.ndarray | None = None
         self._vi_row_scale_field_current: dict[str, float] = {}
+
+    @staticmethod
+    def _merge_vi_field_names(*groups: Sequence[str] | tuple[str, ...]) -> tuple[str, ...]:
+        merged: list[str] = []
+        seen: set[str] = set()
+        for group in groups:
+            for name in tuple(group or ()):
+                key = str(name).strip()
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                merged.append(key)
+        return tuple(merged)
+
+    def configure_identified_manifold_recovery(
+        self,
+        *,
+        proximal_fields: Sequence[str] = (),
+        ptc_fields: Sequence[str] = (),
+        arm_initial: bool = False,
+    ) -> None:
+        """
+        Enable the semismooth recovery package used by hard bounded monolithic
+        problems once the active set starts to stall or chatter.
+
+        This is intentionally a *preset* over the existing VI knobs rather than
+        a second solver path. It wires together the already-implemented local
+        affine rescue, field-proximal recovery, identified-manifold PTC, and
+        Anderson acceleration with values that are conservative on easy steps
+        and only activate when the semismooth solve stops making useful
+        progress.
+        """
+        self.vi_params.affine_cycle_fallback = True
+        self.vi_params.project_each_iteration = True
+        self.vi_params.accept_best_filtered_descent = True
+        self.vi_params.line_search_nonmonotone_window = max(
+            int(getattr(self.vi_params, "line_search_nonmonotone_window", 0) or 0),
+            5,
+        )
+        self.vi_params.line_search_nonmonotone_active_stable_iters = max(
+            int(getattr(self.vi_params, "line_search_nonmonotone_active_stable_iters", 0) or 0),
+            1,
+        )
+        self.vi_params.line_search_nonmonotone_ginf_trigger = max(
+            float(getattr(self.vi_params, "line_search_nonmonotone_ginf_trigger", 0.0) or 0.0),
+            2.5,
+        )
+        self.vi_params.line_search_nonmonotone_gap_ratio = max(
+            float(getattr(self.vi_params, "line_search_nonmonotone_gap_ratio", 1.0) or 1.0),
+            1.0,
+        )
+        self.vi_params.line_search_nonmonotone_eq_abs = max(
+            float(getattr(self.vi_params, "line_search_nonmonotone_eq_abs", 1.0e-10) or 1.0e-10),
+            1.0e-10,
+        )
+        self.vi_params.line_search_nonmonotone_disable_filter = True
+
+        prox_fields = self._merge_vi_field_names(
+            getattr(self.vi_params, "field_proximal_recovery_fields", ()) or (),
+            proximal_fields,
+        )
+        self.vi_params.field_proximal_recovery = True
+        self.vi_params.field_proximal_recovery_fields = prox_fields
+        self.vi_params.field_proximal_recovery_lambda0 = max(
+            float(getattr(self.vi_params, "field_proximal_recovery_lambda0", 1.0e-3) or 1.0e-3),
+            1.0e-2,
+        )
+        self.vi_params.field_proximal_recovery_lambda_max = max(
+            float(getattr(self.vi_params, "field_proximal_recovery_lambda_max", 1.0e6) or 1.0e6),
+            1.0e8,
+        )
+        self.vi_params.field_proximal_recovery_growth = max(
+            float(getattr(self.vi_params, "field_proximal_recovery_growth", 10.0) or 10.0),
+            5.0,
+        )
+        self.vi_params.field_proximal_recovery_max_tries = max(
+            int(getattr(self.vi_params, "field_proximal_recovery_max_tries", 6) or 6),
+            6,
+        )
+        self.vi_params.field_proximal_recovery_stable_iters = 0
+        self.vi_params.field_proximal_recovery_gap_ratio = max(
+            float(getattr(self.vi_params, "field_proximal_recovery_gap_ratio", 1.0) or 1.0),
+            1.0,
+        )
+        self.vi_params.field_proximal_recovery_eq_abs = max(
+            float(getattr(self.vi_params, "field_proximal_recovery_eq_abs", 1.0e-10) or 1.0e-10),
+            1.0e-10,
+        )
+        self.vi_params.field_proximal_recovery_identified_window = True
+        self.vi_params.field_proximal_recovery_ginf_max = max(
+            float(getattr(self.vi_params, "field_proximal_recovery_ginf_max", 0.0) or 0.0),
+            5.0,
+        )
+
+        ptc_fields_merged = self._merge_vi_field_names(
+            getattr(self.vi_params, "ptc_fields", ()) or (),
+            ptc_fields,
+        )
+        self.vi_params.ptc_recovery = True
+        self.vi_params.ptc_fields = ptc_fields_merged
+        self.vi_params.ptc_sigma0 = max(
+            float(getattr(self.vi_params, "ptc_sigma0", 1.0e-2) or 1.0e-2),
+            5.0e-2,
+        )
+        self.vi_params.ptc_sigma_max = max(
+            float(getattr(self.vi_params, "ptc_sigma_max", 1.0e6) or 1.0e6),
+            1.0e8,
+        )
+        self.vi_params.ptc_growth = max(
+            float(getattr(self.vi_params, "ptc_growth", 5.0) or 5.0),
+            5.0,
+        )
+        self.vi_params.ptc_decay = min(
+            max(float(getattr(self.vi_params, "ptc_decay", 0.5) or 0.5), 0.0),
+            0.5,
+        )
+        self.vi_params.ptc_stable_iters = 0
+        self.vi_params.ptc_gap_ratio = max(
+            float(getattr(self.vi_params, "ptc_gap_ratio", 1.0) or 1.0),
+            1.0,
+        )
+        self.vi_params.ptc_eq_abs = max(
+            float(getattr(self.vi_params, "ptc_eq_abs", 1.0e-10) or 1.0e-10),
+            1.0e-10,
+        )
+        self.vi_params.ptc_identified_window = True
+        self.vi_params.ptc_ginf_max = max(
+            float(getattr(self.vi_params, "ptc_ginf_max", 0.0) or 0.0),
+            5.0,
+        )
+        self.vi_params.ptc_freeze_complement = False
+
+        self.vi_params.anderson_acceleration = True
+        self.vi_params.anderson_history = max(
+            int(getattr(self.vi_params, "anderson_history", 3) or 3),
+            3,
+        )
+        self.vi_params.anderson_regularization = max(
+            float(getattr(self.vi_params, "anderson_regularization", 1.0e-10) or 1.0e-10),
+            1.0e-10,
+        )
+        self.vi_params.anderson_damping = min(
+            max(float(getattr(self.vi_params, "anderson_damping", 1.0) or 1.0), 0.25),
+            0.9,
+        )
+        self.vi_params.anderson_stable_iters = 1
+        self.vi_params.anderson_ginf_trigger = max(
+            float(getattr(self.vi_params, "anderson_ginf_trigger", 0.0) or 0.0),
+            5.0e-2,
+        )
+        self.vi_params.anderson_gap_ratio = max(
+            float(getattr(self.vi_params, "anderson_gap_ratio", 1.0) or 1.0),
+            1.0,
+        )
+        self.vi_params.anderson_eq_abs = max(
+            float(getattr(self.vi_params, "anderson_eq_abs", 1.0e-10) or 1.0e-10),
+            1.0e-10,
+        )
+        self.vi_params.anderson_ginf_max = max(
+            float(getattr(self.vi_params, "anderson_ginf_max", 0.0) or 0.0),
+            5.0,
+        )
+
+        if arm_initial:
+            if prox_fields and self.vi_params.field_proximal_recovery_lambda0 > 0.0:
+                self._vi_force_initial_field_prox_lambda = max(
+                    float(getattr(self, "_vi_force_initial_field_prox_lambda", 0.0) or 0.0),
+                    float(self.vi_params.field_proximal_recovery_lambda0),
+                )
+            if ptc_fields_merged and self.vi_params.ptc_sigma0 > 0.0:
+                self._vi_force_initial_ptc_sigma = max(
+                    float(getattr(self, "_vi_force_initial_ptc_sigma", 0.0) or 0.0),
+                    float(self.vi_params.ptc_sigma0),
+                )
 
     def set_linear_equalities(self, equalities: list[LinearEqualityConstraint] | None = None) -> None:
         cleaned: list[LinearEqualityConstraint] = []
@@ -10562,23 +10841,34 @@ class PdasNewtonSolver(NewtonSolver):
         )
         if not field_ready and not ptc_ready:
             return False
-        if (
+        force_field = bool(
             field_ready
             and self._vi_should_force_field_proximal_on_identified_window(
                 metrics=metrics,
                 active_stable_count=int(active_stable_count),
                 changed=int(changed),
             )
-        ) or (
+        )
+        force_ptc = bool(
             ptc_ready
             and self._vi_should_force_ptc_on_identified_window(
                 metrics=metrics,
                 active_stable_count=int(active_stable_count),
                 changed=int(changed),
             )
-        ):
-            return True
-        return (
+        )
+        if force_field or force_ptc:
+            # The identified-window guard is useful while the fixed working set
+            # is still producing meaningful progress. If accepted steps have
+            # already flattened out, repeatedly re-arming the guard can pin the
+            # solver on a stale manifold and prevent the next active-set move.
+            progress_alpha = float(accepted_alpha) >= 0.5
+            progress_merit = float(merit_ratio) < 0.995
+            progress_g = float(accepted_g_ratio) < 0.995
+            if progress_alpha and (progress_merit or progress_g):
+                return True
+            return False
+        if (
             field_ready
             and self._vi_should_arm_field_proximal_after_accept(
                 accepted_alpha=float(accepted_alpha),
@@ -10592,7 +10882,9 @@ class PdasNewtonSolver(NewtonSolver):
                 merit_ratio=float(merit_ratio),
                 accepted_g_ratio=float(accepted_g_ratio),
             )
-        )
+        ):
+            return True
+        return False
 
     def _vi_update_field_proximal_after_accept(
         self,
@@ -10687,9 +10979,19 @@ class PdasNewtonSolver(NewtonSolver):
             return
 
         cur = float(getattr(self, "_vi_ptc_sigma_current", 0.0) or 0.0)
+        if ptc_stalled or force_identified:
+            next_sigma = float(sigma0) if cur <= 0.0 else float(min(cur * sigma_growth, sigma_max))
+            if next_sigma > 0.0:
+                self._vi_ptc_sigma_current = float(next_sigma)
+                if os.getenv("PYCUTFEM_VI_TRACE_PTC", "").lower() in {"1", "true", "yes"}:
+                    reason = "identified-window" if force_identified and not ptc_stalled else "accepted-stall"
+                    print(
+                        f"        [vi-ptc] {reason} alpha={float(accepted_alpha):.2e} "
+                        f"merit_ratio={float(merit_ratio):.3f} G_ratio={float(accepted_g_ratio):.3f} "
+                        f"sigma->{self._vi_ptc_sigma_current:.2e}"
+                    )
+            return
         if cur <= 0.0:
-            if ptc_stalled or force_identified:
-                self._vi_ptc_sigma_current = float(sigma0)
             return
 
         # Once the PTC phase is already active, accepted steps should not make
@@ -11498,6 +11800,7 @@ class PdasNewtonSolver(NewtonSolver):
 
         self._box_lower_full = lo_full
         self._box_upper_full = hi_full
+        self._trace_reduced_box_bounds_summary()
 
         if getattr(self, "constraints", None) is not None:
             try:
@@ -12689,6 +12992,15 @@ class PdasNewtonSolver(NewtonSolver):
 
         # Optionally project the initial guess to be feasible.
         lo_red, hi_red = self._bounds_reduced()
+        no_finite_bounds = not np.any(np.isfinite(lo_red) | np.isfinite(hi_red))
+        no_linear_equalities = int(np.asarray(getattr(eq_data, "B_red", np.zeros((0, 0), dtype=float))).shape[0]) == 0
+        if no_finite_bounds and no_linear_equalities:
+            print(
+                "    [solver] current reduced PDAS stage has no finite box bounds or linear equalities; "
+                "falling back to plain Newton for this solve.",
+                flush=True,
+            )
+            return super()._newton_loop(funcs, prev_funcs, aux_funcs, bcs_now)
         if bool(getattr(self.vi_params, "project_initial_guess", True)):
             self._project_funcs_to_bounds(
                 funcs,
@@ -14368,6 +14680,26 @@ class PdasNewtonSolver(NewtonSolver):
                 x_next=x_acc,
                 lambda_next=np.asarray(self._vi_eq_lambda_current, dtype=float),
             )
+            accepted_norm_G = float(accepted_metrics.get("G_inf", metrics0["G_inf"]))
+            relaxed_why = _vi_relaxed_accept_reason(
+                norm_G=float(accepted_norm_G),
+                accept_factor=float(accept_factor),
+                atol=float(atol),
+                relaxed_g=float(getattr(self.vi_params, "relaxed_filter_accept_ginf", 0.0) or 0.0),
+            )
+            if relaxed_why is not None:
+                print(
+                    f"        [vi-accept] accepting current iterate since |G|_∞={float(accepted_norm_G):.3e} "
+                    f"<= {relaxed_why}."
+                )
+                self._last_nonlinear_norm = float(accepted_norm_G)
+                self._last_nonlinear_norm_label = "|G|_∞"
+                self._last_nonlinear_reason = 2
+                self._last_nonlinear_accepted = True
+                self._last_nonlinear_relaxed_accept = True
+                self._vi_eq_lambda_accepted = np.asarray(self._vi_eq_lambda_current, dtype=float).copy()
+                delta = np.hstack([f.nodal_values - f_prev.nodal_values for f, f_prev in zip(funcs, prev_funcs)])
+                return delta, True, it + 1
 
             lam0 = float(getattr(self.vi_params, "inactive_reg_lambda0", 0.0) or 0.0)
             lam_max = float(getattr(self.vi_params, "inactive_reg_lambda_max", 1.0e6) or 1.0e6)
@@ -14390,16 +14722,13 @@ class PdasNewtonSolver(NewtonSolver):
 
             print(f"          timings: solve={lin_time:.2e}s, line-search={ls_time:.2e}s, alpha={accepted_alpha:.2e}, merit_ratio={merit_ratio:.3f}")
 
-        relaxed_g = float(getattr(self.vi_params, "relaxed_filter_accept_ginf", 0.0) or 0.0)
-        final_accept = False
-        final_why = None
-        if accept_factor > 0.0 and atol > 0.0 and np.isfinite(last_norm_G) and last_norm_G <= accept_factor * atol:
-            final_accept = True
-            final_why = f"{accept_factor:g}·atol (atol={atol:.3e})"
-        elif relaxed_g > 0.0 and np.isfinite(last_norm_G) and last_norm_G <= relaxed_g:
-            final_accept = True
-            final_why = f"relaxed_filter_accept_ginf={relaxed_g:.3e}"
-        if final_accept:
+        final_why = _vi_relaxed_accept_reason(
+            norm_G=float(last_norm_G),
+            accept_factor=float(accept_factor),
+            atol=float(atol),
+            relaxed_g=float(getattr(self.vi_params, "relaxed_filter_accept_ginf", 0.0) or 0.0),
+        )
+        if final_why is not None:
             print(
                 f"    [warn] Accepting VI Newton best iterate since |G|_∞={last_norm_G:.3e} "
                 f"≤ {final_why}."

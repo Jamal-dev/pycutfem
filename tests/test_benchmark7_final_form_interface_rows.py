@@ -4,6 +4,7 @@ import numpy as np
 from examples.biofilms.benchmarks.seboldt.paper1_benchmark7_seboldt import (
     _build_forms,
     _create_problem,
+    _geometry_indicator_prime_array,
     _named_constant,
     _normalize_benchmark7_solver_choice,
     _parse_args,
@@ -25,6 +26,7 @@ from pycutfem.utils.meshgen import structured_quad
 
 def _build_final_form_problem(
     *,
+    p_shift: float = 0.0,
     p_pore_shift: float = 0.0,
     phi_shift: float = 0.0,
     phi_prev_shift: float = 0.0,
@@ -38,12 +40,43 @@ def _build_final_form_problem(
     disable_interface_physics: bool = False,
     final_form_constant_rho_s: bool = False,
     final_form_domain_lm: bool = False,
+    final_form_domain_lm_vf: bool | None = None,
+    final_form_domain_lm_p: bool | None = None,
+    final_form_domain_lm_vP: bool | None = None,
+    final_form_domain_lm_vS: bool | None = None,
+    final_form_domain_lm_p_pore: bool | None = None,
+    final_form_domain_lm_phi: bool | None = None,
+    final_form_domain_lm_u: bool | None = None,
     final_form_domain_lm_aug_gamma: float = 0.0,
+    final_form_domain_lm_free_weight_mode: str = "diffuse",
+    final_form_domain_lm_free_alpha_max: float | None = None,
     final_form_mass_lm_aug_gamma: float = 0.0,
     final_form_normal_lm_aug_gamma: float = 0.0,
+    final_form_quasistatic_porous_media: bool = False,
+    final_form_direct_interface_transfer: bool = False,
+    final_form_disable_pore_momentum: bool = False,
+    final_form_disable_solid_momentum: bool = False,
+    final_form_combined_porous_momentum: bool = False,
+    final_form_quasistatic_flip_pore_stress_sign: bool = False,
+    kappa_inv: float = 1.0e3,
+    fluid_velocity_y_shift: float = 0.0,
+    pore_velocity_y_shift: float = 0.0,
+    solid_velocity_y_shift: float = 0.0,
     solid_volumetric_split: bool = False,
     mu_mass_value: float = 0.0,
     mu_normal_value: float = 0.0,
+    mu_tangent_value: float = 0.0,
+    alpha_value: float | None = None,
+    alpha_prev_value: float | None = None,
+    phi_value: float | None = None,
+    gamma_phi: float = 0.0,
+    geometry_indicator_beta: float = 0.0,
+    geometry_indicator_mode: str = "raw",
+    final_form_phi_mode: str = "transport",
+    alpha_advect_with: str = "vS",
+    alpha_advection_form: str = "conservative",
+    support_physics: str = "stored_support",
+    alpha_biot: float = 1.0,
 ):
     problem = _create_problem(
         Lx=1.0,
@@ -57,19 +90,37 @@ def _build_final_form_problem(
         fluid_hdiv_order=0,
         enable_phi_evolution=True,
         one_domain_formulation="final_form",
-        final_form_phi_mode="transport",
+        final_form_phi_mode=final_form_phi_mode,
         final_form_constant_rho_s=final_form_constant_rho_s,
         final_form_domain_lm=final_form_domain_lm,
+        final_form_domain_lm_vf=final_form_domain_lm_vf,
+        final_form_domain_lm_p=final_form_domain_lm_p,
+        final_form_domain_lm_vP=final_form_domain_lm_vP,
+        final_form_domain_lm_vS=final_form_domain_lm_vS,
+        final_form_domain_lm_p_pore=final_form_domain_lm_p_pore,
+        final_form_domain_lm_phi=final_form_domain_lm_phi,
+        final_form_domain_lm_u=final_form_domain_lm_u,
+        final_form_quasistatic_porous_media=final_form_quasistatic_porous_media,
+        final_form_direct_interface_transfer=final_form_direct_interface_transfer,
+        final_form_disable_pore_momentum=final_form_disable_pore_momentum,
+        final_form_disable_solid_momentum=final_form_disable_solid_momentum,
+        final_form_combined_porous_momentum=final_form_combined_porous_momentum,
+        final_form_domain_lm_free_weight_mode=final_form_domain_lm_free_weight_mode,
+        final_form_domain_lm_free_alpha_max=final_form_domain_lm_free_alpha_max,
         solid_volumetric_split=solid_volumetric_split,
     )
 
-    problem["v_k"].set_values_from_function(lambda x, y: np.array([0.15 + 0.02 * x, -0.03 + 0.04 * y]))
-    problem["v_n"].set_values_from_function(lambda x, y: np.array([0.10 + 0.01 * x, -0.02 + 0.03 * y]))
+    problem["v_k"].set_values_from_function(
+        lambda x, y: np.array([0.15 + 0.02 * x, -0.03 + 0.04 * y + float(fluid_velocity_y_shift)])
+    )
+    problem["v_n"].set_values_from_function(
+        lambda x, y: np.array([0.10 + 0.01 * x, -0.02 + 0.03 * y + float(fluid_velocity_y_shift)])
+    )
     problem["vP_k"].set_values_from_function(
         lambda x, y: np.array(
             [
                 0.05 + (0.03 + float(pore_shear_shift)) * x,
-                0.07 - (0.02 - 0.5 * float(pore_shear_shift)) * y,
+                0.07 - (0.02 - 0.5 * float(pore_shear_shift)) * y + float(pore_velocity_y_shift),
             ]
         )
     )
@@ -77,7 +128,7 @@ def _build_final_form_problem(
         lambda x, y: np.array(
             [
                 0.02 + (0.02 + 0.5 * float(pore_shear_shift)) * x,
-                0.05 - (0.01 - 0.25 * float(pore_shear_shift)) * y,
+                0.05 - (0.01 - 0.25 * float(pore_shear_shift)) * y + float(pore_velocity_y_shift),
             ]
         )
     )
@@ -85,7 +136,7 @@ def _build_final_form_problem(
         lambda x, y: np.array(
             [
                 -0.01 + 0.01 * x + 0.5 * float(solid_velocity_shift) * x,
-                0.04 + 0.02 * y + float(solid_velocity_shift) * (0.25 + y),
+                0.04 + 0.02 * y + float(solid_velocity_shift) * (0.25 + y) + float(solid_velocity_y_shift),
             ]
         )
     )
@@ -93,7 +144,7 @@ def _build_final_form_problem(
         lambda x, y: np.array(
             [
                 -0.02 + 0.01 * x + 0.25 * float(solid_velocity_shift) * x,
-                0.03 + 0.01 * y + 0.5 * float(solid_velocity_shift) * (0.25 + y),
+                0.03 + 0.01 * y + 0.5 * float(solid_velocity_shift) * (0.25 + y) + float(solid_velocity_y_shift),
             ]
         )
     )
@@ -103,16 +154,26 @@ def _build_final_form_problem(
     problem["u_n"].set_values_from_function(
         lambda x, y: np.array([0.008 + 0.015 * x * y + 0.5 * float(u_shift) * x, -0.010 + 0.006 * y + 0.5 * float(u_shift) * y])
     )
-    problem["p_k"].set_values_from_function(lambda x, y: 0.3 + 0.1 * x - 0.05 * y)
-    problem["p_n"].set_values_from_function(lambda x, y: 0.2 + 0.05 * x - 0.03 * y)
+    problem["p_k"].set_values_from_function(lambda x, y: 0.3 + 0.1 * x - 0.05 * y + float(p_shift))
+    problem["p_n"].set_values_from_function(lambda x, y: 0.2 + 0.05 * x - 0.03 * y + float(p_shift))
     problem["p_pore_k"].set_values_from_function(lambda x, y: 0.25 - 0.04 * x + 0.08 * y + float(p_pore_shift))
     problem["p_pore_n"].set_values_from_function(lambda x, y: 0.18 - 0.02 * x + 0.05 * y + float(p_pore_shift))
-    problem["alpha_k"].set_values_from_function(lambda x, y: 0.45 + 0.10 * x + 0.08 * y)
-    problem["alpha_n"].set_values_from_function(lambda x, y: 0.40 + 0.08 * x + 0.06 * y)
-    problem["phi_k"].set_values_from_function(lambda x, y: 0.32 + 0.04 * x - 0.03 * y + float(phi_shift))
-    problem["phi_n"].set_values_from_function(
-        lambda x, y: 0.30 + 0.03 * x - 0.02 * y + float(phi_shift) + float(phi_prev_shift)
-    )
+    if alpha_value is None:
+        problem["alpha_k"].set_values_from_function(lambda x, y: 0.45 + 0.10 * x + 0.08 * y)
+        problem["alpha_n"].set_values_from_function(lambda x, y: 0.40 + 0.08 * x + 0.06 * y)
+    else:
+        problem["alpha_k"].set_values_from_function(lambda x, y: float(alpha_value))
+        problem["alpha_n"].set_values_from_function(
+            lambda x, y: float(alpha_value if alpha_prev_value is None else alpha_prev_value)
+        )
+    if phi_value is None:
+        problem["phi_k"].set_values_from_function(lambda x, y: 0.32 + 0.04 * x - 0.03 * y + float(phi_shift))
+        problem["phi_n"].set_values_from_function(
+            lambda x, y: 0.30 + 0.03 * x - 0.02 * y + float(phi_shift) + float(phi_prev_shift)
+        )
+    else:
+        problem["phi_k"].set_values_from_function(lambda x, y: float(phi_value))
+        problem["phi_n"].set_values_from_function(lambda x, y: float(phi_value) + float(phi_prev_shift))
     if problem.get("rho_s_k") is not None:
         problem["rho_s_k"].set_values_from_function(lambda x, y: 1.10 + 0.05 * x + 0.02 * y)
         problem["rho_s_n"].set_values_from_function(lambda x, y: 1.08 + 0.04 * x + 0.01 * y)
@@ -159,6 +220,13 @@ def _build_final_form_problem(
             problem["mu_normal_k"].set_values_from_function(lambda x, y: float(mu_normal_value))
         except NotImplementedError:
             problem["mu_normal_k"].nodal_values[:] = float(mu_normal_value)
+    if problem.get("mu_tangent_k") is not None and float(mu_tangent_value) != 0.0:
+        try:
+            problem["mu_tangent_k"].set_values_from_function(lambda x, y: float(mu_tangent_value))
+        except NotImplementedError:
+            problem["mu_tangent_k"].nodal_values[:] = float(mu_tangent_value)
+    problem["geometry_indicator_beta"] = float(geometry_indicator_beta)
+    problem["geometry_indicator_mode"] = str(geometry_indicator_mode)
 
     forms = _build_forms(
         problem,
@@ -169,7 +237,7 @@ def _build_final_form_problem(
         mu_f=0.035,
         mu_b=0.035,
         mu_b_model="mu",
-        kappa_inv=1.0e3,
+        kappa_inv=float(kappa_inv),
         mu_s=1.67785e5,
         lambda_s=8.22148e6,
         phi_b=0.30,
@@ -202,7 +270,15 @@ def _build_final_form_problem(
         gamma_rho_s_pin=0.0,
         final_form_constant_rho_s=final_form_constant_rho_s,
         final_form_domain_lm=final_form_domain_lm,
+        final_form_quasistatic_porous_media=final_form_quasistatic_porous_media,
+        final_form_quasistatic_flip_pore_stress_sign=final_form_quasistatic_flip_pore_stress_sign,
+        final_form_direct_interface_transfer=final_form_direct_interface_transfer,
+        final_form_disable_pore_momentum=final_form_disable_pore_momentum,
+        final_form_disable_solid_momentum=final_form_disable_solid_momentum,
+        final_form_combined_porous_momentum=final_form_combined_porous_momentum,
         final_form_domain_lm_aug_gamma=float(final_form_domain_lm_aug_gamma),
+        final_form_domain_lm_free_weight_mode=str(final_form_domain_lm_free_weight_mode),
+        final_form_domain_lm_free_alpha_max=final_form_domain_lm_free_alpha_max,
         final_form_mass_lm_aug_gamma=float(final_form_mass_lm_aug_gamma),
         final_form_normal_lm_aug_gamma=float(final_form_normal_lm_aug_gamma),
         vS_cip=0.0,
@@ -211,7 +287,7 @@ def _build_final_form_problem(
         gamma_vS_pin=0.0,
         D_phi=0.0,
         phi_diffusion_weight="fluid",
-        gamma_phi=0.0,
+        gamma_phi=float(gamma_phi),
         phi_supg=0.0,
         phi_cip=0.0,
         alpha_supg=0.0,
@@ -221,8 +297,8 @@ def _build_final_form_problem(
         alpha_reg_eps_normal=0.05,
         alpha_reg_eps_tangent=0.0125,
         alpha_reg_eta=1.0e-12,
-        alpha_advect_with="vS",
-        alpha_advection_form="conservative",
+        alpha_advect_with=str(alpha_advect_with),
+        alpha_advection_form=str(alpha_advection_form),
         solid_model="linear",
         kappa_inv_model="spatial",
         enable_phi_evolution=True,
@@ -230,9 +306,9 @@ def _build_final_form_problem(
         rho_s0_tilde=1.1,
         skeleton_inertia_convection="lagged",
         fluid_convection="off",
-        support_physics="stored_support",
+        support_physics=str(support_physics),
         skeleton_pressure_mode="seboldt",
-        alpha_biot=1.0,
+        alpha_biot=float(alpha_biot),
         full_ratio_free_state=False,
         split_primary_darcy_flux=False,
         split_pore_flux_model="exact_conservative_p",
@@ -339,6 +415,533 @@ def test_benchmark7_final_form_pore_bulk_row_responds_to_viscous_pore_shear() ->
 
     assert np.linalg.norm(pore_bulk_x_shift - pore_bulk_x_ref, ord=np.inf) > 1.0e-10
     assert np.linalg.norm(pore_bulk_y_shift - pore_bulk_y_ref, ord=np.inf) > 1.0e-10
+
+
+def test_benchmark7_final_form_quasistatic_pore_bulk_drops_pore_shear() -> None:
+    problem_ref, forms_ref = _build_final_form_problem(
+        final_form_constant_rho_s=True,
+        final_form_quasistatic_porous_media=True,
+        pore_shear_shift=0.0,
+        p_pore_shift=0.0,
+        kappa_inv=0.0,
+    )
+    problem_shift, forms_shift = _build_final_form_problem(
+        final_form_constant_rho_s=True,
+        final_form_quasistatic_porous_media=True,
+        pore_shear_shift=0.12,
+        p_pore_shift=0.0,
+        kappa_inv=0.0,
+    )
+
+    pore_bulk_x_ref = _assemble_block(problem_ref, forms_ref.r_momentum_terms["pore_bulk"], "vP_x")
+    pore_bulk_x_shift = _assemble_block(problem_shift, forms_shift.r_momentum_terms["pore_bulk"], "vP_x")
+    pore_bulk_y_ref = _assemble_block(problem_ref, forms_ref.r_momentum_terms["pore_bulk"], "vP_y")
+    pore_bulk_y_shift = _assemble_block(problem_shift, forms_shift.r_momentum_terms["pore_bulk"], "vP_y")
+
+    assert np.linalg.norm(pore_bulk_x_shift - pore_bulk_x_ref, ord=np.inf) < 1.0e-12
+    assert np.linalg.norm(pore_bulk_y_shift - pore_bulk_y_ref, ord=np.inf) < 1.0e-12
+
+
+def test_benchmark7_final_form_quasistatic_pore_bulk_responds_to_pore_pressure() -> None:
+    problem_ref, forms_ref = _build_final_form_problem(
+        final_form_constant_rho_s=True,
+        final_form_quasistatic_porous_media=True,
+        p_pore_shift=0.0,
+    )
+    problem_shift, forms_shift = _build_final_form_problem(
+        final_form_constant_rho_s=True,
+        final_form_quasistatic_porous_media=True,
+        p_pore_shift=0.15,
+    )
+
+    pore_bulk_x_ref = _assemble_block(problem_ref, forms_ref.r_momentum_terms["pore_bulk"], "vP_x")
+    pore_bulk_x_shift = _assemble_block(problem_shift, forms_shift.r_momentum_terms["pore_bulk"], "vP_x")
+    pore_bulk_y_ref = _assemble_block(problem_ref, forms_ref.r_momentum_terms["pore_bulk"], "vP_y")
+    pore_bulk_y_shift = _assemble_block(problem_shift, forms_shift.r_momentum_terms["pore_bulk"], "vP_y")
+
+    assert np.linalg.norm(pore_bulk_x_shift - pore_bulk_x_ref, ord=np.inf) > 1.0e-10
+    assert np.linalg.norm(pore_bulk_y_shift - pore_bulk_y_ref, ord=np.inf) > 1.0e-10
+
+
+def test_benchmark7_final_form_quasistatic_flip_pore_stress_sign_reverses_pressure_row() -> None:
+    problem_neg, forms_neg = _build_final_form_problem(
+        final_form_constant_rho_s=True,
+        final_form_quasistatic_porous_media=True,
+        final_form_quasistatic_flip_pore_stress_sign=False,
+        kappa_inv=0.0,
+    )
+    problem_pos, forms_pos = _build_final_form_problem(
+        final_form_constant_rho_s=True,
+        final_form_quasistatic_porous_media=True,
+        final_form_quasistatic_flip_pore_stress_sign=True,
+        kappa_inv=0.0,
+    )
+
+    pore_bulk_x_neg = _assemble_block(problem_neg, forms_neg.r_momentum_terms["pore_bulk"], "vP_x")
+    pore_bulk_x_pos = _assemble_block(problem_pos, forms_pos.r_momentum_terms["pore_bulk"], "vP_x")
+    pore_bulk_y_neg = _assemble_block(problem_neg, forms_neg.r_momentum_terms["pore_bulk"], "vP_y")
+    pore_bulk_y_pos = _assemble_block(problem_pos, forms_pos.r_momentum_terms["pore_bulk"], "vP_y")
+
+    assert np.linalg.norm(pore_bulk_x_neg, ord=np.inf) > 1.0e-10
+    assert np.linalg.norm(pore_bulk_y_neg, ord=np.inf) > 1.0e-10
+    assert np.linalg.norm(pore_bulk_x_pos + pore_bulk_x_neg, ord=np.inf) < 1.0e-12
+    assert np.linalg.norm(pore_bulk_y_pos + pore_bulk_y_neg, ord=np.inf) < 1.0e-12
+
+
+def test_benchmark7_final_form_quasistatic_pore_bulk_drops_grad_phi_pressure_coupling() -> None:
+    problem_ref, forms_ref = _build_final_form_problem(
+        final_form_constant_rho_s=True,
+        final_form_quasistatic_porous_media=True,
+        phi_shift=0.0,
+        kappa_inv=0.0,
+    )
+    problem_shift, forms_shift = _build_final_form_problem(
+        final_form_constant_rho_s=True,
+        final_form_quasistatic_porous_media=True,
+        phi_shift=0.15,
+        kappa_inv=0.0,
+    )
+
+    pore_bulk_x_ref = _assemble_block(problem_ref, forms_ref.r_momentum_terms["pore_bulk"], "vP_x")
+    pore_bulk_x_shift = _assemble_block(problem_shift, forms_shift.r_momentum_terms["pore_bulk"], "vP_x")
+    pore_bulk_y_ref = _assemble_block(problem_ref, forms_ref.r_momentum_terms["pore_bulk"], "vP_y")
+    pore_bulk_y_shift = _assemble_block(problem_shift, forms_shift.r_momentum_terms["pore_bulk"], "vP_y")
+
+    assert np.linalg.norm(pore_bulk_x_shift - pore_bulk_x_ref, ord=np.inf) < 1.0e-12
+    assert np.linalg.norm(pore_bulk_y_shift - pore_bulk_y_ref, ord=np.inf) < 1.0e-12
+
+
+def test_benchmark7_final_form_quasistatic_solid_pressure_uses_biot_divergence_loading() -> None:
+    problem_ref, forms_ref = _build_final_form_problem(
+        final_form_constant_rho_s=True,
+        final_form_quasistatic_porous_media=True,
+        p_pore_shift=0.0,
+        phi_value=0.32,
+        alpha_biot=1.0,
+    )
+    problem_shift, forms_shift = _build_final_form_problem(
+        final_form_constant_rho_s=True,
+        final_form_quasistatic_porous_media=True,
+        p_pore_shift=0.2,
+        phi_value=0.32,
+        alpha_biot=1.0,
+    )
+    problem_zero, forms_zero = _build_final_form_problem(
+        final_form_constant_rho_s=True,
+        final_form_quasistatic_porous_media=True,
+        p_pore_shift=0.2,
+        phi_value=0.32,
+        alpha_biot=0.0,
+    )
+
+    pressure_grad_ref = _assemble_block(
+        problem_ref,
+        forms_ref.r_skeleton_terms["pore_pressure_grad_phi"],
+        "vS_y",
+    )
+    pressure_grad_shift = _assemble_block(
+        problem_shift,
+        forms_shift.r_skeleton_terms["pore_pressure_grad_phi"],
+        "vS_y",
+    )
+    pressure_grad_zero = _assemble_block(
+        problem_zero,
+        forms_zero.r_skeleton_terms["pore_pressure_grad_phi"],
+        "vS_y",
+    )
+
+    delta = pressure_grad_shift - pressure_grad_ref
+
+    assert np.linalg.norm(delta, ord=np.inf) > 1.0e-10
+    assert np.linalg.norm(pressure_grad_zero, ord=np.inf) < 1.0e-12
+
+
+def test_benchmark7_final_form_quasistatic_interface_normal_pore_block_drops_phi_weighting() -> None:
+    problem_ref, forms_ref = _build_final_form_problem(
+        final_form_constant_rho_s=True,
+        final_form_quasistatic_porous_media=True,
+        mu_normal_value=0.2,
+        phi_value=0.32,
+    )
+    problem_shift, forms_shift = _build_final_form_problem(
+        final_form_constant_rho_s=True,
+        final_form_quasistatic_porous_media=True,
+        mu_normal_value=0.2,
+        phi_value=0.47,
+    )
+
+    mu_normal_ref = _assemble_block(
+        problem_ref,
+        forms_ref.r_momentum_terms["interface_normal_constraint"],
+        "mu_normal",
+    )
+    mu_normal_shift = _assemble_block(
+        problem_shift,
+        forms_shift.r_momentum_terms["interface_normal_constraint"],
+        "mu_normal",
+    )
+
+    assert np.linalg.norm(mu_normal_ref, ord=np.inf) > 1.0e-10
+    assert np.linalg.norm(mu_normal_shift - mu_normal_ref, ord=np.inf) < 1.0e-12
+
+
+def test_benchmark7_final_form_quasistatic_combined_row_can_replace_separate_rows() -> None:
+    problem, forms = _build_final_form_problem(
+        final_form_constant_rho_s=True,
+        final_form_quasistatic_porous_media=True,
+        final_form_disable_pore_momentum=True,
+        final_form_disable_solid_momentum=True,
+        final_form_combined_porous_momentum=True,
+    )
+
+    pore_bulk_x = _assemble_block(problem, forms.r_momentum_terms["pore_bulk"], "vP_x")
+    solid_bulk_x = _assemble_block(problem, forms.r_skeleton_terms["solid_bulk"], "vS_x")
+    combined_bulk_x = _assemble_block(problem, forms.r_skeleton_terms["combined_porous_bulk"], "vS_x")
+
+    assert np.linalg.norm(pore_bulk_x, ord=np.inf) < 1.0e-12
+    assert np.linalg.norm(solid_bulk_x, ord=np.inf) < 1.0e-12
+    assert np.linalg.norm(combined_bulk_x, ord=np.inf) > 1.0e-10
+
+
+def test_benchmark7_final_form_quasistatic_direct_interface_traction_drives_porous_row_from_full_jump() -> None:
+    problem_ref, forms_ref = _build_final_form_problem(
+        final_form_constant_rho_s=True,
+        final_form_quasistatic_porous_media=True,
+        p_shift=0.0,
+        p_pore_shift=0.0,
+    )
+    problem_fluid_shift, forms_fluid_shift = _build_final_form_problem(
+        final_form_constant_rho_s=True,
+        final_form_quasistatic_porous_media=True,
+        p_shift=0.2,
+        p_pore_shift=0.0,
+    )
+    problem_pore_shift, forms_pore_shift = _build_final_form_problem(
+        final_form_constant_rho_s=True,
+        final_form_quasistatic_porous_media=True,
+        p_shift=0.0,
+        p_pore_shift=0.2,
+    )
+
+    traction_free_ref = _assemble_block(problem_ref, forms_ref.r_momentum_terms["direct_interface_traction_free"], "v_x")
+    traction_free_shift = _assemble_block(problem_fluid_shift, forms_fluid_shift.r_momentum_terms["direct_interface_traction_free"], "v_x")
+    traction_porous_ref = _assemble_block(problem_ref, forms_ref.r_skeleton_terms["direct_interface_traction_porous"], "vS_x")
+    traction_porous_fluid_shift = _assemble_block(
+        problem_fluid_shift,
+        forms_fluid_shift.r_skeleton_terms["direct_interface_traction_porous"],
+        "vS_x",
+    )
+    traction_porous_shift = _assemble_block(
+        problem_pore_shift,
+        forms_pore_shift.r_skeleton_terms["direct_interface_traction_porous"],
+        "vS_x",
+    )
+
+    assert np.linalg.norm(traction_free_ref, ord=np.inf) < 1.0e-12
+    assert np.linalg.norm(traction_free_shift, ord=np.inf) < 1.0e-12
+    assert np.linalg.norm(traction_porous_ref, ord=np.inf) > 1.0e-10
+    assert np.linalg.norm(traction_porous_fluid_shift - traction_porous_ref, ord=np.inf) > 1.0e-10
+    assert np.linalg.norm(traction_porous_shift - traction_porous_ref, ord=np.inf) > 1.0e-10
+
+
+def test_benchmark7_final_form_quasistatic_direct_interface_traction_loads_vsy_upward_for_positive_fluid_pressure() -> None:
+    problem_ref, forms_ref = _build_final_form_problem(
+        final_form_constant_rho_s=True,
+        final_form_quasistatic_porous_media=True,
+        final_form_direct_interface_transfer=True,
+        p_shift=0.0,
+        p_pore_shift=0.0,
+    )
+    problem_shift, forms_shift = _build_final_form_problem(
+        final_form_constant_rho_s=True,
+        final_form_quasistatic_porous_media=True,
+        final_form_direct_interface_transfer=True,
+        p_shift=0.2,
+        p_pore_shift=0.0,
+    )
+
+    traction_ref = _assemble_block(
+        problem_ref,
+        forms_ref.r_skeleton_terms["direct_interface_traction_porous"],
+        "vS_y",
+    )
+    traction_shift = _assemble_block(
+        problem_shift,
+        forms_shift.r_skeleton_terms["direct_interface_traction_porous"],
+        "vS_y",
+    )
+
+    delta = traction_shift - traction_ref
+
+    assert np.linalg.norm(delta, ord=np.inf) > 1.0e-10
+    assert float(np.min(delta)) > 0.0
+    assert float(np.sum(delta)) > 0.0
+
+
+def test_benchmark7_final_form_quasistatic_direct_interface_mass_drives_porous_row_from_full_jump() -> None:
+    problem_ref, forms_ref = _build_final_form_problem(
+        final_form_constant_rho_s=True,
+        final_form_quasistatic_porous_media=True,
+        fluid_velocity_y_shift=0.0,
+        pore_velocity_y_shift=0.0,
+        solid_velocity_y_shift=0.0,
+    )
+    problem_fluid_shift, forms_fluid_shift = _build_final_form_problem(
+        final_form_constant_rho_s=True,
+        final_form_quasistatic_porous_media=True,
+        fluid_velocity_y_shift=0.2,
+        pore_velocity_y_shift=0.0,
+        solid_velocity_y_shift=0.0,
+    )
+    problem_porous_shift, forms_porous_shift = _build_final_form_problem(
+        final_form_constant_rho_s=True,
+        final_form_quasistatic_porous_media=True,
+        fluid_velocity_y_shift=0.0,
+        pore_velocity_y_shift=0.15,
+        solid_velocity_y_shift=0.1,
+    )
+
+    mass_free_ref = _assemble_block(problem_ref, forms_ref.r_mass_terms["direct_interface_mass_free"], "p")
+    mass_free_shift = _assemble_block(problem_fluid_shift, forms_fluid_shift.r_mass_terms["direct_interface_mass_free"], "p")
+    mass_porous_ref = _assemble_block(problem_ref, forms_ref.r_mass_terms["direct_interface_mass_porous"], "p_pore")
+    mass_porous_fluid_shift = _assemble_block(
+        problem_fluid_shift,
+        forms_fluid_shift.r_mass_terms["direct_interface_mass_porous"],
+        "p_pore",
+    )
+    mass_porous_shift = _assemble_block(problem_porous_shift, forms_porous_shift.r_mass_terms["direct_interface_mass_porous"], "p_pore")
+
+    assert np.linalg.norm(mass_free_ref, ord=np.inf) < 1.0e-12
+    assert np.linalg.norm(mass_free_shift, ord=np.inf) < 1.0e-12
+    assert np.linalg.norm(mass_porous_ref, ord=np.inf) > 1.0e-10
+    assert np.linalg.norm(mass_porous_fluid_shift - mass_porous_ref, ord=np.inf) > 1.0e-10
+    assert np.linalg.norm(mass_porous_shift - mass_porous_ref, ord=np.inf) > 1.0e-10
+
+
+def test_benchmark7_final_form_quasistatic_zero_porous_state_still_has_mixed_residual() -> None:
+    problem, forms = _build_final_form_problem(
+        final_form_constant_rho_s=True,
+        final_form_quasistatic_porous_media=True,
+    )
+
+    for key in ("vP_k", "vP_n", "vS_k", "vS_n", "u_k", "u_n"):
+        problem[key].nodal_values[:] = 0.0
+    for key in ("p_pore_k", "p_pore_n"):
+        problem[key].nodal_values[:] = 0.0
+
+    pore_row = _assemble_block(problem, forms.r_pore, "p_pore")
+    skel_row = _assemble_block(problem, forms.r_skeleton, "vS_x")
+
+    assert np.linalg.norm(pore_row, ord=np.inf) > 1.0e-10
+    assert np.linalg.norm(skel_row, ord=np.inf) > 1.0e-10
+
+
+def test_benchmark7_final_form_quasistatic_alpha_closure_keeps_pore_continuity_row() -> None:
+    problem_ref, forms_ref = _build_final_form_problem(
+        final_form_constant_rho_s=True,
+        final_form_quasistatic_porous_media=True,
+        final_form_phi_mode="alpha_closure",
+    )
+    problem_vel_shift, forms_vel_shift = _build_final_form_problem(
+        final_form_constant_rho_s=True,
+        final_form_quasistatic_porous_media=True,
+        final_form_phi_mode="alpha_closure",
+        pore_velocity_y_shift=0.2,
+        solid_velocity_y_shift=-0.1,
+    )
+    problem_pp_shift, forms_pp_shift = _build_final_form_problem(
+        final_form_constant_rho_s=True,
+        final_form_quasistatic_porous_media=True,
+        final_form_phi_mode="alpha_closure",
+        p_pore_shift=0.4,
+    )
+
+    pore_ref = _assemble_block(problem_ref, forms_ref.r_pore, "p_pore")
+    pore_vel_shift = _assemble_block(problem_vel_shift, forms_vel_shift.r_pore, "p_pore")
+    pore_pp_shift = _assemble_block(problem_pp_shift, forms_pp_shift.r_pore, "p_pore")
+
+    assert np.linalg.norm(pore_ref, ord=np.inf) > 1.0e-10
+    assert np.linalg.norm(pore_vel_shift - pore_ref, ord=np.inf) > 1.0e-10
+    assert np.linalg.norm(pore_pp_shift - pore_ref, ord=np.inf) < 1.0e-12
+
+
+def test_benchmark7_final_form_quasistatic_pins_interface_multiplier_rows() -> None:
+    problem_ref, forms_ref = _build_final_form_problem(
+        final_form_constant_rho_s=True,
+        final_form_quasistatic_porous_media=True,
+        p_pore_shift=0.0,
+        fluid_velocity_y_shift=0.0,
+    )
+    problem_shift, forms_shift = _build_final_form_problem(
+        final_form_constant_rho_s=True,
+        final_form_quasistatic_porous_media=True,
+        p_pore_shift=0.2,
+        fluid_velocity_y_shift=0.15,
+        u_shift=0.1,
+    )
+
+    mu_mass_ref = _assemble_block(
+        problem_ref,
+        forms_ref.r_momentum_terms["interface_mass_constraint"],
+        "mu_mass",
+    )
+    mu_mass_shift = _assemble_block(
+        problem_shift,
+        forms_shift.r_momentum_terms["interface_mass_constraint"],
+        "mu_mass",
+    )
+    mu_normal_ref = _assemble_block(
+        problem_ref,
+        forms_ref.r_momentum_terms["interface_normal_constraint"],
+        "mu_normal",
+    )
+    mu_normal_shift = _assemble_block(
+        problem_shift,
+        forms_shift.r_momentum_terms["interface_normal_constraint"],
+        "mu_normal",
+    )
+    mu_tangent_ref = _assemble_block(
+        problem_ref,
+        forms_ref.r_momentum_terms["interface_tangential_constraint"],
+        "mu_tangent",
+    )
+    mu_tangent_shift = _assemble_block(
+        problem_shift,
+        forms_shift.r_momentum_terms["interface_tangential_constraint"],
+        "mu_tangent",
+    )
+
+    assert np.linalg.norm(mu_mass_shift - mu_mass_ref, ord=np.inf) < 1.0e-12
+    assert np.linalg.norm(mu_normal_shift - mu_normal_ref, ord=np.inf) < 1.0e-12
+    assert np.linalg.norm(mu_tangent_shift - mu_tangent_ref, ord=np.inf) < 1.0e-12
+
+
+def test_benchmark7_final_form_quasistatic_zeroes_interface_multiplier_bulk_couplings() -> None:
+    problem, forms = _build_final_form_problem(
+        final_form_constant_rho_s=True,
+        final_form_quasistatic_porous_media=True,
+        mu_mass_value=0.3,
+        mu_normal_value=0.2,
+        mu_tangent_value=0.1,
+    )
+
+    for term_key, field_name in (
+        ("interface_mass_bulk_coupling", "v_y"),
+        ("interface_normal_bulk_coupling", "v_y"),
+        ("interface_tangential_bulk_coupling", "v_y"),
+        ("interface_mass_bulk_coupling", "vP_y"),
+        ("interface_tangential_bulk_coupling", "vS_y"),
+    ):
+        block = _assemble_block(problem, forms.r_momentum_terms[term_key], field_name)
+        assert np.linalg.norm(block, ord=np.inf) < 1.0e-12
+
+
+def test_benchmark7_final_form_quasistatic_phi_row_uses_transient_pore_mass_transport() -> None:
+    problem_ref, forms_ref = _build_final_form_problem(
+        final_form_constant_rho_s=True,
+        final_form_quasistatic_porous_media=True,
+        phi_prev_shift=0.0,
+    )
+    problem_shift, forms_shift = _build_final_form_problem(
+        final_form_constant_rho_s=True,
+        final_form_quasistatic_porous_media=True,
+        phi_prev_shift=0.05,
+    )
+
+    phi_ref = _assemble_block(problem_ref, forms_ref.r_phi, "phi")
+    phi_shift = _assemble_block(problem_shift, forms_shift.r_phi, "phi")
+
+    assert np.linalg.norm(phi_shift - phi_ref, ord=np.inf) > 1.0e-10
+
+
+def test_benchmark7_final_form_quasistatic_phi_row_uses_pore_flux_not_solid_flux() -> None:
+    problem_ref, forms_ref = _build_final_form_problem(
+        final_form_constant_rho_s=True,
+        final_form_quasistatic_porous_media=True,
+        pore_velocity_y_shift=0.0,
+        solid_velocity_y_shift=0.0,
+    )
+    problem_pore_shift, forms_pore_shift = _build_final_form_problem(
+        final_form_constant_rho_s=True,
+        final_form_quasistatic_porous_media=True,
+        pore_velocity_y_shift=0.2,
+        solid_velocity_y_shift=0.0,
+    )
+    problem_solid_shift, forms_solid_shift = _build_final_form_problem(
+        final_form_constant_rho_s=True,
+        final_form_quasistatic_porous_media=True,
+        pore_velocity_y_shift=0.0,
+        solid_velocity_y_shift=0.2,
+    )
+
+    phi_ref = _assemble_block(problem_ref, forms_ref.r_phi, "phi")
+    phi_pore_shift = _assemble_block(problem_pore_shift, forms_pore_shift.r_phi, "phi")
+    phi_solid_shift = _assemble_block(problem_solid_shift, forms_solid_shift.r_phi, "phi")
+
+    assert np.linalg.norm(phi_pore_shift - phi_ref, ord=np.inf) > 1.0e-10
+    assert np.linalg.norm(phi_solid_shift - phi_ref, ord=np.inf) < 1.0e-12
+
+
+def test_benchmark7_final_form_quasistatic_phi_row_keeps_free_fluid_phi_penalty() -> None:
+    problem_ref, forms_ref = _build_final_form_problem(
+        final_form_constant_rho_s=True,
+        final_form_quasistatic_porous_media=True,
+        alpha_value=0.0,
+        phi_value=1.0,
+        gamma_phi=5.0,
+    )
+    problem_shift, forms_shift = _build_final_form_problem(
+        final_form_constant_rho_s=True,
+        final_form_quasistatic_porous_media=True,
+        alpha_value=0.0,
+        phi_value=0.8,
+        gamma_phi=5.0,
+    )
+
+    phi_ref = _assemble_block(problem_ref, forms_ref.r_phi, "phi")
+    phi_shift = _assemble_block(problem_shift, forms_shift.r_phi, "phi")
+
+    assert np.linalg.norm(phi_shift - phi_ref, ord=np.inf) > 1.0e-10
+
+
+def test_benchmark7_final_form_alpha_row_can_use_biofilm_volume_flux() -> None:
+    problem_ref, forms_ref = _build_final_form_problem(
+        final_form_constant_rho_s=True,
+        final_form_phi_mode="transport",
+        support_physics="internal_conversion",
+        alpha_advect_with="biofilm_volume",
+        alpha_advection_form="conservative_weak",
+        phi_value=0.3,
+        pore_velocity_y_shift=0.0,
+        solid_velocity_y_shift=0.0,
+    )
+    problem_shift, forms_shift = _build_final_form_problem(
+        final_form_constant_rho_s=True,
+        final_form_phi_mode="transport",
+        support_physics="internal_conversion",
+        alpha_advect_with="biofilm_volume",
+        alpha_advection_form="conservative_weak",
+        phi_value=0.3,
+        pore_velocity_y_shift=0.2,
+        solid_velocity_y_shift=0.0,
+    )
+
+    alpha_ref = _assemble_block(problem_ref, forms_ref.r_alpha, "alpha")
+    alpha_shift = _assemble_block(problem_shift, forms_shift.r_alpha, "alpha")
+
+    assert np.linalg.norm(alpha_shift - alpha_ref, ord=np.inf) > 1.0e-10
+
+
+def test_benchmark7_parabolic_indicator_derivatives_match_closed_form() -> None:
+    alpha = np.linspace(0.0, 1.0, 9)
+    support_prime = _geometry_indicator_prime_array(alpha, beta=4.0, mode="parabolic_envelope")
+    free_prime = -4.0 * np.square(alpha - 0.5) + (1.0 - alpha) * (8.0 * (alpha - 0.5))
+
+    expected_support = 12.0 * np.square(alpha) - 8.0 * alpha + 1.0
+    expected_free = -12.0 * np.square(alpha) + 16.0 * alpha - 5.0
+
+    assert np.allclose(support_prime, expected_support)
+    assert np.allclose(free_prime, expected_free)
 
 
 def test_benchmark7_final_form_volumetric_split_builds_live_pi_row() -> None:
@@ -696,6 +1299,83 @@ def test_benchmark7_final_form_domain_lm_fields_use_dg0() -> None:
         assert orders[name] == 0
 
 
+def test_benchmark7_final_form_domain_lm_can_select_only_phi() -> None:
+    problem, forms = _build_final_form_problem(
+        final_form_constant_rho_s=True,
+        final_form_domain_lm_phi=True,
+    )
+    dh_fields = set(problem["dh"].field_names)
+    assert bool(problem["final_form_domain_lm"])
+    assert bool(problem["final_form_domain_lm_phi"])
+    assert "lm_phi" in dh_fields
+    assert "lm_vf_x" not in dh_fields
+    assert "support_kill_vf_row" not in (forms.r_domain_lm_terms or {})
+    assert "free_kill_phi_row" in (forms.r_domain_lm_terms or {})
+
+
+def test_benchmark7_final_form_domain_lm_can_select_phi_and_vf_without_other_targets() -> None:
+    problem, forms = _build_final_form_problem(
+        final_form_constant_rho_s=True,
+        final_form_domain_lm_vf=True,
+        final_form_domain_lm_phi=True,
+    )
+    dh_fields = set(problem["dh"].field_names)
+    assert "lm_vf_x" in dh_fields
+    assert "lm_vf_y" in dh_fields
+    assert "lm_phi" in dh_fields
+    assert "lm_vP_x" not in dh_fields
+    assert "support_kill_vf_row" in (forms.r_domain_lm_terms or {})
+    assert "free_kill_phi_row" in (forms.r_domain_lm_terms or {})
+    assert "free_kill_vP_row" not in (forms.r_domain_lm_terms or {})
+
+
+def test_benchmark7_final_form_domain_lm_uses_true_membership_weight_under_parabolic_mode() -> None:
+    problem_raw, forms_raw = _build_final_form_problem(
+        final_form_constant_rho_s=True,
+        final_form_domain_lm_phi=True,
+        alpha_value=0.9,
+        phi_value=0.2,
+        geometry_indicator_beta=4.0,
+        geometry_indicator_mode="raw",
+    )
+    problem_para, forms_para = _build_final_form_problem(
+        final_form_constant_rho_s=True,
+        final_form_domain_lm_phi=True,
+        alpha_value=0.9,
+        phi_value=0.2,
+        geometry_indicator_beta=4.0,
+        geometry_indicator_mode="parabolic_envelope",
+    )
+    row_raw = _assemble_block(problem_raw, forms_raw.r_domain_lm_terms["free_kill_phi_row"], "lm_phi")
+    row_para = _assemble_block(problem_para, forms_para.r_domain_lm_terms["free_kill_phi_row"], "lm_phi")
+    np.testing.assert_allclose(row_para, row_raw, rtol=1.0e-12, atol=1.0e-12)
+
+
+def test_benchmark7_final_form_domain_lm_step_cutoff_uses_previous_alpha_state() -> None:
+    problem_on, forms_on = _build_final_form_problem(
+        final_form_constant_rho_s=True,
+        final_form_domain_lm_phi=True,
+        final_form_domain_lm_free_weight_mode="step_cutoff",
+        final_form_domain_lm_free_alpha_max=0.1,
+        alpha_value=0.0,
+        alpha_prev_value=0.0,
+        phi_value=0.2,
+    )
+    problem_off, forms_off = _build_final_form_problem(
+        final_form_constant_rho_s=True,
+        final_form_domain_lm_phi=True,
+        final_form_domain_lm_free_weight_mode="step_cutoff",
+        final_form_domain_lm_free_alpha_max=0.1,
+        alpha_value=0.0,
+        alpha_prev_value=0.2,
+        phi_value=0.2,
+    )
+    row_on = _assemble_block(problem_on, forms_on.r_domain_lm_terms["free_kill_phi_row"], "lm_phi")
+    row_off = _assemble_block(problem_off, forms_off.r_domain_lm_terms["free_kill_phi_row"], "lm_phi")
+    assert np.linalg.norm(row_on) > 1.0e-12
+    np.testing.assert_allclose(row_off, 0.0, rtol=1.0e-12, atol=1.0e-8)
+
+
 def test_benchmark7_final_form_interface_multiplier_fields_use_dg0() -> None:
     problem, _ = _build_final_form_problem(
         final_form_constant_rho_s=True,
@@ -902,6 +1582,57 @@ def test_benchmark7_final_form_domain_lm_disables_predictor_corrector_startup() 
     args = _normalize_benchmark7_solver_choice(args)
 
     assert not bool(args.predictor_corrector_startup)
+
+
+def test_benchmark7_final_form_domain_lm_subset_flags_do_not_enable_other_targets() -> None:
+    saved_argv = list(sys.argv)
+    try:
+        sys.argv = [
+            "pytest",
+            "--one-domain-formulation",
+            "final_form",
+            "--final-form-constant-rho-s",
+            "--final-form-domain-lm",
+            "--final-form-domain-lm-vP",
+            "--final-form-domain-lm-p-pore",
+        ]
+        args = _parse_args()
+    finally:
+        sys.argv = saved_argv
+
+    args = _normalize_benchmark7_solver_choice(args)
+
+    assert bool(args.final_form_domain_lm)
+    assert bool(args.final_form_domain_lm_vP)
+    assert bool(args.final_form_domain_lm_p_pore)
+    assert not bool(args.final_form_domain_lm_vf)
+    assert not bool(args.final_form_domain_lm_p)
+    assert not bool(args.final_form_domain_lm_vS)
+    assert not bool(args.final_form_domain_lm_phi)
+    assert not bool(args.final_form_domain_lm_u)
+
+
+def test_benchmark7_final_form_honors_explicit_zero_free_side_penalties() -> None:
+    saved_argv = list(sys.argv)
+    try:
+        sys.argv = [
+            "pytest",
+            "--one-domain-formulation",
+            "final_form",
+            "--final-form-constant-rho-s",
+            "--gamma-vP",
+            "0",
+            "--gamma-p-pore",
+            "0",
+        ]
+        args = _parse_args()
+    finally:
+        sys.argv = saved_argv
+
+    args = _normalize_benchmark7_solver_choice(args)
+
+    assert float(args.gamma_vP) == 0.0
+    assert float(args.gamma_p_pore) == 0.0
 
 
 def test_benchmark7_named_constant_reuses_cached_object() -> None:
@@ -1203,6 +1934,22 @@ def test_final_form_bjs_tangential_constraint_depends_on_pore_slip() -> None:
     assert np.linalg.norm(mu_t_shift - mu_t_ref, ord=np.inf) > 1.0e-10
 
 
+def test_final_form_bjs_tangential_constraint_depends_on_solid_mixture_velocity() -> None:
+    problem_ref, forms_ref = _build_final_form_problem(bjs_coefficient=1.0)
+    problem_shift, forms_shift = _build_final_form_problem(
+        bjs_coefficient=1.0,
+        solid_velocity_y_shift=0.20,
+    )
+
+    tangential_if_ref = forms_ref.r_momentum_terms["interface_tangential_constraint"]
+    tangential_if_shift = forms_shift.r_momentum_terms["interface_tangential_constraint"]
+
+    mu_t_ref = _assemble_block(problem_ref, tangential_if_ref, "mu_tangent")
+    mu_t_shift = _assemble_block(problem_shift, tangential_if_shift, "mu_tangent")
+
+    assert np.linalg.norm(mu_t_shift - mu_t_ref, ord=np.inf) > 1.0e-10
+
+
 def test_final_form_bjs_tangential_constraint_drops_pore_pressure_dependence() -> None:
     problem_ref, forms_ref = _build_final_form_problem(bjs_coefficient=1.0)
     problem_shift, forms_shift = _build_final_form_problem(
@@ -1217,6 +1964,88 @@ def test_final_form_bjs_tangential_constraint_drops_pore_pressure_dependence() -
     mu_t_shift = _assemble_block(problem_shift, tangential_if_shift, "mu_tangent")
 
     np.testing.assert_allclose(mu_t_ref, mu_t_shift, rtol=1.0e-12, atol=1.0e-12)
+
+
+def test_final_form_bjs_tangential_bulk_coupling_reaches_solid_velocity_row() -> None:
+    problem, forms = _build_final_form_problem(
+        bjs_coefficient=1.0,
+        mu_tangent_value=0.8,
+    )
+
+    vS_y = _assemble_block(problem, forms.r_skeleton, "vS_y")
+
+    assert np.linalg.norm(vS_y, ord=np.inf) > 1.0e-10
+
+
+def test_quasistatic_combined_bjs_drag_couples_free_and_combined_rows() -> None:
+    kwargs = dict(
+        bjs_coefficient=1.0,
+        final_form_constant_rho_s=True,
+        final_form_quasistatic_porous_media=True,
+        final_form_direct_interface_transfer=True,
+        final_form_disable_pore_momentum=True,
+        final_form_disable_solid_momentum=True,
+        final_form_combined_porous_momentum=True,
+    )
+    problem_ref, forms_ref = _build_final_form_problem(
+        **kwargs,
+    )
+    problem_solid_shift, forms_solid_shift = _build_final_form_problem(
+        **kwargs,
+        solid_velocity_y_shift=0.25,
+    )
+    problem_fluid_shift, forms_fluid_shift = _build_final_form_problem(
+        **kwargs,
+        fluid_velocity_y_shift=0.25,
+    )
+
+    free_ref = _assemble_block(problem_ref, forms_ref.r_momentum, "v_y")
+    free_shift = _assemble_block(problem_solid_shift, forms_solid_shift.r_momentum, "v_y")
+    solid_ref = _assemble_block(problem_ref, forms_ref.r_skeleton, "vS_y")
+    solid_shift = _assemble_block(problem_fluid_shift, forms_fluid_shift.r_skeleton, "vS_y")
+
+    assert np.linalg.norm(free_shift - free_ref, ord=np.inf) > 1.0e-10
+    assert np.linalg.norm(solid_shift - solid_ref, ord=np.inf) > 1.0e-10
+
+
+def test_quasistatic_combined_bjs_drag_is_action_reaction_pair() -> None:
+    problem, forms = _build_final_form_problem(
+        bjs_coefficient=1.0,
+        final_form_constant_rho_s=True,
+        final_form_quasistatic_porous_media=True,
+        final_form_direct_interface_transfer=True,
+        final_form_disable_pore_momentum=True,
+        final_form_disable_solid_momentum=True,
+        final_form_combined_porous_momentum=True,
+    )
+
+    free_drag_x = _assemble_block(
+        problem,
+        forms.r_momentum_terms["direct_interface_tangential_drag_free"],
+        "v_x",
+    )
+    solid_drag_x = _assemble_block(
+        problem,
+        forms.r_skeleton_terms["direct_interface_tangential_drag"],
+        "vS_x",
+    )
+    free_drag_y = _assemble_block(
+        problem,
+        forms.r_momentum_terms["direct_interface_tangential_drag_free"],
+        "v_y",
+    )
+    solid_drag_y = _assemble_block(
+        problem,
+        forms.r_skeleton_terms["direct_interface_tangential_drag"],
+        "vS_y",
+    )
+
+    assert np.linalg.norm(free_drag_x, ord=np.inf) > 1.0e-10
+    assert np.linalg.norm(solid_drag_x, ord=np.inf) > 1.0e-10
+    assert np.linalg.norm(free_drag_y, ord=np.inf) > 1.0e-10
+    assert np.linalg.norm(solid_drag_y, ord=np.inf) > 1.0e-10
+    np.testing.assert_allclose(free_drag_x + solid_drag_x, 0.0, atol=1.0e-12, rtol=1.0e-12)
+    np.testing.assert_allclose(free_drag_y + solid_drag_y, 0.0, atol=1.0e-12, rtol=1.0e-12)
 
 
 def test_rigid_final_form_interface_constraints_live_only_on_interface_multiplier_rows() -> None:

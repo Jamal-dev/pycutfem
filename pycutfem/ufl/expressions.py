@@ -202,7 +202,13 @@ def _expr_shape(expr) -> tuple[int, ...]:
         return tuple(expr.shape)
     if isinstance(expr, ElementWiseConstant):
         return tuple(expr.shape)
-    if isinstance(expr, (FacetNormal, VectorFunction, VectorTrialFunction, VectorTestFunction,
+    if isinstance(expr, (CellDiameter, MeshSize, NodalFunction)):
+        return ()
+    if hasattr(expr, "tensor_shape") and hasattr(expr, "eval"):
+        return tuple(getattr(expr, "tensor_shape", ()) or ())
+    if isinstance(expr, FacetNormal):
+        return (_SPATIAL_DIM,)
+    if isinstance(expr, (VectorFunction, VectorTrialFunction, VectorTestFunction,
                          HdivFunction, HdivTrialFunction, HdivTestFunction)):
         return (int(expr.num_components),)
     if isinstance(expr, (Function, TrialFunction, TestFunction, NormalComponent, Derivative, DivOperation, Laplacian,

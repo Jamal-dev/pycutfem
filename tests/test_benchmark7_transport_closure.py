@@ -27,6 +27,7 @@ from examples.biofilms.benchmarks.seboldt.paper1_benchmark7_seboldt import (
     _effective_eps_alpha,
     _effective_logistic_bounded_fields,
     _final_form_enabled,
+    _final_form_domain_lm_active_fields,
     _interface_tangent_from_normal_2d,
     _interface_unit_normal_2d,
     _dot_basis_2d,
@@ -58,6 +59,7 @@ from examples.biofilms.benchmarks.seboldt.paper1_benchmark7_seboldt import (
     _startup_stage_solver_kind,
     _solver_side_alpha_mass_equality_enabled,
     _tangential_viscous_traction_scalar_2d,
+    _resolve_final_form_domain_lm_targets,
     _use_post_accept_transport_update,
     _named_constant,
 )
@@ -92,6 +94,66 @@ def test_generic_final_form_keeps_phi_in_main_when_not_constant_density() -> Non
             }
         )
     )
+
+
+def test_post_accept_lag_phi_override_is_honored() -> None:
+    assert not bool(
+        _post_accept_lag_phi_in_main(
+            {
+                "final_form": True,
+                "final_form_constant_rho_s": True,
+                "final_form_lag_phi_in_main": False,
+            }
+        )
+    )
+    assert bool(
+        _post_accept_lag_phi_in_main(
+            {
+                "final_form": True,
+                "final_form_constant_rho_s": False,
+                "final_form_lag_phi_in_main": True,
+            }
+        )
+    )
+
+
+def test_final_form_domain_lm_active_fields_can_exclude_phi_lm() -> None:
+    problem = {
+        "final_form_domain_lm": True,
+        "lm_vf_k": object(),
+        "lm_p_k": object(),
+        "lm_vP_k": object(),
+        "lm_vS_k": object(),
+        "lm_p_pore_k": object(),
+        "lm_phi_k": object(),
+        "lm_u_k": object(),
+    }
+    fields_full = _final_form_domain_lm_active_fields(problem, include_phi_lm=True)
+    fields_no_phi = _final_form_domain_lm_active_fields(problem, include_phi_lm=False)
+    assert "lm_phi" in fields_full
+    assert "lm_phi" not in fields_no_phi
+
+
+def test_final_form_domain_lm_target_resolution_supports_partial_overrides() -> None:
+    targets, enabled = _resolve_final_form_domain_lm_targets(
+        enabled=True,
+        phi=True,
+        vf=False,
+    )
+    assert bool(enabled)
+    assert not bool(targets["vf"])
+    assert bool(targets["phi"])
+    assert bool(targets["p"])
+
+    targets, enabled = _resolve_final_form_domain_lm_targets(
+        enabled=False,
+        phi=True,
+        vP=True,
+    )
+    assert bool(enabled)
+    assert bool(targets["phi"])
+    assert bool(targets["vP"])
+    assert not bool(targets["vf"])
 
 
 def _assemble_block(problem, form, field: str) -> np.ndarray:
@@ -3843,6 +3905,48 @@ def test_benchmark7_unconstrained_configuration_keeps_newton_solver() -> None:
     assert updated.nonlinear_solver == "newton"
 
 
+def test_quasistatic_final_form_auto_phi_mode_prefers_transport() -> None:
+    args = SimpleNamespace(
+        nonlinear_solver="newton",
+        one_domain_formulation="final_form",
+        final_form_phi_mode="auto",
+        final_form_quasistatic_porous_media=True,
+        final_form_domain_lm_phi=False,
+        enable_phi_evolution=True,
+        full_ratio_free_state=False,
+        split_primary_darcy_flux=False,
+        one_pressure_primary_darcy_flux=False,
+        alpha_bc_mode="dirichlet",
+        alpha_box_constraints=False,
+        phi_box_constraints=False,
+    )
+
+    updated = _normalize_benchmark7_solver_choice(args)
+
+    assert str(updated.final_form_phi_mode) == "transport"
+
+
+def test_quasistatic_final_form_alpha_closure_keeps_explicit_lm_phi() -> None:
+    args = SimpleNamespace(
+        nonlinear_solver="newton",
+        one_domain_formulation="final_form",
+        final_form_phi_mode="alpha_closure",
+        final_form_quasistatic_porous_media=True,
+        final_form_domain_lm_phi=True,
+        enable_phi_evolution=True,
+        full_ratio_free_state=False,
+        split_primary_darcy_flux=False,
+        one_pressure_primary_darcy_flux=False,
+        alpha_bc_mode="dirichlet",
+        alpha_box_constraints=False,
+        phi_box_constraints=False,
+    )
+
+    updated = _normalize_benchmark7_solver_choice(args)
+
+    assert bool(updated.final_form_domain_lm_phi)
+
+
 def test_legacy_single_pressure_branch_disables_pressure_mean_constraint() -> None:
     args = SimpleNamespace(
         nonlinear_solver="newton",
@@ -4846,6 +4950,57 @@ def test_build_bcs_primary_q_branch_supports_hdiv_flux_with_cg_fluid() -> None:
     assert ("q", "left") in side_pairs
     assert ("q", "right") in side_pairs
     assert ("lambda_drag_x", "left") not in side_pairs
+
+
+def test_build_bcs_can_add_internal_offdomain_zero_dirichlet_tags() -> None:
+    bcs = _build_bcs(
+        fluid_space="cg",
+        enable_phi_evolution=True,
+        one_domain_formulation="final_form",
+        y_interface=1.0,
+        eps_alpha=0.05,
+        phi_b=0.18,
+        v_in=5.0,
+        t_ramp=0.0,
+        alpha_bc_mode="natural",
+        pressure_mean_constraint=False,
+        final_form_internal_zero_dirichlet=True,
+    )
+    tagged_pairs = {(bc.field, bc.domain_tag) for bc in bcs if bc.method == "dirichlet"}
+    assert ("v_x", "final_form_internal_zero_fluid") in tagged_pairs
+    assert ("v_y", "final_form_internal_zero_fluid") in tagged_pairs
+    assert ("vP_x", "final_form_internal_zero_porous") in tagged_pairs
+    assert ("vP_y", "final_form_internal_zero_porous") in tagged_pairs
+    assert ("vS_x", "final_form_internal_zero_porous") in tagged_pairs
+    assert ("vS_y", "final_form_internal_zero_porous") in tagged_pairs
+    assert ("u_x", "final_form_internal_zero_porous") in tagged_pairs
+    assert ("u_y", "final_form_internal_zero_porous") in tagged_pairs
+
+
+def test_build_bcs_can_limit_internal_offdomain_zero_dirichlet_to_vf_only() -> None:
+    bcs = _build_bcs(
+        fluid_space="cg",
+        enable_phi_evolution=True,
+        one_domain_formulation="final_form",
+        y_interface=1.0,
+        eps_alpha=0.05,
+        phi_b=0.18,
+        v_in=5.0,
+        t_ramp=0.0,
+        alpha_bc_mode="natural",
+        pressure_mean_constraint=False,
+        final_form_internal_zero_dirichlet=True,
+        final_form_internal_zero_targets=("vf",),
+    )
+    tagged_pairs = {(bc.field, bc.domain_tag) for bc in bcs if bc.method == "dirichlet"}
+    assert ("v_x", "final_form_internal_zero_fluid") in tagged_pairs
+    assert ("v_y", "final_form_internal_zero_fluid") in tagged_pairs
+    assert ("vP_x", "final_form_internal_zero_porous") not in tagged_pairs
+    assert ("vP_y", "final_form_internal_zero_porous") not in tagged_pairs
+    assert ("vS_x", "final_form_internal_zero_porous") not in tagged_pairs
+    assert ("vS_y", "final_form_internal_zero_porous") not in tagged_pairs
+    assert ("u_x", "final_form_internal_zero_porous") not in tagged_pairs
+    assert ("u_y", "final_form_internal_zero_porous") not in tagged_pairs
 
 
 def test_create_problem_supports_cg_fluid_with_hdiv_primary_q() -> None:

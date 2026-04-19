@@ -11,6 +11,7 @@ from pycutfem.ufl.forms import (
     CondensedQuadratureLocalSystem,
     assemble_form,
 )
+from pycutfem.ufl.autodiff import gateaux_derivative, linearize_equation, linearize_form
 from pycutfem.ufl.expressions import (
     Constant,
     TrialFunction,
@@ -37,6 +38,10 @@ __all__ = [
     "BoundaryCondition",
     "CondensedQuadratureLocalSystem",
     "assemble_form",
+    "derivative",
+    "gateaux_derivative",
+    "linearize_form",
+    "linearize_equation",
     "Constant",
     "TrialFunction",
     "TestFunction",
@@ -61,3 +66,5 @@ __all__ = [
     "dInterface",
     "dGhost",
 ]
+
+derivative = gateaux_derivative
