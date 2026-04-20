@@ -14,7 +14,7 @@ from pycutfem.ufl.forms import BoundaryCondition, Equation, assemble_form
 from pycutfem.ufl.measures import dInterface, dx
 
 
-def test_xfem_abs_enrichment_penalty_dirichlet_smoke(monkeypatch):
+def test_xfem_abs_enrichment_penalty_dirichlet_smoke(monkeypatch, tmp_path):
     """
     Regression smoke test for shifted-|phi| ("abs") enrichment.
 
@@ -24,6 +24,7 @@ def test_xfem_abs_enrichment_penalty_dirichlet_smoke(monkeypatch):
     on the C++ JIT backend.
     """
     monkeypatch.setenv("PYCUTFEM_JIT_BACKEND", "cpp")
+    monkeypatch.setenv("PYCUTFEM_CACHE_DIR", str(tmp_path / "jit_cache"))
 
     # --- mesh / level set -----------------------------------------------------
     ll = (-1.0, -1.0)

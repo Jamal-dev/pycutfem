@@ -14,7 +14,7 @@ from pycutfem.jit.ir import LoadAnalytic
 # 2026-04-13 invalidates stale JIT kernels after fixing transported rank-2
 # basis dot classification, scalar-basis/matrix products, and rank-2 inner
 # contractions.
-CODEGEN_ABI = "2026-04-14-abi-rank2-dot-inner-v18"
+CODEGEN_ABI = "2026-04-20-abi-rank2-dot-inner-v19"
 
 
 def _resolve_cache_dir(override: str | os.PathLike[str] | None = None) -> Path:

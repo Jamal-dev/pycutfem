@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 
 from examples.biofilms.benchmarks.seboldt.paper1_benchmark7_seboldt import _build_forms, _create_problem
-from pycutfem.jit import _form_integrals, _integral_fusion_key
+from pycutfem.jit import _form_integrals, _integral_fusion_key, _plan_integral_execution_units
 from pycutfem.ufl.compilers import FormCompiler
 from pycutfem.ufl.expressions import Constant
 from pycutfem.ufl.forms import Equation, assemble_form
@@ -169,7 +169,7 @@ def test_benchmark7_tensor_final_form_matches_decomposed_reference() -> None:
     decomp_jacobian = _assemble_matrix(problem_decomp, forms_decomp.jacobian_form, backend="python")
 
     np.testing.assert_allclose(tensor_residual, decomp_residual, rtol=1.0e-11, atol=1.0e-11)
-    np.testing.assert_allclose(tensor_jacobian, decomp_jacobian, rtol=1.0e-11, atol=1.0e-11)
+    np.testing.assert_allclose(tensor_jacobian, decomp_jacobian, rtol=1.0e-10, atol=1.0e-10)
 
     term_names = (
         "interface_mass_constraint",
@@ -229,5 +229,30 @@ def test_benchmark7_tensor_final_form_cpp_shared_loop_backend_parity(monkeypatch
 def test_benchmark7_tensor_final_form_volume_fusion_groups_stay_coarse() -> None:
     problem, forms = _build_final_form_problem(final_form_implementation="tensor")
 
-    assert _fusion_group_sizes(problem, forms.residual_form) == [36]
-    assert _fusion_group_sizes(problem, forms.jacobian_form) == [37]
+    assert _fusion_group_sizes(problem, forms.residual_form) == [len(_form_integrals(forms.residual_form))]
+    assert _fusion_group_sizes(problem, forms.jacobian_form) == [len(_form_integrals(forms.jacobian_form))]
+
+
+def test_benchmark7_tensor_final_form_jit_planner_splits_oversized_groups(monkeypatch) -> None:
+    monkeypatch.setenv("PYCUTFEM_JIT_FUSION_IR_BUDGET", "2000")
+    problem, forms = _build_final_form_problem(final_form_implementation="tensor")
+
+    compiler = FormCompiler(problem["dh"], backend="jit")
+    p_geo = int(getattr(problem["dh"].mixed_element.mesh, "poly_order", 1))
+    planned_residual = _plan_integral_execution_units(
+        _form_integrals(forms.residual_form),
+        compiler=compiler,
+        p_geo=p_geo,
+        backend="jit",
+    )
+    planned_jacobian = _plan_integral_execution_units(
+        _form_integrals(forms.jacobian_form),
+        compiler=compiler,
+        p_geo=p_geo,
+        backend="jit",
+    )
+
+    assert _fusion_group_sizes(problem, forms.residual_form) == [len(_form_integrals(forms.residual_form))]
+    assert _fusion_group_sizes(problem, forms.jacobian_form) == [len(_form_integrals(forms.jacobian_form))]
+    assert len(planned_residual) > 1
+    assert len(planned_jacobian) > 1

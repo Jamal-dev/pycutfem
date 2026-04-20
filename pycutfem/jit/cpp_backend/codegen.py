@@ -1444,10 +1444,15 @@ class CppCodeGen:
                 emit_line(f"double {nm} = h_arr_view(owner_id_view(e));")
                 stack.append(StackItem(nm, "scalar", "const", ()))
             elif isinstance(op, MeshSize):
-                required_args.add("detJ")
                 nm = new_tmp("mesh_h")
-                factor = 2.0 if getattr(self.mixed_element.mesh, "element_type", "tri") == "quad" else 1.0
-                emit_line(f"double {nm} = {factor} * std::sqrt(std::abs(detJ_view(e,q)));")
+                if self.on_facet:
+                    required_args.add("owner_id")
+                    required_args.add("h_arr")
+                    emit_line(f"double {nm} = h_arr_view(owner_id_view(e));")
+                else:
+                    required_args.add("detJ")
+                    factor = 2.0 if getattr(self.mixed_element.mesh, "element_type", "tri") == "quad" else 1.0
+                    emit_line(f"double {nm} = {factor} * std::sqrt(std::abs(detJ_view(e,q)));")
                 stack.append(StackItem(nm, "scalar", "const", ()))
             elif isinstance(op, LoadFacetNormal):
                 nm = new_tmp("nrm")
@@ -3256,6 +3261,13 @@ class CppCodeGen:
                     expression_meta: Any = None,
                     respect_sum_specs: bool = True,
                 ):
+                    preserve_sum_basis_rank1 = bool(
+                        respect_sum_specs
+                        and a.role == b.role
+                        and a.role in {"test", "trial"}
+                        and _semantic_is_basis_rank1(a, spatial_dim=self.spatial_dim)
+                        and _semantic_is_basis_rank1(b, spatial_dim=self.spatial_dim)
+                    )
                     if product_lowering is not None:
                         planned_shape = tuple(int(v) for v in product_lowering.result_storage.stored_shape)
                         if planned_shape:
@@ -3274,13 +3286,13 @@ class CppCodeGen:
                             shape = planned_shape
                     if respect_sum_specs and sum_plan is not None:
                         planned_role = getattr(sum_plan.result.tensor, "role", "") or ""
-                        if planned_role not in {"", "none"}:
+                        if planned_role not in {"", "none"} and not preserve_sum_basis_rank1:
                             role = planned_role
                     if respect_sum_specs and sum_value_spec is not None:
                         planned_kind = getattr(sum_value_spec, "kind", "") or ""
                         kind = _merge_cpp_planned_kind(kind, planned_kind, role)
                         planned_role = getattr(sum_value_spec, "role", "") or ""
-                        if planned_role not in {"", "none"}:
+                        if planned_role not in {"", "none"} and not preserve_sum_basis_rank1:
                             role = planned_role
                     if product_value_spec is not None:
                         planned_kind = getattr(product_value_spec, "kind", "") or ""
@@ -3327,6 +3339,12 @@ class CppCodeGen:
                                 layout_tag
                                 if layout_tag is not None
                                 else (
+                                    a.layout_tag or b.layout_tag
+                                    if preserve_sum_basis_rank1
+                                    else None
+                                )
+                                if (layout_tag is not None or preserve_sum_basis_rank1)
+                                else (
                                     sum_value_spec.layout.value
                                     if sum_value_spec is not None
                                     else (
@@ -3339,6 +3357,12 @@ class CppCodeGen:
                             expression_meta=(
                                 expression_meta
                                 if expression_meta is not None
+                                else (
+                                    a.expression_meta or b.expression_meta
+                                    if preserve_sum_basis_rank1
+                                    else None
+                                )
+                                if (expression_meta is not None or preserve_sum_basis_rank1)
                                 else (
                                     sum_value_spec.meta
                                     if sum_value_spec is not None
@@ -5343,7 +5367,20 @@ class CppCodeGen:
                         meta_side = side_override
                     if field_sides is not None:
                         meta_fsides = field_sides
-                    kind = _normalize_cpp_storage_kind(kind, role, shape)
+                    kind = _normalize_cpp_storage_kind(
+                        kind,
+                        role,
+                        shape,
+                        expression_meta=(
+                            expression_meta
+                            if expression_meta is not None
+                            else (
+                                dot_lowering.meta
+                                if dot_lowering is not None
+                                else None
+                            )
+                        ),
+                    )
                     stack.append(
                         StackItem(
                             nm,
@@ -7069,6 +7106,36 @@ class CppCodeGen:
                     test_var = a.name if a.role == "test" else b.name
                     trial_var = a.name if a.role == "trial" else b.name
                     emit_line(f"Eigen::MatrixXd {nm} = inner_grad_grad({test_var}, {trial_var});")
+                    push_inner("mat", "value", (-1, -1))
+                elif (
+                    a.role in {"test", "trial"}
+                    and b.role in {"test", "trial"}
+                    and a.kind in {"mat", "grad"}
+                    and b.kind in {"mat", "grad"}
+                    and len(a.shape) == 2
+                    and len(b.shape) == 2
+                    and min(int(a.shape[0]), int(a.shape[1])) > 1
+                    and min(int(b.shape[0]), int(b.shape[1])) > 1
+                    and min(int(a.shape[0]), int(a.shape[1])) < max(int(a.shape[0]), int(a.shape[1]))
+                    and min(int(b.shape[0]), int(b.shape[1])) < max(int(b.shape[0]), int(b.shape[1]))
+                    and not (a.is_hessian or b.is_hessian)
+                ):
+                    test_var = a.name if a.role == "test" else b.name
+                    trial_var = a.name if a.role == "trial" else b.name
+                    emit_line(f"Eigen::MatrixXd {nm} = dot_mass_test_trial({test_var}, {trial_var});")
+                    push_inner("mat", "value", (-1, -1))
+                elif (
+                    a.role in {"test", "trial"}
+                    and b.role in {"test", "trial"}
+                    and _semantic_is_basis_rank1(a, spatial_dim=self.spatial_dim)
+                    and _semantic_is_basis_rank1(b, spatial_dim=self.spatial_dim)
+                    and not is_a_scalar_grad_basis
+                    and not is_b_scalar_grad_basis
+                    and not (a.is_hessian or b.is_hessian)
+                ):
+                    test_var = a.name if a.role == "test" else b.name
+                    trial_var = a.name if a.role == "trial" else b.name
+                    emit_line(f"Eigen::MatrixXd {nm} = dot_mass_test_trial({test_var}, {trial_var});")
                     push_inner("mat", "value", (-1, -1))
                 elif (_semantic_is_basis_rank2(a, spatial_dim=self.spatial_dim)
                       and _semantic_is_value_rank2(b, spatial_dim=self.spatial_dim)

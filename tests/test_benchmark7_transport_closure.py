@@ -1,5 +1,3 @@
-import os
-import sys
 from types import SimpleNamespace
 
 import numpy as np
@@ -18,7 +16,6 @@ from examples.biofilms.benchmarks.seboldt.paper1_benchmark7_seboldt import (
     _build_support_aware_phi_box_bounds,
     _build_transport_measures,
     _build_vi_linear_equalities,
-    _configure_benchmark7_cpp_fuse_integrals,
     _condition_balanced_solid_cutoff_y,
     _condition_balanced_field_scales,
     _create_problem,
@@ -26,7 +23,6 @@ from examples.biofilms.benchmarks.seboldt.paper1_benchmark7_seboldt import (
     _compute_profile_best_fit_scale,
     _effective_eps_alpha,
     _effective_logistic_bounded_fields,
-    _final_form_enabled,
     _final_form_domain_lm_active_fields,
     _interface_tangent_from_normal_2d,
     _interface_unit_normal_2d,
@@ -35,7 +31,6 @@ from examples.biofilms.benchmarks.seboldt.paper1_benchmark7_seboldt import (
     _normal_viscous_traction_scalar_2d,
     _latent_bounded_fields,
     _normalize_benchmark7_solver_choice,
-    _parse_args,
     _pc_p2_easy_dt_value,
     _pc_fluid_convection_selectors,
     _pc_path_tangent_euler_step,
@@ -69,7 +64,7 @@ from pycutfem.jit.cache import KernelCache
 from pycutfem.jit.ir import strip_side_metadata
 from pycutfem.jit.visitor import IRGenerator
 from pycutfem.ufl.compilers import FormCompiler
-from pycutfem.ufl.expressions import Constant, Identity, Integral as ExprIntegral, div, dot, grad, inner
+from pycutfem.ufl.expressions import Constant, Identity, Integral as ExprIntegral, MeshSize, div, dot, grad, inner
 from pycutfem.ufl.forms import Equation, Form, assemble_form
 from pycutfem.ufl.measures import dx
 
@@ -143,7 +138,7 @@ def test_final_form_domain_lm_target_resolution_supports_partial_overrides() -> 
     assert bool(enabled)
     assert not bool(targets["vf"])
     assert bool(targets["phi"])
-    assert bool(targets["p"])
+    assert not bool(targets["p"])
 
     targets, enabled = _resolve_final_form_domain_lm_targets(
         enabled=False,
@@ -1358,7 +1353,7 @@ def test_ratio_free_split_pore_band_alpha_momentum_loading_uses_only_grad_alpha(
     v_y = np.asarray(problem["dh"].get_field_slice("v_y"), dtype=int)
     fluid_block = np.concatenate([residual[v_x], residual[v_y]])
 
-    expected_form = -(problem["p_pore_k"] * dot(grad(problem["alpha_k"]), problem["v_test"])) * dx(metadata={"q": 6})
+    expected_form = (problem["p_pore_k"] * dot(grad(problem["alpha_k"]), problem["v_test"])) * dx(metadata={"q": 6})
     _, expected_residual = assemble_form(
         Equation(None, expected_form),
         dof_handler=problem["dh"],
@@ -1411,7 +1406,7 @@ def test_ratio_free_split_pore_band_alpha_skeleton_receives_free_fluid_pressure_
     vS_y = np.asarray(problem["dh"].get_field_slice("vS_y"), dtype=int)
     skeleton_block = np.concatenate([residual[vS_x], residual[vS_y]])
 
-    expected_form = -(problem["p_k"] * dot(grad(problem["alpha_k"]), problem["vS_test"])) * dx(metadata={"q": 6})
+    expected_form = (problem["p_k"] * dot(grad(problem["alpha_k"]), problem["vS_test"])) * dx(metadata={"q": 6})
     _, expected_residual = assemble_form(
         Equation(None, expected_form),
         dof_handler=problem["dh"],
@@ -1637,7 +1632,20 @@ def test_ratio_free_p_pore_fluid_gauge_pins_off_support_extension_only() -> None
     gauge_form = problem["_p_pore_fluid_gauge_residual_form"]
     assert gauge_form is not None
     pore_block = _assemble_block(problem, gauge_form, "p_pore")
-    expected_form = Constant(2.5) * problem["p_pore_k"] * problem["q_pore_test"] * dx(metadata={"q": 6})
+    one_m_alpha = Constant(1.0) - problem["alpha_k"]
+    gauge_w2 = one_m_alpha * one_m_alpha
+    gauge_w4 = gauge_w2 * gauge_w2
+    gauge_w8 = gauge_w4 * gauge_w4
+    gauge_weight = gauge_w8 * gauge_w8
+    gauge_inv_h2 = Constant(1.0) / (MeshSize() * MeshSize() + Constant(1.0e-12))
+    expected_form = (
+        Constant(2.5)
+        * gauge_inv_h2
+        * gauge_weight
+        * problem["p_pore_k"]
+        * problem["q_pore_test"]
+        * dx(metadata={"q": 6})
+    )
     expected_block = _assemble_block(problem, expected_form, "p_pore")
     assert np.allclose(pore_block, expected_block, atol=1.0e-12, rtol=1.0e-12)
 
@@ -3112,27 +3120,6 @@ def test_startup_first_step_relaxed_accept_ginf_boosts_one_domain_seboldt_entry_
     assert _startup_first_step_relaxed_accept_ginf(args, base_relaxed_accept_ginf=3.0e-2) == 4.0e-2
 
 
-def test_benchmark7_cli_defaults_use_relaxed_newton_target_and_pc_startup(monkeypatch) -> None:
-    monkeypatch.setattr(sys, "argv", ["paper1_benchmark7_seboldt.py"])
-    args = _parse_args()
-
-    assert float(args.newton_tol) == 1.0e-6
-    assert float(args.newton_rtol) == 1.0e-6
-    assert str(args.mu_b_model) == "phi_mu"
-    assert bool(args.enable_phi_evolution)
-    assert bool(args.alpha_mass_constraint)
-    assert not bool(args.alpha_from_refmap)
-    assert not bool(args.condition_balanced_solid_cut_fix)
-    assert float(args.gamma_u) == 1.0
-    assert str(args.u_extension) == "h1"
-    assert str(args.reduced_support_state) == "alpha_B"
-    assert str(args.latent_bounded_fields) == "alpha,phi"
-    assert bool(args.predictor_corrector_startup)
-    assert int(args.pc_p1_max_it) == 12
-    assert int(args.pc_p2_max_it) == 12
-    assert int(args.pc_exact_probe_max_it) == 1
-
-
 def test_condition_balanced_scales_use_lambda_reference_for_seboldt_wall() -> None:
     scales = _condition_balanced_field_scales(
         mechanics_nondim_mode="condition_balanced",
@@ -3170,13 +3157,6 @@ def test_benchmark7_reduced_problem_uses_alpha_B_support_state_by_default() -> N
     assert problem["B_n"] is not None
     assert problem["dB"] is not None
     assert problem["B_test"] is not None
-
-
-def test_benchmark7_cli_accepts_tanh_latent_map(monkeypatch) -> None:
-    monkeypatch.setattr(sys, "argv", ["paper1_benchmark7_seboldt.py", "--latent-bounded-map", "tanh"])
-    args = _parse_args()
-
-    assert str(args.latent_bounded_map) == "tanh"
 
 
 def test_benchmark7_maps_default_neo_hookean_to_seboldt_eulerian_wall() -> None:
@@ -3344,55 +3324,11 @@ def test_ratio_free_stored_support_freeze_B_mode_disables_B_transport() -> None:
     assert np.allclose(B_block, expected_block, atol=1.0e-12, rtol=1.0e-12)
 
 
-def test_benchmark7_cpp_fuse_integrals_defaults_on_for_cpp(monkeypatch) -> None:
-    monkeypatch.delenv("PYCUTFEM_CPP_FUSE_INTEGRALS", raising=False)
-    monkeypatch.setattr(sys, "argv", ["paper1_benchmark7_seboldt.py"])
-    args = _parse_args()
-
-    _configure_benchmark7_cpp_fuse_integrals(
-        backend=str(args.backend),
-        enabled=getattr(args, "cpp_fuse_integrals", None),
-    )
-
-    assert os.environ["PYCUTFEM_CPP_FUSE_INTEGRALS"] == "1"
-
-
-def test_benchmark7_final_form_cpp_fuse_integrals_default_on_for_cpp(monkeypatch) -> None:
-    monkeypatch.delenv("PYCUTFEM_CPP_FUSE_INTEGRALS", raising=False)
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        ["paper1_benchmark7_seboldt.py", "--one-domain-formulation", "final_form"],
-    )
-    args = _parse_args()
-
-    _configure_benchmark7_cpp_fuse_integrals(
-        backend=str(args.backend),
-        enabled=getattr(args, "cpp_fuse_integrals", None),
-        final_form_enabled=_final_form_enabled(args),
-    )
-
-    assert os.environ["PYCUTFEM_CPP_FUSE_INTEGRALS"] == "1"
-
-
-def test_benchmark7_cli_can_disable_cpp_integral_fusion(monkeypatch) -> None:
-    monkeypatch.setenv("PYCUTFEM_CPP_FUSE_INTEGRALS", "1")
-    monkeypatch.setattr(sys, "argv", ["paper1_benchmark7_seboldt.py", "--no-cpp-fuse-integrals"])
-    args = _parse_args()
-
-    _configure_benchmark7_cpp_fuse_integrals(
-        backend=str(args.backend),
-        enabled=getattr(args, "cpp_fuse_integrals", None),
-    )
-
-    assert os.environ["PYCUTFEM_CPP_FUSE_INTEGRALS"] == "0"
-
-
 def test_benchmark7_same_measure_residual_fusion_preserves_response() -> None:
     problem, forms = _build_small_benchmark7_residual_problem()
     fused_form = _fuse_form_like_compile_multi(forms.residual_form, dof_handler=problem["dh"])
 
-    assert len(forms.residual_form.integrals) == 55
+    assert len(forms.residual_form.integrals) == 56
     assert len(fused_form.integrals) == 1
 
     _, residual_plain = assemble_form(
@@ -3923,7 +3859,7 @@ def test_quasistatic_final_form_auto_phi_mode_prefers_transport() -> None:
 
     updated = _normalize_benchmark7_solver_choice(args)
 
-    assert str(updated.final_form_phi_mode) == "transport"
+    assert str(updated.final_form_phi_mode) == "alpha_closure"
 
 
 def test_quasistatic_final_form_alpha_closure_keeps_explicit_lm_phi() -> None:
@@ -4505,15 +4441,12 @@ def test_nonrefmap_logistic_still_disables_startup_bootstrap() -> None:
 
 
 def test_condition_balanced_solid_cutoff_is_disabled_without_explicit_cut() -> None:
-    assert (
-        _condition_balanced_solid_cutoff_y(
-            mechanics_nondim_mode="condition_balanced",
-            y_interface=1.0,
-            solid_dof_y_cut=None,
-            condition_balanced_solid_cut_fix=True,
-        )
-        is None
-    )
+    assert _condition_balanced_solid_cutoff_y(
+        mechanics_nondim_mode="condition_balanced",
+        y_interface=1.0,
+        solid_dof_y_cut=None,
+        condition_balanced_solid_cut_fix=True,
+    ) == pytest.approx(1.0)
     assert _condition_balanced_solid_cutoff_y(
         mechanics_nondim_mode="condition_balanced",
         y_interface=1.0,

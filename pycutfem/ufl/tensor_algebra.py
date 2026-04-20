@@ -461,6 +461,51 @@ def _make_result_storage_spec(
     basis_sizes: tuple[int, ...],
 ) -> StorageSpec:
     free_sizes = tuple(int(axis.size) for axis in sig.free_axes)
+    if sig.storage_kind == "hess" and sig.basis_rank == 1:
+        if len(free_sizes) == 2:
+            stored_shape = (1, int(basis_sizes[0]), int(free_sizes[0]), int(free_sizes[1]))
+            free_axis_positions = (2, 3)
+        else:
+            stored_shape = (
+                int(free_sizes[0]),
+                int(basis_sizes[0]),
+                *tuple(int(v) for v in free_sizes[1:]),
+            )
+            free_axis_positions = tuple(range(0, len(free_sizes)))
+        basis_axis_positions = (1,)
+        return StorageSpec(
+            stored_shape=stored_shape,
+            free_axis_positions=free_axis_positions,
+            basis_axis_positions=basis_axis_positions,
+            basis_sizes=basis_sizes,
+            canonical_shape=_canonical_shape_from_signature(sig, free_sizes, basis_sizes),
+        )
+    if sig.storage_kind == "hess" and sig.basis_rank == 2:
+        if len(free_sizes) == 2:
+            stored_shape = (
+                1,
+                int(basis_sizes[0]),
+                int(basis_sizes[1]),
+                int(free_sizes[0]),
+                int(free_sizes[1]),
+            )
+            free_axis_positions = (3, 4)
+        else:
+            stored_shape = (
+                int(free_sizes[0]),
+                int(basis_sizes[0]),
+                int(basis_sizes[1]),
+                *tuple(int(v) for v in free_sizes[1:]),
+            )
+            free_axis_positions = tuple(range(0, len(free_sizes)))
+        basis_axis_positions = (1, 2)
+        return StorageSpec(
+            stored_shape=stored_shape,
+            free_axis_positions=free_axis_positions,
+            basis_axis_positions=basis_axis_positions,
+            basis_sizes=basis_sizes,
+            canonical_shape=_canonical_shape_from_signature(sig, free_sizes, basis_sizes),
+        )
     stored_shape = _storage_shape_from_free_and_basis(
         free_sizes,
         basis_sizes,

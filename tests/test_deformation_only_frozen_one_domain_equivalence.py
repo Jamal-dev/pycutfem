@@ -222,15 +222,21 @@ def test_deformation_only_matches_frozen_one_domain_internal_conversion_ch() -> 
     reduced_forms = _build_reduced_forms(problem, qdeg=qdeg)
     frozen_forms = _build_frozen_one_domain_forms(problem, qdeg=qdeg)
 
+    # The production one-domain internal-conversion path now treats the fluid
+    # momentum row with the explicit free-fluid weight F_free. The reduced
+    # deformation-only model intentionally keeps the historical frozen-phi_b
+    # liquid-content row C = 1 - B, so the monolithic momentum/residual blocks
+    # are no longer expected to match term-for-term. The reduced support,
+    # kinematics, alpha, and chemical-potential blocks must still stay aligned.
     residual_names = (
-        "residual_form",
+        "r_mass",
         "r_skeleton",
         "r_kinematics",
         "r_alpha",
         "r_mu_alpha",
     )
     jacobian_names = (
-        "jacobian_form",
+        "a_mass",
         "a_skeleton",
         "a_kinematics",
         "a_alpha",

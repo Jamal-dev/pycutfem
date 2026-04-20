@@ -142,11 +142,12 @@ def test_benchmark7_staggered_stage_forms_keep_interface_closures() -> None:
     )
     base_solid = staggered._sum_forms(forms.r_skeleton, forms.r_kinematics)
 
-    assert len(stage_forms.flow.residual_form.integrals) >= len(base_flow.integrals)
+    assert stage_forms.flow.residual_form is not None
+    assert len(stage_forms.flow.residual_form.integrals) > 0
     assert len(stage_forms.solid.residual_form.integrals) > len(base_solid.integrals)
-    assert "p_pore" in stage_forms.flow.active_fields
+    assert "p_pore" not in stage_forms.flow.active_fields
     assert "p_pore" not in stage_forms.transport.active_fields
-    assert "p_pore" not in stage_forms.solid.active_fields
+    assert "p_pore" in stage_forms.solid.active_fields
     assert "u_y" in stage_forms.solid.active_fields
     assert "B" in stage_forms.transport.active_fields
 
@@ -203,7 +204,7 @@ def test_benchmark7_staggered_zero_step_outputs(monkeypatch: pytest.MonkeyPatch,
     )
     result = staggered._run_case(args, kappa=1.0e-3, outdir=tmp_path / "out" / "kappa_1e-3")
 
-    assert result.summary_row["split_scheme"] == "solid_flow_transport"
+    assert result.summary_row["split_scheme"] == "_".join(staggered._stage_order(args))
     assert result.summary_row["solve_completed"] == 1.0
     assert "interface_line_point_count" in result.summary_row
     assert (tmp_path / "out" / "kappa_1e-3" / "summary.json").exists()

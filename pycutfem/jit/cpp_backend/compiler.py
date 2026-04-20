@@ -253,6 +253,17 @@ def compile_extension(
 
     class _BuildExt(build_ext):  # type: ignore[misc]
         def build_extension(self, ext):  # pragma: no cover - invoked by setuptools
+            # Distutils can derive deeply nested object paths from absolute source
+            # filenames (build_temp + /abs/source/path.o) but does not always
+            # create those parent directories before invoking the compiler.
+            # Generated kernels live in long pytest cache paths, so precreate the
+            # object parents here to avoid spurious "compiler exited 2" failures.
+            try:
+                objects = self.compiler.object_filenames(ext.sources, output_dir=self.build_temp)
+                for obj in objects:
+                    Path(obj).parent.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
             super().build_extension(ext)
 
     def _run_build(ext: Extension, tmp: Path) -> None:

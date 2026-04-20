@@ -1311,6 +1311,21 @@ inline Eigen::VectorXd inner_grad_const(const std::vector<Eigen::MatrixXd>& grad
     if (k == 0) return Eigen::VectorXd();
     int n = static_cast<int>(grad_test[0].rows());
     Eigen::VectorXd out = Eigen::VectorXd::Zero(n);
+    if (k == 1 && (grad_val.rows() == 1 || grad_val.cols() == 1)) {
+        Eigen::VectorXd grad_vec;
+        if (grad_val.rows() == 1) {
+            grad_vec = grad_val.row(0).transpose();
+        } else {
+            grad_vec = grad_val.col(0);
+        }
+        if (grad_test[0].cols() != grad_vec.size()) {
+            throw std::runtime_error("inner_grad_const: incompatible scalar grad basis/value shapes");
+        }
+        return grad_test[0] * grad_vec;
+    }
+    if (grad_val.rows() != k) {
+        throw std::runtime_error("inner_grad_const: expected grad(value) with leading component axis matching grad_test.size()");
+    }
     for (int c = 0; c < k; ++c) {
         out += grad_test[c] * grad_val.row(c).transpose();
     }
@@ -1321,14 +1336,19 @@ inline Eigen::VectorXd inner_grad_const(const std::vector<Eigen::MatrixXd>& grad
 inline Eigen::VectorXd inner_grad_const(const Eigen::MatrixXd& grad_test,
                                         const Eigen::MatrixXd& grad_val) {
     if (is_debug) {std::cout<< "-----------------inner_grad_const(rank1_basis)---------------------"<<std::endl;}
-    if (grad_val.rows() != 1) {
-        throw std::runtime_error("inner_grad_const(rank1_basis): expected scalar grad(value) with shape (1,d)");
+    Eigen::VectorXd grad_vec;
+    if (grad_val.rows() == 1) {
+        grad_vec = grad_val.row(0).transpose();
+    } else if (grad_val.cols() == 1) {
+        grad_vec = grad_val.col(0);
+    } else {
+        throw std::runtime_error("inner_grad_const(rank1_basis): expected scalar grad(value) with shape (1,d) or (d,1)");
     }
-    if (grad_test.rows() == grad_val.cols()) {
-        return grad_test.transpose() * grad_val.row(0).transpose();
+    if (grad_test.rows() == grad_vec.size()) {
+        return grad_test.transpose() * grad_vec;
     }
-    if (grad_test.cols() == grad_val.cols()) {
-        return grad_test * grad_val.row(0).transpose();
+    if (grad_test.cols() == grad_vec.size()) {
+        return grad_test * grad_vec;
     }
     throw std::runtime_error("inner_grad_const(rank1_basis): incompatible scalar grad basis/value shapes");
 }
@@ -1870,12 +1890,15 @@ inline Eigen::VectorXd matrix_like_to_vector(const Eigen::MatrixXd& mat_like) {
     throw std::runtime_error("matrix_like_to_vector: expected a row/column matrix");
 }
 
-inline Eigen::VectorXd ensure_vector(const Eigen::VectorXd& vec_like) {
-    return vec_like;
-}
-
-inline Eigen::VectorXd ensure_vector(const Eigen::MatrixXd& mat_like) {
-    return matrix_like_to_vector(mat_like);
+template <typename Derived>
+inline Eigen::VectorXd ensure_vector(const Eigen::MatrixBase<Derived>& value_like) {
+    if (value_like.cols() == 1) {
+        return Eigen::VectorXd(value_like);
+    }
+    if (value_like.rows() == 1) {
+        return Eigen::VectorXd(value_like.transpose());
+    }
+    return matrix_like_to_vector(Eigen::MatrixXd(value_like));
 }
 
 inline double dot_matrix_like_vector(const Eigen::MatrixXd& mat_like,

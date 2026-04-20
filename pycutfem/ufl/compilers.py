@@ -5839,6 +5839,7 @@ class FormCompiler:
                 self.ctx["eid"]    = eid
                 self.ctx["q"] = int(q)
                 self.ctx["qstate_owner_id"] = int(eid)
+                self.ctx["detJ"] = float(detJ)
                 self.ctx["x_phys"] = transform.x_mapping(mesh, eid, (xi, eta))
 
                 integrand_val = self._visit(integral.integrand)
@@ -5862,7 +5863,7 @@ class FormCompiler:
                 self._scatter_local(eid, loc, fields=None, matvec=matvec, rhs=rhs)
 
         # cleanup
-        for k in ("eid", "x_phys", "is_interface", "q", "qstate_owner_id"):
+        for k in ("eid", "x_phys", "is_interface", "q", "qstate_owner_id", "detJ"):
             self.ctx.pop(k, None)
 
     
@@ -8108,6 +8109,28 @@ class FormCompiler:
         # Interface assembly needs up-to-date cut tags and interface segments.
         self._ensure_mesh_classified(level_set, need_interface_segments=True)
 
+        trial, test = _trial_test(intg.integrand)
+        if trial is None and test is None and self._is_jit_backend():
+            # Keep scalar dInterface functionals on the Python path for now.
+            # This matches the existing fallback policy used by other edge-based
+            # measures whose JIT local-batch plumbing is matrix/vector oriented.
+            mesh = self.me.mesh
+            aligned_edges = None
+            try:
+                aligned_edges = mesh.edge_bitset("interface")
+            except Exception:
+                aligned_edges = None
+            has_aligned = False
+            if aligned_edges is not None:
+                try:
+                    has_aligned = aligned_edges.cardinality() > 0
+                except Exception:
+                    has_aligned = bool(aligned_edges)
+            if has_aligned:
+                self._assemble_aligned_interface_python(intg, matvec, aligned_edges)
+            self._assemble_interface_python(intg, matvec)
+            return
+
         mesh = self.me.mesh
         aligned_edges = None
         try:
@@ -9608,14 +9631,14 @@ class FormCompiler:
         and scalar functional forms – scalar forms can be captured with the
         same “assembler_hooks” mechanism used for interfaces / ghost edges.
         """
-        if self._is_jit_backend():
+        trial, test = _trial_test(intg.integrand)
+        if self._is_jit_backend() and not (trial is None and test is None):
             raise NotImplementedError("dS + JIT not wired yet")
 
         rhs   = self.ctx.get("rhs", False)
         mesh  = self.me.mesh
         qdeg  = self._find_q_order(intg)
         hook  = self._hook_for(intg.integrand)
-        trial, test = _trial_test(intg.integrand)
         is_functional = hook and trial is None and test is None
         if _collector is not None and is_functional:
             raise NotImplementedError(
@@ -9950,6 +9973,13 @@ class FormCompiler:
         )
     def _assemble_boundary_edge(self, intg: Integral, matvec):
         """Assemble integrals over boundary edges."""
+        trial, test = _trial_test(intg.integrand)
+        if trial is None and test is None and self._is_jit_backend():
+            # Keep scalar exterior-facet functionals on the Python path for now.
+            # The JIT helper is also used by local-batch assembly, which is still
+            # matrix/vector oriented for boundary entities.
+            self._assemble_boundary_edge_python(intg, matvec)
+            return
         if self.backend == "python":
             self._assemble_boundary_edge_python(intg, matvec)
         elif self._is_jit_backend():

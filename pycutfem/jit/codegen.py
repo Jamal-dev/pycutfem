@@ -1437,7 +1437,10 @@ class NumbaCodeGen:
                         )
                         continue
 
-                    coeff_sym = op.name if op.name.startswith("u_") else f"u_{op.name}_loc"
+                    # H(div) coefficient component probes must use the already
+                    # element-gathered coefficient block so the kernel reads the
+                    # current element's local RT dofs, not one raw global vector.
+                    coeff_sym = op.name if op.name.startswith("u_") and op.name.endswith("_loc") else f"u_{op.name}_loc"
                     required_args.add(coeff_sym)
                     solution_func_names.add(coeff_sym)
                     if deriv_order == (0, 0):
@@ -2258,11 +2261,16 @@ class NumbaCodeGen:
                     required_args.add("h_arr")
 
             elif isinstance(op, MeshSize):
-                # Pointwise mesh size from the (possibly deformed) Jacobian determinant.
-                required_args.add("detJ")
                 res = new_var("mesh_h")
-                factor = 2.0 if getattr(self.me.mesh, "element_type", "tri") == "quad" else 1.0
-                body_lines.append(f"{res} = {factor} * np.sqrt(abs(detJ[e, q]))")
+                if self.on_facet:
+                    required_args.add("owner_id")
+                    required_args.add("h_arr")
+                    body_lines.append(f"{res} = h_arr[owner_id[e]]")
+                else:
+                    # Pointwise mesh size from the (possibly deformed) Jacobian determinant.
+                    required_args.add("detJ")
+                    factor = 2.0 if getattr(self.me.mesh, "element_type", "tri") == "quad" else 1.0
+                    body_lines.append(f"{res} = {factor} * np.sqrt(abs(detJ[e, q]))")
                 stack.append(StackItem(var_name=res, shape=(), is_vector=False, role='const', is_gradient=False))
 
 
@@ -3315,29 +3323,29 @@ class NumbaCodeGen:
                 # elif a.role == 'const' and b.role == 'const' and a.shape == b.shape:
                 #     body_lines.append(f'# Inner(Const, Const): element-wise product')
                 #     body_lines.append(f'{res_var} = {a.var_name} * {b.var_name}')
-                elif a.role in {'value', 'const'} and b.role == 'test':  # RHS
-                    body_lines.append('# RHS: Inner(Function, Test)')
+                elif a.role in {'value', 'const'} and b.role in {'test', 'trial'}:
+                    body_lines.append(f"# Inner(Function, {b.role.title()})")
                     # body_lines.append(f"print(f'RHS inner: a.shape: {{{a.var_name}.shape}}, "
                     #                   f"b.shape: {{{b.var_name}.shape}}, ')")
 
                     if (_semantic_is_value_rank2(a, spatial_dim=self.spatial_dim)
                           and _semantic_is_basis_rank2(b, spatial_dim=self.spatial_dim)
                           and not (a.is_hessian or b.is_hessian)):
-                        body_lines.append("# RHS: Inner(Value rank-2, Test rank-2)")
+                        body_lines.append(f"# Inner(Value rank-2, {b.role.title()} rank-2)")
                         body_lines.append(
                             f"{res_var} = inner_rank2_value_rank2_basis({a.var_name}, {b.var_name}, {self.dtype})"
                         )
 
                     elif a.is_gradient and b.is_gradient:
                         # a: (k,d) collapsed grad(Function), b: (k,n,d)
-                        body_lines.append("# RHS: Inner(Grad(Function), Grad(Test))")
+                        body_lines.append(f"# Inner(Grad(Function), Grad({b.role.title()}))")
                         body_lines.append(
                             f"{res_var} = inner_grad_function_grad_test({a.var_name}, {b.var_name}, {self.dtype})"
                         )
 
                     elif a.is_hessian and b.is_hessian:
                         # a: (k,2,2) collapsed Hess(Function), b: (k,n,2,2)
-                        body_lines.append("# RHS: Inner(Hessian(Function), Hessian(Test))")
+                        body_lines.append(f"# Inner(Hessian(Function), Hessian({b.role.title()}))")
                         body_lines.append(
                             f"{res_var} = inner_hessian_function_hessian_test({a.var_name}, {b.var_name}, {self.dtype})"
                         )
@@ -3345,7 +3353,7 @@ class NumbaCodeGen:
                     elif (_semantic_is_value_rank1(a, spatial_dim=self.spatial_dim)
                           and _semantic_is_basis_rank1(b, spatial_dim=self.spatial_dim)):
                         # a: value rank-1 carrier, b: basis rank-1 carrier → (n,)
-                        body_lines.append("# RHS: Inner(Value rank-1, Test rank-1)")
+                        body_lines.append(f"# Inner(Value rank-1, {b.role.title()} rank-1)")
                         body_lines.append(
                             f"{res_var} = const_vector_dot_basis_1d({a.var_name}, {b.var_name}, {self.dtype})"
                         )
@@ -3377,7 +3385,7 @@ class NumbaCodeGen:
                         )
                     ):
                         # a: (), b: (n,)  → (n,)
-                        body_lines.append("# RHS: Inner(Value(Scalar), Test(Scalar))")
+                        body_lines.append(f"# Inner(Value(Scalar), {b.role.title()}(Scalar))")
                         basis_expr = f"{b.var_name}[0]" if len(b.shape) == 2 else b.var_name
                         body_lines.append(
                             f"{res_var} = mul_scalar({a.var_name}, {basis_expr}, {self.dtype})"
@@ -3390,10 +3398,10 @@ class NumbaCodeGen:
                             f"is_gradient: {a.is_gradient}/{b.is_gradient}, "
                             f"shapes: {a.shape}/{b.shape}, is_hessian: {a.is_hessian}/{b.is_hessian}"
                         )
-                    # Push RHS vector (n,) with resolved metadata (prefer test’s side)
+                    # Preserve the basis carrier role/metadata from the trial/test side.
                     field_names, parent_name, side, field_sides = StackItem.resolve_metadata(a, b, prefer=b, strict=False)
                     _push_inner_result(
-                        default_role="test",
+                        default_role=b.role,
                         fallback_shape=(_basis_col_dim(b.shape),),
                         field_names=field_names,
                         parent_name=parent_name,
@@ -3499,10 +3507,7 @@ class NumbaCodeGen:
                                 f'{res_var} = {a.var_name} @ {b.var_name}.T.copy()',
                             ]
                             shape = (a.shape[0], b.shape[1])  # (k,k) for stiffness matrix
-                    elif (
-                        tensor_rank_a == tensor_rank_b == 2
-                        and not (a.is_gradient or b.is_gradient or a.is_hessian or b.is_hessian)
-                    ):
+                    elif tensor_rank_a == tensor_rank_b == 2 and not (a.is_hessian or b.is_hessian):
                         body_lines.append("# Inner(Value rank-2, Value rank-2): full contraction")
                         body_lines.append(
                             f"{res_var} = inner_full_contraction({a.var_name}, {b.var_name}, {self.dtype})"
@@ -4994,6 +4999,75 @@ class NumbaCodeGen:
                                         side=b.side, field_sides=b.field_sides or [],
                                         expression_meta=dot_meta,
                                         **dot_kwargs))
+                elif (
+                    _is_basis_row_like(a)
+                    and _is_basis_row_like(b)
+                    and ((a.role, b.role) == ("test", "trial") or (a.role, b.role) == ("trial", "test"))
+                ):
+                    body_lines.append("# Dot plan: scalar test/trial basis rows")
+                    test_var = a if a.role == "test" else b
+                    trial_var = a if a.role == "trial" else b
+                    fallback_shape = (_basis_col_dim(test_var.shape), _basis_col_dim(trial_var.shape))
+                    body_lines.append(
+                        f"{res_var} = dot_mass_test_trial({test_var.var_name}, {trial_var.var_name}, {self.dtype})"
+                    )
+                    dot_kwargs = _dot_result_stack_kwargs(dot_lowering, dot_value_spec, fallback_shape, "mixed")
+                    field_names, parent_name, side, field_sides = StackItem.resolve_metadata(
+                        a, b, prefer=None, strict=False
+                    )
+                    stack.append(
+                        StackItem(
+                            var_name=res_var,
+                            field_names=field_names,
+                            parent_name=parent_name,
+                            side=side,
+                            field_sides=field_sides or [],
+                            expression_meta=dot_meta,
+                            **dot_kwargs,
+                        )
+                    )
+                elif (
+                    a.role in {"trial", "test"}
+                    and b.role in {"trial", "test"}
+                    and _semantic_is_basis_rank1(a, spatial_dim=self.spatial_dim)
+                    and _semantic_is_basis_rank1(b, spatial_dim=self.spatial_dim)
+                    and not (a.is_gradient or b.is_gradient or a.is_hessian or b.is_hessian)
+                ):
+                    body_lines.append("# Dot plan: semantic scalar basis · scalar basis")
+                    test_var = a if a.role == "test" else b
+                    trial_var = a if a.role == "trial" else b
+                    if len(test_var.shape) == 2 and len(trial_var.shape) == 2:
+                        body_lines.append(
+                            f"{res_var} = dot_mass_test_trial({test_var.var_name}, {trial_var.var_name}, {self.dtype})"
+                        )
+                        fallback_shape = (_basis_col_dim(test_var.shape), _basis_col_dim(trial_var.shape))
+                    else:
+                        body_lines.append(
+                            f"{res_var} = contract_component_first_basis({test_var.var_name}, {trial_var.var_name}, {self.dtype})"
+                        )
+                        lhs_tail = test_var.shape[2:] if len(test_var.shape) > 2 else ()
+                        rhs_tail = trial_var.shape[2:] if len(trial_var.shape) > 2 else ()
+                        if lhs_tail:
+                            fallback_shape = lhs_tail + (_basis_col_dim(test_var.shape), _basis_col_dim(trial_var.shape)) + rhs_tail
+                        elif rhs_tail:
+                            fallback_shape = rhs_tail + (_basis_col_dim(test_var.shape), _basis_col_dim(trial_var.shape))
+                        else:
+                            fallback_shape = (_basis_col_dim(test_var.shape), _basis_col_dim(trial_var.shape))
+                    dot_kwargs = _dot_result_stack_kwargs(dot_lowering, dot_value_spec, fallback_shape, "mixed")
+                    field_names, parent_name, side, field_sides = StackItem.resolve_metadata(
+                        a, b, prefer=None, strict=False
+                    )
+                    stack.append(
+                        StackItem(
+                            var_name=res_var,
+                            field_names=field_names,
+                            parent_name=parent_name,
+                            side=side,
+                            field_sides=field_sides or [],
+                            expression_meta=dot_meta,
+                            **dot_kwargs,
+                        )
+                    )
                 # ---------------------------------------------------------------------
                 # dot( Hessian ,  value/const )          ← Grad object
                 # ---------------------------------------------------------------------
@@ -6727,6 +6801,13 @@ class NumbaCodeGen:
             # Parallel compilation can be very expensive for large generated kernels.
             # Allow opting out via an env var while keeping the historical default.
             use_parallel = os.getenv("PYCUTFEM_JIT_PARALLEL", "1").lower() not in {"0", "false", "no"}
+            parallel_ir_limit_raw = os.getenv("PYCUTFEM_JIT_PARALLEL_IR_LIMIT", "800").strip().lower()
+            try:
+                parallel_ir_limit = int(parallel_ir_limit_raw)
+            except ValueError:
+                parallel_ir_limit = 800
+            if parallel_ir_limit > 0 and len(body_lines) > parallel_ir_limit:
+                use_parallel = False
             decorator = f"@numba.njit(parallel={str(use_parallel)}, fastmath=True, cache={str(use_cache)})"
         # New Newton: The kernel signature and loop structure are updated.
         final_kernel_src = f"""

@@ -1,6 +1,6 @@
 import numpy as np
 
-from examples.biofilms.benchmarks.seboldt.paper1_benchmark7_seboldt import _build_bcs, _latent_inverse_array, _parse_args
+from examples.biofilms.benchmarks.seboldt.paper1_benchmark7_seboldt import _build_bcs, _latent_inverse_array
 from examples.utils.biofilm.deformation_only import build_deformation_only_forms
 from pycutfem.core.dofhandler import DofHandler
 from pycutfem.core.mesh import Mesh
@@ -357,28 +357,6 @@ def test_benchmark7_alpha_solid_dirichlet_side_and_bottom_are_mirrored_to_latent
         expected = float(_latent_inverse_array(np.asarray([1.0], dtype=float), eps=1.0e-8, map_kind="sigmoid")[0])
         assert alpha_val == 1.0
         assert latent_val == expected
-
-
-def test_benchmark7_alpha_transport_defaults_to_conservative_biofilm_volume_flux() -> None:
-    import sys
-
-    argv_prev = sys.argv[:]
-    try:
-        sys.argv = ["paper1_benchmark7_seboldt.py"]
-        args = _parse_args()
-    finally:
-        sys.argv = argv_prev
-
-    assert str(args.alpha_advect_with) == "biofilm_volume"
-    assert str(args.alpha_advection_form) == "conservative_weak"
-    assert str(args.support_physics) == "internal_conversion"
-    assert bool(args.enable_phi_evolution) is False
-    assert np.isclose(float(args.phi_b), 0.18)
-    assert np.isclose(float(args.eps_alpha_over_h), 0.6)
-    assert str(args.kappa_inv_model) == "refmap"
-    assert str(args.solid_bc_mode) == "lateral_clamped"
-    assert str(args.skeleton_pressure_mode) == "whole_domain"
-    assert args.alpha_biot is None
 
 
 def test_deformation_only_reduced_benchmark_honors_skeleton_inertia() -> None:

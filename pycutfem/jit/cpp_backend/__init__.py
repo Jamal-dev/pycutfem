@@ -76,8 +76,14 @@ def compile_backend_cpp(
     param = getattr(ir_generator, "_param", None)
     from pycutfem.jit.ir import strip_side_metadata
     ir_sequence = strip_side_metadata(ir_sequence, on_facet=on_facet)
+    from pycutfem.jit import _kernel_layout_signature
 
-    cache_sig = (mixed_element.signature(), bool(on_facet), int(rank))
+    cache_sig = _kernel_layout_signature(
+        mixed_element,
+        ir_sequence,
+        on_facet=on_facet,
+        rank=rank,
+    )
     kernel, param_order, active_fields = cache.get_kernel(ir_sequence, cpp_codegen, cache_sig)
 
     runner = KernelRunnerCpp(kernel, param_order, ir_sequence, dof_handler, fallback_runner=None)
@@ -143,7 +149,14 @@ def compile_backend_cpp_group(
         ir_sequence = ir_generator.generate(expr, jit_param=param)
         flat_ir.extend(strip_side_metadata(ir_sequence, on_facet=on_facet))
 
-    cache_sig = (mixed_element.signature(), bool(on_facet), int(rank))
+    from pycutfem.jit import _kernel_layout_signature
+
+    cache_sig = _kernel_layout_signature(
+        mixed_element,
+        flat_ir,
+        on_facet=on_facet,
+        rank=rank,
+    )
     kernel, param_order, active_fields = cache.get_kernel(flat_ir, cpp_codegen, cache_sig)
 
     runner = KernelRunnerCpp(kernel, param_order, flat_ir, dof_handler, fallback_runner=None)

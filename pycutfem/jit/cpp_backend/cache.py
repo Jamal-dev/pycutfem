@@ -81,7 +81,12 @@ except ImportError:  # pragma: no cover - platform dependent.
 # - v69 invalidates kernels after adding runtime quadrature-state loads,
 #   including matrix-valued quadrature-state support in the C++ backend.
 #   mass-style contraction path instead of the stack-only grad-grad helper.
-CODEGEN_ABI_CPP = "2026-04-14-cpp-v75-matrix-like-vector-dot-normalization"
+# - v76 invalidates kernels after broadening scalar-gradient inner-product
+#   helpers to accept row/column vector carriers, matching the Python backend.
+# - v77 invalidates kernels after adding a dedicated semantic basis-rank1
+#   inner-product branch so vector-valued test/trial interface terms no longer
+#   fall through to scalar-gradient/value lowering.
+CODEGEN_ABI_CPP = "2026-04-20-cpp-v77-basis-rank1-inner-fix"
 
 
 @contextmanager

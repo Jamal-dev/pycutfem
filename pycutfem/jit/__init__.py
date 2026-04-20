@@ -74,6 +74,27 @@ def _active_field_order(ir_sequence, me) -> tuple[str, ...]:
     return tuple([f for f in me_order if f in seen])
 
 
+def _kernel_layout_signature(mixed_element, ir_sequence, *, on_facet: bool, rank: int) -> tuple:
+    """
+    Return the cache-stable kernel layout signature.
+
+    Mathematical rule:
+      K = H(IR_struct, L_active, on_facet, rank)
+
+    where ``IR_struct`` is the value-independent lowered IR and ``L_active`` is
+    the mixed-element layout restricted to the fields actually touched by the
+    kernel. Runtime data such as coefficient values, BitSet contents, moving
+    interface state, or Constant.value does not enter the signature.
+    """
+    active_fields = _active_field_order(ir_sequence, mixed_element)
+    layout_sig_fn = getattr(mixed_element, "signature_for_fields", None)
+    if callable(layout_sig_fn):
+        layout_sig = layout_sig_fn(active_fields)
+    else:
+        layout_sig = mixed_element.signature()
+    return (layout_sig, bool(on_facet), int(rank))
+
+
 def _active_columns(me, active_fields: tuple[str, ...]) -> np.ndarray:
     """Concatenate component slices for the active fields."""
     cols: list[int] = []
@@ -202,7 +223,7 @@ def _integral_execution_signature(intg, *, compiler, p_geo: int) -> tuple | None
     return None
 
 
-def _integral_fusion_key(intg, *, compiler, p_geo: int, backend: str) -> tuple:
+def _integral_fusion_key(intg, *, compiler, p_geo: int, backend: str = "python") -> tuple:
     exec_sig = _integral_execution_signature(intg, compiler=compiler, p_geo=p_geo)
     rank = _form_rank(intg.integrand)
     if exec_sig is not None and rank > 0:
@@ -292,6 +313,89 @@ def _can_use_cpp_shared_loop(grp: list[Any]) -> bool:
     )
 
 
+def _jit_symbolic_fusion_ir_budget() -> int | None:
+    """
+    Return the maximum cumulative lowered-IR size for one symbolic JIT fusion unit.
+
+    Let ``c(I) = |IR(I)|`` be the length of the value-independent lowered IR for
+    integral ``I``. For the Python/Numba JIT backend we fuse a contiguous group
+    ``G`` only while
+
+        C(G) = sum(c(I) for I in G) <= B
+
+    where ``B`` is this budget. This keeps kernel reuse coarse without creating
+    monolithic generated kernels whose first Numba compile becomes pathological.
+    """
+    raw = os.getenv("PYCUTFEM_JIT_FUSION_IR_BUDGET", "1000").strip().lower()
+    if raw in {"", "0", "false", "no", "off", "none", "inf", "infinite", "unlimited"}:
+        return None
+    try:
+        budget = int(raw)
+    except ValueError:
+        return 1000
+    return budget if budget > 0 else None
+
+
+def _jit_cpp_fallback_ir_threshold() -> int | None:
+    """
+    Return the IR-size threshold above which the JIT path delegates a unit to C++.
+
+    For a compile unit ``U`` with lowered structural size ``|IR(U)|``, use the
+    Numba backend when ``|IR(U)| <= T`` and the C++ backend when ``|IR(U)| > T``.
+    This keeps ordinary kernels on the lighter-weight JIT path while routing the
+    pathological large kernels to the more robust C++ generator.
+    """
+    raw = os.getenv("PYCUTFEM_JIT_CPP_FALLBACK_IR_THRESHOLD", "300").strip().lower()
+    if raw in {"", "0", "false", "no", "off", "none", "inf", "infinite", "unlimited"}:
+        return None
+    try:
+        threshold = int(raw)
+    except ValueError:
+        return 300
+    return threshold if threshold > 0 else None
+
+
+def _estimate_integral_ir_size(intg, *, cache: dict[int, int]) -> int:
+    cached = cache.get(int(id(intg)))
+    if cached is not None:
+        return cached
+    from pycutfem.jit.ir import strip_side_metadata
+
+    ir_sequence = IRGenerator().generate(intg.integrand)
+    ir_sequence = strip_side_metadata(
+        ir_sequence,
+        on_facet=bool(getattr(intg.measure, "on_facet", False)),
+    )
+    size = max(1, int(len(ir_sequence)))
+    cache[int(id(intg))] = size
+    return size
+
+
+def _partition_jit_symbolic_fusion_group(grp: list[Any]) -> list[list[Any]]:
+    budget = _jit_symbolic_fusion_ir_budget()
+    if budget is None or len(grp) <= 1:
+        return [grp]
+
+    partitions: list[list[Any]] = []
+    current: list[Any] = []
+    current_cost = 0
+    ir_size_cache: dict[int, int] = {}
+
+    for intg in grp:
+        cost = _estimate_integral_ir_size(intg, cache=ir_size_cache)
+        if current and current_cost + cost > budget:
+            partitions.append(current)
+            current = [intg]
+            current_cost = cost
+            continue
+        current.append(intg)
+        current_cost += cost
+
+    if current:
+        partitions.append(current)
+    return partitions
+
+
 def _plan_integral_execution_units(
     integrals,
     *,
@@ -336,28 +440,34 @@ def _plan_integral_execution_units(
     planned_units: list[Any] = []
     for key in order:
         grp = groups[key]
-        if len(grp) == 1:
-            planned_units.append(grp[0])
-            continue
+        group_partitions = (
+            [grp]
+            if backend in {"cpp", "c++"}
+            else _partition_jit_symbolic_fusion_group(grp)
+        )
+        for fused_group in group_partitions:
+            if len(fused_group) == 1:
+                planned_units.append(fused_group[0])
+                continue
 
-        integrand_sum = grp[0].integrand
-        for other in grp[1:]:
-            integrand_sum = integrand_sum + other.integrand
+            integrand_sum = fused_group[0].integrand
+            for other in fused_group[1:]:
+                integrand_sum = integrand_sum + other.integrand
 
-        if backend in {"cpp", "c++"} and _can_use_cpp_shared_loop(grp):
-            planned_units.append(
-                _FusedIntegralGroup(
-                    integrals=tuple(grp),
-                    measure=grp[0].measure,
-                    integrand=integrand_sum,
+            if backend in {"cpp", "c++"} and _can_use_cpp_shared_loop(fused_group):
+                planned_units.append(
+                    _FusedIntegralGroup(
+                        integrals=tuple(fused_group),
+                        measure=fused_group[0].measure,
+                        integrand=integrand_sum,
+                    )
                 )
-            )
-            continue
+                continue
 
-        fused = _IntegralExpr(integrand_sum, grp[0].measure)
-        if hasattr(fused, "__dict__"):
-            fused._fused_from = [int(id(x)) for x in grp]
-        planned_units.append(fused)
+            fused = _IntegralExpr(integrand_sum, fused_group[0].measure)
+            if hasattr(fused, "__dict__"):
+                fused._fused_from = [int(id(x)) for x in fused_group]
+            planned_units.append(fused)
 
     return planned_units
 
@@ -1022,6 +1132,34 @@ class KernelRunner:
         n_union = gdofs_map.shape[1]
         total_dofs = self.dof_handler.total_dofs
 
+        def _target_vector_for_function_obj(f):
+            base = getattr(f, "_parent_vector", None)
+            source = base if base is not None else f
+            cache_key = id(source)
+            full_vec = self._full_vec_cache.get(cache_key)
+            if full_vec is None:
+                full_vec = np.zeros(total_dofs, dtype=source.nodal_values.dtype)
+                self._full_vec_cache[cache_key] = full_vec
+            if hasattr(source, "_g_dofs") and source._g_dofs.size:
+                full_vec[source._g_dofs] = source.nodal_values
+            else:
+                g2l = getattr(source, "_g2l", {})
+                if g2l:
+                    local_vals = source.nodal_values
+                    for gdof, lidx in g2l.items():
+                        full_vec[gdof] = local_vals[lidx]
+
+            if base is not None and base is not f:
+                comp_key = (cache_key, f.field_name)
+                comp_vec = self._full_vec_cache.get(comp_key)
+                if comp_vec is None:
+                    comp_vec = np.zeros_like(full_vec)
+                    self._full_vec_cache[comp_key] = comp_vec
+                fld_slice = self.dof_handler.get_field_slice(f.field_name)
+                comp_vec[fld_slice] = full_vec[fld_slice]
+                return comp_vec
+            return full_vec
+
         def _gather(full_vec: np.ndarray, side_map, tag, name):
             if side_map is None:
                 return
@@ -1095,35 +1233,7 @@ class KernelRunner:
                         continue
 
             # 1) global vector with current nodal values --------------------
-            base = getattr(f, "_parent_vector", None)
-            source = base if base is not None else f
-            cache_key = id(source)
-            full_vec = self._full_vec_cache.get(cache_key)
-            if full_vec is None:
-                full_vec = np.zeros(total_dofs, dtype=source.nodal_values.dtype)
-                self._full_vec_cache[cache_key] = full_vec
-            if hasattr(source, "_g_dofs") and source._g_dofs.size:
-                full_vec[source._g_dofs] = source.nodal_values
-            else:
-                # Fallback: populate via mapping dict (rare path)
-                g2l = getattr(source, "_g2l", {})
-                if g2l:
-                    local_vals = source.nodal_values
-                    for gdof, lidx in g2l.items():
-                        full_vec[gdof] = local_vals[lidx]
-
-            # 2a) volume coefficients  u_<name>_loc -------------------------
-            if base is not None and base is not f:
-                comp_key = (cache_key, f.field_name)
-                comp_vec = self._full_vec_cache.get(comp_key)
-                if comp_vec is None:
-                    comp_vec = np.zeros_like(full_vec)
-                    self._full_vec_cache[comp_key] = comp_vec
-                fld_slice = self.dof_handler.get_field_slice(f.field_name)
-                comp_vec[fld_slice] = full_vec[fld_slice]
-                target_vec = comp_vec
-            else:
-                target_vec = full_vec
+            target_vec = _target_vector_for_function_obj(f)
             coeff_name = f"u_{name}_loc"
             coeff = static_args.get(coeff_name)
             if (
@@ -1156,6 +1266,8 @@ class KernelRunner:
                 elif hasattr(val, "value") and not hasattr(val, "nodal_values"):
                     # UFL Constant-like object (scalar or array)
                     kernel_args[tag] = _kernel_float64_arg(val.value)
+                elif hasattr(val, "nodal_values"):
+                    kernel_args[tag] = _target_vector_for_function_obj(val)
                 else:
                     kernel_args[tag] = _kernel_float64_arg(val)
             except Exception as exc:
@@ -1263,8 +1375,24 @@ def compile_backend(integral_expression, dof_handler,mixed_element, *, on_facet:
     param = getattr(ir_generator, "_param", None)
     from pycutfem.jit.ir import strip_side_metadata
     ir_sequence = strip_side_metadata(ir_sequence, on_facet=on_facet)
-    
-    cache_sig = (mixed_element.signature(), bool(on_facet), int(rank))
+    cpp_fallback_threshold = _jit_cpp_fallback_ir_threshold()
+    if cpp_fallback_threshold is not None and len(ir_sequence) > cpp_fallback_threshold:
+        from pycutfem.jit.cpp_backend import compile_backend_cpp
+
+        return compile_backend_cpp(
+            integral_expression,
+            dof_handler,
+            mixed_element,
+            on_facet=on_facet,
+        )
+    codegen._init_active_fields(ir_sequence)
+
+    cache_sig = _kernel_layout_signature(
+        mixed_element,
+        ir_sequence,
+        on_facet=on_facet,
+        rank=rank,
+    )
     kernel, param_order = cache.get_kernel(ir_sequence, codegen, cache_sig)
     
     if hasattr(kernel, "py_func"):

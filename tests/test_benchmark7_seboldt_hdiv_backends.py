@@ -371,8 +371,14 @@ def _assemble_benchmark7_momentum_pressure_alpha_term(backend: str) -> np.ndarra
 @pytest.mark.parametrize("backend", ("jit", "cpp"))
 def test_benchmark7_seboldt_hdiv_mass_and_total_forms_match_python(backend, monkeypatch, tmp_path):
     monkeypatch.setenv("PYCUTFEM_CACHE_DIR", str(tmp_path / f"jit_cache_{backend}"))
+    # These are backend-parity regressions; disable JIT parfor lowering so the
+    # test budget is spent on assembly semantics rather than Numba's parallel IR.
+    monkeypatch.setenv("PYCUTFEM_JIT_PARALLEL", "0")
     if backend == "cpp":
         monkeypatch.setenv("PYCUTFEM_JIT_BACKEND", "cpp")
+        monkeypatch.setenv("PYCUTFEM_CPP_FAST_COMPILE", "1")
+        monkeypatch.setenv("PYCUTFEM_CPP_FAST_OPT_LEVEL", "0")
+        monkeypatch.setenv("PYCUTFEM_CPP_FAST_MARCH_NATIVE", "0")
     else:
         monkeypatch.delenv("PYCUTFEM_JIT_BACKEND", raising=False)
 
@@ -387,8 +393,12 @@ def test_benchmark7_seboldt_hdiv_mass_and_total_forms_match_python(backend, monk
 @pytest.mark.parametrize("backend", ("cpp",))
 def test_benchmark7_seboldt_full_hdiv_refmap_grad_backend_matches_python_on_1x1(backend, monkeypatch, tmp_path):
     monkeypatch.setenv("PYCUTFEM_CACHE_DIR", str(tmp_path / f"jit_cache_full_{backend}"))
+    monkeypatch.setenv("PYCUTFEM_JIT_PARALLEL", "0")
     if backend == "cpp":
         monkeypatch.setenv("PYCUTFEM_JIT_BACKEND", "cpp")
+        monkeypatch.setenv("PYCUTFEM_CPP_FAST_COMPILE", "1")
+        monkeypatch.setenv("PYCUTFEM_CPP_FAST_OPT_LEVEL", "0")
+        monkeypatch.setenv("PYCUTFEM_CPP_FAST_MARCH_NATIVE", "0")
     else:
         monkeypatch.delenv("PYCUTFEM_JIT_BACKEND", raising=False)
 
@@ -402,6 +412,7 @@ def test_benchmark7_seboldt_full_hdiv_refmap_grad_backend_matches_python_on_1x1(
 @pytest.mark.parametrize("backend", ("jit", "cpp"))
 def test_benchmark7_seboldt_full_hdiv_tanh_latent_backend_matches_python_on_1x1(backend, monkeypatch, tmp_path):
     monkeypatch.setenv("PYCUTFEM_CACHE_DIR", str(tmp_path / f"jit_cache_tanh_latent_{backend}"))
+    monkeypatch.setenv("PYCUTFEM_JIT_PARALLEL", "0")
     if backend == "cpp":
         monkeypatch.setenv("PYCUTFEM_JIT_BACKEND", "cpp")
         monkeypatch.setenv("PYCUTFEM_CPP_FAST_COMPILE", "1")
@@ -420,6 +431,7 @@ def test_benchmark7_seboldt_full_hdiv_tanh_latent_backend_matches_python_on_1x1(
 @pytest.mark.parametrize("backend", ("jit", "cpp"))
 def test_benchmark7_full_hdiv_pressure_block_matches_python_on_1x1(backend, monkeypatch, tmp_path):
     monkeypatch.setenv("PYCUTFEM_CACHE_DIR", str(tmp_path / f"jit_cache_pressure_block_{backend}"))
+    monkeypatch.setenv("PYCUTFEM_JIT_PARALLEL", "0")
     if backend == "cpp":
         monkeypatch.setenv("PYCUTFEM_JIT_BACKEND", "cpp")
         monkeypatch.setenv("PYCUTFEM_CPP_FAST_COMPILE", "1")
@@ -438,6 +450,7 @@ def test_benchmark7_full_hdiv_pressure_block_matches_python_on_1x1(backend, monk
 @pytest.mark.parametrize("backend", ("jit", "cpp"))
 def test_benchmark7_momentum_pressure_alpha_term_matches_python(backend, monkeypatch, tmp_path):
     monkeypatch.setenv("PYCUTFEM_CACHE_DIR", str(tmp_path / f"jit_cache_pressure_alpha_{backend}"))
+    monkeypatch.setenv("PYCUTFEM_JIT_PARALLEL", "0")
     if backend == "cpp":
         monkeypatch.setenv("PYCUTFEM_JIT_BACKEND", "cpp")
         monkeypatch.setenv("PYCUTFEM_CPP_FAST_COMPILE", "1")
@@ -458,6 +471,10 @@ def test_hdiv_ref_table_cache_respects_active_layout(monkeypatch, tmp_path):
     kernel_args._REF_TABLE_CACHE.clear()
     monkeypatch.setenv("PYCUTFEM_CACHE_DIR", str(tmp_path / "jit_cache_active_layout"))
     monkeypatch.delenv("PYCUTFEM_JIT_BACKEND", raising=False)
+    # This regression is about cache-key/layout reuse, not Numba parfor lowering.
+    # Disable parfor here so the large reduced H(div) Jacobian does not spend most
+    # of the test budget in Numba's parallel IR analysis.
+    monkeypatch.setenv("PYCUTFEM_JIT_PARALLEL", "0")
 
     warm_ref = _assemble_benchmark7_hdiv_div_warmup("python")
     warm_jit = _assemble_benchmark7_hdiv_div_warmup("jit")

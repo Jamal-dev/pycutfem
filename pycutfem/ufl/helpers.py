@@ -867,23 +867,24 @@ class VecOpInfo(BaseOpInfo):
         # shape_b = getattr(other, 'shape', "None")
         # role_b = getattr(other, 'role', "None")
         # print(f"VecOpInfo.__mul__: roles=({self.role}, {role_b}), shapes=({shape_a}, {shape_b})")
+        data = np.asarray(self.data)
         if isinstance(other, (float, int)):
-            return self._with(self.data * other, role=self.role)
+            return self._with(data * other, role=self.role)
         elif isinstance(other, np.ndarray): # np.array
             if other.ndim == 0:
                 # Scalar multiplication
-                return self._with(self.data * other, role=self.role)
-            if self.data.ndim == 0 and other.ndim == 1:
+                return self._with(data * other, role=self.role)
+            if data.ndim == 0 and other.ndim == 1:
                 # Scalar (QP) value times a constant vector -> vector (QP).
-                return self._with(self.data * other, role="vector")
-            elif other.ndim == 1 and other.size == self.data.shape[0]:
-                return self._with(self.data * other[:, np.newaxis], role=self.role)
-            elif other.ndim == 1 and self.data.shape[0] == 1:
+                return self._with(data * other, role="vector")
+            elif other.ndim == 1 and other.size == data.shape[0]:
+                return self._with(data * other[:, np.newaxis], role=self.role)
+            elif other.ndim == 1 and data.shape[0] == 1:
                 # New Case: Scalar multiplication with a vector
                 if self.role == "function":
                     vals = _collapsed_function(self)  # shape (k,)
                     return self._with(vals * other, role="vector")
-                return self._with(np.asarray([self.data[0,:] * comp for comp in other]), role=self.role)
+                return self._with(np.asarray([data[0, :] * comp for comp in other]), role=self.role)
             elif other.ndim == 2:
                 if self.role in {"function", "vector", "trial", "test", "trial_n", "test_n", "mixed"}:
                     try:
@@ -892,12 +893,12 @@ class VecOpInfo(BaseOpInfo):
                         pass
                 # Scale a matrix by a scalar-valued function (e.g. div(u_k) * dot(u_trial, v_test)
                 # in the skew-symmetric convection Jacobian).
-                if self.data.ndim == 0:
-                    return other * float(self.data)
-                if self.data.ndim == 1 and self.data.shape[0] == 1:
-                    return other * float(self.data[0])
+                if data.ndim == 0:
+                    return other * float(data)
+                if data.ndim == 1 and data.shape[0] == 1:
+                    return other * float(data[0])
                 if self.role in {"function", "vector"}:
-                    vals = _collapsed_function(self) if self.role == "function" else np.asarray(self.data, dtype=float)
+                    vals = _collapsed_function(self) if self.role == "function" else np.asarray(data, dtype=float)
                     vals = np.asarray(vals, dtype=float)
                     if vals.ndim == 1 and other.shape[0] == vals.shape[0]:
                         data = vals @ other
@@ -972,12 +973,12 @@ class VecOpInfo(BaseOpInfo):
                 return VecOpInfo(data, role=role, **self.update_meta(meta))
             elif self.role == "scalar" and other.role != "scalar":
                 # Case: scalar coefficient (collapsed) scaling a basis/vector/function
-                scale = float(self.data)
+                scale = float(np.asarray(self.data).reshape(-1)[0])
                 meta = _resolve_meta(self.meta(), other.meta(), prefer="b")
                 return VecOpInfo(scale * other.data, role=other.role, **other.update_meta(meta))
             elif self.role != "scalar" and other.role == "scalar":
                 # Case: basis/vector/function scaled by a scalar coefficient on the right
-                scale = float(other.data)
+                scale = float(np.asarray(other.data).reshape(-1)[0])
                 meta = _resolve_meta(self.meta(), other.meta(), prefer="a")
                 return VecOpInfo(scale * self.data, role=self.role, **self.update_meta(meta))
             elif self.role in {"trial", "test"} and other.role in {"function", "vector"} and other.is_scalar_function():

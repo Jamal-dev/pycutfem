@@ -294,10 +294,12 @@ def _assemble_small_benchmark7_reduced(
         problem["vS_k"],
         problem["u_k"],
         problem["alpha_k"],
+        problem.get("B_k"),
         problem["mu_k"],
         problem["phi_k"],
         problem["S_k"],
     ]
+    funcs = [f for f in funcs if f is not None]
     if problem.get("lambda_drag_k") is not None:
         funcs.insert(4, problem["lambda_drag_k"])
     prev_funcs = [
@@ -306,10 +308,12 @@ def _assemble_small_benchmark7_reduced(
         problem["vS_n"],
         problem["u_n"],
         problem["alpha_n"],
+        problem.get("B_n"),
         problem["mu_n"],
         problem["phi_n"],
         problem["S_n"],
     ]
+    prev_funcs = [f for f in prev_funcs if f is not None]
     if problem.get("lambda_drag_n") is not None:
         prev_funcs.insert(4, problem["lambda_drag_n"])
     coeffs = {f.name: f for f in funcs}
@@ -449,8 +453,10 @@ def _assemble_small_benchmark7_split_reduced(
         problem["vS_k"],
         problem["u_k"],
         problem["alpha_k"],
+        problem.get("B_k"),
         problem["mu_k"],
     ]
+    funcs = [f for f in funcs if f is not None]
     if problem.get("lambda_drag_k") is not None:
         funcs.insert(5, problem["lambda_drag_k"])
     prev_funcs = [
@@ -460,8 +466,10 @@ def _assemble_small_benchmark7_split_reduced(
         problem["vS_n"],
         problem["u_n"],
         problem["alpha_n"],
+        problem.get("B_n"),
         problem["mu_n"],
     ]
+    prev_funcs = [f for f in prev_funcs if f is not None]
     if problem.get("lambda_drag_n") is not None:
         prev_funcs.insert(5, problem["lambda_drag_n"])
     coeffs = {f.name: f for f in funcs}

@@ -2041,7 +2041,7 @@ class Restriction(Expression):
         self.is_function = getattr(operand, "is_function", False)
         self.is_trial    = getattr(operand, "is_trial",    False)
         self.is_test     = getattr(operand, "is_test",     False)
-        self.num_components = operand.num_components
+        self.num_components = getattr(operand, "num_components", 1)
 
     def __repr__(self):
         return f"Restriction({self.operand!r}, '{self.domain}')"

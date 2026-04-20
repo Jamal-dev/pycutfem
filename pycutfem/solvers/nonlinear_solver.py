@@ -10979,7 +10979,11 @@ class PdasNewtonSolver(NewtonSolver):
             return
 
         cur = float(getattr(self, "_vi_ptc_sigma_current", 0.0) or 0.0)
-        if ptc_stalled or force_identified:
+        accepted_has_meaningful_progress = (
+            float(accepted_alpha) >= 0.5
+            and (float(merit_ratio) < 0.995 or float(accepted_g_ratio) < 0.995)
+        )
+        if (ptc_stalled or force_identified) and not (cur > 0.0 and accepted_has_meaningful_progress):
             next_sigma = float(sigma0) if cur <= 0.0 else float(min(cur * sigma_growth, sigma_max))
             if next_sigma > 0.0:
                 self._vi_ptc_sigma_current = float(next_sigma)

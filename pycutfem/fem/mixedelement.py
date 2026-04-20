@@ -493,6 +493,40 @@ class MixedElement:
                 self.mesh.poly_order,              # geometry order
                 field_info,                        # heterogeneous field orders
                 self.n_dofs_local)                 # 22, 18, 8, ...
+
+    def signature_for_fields(self, fields: Sequence[str] | None = None) -> tuple:
+        """
+        Return a layout signature for a kernel that only touches ``fields``.
+
+        Kernel codegen compresses inactive fields away, so cache keys should do
+        the same. Reusing a kernel is safe whenever the active-field layout is
+        identical even if the surrounding mixed system contains additional
+        inactive fields.
+        """
+        if fields is None:
+            return self.signature()
+
+        requested = {str(name) for name in fields}
+        active_names = tuple(name for name in self.field_names if name in requested)
+        if not active_names:
+            active_names = tuple(self.field_names)
+
+        field_info = tuple(
+            (
+                name,
+                self._field_families.get(name, "Lagrange"),
+                self._field_orders[name],
+                int(self.component_dof_slices[name].stop - self.component_dof_slices[name].start),
+            )
+            for name in active_names
+        )
+        active_n_dofs = int(sum(info[-1] for info in field_info))
+        return (
+            self.mesh.element_type,
+            self.mesh.poly_order,
+            field_info,
+            active_n_dofs,
+        )
     
     # ..................................................................
     def __repr__(self) -> str:  # pragma: no cover – debug aide

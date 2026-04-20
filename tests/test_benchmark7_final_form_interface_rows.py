@@ -1,4 +1,3 @@
-import sys
 import numpy as np
 
 from examples.biofilms.benchmarks.seboldt.paper1_benchmark7_seboldt import (
@@ -6,8 +5,6 @@ from examples.biofilms.benchmarks.seboldt.paper1_benchmark7_seboldt import (
     _create_problem,
     _geometry_indicator_prime_array,
     _named_constant,
-    _normalize_benchmark7_solver_choice,
-    _parse_args,
     _primary_darcy_field_names,
     _tag_inactive_fields_above_alpha,
     _tag_inactive_fields_below_alpha,
@@ -1545,94 +1542,6 @@ def test_benchmark7_final_form_domain_lm_fields_join_inactive_domain_tags() -> N
     assert high_counts.get("lm_u_x", 0) > 0
     assert high_counts.get("mu_normal", 0) > 0
     assert high_counts.get("mu_mass", 0) > 0
-
-
-def test_benchmark7_final_form_keeps_predictor_corrector_startup_enabled() -> None:
-    saved_argv = list(sys.argv)
-    try:
-        sys.argv = [
-            "pytest",
-            "--one-domain-formulation",
-            "final_form",
-            "--final-form-constant-rho-s",
-        ]
-        args = _parse_args()
-    finally:
-        sys.argv = saved_argv
-
-    args = _normalize_benchmark7_solver_choice(args)
-
-    assert bool(args.predictor_corrector_startup)
-
-
-def test_benchmark7_final_form_domain_lm_disables_predictor_corrector_startup() -> None:
-    saved_argv = list(sys.argv)
-    try:
-        sys.argv = [
-            "pytest",
-            "--one-domain-formulation",
-            "final_form",
-            "--final-form-constant-rho-s",
-            "--final-form-domain-lm",
-        ]
-        args = _parse_args()
-    finally:
-        sys.argv = saved_argv
-
-    args = _normalize_benchmark7_solver_choice(args)
-
-    assert not bool(args.predictor_corrector_startup)
-
-
-def test_benchmark7_final_form_domain_lm_subset_flags_do_not_enable_other_targets() -> None:
-    saved_argv = list(sys.argv)
-    try:
-        sys.argv = [
-            "pytest",
-            "--one-domain-formulation",
-            "final_form",
-            "--final-form-constant-rho-s",
-            "--final-form-domain-lm",
-            "--final-form-domain-lm-vP",
-            "--final-form-domain-lm-p-pore",
-        ]
-        args = _parse_args()
-    finally:
-        sys.argv = saved_argv
-
-    args = _normalize_benchmark7_solver_choice(args)
-
-    assert bool(args.final_form_domain_lm)
-    assert bool(args.final_form_domain_lm_vP)
-    assert bool(args.final_form_domain_lm_p_pore)
-    assert not bool(args.final_form_domain_lm_vf)
-    assert not bool(args.final_form_domain_lm_p)
-    assert not bool(args.final_form_domain_lm_vS)
-    assert not bool(args.final_form_domain_lm_phi)
-    assert not bool(args.final_form_domain_lm_u)
-
-
-def test_benchmark7_final_form_honors_explicit_zero_free_side_penalties() -> None:
-    saved_argv = list(sys.argv)
-    try:
-        sys.argv = [
-            "pytest",
-            "--one-domain-formulation",
-            "final_form",
-            "--final-form-constant-rho-s",
-            "--gamma-vP",
-            "0",
-            "--gamma-p-pore",
-            "0",
-        ]
-        args = _parse_args()
-    finally:
-        sys.argv = saved_argv
-
-    args = _normalize_benchmark7_solver_choice(args)
-
-    assert float(args.gamma_vP) == 0.0
-    assert float(args.gamma_p_pore) == 0.0
 
 
 def test_benchmark7_named_constant_reuses_cached_object() -> None:

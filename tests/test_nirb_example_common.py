@@ -6,6 +6,16 @@ import pyvista as pv
 from examples.NIRB.common import numeric_suffix_key, parse_git_lfs_pointer, read_arterial_vtk_series
 
 
+def _save_polydata_compat(mesh: pv.PolyData, path: Path) -> None:
+    # Some PyVista builds leave these metadata registries unset until arrays are
+    # marked specially, but save() unconditionally reads them.
+    for assoc_name in ("bitarray", "complex"):
+        attr = f"_association_{assoc_name}_names"
+        if not hasattr(mesh, attr):
+            setattr(mesh, attr, {})
+    mesh.save(path, binary=False)
+
+
 def test_parse_git_lfs_pointer_extracts_oid_and_size(tmp_path: Path):
     pointer_path = tmp_path / "array.npy"
     pointer_path.write_text(
@@ -41,7 +51,7 @@ def test_read_arterial_vtk_series_builds_feature_major_arrays(tmp_path: Path):
         mesh.point_data["pressure"] = np.array([pressure0, pressure0 + 1.0])
         mesh.point_data["diameter"] = np.array([1.0 + 0.1 * step, 1.0 + 0.2 * step])
         mesh.point_data["iters"] = np.array([3.0 + step, 3.0 + step])
-        mesh.save(tmp_path / f"out_fluid_{step}.vtk", binary=False)
+        _save_polydata_compat(mesh, tmp_path / f"out_fluid_{step}.vtk")
 
     series = read_arterial_vtk_series(tmp_path)
     assert series["pressure"].shape == (2, 2)
