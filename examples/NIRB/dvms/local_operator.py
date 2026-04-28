@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
 
 from pycutfem.core.dofhandler import DofHandler
 from pycutfem.core.mesh import Mesh
 from pycutfem.operators import LocalAssemblyOperator, LocalAssemblyResult, LocalAssemblyWorkset
 from pycutfem.ufl.compilers import FormCompiler
-from pycutfem.ufl.forms import Equation
+from pycutfem.ufl.forms import Equation, Form
 from pycutfem.ufl.measures import dx
 from pycutfem.ufl.spaces import FunctionSpace
 from pycutfem.ufl.expressions import Constant, ElementWiseConstant, Function, TrialFunction, VectorFunction, VectorTestFunction, VectorTrialFunction, TestFunction
@@ -18,7 +20,7 @@ from .helpers import (
     _kratos_dvms_element_size_coefficient,
 )
 from .state import FluidDVMSState
-from .symbolics import build_fluid_dvms_local_forms
+from .symbolics import build_fluid_dvms_kratos_split_forms, build_fluid_dvms_local_forms
 from .update import _dvms_fast_p1_tri_cache, _grad_phi_phys, _scalar_locals, _update_fluid_dvms_predicted_subscale
 
 
@@ -101,6 +103,81 @@ def _compress_batch_to_fluid_block(
     return lhs, rhs, fluid_gdofs
 
 
+def _as_form(term) -> Form:
+    if isinstance(term, Form):
+        return term
+    return Form([term])
+
+
+def _sum_forms(terms) -> Form:
+    result = None
+    for term in terms:
+        result = _as_form(term) if result is None else result + term
+    if result is None:
+        raise ValueError("Cannot build an empty DVMS form.")
+    return result
+
+
+@dataclass(frozen=True)
+class _KratosResidualizedSystemForms:
+    nonviscous_velocity: Equation
+    viscous_velocity: Equation
+    mass_matrix: Form
+
+
+def _fluid_values_full(
+    dh: DofHandler,
+    *,
+    u: VectorFunction,
+    p: Function | None = None,
+) -> np.ndarray:
+    values = np.zeros(int(dh.total_dofs), dtype=float)
+    ux_ids = np.asarray(dh.get_field_slice(u.components[0].field_name), dtype=int)
+    uy_ids = np.asarray(dh.get_field_slice(u.components[1].field_name), dtype=int)
+    values[ux_ids] = np.asarray(u.components[0].nodal_values, dtype=float).reshape(-1)
+    values[uy_ids] = np.asarray(u.components[1].nodal_values, dtype=float).reshape(-1)
+    if p is not None:
+        p_ids = np.asarray(dh.get_field_slice(p.field_name), dtype=int)
+        values[p_ids] = np.asarray(p.nodal_values, dtype=float).reshape(-1)
+    return values
+
+
+def _fluid_bossak_acceleration_values_full(
+    dh: DofHandler,
+    *,
+    u_k: VectorFunction,
+    u_prev: VectorFunction | None,
+    a_prev: VectorFunction | None,
+    a_curr: VectorFunction | None,
+    bossak_alpha: float,
+    dt: float,
+) -> np.ndarray:
+    if a_prev is None:
+        raise ValueError("Kratos residualized DVMS system requires a_prev.")
+    bossak = _bossak_coefficients(alpha=float(bossak_alpha), dt=float(dt))
+    if a_curr is None:
+        if u_prev is None:
+            raise ValueError("Kratos residualized DVMS system requires u_prev when a_curr is not supplied.")
+        current_acceleration = (
+            float(bossak["ma0"])
+            * (np.asarray(u_k.nodal_values, dtype=float) - np.asarray(u_prev.nodal_values, dtype=float))
+            + float(bossak["ma2"]) * np.asarray(a_prev.nodal_values, dtype=float)
+        )
+    else:
+        current_acceleration = np.asarray(a_curr.nodal_values, dtype=float)
+    scheme_acceleration = (
+        (1.0 - float(bossak["alpha"])) * np.asarray(current_acceleration, dtype=float)
+        + float(bossak["alpha"]) * np.asarray(a_prev.nodal_values, dtype=float)
+    )
+    tmp = VectorFunction(
+        "dvms_bossak_scheme_accel_tmp",
+        [u_k.components[0].field_name, u_k.components[1].field_name],
+        dof_handler=dh,
+    )
+    tmp.nodal_values[:] = scheme_acceleration
+    return _fluid_values_full(dh, u=tmp, p=None)
+
+
 def _local_trial_test_functions(dh: DofHandler):
     v_space = FunctionSpace("FluidVelocityLocal", ["ux", "uy"], dim=1)
     du = VectorTrialFunction(space=v_space, dof_handler=dh)
@@ -155,10 +232,10 @@ def _dvms_condensed_hidden_state_correction_batch(
     p_k: Function,
     d_mesh: VectorFunction,
     d_prev: VectorFunction,
-    d_prev2: VectorFunction | None,
-    mesh_v: VectorFunction | None,
-    mesh_v_prev: VectorFunction | None,
-    mesh_a_prev: VectorFunction | None,
+    d_prev2: VectorFunction | None = None,
+    mesh_v: VectorFunction | None = None,
+    mesh_v_prev: VectorFunction | None = None,
+    mesh_a_prev: VectorFunction | None = None,
     state: FluidDVMSState,
     rho_f: float,
     mu_f: float,
@@ -183,7 +260,11 @@ def _dvms_condensed_hidden_state_correction_batch(
     rho_value = float(rho_f)
     mu_value = float(mu_f)
     dt_value = max(float(dt), 1.0e-14)
-    dynamic_tau_value = max(float(dynamic_tau), 1.0e-14)
+    # Kratos' DVMS element keeps DYNAMIC_TAU in the formulation settings, but
+    # d_vms.cpp hard-codes the dynamic subscale time term with coefficient 1.
+    # Preserve the argument for API compatibility while matching Kratos here.
+    del dynamic_tau
+    dynamic_tau_value = 1.0
     bossak = _bossak_coefficients(alpha=float(bossak_alpha), dt=dt_value)
     bossak_mass_coeff = (1.0 - float(bossak["alpha"])) * float(bossak["ma0"])
     inv_dt = 1.0 / dt_value
@@ -487,6 +568,7 @@ def _build_fluid_dvms_form_or_equation(
     u_k: VectorFunction,
     u_prev: VectorFunction | None,
     a_prev: VectorFunction | None,
+    a_curr: VectorFunction | None,
     p_k: Function,
     d_mesh: VectorFunction,
     d_prev: VectorFunction,
@@ -521,6 +603,7 @@ def _build_fluid_dvms_form_or_equation(
         u_k=u_k,
         u_prev=u_k if u_prev is None else u_prev,
         a_prev=u_k if a_prev is None else a_prev,
+        a_curr=a_curr,
         p_k=p_k,
         d_mesh=d_mesh,
         d_prev=d_prev,
@@ -555,6 +638,88 @@ def _build_fluid_dvms_form_or_equation(
     return forms.mass_stabilization
 
 
+def _build_fluid_dvms_kratos_residualized_system_forms(
+    *,
+    mesh: Mesh,
+    dh: DofHandler,
+    u_k: VectorFunction,
+    u_prev: VectorFunction | None,
+    a_prev: VectorFunction | None,
+    a_curr: VectorFunction | None,
+    p_k: Function,
+    d_mesh: VectorFunction,
+    d_prev: VectorFunction,
+    d_prev2: VectorFunction | None,
+    mesh_v: VectorFunction | None,
+    mesh_v_prev: VectorFunction | None,
+    mesh_a_prev: VectorFunction | None,
+    state: FluidDVMSState | None,
+    rho_f: float,
+    mu_f: float,
+    dt: float,
+    bossak_alpha: float,
+    quadrature_order: int | None,
+    body_force: np.ndarray | None,
+    use_oss: bool,
+    h_coefficient: ElementWiseConstant | None = None,
+) -> _KratosResidualizedSystemForms:
+    if u_prev is None or a_prev is None:
+        raise ValueError("Kratos residualized DVMS system requires u_prev and a_prev.")
+
+    du, dp, v, q = _local_trial_test_functions(dh)
+    bossak = _bossak_coefficients(alpha=float(bossak_alpha), dt=float(dt))
+    qorder = int(quadrature_order) if quadrature_order is not None else int(getattr(state, "quadrature_order", 2))
+    coeffs = _dvms_state_coefficients(state)
+    split = build_fluid_dvms_kratos_split_forms(
+        du=du,
+        dp=dp,
+        v=v,
+        q=q,
+        u_k=u_k,
+        u_prev=u_prev,
+        a_prev=a_prev,
+        a_curr=a_curr,
+        p_k=p_k,
+        d_mesh=d_mesh,
+        d_prev=d_prev,
+        d_prev2=d_prev2,
+        mesh_v=mesh_v,
+        mesh_v_prev=mesh_v_prev,
+        mesh_a_prev=mesh_a_prev,
+        dx_measure=dx(metadata={"q": qorder}),
+        rho=Constant(float(rho_f)),
+        mu=Constant(float(mu_f)),
+        dt=Constant(max(float(dt), 1.0e-14)),
+        h=_kratos_dvms_element_size_coefficient(mesh) if h_coefficient is None else h_coefficient,
+        bossak_ma0=Constant(float(bossak["ma0"])),
+        bossak_ma2=Constant(float(bossak["ma2"])),
+        bossak_alpha=Constant(float(bossak["alpha"])),
+        predicted_subscale=coeffs["predicted_subscale"],
+        old_subscale=coeffs["old_subscale"],
+        momentum_projection=coeffs["momentum_projection"],
+        mass_projection=coeffs["mass_projection"],
+        old_mass_residual=coeffs["old_mass_residual"],
+        body_force=None if body_force is None else np.asarray(body_force, dtype=float).reshape(2),
+        use_oss=bool(use_oss),
+    )
+    nonviscous_lhs = _sum_forms(
+        form for name, form in split.lhs_terms.items() if str(name) != "viscous"
+    )
+    source_rhs = _sum_forms(
+        form
+        for name, form in split.rhs_terms.items()
+        if str(name) != "viscous" and not str(name).startswith("minus_")
+    )
+    viscous_lhs = split.lhs_terms["viscous"]
+    viscous_rhs = split.rhs_terms["viscous"]
+    mass_matrix = split.mass_terms["mass_lhs"] + split.mass_terms["mass_stabilization"]
+    return _KratosResidualizedSystemForms(
+        nonviscous_velocity=Equation(nonviscous_lhs, source_rhs),
+        viscous_velocity=Equation(viscous_lhs, viscous_rhs),
+        mass_matrix=mass_matrix,
+    )
+
+
 def assemble_fluid_dvms_local_contribution_batch(
     *,
     mesh: Mesh,
@@ -562,6 +727,7 @@ def assemble_fluid_dvms_local_contribution_batch(
     u_k: VectorFunction,
     u_prev: VectorFunction | None = None,
     a_prev: VectorFunction | None = None,
+    a_curr: VectorFunction | None = None,
     p_k: Function,
     d_mesh: VectorFunction,
     d_prev: VectorFunction,
@@ -592,6 +758,7 @@ def assemble_fluid_dvms_local_contribution_batch(
         u_k=u_k,
         u_prev=u_prev,
         a_prev=a_prev,
+        a_curr=a_curr,
         p_k=p_k,
         d_mesh=d_mesh,
         d_prev=d_prev,
@@ -862,6 +1029,7 @@ class FluidDVMSLocalVelocityContributionOperator(LocalAssemblyOperator):
         u_k: VectorFunction,
         u_prev: VectorFunction | None = None,
         a_prev: VectorFunction | None = None,
+        a_curr: VectorFunction | None = None,
         p_k: Function,
         d_mesh: VectorFunction,
         d_prev: VectorFunction,
@@ -880,12 +1048,14 @@ class FluidDVMSLocalVelocityContributionOperator(LocalAssemblyOperator):
         use_oss: bool = False,
         apply_dirichlet_lift: bool = False,
         contribution_mode: str = "velocity",
+        residualization: str = "kratos",
     ) -> None:
         self.mesh = mesh
         self.dh = dh
         self.u_k = u_k
         self.u_prev = u_prev
         self.a_prev = a_prev
+        self.a_curr = a_curr
         self.p_k = p_k
         self.d_mesh = d_mesh
         self.d_prev = d_prev
@@ -908,9 +1078,14 @@ class FluidDVMSLocalVelocityContributionOperator(LocalAssemblyOperator):
         self.use_oss = bool(use_oss)
         self.apply_dirichlet_lift = bool(apply_dirichlet_lift)
         self.contribution_mode = _normalize_contribution_mode(contribution_mode)
+        residualization_name = str(residualization or "symbolic").strip().lower()
+        if residualization_name not in {"symbolic", "kratos"}:
+            raise ValueError(f"Unsupported FluidDVMS residualization mode {residualization!r}.")
+        self.residualization = residualization_name
         self.h_coefficient = _kratos_dvms_current_element_size_coefficient(self.mesh, self.dh, self.d_mesh)
         self._compiler_cache: dict[str, FormCompiler] = {}
         self._form_or_equation_cache = None
+        self._kratos_residualized_forms_cache: _KratosResidualizedSystemForms | None = None
         self._fluid_gdofs_map = _local_grouped_gdofs_batch(self.dh, self.element_ids)
         self._compiled_layout_cache_map: np.ndarray | None = None
         self._fluid_block_positions_cache: np.ndarray | None = None
@@ -938,6 +1113,7 @@ class FluidDVMSLocalVelocityContributionOperator(LocalAssemblyOperator):
             u_k=self.u_k,
             u_prev=self.u_prev,
             a_prev=self.a_prev,
+            a_curr=self.a_curr,
             p_k=self.p_k,
             d_mesh=self.d_mesh,
             d_prev=self.d_prev,
@@ -959,11 +1135,51 @@ class FluidDVMSLocalVelocityContributionOperator(LocalAssemblyOperator):
         self._form_or_equation_cache = cached
         return cached
 
+    def _kratos_residualized_forms(self) -> _KratosResidualizedSystemForms:
+        cached = self._kratos_residualized_forms_cache
+        if cached is not None:
+            return cached
+        cached = _build_fluid_dvms_kratos_residualized_system_forms(
+            mesh=self.mesh,
+            dh=self.dh,
+            u_k=self.u_k,
+            u_prev=self.u_prev,
+            a_prev=self.a_prev,
+            a_curr=self.a_curr,
+            p_k=self.p_k,
+            d_mesh=self.d_mesh,
+            d_prev=self.d_prev,
+            d_prev2=self.d_prev2,
+            mesh_v=self.mesh_v,
+            mesh_v_prev=self.mesh_v_prev,
+            mesh_a_prev=self.mesh_a_prev,
+            state=self.state,
+            rho_f=self.rho_f,
+            mu_f=self.mu_f,
+            dt=self.dt,
+            bossak_alpha=self.bossak_alpha,
+            quadrature_order=self.quadrature_order,
+            body_force=self.body_force,
+            use_oss=self.use_oss,
+            h_coefficient=self.h_coefficient,
+        )
+        self._kratos_residualized_forms_cache = cached
+        return cached
+
     def _refresh_element_size_coefficient(self) -> None:
-        self.h_coefficient.values[...] = _kratos_dvms_current_element_size_array(
+        eids = np.asarray(self.element_ids, dtype=int).reshape(-1)
+        if eids.size == int(self.mesh.n_elements):
+            self.h_coefficient.values[...] = _kratos_dvms_current_element_size_array(
+                self.mesh,
+                self.dh,
+                self.d_mesh,
+            )
+            return
+        self.h_coefficient.values[eids] = _kratos_dvms_current_element_size_array(
             self.mesh,
             self.dh,
             self.d_mesh,
+            element_ids=eids,
         )
 
     def build_local_workset(self, *, solver, coeffs, need_matrix: bool):
@@ -1012,15 +1228,10 @@ class FluidDVMSLocalVelocityContributionOperator(LocalAssemblyOperator):
         self._fluid_block_positions_cache = positions
         return positions
 
-    def assemble_local(self, workset: LocalAssemblyWorkset):
-        compiler = self._compiler(workset.backend)
-        batch = compiler.assemble_volume_local_contributions(
-            self._form_or_equation(),
-            element_ids=workset.element_ids,
-        )
+    def _compress_compiler_batch(self, batch):
         batch_gdofs = np.asarray(batch.gdofs_map, dtype=int)
         positions = self._fluid_block_positions(batch_gdofs)
-        K_elem, F_elem, gdofs_map = _compress_batch_to_fluid_block(
+        return _compress_batch_to_fluid_block(
             self.dh,
             LocalAssemblyResult(
                 K_elem=None if batch.K_elem is None else np.asarray(batch.K_elem, dtype=float),
@@ -1031,6 +1242,76 @@ class FluidDVMSLocalVelocityContributionOperator(LocalAssemblyOperator):
             fluid_gdofs_map=self._fluid_gdofs_map,
             positions=positions,
         )
+
+    def _assemble_kratos_residualized_system_local(self, workset: LocalAssemblyWorkset):
+        compiler = self._compiler(workset.backend)
+        forms = self._kratos_residualized_forms()
+
+        nonvisc_batch = compiler.assemble_volume_local_contributions(
+            forms.nonviscous_velocity,
+            element_ids=workset.element_ids,
+            need_matrix=True,
+            need_vector=True,
+        )
+        K_nonvisc, F_source, gdofs_map = self._compress_compiler_batch(nonvisc_batch)
+        if K_nonvisc is None or F_source is None:
+            raise RuntimeError("Kratos residualized DVMS nonviscous assembly did not return both K and RHS.")
+
+        visc_batch = compiler.assemble_volume_local_contributions(
+            forms.viscous_velocity,
+            element_ids=workset.element_ids,
+            need_matrix=True,
+            need_vector=True,
+        )
+        K_visc, F_visc, _ = self._compress_compiler_batch(visc_batch)
+        if K_visc is None or F_visc is None:
+            raise RuntimeError("Kratos residualized DVMS viscous assembly did not return both K and RHS.")
+
+        mass_batch = compiler.assemble_volume_local_contributions(
+            forms.mass_matrix,
+            element_ids=workset.element_ids,
+            need_matrix=True,
+            need_vector=False,
+        )
+        M_elem, _, _ = self._compress_compiler_batch(mass_batch)
+        if M_elem is None:
+            raise RuntimeError("Kratos residualized DVMS mass assembly did not return K.")
+
+        x_full = _fluid_values_full(self.dh, u=self.u_k, p=self.p_k)
+        a_full = _fluid_bossak_acceleration_values_full(
+            self.dh,
+            u_k=self.u_k,
+            u_prev=self.u_prev,
+            a_prev=self.a_prev,
+            a_curr=self.a_curr,
+            bossak_alpha=self.bossak_alpha,
+            dt=self.dt,
+        )
+        local_values = np.asarray(x_full[np.asarray(gdofs_map, dtype=int)], dtype=float)
+        local_acceleration = np.asarray(a_full[np.asarray(gdofs_map, dtype=int)], dtype=float)
+
+        bossak = _bossak_coefficients(alpha=self.bossak_alpha, dt=self.dt)
+        K_elem = np.asarray(K_nonvisc, dtype=float) + np.asarray(K_visc, dtype=float) + float(bossak["mam"]) * np.asarray(M_elem, dtype=float)
+        F_elem = (
+            np.asarray(F_source, dtype=float)
+            + np.asarray(F_visc, dtype=float)
+            - np.einsum("eij,ej->ei", np.asarray(K_nonvisc, dtype=float), local_values, optimize=True)
+            - np.einsum("eij,ej->ei", np.asarray(M_elem, dtype=float), local_acceleration, optimize=True)
+        )
+        return K_elem, F_elem, gdofs_map
+
+    def assemble_local(self, workset: LocalAssemblyWorkset):
+        if self.contribution_mode == "system" and self.residualization == "kratos":
+            K_elem, F_elem, gdofs_map = self._assemble_kratos_residualized_system_local(workset)
+            batch_element_ids = np.asarray(workset.element_ids, dtype=int)
+        else:
+            compiler = self._compiler(workset.backend)
+            batch = compiler.assemble_volume_local_contributions(
+                self._form_or_equation(),
+                element_ids=workset.element_ids,
+            )
+            K_elem, F_elem, gdofs_map = self._compress_compiler_batch(batch)
+            batch_element_ids = np.asarray(batch.element_ids, dtype=int)
         if self.apply_dirichlet_lift and K_elem is not None:
             bc_values_full = workset.payload.get("bc_values_full")
             if bc_values_full is not None:
@@ -1057,7 +1338,7 @@ class FluidDVMSLocalVelocityContributionOperator(LocalAssemblyOperator):
         return LocalAssemblyResult(
             K_elem=None if (K_elem is None or not workset.need_matrix) else K_elem,
             F_elem=F_elem,
-            element_ids=np.asarray(batch.element_ids, dtype=int),
+            element_ids=batch_element_ids,
             gdofs_map=gdofs_map,
         )
 
@@ -1092,7 +1373,7 @@ class FluidDVMSCondensedLocalSystemOperator(FluidDVMSLocalVelocityContributionOp
         self.refresh_predicted_subscale = bool(refresh_predicted_subscale)
 
     def assemble_local(self, workset: LocalAssemblyWorkset):
-        if self.refresh_predicted_subscale:
+        if self.refresh_predicted_subscale and bool(workset.need_matrix):
             if self.state is None or self.u_prev is None or self.a_prev is None:
                 raise ValueError(
                     "FluidDVMSCondensedLocalSystemOperator requires state, u_prev, and a_prev."
@@ -1104,6 +1385,7 @@ class FluidDVMSCondensedLocalSystemOperator(FluidDVMSLocalVelocityContributionOp
                 u_k=self.u_k,
                 u_prev=self.u_prev,
                 a_prev=self.a_prev,
+                a_curr=self.a_curr,
                 p_k=self.p_k,
                 d_mesh=self.d_mesh,
                 d_prev=self.d_prev,
@@ -1117,6 +1399,7 @@ class FluidDVMSCondensedLocalSystemOperator(FluidDVMSLocalVelocityContributionOp
                 bossak_alpha=self.bossak_alpha,
                 dynamic_tau=self.dynamic_tau,
                 backend=workset.backend,
+                use_oss=bool(self.use_oss),
             )
         return super().assemble_local(workset)
 

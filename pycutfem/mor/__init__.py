@@ -27,7 +27,9 @@ from .quadratic_manifold import (
 from .regressors import (
     PolynomialFeatureMap,
     PolynomialLassoRegressor,
+    PolynomialLeastSquaresRegressor,
     ThinPlateSplineRBF,
+    fit_poly_least_squares,
     fit_poly_lasso,
     fit_tps_rbf,
 )
@@ -43,6 +45,7 @@ __all__ = [
     "PODBasis",
     "PolynomialFeatureMap",
     "PolynomialLassoRegressor",
+    "PolynomialLeastSquaresRegressor",
     "QuadraticFeatureMap",
     "QuadraticManifoldDecoder",
     "SnapshotBatch",
@@ -57,6 +60,7 @@ __all__ = [
     "build_restriction_matrix",
     "build_speedup_report",
     "fit_pod",
+    "fit_poly_least_squares",
     "fit_poly_lasso",
     "fit_quadratic_decoder",
     "fit_quadratic_manifold",

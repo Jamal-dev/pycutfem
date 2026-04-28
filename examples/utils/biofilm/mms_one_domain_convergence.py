@@ -347,19 +347,30 @@ def build_biofilm_one_domain_mms_trig_step(
     # ------------------------------------------------------------------
     # Momentum forcing
     # ------------------------------------------------------------------
+    # Match the one-domain momentum row in `build_biofilm_one_domain_forms`:
+    # inertia, convection and viscosity act on the free-fluid fraction
+    # F = 1 - alpha, while the pressure term remains capacity-weighted.
+    F_k_expr = 1.0 - alpha_k_expr
+    F_n_expr = 1.0 - alpha_n_expr
+    rho_mom_k_expr = float(rho_f) * F_k_expr
+    rho_mom_n_expr = float(rho_f) * F_n_expr
+    mu_mom_k_expr = float(mu_f) * F_k_expr
+    mu_mom_n_expr = float(mu_f) * F_n_expr
+
     # Conservative-in-time momentum: (rho_k v_k - rho_n v_n)/dt.
-    momdot_expr = (rho_k_expr * v_k_expr - rho_n_expr * v_n_expr) / dt
+    momdot_expr = (rho_mom_k_expr * v_k_expr - rho_mom_n_expr * v_n_expr) / dt
     conv_k_expr = _sym_grad_vec(v_k_expr, x, y) * v_k_expr
     conv_n_expr = _sym_grad_vec(v_n_expr, x, y) * v_n_expr
 
-    # Conservative convection correction: v div(rho v), with rho=rho_f*C.
-    divCv_k_expr = _sym_div_vec(C_k_expr * v_k_expr, x, y)
-    divCv_n_expr = _sym_div_vec(C_n_expr * v_n_expr, x, y)
-    div_rhov_k_expr = float(rho_f) * divCv_k_expr
-    div_rhov_n_expr = float(rho_f) * divCv_n_expr
+    # Conservative convection correction: v div(rho v), with rho=rho_f*F on
+    # the fluid momentum row.
+    divFv_k_expr = _sym_div_vec(F_k_expr * v_k_expr, x, y)
+    divFv_n_expr = _sym_div_vec(F_n_expr * v_n_expr, x, y)
+    div_rhov_k_expr = float(rho_f) * divFv_k_expr
+    div_rhov_n_expr = float(rho_f) * divFv_n_expr
 
-    stress_k = mu_k_expr * (_sym_grad_vec(v_k_expr, x, y) + _sym_grad_vec(v_k_expr, x, y).T)
-    stress_n = mu_n_expr * (_sym_grad_vec(v_n_expr, x, y) + _sym_grad_vec(v_n_expr, x, y).T)
+    stress_k = mu_mom_k_expr * (_sym_grad_vec(v_k_expr, x, y) + _sym_grad_vec(v_k_expr, x, y).T)
+    stress_n = mu_mom_n_expr * (_sym_grad_vec(v_n_expr, x, y) + _sym_grad_vec(v_n_expr, x, y).T)
     div_stress_mix = _sym_div_mat(th * stress_k + one_m_th * stress_n, x, y)
 
     f_v_expr = momdot_expr

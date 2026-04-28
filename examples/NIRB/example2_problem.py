@@ -48,8 +48,8 @@ class DoubleFlapGeometry:
     base_height: float
     arm_width: float
     inlet_ramp_end_time: float
-    inlet_modulus_ramp: str
-    inlet_modulus_steady: str
+    inlet_modulus_ramp: str | None = None
+    inlet_modulus_steady: str | None = None
     inlet_tag: str = "inlet"
     outlet_tag: str = "outlet"
     walls_tag: str = "walls"
@@ -109,24 +109,32 @@ class DoubleFlapGeometry:
     def inlet_velocity(self, y: float, t: float, *, reference_velocity: float) -> float:
         y = float(y)
         t = float(t)
-        del reference_velocity
         if y <= 0.0 or y >= self.channel_height:
             return 0.0
-        expr = self.inlet_modulus_steady if t >= self.inlet_ramp_end_time else self.inlet_modulus_ramp
-        safe_locals = {
-            "y": y,
-            "t": t,
-            "pi": math.pi,
-            "sin": math.sin,
-            "cos": math.cos,
-            "tan": math.tan,
-            "exp": math.exp,
-            "sqrt": math.sqrt,
-            "abs": abs,
-            "min": min,
-            "max": max,
-        }
-        return float(eval(expr, {"__builtins__": {}}, safe_locals))
+        if self.inlet_modulus_ramp and self.inlet_modulus_steady:
+            expr = self.inlet_modulus_steady if t >= self.inlet_ramp_end_time else self.inlet_modulus_ramp
+            safe_locals = {
+                "y": y,
+                "t": t,
+                "pi": math.pi,
+                "sin": math.sin,
+                "cos": math.cos,
+                "tan": math.tan,
+                "exp": math.exp,
+                "sqrt": math.sqrt,
+                "abs": abs,
+                "min": min,
+                "max": max,
+            }
+            return float(eval(expr, {"__builtins__": {}}, safe_locals))
+        peak = float(reference_velocity)
+        H = max(float(self.channel_height), 1.0e-14)
+        steady = (4.0 * peak / (H * H)) * y * (H - y)
+        if self.inlet_ramp_end_time <= 0.0:
+            return steady
+        tau = min(max(t / float(self.inlet_ramp_end_time), 0.0), 1.0)
+        ramp = 0.5 * (1.0 - math.cos(math.pi * tau))
+        return ramp * steady
 
 
 def _group_consecutive(values: np.ndarray, *, gap_tol: float) -> list[tuple[float, float]]:

@@ -9,7 +9,7 @@ from pycutfem.mor.interface import InterfaceRestriction
 from pycutfem.mor.io import save_model
 from pycutfem.mor.pod import PODBasis, fit_pod, project_to_basis
 from pycutfem.mor.quadratic_manifold import QuadraticFeatureMap, QuadraticManifoldDecoder, fit_quadratic_decoder
-from pycutfem.mor.regressors import PolynomialLassoRegressor, ThinPlateSplineRBF
+from pycutfem.mor.regressors import PolynomialLassoRegressor, PolynomialLeastSquaresRegressor, ThinPlateSplineRBF
 
 from .dataset import OfflineDataset, load_dataset
 
@@ -21,6 +21,7 @@ class RegressionConfig:
     degree: int = 2
     criterion: str = "bic"
     standardize_inputs: bool = True
+    regularization: float = 0.0
 
     @classmethod
     def from_mapping(cls, mapping: dict[str, Any] | None) -> "RegressionConfig":
@@ -39,6 +40,9 @@ class OfflineConfig:
     center_forces: bool = True
     center_displacements: bool = True
     use_quadratic_decoder: bool = True
+    dataset_force_key: str = "load_guess_data"
+    dataset_displacement_key: str = "disp_data"
+    zero_anchor_weight: int = 0
     interface_indices: list[int] | None = None
     interface_matrix_path: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -96,6 +100,12 @@ def _build_regressor(config: RegressionConfig) -> Any:
             criterion=config.criterion,
             standardize_inputs=config.standardize_inputs,
         )
+    if config.kind in {"poly_ls", "poly_ridge"}:
+        return PolynomialLeastSquaresRegressor(
+            degree=config.degree,
+            regularization=config.regularization,
+            standardize_inputs=config.standardize_inputs,
+        )
     raise ValueError(f"unsupported regression kind: {config.kind}")
 
 
@@ -106,31 +116,43 @@ def run_offline_pipeline(config: OfflineConfig | dict[str, Any]) -> TrainedNIRBM
     dataset: OfflineDataset = load_dataset(
         config.dataset_path,
         interface_indices=None if config.interface_indices is None else np.asarray(config.interface_indices, dtype=int),
+        force_key=config.dataset_force_key,
+        displacement_key=config.dataset_displacement_key,
     )
+    forces = dataset.forces
+    displacements = dataset.displacements
+    if int(config.zero_anchor_weight) > 0:
+        anchor_count = int(config.zero_anchor_weight)
+        forces = np.column_stack(
+            [forces, np.zeros((forces.shape[0], anchor_count), dtype=float)]
+        )
+        displacements = np.column_stack(
+            [displacements, np.zeros((displacements.shape[0], anchor_count), dtype=float)]
+        )
 
     force_basis = fit_pod(
-        dataset.forces,
+        forces,
         n_modes=config.force_modes,
         center=config.center_forces,
     )
 
     if config.use_quadratic_decoder:
         decoder = fit_quadratic_decoder(
-            dataset.displacements,
+            displacements,
             n_modes=config.displacement_modes,
             center=config.center_displacements,
         )
     else:
         displacement_basis = fit_pod(
-            dataset.displacements,
+            displacements,
             n_modes=config.displacement_modes,
             center=config.center_displacements,
         )
         decoder = _linear_decoder_from_basis(displacement_basis)
 
-    reduced_forces = force_basis.project(dataset.forces).T
+    reduced_forces = force_basis.project(forces).T
     reduced_displacements = project_to_basis(
-        dataset.displacements,
+        displacements,
         decoder.linear_basis,
         decoder.mean,
     ).T
@@ -155,7 +177,12 @@ def run_offline_pipeline(config: OfflineConfig | dict[str, Any]) -> TrainedNIRBM
         metadata={
             "force_modes": config.force_modes,
             "displacement_modes": config.displacement_modes,
+            "dataset_path": config.dataset_path,
+            "dataset_force_key": config.dataset_force_key,
+            "dataset_displacement_key": config.dataset_displacement_key,
+            "zero_anchor_weight": int(config.zero_anchor_weight),
             "regression": config.regression.__dict__,
+            "dataset": dataset.metadata,
             **config.metadata,
         },
     )

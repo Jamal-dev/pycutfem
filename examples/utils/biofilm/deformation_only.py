@@ -14,9 +14,11 @@ transport closures:
 
   - the historical frozen-`phi_b` reduction, where `B = alpha (1-phi_b)` is
     derived from `alpha`, and
-  - an optional native `alpha-B` transport mode for the conserved-support
-    `internal_conversion` branch, where `B` is an actual unknown and
-    `phi = (alpha-B)/alpha` is derived from the reduced state when needed.
+  - an optional native `alpha-B` transport mode, where `B` is an actual
+    unknown and `phi = (alpha-B)/alpha` is derived from the reduced state when
+    needed. The production support-preserving formulation uses this on the
+    conserved-support `internal_conversion` branch; the legacy reduced branch
+    still keeps it available for backend/regression comparisons.
 
 It is the form builder that should be used for the Paper-1 verification program.
 
@@ -428,8 +430,11 @@ def build_deformation_only_forms(
     if kappa_inv_key not in {"spatial", "constant", "const"} and not use_refmap_drag:
         raise ValueError(f"Unsupported deformation-only kappa_inv_model {kappa_inv_model!r}.")
     support_physics_key = _support_physics_key(support_physics)
-    if use_B_transport and support_physics_key != "internal_conversion":
-        raise ValueError("alpha-B reduced transport is only implemented for support_physics='internal_conversion'.")
+    if use_B_transport and support_physics_key == "stored_support":
+        raise ValueError(
+            "alpha-B reduced transport on support_physics='stored_support' belongs to "
+            "the full one-domain builder, not deformation_only."
+        )
     if support_physics_key == "internal_conversion":
         adv_with_norm = str(alpha_advect_with or "biofilm_volume").strip().lower().replace("-", "_")
         if adv_with_norm not in {"biofilm", "biofilm_volume", "phase", "phase_volume"}:
@@ -1090,7 +1095,7 @@ def build_deformation_only_forms(
         time_alpha_k = alpha_k
         time_alpha_n = alpha_n
     elif adv_key == "conservative":
-        if use_B_transport:
+        if use_B_transport and div_alpha_flux_k is not None and div_alpha_flux_n is not None:
             adv_alpha_k = div_alpha_flux_k
             adv_alpha_n = div_alpha_flux_n
         else:
@@ -1119,7 +1124,7 @@ def build_deformation_only_forms(
         # integral of alpha when the boundary contribution vanishes, either
         # because natural no-flux conditions are used or because the Dirichlet
         # test space vanishes on the relevant boundary.
-        if use_B_transport:
+        if use_B_transport and alpha_flux_k_comp is not None and alpha_flux_n_comp is not None:
             flux_dot_grad_test_k = _c(0.0)
             flux_dot_grad_test_n = _c(0.0)
             for i in range(2):
@@ -1138,7 +1143,7 @@ def build_deformation_only_forms(
             flux_alpha_bdry_k = _c(0.0)
             flux_alpha_bdry_n = _c(0.0)
             for i in range(2):
-                if use_B_transport:
+                if use_B_transport and alpha_flux_k_comp is not None and alpha_flux_n_comp is not None:
                     flux_alpha_bdry_k = flux_alpha_bdry_k + alpha_flux_k_comp[i] * _vector_component(n_b, i)
                     flux_alpha_bdry_n = flux_alpha_bdry_n + alpha_flux_n_comp[i] * _vector_component(n_b, i)
                 else:
@@ -1160,7 +1165,7 @@ def build_deformation_only_forms(
     if adv_key == "advective":
         a_alpha += th * alpha_test * (dot(grad(dalpha), adv_u_k) + dot(grad(alpha_k), dadv_u)) * dx
     elif adv_key == "conservative":
-        if use_B_transport:
+        if use_B_transport and d_div_alpha_flux_k is not None:
             a_alpha += th * alpha_test * d_div_alpha_flux_k * dx
         else:
             a_alpha += th * alpha_test * (
@@ -1171,7 +1176,7 @@ def build_deformation_only_forms(
             dot(d_grad_band_alpha, adv_u_k) + dot(grad_band_alpha_k, dadv_u) + dband_alpha * div_adv_u_k + band_alpha_k * d_div_adv_u
         ) * dx
     else:
-        if use_B_transport:
+        if use_B_transport and d_alpha_flux_k_comp is not None:
             dflux_dot_grad_test_k = _c(0.0)
             for i in range(2):
                 dflux_dot_grad_test_k = dflux_dot_grad_test_k + d_alpha_flux_k_comp[i] * grad(alpha_test)[i]
@@ -1186,7 +1191,7 @@ def build_deformation_only_forms(
             n_b = FacetNormal()
             dflux_alpha_bdry_k = _c(0.0)
             for i in range(2):
-                if use_B_transport:
+                if use_B_transport and d_alpha_flux_k_comp is not None:
                     dflux_alpha_bdry_k = dflux_alpha_bdry_k + d_alpha_flux_k_comp[i] * _vector_component(n_b, i)
                 else:
                     dflux_alpha_bdry_k = dflux_alpha_bdry_k + (

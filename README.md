@@ -12,8 +12,8 @@ while keeping the workflow close to classical FEM tooling.
   `pycutfem.core`.
 - Symbolic form definitions via `pycutfem.ufl` with automatic kernel
   generation in `pycutfem.jit`.
-- Ready-to-use Newton and linear solvers with optional PETSc integration in
-  `pycutfem.solvers`.
+- Reusable block linear algebra in `pycutfem.linalg` and ready-to-use Newton
+  and linear solvers with optional PETSc integration in `pycutfem.solvers`.
 - Example scripts covering Poisson, Stokes, Navier–Stokes, FSI benchmarks, and
   CutFEM verification cases in `examples/`.
 
@@ -33,6 +33,7 @@ python -m pip install -e .
 Optional extras:
 
 - `petsc4py` enables PETSc-based Krylov solvers (`python -m pip install petsc4py`).
+- `pypardiso` enables the direct PARDISO backend (`python -m pip install pypardiso`).
 - `ngsolve`, `fenics`, or `fenics-dolfinx` are only needed for the comparison
   notebooks in `examples/`.
 

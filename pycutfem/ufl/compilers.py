@@ -8216,6 +8216,7 @@ class FormCompiler:
             qdeg=int(qdeg),
             derivs=derivs,
             reuse=True,
+            quadrature=str(md.get("quadrature", md.get("rule", "gauss"))),
         )
         eids = np.asarray(geo.get("eids", np.empty((0,), dtype=np.int32)), dtype=np.int32)
         if eids.size == 0:
@@ -8429,8 +8430,16 @@ class FormCompiler:
         runner, ir = self._compile_backend(intg.integrand, dh, me_used, on_facet=True)
         derivs, need_hess, need_o3, need_o4 = self._find_req_derivs(intg, runner)
 
+        md = getattr(intg.measure, "metadata", None) or {}
+        quadrature_rule = str(md.get("quadrature", md.get("rule", "gauss"))).strip().lower().replace("-", "_")
+        if quadrature_rule in {"gll", "lobatto"}:
+            quadrature_rule = "gauss_lobatto"
+
         max_total = max((ox + oy for (ox, oy) in derivs), default=0)
-        qdeg = max(self._find_q_order(intg), 2 * max_total + 4)
+        if quadrature_rule == "gauss_lobatto":
+            qdeg = int(self._find_q_order(intg))
+        else:
+            qdeg = max(self._find_q_order(intg), 2 * max_total + 4)
         p_geo = int(getattr(me_used.mesh, "poly_order", 1))
         qdeg += max(0, p_geo - 1)
 
@@ -8443,6 +8452,7 @@ class FormCompiler:
             need_o3=need_o3,
             need_o4=need_o4,
             deformation=getattr(intg.measure, "deformation", None),
+            quadrature=quadrature_rule,
         )
         geo["is_interface"] = True
         geo["is_ghost"] = False

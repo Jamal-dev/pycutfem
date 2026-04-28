@@ -3,6 +3,7 @@ from pathlib import Path
 import numpy as np
 
 from pycutfem.mor.snapshots import SnapshotBatch
+from pycutfem.nirb.coupling import NIRBSolidPredictor
 from pycutfem.nirb.offline import OfflineConfig, RegressionConfig, run_offline_pipeline
 
 
@@ -51,3 +52,61 @@ def test_offline_pipeline_accepts_full_interface_restriction_matrix(tmp_path: Pa
     predicted_full = model.predict_full(forces)
     predicted_interface = model.predict_interface(forces)
     assert np.allclose(predicted_interface, interface_matrix @ predicted_full, atol=1.0e-8)
+
+
+def test_nirb_predictor_uses_runtime_interface_restriction_for_algorithm2(tmp_path: Path):
+    reduced_forces = np.array(
+        [
+            [0.0, 1.0, 2.0, 3.0],
+            [1.0, 0.0, 1.0, 0.0],
+        ]
+    )
+    displacements = np.vstack(
+        [
+            reduced_forces[0] + 2.0 * reduced_forces[1],
+            -reduced_forces[0],
+            0.5 * reduced_forces[0] - reduced_forces[1],
+            2.0 * reduced_forces[1],
+        ]
+    )
+
+    dataset_path = tmp_path / "dataset.npz"
+    model_path = tmp_path / "model.pkl"
+    SnapshotBatch(interface_forces=reduced_forces, full_displacements=displacements).save(dataset_path)
+
+    model = run_offline_pipeline(
+        OfflineConfig(
+            dataset_path=str(dataset_path),
+            model_path=str(model_path),
+            force_modes=2,
+            displacement_modes=2,
+            regression=RegressionConfig(kind="tps_rbf"),
+            use_quadratic_decoder=False,
+        )
+    )
+
+    interface_matrix = np.array(
+        [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+        ]
+    )
+    predictor = NIRBSolidPredictor(
+        model=model,
+        full_shape=(4,),
+        interface_matrix=interface_matrix,
+        interface_shape=(2,),
+    )
+
+    prediction = predictor.predict_interface(reduced_forces[:, 2])
+    assert prediction.full_displacement is None
+    assert prediction.reduced_displacement is not None
+    assert prediction.interface_displacement is not None
+
+    full_from_reduced = predictor.reconstruct_full(prediction.reduced_displacement)
+    assert np.allclose(prediction.interface_displacement, interface_matrix @ full_from_reduced, atol=1.0e-8)
+    assert np.allclose(
+        prediction.interface_displacement,
+        (interface_matrix @ model.predict_full(reduced_forces[:, 2]))[:, 0],
+        atol=1.0e-8,
+    )

@@ -321,6 +321,9 @@ def _solve_benchmark_final_form_rigid(
     inactive_alpha_low: float | None,
     inactive_alpha_high: float | None,
     multiplier_regularization: float,
+    domain_lm_vf: bool,
+    domain_lm_aug_gamma: float,
+    domain_lm_vf_space: str,
 ) -> dict[str, object]:
     geom = Geometry()
     nodes, elems, _, corners = structured_quad(
@@ -333,6 +336,16 @@ def _solve_benchmark_final_form_rigid(
     )
     mesh = Mesh(nodes, elems, elements_corner_nodes=corners, element_type="quad", poly_order=1)
     _tag_boundaries(mesh, geom)
+
+    domain_lm_vf_space_key = str(domain_lm_vf_space or "dg0").strip().lower().replace("-", "_")
+    if domain_lm_vf_space_key == "dg0":
+        lm_vf_field_specs = {"lm_vf_x": ("DG", 0), "lm_vf_y": ("DG", 0)}
+    elif domain_lm_vf_space_key == "dg1":
+        lm_vf_field_specs = {"lm_vf_x": ("DG", 1), "lm_vf_y": ("DG", 1)}
+    elif domain_lm_vf_space_key in {"cg1", "p1", "c1"}:
+        lm_vf_field_specs = {"lm_vf_x": 1, "lm_vf_y": 1}
+    else:
+        raise ValueError("domain_lm_vf_space must be 'dg0', 'dg1', or 'cg1'.")
 
     field_specs = {
         "ux": 1,
@@ -351,6 +364,7 @@ def _solve_benchmark_final_form_rigid(
         "mu_mass": 1,
         "mu_normal": 1,
         "mu_tangent": 1,
+        **(lm_vf_field_specs if bool(domain_lm_vf) else {}),
     }
     me = MixedElement(mesh, field_specs=field_specs)
     dh = DofHandler(me, method="cg")
@@ -372,6 +386,11 @@ def _solve_benchmark_final_form_rigid(
     VP = FunctionSpace("pore_velocity", ["vpx", "vpy"], dim=1)
     VS = FunctionSpace("solid_velocity", ["vSx", "vSy"], dim=1)
     U = FunctionSpace("solid_disp", ["dx", "dy"], dim=1)
+    LM_VF = (
+        FunctionSpace("LM_VF", ["lm_vf_x", "lm_vf_y"], dim=1)
+        if ("lm_vf_x" in field_specs and "lm_vf_y" in field_specs)
+        else None
+    )
 
     dv = VectorTrialFunction(space=V, dof_handler=dh)
     v_test = VectorTestFunction(space=V, dof_handler=dh)
@@ -398,6 +417,8 @@ def _solve_benchmark_final_form_rigid(
     mu_normal_test = TestFunction("mu_normal", dof_handler=dh)
     dmu_tangent = TrialFunction("mu_tangent", dof_handler=dh)
     mu_tangent_test = TestFunction("mu_tangent", dof_handler=dh)
+    dlm_vf = None if LM_VF is None else VectorTrialFunction(space=LM_VF, dof_handler=dh)
+    lm_vf_test = None if LM_VF is None else VectorTestFunction(space=LM_VF, dof_handler=dh)
 
     v_k = VectorFunction("v_k", ["ux", "uy"], dof_handler=dh)
     v_n = VectorFunction("v_n", ["ux", "uy"], dof_handler=dh)
@@ -423,6 +444,8 @@ def _solve_benchmark_final_form_rigid(
     mu_normal_n = Function("mu_normal_n", "mu_normal", dof_handler=dh)
     mu_tangent_k = Function("mu_tangent_k", "mu_tangent", dof_handler=dh)
     mu_tangent_n = Function("mu_tangent_n", "mu_tangent", dof_handler=dh)
+    lm_vf_k = None if LM_VF is None else VectorFunction("lm_vf_k", ["lm_vf_x", "lm_vf_y"], dof_handler=dh)
+    lm_vf_n = None if LM_VF is None else VectorFunction("lm_vf_n", ["lm_vf_x", "lm_vf_y"], dof_handler=dh)
 
     for f in (
         v_k,
@@ -449,6 +472,8 @@ def _solve_benchmark_final_form_rigid(
         mu_normal_n,
         mu_tangent_k,
         mu_tangent_n,
+        *([lm_vf_k] if lm_vf_k is not None else []),
+        *([lm_vf_n] if lm_vf_n is not None else []),
     ):
         f.nodal_values.fill(0.0)
 
@@ -569,9 +594,12 @@ def _solve_benchmark_final_form_rigid(
         mu_mass_test=mu_mass_test,
         mu_normal_test=mu_normal_test,
         mu_tangent_test=mu_tangent_test,
+        lm_vf_test=lm_vf_test,
         mu_mass_k=mu_mass_k,
         mu_normal_k=mu_normal_k,
         mu_tangent_k=mu_tangent_k,
+        lm_vf_k=lm_vf_k,
+        dlm_vf=dlm_vf,
         dx=dx(),
         dt=Constant(1.0e12),
         rho_f=Constant(1.0),
@@ -616,9 +644,12 @@ def _solve_benchmark_final_form_rigid(
         normal_pressure_scale=1.0,
         normal_constraint_carrier="multiplier",
         rigid_darcy_head_mode=True,
-        # The rigid debug reduction follows the simplified audit note exactly:
-        # interface transfer is only via the explicit mass and traction laws.
-        bjs_coefficient=0.0,
+        # Use the paper's BJS coefficient in the rigid-limit shared form so the
+        # interface law matches the benchmark rather than the stripped audit
+        # reduction.
+        bjs_coefficient=float(friction_alpha) / math.sqrt(float(K)),
+        domain_lm=bool(domain_lm_vf),
+        domain_lm_aug_gamma=float(domain_lm_aug_gamma),
         interface_formulation="decomposed",
     )
 
@@ -707,6 +738,7 @@ def _solve_benchmark_final_form_rigid(
         mu_mass_k,
         mu_normal_k,
         mu_tangent_k,
+        *([lm_vf_k] if lm_vf_k is not None else []),
     ]
     prev_functions = [
         v_n,
@@ -721,6 +753,7 @@ def _solve_benchmark_final_form_rigid(
         mu_mass_n,
         mu_normal_n,
         mu_tangent_n,
+        *([lm_vf_n] if lm_vf_n is not None else []),
     ]
     dh.apply_bcs(bcs_now, *functions)
     dh.apply_bcs(bcs_now, *prev_functions)
@@ -814,8 +847,11 @@ def _solve_benchmark_final_form_rigid(
         "phase_field_meta": alpha_meta,
         "nonlinear_iterations": int(iters_total),
         "friction_alpha_requested": float(friction_alpha),
-        "applied_bjs_coefficient": 0.0,
+        "applied_bjs_coefficient": float(friction_alpha) / math.sqrt(float(K)),
         "multiplier_regularization": multiplier_reg_value,
+        "domain_lm_vf": bool(domain_lm_vf),
+        "domain_lm_aug_gamma": float(domain_lm_aug_gamma),
+        "domain_lm_vf_space": str(domain_lm_vf_space_key),
         "gamma_v_in_porous": float(gamma_v_in_porous),
         "gamma_p_in_porous": float(gamma_p_in_porous),
         "gamma_vp_in_free": float(gamma_vp_in_free),
@@ -888,6 +924,9 @@ def solve_benchmark(
     inactive_alpha_low: float | None,
     inactive_alpha_high: float | None,
     multiplier_regularization: float,
+    domain_lm_vf: bool,
+    domain_lm_aug_gamma: float,
+    domain_lm_vf_space: str,
 ) -> dict[str, object]:
     formulation_key = str(formulation or "diagnostic").strip().lower()
     if formulation_key not in {"diagnostic", "final_form_rigid"}:
@@ -918,6 +957,9 @@ def solve_benchmark(
             inactive_alpha_low=inactive_alpha_low,
             inactive_alpha_high=inactive_alpha_high,
             multiplier_regularization=float(multiplier_regularization),
+            domain_lm_vf=bool(domain_lm_vf),
+            domain_lm_aug_gamma=float(domain_lm_aug_gamma),
+            domain_lm_vf_space=str(domain_lm_vf_space),
         )
 
     geom = Geometry()
@@ -1298,6 +1340,9 @@ def main() -> None:
     ap.add_argument("--gamma-vp-in-free", type=float, default=0.0)
     ap.add_argument("--gamma-p-pore-in-free", type=float, default=0.0)
     ap.add_argument("--multiplier-regularization", type=float, default=0.0)
+    ap.add_argument("--domain-lm-vf", action=argparse.BooleanOptionalAction, default=False)
+    ap.add_argument("--domain-lm-aug-gamma", type=float, default=10.0)
+    ap.add_argument("--domain-lm-vf-space", type=str, default="dg0", choices=("dg0", "dg1", "cg1"))
     ap.add_argument("--inactive-alpha-low", type=float, default=0.05)
     ap.add_argument("--inactive-alpha-high", type=float, default=0.95)
     ap.add_argument("--backend", type=str, default="cpp", choices=("python", "jit", "cpp"))
@@ -1332,6 +1377,9 @@ def main() -> None:
         gamma_p_in_porous=float(args.gamma_p_in_porous),
         gamma_vp_in_free=float(args.gamma_vp_in_free),
         gamma_p_pore_in_free=float(args.gamma_p_pore_in_free),
+        domain_lm_vf=bool(args.domain_lm_vf),
+        domain_lm_aug_gamma=float(args.domain_lm_aug_gamma),
+        domain_lm_vf_space=str(args.domain_lm_vf_space),
         multiplier_regularization=float(args.multiplier_regularization),
         inactive_alpha_low=float(args.inactive_alpha_low),
         inactive_alpha_high=float(args.inactive_alpha_high),

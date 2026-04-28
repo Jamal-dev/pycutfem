@@ -303,6 +303,9 @@ class LocalAssemblyOperator(RuntimeOperator):
         A_red,
         R_red,
     ):
+        record_pattern = getattr(solver, "record_amgcl_kratos_dirichlet_pattern", None)
+        if callable(record_pattern):
+            record_pattern(K_elem=result.K_elem, gdofs_map=result.gdofs_map)
         return solver.scatter_element_contribs_reduced(
             K_elem=result.K_elem,
             F_elem=result.F_elem,

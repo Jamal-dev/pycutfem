@@ -228,6 +228,18 @@ def _tensor_trace(A, *, dim: int):
 def _deviatoric_tensor(A, *, dim: int):
     return A - (_tensor_trace(A, dim=int(dim)) / _c(float(dim))) * Identity(int(dim))
 
+def _deviatoric_shear_stress(u, *, dim: int, mu:float):
+    deviatoric_strain = _deviatoric_tensor(_eps(u), dim=int(dim))
+    return _c(2.0) * mu * deviatoric_strain
+
+def _shear_stress(u, *, mu: float):
+    return _c(2.0) * mu * _eps(u)
+
+def _linear_stress_fluid_model(u, p, *, mu: float, dim: int):
+    return _shear_stress(u, mu=mu) - p * Identity(int(dim)) 
+
+def _linear_stress_solid_model(u, *, mu: float, lambda_: float, dim: int):
+    return _c(2.0) * mu * _eps(u) + lambda_ * div(u) * Identity(int(dim))
 
 def _solid_model_key(model_key: str) -> str:
     return str(model_key or "linear").strip().lower().replace("-", "_")
@@ -236,10 +248,8 @@ def _solid_model_key(model_key: str) -> str:
 def _solid_stress_and_tangent(*, solid_model: str, u_k, du, mu_s, lambda_s, dim: int):
     key = _solid_model_key(solid_model)
     if key in {"linear", "small_strain", "linear_elastic"}:
-        eps_u = _eps(u_k)
-        eps_du = _eps(du)
-        sigma_k = _c(2.0) * mu_s * eps_u + lambda_s * div(u_k) * Identity(int(dim))
-        dsigma = _c(2.0) * mu_s * eps_du + lambda_s * div(du) * Identity(int(dim))
+        sigma_k = _linear_stress_solid_model(u_k, mu=mu_s, lambda_=lambda_s, dim=int(dim))
+        dsigma = _linear_stress_solid_model(du, mu=mu_s, lambda_=lambda_s, dim=int(dim))
         return sigma_k, dsigma
     if key in {"neo_hookean_seboldt", "seboldt_neo_hookean"}:
         return (
@@ -367,6 +377,8 @@ def build_biofilm_one_domain_final_form(
     u_extension_mode: str = "h1",
     gamma_u_pin: float = 0.0,
     domain_lm_aug_gamma: float = 10.0,
+    domain_lm_free_weight_mode: str = "diffuse",
+    domain_lm_free_alpha_max: float | None = None,
     mass_lm_aug_gamma: float = 0.0,
     normal_lm_aug_gamma: float = 0.0,
     interface_band_extension_gamma: float = 0.0,
@@ -385,6 +397,7 @@ def build_biofilm_one_domain_final_form(
     solid_volumetric_penalty: float = 1.0,
     phi_mode: str = "transport",
     phi_b: float = 0.18,
+    alpha_biot: float = 1.0,
     normal_pressure_scale: float = 1.0,
     normal_constraint_carrier: str = "multiplier",
     rigid_darcy_head_mode: bool = False,
@@ -395,8 +408,22 @@ def build_biofilm_one_domain_final_form(
     disable_interface_physics: bool = False,
     disable_normal_interface: bool = False,
     domain_lm: bool = False,
+    domain_lm_free_tie_vP_to_vf: bool = False,
+    domain_lm_free_tie_p_pore_to_p: bool = False,
+    quasi_static_porous_media: bool = False,
+    quasi_static_flip_pore_stress_sign: bool = False,
+    quasi_static_disable_pore_momentum: bool = False,
+    quasi_static_disable_solid_momentum: bool = False,
+    quasi_static_use_combined_porous_momentum: bool = False,
+    direct_interface_transfer: bool = False,
     support_indicator_beta: float = 0.0,
     support_indicator_mode: str = "raw",
+    alpha_advect_with: str | None = None,
+    alpha_advection_form: str = "conservative_weak",
+    support_physics: str = "internal_conversion",
+    alpha_vS_gate_alpha0: float = 0.0,
+    alpha_vS_gate_power: int = 8,
+    ds_alpha_transport=None,
     interface_formulation: str = "tensor",
     dpi_s=None,
     pi_s_test=None,
@@ -434,41 +461,59 @@ def build_biofilm_one_domain_final_form(
     gamma_band_ext_c = _named_c("ff_gamma_band_ext", float(interface_band_extension_gamma))
     u_cip_c = _named_c("ff_u_cip", float(u_cip))
     phi_b_c = _named_c("ff_phi_b", float(phi_b))
+    alpha_biot_c = _named_c("ff_alpha_biot", float(alpha_biot))
     normal_pressure_scale_c = _named_c("ff_normal_pressure_scale", float(normal_pressure_scale))
     bjs_coeff_c = _named_c("ff_bjs_coefficient", float(bjs_coefficient))
     solid_interface_traction_weight_c = _named_c(
         "ff_solid_interface_traction_weight",
         float(solid_interface_traction_weight),
     )
-    if isinstance(mass_interface_weight, Constant):
-        mass_interface_weight_raw = mass_interface_weight.value
-    else:
-        mass_interface_weight_raw = mass_interface_weight
-    mass_interface_weight_arr = np.asarray(mass_interface_weight_raw, dtype=float).ravel()
-    if mass_interface_weight_arr.size != 1:
-        raise ValueError("mass_interface_weight must be scalar.")
-    mass_interface_weight_val = float(mass_interface_weight_arr[0])
-    if (not math.isfinite(mass_interface_weight_val)) or not (0.0 <= mass_interface_weight_val <= 1.0):
-        raise ValueError("mass_interface_weight must be finite and lie in [0, 1].")
-    if isinstance(mass_interface_weight, Constant):
-        mass_interface_weight_c = mass_interface_weight
-    else:
-        mass_interface_weight_c = _named_c("ff_mass_interface_weight", float(mass_interface_weight_val))
-    if isinstance(normal_interface_weight, Constant):
-        normal_interface_weight_raw = normal_interface_weight.value
-    else:
-        normal_interface_weight_raw = normal_interface_weight
-    normal_interface_weight_arr = np.asarray(normal_interface_weight_raw, dtype=float).ravel()
-    if normal_interface_weight_arr.size != 1:
-        raise ValueError("normal_interface_weight must be scalar.")
-    normal_interface_weight_val = float(normal_interface_weight_arr[0])
-    if (not math.isfinite(normal_interface_weight_val)) or not (0.0 <= normal_interface_weight_val <= 1.0):
-        raise ValueError("normal_interface_weight must be finite and lie in [0, 1].")
+    def _interface_weight_expr_and_value(name: str, raw_weight):
+        if isinstance(raw_weight, Constant):
+            weight_raw = raw_weight.value
+            weight_arr = np.asarray(weight_raw, dtype=float).ravel()
+            if weight_arr.size != 1:
+                raise ValueError(f"{name} must be scalar.")
+            weight_val = float(weight_arr[0])
+            if (not math.isfinite(weight_val)) or not (0.0 <= weight_val <= 1.0):
+                raise ValueError(f"{name} must be finite and lie in [0, 1].")
+            return raw_weight, weight_val
+        try:
+            weight_arr = np.asarray(raw_weight, dtype=float).ravel()
+        except Exception:
+            return raw_weight, None
+        if weight_arr.size != 1:
+            raise ValueError(f"{name} must be scalar.")
+        weight_val = float(weight_arr[0])
+        if (not math.isfinite(weight_val)) or not (0.0 <= weight_val <= 1.0):
+            raise ValueError(f"{name} must be finite and lie in [0, 1].")
+        return _named_c(f"ff_{name}", float(weight_val)), weight_val
+
+    mass_interface_weight_c, mass_interface_weight_val = _interface_weight_expr_and_value(
+        "mass_interface_weight",
+        mass_interface_weight,
+    )
+    normal_interface_weight_c, normal_interface_weight_val = _interface_weight_expr_and_value(
+        "normal_interface_weight",
+        normal_interface_weight,
+    )
     disable_interface_physics = bool(disable_interface_physics)
     one_m_mass_interface_weight_c = _c(1.0) - mass_interface_weight_c
     sqrt_kappa_inv_c = kappa_inv_c ** _c(0.5)
     use_bjs_tangential_law = abs(float(bjs_coefficient)) > 0.0
     zero = _c(0.0)
+
+    def _safe_zero_scalar_linear_form(anchor_expr, test_expr):
+        if anchor_expr is None or test_expr is None:
+            raise ValueError("safe zero scalar linear form requires both anchor_expr and test_expr.")
+        # Keep a nontrivial coefficient/test product so the python backend does
+        # not simplify disabled scalar rows to a pure 0*dx functional.
+        return _c(0.0) * anchor_expr * test_expr * dx
+
+    def _safe_zero_vector_linear_form(anchor_vec, test_vec):
+        if anchor_vec is None or test_vec is None:
+            raise ValueError("safe zero vector linear form requires both anchor_vec and test_vec.")
+        return _c(0.0) * dot(anchor_vec, test_vec) * dx
     phi_mode_key = str(phi_mode or "transport").strip().lower().replace("-", "_")
     if phi_mode_key not in {"transport", "alpha_closure"}:
         raise ValueError(
@@ -489,19 +534,72 @@ def build_biofilm_one_domain_final_form(
     support_indicator_mode_key = _support_indicator_mode_key(support_indicator_mode)
     disable_normal_interface = bool(disable_normal_interface)
     use_domain_lm = bool(domain_lm)
+    quasi_static_porous_media = bool(quasi_static_porous_media)
+    quasi_static_flip_pore_stress_sign = bool(quasi_static_flip_pore_stress_sign)
+    quasi_static_disable_pore_momentum = bool(quasi_static_disable_pore_momentum)
+    quasi_static_disable_solid_momentum = bool(quasi_static_disable_solid_momentum)
+    quasi_static_use_combined_porous_momentum = bool(quasi_static_use_combined_porous_momentum)
+    direct_interface_transfer = bool(direct_interface_transfer)
+    if direct_interface_transfer and (not quasi_static_porous_media):
+        raise ValueError(
+            "direct_interface_transfer is currently implemented only on quasi_static_porous_media=True."
+        )
+    if quasi_static_porous_media:
+        if not constant_rho_s:
+            raise ValueError(
+                "quasi_static_porous_media currently requires constant_rho_s=True so the porous block "
+                "uses only div(phi v_p + (1-phi) v_s)=0 without a separate solid-mass row."
+            )
+        # The simplified direct-transfer debug hook replaces the multiplier
+        # rows with explicit grad(alpha)-driven transfer terms. When that hook
+        # is disabled, the quasi-static branch must keep the interface rows
+        # active; otherwise the porous side can collapse to the dead branch
+        # with nonzero diagnostic jumps and zero support response.
+        if direct_interface_transfer:
+            disable_interface_physics = True
     if disable_normal_interface:
         normal_interface_weight_c = _named_c("ff_normal_interface_weight", 0.0)
+        normal_interface_weight_val = 0.0
     else:
-        normal_interface_weight_c = _named_c(
-            "ff_normal_interface_weight",
-            normal_interface_weight,
-        )
+        normal_interface_weight_c = normal_interface_weight_c
     one_m_normal_interface_weight_c = _c(1.0) - normal_interface_weight_c
     alpha_support_k = _smooth_support_indicator_expr(alpha_k, beta=support_indicator_beta_val)
     alpha_support_n = _smooth_support_indicator_expr(alpha_n, beta=support_indicator_beta_val)
     dalpha_support = _smooth_support_indicator_prime_expr(alpha_k, beta=support_indicator_beta_val) * dalpha
     F_support_k = _one_minus(alpha_support_k)
     dF_support = -dalpha_support
+    # Bulk domain-LM constraints should use true diffuse domain-membership
+    # weights, not the parabolic bulk envelope used by the simplified debug
+    # bulk rows. Otherwise "free-side" LM terms stay active well into the
+    # porous side when support_indicator_mode='parabolic_envelope'.
+    alpha_domain_lm_k = alpha_support_k
+    dalpha_domain_lm = dalpha_support
+    free_domain_lm_weight_mode_key = str(domain_lm_free_weight_mode or "diffuse").strip().lower().replace("-", "_")
+    if free_domain_lm_weight_mode_key == "diffuse":
+        F_domain_lm_k = F_support_k
+        dF_domain_lm = dF_support
+    elif free_domain_lm_weight_mode_key in {"sharp", "sharp16", "free_interior", "interior"}:
+        F_domain_lm_2 = F_support_k * F_support_k
+        F_domain_lm_4 = F_domain_lm_2 * F_domain_lm_2
+        F_domain_lm_8 = F_domain_lm_4 * F_domain_lm_4
+        F_domain_lm_k = F_domain_lm_8 * F_domain_lm_8
+        dF_domain_lm = _c(16.0) * (
+            F_domain_lm_8 * F_domain_lm_4 * (F_support_k * F_support_k * F_support_k)
+        ) * dF_support
+    elif free_domain_lm_weight_mode_key in {"step_cutoff", "interior_cutoff", "step_interior"}:
+        alpha_free_max_val = 0.05 if domain_lm_free_alpha_max is None else float(domain_lm_free_alpha_max)
+        alpha_free_max_c = _named_c("ff_domain_lm_free_alpha_max", alpha_free_max_val)
+        cutoff_sharpness_c = _named_c("ff_domain_lm_free_cutoff_sharpness", 100.0)
+        # Keep the LM support fixed over a Newton step by using the previous
+        # accepted alpha-state, then suppress it rapidly outside the deep
+        # free-fluid interior.
+        F_domain_lm_k = _c(0.5) * (_c(1.0) - tanh(cutoff_sharpness_c * (alpha_support_n - alpha_free_max_c)))
+        dF_domain_lm = zero
+    else:
+        raise ValueError(
+            "Unknown domain_lm_free_weight_mode="
+            f"{domain_lm_free_weight_mode!r}. Use 'diffuse', 'sharp16', or 'step_cutoff'."
+        )
     interface_band_weight_k = _c(4.0) * alpha_support_k * F_support_k
     dinterface_band_weight = _c(4.0) * (
         dalpha_support * F_support_k + alpha_support_k * dF_support
@@ -509,40 +607,72 @@ def build_biofilm_one_domain_final_form(
     alpha_bulk_k = _support_indicator_expr(alpha_k, beta=support_indicator_beta_val, mode=support_indicator_mode_key)
     alpha_bulk_n = _support_indicator_expr(alpha_n, beta=support_indicator_beta_val, mode=support_indicator_mode_key)
     dalpha_bulk = _support_indicator_prime_expr(alpha_k, beta=support_indicator_beta_val, mode=support_indicator_mode_key) * dalpha
+    div_alpha_bulk_vStest_k = alpha_bulk_k * div(vS_test) + dot(grad(alpha_bulk_k), vS_test)
+    ddiv_alpha_bulk_vStest = dalpha_bulk * div(vS_test) + dot(grad(dalpha_bulk), vS_test)
     F_bulk_k = _free_indicator_expr(alpha_k, beta=support_indicator_beta_val, mode=support_indicator_mode_key)
     dF_bulk = _free_indicator_prime_expr(alpha_k, beta=support_indicator_beta_val, mode=support_indicator_mode_key) * dalpha
+    selected_groups: list[str] = []
     if use_domain_lm:
-        required_domain_lm = (
-            ("dlm_vf", dlm_vf),
-            ("dlm_p", dlm_p),
-            ("dlm_vP", dlm_vP),
-            ("dlm_vS", dlm_vS),
-            ("dlm_p_pore", dlm_p_pore),
-            ("dlm_phi", dlm_phi),
-            ("dlm_u", dlm_u),
-            ("lm_vf_test", lm_vf_test),
-            ("lm_p_test", lm_p_test),
-            ("lm_vP_test", lm_vP_test),
-            ("lm_vS_test", lm_vS_test),
-            ("lm_p_pore_test", lm_p_pore_test),
-            ("lm_phi_test", lm_phi_test),
-            ("lm_u_test", lm_u_test),
-            ("lm_vf_k", lm_vf_k),
-            ("lm_p_k", lm_p_k),
-            ("lm_vP_k", lm_vP_k),
-            ("lm_vS_k", lm_vS_k),
-            ("lm_p_pore_k", lm_p_pore_k),
-            ("lm_phi_k", lm_phi_k),
-            ("lm_u_k", lm_u_k),
-        )
-        missing = [name for name, value in required_domain_lm if value is None]
+        domain_lm_groups = {
+            "vf": {
+                "dlm": dlm_vf,
+                "test": lm_vf_test,
+                "state": lm_vf_k,
+            },
+            "p": {
+                "dlm": dlm_p,
+                "test": lm_p_test,
+                "state": lm_p_k,
+            },
+            "vP": {
+                "dlm": dlm_vP,
+                "test": lm_vP_test,
+                "state": lm_vP_k,
+            },
+            "vS": {
+                "dlm": dlm_vS,
+                "test": lm_vS_test,
+                "state": lm_vS_k,
+            },
+            "p_pore": {
+                "dlm": dlm_p_pore,
+                "test": lm_p_pore_test,
+                "state": lm_p_pore_k,
+            },
+            "phi": {
+                "dlm": dlm_phi,
+                "test": lm_phi_test,
+                "state": lm_phi_k,
+            },
+            "u": {
+                "dlm": dlm_u,
+                "test": lm_u_test,
+                "state": lm_u_k,
+            },
+        }
+        selected_groups = [
+            name for name, group in domain_lm_groups.items() if any(value is not None for value in group.values())
+        ]
+        if not selected_groups:
+            raise ValueError("domain_lm=True requires at least one bulk domain LM target to be present.")
+        missing: list[str] = []
+        for name in selected_groups:
+            group = domain_lm_groups[name]
+            for key, value in group.items():
+                if value is None:
+                    missing.append(f"{name}:{key}")
         if missing:
             raise ValueError(
-                "domain_lm=True requires the domain LM fields/tests/increments to be present. "
+                "domain_lm=True requires each selected domain LM target to provide the LM field, test, and increment. "
                 f"Missing: {', '.join(missing)}."
             )
     if rigid_darcy_head_mode and use_domain_lm:
-        raise ValueError("domain_lm is not implemented for rigid_darcy_head_mode=True.")
+        unsupported_rigid_targets = sorted(name for name in selected_groups if name not in {"vf"})
+        if unsupported_rigid_targets:
+            raise ValueError(
+                "rigid_darcy_head_mode=True currently supports bulk domain LM only for the "
+                f"free-velocity target. Unsupported targets: {', '.join(unsupported_rigid_targets)}."
+            )
     one_m_phi_k = _one_minus(phi_k)
     one_m_phi_n = _one_minus(phi_n)
     rho_s_phys_k = rho_s_ref_c if constant_rho_s else rho_s_k
@@ -553,8 +683,10 @@ def build_biofilm_one_domain_final_form(
     mu_b_key = str(mu_b_model or "phi_mu").strip().lower()
 
     def _pore_effective_viscosity_terms(phi_expr, dphi_expr):
+        # For the constant case it is mu_f and dmu=0
         if mu_b_key in {"mu", "const", "constant"}:
             return mu_f_c, zero
+        # For this case we are assuming mu_b = phi * mu_f, dmu_b =  mu_f * dphi
         if mu_b_key in {"phi_mu", "phi*mu", "phi"}:
             return phi_expr * mu_f_c, dphi_expr * mu_f_c
         if mu_b_key in {"alpha_mu", "alpha", "mu_b", "biofilm_mu", "biofilm"}:
@@ -680,8 +812,25 @@ def build_biofilm_one_domain_final_form(
     t1 = tangent_vec[1]
     dt0 = dtangent_vec[0]
     dt1 = dtangent_vec[1]
+
+    def _stress_times_dir_components(stress, dir0, dir1):
+        return (
+            stress[0, 0] * dir0 + stress[0, 1] * dir1,
+            stress[1, 0] * dir0 + stress[1, 1] * dir1,
+        )
+
+    def _normal_trace_from_components(comp_x, comp_y, normal0, normal1):
+        return normal0 * comp_x + normal1 * comp_y
+
+    def _tangential_trace_from_components(comp_x, comp_y, tang0, tang1):
+        return tang0 * comp_x + tang1 * comp_y
+
     zero_v = _named_c("ff_zero_v", (0.0, 0.0))
     zero_u = _named_c("ff_zero_u", (0.0, 0.0))
+    qs_pore_stress_sign_c = _named_c(
+        "ff_qs_pore_stress_sign",
+        (1.0 if quasi_static_flip_pore_stress_sign else -1.0),
+    )
 
     # Bulk free-fluid momentum: chi_f(alpha) rho_f D^f(v_f) = chi_f(alpha) div(sigma_f),
     # with chi_f = 1 - chi(alpha) and the explicit transfer laws kept on raw grad(alpha).
@@ -709,53 +858,82 @@ def build_biofilm_one_domain_final_form(
     r_mom_f_bulk = r_mom_f
     a_mom_f_bulk = a_mom_f
 
-    # Bulk pore momentum:
-    #   alpha*phi*rho_f*D^p(v_p)
-    #   = alpha*div(phi*sigma_p) + alpha*p_p*grad(phi) - alpha*phi^2/K*(v_p-v_s)
-    # with
-    #   sigma_p = 2*mu_p(phi)*eps(v_p) - p_p*I.
-    #
-    # Expanding the product term gives
-    #   div(phi*sigma_p) + p_p*grad(phi)
-    #   = phi*div(sigma_p) + sigma_p*grad(phi) + p_p*grad(phi)
-    #   = phi*div(sigma_p) + 2*mu_p(phi)*eps(v_p)*grad(phi),
-    # so the extra viscous grad(phi) contribution is already contained in the
-    # assembled product-form weak row below and must not be dropped when the
-    # strong form is written out.
-    pore_coeff_k = alpha_bulk_k * phi_k
-    dpore_coeff = dalpha_bulk * phi_k + alpha_bulk_k * dphi
-    r_mom_p = pore_coeff_k * rho_f_c * dot((vP_k - vP_n) * inv_dt, vP_test) * dx
-    a_mom_p = (
-        dpore_coeff * rho_f_c * dot((vP_k - vP_n) * inv_dt, vP_test)
-        + pore_coeff_k * rho_f_c * dot(dvP * inv_dt, vP_test)
-    ) * dx
-    if pore_conv_key != "off":
-        conv_p_k = dot(grad(vP_k), vP_k)
-        dconv_p = dot(grad(dvP), vP_k) + dot(grad(vP_k), dvP)
-        r_mom_p += pore_coeff_k * rho_f_c * dot(conv_p_k, vP_test) * dx
-        a_mom_p += (
-            dpore_coeff * rho_f_c * dot(conv_p_k, vP_test)
-            + pore_coeff_k * rho_f_c * dot(dconv_p, vP_test)
-        ) * dx
-    r_mom_p += alpha_bulk_k * phi_k * inner(sigma_p_k, grad(vP_test)) * dx
-    a_mom_p += (
-        (dalpha_bulk * phi_k + alpha_bulk_k * dphi) * inner(sigma_p_k, grad(vP_test))
-        + alpha_bulk_k * phi_k * inner(dsigma_p, grad(vP_test))
-    ) * dx
-    r_mom_p += -(alpha_bulk_k * p_pore_k) * dot(grad(phi_k), vP_test) * dx
-    a_mom_p += -(
-        (dalpha_bulk * p_pore_k + alpha_bulk_k * dp_pore) * dot(grad(phi_k), vP_test)
-        + alpha_bulk_k * p_pore_k * dot(grad(dphi), vP_test)
-    ) * dx
-    # Keep the undivided whole-domain form so the pore row deactivates smoothly
-    # when alpha->0 or phi->0. Dividing out phi would hide that weighting and is
-    # not robust at vanishing pore fraction.
-    drag_coeff_k = alpha_bulk_k * phi_k * phi_k * kappa_inv_c
-    ddrag_coeff = (dalpha_bulk * phi_k * phi_k + alpha_bulk_k * _c(2.0) * phi_k * dphi) * kappa_inv_c
     rel_p_k = vP_k - vS_k
     drel_p = dvP - dvS
-    r_mom_p += drag_coeff_k * dot(rel_p_k, vP_test) * dx
-    a_mom_p += (ddrag_coeff * dot(rel_p_k, vP_test) + drag_coeff_k * dot(drel_p, vP_test)) * dx
+    drag_coeff_k = alpha_bulk_k * phi_k * phi_k * kappa_inv_c
+    ddrag_coeff = (dalpha_bulk * phi_k * phi_k + alpha_bulk_k * _c(2.0) * phi_k * dphi) * kappa_inv_c
+
+    if quasi_static_porous_media:
+        sigma_p_qs_k = qs_pore_stress_sign_c * p_pore_k * Identity(dim)
+        dsigma_p_qs = qs_pore_stress_sign_c * dp_pore * Identity(dim)
+        r_mom_p = zero * dot(vP_k, vP_test) * dx
+        a_mom_p = zero * dot(vP_k, vP_test) * dx
+        if not quasi_static_disable_pore_momentum:
+            # Quasi-static pore-fluid momentum with sigma_p = s p_pore I,
+            # reduced to the pressure-plus-drag form requested for this debug hook:
+            #   -s grad(p_pore) + phi/K (v_p-v_s) = 0
+            # and test function w_p = vP_test.
+            r_mom_p = alpha_bulk_k * (
+                (qs_pore_stress_sign_c * p_pore_k * div(vP_test))
+                + (phi_k * kappa_inv_c) * dot(rel_p_k, vP_test)
+            ) * dx
+            a_mom_p = (
+                dalpha_bulk
+                * (
+                    (qs_pore_stress_sign_c * p_pore_k * div(vP_test))
+                    + (phi_k * kappa_inv_c) * dot(rel_p_k, vP_test)
+                )
+                + alpha_bulk_k
+                * (
+                    (qs_pore_stress_sign_c * dp_pore * div(vP_test))
+                    + (dphi * kappa_inv_c) * dot(rel_p_k, vP_test)
+                    + (phi_k * kappa_inv_c) * dot(drel_p, vP_test)
+                )
+            ) * dx
+    else:
+        # Bulk pore momentum:
+        #   alpha*phi*rho_f*D^p(v_p)
+        #   = alpha*div(phi*sigma_p) + alpha*p_p*grad(phi) - alpha*phi^2/K*(v_p-v_s)
+        # with
+        #   sigma_p = 2*mu_p(phi)*eps(v_p) - p_p*I.
+        #
+        # Expanding the product term gives
+        #   div(phi*sigma_p) + p_p*grad(phi)
+        #   = phi*div(sigma_p) + sigma_p*grad(phi) + p_p*grad(phi)
+        #   = phi*div(sigma_p) + 2*mu_p(phi)*eps(v_p)*grad(phi),
+        # so the extra viscous grad(phi) contribution is already contained in the
+        # assembled product-form weak row below and must not be dropped when the
+        # strong form is written out.
+        pore_coeff_k = alpha_bulk_k * phi_k
+        dpore_coeff = dalpha_bulk * phi_k + alpha_bulk_k * dphi
+        r_mom_p = pore_coeff_k * rho_f_c * dot((vP_k - vP_n) * inv_dt, vP_test) * dx
+        a_mom_p = (
+            dpore_coeff * rho_f_c * dot((vP_k - vP_n) * inv_dt, vP_test)
+            + pore_coeff_k * rho_f_c * dot(dvP * inv_dt, vP_test)
+        ) * dx
+        if pore_conv_key != "off":
+            conv_p_k = dot(grad(vP_k), vP_k)
+            dconv_p = dot(grad(dvP), vP_k) + dot(grad(vP_k), dvP)
+            r_mom_p += pore_coeff_k * rho_f_c * dot(conv_p_k, vP_test) * dx
+            a_mom_p += (
+                dpore_coeff * rho_f_c * dot(conv_p_k, vP_test)
+                + pore_coeff_k * rho_f_c * dot(dconv_p, vP_test)
+            ) * dx
+        r_mom_p += alpha_bulk_k * phi_k * inner(sigma_p_k, grad(vP_test)) * dx
+        a_mom_p += (
+            (dalpha_bulk * phi_k + alpha_bulk_k * dphi) * inner(sigma_p_k, grad(vP_test))
+            + alpha_bulk_k * phi_k * inner(dsigma_p, grad(vP_test))
+        ) * dx
+        r_mom_p += -(alpha_bulk_k * p_pore_k) * dot(grad(phi_k), vP_test) * dx
+        a_mom_p += -(
+            (dalpha_bulk * p_pore_k + alpha_bulk_k * dp_pore) * dot(grad(phi_k), vP_test)
+            + alpha_bulk_k * p_pore_k * dot(grad(dphi), vP_test)
+        ) * dx
+        # Keep the undivided whole-domain form so the pore row deactivates smoothly
+        # when alpha->0 or phi->0. Dividing out phi would hide that weighting and is
+        # not robust at vanishing pore fraction.
+        r_mom_p += drag_coeff_k * dot(rel_p_k, vP_test) * dx
+        a_mom_p += (ddrag_coeff * dot(rel_p_k, vP_test) + drag_coeff_k * dot(drel_p, vP_test)) * dx
 
     r_mom_p_bulk = r_mom_p
     a_mom_p_bulk = a_mom_p
@@ -779,9 +957,13 @@ def build_biofilm_one_domain_final_form(
                 dfluid_normal_trac_loc = n0 * dfluid_n_x_loc + n1 * dfluid_n_y_loc
                 dfluid_tang_trac_loc = t0 * dfluid_n_x_loc + t1 * dfluid_n_y_loc
             else:
-                dfluid_traction_loc = dot(dsigma_f_loc, normal_vec)
-                dfluid_normal_trac_loc = dot(normal_vec, dfluid_traction_loc)
-                dfluid_tang_trac_loc = dot(tangent_vec, dfluid_traction_loc)
+                dfluid_n_x_loc, dfluid_n_y_loc = _stress_times_dir_components(dsigma_f_loc, n0, n1)
+                dfluid_normal_trac_loc = _normal_trace_from_components(
+                    dfluid_n_x_loc, dfluid_n_y_loc, n0, n1
+                )
+                dfluid_tang_trac_loc = _tangential_trace_from_components(
+                    dfluid_n_x_loc, dfluid_n_y_loc, t0, t1
+                )
 
             dnormal_jump_loc = dfluid_normal_trac_loc + normal_pressure_scale_c * phi_k * dp_pore_loc
             dtangential_jump_loc = dfluid_tang_trac_loc
@@ -800,14 +982,16 @@ def build_biofilm_one_domain_final_form(
             fluid_tang_trac = t0 * fluid_n_x + t1 * fluid_n_y
             fluid_tangential_velocity_k = t0 * v_k[0] + t1 * v_k[1]
         else:
-            fluid_traction = dot(sigma_f_k, normal_vec)
-            fluid_normal_trac = dot(normal_vec, fluid_traction)
-            fluid_tang_trac = dot(tangent_vec, fluid_traction)
+            fluid_n_x, fluid_n_y = _stress_times_dir_components(sigma_f_k, n0, n1)
+            fluid_normal_trac = _normal_trace_from_components(fluid_n_x, fluid_n_y, n0, n1)
+            fluid_tang_trac = _tangential_trace_from_components(fluid_n_x, fluid_n_y, t0, t1)
             fluid_tangential_velocity_k = dot(tangent_vec, v_k)
 
+        # Fluid mass block
         r_mass = q_test * (F_bulk_k * div(v_k)) * dx
         a_mass = q_test * (dF_bulk * div(v_k) + F_bulk_k * div(dv)) * dx
 
+        # Porous mass block
         pore_bulk_flux_k = alpha_bulk_k * (phi_k * div(vP_k) + dot(grad(phi_k), vP_k))
         dpore_bulk_flux = (
             dalpha_bulk * (phi_k * div(vP_k) + dot(grad(phi_k), vP_k))
@@ -956,10 +1140,11 @@ def build_biofilm_one_domain_final_form(
         zero_rho_s_test = rho_s_test if rho_s_test is not None else zero_scalar_test
         zero_vec_form = zero * dot(vS_k, vS_test) * dx
         zero_u_form = zero * dot(u_k, u_test) * dx
-        zero_phi_form = zero * zero_phi_test * dx
-        zero_rho_s_form = zero * zero_rho_s_test * dx
-        zero_alpha_form = zero * alpha_test * dx
-        zero_q_form = zero * zero_scalar_test * dx
+        zero_phi_form = _safe_zero_scalar_linear_form(phi_k, zero_phi_test)
+        zero_rho_s_form = _safe_zero_scalar_linear_form(rho_s_phys_k, zero_rho_s_test)
+        zero_alpha_form = _safe_zero_scalar_linear_form(alpha_k, alpha_test)
+        zero_q_anchor = p_k if q_test is not None else p_pore_k
+        zero_q_form = _safe_zero_scalar_linear_form(zero_q_anchor, zero_scalar_test)
 
         r_momentum = r_mom_f + r_mom_p
         a_momentum = a_mom_f + a_mom_p
@@ -988,7 +1173,9 @@ def build_biofilm_one_domain_final_form(
             r_kinematics=zero_u_form,
             r_skeleton=zero_vec_form,
             r_phi=zero_phi_form,
+            r_phi_transport=zero_phi_form,
             r_alpha=zero_alpha_form,
+            r_alpha_transport=zero_alpha_form,
             r_mu_alpha=zero_alpha_form,
             r_damage=None,
             r_substrate=zero_alpha_form,
@@ -1040,8 +1227,10 @@ def build_biofilm_one_domain_final_form(
                 "drag": zero_vec_form,
             },
             a_phi=zero_rho_s_form,
+            a_phi_transport=zero_rho_s_form,
             a_B=None,
             a_alpha=zero_alpha_form,
+            a_alpha_transport=zero_alpha_form,
             a_mu_alpha=None,
             a_damage=None,
             a_substrate=None,
@@ -1059,43 +1248,159 @@ def build_biofilm_one_domain_final_form(
 
     # Bulk solid momentum uses the support indicator chi(alpha) for occupancy,
     # while the explicit transfer terms below remain on raw grad(alpha).
-    solid_coeff_k = alpha_bulk_k * rho_s_phys_k * one_m_phi_k
-    dsolid_coeff = (
-        dalpha_bulk * rho_s_phys_k * one_m_phi_k
-        + alpha_bulk_k * drho_s_phys * one_m_phi_k
-        - alpha_bulk_k * rho_s_phys_k * dphi
-    )
-    r_skel = solid_coeff_k * dot((vS_k - vS_n) * inv_dt, vS_test) * dx
-    a_skel = (
-        dsolid_coeff * dot((vS_k - vS_n) * inv_dt, vS_test)
-        + solid_coeff_k * dot(dvS * inv_dt, vS_test)
-    ) * dx
-    if solid_conv_key != "off":
-        conv_s_k = dot(grad(vS_k), vS_k)
-        dconv_s = dot(grad(dvS), vS_k) + dot(grad(vS_k), dvS)
-        r_skel += solid_coeff_k * dot(conv_s_k, vS_test) * dx
-        a_skel += dsolid_coeff * dot(conv_s_k, vS_test) * dx + solid_coeff_k * dot(dconv_s, vS_test) * dx
-    r_skel += -(alpha_bulk_k * one_m_phi_k) * inner(sigma_s_k, grad(vS_test)) * dx
-    a_skel += -(
-        (dalpha_bulk * one_m_phi_k - alpha_bulk_k * dphi) * inner(sigma_s_k, grad(vS_test))
-        + alpha_bulk_k * one_m_phi_k * inner(dsigma_s, grad(vS_test))
-    ) * dx
-    if float(solid_visco_eta) != 0.0:
-        r_skel += alpha_bulk_k * one_m_phi_k * _c(2.0) * eta_s_c * inner(_eps(vS_k), _eps(vS_test)) * dx
-        a_skel += (
-            (dalpha_bulk * one_m_phi_k - alpha_bulk_k * dphi) * _c(2.0) * eta_s_c * inner(_eps(vS_k), _eps(vS_test))
-            + alpha_bulk_k * one_m_phi_k * _c(2.0) * eta_s_c * inner(_eps(dvS), _eps(vS_test))
+    r_interface_direct_traction_free = zero * dot(v_k, v_test) * dx
+    a_interface_direct_traction_free = zero * dot(v_k, v_test) * dx
+    r_interface_direct_tangential_drag_free = zero * dot(v_k, v_test) * dx
+    a_interface_direct_tangential_drag_free = zero * dot(v_k, v_test) * dx
+    r_interface_direct_tangential_drag = zero * dot(vS_k, vS_test) * dx
+    a_interface_direct_tangential_drag = zero * dot(vS_k, vS_test) * dx
+    if quasi_static_porous_media:
+        sigma_p_qs_k = -(p_pore_k * Identity(dim))
+        dsigma_p_qs = -(dp_pore * Identity(dim))
+        r_skel = zero * dot(vS_k, vS_test) * dx
+        a_skel = zero * dot(vS_k, vS_test) * dx
+        if not quasi_static_disable_solid_momentum:
+            # Quasi-static porous-solid momentum:
+            #   div((1-phi) sigma_s) - alpha_biot p_pore div(alpha test)
+            #   + phi^2/K (v_p-v_s) = 0
+            # tested with w_u = vS_test.
+            r_skel = (
+                -(alpha_bulk_k * one_m_phi_k) * inner(sigma_s_k, _eps(vS_test))
+                - alpha_biot_c * p_pore_k * div_alpha_bulk_vStest_k
+                - drag_coeff_k * dot(rel_p_k, vS_test)
+            ) * dx
+            a_skel = -(
+                (dalpha_bulk * one_m_phi_k - alpha_bulk_k * dphi) * inner(sigma_s_k, _eps(vS_test))
+                + alpha_bulk_k * one_m_phi_k * inner(dsigma_s, _eps(vS_test))
+            ) * dx + (
+                - alpha_biot_c * (dp_pore * div_alpha_bulk_vStest_k + p_pore_k * ddiv_alpha_bulk_vStest)
+                - (ddrag_coeff * dot(rel_p_k, vS_test) + drag_coeff_k * dot(drel_p, vS_test))
+            ) * dx
+        r_skel_bulk = r_skel
+        a_skel_bulk = a_skel
+        r_combined_porous_bulk = zero * dot(vS_k, vS_test) * dx
+        a_combined_porous_bulk = zero * dot(vS_k, vS_test) * dx
+        if quasi_static_use_combined_porous_momentum:
+            porous_sigma_qs_k = phi_k * sigma_p_qs_k + one_m_phi_k * sigma_s_k
+            dporous_sigma_qs = dphi * sigma_p_qs_k + phi_k * dsigma_p_qs - dphi * sigma_s_k + one_m_phi_k * dsigma_s
+            # Debug hook requested by the user: a single combined porous-body
+            # momentum row on the solid test space.
+            r_combined_porous_bulk = alpha_bulk_k * inner(porous_sigma_qs_k, _eps(vS_test)) * dx
+            a_combined_porous_bulk = (
+                dalpha_bulk * inner(porous_sigma_qs_k, _eps(vS_test))
+                + alpha_bulk_k * inner(dporous_sigma_qs, _eps(vS_test))
+            ) * dx
+            r_skel = r_skel + r_combined_porous_bulk
+            a_skel = a_skel + a_combined_porous_bulk
+        r_interface_direct_traction = zero * dot(vS_k, vS_test) * dx
+        a_interface_direct_traction = zero * dot(vS_k, vS_test) * dx
+        if direct_interface_transfer:
+            # Keep the direct porous-side traction jump consistent with the
+            # combined porous-body row: sigma_f - phi*sigma_p - (1-phi)*sigma_s.
+            porous_interface_sigma_k = (
+                phi_k * sigma_p_qs_k
+                + solid_interface_traction_weight_c * one_m_phi_k * sigma_s_k
+            )
+            dporous_interface_sigma = (
+                dphi * sigma_p_qs_k
+                + phi_k * dsigma_p_qs
+                + solid_interface_traction_weight_c
+                * (-dphi * sigma_s_k + one_m_phi_k * dsigma_s)
+            )
+            porous_traction_transfer_k = dot(porous_interface_sigma_k, grad_alpha_k)
+            dporous_traction_transfer = (
+                dot(dporous_interface_sigma, grad_alpha_k)
+                + dot(porous_interface_sigma_k, grad(dalpha))
+            )
+            fluid_traction_transfer_k = dot(sigma_f_k, grad_alpha_k)
+            dfluid_traction_transfer = (
+                dot(dsigma_f, grad_alpha_k)
+                + dot(sigma_f_k, grad(dalpha))
+            )
+            # On the quasi-static debug hook the multiplier rows are disabled and
+            # the full diffuse traction jump is injected on the porous-side test
+            # space. Splitting the fluid and porous pieces onto separate self
+            # rows leaves the porous residual identically zero at the trivial
+            # porous state, which uncouples the mixed problem.
+            traction_jump_transfer_k = fluid_traction_transfer_k - porous_traction_transfer_k
+            dtraction_jump_transfer = dfluid_traction_transfer - dporous_traction_transfer
+            r_interface_direct_traction = dot(traction_jump_transfer_k, vS_test) * dx
+            a_interface_direct_traction = dot(dtraction_jump_transfer, vS_test) * dx
+            r_skel = r_skel + r_interface_direct_traction
+            a_skel = a_skel + a_interface_direct_traction
+            if quasi_static_use_combined_porous_momentum and use_bjs_tangential_law:
+                porous_mix_velocity_k = phi_k * vP_k + one_m_phi_k * vS_k
+                dporous_mix_velocity = dphi * rel_p_k + phi_k * dvP + one_m_phi_k * dvS
+                bjs_beta_interface_c = bjs_coeff_c * mu_f_c * sqrt_kappa_inv_c
+                tangential_slip_k = dot(tangent_vec, v_k - porous_mix_velocity_k)
+                dtangential_slip = (
+                    dot(dtangent_vec, v_k - porous_mix_velocity_k)
+                    + dot(tangent_vec, dv - dporous_mix_velocity)
+                )
+                tangential_drag_vec_k = (
+                    grad_alpha_mag * bjs_beta_interface_c * tangential_slip_k * tangent_vec
+                )
+                dtangential_drag_vec = bjs_beta_interface_c * (
+                    dgrad_alpha_mag * tangential_slip_k * tangent_vec
+                    + grad_alpha_mag * dtangential_slip * tangent_vec
+                    + grad_alpha_mag * tangential_slip_k * dtangent_vec
+                )
+                r_interface_direct_tangential_drag_free = -dot(
+                    tangential_drag_vec_k, v_test
+                ) * dx
+                a_interface_direct_tangential_drag_free = -dot(
+                    dtangential_drag_vec, v_test
+                ) * dx
+                r_mom_f = r_mom_f + r_interface_direct_tangential_drag_free
+                a_mom_f = a_mom_f + a_interface_direct_tangential_drag_free
+                r_interface_direct_tangential_drag = dot(
+                    tangential_drag_vec_k, vS_test
+                ) * dx
+                a_interface_direct_tangential_drag = dot(
+                    dtangential_drag_vec, vS_test
+                ) * dx
+                r_skel = r_skel + r_interface_direct_tangential_drag
+                a_skel = a_skel + a_interface_direct_tangential_drag
+    else:
+        solid_coeff_k = alpha_bulk_k * rho_s_phys_k * one_m_phi_k
+        dsolid_coeff = (
+            dalpha_bulk * rho_s_phys_k * one_m_phi_k
+            + alpha_bulk_k * drho_s_phys * one_m_phi_k
+            - alpha_bulk_k * rho_s_phys_k * dphi
+        )
+        r_skel = solid_coeff_k * dot((vS_k - vS_n) * inv_dt, vS_test) * dx
+        a_skel = (
+            dsolid_coeff * dot((vS_k - vS_n) * inv_dt, vS_test)
+            + solid_coeff_k * dot(dvS * inv_dt, vS_test)
         ) * dx
-    r_skel += (alpha_bulk_k * p_pore_k) * dot(grad(phi_k), vS_test) * dx
-    a_skel += (
-        (dalpha_bulk * p_pore_k + alpha_bulk_k * dp_pore) * dot(grad(phi_k), vS_test)
-        + alpha_bulk_k * p_pore_k * dot(grad(dphi), vS_test)
-    ) * dx
-    r_skel += -drag_coeff_k * dot(rel_p_k, vS_test) * dx
-    a_skel += -(ddrag_coeff * dot(rel_p_k, vS_test) + drag_coeff_k * dot(drel_p, vS_test)) * dx
-
-    r_skel_bulk = r_skel
-    a_skel_bulk = a_skel
+        if solid_conv_key != "off":
+            conv_s_k = dot(grad(vS_k), vS_k)
+            dconv_s = dot(grad(dvS), vS_k) + dot(grad(vS_k), dvS)
+            r_skel += solid_coeff_k * dot(conv_s_k, vS_test) * dx
+            a_skel += dsolid_coeff * dot(conv_s_k, vS_test) * dx + solid_coeff_k * dot(dconv_s, vS_test) * dx
+        r_skel += -(alpha_bulk_k * one_m_phi_k) * inner(sigma_s_k, grad(vS_test)) * dx
+        a_skel += -(
+            (dalpha_bulk * one_m_phi_k - alpha_bulk_k * dphi) * inner(sigma_s_k, grad(vS_test))
+            + alpha_bulk_k * one_m_phi_k * inner(dsigma_s, grad(vS_test))
+        ) * dx
+        if float(solid_visco_eta) != 0.0:
+            r_skel += alpha_bulk_k * one_m_phi_k * _c(2.0) * eta_s_c * inner(_eps(vS_k), _eps(vS_test)) * dx
+            a_skel += (
+                (dalpha_bulk * one_m_phi_k - alpha_bulk_k * dphi) * _c(2.0) * eta_s_c * inner(_eps(vS_k), _eps(vS_test))
+                + alpha_bulk_k * one_m_phi_k * _c(2.0) * eta_s_c * inner(_eps(dvS), _eps(vS_test))
+            ) * dx
+        r_skel += -(alpha_biot_c * p_pore_k * div_alpha_bulk_vStest_k) * dx
+        a_skel += (
+            -(alpha_biot_c * (dp_pore * div_alpha_bulk_vStest_k + p_pore_k * ddiv_alpha_bulk_vStest))
+        ) * dx
+        r_skel += -drag_coeff_k * dot(rel_p_k, vS_test) * dx
+        a_skel += -(ddrag_coeff * dot(rel_p_k, vS_test) + drag_coeff_k * dot(drel_p, vS_test)) * dx
+        r_combined_porous_bulk = zero * dot(vS_k, vS_test) * dx
+        a_combined_porous_bulk = zero * dot(vS_k, vS_test) * dx
+        r_interface_direct_traction = zero * dot(vS_k, vS_test) * dx
+        a_interface_direct_traction = zero * dot(vS_k, vS_test) * dx
+        r_skel_bulk = r_skel
+        a_skel_bulk = a_skel
 
     
     # Interface mass transfer
@@ -1112,6 +1417,12 @@ def build_biofilm_one_domain_final_form(
             - ((drho_s_phys * phi_k + rho_s_phys_k * dphi) * vP_k + rho_s_phys_k * phi_k * dvP)
             - ((drho_s_phys * one_m_phi_k - rho_s_phys_k * dphi) * vS_k + rho_s_phys_k * one_m_phi_k * dvS)
         )
+    mass_constraint_k = dot(grad(alpha_k), mass_jump_k)
+    dmass_constraint = dot(grad(dalpha), mass_jump_k) + dot(grad(alpha_k), dmass_jump)
+    direct_interface_mass_free_k = _safe_zero_scalar_linear_form(p_k, q_test)
+    ddirect_interface_mass_free = _safe_zero_scalar_linear_form(p_k, q_test)
+    direct_interface_mass_porous_k = _safe_zero_scalar_linear_form(p_pore_k, q_pore_test)
+    ddirect_interface_mass_porous = _safe_zero_scalar_linear_form(p_pore_k, q_pore_test)
     # Free-fluid mass row: free-region incompressibility only.
     r_mass_bulk = q_test * (F_bulk_k * div(v_k)) * dx
     a_mass_bulk = q_test * (
@@ -1159,21 +1470,47 @@ def build_biofilm_one_domain_final_form(
         + dot(grad(dphi), transfer_vel_k)
         + dot(grad(phi_k), dtransfer_vel)
     )
-    if phi_mode_key != "alpha_closure":
-        if constant_rho_s:
-            combined_porous_continuity_k = div(vS_k) + div_transfer_k
-            dcombined_porous_continuity = div(dvS) + ddiv_transfer
-            r_pore = q_pore_test * (alpha_bulk_k * combined_porous_continuity_k) * dx
-            a_pore = q_pore_test * (
-                dalpha_bulk * combined_porous_continuity_k
-                + alpha_bulk_k * dcombined_porous_continuity
+    if quasi_static_porous_media:
+        porous_mass_flux_k = phi_k * vP_k + one_m_phi_k * vS_k
+        dporous_mass_flux = dphi * rel_p_k + phi_k * dvP + one_m_phi_k * dvS
+        r_pore = -(alpha_bulk_k * dot(grad(q_pore_test), porous_mass_flux_k)) * dx
+        a_pore = -(
+            dalpha_bulk * dot(grad(q_pore_test), porous_mass_flux_k)
+            + alpha_bulk_k * dot(grad(q_pore_test), dporous_mass_flux)
+        ) * dx
+        if direct_interface_transfer:
+            # The quasi-static porous continuity equation always carries the
+            # porous-side diffuse mass-transfer law, regardless of how phi is
+            # evolved. alpha_closure replaces only the phi row, not the
+            # p_pore/q_pore continuity law.
+            direct_interface_mass_jump_k = rho_f_c * v_k - rho_s_phys_k * porous_mass_flux_k
+            ddirect_interface_mass_jump = (
+                rho_f_c * dv
+                - (drho_s_phys * porous_mass_flux_k + rho_s_phys_k * dporous_mass_flux)
+            )
+            direct_interface_mass_porous_k = -(
+                q_pore_test * dot(grad_alpha_k, direct_interface_mass_jump_k)
             ) * dx
-        else:
-            r_pore = q_pore_test * (alpha_bulk_k * pore_transport_k) * dx
-            a_pore = q_pore_test * (
-                dalpha_bulk * pore_transport_k
-                + alpha_bulk_k * dpore_transport
+            ddirect_interface_mass_porous = -(
+                q_pore_test * dot(grad(dalpha), direct_interface_mass_jump_k)
+                + q_pore_test * dot(grad_alpha_k, ddirect_interface_mass_jump)
             ) * dx
+            r_pore = r_pore + direct_interface_mass_porous_k
+            a_pore = a_pore + ddirect_interface_mass_porous
+    elif constant_rho_s:
+        combined_porous_continuity_k = div(vS_k) + div_transfer_k
+        dcombined_porous_continuity = div(dvS) + ddiv_transfer
+        r_pore = q_pore_test * (alpha_bulk_k * combined_porous_continuity_k) * dx
+        a_pore = q_pore_test * (
+            dalpha_bulk * combined_porous_continuity_k
+            + alpha_bulk_k * dcombined_porous_continuity
+        ) * dx
+    else:
+        r_pore = q_pore_test * (alpha_bulk_k * pore_transport_k) * dx
+        a_pore = q_pore_test * (
+            dalpha_bulk * pore_transport_k
+            + alpha_bulk_k * dpore_transport
+        ) * dx
     if phi_mode_key == "alpha_closure":
         phi_target_k = _c(1.0) - (_c(1.0) - phi_b_c) * alpha_bulk_k
         dphi_target = -(_c(1.0) - phi_b_c) * dalpha_bulk
@@ -1182,8 +1519,27 @@ def build_biofilm_one_domain_final_form(
         r_solid_mass = None
         a_solid_mass = None
     elif constant_rho_s:
-        r_phi_bulk = zero * phi_test * dx
-        a_phi_bulk = zero * phi_test * dx
+        if quasi_static_porous_media:
+            if phi_test is None:
+                raise ValueError(
+                    "quasi_static_porous_media on the constant-density final_form branch requires "
+                    "the phi field so the pore-mass equation d_t(phi) + div(phi v_p) = 0 can be assembled."
+                )
+            # Quasi-static affects the porous momentum laws, not the transient
+            # pore-mass transport. Keep the conservative phi equation live:
+            #   d_t(phi) + div(phi v_p) = 0.
+            #
+            # The free-fluid clamp (1-alpha)^16 (phi-1) remains added below
+            # through gamma_phi, so this row becomes
+            #   alpha * (d_t(phi) + div(phi v_p)) + gamma_phi * (1-alpha)^16 * (phi-1) = 0.
+            r_phi_bulk = phi_test * (alpha_bulk_k * pore_transport_k) * dx
+            a_phi_bulk = phi_test * (
+                dalpha_bulk * pore_transport_k
+                + alpha_bulk_k * dpore_transport
+            ) * dx
+        else:
+            r_phi_bulk = _safe_zero_scalar_linear_form(phi_k, phi_test)
+            a_phi_bulk = _safe_zero_scalar_linear_form(phi_k, phi_test)
         r_solid_mass = None
         a_solid_mass = None
     else:
@@ -1198,14 +1554,12 @@ def build_biofilm_one_domain_final_form(
             + drho_s_phys * (div(vS_k) + div_transfer_k)
             + rho_s_phys_k * (div(dvS) + ddiv_transfer)
         )
-        r_phi_bulk = zero * phi_test * dx
-        a_phi_bulk = zero * phi_test * dx
+        r_phi_bulk = _safe_zero_scalar_linear_form(phi_k, phi_test)
+        a_phi_bulk = _safe_zero_scalar_linear_form(phi_k, phi_test)
         r_solid_mass = rho_s_test * (alpha_bulk_k * combined_mass_bulk_k) * dx
         a_solid_mass = rho_s_test * (
             dalpha_bulk * combined_mass_bulk_k + alpha_bulk_k * dcombined_mass_bulk
         ) * dx
-    mass_constraint_k = dot(grad(alpha_k), mass_jump_k)
-    dmass_constraint = dot(grad(dalpha), mass_jump_k) + dot(grad(alpha_k), dmass_jump)
     r_phi = _form_add(r_phi_bulk, r_solid_mass)
     a_phi = _form_add(a_phi_bulk, a_solid_mass)
     r_volumetric = None
@@ -1221,8 +1575,23 @@ def build_biofilm_one_domain_final_form(
             + vol_pen_c * (dF_support * pi_s_k * pi_s_test + F_support_k * dpi_s * pi_s_test)
         ) * dx
 
-    kin_jump_k = (u_k - u_n) * inv_dt + dot(grad(u_k), vS_k) - vS_k
-    dkin_jump = du * inv_dt + dot(grad(du), vS_k) + dot(grad(u_k), dvS) - dvS
+    stored_support_vS_gate_n = _c(1.0)
+    if float(alpha_vS_gate_alpha0) > 0.0:
+        gate_pow = int(alpha_vS_gate_power)
+        if gate_pow < 1:
+            raise ValueError(f"alpha_vS_gate_power must be >= 1; got {alpha_vS_gate_power}.")
+        gate_num = alpha_n
+        for _ in range(gate_pow - 1):
+            gate_num = gate_num * alpha_n
+        gate_denom = gate_num + _c(float(alpha_vS_gate_alpha0) ** float(gate_pow)) + _c(1.0e-12)
+        stored_support_vS_gate_n = gate_num / gate_denom
+    grad_stored_support_vS_gate_n = grad(stored_support_vS_gate_n)
+    vS_kin_k = stored_support_vS_gate_n * vS_k
+    vS_kin_n = stored_support_vS_gate_n * vS_n
+    dvS_kin = stored_support_vS_gate_n * dvS
+
+    kin_jump_k = (u_k - u_n) * inv_dt + dot(grad(u_k), vS_kin_k) - vS_kin_k
+    dkin_jump = du * inv_dt + dot(grad(du), vS_kin_k) + dot(grad(u_k), dvS_kin) - dvS_kin
     r_kin = alpha_bulk_k * dot(kin_jump_k, u_test) * dx
     a_kin = (
         dalpha_bulk * dot(kin_jump_k, u_test)
@@ -1230,8 +1599,99 @@ def build_biofilm_one_domain_final_form(
         * dot(dkin_jump, u_test)
     ) * dx
 
-    r_alpha = alpha_test * ((alpha_k - alpha_n) * inv_dt + dot(vS_k, grad(alpha_k))) * dx
-    a_alpha = alpha_test * (dalpha * inv_dt + dot(dvS, grad(alpha_k)) + dot(vS_k, grad(dalpha))) * dx
+    support_physics_key = str(support_physics or "internal_conversion").strip().lower().replace("-", "_")
+    adv_with_default = "biofilm_volume" if support_physics_key == "internal_conversion" else "vS"
+    adv_with_key = str(alpha_advect_with or adv_with_default).strip().lower().replace("-", "_")
+    adv_key = str(alpha_advection_form or "conservative_weak").strip().lower().replace("-", "_")
+    if adv_key in {"conservative-weak", "weak", "weak_conservative"}:
+        adv_key = "conservative_weak"
+    elif adv_key in {"conservative", "div", "divergence"}:
+        adv_key = "conservative"
+    elif adv_key in {"advective", "nonconservative", "vgrad", "v_grad"}:
+        adv_key = "advective"
+    elif adv_key in {"interface_band_conservative", "interface-band-conservative", "band_conservative"}:
+        adv_key = "interface_band_conservative"
+    if support_physics_key == "internal_conversion" and adv_key not in {"conservative", "conservative_weak"}:
+        raise ValueError(
+            "final_form support_physics='internal_conversion' requires a conservative alpha law. "
+            "Use alpha_advection_form='conservative_weak' (recommended) or 'conservative'."
+        )
+    if adv_with_key in {"vs", "v_s", "s", "skeleton", "solid"}:
+        adv_u_k = vS_kin_k
+        dadv_u = dvS_kin
+        div_adv_u_k = stored_support_vS_gate_n * div(vS_k) + dot(grad_stored_support_vS_gate_n, vS_k)
+        d_div_adv_u = stored_support_vS_gate_n * div(dvS) + dot(grad_stored_support_vS_gate_n, dvS)
+    elif adv_with_key in {"v", "fluid"}:
+        adv_u_k = v_k
+        dadv_u = dv
+        div_adv_u_k = div(v_k)
+        d_div_adv_u = div(dv)
+    elif adv_with_key in {"biofilm", "biofilm_volume", "phase", "phase_volume"}:
+        grad_phi_k = grad(phi_k)
+        adv_u_k = phi_k * vP_k + one_m_phi_k * vS_k
+        dadv_u = phi_k * dvP + one_m_phi_k * dvS + dphi * (vP_k - vS_k)
+        div_adv_u_k = (
+            phi_k * div(vP_k)
+            + dot(grad_phi_k, vP_k)
+            + one_m_phi_k * div(vS_k)
+            - dot(grad_phi_k, vS_k)
+        )
+        d_div_adv_u = (
+            phi_k * div(dvP)
+            + dot(grad_phi_k, dvP)
+            + one_m_phi_k * div(dvS)
+            - dot(grad_phi_k, dvS)
+            + dphi * (div(vP_k) - div(vS_k))
+            + dot(grad(dphi), vP_k - vS_k)
+        )
+    elif adv_with_key in {"relative", "rel", "slip", "v_minus_vs", "v_vs"}:
+        adv_u_k = vP_k - vS_k
+        dadv_u = dvP - dvS
+        div_adv_u_k = div(vP_k) - div(vS_k)
+        d_div_adv_u = div(dvP) - div(dvS)
+    elif adv_with_key in {"interface", "avg", "average", "midpoint"}:
+        adv_u_k = _c(0.5) * (vP_k + vS_k)
+        dadv_u = _c(0.5) * (dvP + dvS)
+        div_adv_u_k = _c(0.5) * (div(vP_k) + div(vS_k))
+        d_div_adv_u = _c(0.5) * (div(dvP) + div(dvS))
+    else:
+        raise ValueError(
+            f"Unsupported final_form alpha_advect_with={alpha_advect_with!r}. "
+            "Use 'vS', 'v', 'biofilm_volume', 'relative', or 'interface'."
+        )
+
+    time_alpha_k = (alpha_k - alpha_n) * inv_dt
+    if adv_key == "conservative_weak":
+        flux_alpha_k = alpha_k * adv_u_k
+        dflux_alpha = dalpha * adv_u_k + alpha_k * dadv_u
+        r_alpha = alpha_test * time_alpha_k * dx - dot(flux_alpha_k, grad(alpha_test)) * dx
+        a_alpha = alpha_test * (dalpha * inv_dt) * dx - dot(dflux_alpha, grad(alpha_test)) * dx
+        if ds_alpha_transport is not None:
+            n_b = FacetNormal()
+            flux_bdry_k = dot(flux_alpha_k, n_b)
+            dflux_bdry = dot(dflux_alpha, n_b)
+            r_alpha = r_alpha + alpha_test * flux_bdry_k * ds_alpha_transport
+            a_alpha = a_alpha + alpha_test * dflux_bdry * ds_alpha_transport
+    elif adv_key == "conservative":
+        adv_alpha_k = dot(grad(alpha_k), adv_u_k) + alpha_k * div_adv_u_k
+        d_adv_alpha = (
+            dot(grad(dalpha), adv_u_k)
+            + dot(grad(alpha_k), dadv_u)
+            + dalpha * div_adv_u_k
+            + alpha_k * d_div_adv_u
+        )
+        r_alpha = alpha_test * (time_alpha_k + adv_alpha_k) * dx
+        a_alpha = alpha_test * (dalpha * inv_dt + d_adv_alpha) * dx
+    elif adv_key == "advective":
+        adv_alpha_k = dot(grad(alpha_k), adv_u_k)
+        d_adv_alpha = dot(grad(dalpha), adv_u_k) + dot(grad(alpha_k), dadv_u)
+        r_alpha = alpha_test * (time_alpha_k + adv_alpha_k) * dx
+        a_alpha = alpha_test * (dalpha * inv_dt + d_adv_alpha) * dx
+    else:
+        raise ValueError(
+            f"Unsupported final_form alpha_advection_form={alpha_advection_form!r}. "
+            "Use 'advective', 'conservative', or 'conservative_weak'."
+        )
 
     one_m_alpha4_k = F_support_k * F_support_k
     one_m_alpha4_k = one_m_alpha4_k * one_m_alpha4_k
@@ -1446,8 +1906,8 @@ def build_biofilm_one_domain_final_form(
         a_interface_kin_bulk_u = zero_mu_kin_form
         r_interface_kin_bulk_vS = zero_mu_kin_form
         a_interface_kin_bulk_vS = zero_mu_kin_form
-        r_interface_kin_bulk_alpha = zero * alpha_test * dx
-        a_interface_kin_bulk_alpha = zero * alpha_test * dx
+        r_interface_kin_bulk_alpha = _safe_zero_scalar_linear_form(alpha_k, alpha_test)
+        a_interface_kin_bulk_alpha = _safe_zero_scalar_linear_form(alpha_k, alpha_test)
 
     if interface_formulation_key == "decomposed":
         def _traction_directional(
@@ -1475,14 +1935,30 @@ def build_biofilm_one_domain_final_form(
                 + _c(2.0) * mu_pore_eff_loc * _eps(dvP_loc)
                 - dp_pore_loc * Identity(dim)
             )
-            _, dsigma_s_loc = _solid_stress_and_tangent(
-                solid_model=str(solid_model),
-                u_k=u_k,
-                du=du_loc,
-                mu_s=mu_s_c,
-                lambda_s=lambda_s_c,
-                dim=int(dim),
-            )
+            if solid_volumetric_split:
+                if solid_model_key in {"linear", "small_strain", "linear_elastic"}:
+                    dsigma_s_dev_loc = _c(2.0) * mu_s_c * _deviatoric_tensor(_eps(du_loc), dim=int(dim))
+                else:
+                    _, dsigma_s_full_loc = _solid_stress_and_tangent(
+                        solid_model=str(solid_model),
+                        u_k=u_k,
+                        du=du_loc,
+                        mu_s=mu_s_c,
+                        lambda_s=lambda_s_c,
+                        dim=int(dim),
+                    )
+                    dmean_dr_loc = _tensor_trace(dsigma_s_full_loc, dim=int(dim)) / _c(float(dim))
+                    dsigma_s_dev_loc = dsigma_s_full_loc - dmean_dr_loc * Identity(dim)
+                dsigma_s_loc = dsigma_s_dev_loc
+            else:
+                _, dsigma_s_loc = _solid_stress_and_tangent(
+                    solid_model=str(solid_model),
+                    u_k=u_k,
+                    du=du_loc,
+                    mu_s=mu_s_c,
+                    lambda_s=lambda_s_c,
+                    dim=int(dim),
+                )
             dgrad_alpha_loc = grad(dalpha_loc)
             dgrad_alpha_mag_loc = dot(grad_alpha_k, dgrad_alpha_loc) * inv_grad_alpha_mag
             dn0_loc = (dgrad_alpha_loc[0] - n0 * dgrad_alpha_mag_loc) * inv_grad_alpha_mag
@@ -1625,20 +2101,25 @@ def build_biofilm_one_domain_final_form(
             + solid_interface_traction_weight_c * dphi * solid_tang_trac
             - solid_interface_traction_weight_c * one_m_phi_k * dsolid_tang_trac
         )
-        fluid_tangential_velocity_k = t0 * v_k[0] + t1 * v_k[1]
-        dfluid_tangential_velocity = (
-            dt0 * v_k[0] + t0 * dv[0] + dt1 * v_k[1] + t1 * dv[1]
+        fluid_tangential_velocity_k = dot(tangent_vec, v_k)
+        dfluid_tangential_velocity = dot(dtangent_vec, v_k) + dot(tangent_vec, dv)
+        pore_tangential_velocity_k = dot(tangent_vec, vP_k)
+        dpore_tangential_velocity = dot(dtangent_vec, vP_k) + dot(tangent_vec, dvP)
+        solid_tangential_velocity_k = dot(tangent_vec, vS_k)
+        dsolid_tangential_velocity = dot(dtangent_vec, vS_k) + dot(tangent_vec, dvS)
+        bjs_mixture_tangential_velocity_k = (
+            phi_k * pore_tangential_velocity_k + one_m_phi_k * solid_tangential_velocity_k
         )
-        pore_tangential_velocity_k = t0 * vP_k[0] + t1 * vP_k[1]
-        dpore_tangential_velocity = (
-            dt0 * vP_k[0] + t0 * dvP[0] + dt1 * vP_k[1] + t1 * dvP[1]
+        dbjs_mixture_tangential_velocity = (
+            dphi * pore_tangential_velocity_k
+            + phi_k * dpore_tangential_velocity
+            - dphi * solid_tangential_velocity_k
+            + one_m_phi_k * dsolid_tangential_velocity
         )
-        bjs_beta_k = bjs_coeff_c * mu_f_c * alpha_k * sqrt_kappa_inv_c
-        dbjs_beta = bjs_coeff_c * mu_f_c * dalpha * sqrt_kappa_inv_c
-        bjs_slip_t_k = fluid_tangential_velocity_k - phi_k * pore_tangential_velocity_k
-        dbjs_slip_t = dfluid_tangential_velocity - (
-            dphi * pore_tangential_velocity_k + phi_k * dpore_tangential_velocity
-        )
+        bjs_beta_k = bjs_coeff_c * mu_f_c * sqrt_kappa_inv_c
+        dbjs_beta = zero
+        bjs_slip_t_k = fluid_tangential_velocity_k - bjs_mixture_tangential_velocity_k
+        dbjs_slip_t = dfluid_tangential_velocity - dbjs_mixture_tangential_velocity
         bjs_tangential_jump = fluid_tang_trac - bjs_beta_k * bjs_slip_t_k
         dbjs_tangential_jump = (
             dfluid_tang_trac
@@ -1650,6 +2131,7 @@ def build_biofilm_one_domain_final_form(
             *,
             dv_var=None,
             dvP_var=None,
+            dvS_var=None,
             du_var=None,
             dphi_var=None,
             dalpha_var=None,
@@ -1664,6 +2146,7 @@ def build_biofilm_one_domain_final_form(
                 )[1]
             dv_loc = zero_v if dv_var is None else dv_var
             dvP_loc = zero_v if dvP_var is None else dvP_var
+            dvS_loc = zero_v if dvS_var is None else dvS_var
             dphi_loc = zero if dphi_var is None else dphi_var
             dalpha_loc = zero if dalpha_var is None else dalpha_var
             dgrad_alpha_loc = grad(dalpha_loc)
@@ -1697,10 +2180,15 @@ def build_biofilm_one_domain_final_form(
             dpore_tangential_velocity_loc = (
                 dt0_loc * vP_k[0] + t0 * dvP_loc[0] + dt1_loc * vP_k[1] + t1 * dvP_loc[1]
             )
-            dbjs_beta_loc = bjs_coeff_c * mu_f_c * dalpha_loc * sqrt_kappa_inv_c
-            dbjs_slip_t_loc = dfluid_tangential_velocity_loc - (
-                dphi_loc * pore_tangential_velocity_k + phi_k * dpore_tangential_velocity_loc
+            dsolid_tangential_velocity_loc = (
+                dt0_loc * vS_k[0] + t0 * dvS_loc[0] + dt1_loc * vS_k[1] + t1 * dvS_loc[1]
             )
+            dbjs_mixture_tangential_velocity_loc = (
+                dphi_loc * pore_tangential_velocity_k + phi_k * dpore_tangential_velocity_loc
+                - dphi_loc * solid_tangential_velocity_k + one_m_phi_k * dsolid_tangential_velocity_loc
+            )
+            dbjs_beta_loc = zero
+            dbjs_slip_t_loc = dfluid_tangential_velocity_loc - dbjs_mixture_tangential_velocity_loc
             dbjs_tangential_jump_loc = (
                 dfluid_tang_trac_loc
                 - (dbjs_beta_loc * bjs_slip_t_k + bjs_beta_k * dbjs_slip_t_loc)
@@ -1735,28 +2223,71 @@ def build_biofilm_one_domain_final_form(
                 + _c(2.0) * mu_pore_eff_loc * _eps(dvP_loc)
                 - dp_pore_loc * Identity(dim)
             )
-            _, dsigma_s_loc = _solid_stress_and_tangent(
-                solid_model=str(solid_model),
-                u_k=u_k,
-                du=du_loc,
-                mu_s=mu_s_c,
-                lambda_s=lambda_s_c,
-                dim=int(dim),
-            )
+            if solid_volumetric_split:
+                if solid_model_key in {"linear", "small_strain", "linear_elastic"}:
+                    dsigma_s_dev_loc = _c(2.0) * mu_s_c * _deviatoric_tensor(_eps(du_loc), dim=int(dim))
+                else:
+                    _, dsigma_s_full_loc = _solid_stress_and_tangent(
+                        solid_model=str(solid_model),
+                        u_k=u_k,
+                        du=du_loc,
+                        mu_s=mu_s_c,
+                        lambda_s=lambda_s_c,
+                        dim=int(dim),
+                    )
+                    dmean_dr_loc = _tensor_trace(dsigma_s_full_loc, dim=int(dim)) / _c(float(dim))
+                    dsigma_s_dev_loc = dsigma_s_full_loc - dmean_dr_loc * Identity(dim)
+                dsigma_s_loc = dsigma_s_dev_loc
+            else:
+                _, dsigma_s_loc = _solid_stress_and_tangent(
+                    solid_model=str(solid_model),
+                    u_k=u_k,
+                    du=du_loc,
+                    mu_s=mu_s_c,
+                    lambda_s=lambda_s_c,
+                    dim=int(dim),
+                )
             dgrad_alpha_loc = grad(dalpha_loc)
             dgrad_alpha_mag_loc = dot(grad_alpha_k, dgrad_alpha_loc) * inv_grad_alpha_mag
             dnormal_loc = (dgrad_alpha_loc - normal_vec * dgrad_alpha_mag_loc) * inv_grad_alpha_mag
-            dtangent_loc = dot(rot90, dnormal_loc)
+            dn0_loc = dnormal_loc[0]
+            dn1_loc = dnormal_loc[1]
+            dt0_loc = -dn1_loc
+            dt1_loc = dn0_loc
 
-            dfluid_traction_loc = dot(dsigma_f_loc, normal_vec) + dot(sigma_f_k, dnormal_loc)
-            dpore_traction_loc = dot(dsigma_p_loc, normal_vec) + dot(sigma_p_k, dnormal_loc)
-            dsolid_traction_loc = dot(dsigma_s_loc, normal_vec) + dot(sigma_s_k, dnormal_loc)
-            dfluid_normal_trac_loc = dot(dnormal_loc, fluid_traction) + dot(normal_vec, dfluid_traction_loc)
-            dpore_normal_trac_loc = dot(dnormal_loc, pore_traction) + dot(normal_vec, dpore_traction_loc)
-            dsolid_normal_trac_loc = dot(dnormal_loc, solid_traction) + dot(normal_vec, dsolid_traction_loc)
-            dfluid_tang_trac_loc = dot(dtangent_loc, fluid_traction) + dot(tangent_vec, dfluid_traction_loc)
-            dpore_tang_trac_loc = dot(dtangent_loc, pore_traction) + dot(tangent_vec, dpore_traction_loc)
-            dsolid_tang_trac_loc = dot(dtangent_loc, solid_traction) + dot(tangent_vec, dsolid_traction_loc)
+            dsigma_f_n_x_loc, dsigma_f_n_y_loc = _stress_times_dir_components(dsigma_f_loc, n0, n1)
+            sigma_f_dn_x_loc, sigma_f_dn_y_loc = _stress_times_dir_components(sigma_f_k, dn0_loc, dn1_loc)
+            dfluid_n_x_loc = dsigma_f_n_x_loc + sigma_f_dn_x_loc
+            dfluid_n_y_loc = dsigma_f_n_y_loc + sigma_f_dn_y_loc
+
+            dsigma_p_n_x_loc, dsigma_p_n_y_loc = _stress_times_dir_components(dsigma_p_loc, n0, n1)
+            sigma_p_dn_x_loc, sigma_p_dn_y_loc = _stress_times_dir_components(sigma_p_k, dn0_loc, dn1_loc)
+            dpore_n_x_loc = dsigma_p_n_x_loc + sigma_p_dn_x_loc
+            dpore_n_y_loc = dsigma_p_n_y_loc + sigma_p_dn_y_loc
+
+            dsigma_s_n_x_loc, dsigma_s_n_y_loc = _stress_times_dir_components(dsigma_s_loc, n0, n1)
+            sigma_s_dn_x_loc, sigma_s_dn_y_loc = _stress_times_dir_components(sigma_s_k, dn0_loc, dn1_loc)
+            dsolid_n_x_loc = dsigma_s_n_x_loc + sigma_s_dn_x_loc
+            dsolid_n_y_loc = dsigma_s_n_y_loc + sigma_s_dn_y_loc
+
+            dfluid_normal_trac_loc = (
+                dn0_loc * fluid_n_x + n0 * dfluid_n_x_loc + dn1_loc * fluid_n_y + n1 * dfluid_n_y_loc
+            )
+            dpore_normal_trac_loc = (
+                dn0_loc * pore_n_x + n0 * dpore_n_x_loc + dn1_loc * pore_n_y + n1 * dpore_n_y_loc
+            )
+            dsolid_normal_trac_loc = (
+                dn0_loc * solid_n_x + n0 * dsolid_n_x_loc + dn1_loc * solid_n_y + n1 * dsolid_n_y_loc
+            )
+            dfluid_tang_trac_loc = (
+                dt0_loc * fluid_n_x + t0 * dfluid_n_x_loc + dt1_loc * fluid_n_y + t1 * dfluid_n_y_loc
+            )
+            dpore_tang_trac_loc = (
+                dt0_loc * pore_n_x + t0 * dpore_n_x_loc + dt1_loc * pore_n_y + t1 * dpore_n_y_loc
+            )
+            dsolid_tang_trac_loc = (
+                dt0_loc * solid_n_x + t0 * dsolid_n_x_loc + dt1_loc * solid_n_y + t1 * dsolid_n_y_loc
+            )
             dnormal_jump_loc = (
                 dfluid_normal_trac_loc
                 - (dphi_loc * pore_normal_trac + phi_k * dpore_normal_trac_loc)
@@ -1774,24 +2305,36 @@ def build_biofilm_one_domain_final_form(
                 dgrad_alpha_mag_loc * tangential_traction_jump + grad_alpha_mag * dtangential_jump_loc,
             )
 
-        fluid_traction = dot(sigma_f_k, normal_vec)
-        dfluid_traction = dot(dsigma_f, normal_vec) + dot(sigma_f_k, dnormal_vec)
-        fluid_normal_trac = dot(normal_vec, fluid_traction)
-        dfluid_normal_trac = dot(dnormal_vec, fluid_traction) + dot(normal_vec, dfluid_traction)
-        pore_traction = dot(sigma_p_k, normal_vec)
-        dpore_traction = dot(dsigma_p, normal_vec) + dot(sigma_p_k, dnormal_vec)
-        pore_normal_trac = dot(normal_vec, pore_traction)
-        dpore_normal_trac = dot(dnormal_vec, pore_traction) + dot(normal_vec, dpore_traction)
-        solid_traction = dot(sigma_s_k, normal_vec)
-        dsolid_traction = dot(dsigma_s, normal_vec) + dot(sigma_s_k, dnormal_vec)
-        solid_normal_trac = dot(normal_vec, solid_traction)
-        dsolid_normal_trac = dot(dnormal_vec, solid_traction) + dot(normal_vec, dsolid_traction)
-        fluid_tang_trac = dot(tangent_vec, fluid_traction)
-        dfluid_tang_trac = dot(dtangent_vec, fluid_traction) + dot(tangent_vec, dfluid_traction)
-        pore_tang_trac = dot(tangent_vec, pore_traction)
-        dpore_tang_trac = dot(dtangent_vec, pore_traction) + dot(tangent_vec, dpore_traction)
-        solid_tang_trac = dot(tangent_vec, solid_traction)
-        dsolid_tang_trac = dot(dtangent_vec, solid_traction) + dot(tangent_vec, dsolid_traction)
+        fluid_n_x, fluid_n_y = _stress_times_dir_components(sigma_f_k, n0, n1)
+        dfluid_sigma_n_x, dfluid_sigma_n_y = _stress_times_dir_components(dsigma_f, n0, n1)
+        fluid_sigma_dn_x, fluid_sigma_dn_y = _stress_times_dir_components(sigma_f_k, dn0, dn1)
+        dfluid_n_x = dfluid_sigma_n_x + fluid_sigma_dn_x
+        dfluid_n_y = dfluid_sigma_n_y + fluid_sigma_dn_y
+        fluid_normal_trac = _normal_trace_from_components(fluid_n_x, fluid_n_y, n0, n1)
+        dfluid_normal_trac = dn0 * fluid_n_x + n0 * dfluid_n_x + dn1 * fluid_n_y + n1 * dfluid_n_y
+
+        pore_n_x, pore_n_y = _stress_times_dir_components(sigma_p_k, n0, n1)
+        dpore_sigma_n_x, dpore_sigma_n_y = _stress_times_dir_components(dsigma_p, n0, n1)
+        pore_sigma_dn_x, pore_sigma_dn_y = _stress_times_dir_components(sigma_p_k, dn0, dn1)
+        dpore_n_x = dpore_sigma_n_x + pore_sigma_dn_x
+        dpore_n_y = dpore_sigma_n_y + pore_sigma_dn_y
+        pore_normal_trac = _normal_trace_from_components(pore_n_x, pore_n_y, n0, n1)
+        dpore_normal_trac = dn0 * pore_n_x + n0 * dpore_n_x + dn1 * pore_n_y + n1 * dpore_n_y
+
+        solid_n_x, solid_n_y = _stress_times_dir_components(sigma_s_k, n0, n1)
+        dsolid_sigma_n_x, dsolid_sigma_n_y = _stress_times_dir_components(dsigma_s, n0, n1)
+        solid_sigma_dn_x, solid_sigma_dn_y = _stress_times_dir_components(sigma_s_k, dn0, dn1)
+        dsolid_n_x = dsolid_sigma_n_x + solid_sigma_dn_x
+        dsolid_n_y = dsolid_sigma_n_y + solid_sigma_dn_y
+        solid_normal_trac = _normal_trace_from_components(solid_n_x, solid_n_y, n0, n1)
+        dsolid_normal_trac = dn0 * solid_n_x + n0 * dsolid_n_x + dn1 * solid_n_y + n1 * dsolid_n_y
+
+        fluid_tang_trac = _tangential_trace_from_components(fluid_n_x, fluid_n_y, t0, t1)
+        dfluid_tang_trac = dt0 * fluid_n_x + t0 * dfluid_n_x + dt1 * fluid_n_y + t1 * dfluid_n_y
+        pore_tang_trac = _tangential_trace_from_components(pore_n_x, pore_n_y, t0, t1)
+        dpore_tang_trac = dt0 * pore_n_x + t0 * dpore_n_x + dt1 * pore_n_y + t1 * dpore_n_y
+        solid_tang_trac = _tangential_trace_from_components(solid_n_x, solid_n_y, t0, t1)
+        dsolid_tang_trac = dt0 * solid_n_x + t0 * dsolid_n_x + dt1 * solid_n_y + t1 * dsolid_n_y
         normal_traction_jump = (
             fluid_normal_trac
             - phi_k * pore_normal_trac
@@ -1818,12 +2361,21 @@ def build_biofilm_one_domain_final_form(
         dfluid_tangential_velocity = dot(dtangent_vec, v_k) + dot(tangent_vec, dv)
         pore_tangential_velocity_k = dot(tangent_vec, vP_k)
         dpore_tangential_velocity = dot(dtangent_vec, vP_k) + dot(tangent_vec, dvP)
-        bjs_beta_k = bjs_coeff_c * mu_f_c * alpha_k * sqrt_kappa_inv_c
-        dbjs_beta = bjs_coeff_c * mu_f_c * dalpha * sqrt_kappa_inv_c
-        bjs_slip_t_k = fluid_tangential_velocity_k - phi_k * pore_tangential_velocity_k
-        dbjs_slip_t = dfluid_tangential_velocity - (
-            dphi * pore_tangential_velocity_k + phi_k * dpore_tangential_velocity
+        solid_tangential_velocity_k = dot(tangent_vec, vS_k)
+        dsolid_tangential_velocity = dot(dtangent_vec, vS_k) + dot(tangent_vec, dvS)
+        bjs_mixture_tangential_velocity_k = (
+            phi_k * pore_tangential_velocity_k + one_m_phi_k * solid_tangential_velocity_k
         )
+        dbjs_mixture_tangential_velocity = (
+            dphi * pore_tangential_velocity_k
+            + phi_k * dpore_tangential_velocity
+            - dphi * solid_tangential_velocity_k
+            + one_m_phi_k * dsolid_tangential_velocity
+        )
+        bjs_beta_k = bjs_coeff_c * mu_f_c * sqrt_kappa_inv_c
+        dbjs_beta = zero
+        bjs_slip_t_k = fluid_tangential_velocity_k - bjs_mixture_tangential_velocity_k
+        dbjs_slip_t = dfluid_tangential_velocity - dbjs_mixture_tangential_velocity
         bjs_tangential_jump = fluid_tang_trac - bjs_beta_k * bjs_slip_t_k
         dbjs_tangential_jump = (
             dfluid_tang_trac
@@ -1835,6 +2387,7 @@ def build_biofilm_one_domain_final_form(
             *,
             dv_var=None,
             dvP_var=None,
+            dvS_var=None,
             du_var=None,
             dphi_var=None,
             dalpha_var=None,
@@ -1849,21 +2402,39 @@ def build_biofilm_one_domain_final_form(
                 )[1]
             dv_loc = zero_v if dv_var is None else dv_var
             dvP_loc = zero_v if dvP_var is None else dvP_var
+            dvS_loc = zero_v if dvS_var is None else dvS_var
             dphi_loc = zero if dphi_var is None else dphi_var
             dalpha_loc = zero if dalpha_var is None else dalpha_var
             dgrad_alpha_loc = grad(dalpha_loc)
             dgrad_alpha_mag_loc = dot(grad_alpha_k, dgrad_alpha_loc) * inv_grad_alpha_mag
             dnormal_loc = (dgrad_alpha_loc - normal_vec * dgrad_alpha_mag_loc) * inv_grad_alpha_mag
-            dtangent_loc = dot(rot90, dnormal_loc)
+            dn0_loc = dnormal_loc[0]
+            dn1_loc = dnormal_loc[1]
+            dt0_loc = -dn1_loc
+            dt1_loc = dn0_loc
             dsigma_f_loc = _c(2.0) * mu_f_c * _eps(dv_loc)
-            dfluid_traction_loc = dot(dsigma_f_loc, normal_vec) + dot(sigma_f_k, dnormal_loc)
-            dfluid_tang_trac_loc = dot(dtangent_loc, fluid_traction) + dot(tangent_vec, dfluid_traction_loc)
-            dfluid_tangential_velocity_loc = dot(dtangent_loc, v_k) + dot(tangent_vec, dv_loc)
-            dpore_tangential_velocity_loc = dot(dtangent_loc, vP_k) + dot(tangent_vec, dvP_loc)
-            dbjs_beta_loc = bjs_coeff_c * mu_f_c * dalpha_loc * sqrt_kappa_inv_c
-            dbjs_slip_t_loc = dfluid_tangential_velocity_loc - (
-                dphi_loc * pore_tangential_velocity_k + phi_k * dpore_tangential_velocity_loc
+            dsigma_f_n_x_loc, dsigma_f_n_y_loc = _stress_times_dir_components(dsigma_f_loc, n0, n1)
+            sigma_f_dn_x_loc, sigma_f_dn_y_loc = _stress_times_dir_components(sigma_f_k, dn0_loc, dn1_loc)
+            dfluid_n_x_loc = dsigma_f_n_x_loc + sigma_f_dn_x_loc
+            dfluid_n_y_loc = dsigma_f_n_y_loc + sigma_f_dn_y_loc
+            dfluid_tang_trac_loc = (
+                dt0_loc * fluid_n_x + t0 * dfluid_n_x_loc + dt1_loc * fluid_n_y + t1 * dfluid_n_y_loc
             )
+            dfluid_tangential_velocity_loc = (
+                dt0_loc * v_k[0] + t0 * dv_loc[0] + dt1_loc * v_k[1] + t1 * dv_loc[1]
+            )
+            dpore_tangential_velocity_loc = (
+                dt0_loc * vP_k[0] + t0 * dvP_loc[0] + dt1_loc * vP_k[1] + t1 * dvP_loc[1]
+            )
+            dsolid_tangential_velocity_loc = (
+                dt0_loc * vS_k[0] + t0 * dvS_loc[0] + dt1_loc * vS_k[1] + t1 * dvS_loc[1]
+            )
+            dbjs_mixture_tangential_velocity_loc = (
+                dphi_loc * pore_tangential_velocity_k + phi_k * dpore_tangential_velocity_loc
+                - dphi_loc * solid_tangential_velocity_k + one_m_phi_k * dsolid_tangential_velocity_loc
+            )
+            dbjs_beta_loc = zero
+            dbjs_slip_t_loc = dfluid_tangential_velocity_loc - dbjs_mixture_tangential_velocity_loc
             dbjs_tangential_jump_loc = (
                 dfluid_tang_trac_loc
                 - (dbjs_beta_loc * bjs_slip_t_k + bjs_beta_k * dbjs_slip_t_loc)
@@ -1984,8 +2555,25 @@ def build_biofilm_one_domain_final_form(
         tangential_test_bracket_v = _active_tangential_interface_directional(dv_var=v_test)
         normal_test_bracket_vP = _traction_directional(dvP_var=vP_test)[0]
         tangential_test_bracket_vP = _active_tangential_interface_directional(dvP_var=vP_test)
+        normal_test_bracket_vS = -solid_interface_traction_weight_c * one_m_phi_k * grad_alpha_mag * dot(
+            normal_vec, vS_test
+        )
+        tangential_test_bracket_vS = -solid_interface_traction_weight_c * one_m_phi_k * grad_alpha_mag * dot(
+            tangent_vec, vS_test
+        )
+        if use_bjs_tangential_law:
+            tangential_test_bracket_vS = _active_tangential_interface_directional(dvS_var=vS_test)
         normal_test_bracket_p, _ = _traction_directional(dp_var=q_test)
         normal_test_bracket_p_pore, _ = _traction_directional(dp_pore_var=q_pore_test)
+        normal_test_bracket_pi_s = zero
+        if solid_volumetric_split and pi_s_test is not None and total_pressure_ref_c is not None:
+            normal_test_bracket_pi_s = (
+                -solid_interface_traction_weight_c
+                * one_m_phi_k
+                * total_pressure_ref_c
+                * grad_alpha_mag
+                * pi_s_test
+            )
         normal_test_bracket_phi = zero if phi_test is None else _traction_directional(dphi_var=phi_test)[0]
         normal_test_bracket_u = _traction_directional(du_var=u_test)[0]
         tangential_test_bracket_u = _active_tangential_interface_directional(du_var=u_test)
@@ -2003,6 +2591,7 @@ def build_biofilm_one_domain_final_form(
         interface_tangential_test_bracket = _active_tangential_interface_directional(
             dv_var=v_test,
             dvP_var=vP_test,
+            dvS_var=vS_test,
             dphi_var=zero if phi_test is None else phi_test,
             du_var=u_test,
             dalpha_var=alpha_test,
@@ -2021,12 +2610,30 @@ def build_biofilm_one_domain_final_form(
             else dgrad_alpha_mag * bjs_tangential_jump + grad_alpha_mag * dbjs_tangential_jump
         )
 
-        r_interface_normal = zero * mu_normal_test * dx
-        a_interface_normal = zero * mu_normal_test * dx
+        if normal_carrier_key == "multiplier":
+            # Keep the actual multiplier row live on the deformable branch.
+            # The transpose couplings into (v, vP, u, p, p_pore, phi, alpha)
+            # are added below block-by-block, but the mu_normal test row must
+            # still enforce the normal jump itself. Otherwise the explicit
+            # normal law survives only through the AL bulk penalty.
+            r_interface_normal = mu_normal_test * (
+                one_m_normal_interface_weight_c * mu_normal_k
+                + normal_interface_weight_c * normal_constraint_k
+            ) * dx
+            a_interface_normal = mu_normal_test * (
+                one_m_normal_interface_weight_c * dmu_normal
+                + normal_interface_weight_c * dnormal_constraint
+            ) * dx
+        else:
+            # When the normal jump is carried on p_pore, mu_normal is not part
+            # of the physical interface law anymore. Keep that unused field
+            # pinned to zero so the mixed system does not carry a null row.
+            r_interface_normal = mu_normal_test * mu_normal_k * dx
+            a_interface_normal = mu_normal_test * dmu_normal * dx
         r_interface_tangential = mu_tangent_test * tangential_constraint_k * dx
         a_interface_tangential = mu_tangent_test * dtangential_constraint * dx
-        r_interface_normal_bulk = zero * q_pore_test * dx
-        a_interface_normal_bulk = zero * q_pore_test * dx
+        r_interface_normal_bulk = _safe_zero_scalar_linear_form(p_pore_k, q_pore_test)
+        a_interface_normal_bulk = _safe_zero_scalar_linear_form(p_pore_k, q_pore_test)
         r_interface_tangential_bulk = mu_tangent_k * interface_tangential_test_bracket * dx
         a_interface_tangential_bulk = dmu_tangent * interface_tangential_test_bracket * dx
     if float(mass_lm_aug_gamma) != 0.0:
@@ -2045,8 +2652,8 @@ def build_biofilm_one_domain_final_form(
             * dx
         )
     else:
-        r_interface_mass_aug_bulk = zero * q_test * dx
-        a_interface_mass_aug_bulk = zero * q_test * dx
+        r_interface_mass_aug_bulk = _safe_zero_scalar_linear_form(p_k, q_test)
+        a_interface_mass_aug_bulk = _safe_zero_scalar_linear_form(p_k, q_test)
     normal_aug_weight_c = normal_interface_weight_c
     if float(normal_lm_aug_gamma) != 0.0:
         # Diffuse-interface AL term on the normal traction jump. The extra
@@ -2070,14 +2677,14 @@ def build_biofilm_one_domain_final_form(
             * dx
         )
     else:
-        r_interface_normal_aug_bulk = zero * q_pore_test * dx
-        a_interface_normal_aug_bulk = zero * q_pore_test * dx
+        r_interface_normal_aug_bulk = _safe_zero_scalar_linear_form(p_pore_k, q_pore_test)
+        a_interface_normal_aug_bulk = _safe_zero_scalar_linear_form(p_pore_k, q_pore_test)
 
     if disable_interface_physics:
-        zero_q_form = zero * q_test * dx
-        zero_u_form = zero * dot(u_k, u_test) * dx
-        zero_vS_form = zero * dot(vS_k, vS_test) * dx
-        zero_alpha_form = zero * alpha_test * dx
+        zero_q_form = _safe_zero_scalar_linear_form(p_k, q_test)
+        zero_u_form = _safe_zero_vector_linear_form(u_k, u_test)
+        zero_vS_form = _safe_zero_vector_linear_form(vS_k, vS_test)
+        zero_alpha_form = _safe_zero_scalar_linear_form(alpha_k, alpha_test)
 
         r_interface_mass = mu_mass_test * mu_mass_k * dx
         a_interface_mass = mu_mass_test * dmu_mass * dx
@@ -2199,6 +2806,51 @@ def build_biofilm_one_domain_final_form(
             if float(mass_lm_aug_gamma) != 0.0:
                 r_skel = r_skel + mass_lm_aug_gamma_c * mass_interface_weight_c * mass_constraint_k * mass_test_bracket_vS * dx
                 a_skel = a_skel + mass_lm_aug_gamma_c * mass_interface_weight_c * dmass_constraint * mass_test_bracket_vS * dx
+            if normal_carrier_key == "multiplier":
+                r_skel = r_skel + normal_interface_weight_c * mu_normal_k * normal_test_bracket_vS * dx
+                a_skel = a_skel + normal_interface_weight_c * dmu_normal * normal_test_bracket_vS * dx
+                if float(normal_lm_aug_gamma) != 0.0:
+                    r_skel = r_skel + (
+                        normal_lm_aug_gamma_c
+                        * normal_aug_weight_c
+                        * normal_constraint_k
+                        * inv_grad_alpha_mag
+                        * normal_test_bracket_vS
+                        * dx
+                    )
+                    a_skel = a_skel + (
+                        normal_lm_aug_gamma_c
+                        * normal_aug_weight_c
+                        * dnormal_constraint
+                        * inv_grad_alpha_mag
+                        * normal_test_bracket_vS
+                        * dx
+                    )
+            if normal_carrier_key == "multiplier" and pi_s_test is not None:
+                r_skel = r_skel + normal_interface_weight_c * mu_normal_k * normal_test_bracket_pi_s * dx
+                a_skel = a_skel + normal_interface_weight_c * dmu_normal * normal_test_bracket_pi_s * dx
+                if float(normal_lm_aug_gamma) != 0.0:
+                    r_skel = r_skel + (
+                        normal_lm_aug_gamma_c
+                        * normal_aug_weight_c
+                        * normal_constraint_k
+                        * inv_grad_alpha_mag
+                        * normal_test_bracket_pi_s
+                        * dx
+                    )
+                    a_skel = a_skel + (
+                        normal_lm_aug_gamma_c
+                        * normal_aug_weight_c
+                        * dnormal_constraint
+                        * inv_grad_alpha_mag
+                        * normal_test_bracket_pi_s
+                        * dx
+                    )
+            elif not disable_normal_interface:
+                r_skel = r_skel + p_pore_k * normal_test_bracket_vS * dx
+                a_skel = a_skel + dp_pore * normal_test_bracket_vS * dx
+            r_skel = r_skel + mu_tangent_k * tangential_test_bracket_vS * dx
+            a_skel = a_skel + dmu_tangent * tangential_test_bracket_vS * dx
 
         if rigid_darcy_head_mode:
             pore_bulk_flux_k = alpha_bulk_k * (phi_k * div(vP_k) + dot(grad(phi_k), vP_k))
@@ -2332,6 +2984,13 @@ def build_biofilm_one_domain_final_form(
                     dw_pin2 * p_pore_k + w_pin2 * dp_pore
                 ) * q_pore_test * dx)
 
+    # Preserve the uncoupled alpha/phi transport rows for the post_accept
+    # transport stage before interface-law bulk couplings are appended below.
+    r_phi_transport = r_phi
+    a_phi_transport = a_phi
+    r_alpha_transport = r_alpha
+    a_alpha_transport = a_alpha
+
     if not disable_interface_physics:
         if phi_test is not None and not rigid_darcy_head_mode:
             r_phi = _form_add(r_phi, mass_interface_weight_c * mu_mass_k * (-rho_s_phys_k * dot(grad(alpha_k), rel_p_k) * phi_test) * dx)
@@ -2435,53 +3094,127 @@ def build_biofilm_one_domain_final_form(
     r_domain_lm_terms: dict[str, object] | None = None
     a_domain_lm_terms: dict[str, object] | None = None
     if use_domain_lm:
-        r_domain_lm = zero * q_test * dx
-        a_domain_lm = zero * q_test * dx
+        r_domain_lm = _safe_zero_scalar_linear_form(p_k, q_test)
+        a_domain_lm = _safe_zero_scalar_linear_form(p_k, q_test)
         r_domain_lm_terms = {}
         a_domain_lm_terms = {}
 
-        def _domain_lm_scalar(*, target_k, dtarget, target_test, lm_k, dlm, lm_test, active_weight, dactive_weight, target_shift=zero):
-            target_residual = target_k - target_shift
+        def _domain_lm_scalar(
+            *,
+            target_k,
+            dtarget,
+            target_test,
+            lm_k,
+            dlm,
+            lm_test,
+            active_weight,
+            dactive_weight,
+            target_shift=None,
+            dtarget_shift=None,
+            shift_test=None,
+        ):
+            shift_k = zero if target_shift is None else target_shift
+            dshift = zero if dtarget_shift is None else dtarget_shift
+            target_residual = target_k - shift_k
+            dtarget_residual = dtarget - dshift
             r_row = lm_test * (active_weight * target_residual) * dx
             a_row = lm_test * (
                 dactive_weight * target_residual
-                + active_weight * dtarget
+                + active_weight * dtarget_residual
             ) * dx
             r_bulk = active_weight * lm_k * target_test * dx
             a_bulk = (
                 dactive_weight * lm_k * target_test
                 + active_weight * dlm * target_test
             ) * dx
+            if shift_test is None:
+                r_shift = _safe_zero_scalar_linear_form(target_k, target_test)
+                a_shift = _safe_zero_scalar_linear_form(target_k, target_test)
+            else:
+                r_shift = -(active_weight * lm_k * shift_test) * dx
+                a_shift = -(
+                    dactive_weight * lm_k * shift_test
+                    + active_weight * dlm * shift_test
+                ) * dx
             active_constraint = active_weight * target_residual
-            dactive_constraint = dactive_weight * target_residual + active_weight * dtarget
+            dactive_constraint = dactive_weight * target_residual + active_weight * dtarget_residual
             r_aug = domain_lm_aug_gamma_c * active_constraint * active_weight * target_test * dx
             a_aug = domain_lm_aug_gamma_c * (
                 dactive_constraint * active_weight * target_test
                 + active_constraint * dactive_weight * target_test
             ) * dx
-            return r_row, a_row, r_bulk, a_bulk, r_aug, a_aug
+            if shift_test is None:
+                r_aug_shift = _safe_zero_scalar_linear_form(target_k, target_test)
+                a_aug_shift = _safe_zero_scalar_linear_form(target_k, target_test)
+            else:
+                r_aug_shift = -(domain_lm_aug_gamma_c * active_constraint * active_weight * shift_test) * dx
+                a_aug_shift = -(
+                    domain_lm_aug_gamma_c
+                    * (
+                        dactive_constraint * active_weight * shift_test
+                        + active_constraint * dactive_weight * shift_test
+                    )
+                ) * dx
+            return r_row, a_row, r_bulk, a_bulk, r_shift, a_shift, r_aug, a_aug, r_aug_shift, a_aug_shift
 
-        def _domain_lm_vector(*, target_k, dtarget, target_test, lm_k, dlm, lm_test, active_weight, dactive_weight, target_shift=None):
-            target_residual = target_k if target_shift is None else (target_k - target_shift)
+        def _domain_lm_vector(
+            *,
+            target_k,
+            dtarget,
+            target_test,
+            lm_k,
+            dlm,
+            lm_test,
+            active_weight,
+            dactive_weight,
+            target_shift=None,
+            dtarget_shift=None,
+            shift_test=None,
+        ):
+            shift_k = zero_v if target_shift is None else target_shift
+            dshift = zero_v if dtarget_shift is None else dtarget_shift
+            target_residual = target_k - shift_k
+            dtarget_residual = dtarget - dshift
             r_row = dot(lm_test, active_weight * target_residual) * dx
             a_row = dot(
                 lm_test,
                 dactive_weight * target_residual
-                + active_weight * dtarget
+                + active_weight * dtarget_residual
             ) * dx
             r_bulk = active_weight * dot(lm_k, target_test) * dx
             a_bulk = (
                 dactive_weight * dot(lm_k, target_test)
                 + active_weight * dot(dlm, target_test)
             ) * dx
+            if shift_test is None:
+                r_shift = zero * dot(target_k, target_test) * dx
+                a_shift = zero * dot(target_k, target_test) * dx
+            else:
+                r_shift = -(active_weight * dot(lm_k, shift_test)) * dx
+                a_shift = -(
+                    dactive_weight * dot(lm_k, shift_test)
+                    + active_weight * dot(dlm, shift_test)
+                ) * dx
             active_constraint = active_weight * target_residual
-            dactive_constraint = dactive_weight * target_residual + active_weight * dtarget
+            dactive_constraint = dactive_weight * target_residual + active_weight * dtarget_residual
             r_aug = domain_lm_aug_gamma_c * active_weight * dot(active_constraint, target_test) * dx
             a_aug = domain_lm_aug_gamma_c * (
                 active_weight * dot(dactive_constraint, target_test)
                 + dactive_weight * dot(active_constraint, target_test)
             ) * dx
-            return r_row, a_row, r_bulk, a_bulk, r_aug, a_aug
+            if shift_test is None:
+                r_aug_shift = zero * dot(target_k, target_test) * dx
+                a_aug_shift = zero * dot(target_k, target_test) * dx
+            else:
+                r_aug_shift = -(domain_lm_aug_gamma_c * active_weight * dot(active_constraint, shift_test)) * dx
+                a_aug_shift = -(
+                    domain_lm_aug_gamma_c
+                    * (
+                        active_weight * dot(dactive_constraint, shift_test)
+                        + dactive_weight * dot(active_constraint, shift_test)
+                    )
+                ) * dx
+            return r_row, a_row, r_bulk, a_bulk, r_shift, a_shift, r_aug, a_aug, r_aug_shift, a_aug_shift
 
         def _record_domain_lm(name: str, r_row, a_row, r_bulk, a_bulk, r_aug, a_aug) -> None:
             nonlocal r_domain_lm, a_domain_lm
@@ -2496,104 +3229,149 @@ def build_biofilm_one_domain_final_form(
             a_domain_lm_terms[f"{name}_bulk"] = a_bulk
             a_domain_lm_terms[f"{name}_aug"] = a_aug
 
-        r_row, a_row, r_bulk, a_bulk, r_aug, a_aug = _domain_lm_vector(
-            target_k=v_k,
-            dtarget=dv,
-            target_test=v_test,
-            lm_k=lm_vf_k,
-            dlm=dlm_vf,
-            lm_test=lm_vf_test,
-            active_weight=alpha_bulk_k,
-            dactive_weight=dalpha_bulk,
-        )
-        _record_domain_lm("support_kill_vf", r_row, a_row, r_bulk, a_bulk, r_aug, a_aug)
-        r_mom_f = r_mom_f + r_bulk + r_aug
-        a_mom_f = a_mom_f + a_bulk + a_aug
+        if lm_vf_k is not None and dlm_vf is not None and lm_vf_test is not None:
+            r_row, a_row, r_bulk, a_bulk, _r_shift, _a_shift, r_aug, a_aug, _r_aug_shift, _a_aug_shift = _domain_lm_vector(
+                target_k=v_k,
+                dtarget=dv,
+                target_test=v_test,
+                lm_k=lm_vf_k,
+                dlm=dlm_vf,
+                lm_test=lm_vf_test,
+                active_weight=alpha_domain_lm_k,
+                dactive_weight=dalpha_domain_lm,
+            )
+            _record_domain_lm("support_kill_vf", r_row, a_row, r_bulk, a_bulk, r_aug, a_aug)
+            r_mom_f = r_mom_f + r_bulk + r_aug
+            a_mom_f = a_mom_f + a_bulk + a_aug
 
-        r_row, a_row, r_bulk, a_bulk, r_aug, a_aug = _domain_lm_scalar(
-            target_k=p_k,
-            dtarget=dp,
-            target_test=q_test,
-            lm_k=lm_p_k,
-            dlm=dlm_p,
-            lm_test=lm_p_test,
-            active_weight=alpha_bulk_k,
-            dactive_weight=dalpha_bulk,
-        )
-        _record_domain_lm("support_kill_p", r_row, a_row, r_bulk, a_bulk, r_aug, a_aug)
-        r_mass = r_mass + r_bulk + r_aug
-        a_mass = a_mass + a_bulk + a_aug
+        if lm_p_k is not None and dlm_p is not None and lm_p_test is not None:
+            r_row, a_row, r_bulk, a_bulk, _r_shift, _a_shift, r_aug, a_aug, _r_aug_shift, _a_aug_shift = _domain_lm_scalar(
+                target_k=p_k,
+                dtarget=dp,
+                target_test=q_test,
+                lm_k=lm_p_k,
+                dlm=dlm_p,
+                lm_test=lm_p_test,
+                active_weight=alpha_domain_lm_k,
+                dactive_weight=dalpha_domain_lm,
+            )
+            _record_domain_lm("support_kill_p", r_row, a_row, r_bulk, a_bulk, r_aug, a_aug)
+            r_mass = r_mass + r_bulk + r_aug
+            a_mass = a_mass + a_bulk + a_aug
 
-        r_row, a_row, r_bulk, a_bulk, r_aug, a_aug = _domain_lm_vector(
-            target_k=vP_k,
-            dtarget=dvP,
-            target_test=vP_test,
-            lm_k=lm_vP_k,
-            dlm=dlm_vP,
-            lm_test=lm_vP_test,
-            active_weight=F_bulk_k,
-            dactive_weight=dF_bulk,
-        )
-        _record_domain_lm("free_kill_vP", r_row, a_row, r_bulk, a_bulk, r_aug, a_aug)
-        r_mom_p = r_mom_p + r_bulk + r_aug
-        a_mom_p = a_mom_p + a_bulk + a_aug
+        if lm_vP_k is not None and dlm_vP is not None and lm_vP_test is not None:
+            vP_shift_k = v_k if bool(domain_lm_free_tie_vP_to_vf) else None
+            dvP_shift = dv if bool(domain_lm_free_tie_vP_to_vf) else None
+            vP_shift_test = v_test if bool(domain_lm_free_tie_vP_to_vf) else None
+            (
+                r_row,
+                a_row,
+                r_bulk,
+                a_bulk,
+                r_shift,
+                a_shift,
+                r_aug,
+                a_aug,
+                r_aug_shift,
+                a_aug_shift,
+            ) = _domain_lm_vector(
+                target_k=vP_k,
+                dtarget=dvP,
+                target_test=vP_test,
+                lm_k=lm_vP_k,
+                dlm=dlm_vP,
+                lm_test=lm_vP_test,
+                active_weight=F_domain_lm_k,
+                dactive_weight=dF_domain_lm,
+                target_shift=vP_shift_k,
+                dtarget_shift=dvP_shift,
+                shift_test=vP_shift_test,
+            )
+            _record_domain_lm("free_kill_vP", r_row, a_row, r_bulk, a_bulk, r_aug, a_aug)
+            r_mom_p = r_mom_p + r_bulk + r_aug
+            a_mom_p = a_mom_p + a_bulk + a_aug
+            r_mom_f = r_mom_f + r_shift + r_aug_shift
+            a_mom_f = a_mom_f + a_shift + a_aug_shift
 
-        r_row, a_row, r_bulk, a_bulk, r_aug, a_aug = _domain_lm_vector(
-            target_k=vS_k,
-            dtarget=dvS,
-            target_test=vS_test,
-            lm_k=lm_vS_k,
-            dlm=dlm_vS,
-            lm_test=lm_vS_test,
-            active_weight=F_bulk_k,
-            dactive_weight=dF_bulk,
-        )
-        _record_domain_lm("free_kill_vS", r_row, a_row, r_bulk, a_bulk, r_aug, a_aug)
-        r_skel = r_skel + r_bulk + r_aug
-        a_skel = a_skel + a_bulk + a_aug
+        if lm_vS_k is not None and dlm_vS is not None and lm_vS_test is not None:
+            r_row, a_row, r_bulk, a_bulk, _r_shift, _a_shift, r_aug, a_aug, _r_aug_shift, _a_aug_shift = _domain_lm_vector(
+                target_k=vS_k,
+                dtarget=dvS,
+                target_test=vS_test,
+                lm_k=lm_vS_k,
+                dlm=dlm_vS,
+                lm_test=lm_vS_test,
+                active_weight=F_domain_lm_k,
+                dactive_weight=dF_domain_lm,
+            )
+            _record_domain_lm("free_kill_vS", r_row, a_row, r_bulk, a_bulk, r_aug, a_aug)
+            r_skel = r_skel + r_bulk + r_aug
+            a_skel = a_skel + a_bulk + a_aug
 
-        r_row, a_row, r_bulk, a_bulk, r_aug, a_aug = _domain_lm_scalar(
-            target_k=p_pore_k,
-            dtarget=dp_pore,
-            target_test=q_pore_test,
-            lm_k=lm_p_pore_k,
-            dlm=dlm_p_pore,
-            lm_test=lm_p_pore_test,
-            active_weight=F_bulk_k,
-            dactive_weight=dF_bulk,
-        )
-        _record_domain_lm("free_kill_p_pore", r_row, a_row, r_bulk, a_bulk, r_aug, a_aug)
-        r_pore = _form_add(r_pore, _form_add(r_bulk, r_aug))
-        a_pore = _form_add(a_pore, _form_add(a_bulk, a_aug))
+        if lm_p_pore_k is not None and dlm_p_pore is not None and lm_p_pore_test is not None:
+            p_pore_shift_k = p_k if bool(domain_lm_free_tie_p_pore_to_p) else None
+            dp_pore_shift = dp if bool(domain_lm_free_tie_p_pore_to_p) else None
+            p_pore_shift_test = q_test if bool(domain_lm_free_tie_p_pore_to_p) else None
+            (
+                r_row,
+                a_row,
+                r_bulk,
+                a_bulk,
+                r_shift,
+                a_shift,
+                r_aug,
+                a_aug,
+                r_aug_shift,
+                a_aug_shift,
+            ) = _domain_lm_scalar(
+                target_k=p_pore_k,
+                dtarget=dp_pore,
+                target_test=q_pore_test,
+                lm_k=lm_p_pore_k,
+                dlm=dlm_p_pore,
+                lm_test=lm_p_pore_test,
+                active_weight=F_domain_lm_k,
+                dactive_weight=dF_domain_lm,
+                target_shift=p_pore_shift_k,
+                dtarget_shift=dp_pore_shift,
+                shift_test=p_pore_shift_test,
+            )
+            _record_domain_lm("free_kill_p_pore", r_row, a_row, r_bulk, a_bulk, r_aug, a_aug)
+            r_pore = _form_add(r_pore, _form_add(r_bulk, r_aug))
+            a_pore = _form_add(a_pore, _form_add(a_bulk, a_aug))
+            r_mass = _form_add(r_mass, _form_add(r_shift, r_aug_shift))
+            a_mass = _form_add(a_mass, _form_add(a_shift, a_aug_shift))
 
-        r_row, a_row, r_bulk, a_bulk, r_aug, a_aug = _domain_lm_scalar(
-            target_k=phi_k,
-            dtarget=dphi,
-            target_test=phi_test,
-            lm_k=lm_phi_k,
-            dlm=dlm_phi,
-            lm_test=lm_phi_test,
-            active_weight=F_bulk_k,
-            dactive_weight=dF_bulk,
-            target_shift=_c(1.0),
-        )
-        _record_domain_lm("free_kill_phi", r_row, a_row, r_bulk, a_bulk, r_aug, a_aug)
-        r_phi = _form_add(r_phi, _form_add(r_bulk, r_aug))
-        a_phi = _form_add(a_phi, _form_add(a_bulk, a_aug))
+        if lm_phi_k is not None and dlm_phi is not None and lm_phi_test is not None and phi_test is not None:
+            r_row, a_row, r_bulk, a_bulk, _r_shift, _a_shift, r_aug, a_aug, _r_aug_shift, _a_aug_shift = _domain_lm_scalar(
+                target_k=phi_k,
+                dtarget=dphi,
+                target_test=phi_test,
+                lm_k=lm_phi_k,
+                dlm=dlm_phi,
+                lm_test=lm_phi_test,
+                active_weight=F_domain_lm_k,
+                dactive_weight=dF_domain_lm,
+                target_shift=_c(1.0),
+            )
+            _record_domain_lm("free_kill_phi", r_row, a_row, r_bulk, a_bulk, r_aug, a_aug)
+            r_phi = _form_add(r_phi, _form_add(r_bulk, r_aug))
+            a_phi = _form_add(a_phi, _form_add(a_bulk, a_aug))
 
-        r_row, a_row, r_bulk, a_bulk, r_aug, a_aug = _domain_lm_vector(
-            target_k=u_k,
-            dtarget=du,
-            target_test=u_test,
-            lm_k=lm_u_k,
-            dlm=dlm_u,
-            lm_test=lm_u_test,
-            active_weight=F_bulk_k,
-            dactive_weight=dF_bulk,
-        )
-        _record_domain_lm("free_kill_u", r_row, a_row, r_bulk, a_bulk, r_aug, a_aug)
-        r_kin = r_kin + r_bulk + r_aug
-        a_kin = a_kin + a_bulk + a_aug
+        if lm_u_k is not None and dlm_u is not None and lm_u_test is not None:
+            r_row, a_row, r_bulk, a_bulk, _r_shift, _a_shift, r_aug, a_aug, _r_aug_shift, _a_aug_shift = _domain_lm_vector(
+                target_k=u_k,
+                dtarget=du,
+                target_test=u_test,
+                lm_k=lm_u_k,
+                dlm=dlm_u,
+                lm_test=lm_u_test,
+                active_weight=F_domain_lm_k,
+                dactive_weight=dF_domain_lm,
+            )
+            _record_domain_lm("free_kill_u", r_row, a_row, r_bulk, a_bulk, r_aug, a_aug)
+            r_kin = r_kin + r_bulk + r_aug
+            a_kin = a_kin + a_bulk + a_aug
 
     r_momentum = r_mom_f + r_mom_p
     a_momentum = a_mom_f + a_mom_p
@@ -2641,10 +3419,12 @@ def build_biofilm_one_domain_final_form(
         r_kinematics=r_kin,
         r_skeleton=r_skel,
         r_phi=r_phi,
+        r_phi_transport=r_phi_transport,
         r_alpha=r_alpha,
-        r_mu_alpha=zero * alpha_test * dx,
+        r_alpha_transport=r_alpha_transport,
+        r_mu_alpha=_safe_zero_scalar_linear_form(alpha_k, alpha_test),
         r_damage=None,
-        r_substrate=zero * alpha_test * dx,
+        r_substrate=_safe_zero_scalar_linear_form(alpha_k, alpha_test),
         r_B=None,
         r_pore=r_pore,
         r_total_mass=r_mass + r_pore + r_phi + r_interface_mass,
@@ -2652,6 +3432,8 @@ def build_biofilm_one_domain_final_form(
             "free_bulk": r_mom_f_bulk,
             "pore_bulk": r_mom_p_bulk,
             "solid_bulk": r_skel_bulk,
+            "direct_interface_traction_free": r_interface_direct_traction_free,
+            "direct_interface_tangential_drag_free": r_interface_direct_tangential_drag_free,
             "free_extension_v": r_mom_f - r_mom_f_bulk,
             "pore_extension_vP": r_mom_p - r_mom_p_bulk,
             "interface_mass_constraint": r_interface_mass,
@@ -2663,6 +3445,12 @@ def build_biofilm_one_domain_final_form(
             "interface_normal_aug_bulk": r_interface_normal_aug_bulk,
             "interface_tangential_bulk_coupling": r_interface_tangential_bulk,
         },
+        r_mass_terms={
+            "free_bulk": r_mass_bulk,
+            "pore_bulk": r_pore,
+            "direct_interface_mass_free": direct_interface_mass_free_k,
+            "direct_interface_mass_porous": direct_interface_mass_porous_k,
+        },
         r_kinematics_terms={
             "bulk": alpha_bulk_k * dot(kin_jump_k, u_test) * dx,
             "interface_kinematic_constraint": r_interface_kin,
@@ -2672,11 +3460,21 @@ def build_biofilm_one_domain_final_form(
         },
         r_skeleton_terms={
             "solid_bulk": r_skel_bulk,
-            "pore_pressure_grad_phi": (alpha_bulk_k * p_pore_k) * dot(grad(phi_k), vS_test) * dx,
+            "combined_porous_bulk": r_combined_porous_bulk,
+            "direct_interface_traction": r_interface_direct_traction,
+            "direct_interface_traction_porous": r_interface_direct_traction,
+            "direct_interface_tangential_drag": r_interface_direct_tangential_drag,
+            "pore_pressure_grad_phi": (
+                (-(alpha_biot_c * p_pore_k * div_alpha_bulk_vStest_k) * dx)
+                if quasi_static_porous_media
+                else (-(alpha_biot_c * p_pore_k * div_alpha_bulk_vStest_k) * dx)
+            ),
             "drag": -drag_coeff_k * dot(rel_p_k, vS_test) * dx,
         },
         a_momentum=a_momentum,
         a_momentum_terms={
+            "direct_interface_traction_free": a_interface_direct_traction_free,
+            "direct_interface_tangential_drag_free": a_interface_direct_tangential_drag_free,
             "interface_mass_constraint": a_interface_mass,
             "interface_normal_constraint": a_interface_normal,
             "interface_tangential_constraint": a_interface_tangential,
@@ -2687,21 +3485,37 @@ def build_biofilm_one_domain_final_form(
             "interface_tangential_bulk_coupling": a_interface_tangential_bulk,
         },
         a_mass=a_mass,
+        a_mass_terms={
+            "free_bulk": a_mass_bulk,
+            "direct_interface_mass_free": ddirect_interface_mass_free,
+            "direct_interface_mass_porous": ddirect_interface_mass_porous,
+        },
         a_pore=a_pore,
         a_total_mass=a_mass + a_pore + a_phi + a_interface_mass,
         a_kinematics=a_kin,
         a_skeleton=a_skel,
         a_skeleton_terms={
             "solid_bulk": a_skel_bulk,
-            "pore_pressure_grad_phi": (
-                (dalpha_bulk * p_pore_k + alpha_bulk_k * dp_pore) * dot(grad(phi_k), vS_test)
-                + alpha_bulk_k * p_pore_k * dot(grad(dphi), vS_test)
+            "combined_porous_bulk": a_combined_porous_bulk,
+                "direct_interface_traction": a_interface_direct_traction,
+                "direct_interface_traction_porous": a_interface_direct_traction,
+                "direct_interface_tangential_drag": a_interface_direct_tangential_drag,
+                "pore_pressure_grad_phi": (
+                    (
+                        -(alpha_biot_c * (dp_pore * div_alpha_bulk_vStest_k + p_pore_k * ddiv_alpha_bulk_vStest))
+                    )
+                    if quasi_static_porous_media
+                    else (
+                    -(alpha_biot_c * (dp_pore * div_alpha_bulk_vStest_k + p_pore_k * ddiv_alpha_bulk_vStest))
+                )
             ) * dx,
             "drag": -(ddrag_coeff * dot(rel_p_k, vS_test) + drag_coeff_k * dot(drel_p, vS_test)) * dx,
         },
         a_phi=a_phi,
+        a_phi_transport=a_phi_transport,
         a_B=None,
         a_alpha=a_alpha,
+        a_alpha_transport=a_alpha_transport,
         a_mu_alpha=None,
         a_damage=None,
         a_substrate=None,

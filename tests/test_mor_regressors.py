@@ -1,6 +1,11 @@
 import numpy as np
 
-from pycutfem.mor.regressors import PolynomialFeatureMap, PolynomialLassoRegressor, ThinPlateSplineRBF
+from pycutfem.mor.regressors import (
+    PolynomialFeatureMap,
+    PolynomialLassoRegressor,
+    PolynomialLeastSquaresRegressor,
+    ThinPlateSplineRBF,
+)
 
 
 def test_thin_plate_spline_rbf_interpolates_training_points():
@@ -34,3 +39,18 @@ def test_polynomial_lasso_regressor_recovers_sparse_quadratic_mapping():
 
     assert np.max(np.abs(predictions - outputs)) < 1.0e-8
     assert np.count_nonzero(model.sparsity_pattern()) < model.coefficients_.size
+
+
+def test_polynomial_least_squares_regressor_recovers_dense_quadratic_mapping():
+    rng = np.random.default_rng(321)
+    inputs = rng.normal(size=(40, 3))
+    outputs = np.column_stack(
+        [
+            0.2 + inputs[:, 0] * inputs[:, 1] - 0.4 * inputs[:, 2] ** 2,
+            -0.1 + 0.3 * inputs[:, 0] + 0.7 * inputs[:, 1] * inputs[:, 2],
+        ]
+    )
+
+    model = PolynomialLeastSquaresRegressor(standardize_inputs=False).fit(inputs, outputs)
+
+    assert np.max(np.abs(model.predict(inputs) - outputs)) < 1.0e-10

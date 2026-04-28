@@ -30,6 +30,7 @@ if str(_THIS_DIR) not in sys.path:
 import paper1_benchmark7_seboldt as mono
 
 from pycutfem.io.vtk import export_vtk
+from pycutfem.solvers.coupling_acceleration import create_coupling_accelerator
 from pycutfem.solvers.nonlinear_solver import (
     InteriorPointNewtonSolver,
     LinearSolverParameters,
@@ -100,7 +101,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--outer-update",
         type=str,
         default="aitken",
-        choices=("constant", "aitken", "iqn_ils", "iqln"),
+        choices=("constant", "aitken", "iqn_ils", "iqln", "mvqn"),
         help="Outer fixed-point update used after each staggered sweep.",
     )
     split_parser.add_argument(
@@ -108,6 +109,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=6,
         help="History length used by the IQN/IQLN-style outer coupling update.",
+    )
+    split_parser.add_argument(
+        "--outer-timestep-history",
+        type=int,
+        default=1,
+        help="Accepted time-step horizon reused by the outer IQN-ILS history; MVQN reuses its Jacobian implicitly.",
     )
     split_parser.add_argument(
         "--outer-regularization",
@@ -869,53 +876,6 @@ def _set_selected_function_vector(
         raise ValueError("Cannot scatter vector into selected functions: input vector has trailing entries.")
 
 
-def _iqn_ils_candidate(
-    *,
-    x_curr: np.ndarray,
-    residual_curr: np.ndarray,
-    x_history: list[np.ndarray],
-    residual_history: list[np.ndarray],
-    omega: float,
-    regularization: float,
-    max_history: int,
-) -> np.ndarray | None:
-    x_curr = np.asarray(x_curr, dtype=float).ravel()
-    residual_curr = np.asarray(residual_curr, dtype=float).ravel()
-    if x_curr.size == 0 or residual_curr.size != x_curr.size:
-        return None
-    if len(x_history) < 2 or len(residual_history) < 2:
-        return None
-    use = max(0, min(int(max_history), len(x_history) - 1))
-    if use <= 0:
-        return None
-    x_sel = [np.asarray(vec, dtype=float).ravel() for vec in x_history[-(use + 1) :]]
-    r_sel = [np.asarray(vec, dtype=float).ravel() for vec in residual_history[-(use + 1) :]]
-    if any(vec.size != x_curr.size for vec in x_sel) or any(vec.size != residual_curr.size for vec in r_sel):
-        return None
-    dx_cols = [x_sel[i + 1] - x_sel[i] for i in range(len(x_sel) - 1)]
-    dr_cols = [r_sel[i + 1] - r_sel[i] for i in range(len(r_sel) - 1)]
-    if not dx_cols or not dr_cols:
-        return None
-    dx_mat = np.column_stack(dx_cols)
-    dr_mat = np.column_stack(dr_cols)
-    if dx_mat.shape != dr_mat.shape or dx_mat.shape[1] == 0:
-        return None
-    lhs = dr_mat.T @ dr_mat
-    reg = max(float(regularization), 0.0)
-    if reg > 0.0:
-        lhs = lhs + reg * np.identity(lhs.shape[0], dtype=float)
-    rhs = -(dr_mat.T @ residual_curr)
-    try:
-        gamma = np.linalg.solve(lhs, rhs)
-    except np.linalg.LinAlgError:
-        gamma, *_ = np.linalg.lstsq(dr_mat, -residual_curr, rcond=None)
-    base = x_curr + float(omega) * residual_curr
-    candidate = base + (dx_mat + float(omega) * dr_mat) @ gamma
-    if not np.all(np.isfinite(candidate)):
-        return None
-    return np.asarray(candidate, dtype=float).ravel()
-
-
 def _outer_interface_physics(
     *,
     args: argparse.Namespace,
@@ -1239,31 +1199,6 @@ def _snapshot_to_vector(
     return np.hstack(parts)
 
 
-def _aitken_relaxation_factor(
-    *,
-    omega_prev: float,
-    residual_prev: np.ndarray | None,
-    residual_curr: np.ndarray,
-    omega_min: float,
-    omega_max: float,
-) -> float:
-    omega = float(np.clip(float(omega_prev), float(omega_min), float(omega_max)))
-    if residual_prev is None:
-        return omega
-    r_prev = np.asarray(residual_prev, dtype=float).ravel()
-    r_curr = np.asarray(residual_curr, dtype=float).ravel()
-    if r_prev.size != r_curr.size or r_curr.size == 0:
-        return omega
-    delta = r_curr - r_prev
-    denom = float(np.dot(delta, delta))
-    if denom <= 1.0e-30 or not np.isfinite(denom):
-        return omega
-    omega_new = -omega * float(np.dot(r_prev, delta)) / denom
-    if not np.isfinite(omega_new):
-        return omega
-    return float(np.clip(omega_new, float(omega_min), float(omega_max)))
-
-
 def _outer_coupling_function_names(problem: dict[str, object]) -> set[str]:
     names = {
         str(problem["vS_k"].name),
@@ -1384,14 +1319,17 @@ def _build_staggered_interface_forms(
     solid_model: str,
     skeleton_pressure_mode: str,
     alpha_biot: float | None,
-    interface_entry_closure: bool,
-    interface_entry_closure_strength: float,
-    interface_entry_delta: float,
-    interface_velocity_continuity_closure: bool,
-    interface_traction_continuity_closure: bool,
-    interface_velocity_normal_strength: float,
-    interface_traction_normal_strength: float,
+    interface_entry_closure: bool = True,
+    interface_entry_closure_strength: float = 1.0,
+    interface_entry_delta: float = 10.0,
+    interface_velocity_continuity_closure: bool = True,
+    interface_traction_continuity_closure: bool = False,
+    interface_velocity_normal_strength: float = 1.0,
+    interface_traction_normal_strength: float = 1.0,
+    interface_robin_l: float | None = None,
 ) -> None:
+    if interface_robin_l is not None:
+        interface_velocity_normal_strength = float(interface_robin_l)
     problem["_staggered_flow_transfer_residual_form"] = None
     problem["_staggered_flow_transfer_jacobian_form"] = None
     problem["_staggered_solid_transfer_residual_form"] = None
@@ -1405,8 +1343,11 @@ def _build_staggered_interface_forms(
     problem["_staggered_state_use_porous_traction_n"] = bool(interface_traction_continuity_closure)
     if problem.get("p_pore_k") is None:
         return
-    if problem.get("q_flux_k") is None or problem.get("dq_flux") is None or problem.get("q_flux_test") is None:
-        raise ValueError("The staggered interface-transfer split requires the q-primary Darcy flux fields.")
+    has_q_primary_flux = (
+        problem.get("q_flux_k") is not None
+        and problem.get("dq_flux") is not None
+        and problem.get("q_flux_test") is not None
+    )
     geometry_indicator_beta = float(problem.get("geometry_indicator_beta", 0.0) or 0.0)
     interface_eta = max(1.0e-12, 1.0e-3 * float(eps_alpha))
     interface_weight_scale = 1.0 / max(float(eps_alpha), 1.0e-12)
@@ -1427,10 +1368,21 @@ def _build_staggered_interface_forms(
     v_n_test = mono._dot_basis_2d(problem["v_test"], n_if)
     vS_n_k = mono._dot_basis_2d(problem["vS_k"], n_if)
     dvS_n = mono._dot_basis_2d(problem["dvS"], n_if)
-    q_n_k = mono._dot_basis_2d(problem["q_flux_k"], n_if)
-    d_q_n = mono._dot_basis_2d(problem["dq_flux"], n_if)
-    q_n_test = mono._dot_basis_2d(problem["q_flux_test"], n_if)
-    q_pore_test = problem.get("q_pore_test", q_n_test)
+    if has_q_primary_flux:
+        q_n_k = mono._dot_basis_2d(problem["q_flux_k"], n_if)
+        d_q_n = mono._dot_basis_2d(problem["dq_flux"], n_if)
+        q_n_test = mono._dot_basis_2d(problem["q_flux_test"], n_if)
+        q_pore_test = problem.get("q_pore_test", q_n_test)
+    else:
+        q_n_k = Constant(0.0)
+        d_q_n = Constant(0.0)
+        q_pore_test = problem.get("q_pore_test")
+        if q_pore_test is None:
+            raise ValueError(
+                "The staggered interface-transfer split requires either q-primary Darcy flux fields "
+                "or the split-pressure q_pore test field."
+            )
+        q_n_test = q_pore_test
     solid_n_test = mono._dot_basis_2d(problem["vS_test"], n_if)
     mu_f_c = mono._named_constant("b7_staggered_mu_f", float(mu_f))
     visc_n_k = mono._normal_viscous_traction_scalar_2d(problem["v_k"], mu_f_c, n_if)
@@ -2621,6 +2573,23 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> mono.C
     dt_step = float(args.dt)
     dt_min = float(getattr(args, "dt_min", 0.0) or 0.0)
     step_no = 0
+    base_outer_omega = float(
+        np.clip(
+            float(getattr(args, "outer_relaxation", 1.0)),
+            float(getattr(args, "outer_relaxation_min", 1.0e-3)),
+            float(getattr(args, "outer_relaxation_max", 1.0)),
+        )
+    )
+    outer_update = str(getattr(args, "outer_update", "constant")).strip().lower()
+    outer_accelerator = create_coupling_accelerator(
+        outer_update,
+        relaxation=float(base_outer_omega),
+        relaxation_min=float(getattr(args, "outer_relaxation_min", 1.0e-3)),
+        relaxation_max=float(getattr(args, "outer_relaxation_max", 1.0)),
+        history=int(getattr(args, "outer_history", 6)),
+        regularization=float(getattr(args, "outer_regularization", 1.0e-10)),
+        timestep_horizon=int(getattr(args, "outer_timestep_history", 1)),
+    )
     t_start = time.perf_counter()
     try:
         while t_now < float(args.t_final) - 1.0e-14:
@@ -2757,17 +2726,8 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> mono.C
                 outer_physics_by_field: dict[str, float] = {}
                 outer_sweeps = 0
                 outer_converged = False
-                base_outer_omega = float(
-                    np.clip(
-                        float(getattr(args, "outer_relaxation", 1.0)),
-                        float(getattr(args, "outer_relaxation_min", 1.0e-3)),
-                        float(getattr(args, "outer_relaxation_max", 1.0)),
-                    )
-                )
+                outer_accelerator.initialize_solution_step()
                 outer_last_omega = float(base_outer_omega)
-                prev_outer_residual_vec: np.ndarray | None = None
-                outer_x_history: list[np.ndarray] = []
-                outer_residual_history: list[np.ndarray] = []
                 outer_saved = []
                 try:
                     try:
@@ -2861,17 +2821,6 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> mono.C
                                 interface_entry_delta=float(entry_delta_eff),
                             )
                             outer_sweeps = int(outer_it)
-                            update_key = str(getattr(args, "outer_update", "constant")).strip().lower()
-                            omega_outer = float(base_outer_omega)
-                            if update_key == "aitken":
-                                omega_outer = _aitken_relaxation_factor(
-                                    omega_prev=float(outer_last_omega),
-                                    residual_prev=prev_outer_residual_vec,
-                                    residual_curr=outer_residual_vec,
-                                    omega_min=float(getattr(args, "outer_relaxation_min", 1.0e-3)),
-                                    omega_max=float(getattr(args, "outer_relaxation_max", 1.0)),
-                                )
-                            outer_last_omega = float(omega_outer)
                             rel_ok = bool(np.isfinite(outer_delta_inf) and outer_delta_inf <= float(args.outer_tol))
                             abs_tol = float(getattr(args, "outer_abs_tol", 0.0) or 0.0)
                             abs_ok = bool(abs_tol > 0.0 and np.isfinite(outer_delta_abs_inf) and outer_delta_abs_inf <= abs_tol)
@@ -2895,34 +2844,12 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> mono.C
                             )
                             if outer_converged:
                                 break
-                            x_next: np.ndarray | None = None
-                            if update_key in {"iqn_ils", "iqln"}:
-                                outer_x_history.append(np.asarray(x_input, dtype=float).copy())
-                                outer_residual_history.append(np.asarray(outer_residual_vec, dtype=float).copy())
-                                max_keep = max(2, int(getattr(args, "outer_history", 6) or 6) + 1)
-                                if len(outer_x_history) > max_keep:
-                                    outer_x_history = outer_x_history[-max_keep:]
-                                    outer_residual_history = outer_residual_history[-max_keep:]
-                                candidate = _iqn_ils_candidate(
-                                    x_curr=np.asarray(x_input, dtype=float),
-                                    residual_curr=np.asarray(outer_residual_vec, dtype=float),
-                                    x_history=outer_x_history,
-                                    residual_history=outer_residual_history,
-                                    omega=(float(base_outer_omega) if update_key == "iqn_ils" else 0.0),
-                                    regularization=float(getattr(args, "outer_regularization", 1.0e-10)),
-                                    max_history=int(getattr(args, "outer_history", 6)),
-                                )
-                                if candidate is not None:
-                                    x_next = candidate
-                                    outer_last_omega = float(base_outer_omega if update_key == "iqn_ils" else 0.0)
-                            if x_next is None:
-                                _set_function_vector(
-                                    _interface_state_functions(problem),
-                                    np.asarray(x_input, dtype=float) + float(outer_last_omega) * np.asarray(outer_residual_vec, dtype=float),
-                                )
-                            else:
-                                _set_function_vector(_interface_state_functions(problem), x_next)
-                            prev_outer_residual_vec = np.asarray(outer_residual_vec, dtype=float).copy()
+                            update = outer_accelerator.compute_next_iterate(
+                                x_curr=np.asarray(x_input, dtype=float),
+                                residual_curr=np.asarray(outer_residual_vec, dtype=float),
+                            )
+                            _set_function_vector(_interface_state_functions(problem), update.next_iterate)
+                            outer_last_omega = float(update.relaxation)
                         if bool(transport_post_accept) and bool(outer_converged) and "transport" in stage_solvers:
                             stage = getattr(stage_forms, "transport")
                             solver = stage_solvers["transport"]
@@ -2954,9 +2881,11 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> mono.C
                                 f"[top: {top_fields}] "
                                 f"after {int(args.outer_it)} sweeps"
                             )
+                        outer_accelerator.finalize_solution_step(accepted=True)
                     finally:
                         _restore_stage_solver_relaxation(outer_saved)
                 except Exception as exc:
+                    outer_accelerator.finalize_solution_step(accepted=False)
                     if bool(getattr(args, "no_dt_reduction", False)):
                         raise RuntimeError(str(exc)) from exc
                     dt_new = float(dt_try) * float(getattr(args, "dt_reduction_factor", 0.5))
@@ -3091,6 +3020,7 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> mono.C
         "outer_relaxation": float(args.outer_relaxation),
         "outer_relaxation_min": float(getattr(args, "outer_relaxation_min", 1.0e-3)),
         "outer_relaxation_max": float(getattr(args, "outer_relaxation_max", 1.0)),
+        "outer_timestep_history": int(getattr(args, "outer_timestep_history", 1)),
         "transport_post_accept": float(1.0 if bool(getattr(args, "transport_post_accept", True)) else 0.0),
         "flow_solid_substeps": float(flow_solid_substeps),
         "solid_solver": str(args.solid_solver),

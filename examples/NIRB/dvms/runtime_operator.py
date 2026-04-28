@@ -14,7 +14,9 @@ from .helpers import (
 )
 from .state import FluidDVMSState
 from .symbolics import build_fluid_dvms_predictor_iteration_symbolics
+from .update import _clear_fluid_dvms_oss_projections
 from .update import _update_fluid_dvms_predicted_subscale
+from .update import _update_fluid_dvms_oss_projections
 
 
 def _predictor_element_char_length_coefficient(state: FluidDVMSState, mesh: Mesh, dh: DofHandler, d_mesh: VectorFunction):
@@ -42,6 +44,7 @@ class FluidDVMSSolverOperator(SymbolicPointwiseNewtonOperator):
         u_k: VectorFunction,
         u_prev: VectorFunction,
         a_prev: VectorFunction,
+        a_curr: VectorFunction | None = None,
         p_k: Function,
         d_mesh: VectorFunction,
         d_prev: VectorFunction,
@@ -54,9 +57,12 @@ class FluidDVMSSolverOperator(SymbolicPointwiseNewtonOperator):
         dt: float,
         bossak_alpha: float,
         dynamic_tau: float,
+        # Kratos DVMS hard-codes ten Newton iterations; non-converged
+        # quadrature-point predictors are zeroed in the update routine.
         max_iterations: int = 10,
         rel_tol: float = 1.0e-14,
         abs_tol: float = 1.0e-14,
+        use_oss: bool = False,
     ) -> None:
         self.state = state
         self.dh = dh
@@ -64,6 +70,7 @@ class FluidDVMSSolverOperator(SymbolicPointwiseNewtonOperator):
         self.u_k = u_k
         self.u_prev = u_prev
         self.a_prev = a_prev
+        self.a_curr = a_curr
         self.p_k = p_k
         self.d_mesh = d_mesh
         self.d_prev = d_prev
@@ -79,6 +86,7 @@ class FluidDVMSSolverOperator(SymbolicPointwiseNewtonOperator):
         self.max_iterations = max(int(max_iterations), 1)
         self.rel_tol = float(rel_tol)
         self.abs_tol = float(abs_tol)
+        self.use_oss = bool(use_oss)
 
         dt_value = max(self.dt, 1.0e-14)
         bossak = _bossak_coefficients(alpha=self.bossak_alpha, dt=dt_value)
@@ -87,6 +95,7 @@ class FluidDVMSSolverOperator(SymbolicPointwiseNewtonOperator):
             u_k=self.u_k,
             u_prev=self.u_prev,
             a_prev=self.a_prev,
+            a_curr=self.a_curr,
             p_k=self.p_k,
             d_mesh=self.d_mesh,
             d_prev=self.d_prev,
@@ -118,7 +127,18 @@ class FluidDVMSSolverOperator(SymbolicPointwiseNewtonOperator):
         )
 
     def before_assembly(self, *, solver, coeffs, need_matrix: bool) -> None:
-        del coeffs, need_matrix
+        del coeffs
+        # Kratos updates the hidden predicted subscale in
+        # InitializeNonLinearIteration(), i.e. once at the start of each
+        # nonlinear build/solve cycle. It does not refresh that hidden state
+        # again for the residual-only checks that happen after UpdateDatabase()
+        # and FinalizeNonLinIteration(). Re-refreshing here on
+        # need_matrix=False advances the hidden DVMS state machine one extra
+        # time per Newton iteration and perturbs the carried fluid state.
+        if not bool(need_matrix):
+            return
+        if not bool(self.use_oss):
+            _clear_fluid_dvms_oss_projections(self.state)
         self.h_coefficient.values[...] = _kratos_dvms_current_element_size_array(self.mesh, self.dh, self.d_mesh)
         _update_fluid_dvms_predicted_subscale(
             state=self.state,
@@ -127,6 +147,7 @@ class FluidDVMSSolverOperator(SymbolicPointwiseNewtonOperator):
             u_k=self.u_k,
             u_prev=self.u_prev,
             a_prev=self.a_prev,
+            a_curr=self.a_curr,
             p_k=self.p_k,
             d_mesh=self.d_mesh,
             d_prev=self.d_prev,
@@ -143,7 +164,45 @@ class FluidDVMSSolverOperator(SymbolicPointwiseNewtonOperator):
             rel_tol=self.rel_tol,
             abs_tol=self.abs_tol,
             backend=str(getattr(solver, "backend", "python")),
+            use_oss=bool(self.use_oss),
         )
+
+    def after_nonlinear_update(self, *, solver, functions) -> None:
+        del functions
+        if not bool(self.use_oss):
+            _clear_fluid_dvms_oss_projections(self.state)
+            return
+        _update_fluid_dvms_oss_projections(
+            state=self.state,
+            dh=self.dh,
+            mesh=self.mesh,
+            u_k=self.u_k,
+            p_k=self.p_k,
+            d_mesh=self.d_mesh,
+            d_prev=self.d_prev,
+            d_prev2=self.d_prev2,
+            mesh_v=self.mesh_v,
+            mesh_v_prev=self.mesh_v_prev,
+            mesh_a_prev=self.mesh_a_prev,
+            rho_f=self.rho_f,
+            dt=self.dt,
+            bossak_alpha=self.bossak_alpha,
+        )
+
+    def on_step_accept(
+        self,
+        *,
+        solver,
+        functions,
+        prev_functions,
+        aux_functions,
+        step: int,
+        step_no: int,
+        t: float,
+        dt: float,
+        bcs,
+    ) -> None:
+        del solver, functions, prev_functions, aux_functions, step, step_no, t, dt, bcs
 
 
 def build_fluid_dvms_predictor_pointwise_operator(
@@ -154,6 +213,7 @@ def build_fluid_dvms_predictor_pointwise_operator(
     u_k: VectorFunction,
     u_prev: VectorFunction,
     a_prev: VectorFunction,
+    a_curr: VectorFunction | None = None,
     p_k: Function,
     d_mesh: VectorFunction,
     d_prev: VectorFunction,
@@ -169,6 +229,7 @@ def build_fluid_dvms_predictor_pointwise_operator(
     max_iterations: int = 10,
     rel_tol: float = 1.0e-14,
     abs_tol: float = 1.0e-14,
+    use_oss: bool = False,
 ) -> FluidDVMSSolverOperator:
     cache = getattr(state, "_predictor_pointwise_operator_cache", None)
     if not isinstance(cache, dict):
@@ -180,6 +241,7 @@ def build_fluid_dvms_predictor_pointwise_operator(
         int(id(u_k)),
         int(id(u_prev)),
         int(id(a_prev)),
+        int(id(a_curr)) if a_curr is not None else -1,
         int(id(p_k)),
         int(id(d_mesh)),
         int(id(d_prev)),
@@ -195,6 +257,7 @@ def build_fluid_dvms_predictor_pointwise_operator(
         int(max_iterations),
         float(rel_tol),
         float(abs_tol),
+        bool(use_oss),
     )
     cached = cache.get(key)
     if isinstance(cached, FluidDVMSSolverOperator):
@@ -206,6 +269,7 @@ def build_fluid_dvms_predictor_pointwise_operator(
         u_k=u_k,
         u_prev=u_prev,
         a_prev=a_prev,
+        a_curr=a_curr,
         p_k=p_k,
         d_mesh=d_mesh,
         d_prev=d_prev,
@@ -221,6 +285,7 @@ def build_fluid_dvms_predictor_pointwise_operator(
         max_iterations=int(max_iterations),
         rel_tol=float(rel_tol),
         abs_tol=float(abs_tol),
+        use_oss=bool(use_oss),
     )
     cache[key] = operator
     return operator

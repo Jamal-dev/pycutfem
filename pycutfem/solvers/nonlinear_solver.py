@@ -34,6 +34,7 @@ import numpy as np
 import scipy.sparse.linalg as spla
 import scipy.sparse as sp
 from pycutfem.linalg import (
+    AMGCLSettings,
     BlockDiagonalPreconditioner,
     BlockLinearSystem,
     BlockTriangularPreconditioner,
@@ -45,6 +46,9 @@ from pycutfem.linalg import (
     UzawaPreconditioner,
     UzawaSolver,
     build_subsolver,
+    EigenSparseQRSubsolver,
+    solve_sparse_amgcl,
+    solve_sparse_eigen_sparseqr,
 )
 try:
     from scipy.sparse.linalg import MatrixRankWarning
@@ -361,8 +365,9 @@ def _scatter_element_contribs_reduced(
 class NewtonParameters:
     """Settings that govern a *single* Newton solve."""
 
-    newton_tol: float = 1e-8            # ‖R‖_∞ convergence threshold
-    newton_rtol: float = 0.0           # optional relative tolerance (‖R‖_∞ ≤ rtol·‖R₀‖_∞)
+    newton_tol: float = 1e-8            # convergence threshold for the selected residual_norm
+    newton_rtol: float = 0.0           # optional relative tolerance on the selected residual_norm
+    residual_norm: str = "linf"        # linf (default) or kratos_l2_over_ndof
     max_newton_iter: int = 20           # hard cap on inner Newton iterations
     # PETSc SNES robustness: when SNES returns a best iterate but reports a
     # non-converged reason (e.g. line-search divergence), optionally accept the
@@ -439,10 +444,12 @@ class NewtonParameters:
     # norm. The nonlinear step is accepted when every listed field/group meets
     # either its absolute or relative tolerance.
     mixed_solution_criteria: tuple[tuple[str, float, float], ...] = ()
-    # Optional safeguard for mixed solution acceptance: require the updated
-    # residual to also satisfy |R|_inf <= factor * newton_tol. A non-positive
-    # value disables the guard.
+    # Optional safeguard for mixed solution acceptance: require the residual to
+    # also satisfy |R|_inf <= factor * residual_tol. When residual_tol is not
+    # provided, newton_tol is used for backward compatibility. A non-positive
+    # factor disables the guard.
     mixed_solution_max_residual_factor: float = 0.0
+    mixed_solution_residual_tol: float = 0.0
     # Optional pseudo-transient continuation on a selected reduced block for
     # plain Newton solves. This is intended for latent / unconstrained
     # formulations that need additional local damping in weakly coupled
@@ -523,6 +530,7 @@ class TimeStepperParameters:
     #   solver, step, step_no, t, dt, t_bc, functions, prev_functions,
     #   aux_functions, bcs
     step_initial_guess_callback: Optional[Callable[..., object]] = None
+    debug_step_preamble: bool = False
 
     def __post_init__(self) -> None:
         if self.final_time is None:
@@ -563,6 +571,8 @@ def _mixed_solution_criteria_report(
     funcs,
     delta_full: np.ndarray,
     criteria: object,
+    bcs: object = None,
+    active_dofs: object = None,
 ) -> tuple[bool, list[dict[str, object]]]:
     try:
         from pycutfem.ufl.expressions import VectorFunction as _VectorFunction
@@ -571,6 +581,20 @@ def _mixed_solution_criteria_report(
     parsed = _normalize_mixed_solution_criteria(criteria)
     if not parsed:
         return False, []
+
+    fixed_dofs: set[int] = set()
+    if bcs is not None:
+        try:
+            fixed_dofs = {int(k) for k in dh.get_dirichlet_data(bcs).keys()}
+        except Exception:
+            fixed_dofs = set()
+    active_dof_set: set[int] | None = None
+    if active_dofs is not None:
+        try:
+            active_arr = np.asarray(active_dofs, dtype=int).reshape(-1)
+            active_dof_set = {int(v) for v in active_arr.tolist()}
+        except Exception:
+            active_dof_set = None
 
     scalar_map: dict[str, np.ndarray] = {}
     value_map: dict[str, np.ndarray] = {}
@@ -589,8 +613,15 @@ def _mixed_solution_criteria_report(
                 continue
             if field_slice.size == 0:
                 continue
-            scalar_map[field_name] = np.asarray(delta_full[field_slice], dtype=float).reshape(-1)
-            value_map[field_name] = np.asarray(piece.nodal_values, dtype=float).reshape(-1)
+            free_mask = np.ones(int(field_slice.size), dtype=bool)
+            if fixed_dofs:
+                free_mask &= np.array([int(idx) not in fixed_dofs for idx in field_slice], dtype=bool)
+            if active_dof_set is not None:
+                free_mask &= np.array([int(idx) in active_dof_set for idx in field_slice], dtype=bool)
+            if not np.any(free_mask):
+                continue
+            scalar_map[field_name] = np.asarray(delta_full[field_slice[free_mask]], dtype=float).reshape(-1)
+            value_map[field_name] = np.asarray(piece.nodal_values, dtype=float).reshape(-1)[free_mask]
 
     reports: list[dict[str, object]] = []
     all_ok = True
@@ -614,9 +645,15 @@ def _mixed_solution_criteria_report(
         du = np.concatenate(parts_du).reshape(-1)
         uu = np.concatenate(parts_u).reshape(-1)
         size = max(int(du.size), 1)
-        abs_norm = float(np.linalg.norm(du, ord=2) / math.sqrt(float(size)))
-        base = max(float(np.linalg.norm(uu, ord=2)), 1.0e-14)
-        rel_norm = float(abs_norm / base)
+        increase_sq = float(np.dot(du, du))
+        solution_sq = float(np.dot(uu, uu))
+        if solution_sq < 1.0e-12:
+            solution_sq = 1.0
+        # Match Kratos MixedGenericCriteria exactly: the relative criterion is
+        # sqrt(sum(dx^2) / sum(u^2)), while the absolute criterion is
+        # sqrt(sum(dx^2)) divided by the number of free DOFs for that variable.
+        rel_norm = float(math.sqrt(increase_sq / solution_sq))
+        abs_norm = float(math.sqrt(increase_sq) / float(size))
         ok = bool((abs_norm <= float(abs_tol)) or (rel_norm <= float(rel_tol)))
         all_ok = bool(all_ok and ok)
         reports.append(
@@ -626,6 +663,7 @@ def _mixed_solution_criteria_report(
                 "abs_tol": float(abs_tol),
                 "abs_norm": abs_norm,
                 "rel_norm": rel_norm,
+                "free_dofs": int(size),
                 "ok": ok,
                 "missing": False,
             }
@@ -1377,6 +1415,7 @@ class NewtonSolver:
         self._manual_reduced_row_field_scales: dict[str, float] = {}
         self._manual_reduced_col_field_scales: dict[str, float] = {}
         self._reduced_field_names = np.asarray([], dtype=object)
+        self._active_field_names: tuple[str, ...] = tuple()
         self._reduced_schur_enabled: bool = False
         self._reduced_schur_pressure_fields: tuple[str, ...] = ("p", "p_mean")
         self._reduced_schur_diag_only: bool = False
@@ -1554,6 +1593,77 @@ class NewtonSolver:
         if A_work is not A_red:
             A_red = A_work.tocsr()
         return A_red, R_red
+
+    def record_amgcl_kratos_dirichlet_pattern(
+        self,
+        *,
+        K_elem: np.ndarray | None,
+        gdofs_map: np.ndarray | None,
+    ) -> None:
+        """Record the full Kratos-style constrained pattern for AMGCL solves.
+
+        Kratos applies Dirichlet constraints by keeping the original sparse
+        graph, zeroing constrained rows/columns, and retaining the original
+        diagonal. AMGCL uses that graph while building its hierarchy. The local
+        reduced solver drops constrained DOFs, so the block-AMGCL expansion
+        needs this element graph to reproduce Kratos' iterative path.
+        """
+        backend = str(getattr(getattr(self, "lp", None), "backend", "") or "").strip().lower()
+        if backend != "amgcl" or getattr(self, "constraints", None) is not None:
+            return
+        mode = str(os.getenv("PYCUTFEM_LINEAR_AMGCL_KRATOS_DIRICHLET_PATTERN", "1") or "1").strip().lower()
+        if mode in {"0", "false", "no", "off"}:
+            return
+        if K_elem is None or gdofs_map is None:
+            return
+        try:
+            gdofs = np.asarray(gdofs_map, dtype=int)
+            kel = np.asarray(K_elem, dtype=float)
+        except Exception:
+            return
+        if gdofs.ndim != 2 or kel.ndim != 3 or int(kel.shape[0]) != int(gdofs.shape[0]):
+            return
+        if int(kel.shape[1]) != int(gdofs.shape[1]) or int(kel.shape[2]) != int(gdofs.shape[1]):
+            return
+
+        system_master_ids = self._amgcl_system_master_ids()
+        n_system = int(system_master_ids.size)
+        n_master = int(getattr(self.full_to_red, "size", 0))
+        if n_system <= 0 or n_master <= 0:
+            return
+        master_to_system = -np.ones((n_master,), dtype=int)
+        master_to_system[system_master_ids] = np.arange(n_system, dtype=int)
+        valid_g = (gdofs >= 0) & (gdofs < n_master)
+        sys = -np.ones_like(gdofs, dtype=int)
+        if np.any(valid_g):
+            sys[valid_g] = master_to_system[gdofs[valid_g]]
+        valid = sys >= 0
+        if not np.any(valid):
+            return
+
+        row = np.broadcast_to(sys[:, :, None], kel.shape).reshape(-1)
+        col = np.broadcast_to(sys[:, None, :], kel.shape).reshape(-1)
+        mask = (row >= 0) & (col >= 0)
+        if not np.any(mask):
+            return
+        data = np.zeros((int(np.count_nonzero(mask)),), dtype=float)
+        pattern = sp.coo_matrix(
+            (data, (row[mask], col[mask])),
+            shape=(n_system, n_system),
+        ).tocsr()
+        pattern.sum_duplicates()
+        # Keep explicit zeros: they are the AMGCL graph Kratos uses after
+        # ApplyDirichletConditions zeroes fixed rows and columns.
+        self._last_amgcl_kratos_dirichlet_pattern = pattern
+
+        diag = np.zeros((n_master,), dtype=float)
+        try:
+            diag_loc = np.diagonal(kel, axis1=1, axis2=2)
+            if diag_loc.shape == gdofs.shape and np.any(valid_g):
+                np.add.at(diag, gdofs[valid_g], diag_loc[valid_g])
+            self._last_amgcl_kratos_dirichlet_diag = diag
+        except Exception:
+            pass
 
     def scatter_element_contribs_full(
         self,
@@ -2805,8 +2915,17 @@ class NewtonSolver:
         free_set = (candidate_master - bc_master) - inactive_master
         return np.asarray(sorted(free_set), dtype=int)
 
+    def _invalidate_amgcl_layout_cache(self) -> None:
+        self._amgcl_system_master_ids_cache = None
+        self._amgcl_master_phys_ids_cache = None
+        self._amgcl_master_field_names_cache = None
+        self._amgcl_node_block_layout_cache = None
+
     def set_active_dofs(self, active_dofs) -> np.ndarray:
         ndof_effective = int(self.constraints.n_master) if getattr(self, "constraints", None) is not None else int(self.dh.total_dofs)
+        if not bool(getattr(self, "_setting_active_fields", False)):
+            self._active_field_names = tuple()
+        self._invalidate_amgcl_layout_cache()
         active_master = self._filter_candidate_active_dofs(active_dofs)
         if int(active_master.size) == 0:
             raise ValueError("Requested active DOF set is empty after removing Dirichlet/inactive DOFs.")
@@ -2865,12 +2984,18 @@ class NewtonSolver:
             names = [str(field_names)]
         else:
             names = [str(name) for name in list(field_names or [])]
+        names = [str(name).strip() for name in names if str(name).strip()]
         if not names:
             raise ValueError("set_active_fields expects at least one field name.")
         full_ids: list[int] = []
         for field in names:
             full_ids.extend(np.asarray(self.dh.get_field_slice(field), dtype=int).ravel().tolist())
-        return self.set_active_dofs(np.asarray(sorted(set(full_ids)), dtype=int))
+        self._active_field_names = tuple(names)
+        self._setting_active_fields = True
+        try:
+            return self.set_active_dofs(np.asarray(sorted(set(full_ids)), dtype=int))
+        finally:
+            self._setting_active_fields = False
 
     def _trace_reduced_box_bounds_summary(self) -> None:
         if os.getenv("PYCUTFEM_TRACE_BOUNDS_FIELDS", "").lower() not in {"1", "true", "yes"}:
@@ -3648,10 +3773,27 @@ class NewtonSolver:
             # For theta-schemes, apply time-dependent Dirichlet data at t_{n+θ}
             # (implicit Euler θ=1 → end-of-step, CN θ=0.5 → midpoint).
             t_bc = t_n + float(getattr(time_params, "theta", 1.0)) * dt
+            debug_step_preamble = bool(getattr(time_params, "debug_step_preamble", False))
+            preamble_t0 = time.perf_counter() if debug_step_preamble else 0.0
+            freeze_t0 = time.perf_counter() if debug_step_preamble else 0.0
             bcs_now = self._freeze_bcs(self.bcs, t_bc)
+            if debug_step_preamble:
+                print(
+                    f"    [debug] step {int(global_step_no)} preamble: _freeze_bcs took "
+                    f"{time.perf_counter() - freeze_t0:.3f}s at t_bc={float(t_bc):.6g}."
+                )
+            apply_t0 = time.perf_counter() if debug_step_preamble else 0.0
             dh.apply_bcs(bcs_now, *functions)
+            if debug_step_preamble:
+                print(
+                    f"    [debug] step {int(global_step_no)} preamble: apply_bcs took "
+                    f"{time.perf_counter() - apply_t0:.3f}s."
+                )
             step_guess_cb = getattr(time_params, "step_initial_guess_callback", None)
             if callable(step_guess_cb) and run_step_guess_cb:
+                cb_t0 = time.perf_counter() if debug_step_preamble else 0.0
+                if debug_step_preamble:
+                    print(f"    [debug] step {int(global_step_no)} preamble: entering step_initial_guess_callback.")
                 try:
                     step_guess_cb(
                         solver=self,
@@ -3667,12 +3809,28 @@ class NewtonSolver:
                     )
                 except Exception as cb_exc:
                     print(f"    [warn] step_initial_guess_callback raised: {cb_exc}")
+                if debug_step_preamble:
+                    print(
+                        f"    [debug] step {int(global_step_no)} preamble: step_initial_guess_callback took "
+                        f"{time.perf_counter() - cb_t0:.3f}s."
+                    )
                 # The callback is allowed to modify the iterate; re-apply BCs and
                 # linear constraints so the monolithic solve starts from a
                 # feasible state.
+                apply_cb_t0 = time.perf_counter() if debug_step_preamble else 0.0
                 dh.apply_bcs(bcs_now, *functions)
                 if getattr(self, "constraints", None) is not None:
                     self._enforce_constraints_on_functions(functions)
+                if debug_step_preamble:
+                    print(
+                        f"    [debug] step {int(global_step_no)} preamble: callback BC/constraint restore took "
+                        f"{time.perf_counter() - apply_cb_t0:.3f}s."
+                    )
+            if debug_step_preamble:
+                print(
+                    f"    [debug] step {int(global_step_no)} preamble: total setup took "
+                    f"{time.perf_counter() - preamble_t0:.3f}s."
+                )
             self._notify_operator_step_begin(
                 functions=functions,
                 prev_functions=prev_functions,
@@ -4064,6 +4222,27 @@ class NewtonSolver:
         self._current_bcs = bcs_now
         dh = self.dh
         ndof_eff = getattr(self.restrictor, "full_size", dh.total_dofs)
+        residual_mode = str(getattr(self.np, "residual_norm", "linf") or "linf").strip().lower()
+
+        def _residual_norm_label() -> str:
+            if residual_mode in {"kratos_l2_over_ndof", "l2_over_ndof", "kratos"}:
+                return "|R|_2/N"
+            return "|R|_∞"
+
+        def _residual_norm_from_full(residual_full: np.ndarray) -> float:
+            vec = np.asarray(residual_full, dtype=float).reshape(-1)
+            if residual_mode in {"kratos_l2_over_ndof", "l2_over_ndof", "kratos"}:
+                denom = max(int(nfree), 1)
+                return float(np.linalg.norm(vec, ord=2) / float(denom))
+            return float(np.linalg.norm(vec, ord=np.inf))
+
+        def _residual_norm_from_red(residual_red: np.ndarray) -> float:
+            vec_red = np.asarray(residual_red, dtype=float).reshape(-1)
+            if residual_mode in {"kratos_l2_over_ndof", "l2_over_ndof", "kratos"}:
+                vec_full = np.zeros(int(ndof_eff), dtype=float)
+                vec_full[self.active_dofs] = vec_red
+                return _residual_norm_from_full(vec_full)
+            return float(np.linalg.norm(vec_red, ord=np.inf))
 
         def _trace_label_text() -> str:
             raw = getattr(self, "_newton_trace_label", None)
@@ -4148,11 +4327,11 @@ class NewtonSolver:
             # Log residual with a full-size view (zeros on fixed DOFs) for readability
             R_full = np.zeros(ndof_eff)
             R_full[self.active_dofs] = R_red
-            norm_R = np.linalg.norm(R_full, ord=np.inf)
+            norm_R = _residual_norm_from_full(R_full)
             norm_hist.append(float(norm_R))
             # Expose convergence diagnostics to the outer time-stepper.
             self._last_nonlinear_norm = float(norm_R)
-            self._last_nonlinear_norm_label = "|R|_∞"
+            self._last_nonlinear_norm_label = _residual_norm_label()
 
             # Optional matrix diagnostics (expensive; debug-only).
             if os.getenv("PYCUTFEM_MATRIX_STATS", "").lower() in {"1", "true", "yes"}:
@@ -4401,7 +4580,7 @@ class NewtonSolver:
                 if global_label and global_norm is not None:
                     global_msg = f", {str(global_label)} = {float(global_norm):.2e}"
                 print(
-                    f"        {prefix}Newton {it+1}: |R|_∞ = {norm_R:.2e}{global_msg}, "
+                    f"        {prefix}Newton {it+1}: {_residual_norm_label()} = {norm_R:.2e}{global_msg}, "
                     f"time = {t_iteration}s"
                 )
             self._current_newton_it = int(it + 1)
@@ -4506,7 +4685,7 @@ class NewtonSolver:
                         if int(getattr(self.np, "print_level", 2) or 0) >= 2:
                             print(
                                 "        Newton stagnated near tolerance "
-                                f"(|R|_∞={float(norm_R):.2e}, tol={tol_eff:.2e}, "
+                                f"({_residual_norm_label()}={float(norm_R):.2e}, tol={tol_eff:.2e}, "
                                 f"window={win}, rel_drop={rel_drop:.2e}, abs_drop={abs_drop:.2e}); accepting iterate."
                             )
                         converged = True
@@ -5004,6 +5183,35 @@ class NewtonSolver:
             dU_red_phys, _, _ = self._solver_coordinate_physical_step(dU_red, funcs)
             dU_full = self.restrictor.expand_vec(dU_red_phys)
 
+            if os.getenv("PYCUTFEM_SAVE_NEWTON_STEP", "").lower() in {"1", "true", "yes"}:
+                outdir = str(os.getenv("PYCUTFEM_SAVE_NEWTON_STEP_DIR", "") or "").strip()
+                if not outdir:
+                    outdir = os.path.join(os.getcwd(), "_pycutfem_newton_step_dumps")
+                try:
+                    os.makedirs(outdir, exist_ok=True)
+                    counter = int(getattr(self, "_saved_newton_step_counter", 0)) + 1
+                    self._saved_newton_step_counter = counter
+                    step_now = int(getattr(self, "_current_step_no", -1))
+                    fields_tag = "_".join(str(v) for v in tuple(getattr(self, "_active_field_names", tuple()) or tuple()))
+                    if not fields_tag:
+                        fields_tag = "all"
+                    stem = (
+                        f"step{step_now:04d}_it{int(it + 1):02d}_"
+                        f"n{int(len(self.active_dofs))}_c{counter:04d}_{fields_tag}"
+                    )
+                    np.savez(
+                        os.path.join(outdir, f"{stem}.npz"),
+                        step=np.asarray(step_now, dtype=int),
+                        iteration=np.asarray(int(it + 1), dtype=int),
+                        active_dofs=np.asarray(self.active_dofs, dtype=np.int64),
+                        dU_red=np.asarray(dU_red, dtype=np.float64),
+                        dU_full=np.asarray(dU_full, dtype=np.float64),
+                        R_red=np.asarray(R_red, dtype=np.float64),
+                    )
+                    print(f"        [newton-save] saved {outdir}/{stem}.npz")
+                except Exception as exc:
+                    print(f"        [newton-save] failed: {exc}")
+
             if os.getenv("PYCUTFEM_CHECK_DIRICHLET_INCREMENT", "").lower() in {"1", "true", "yes"}:
                 try:
                     bc_rows = np.fromiter(dh.get_dirichlet_data(bcs_now).keys(), dtype=int)
@@ -5030,6 +5238,8 @@ class NewtonSolver:
                 funcs=funcs,
                 delta_full=dU_full,
                 criteria=getattr(self.np, "mixed_solution_criteria", ()),
+                bcs=bcs_now,
+                active_dofs=getattr(self, "active_dofs", None),
             )
 
             # Reuse the residual computed during line search to detect convergence
@@ -5053,7 +5263,7 @@ class NewtonSolver:
             if use_ls_cache:
                 R_after = getattr(self, "_ls_last_residual_red", None)
                 if isinstance(R_after, np.ndarray):
-                    norm_after = float(np.linalg.norm(R_after, ord=np.inf))
+                    norm_after = _residual_norm_from_red(R_after)
                     if not np.isfinite(norm_after):
                         norm_after = None
             elif (
@@ -5062,7 +5272,7 @@ class NewtonSolver:
             ):
                 try:
                     _, R_after = self._assemble_system_reduced(current, need_matrix=False)
-                    norm_after = float(np.linalg.norm(np.asarray(R_after, dtype=float), ord=np.inf))
+                    norm_after = _residual_norm_from_red(np.asarray(R_after, dtype=float))
                     if not np.isfinite(norm_after):
                         norm_after = None
                 except Exception:
@@ -5114,7 +5324,7 @@ class NewtonSolver:
                 if near_accept_after and int(getattr(self.np, "print_level", 2) or 0) >= 2:
                     print(
                         "        Best-effort globalization step reached the relaxed acceptance band "
-                        f"(|R|_∞={float(norm_after):.2e}, tol={float(tol_eff):.2e}, factor={accept_factor_after:.2g}); "
+                        f"({_residual_norm_label()}={float(norm_after):.2e}, tol={float(tol_eff):.2e}, factor={accept_factor_after:.2g}); "
                         "accepting iterate."
                     )
                 converged = True
@@ -5131,11 +5341,17 @@ class NewtonSolver:
             mixed_solution_residual_limit = None
             mixed_solution_residual_value = None
             if mixed_solution_residual_factor > 0.0:
+                mixed_solution_residual_tol = float(
+                    getattr(self.np, "mixed_solution_residual_tol", 0.0) or 0.0
+                )
+                if mixed_solution_residual_tol <= 0.0:
+                    mixed_solution_residual_tol = float(tol_eff)
                 mixed_solution_residual_value = float(norm_after if norm_after is not None else norm_R)
-                mixed_solution_residual_limit = mixed_solution_residual_factor * float(tol_eff)
+                mixed_solution_residual_limit = mixed_solution_residual_factor * float(mixed_solution_residual_tol)
                 mixed_solution_residual_ok = bool(
                     np.isfinite(mixed_solution_residual_value)
                     and np.isfinite(mixed_solution_residual_limit)
+                    and mixed_solution_residual_limit > 0.0
                     and mixed_solution_residual_value <= mixed_solution_residual_limit
                 )
 
@@ -5164,7 +5380,7 @@ class NewtonSolver:
                 if int(getattr(self.np, "print_level", 2) or 0) >= 2:
                     print(
                         "        Mixed solution criteria met, but residual safeguard rejected the iterate "
-                        f"(|R|_∞={float(mixed_solution_residual_value):.3e} > "
+                        f"({_residual_norm_label()}={float(mixed_solution_residual_value):.3e} > "
                         f"{float(mixed_solution_residual_limit):.3e})."
                     )
 
@@ -5190,7 +5406,7 @@ class NewtonSolver:
                 if int(getattr(self.np, "print_level", 2) or 0) >= 2:
                     print(
                         "        Newton hit max iterations but is near tolerance "
-                        f"(|R|_∞={float(norm_R):.2e}, tol={tol_eff_last:.2e}, factor={accept_factor:.2g}); accepting iterate."
+                        f"({_residual_norm_label()}={float(norm_R):.2e}, tol={tol_eff_last:.2e}, factor={accept_factor:.2g}); accepting iterate."
                     )
                 converged = True
                 delta = np.hstack(
@@ -6226,6 +6442,30 @@ class NewtonSolver:
 
 
     def _solve_linear_system(self, A: sp.csr_matrix, rhs: np.ndarray) -> np.ndarray:
+        perm = getattr(self, "_linear_solve_perm", None)
+        if perm is not None and not bool(getattr(self, "_linear_solve_perm_active", False)):
+            perm_arr = np.asarray(perm, dtype=int).reshape(-1)
+            n = int(A.shape[0])
+            if int(A.shape[1]) != n:
+                raise ValueError("Linear solve permutation requires a square reduced system.")
+            if perm_arr.size != n:
+                raise ValueError(
+                    "Linear solve permutation size mismatch: "
+                    f"expected {n}, got {perm_arr.size}."
+                )
+            if np.unique(perm_arr).size != n or np.any(perm_arr < 0) or np.any(perm_arr >= n):
+                raise ValueError("Linear solve permutation must be a valid index permutation.")
+            self._linear_solve_perm_active = True
+            try:
+                A_perm = A[perm_arr, :][:, perm_arr].tocsr()
+                rhs_perm = np.asarray(rhs, dtype=np.float64).reshape(-1)[perm_arr]
+                sol_perm = np.asarray(self._solve_linear_system(A_perm, rhs_perm), dtype=np.float64).reshape(-1)
+            finally:
+                self._linear_solve_perm_active = False
+            sol = np.empty_like(sol_perm)
+            sol[perm_arr] = sol_perm
+            return sol
+
         backend = str(getattr(self.lp, "backend", "scipy") or "scipy").lower()
         if backend == "pypardiso":
             backend = "pardiso"
@@ -6244,6 +6484,10 @@ class NewtonSolver:
                 print(f"        [lin] reduced Schur solve fallback failed: {exc}", flush=True)
         if backend == "scipy":
             return self._solve_linear_system_scipy(A, rhs)
+        if backend == "sparseqr":
+            return self._solve_linear_system_sparseqr(A, rhs)
+        if backend in {"eigen_sparseqr", "eigen_sparse_qr", "kratos_sparse_qr"}:
+            return self._solve_linear_system_eigen_sparseqr(A, rhs)
         if backend == "pardiso":
             if not HAS_PYPARDISO:
                 raise RuntimeError(
@@ -6256,6 +6500,8 @@ class NewtonSolver:
                     "LinearSolverParameters.backend='petsc' requested but petsc4py is not available."
                 )
             return self._solve_linear_system_petsc(A, rhs)
+        if backend == "amgcl":
+            return self._solve_linear_system_amgcl(A, rhs)
         raise ValueError(f"Unknown linear solver backend '{self.lp.backend}'.")
 
     def _invalidate_pardiso_linear_cache(self) -> None:
@@ -6842,6 +7088,92 @@ class NewtonSolver:
             if not self._direct_solve_quality_ok(A_reg, rhs, sol, solver_name="scipy+shift"):
                 raise RuntimeError("scipy fallback with diagonal shift returned a low-quality solution.")
             return sol
+
+    def _solve_linear_system_sparseqr_equilibrated(
+        self,
+        A: sp.csr_matrix,
+        rhs: np.ndarray,
+        *,
+        mode: str,
+    ) -> np.ndarray:
+        import sparseqr
+
+        row_scale, col_scale = self._direct_solve_equilibration(A, mode)
+        A_scaled = self._canonicalize_direct_solve_matrix(
+            sp.diags(row_scale, format="csr") @ A @ sp.diags(col_scale, format="csr")
+        )
+        rhs_scaled = np.asarray(row_scale * rhs, dtype=np.float64)
+        out = np.asarray(sparseqr.solve(A_scaled, rhs_scaled), dtype=np.float64).ravel()
+        if not np.all(np.isfinite(out)):
+            raise RuntimeError(f"sparseqr {mode} equilibration returned non-finite solution values.")
+        sol = col_scale * out
+        if not self._direct_solve_quality_ok(A, rhs, sol, solver_name=f"sparseqr+{mode}"):
+            raise RuntimeError(f"sparseqr {mode} equilibration returned a low-quality solution.")
+        return sol
+
+    def _solve_linear_system_sparseqr(self, A: sp.csr_matrix, rhs: np.ndarray) -> np.ndarray:
+        import sparseqr
+
+        A = self._canonicalize_direct_solve_matrix(A)
+        rhs = np.asarray(rhs, dtype=np.float64)
+        try:
+            sol = np.asarray(sparseqr.solve(A, rhs), dtype=np.float64).ravel()
+            if not np.isfinite(sol).all():
+                raise RuntimeError("sparseqr returned non-finite values")
+            if self._direct_solve_quality_ok(A, rhs, sol, solver_name="sparseqr"):
+                return sol
+            raise RuntimeError("sparseqr returned a low-quality solution")
+        except Exception as exc:
+            for mode in self._direct_solve_equilibration_modes():
+                try:
+                    print(f"        [lin] retrying sparseqr with {mode} equilibration after failure: {exc}")
+                    return self._solve_linear_system_sparseqr_equilibrated(A, rhs, mode=mode)
+                except Exception as exc_eq:
+                    exc = exc_eq
+            raise
+
+    def _solve_linear_system_eigen_sparseqr(self, A: sp.csr_matrix, rhs: np.ndarray) -> np.ndarray:
+        A = self._canonicalize_direct_solve_matrix(A)
+        rhs = np.asarray(rhs, dtype=np.float64)
+        use_cache = str(os.getenv("PYCUTFEM_EIGEN_SPARSEQR_CACHE", "1") or "1").strip().lower() not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+        if use_cache and sp.isspmatrix_csr(A):
+            h = hashlib.blake2b(digest_size=16)
+            h.update(np.asarray(A.shape, dtype=np.int64).tobytes())
+            h.update(np.asarray(A.indptr, dtype=np.int64).tobytes())
+            h.update(np.asarray(A.indices, dtype=np.int64).tobytes())
+            h.update(np.asarray(A.data, dtype=np.float64).tobytes())
+            key = h.hexdigest()
+            cache = getattr(NewtonSolver, "_eigen_sparseqr_global_cache", None)
+            if not isinstance(cache, dict):
+                cache = {}
+                setattr(NewtonSolver, "_eigen_sparseqr_global_cache", cache)
+            solver = cache.get(key)
+            if solver is None:
+                max_entries_raw = str(os.getenv("PYCUTFEM_EIGEN_SPARSEQR_CACHE_MAX", "4") or "4").strip()
+                try:
+                    max_entries = max(1, int(max_entries_raw))
+                except Exception:
+                    max_entries = 4
+                while len(cache) >= max_entries:
+                    cache.pop(next(iter(cache)))
+                solver = EigenSparseQRSubsolver(A)
+                cache[key] = solver
+            sol = solver.solve(rhs)
+            report = getattr(solver, "last_report", None)
+        else:
+            sol, report = solve_sparse_eigen_sparseqr(A, rhs)
+        if not np.isfinite(sol).all():
+            raise RuntimeError("Eigen SparseQR returned non-finite values.")
+        if report is not None and not bool(report.converged):
+            raise RuntimeError("Eigen SparseQR reported failure.")
+        if not self._direct_solve_quality_ok(A, rhs, sol, solver_name="eigen_sparseqr"):
+            raise RuntimeError("Eigen SparseQR returned a low-quality solution.")
+        return np.asarray(sol, dtype=np.float64).ravel()
 
     def _solve_linear_system_pardiso_equilibrated(
         self,
@@ -7439,6 +7771,484 @@ class NewtonSolver:
         if last_exc is not None:
             raise RuntimeError(str(last_exc))
         raise RuntimeError("PETSc linear solve returned a low-quality solution.")
+
+    def _amgcl_system_master_ids(self) -> np.ndarray:
+        cache = getattr(self, "_amgcl_system_master_ids_cache", None)
+        if isinstance(cache, np.ndarray) and cache.ndim == 1:
+            return cache
+        n_master = int(self.full_to_red.size)
+        active_fields = tuple(
+            str(name).strip()
+            for name in tuple(getattr(self, "_active_field_names", tuple()) or tuple())
+            if str(name).strip()
+        )
+        if active_fields:
+            ids_acc: list[int] = []
+            for field in active_fields:
+                try:
+                    phys_ids = np.asarray(self.dh.get_field_slice(field), dtype=int).ravel()
+                except Exception:
+                    continue
+                if getattr(self, "constraints", None) is None:
+                    valid = phys_ids[(phys_ids >= 0) & (phys_ids < n_master)]
+                    ids_acc.extend(int(idx) for idx in valid.tolist())
+                else:
+                    ids_acc.extend(int(idx) for idx in self.constraints.to_master_set(phys_ids.tolist()))
+            ids = np.asarray(sorted(set(ids_acc)), dtype=int)
+        else:
+            ids = np.arange(n_master, dtype=int)
+        ids = ids[(ids >= 0) & (ids < n_master)]
+        self._amgcl_system_master_ids_cache = ids
+        return ids
+
+    def _amgcl_master_phys_ids(self) -> np.ndarray:
+        cache = getattr(self, "_amgcl_master_phys_ids_cache", None)
+        if isinstance(cache, np.ndarray) and cache.ndim == 1:
+            return cache
+        system_master_ids = self._amgcl_system_master_ids()
+        if getattr(self, "constraints", None) is None:
+            phys_ids = np.asarray(system_master_ids, dtype=int).copy()
+        else:
+            master_phys = np.asarray(self.constraints.master_ids, dtype=int).ravel()
+            if system_master_ids.size == 0 or int(np.max(system_master_ids)) >= int(master_phys.size):
+                phys_ids = np.asarray([], dtype=int)
+            else:
+                phys_ids = np.asarray(master_phys[system_master_ids], dtype=int)
+        self._amgcl_master_phys_ids_cache = phys_ids
+        return phys_ids
+
+    def _amgcl_master_field_names(self) -> np.ndarray:
+        cache = getattr(self, "_amgcl_master_field_names_cache", None)
+        if isinstance(cache, np.ndarray) and cache.ndim == 1:
+            return cache
+        total_dofs = int(self.dh.total_dofs)
+        phys_names = np.empty((total_dofs,), dtype=object)
+        phys_names[:] = ""
+        for fld in getattr(self.dh, "field_names", []):
+            try:
+                ids = np.asarray(self.dh.get_field_slice(str(fld)), dtype=int).ravel()
+            except Exception:
+                continue
+            if ids.size:
+                phys_names[ids] = str(fld)
+        names = np.asarray(phys_names[self._amgcl_master_phys_ids()], dtype=object)
+        self._amgcl_master_field_names_cache = names
+        return names
+
+    def _amgcl_order_block_fields(self, fields: tuple[str, ...]) -> tuple[str, ...]:
+        raw = str(os.getenv("PYCUTFEM_LINEAR_AMGCL_FIELD_ORDER", "") or "").strip()
+        if raw:
+            requested = tuple(str(part).strip() for part in raw.split(",") if str(part).strip())
+            ordered = tuple(name for name in requested if name in fields)
+            ordered += tuple(name for name in fields if name not in ordered)
+            if len(ordered) == len(fields):
+                return ordered
+        field_set = set(fields)
+        if field_set == {"ux", "uy", "p"}:
+            # Kratos' monolithic fluid systems are numbered per node as
+            # PRESSURE, VELOCITY_X, VELOCITY_Y. AMGCL's block preconditioner
+            # is graph/order sensitive, so keep the same local block layout
+            # when matching Kratos DVMS results.
+            return ("p", "ux", "uy")
+        return fields
+
+    def _amgcl_active_system_indices(self, system_master_ids: np.ndarray | None = None) -> np.ndarray | None:
+        system_ids = (
+            np.asarray(system_master_ids, dtype=int).ravel()
+            if system_master_ids is not None
+            else self._amgcl_system_master_ids()
+        )
+        n_master = int(self.full_to_red.size)
+        master_to_system = -np.ones((n_master,), dtype=int)
+        if system_ids.size:
+            master_to_system[system_ids] = np.arange(int(system_ids.size), dtype=int)
+        active = np.asarray(getattr(self, "active_dofs", np.asarray([], dtype=int)), dtype=int).ravel()
+        if active.size == 0 or np.any(active < 0) or np.any(active >= n_master):
+            return None
+        active_system = master_to_system[active]
+        if np.any(active_system < 0):
+            return None
+        return np.asarray(active_system, dtype=int)
+
+    def _amgcl_node_block_layout(self) -> dict[str, object] | None:
+        cache = getattr(self, "_amgcl_node_block_layout_cache", None)
+        if isinstance(cache, dict):
+            return cache
+        system_master_ids = self._amgcl_system_master_ids()
+        active_system = self._amgcl_active_system_indices(system_master_ids)
+        if active_system is None:
+            self._amgcl_node_block_layout_cache = None
+            return None
+        master_phys_ids = self._amgcl_master_phys_ids()
+        if master_phys_ids.size == 0:
+            self._amgcl_node_block_layout_cache = None
+            return None
+        coords_all = np.asarray(self.dh.get_all_dof_coords(), dtype=float)
+        if coords_all.ndim != 2 or coords_all.shape[0] < int(np.max(master_phys_ids)) + 1:
+            self._amgcl_node_block_layout_cache = None
+            return None
+        coords = np.asarray(coords_all[master_phys_ids], dtype=float)
+        field_names = np.asarray(self._amgcl_master_field_names(), dtype=object)
+        fields: list[str] = []
+        seen_fields: set[str] = set()
+        for name in field_names.tolist():
+            fld = str(name)
+            if not fld or fld in seen_fields:
+                continue
+            seen_fields.add(fld)
+            fields.append(fld)
+        fields = list(self._amgcl_order_block_fields(tuple(fields)))
+        if len(fields) <= 1:
+            self._amgcl_node_block_layout_cache = None
+            return None
+        groups: dict[tuple[float, float], dict[str, int]] = {}
+        group_order: list[tuple[float, float]] = []
+        group_sort_ids: dict[tuple[float, float], int] = {}
+        old_node_ids = None
+        try:
+            mesh = self.dh.mixed_element.mesh
+            old_node_ids_raw = getattr(mesh, "_mdpa_new_to_old_node", None)
+            if old_node_ids_raw is not None:
+                old_node_ids_arr = np.asarray(old_node_ids_raw, dtype=int).reshape(-1)
+                if old_node_ids_arr.size == len(getattr(mesh, "nodes_list", ())):
+                    old_node_ids = old_node_ids_arr
+        except Exception:
+            old_node_ids = None
+
+        dof_to_node = getattr(self.dh, "_dof_to_node_map", {})
+        for master_idx, (phys_id, (x, y), name_obj) in enumerate(
+            zip(master_phys_ids.tolist(), coords.tolist(), field_names.tolist())
+        ):
+            field = str(name_obj)
+            if not field:
+                self._amgcl_node_block_layout_cache = None
+                return None
+            key = (round(float(x), 12), round(float(y), 12))
+            entry = groups.get(key)
+            if entry is None:
+                entry = {}
+                groups[key] = entry
+                group_order.append(key)
+            if field in entry:
+                self._amgcl_node_block_layout_cache = None
+                return None
+            entry[field] = int(master_idx)
+            try:
+                _, node_id = dof_to_node[int(phys_id)]
+                node_id_int = int(node_id)
+                if old_node_ids is not None and 0 <= node_id_int < int(old_node_ids.size):
+                    sort_id = int(old_node_ids[node_id_int])
+                else:
+                    sort_id = node_id_int
+                prev_sort_id = group_sort_ids.get(key)
+                if prev_sort_id is None or sort_id < int(prev_sort_id):
+                    group_sort_ids[key] = int(sort_id)
+            except Exception:
+                pass
+        perm: list[int] = []
+        ordered_group_keys = sorted(
+            group_order,
+            key=lambda key: (
+                int(group_sort_ids.get(key, len(group_order))),
+                group_order.index(key),
+            ),
+        )
+        for key in ordered_group_keys:
+            entry = groups[key]
+            if len(entry) != len(fields):
+                self._amgcl_node_block_layout_cache = None
+                return None
+            if any(field not in entry for field in fields):
+                self._amgcl_node_block_layout_cache = None
+                return None
+            perm.extend(int(entry[field]) for field in fields)
+        perm_arr = np.asarray(perm, dtype=int)
+        if perm_arr.size != master_phys_ids.size:
+            self._amgcl_node_block_layout_cache = None
+            return None
+        inv_perm = np.empty_like(perm_arr)
+        inv_perm[perm_arr] = np.arange(int(perm_arr.size), dtype=int)
+        layout = {
+            "fields": tuple(fields),
+            "block_size": int(len(fields)),
+            "system_master_ids": np.asarray(system_master_ids, dtype=int),
+            "active_system_indices": np.asarray(active_system, dtype=int),
+            "perm": perm_arr,
+            "inv_perm": inv_perm,
+        }
+        self._amgcl_node_block_layout_cache = layout
+        return layout
+
+    def _amgcl_expand_reduced_system(
+        self,
+        A_red: sp.csr_matrix,
+        rhs_red: np.ndarray,
+    ) -> tuple[sp.csr_matrix, np.ndarray, np.ndarray]:
+        n_master = int(self.full_to_red.size)
+        system_master_ids = self._amgcl_system_master_ids()
+        active_system = self._amgcl_active_system_indices(system_master_ids)
+        if active_system is None:
+            raise RuntimeError("AMGCL block layout does not cover all active DOFs.")
+        n_system = int(system_master_ids.size)
+        active = np.asarray(self.active_dofs, dtype=int).ravel()
+        rhs_red = np.asarray(rhs_red, dtype=np.float64).ravel()
+        if int(A_red.shape[0]) != int(active.size) or int(A_red.shape[1]) != int(active.size):
+            raise ValueError(
+                "AMGCL reduced matrix shape does not match the active DOF count: "
+                f"{tuple(A_red.shape)} vs {int(active.size)}."
+            )
+        if (
+            not bool(getattr(self, "use_reduced", False))
+            and active.size == n_system
+            and np.array_equal(active_system, np.arange(n_system, dtype=int))
+        ):
+            return (
+                A_red.tocsr() if not sp.isspmatrix_csr(A_red) else A_red,
+                rhs_red,
+                active_system,
+            )
+        A_red = A_red.tocoo() if not sp.isspmatrix_coo(A_red) else A_red
+        row = np.asarray(active[A_red.row], dtype=int)
+        col = np.asarray(active[A_red.col], dtype=int)
+        master_to_system = -np.ones((n_master,), dtype=int)
+        if system_master_ids.size:
+            master_to_system[system_master_ids] = np.arange(n_system, dtype=int)
+        row = np.asarray(master_to_system[row], dtype=int)
+        col = np.asarray(master_to_system[col], dtype=int)
+        valid = (row >= 0) & (col >= 0)
+        if not np.all(valid):
+            raise RuntimeError("AMGCL reduced matrix contains active DOFs outside the block system.")
+        row = row[valid]
+        col = col[valid]
+        data = np.asarray(A_red.data, dtype=np.float64)
+        data = data[valid]
+        red_for_system = np.asarray(self.full_to_red, dtype=int)[system_master_ids]
+        fixed = np.flatnonzero(red_for_system < 0)
+        pattern = getattr(self, "_last_amgcl_kratos_dirichlet_pattern", None)
+        if (
+            pattern is not None
+            and sp.isspmatrix(pattern)
+            and tuple(pattern.shape) == (n_system, n_system)
+            and str(os.getenv("PYCUTFEM_LINEAR_AMGCL_KRATOS_DIRICHLET_PATTERN", "1") or "1").strip().lower()
+            not in {"0", "false", "no", "off"}
+        ):
+            pattern = pattern.tocoo()
+            row_parts = [np.asarray(pattern.row, dtype=int), row]
+            col_parts = [np.asarray(pattern.col, dtype=int), col]
+            data_parts = [
+                np.zeros((int(pattern.nnz),), dtype=np.float64),
+                np.asarray(data, dtype=np.float64),
+            ]
+            if fixed.size:
+                fixed_diag = np.ones((int(fixed.size),), dtype=np.float64)
+                diag_source = getattr(self, "_last_amgcl_kratos_dirichlet_diag", None)
+                if isinstance(diag_source, np.ndarray) and diag_source.ndim == 1 and int(diag_source.size) == n_master:
+                    diag = np.asarray(diag_source, dtype=np.float64)
+                    finite = np.isfinite(diag)
+                    if np.any(finite):
+                        scale = float(np.max(np.abs(diag[finite])))
+                        if not np.isfinite(scale) or scale <= 0.0:
+                            scale = 1.0
+                    else:
+                        scale = 1.0
+                    fixed_diag = np.asarray(diag[system_master_ids[fixed]], dtype=np.float64)
+                    bad = (~np.isfinite(fixed_diag)) | (np.abs(fixed_diag) <= np.finfo(np.float64).eps)
+                    if np.any(bad):
+                        fixed_diag[bad] = scale
+                row_parts.append(fixed)
+                col_parts.append(fixed)
+                data_parts.append(fixed_diag)
+            A_full = sp.coo_matrix(
+                (
+                    np.concatenate(data_parts),
+                    (np.concatenate(row_parts), np.concatenate(col_parts)),
+                ),
+                shape=(n_system, n_system),
+            ).tocsr()
+            A_full.sum_duplicates()
+            rhs_full = np.zeros((n_system,), dtype=np.float64)
+            rhs_full[active_system] = rhs_red
+            return A_full, rhs_full, active_system
+        if fixed.size:
+            fixed_diag = np.ones((int(fixed.size),), dtype=np.float64)
+            diag_source = getattr(self, "_last_amgcl_kratos_dirichlet_diag", None)
+            if isinstance(diag_source, np.ndarray) and diag_source.ndim == 1 and int(diag_source.size) == n_master:
+                diag = np.asarray(diag_source, dtype=np.float64)
+                finite = np.isfinite(diag)
+                if np.any(finite):
+                    scale = float(np.max(np.abs(diag[finite])))
+                    if not np.isfinite(scale) or scale <= 0.0:
+                        scale = 1.0
+                else:
+                    scale = 1.0
+                fixed_diag = np.asarray(diag[system_master_ids[fixed]], dtype=np.float64)
+                bad = (~np.isfinite(fixed_diag)) | (np.abs(fixed_diag) <= np.finfo(np.float64).eps)
+                if np.any(bad):
+                    fixed_diag[bad] = scale
+            row = np.concatenate([row, fixed])
+            col = np.concatenate([col, fixed])
+            data = np.concatenate([data, fixed_diag])
+        A_full = sp.csr_matrix((data, (row, col)), shape=(n_system, n_system))
+        rhs_full = np.zeros((n_system,), dtype=np.float64)
+        rhs_full[active_system] = rhs_red
+        return A_full, rhs_full, active_system
+
+    def _solve_linear_system_amgcl(self, A: sp.csr_matrix, rhs: np.ndarray) -> np.ndarray:
+        A = A.tocsr() if not sp.isspmatrix_csr(A) else A
+        rhs = np.asarray(rhs, dtype=np.float64).ravel()
+        def _env_str(name: str, default: str) -> str:
+            raw = os.getenv(name, "")
+            if raw is None:
+                return str(default)
+            text = str(raw).strip()
+            return text if text else str(default)
+
+        def _env_float(name: str, default: float) -> float:
+            text = _env_str(name, str(default))
+            try:
+                return float(text)
+            except Exception:
+                return float(default)
+
+        def _env_int(name: str, default: int) -> int:
+            text = _env_str(name, str(default))
+            try:
+                return int(float(text))
+            except Exception:
+                return int(default)
+
+        def _env_bool(name: str, default: bool) -> bool:
+            raw = os.getenv(name, "")
+            if raw is None:
+                return bool(default)
+            text = str(raw).strip().lower()
+            if not text:
+                return bool(default)
+            return text in {"1", "true", "yes", "y", "on"}
+
+        block_size_raw = str(os.getenv("PYCUTFEM_LINEAR_AMGCL_BLOCK_SIZE", "auto") or "auto").strip().lower()
+        block_layout = self._amgcl_node_block_layout()
+        use_block_layout = False
+        block_size = 1
+        if block_layout is not None:
+            if block_size_raw == "auto":
+                use_block_layout = True
+                block_size = int(block_layout["block_size"])
+            else:
+                requested_block_size = max(1, int(float(block_size_raw)))
+                if requested_block_size == int(block_layout["block_size"]):
+                    use_block_layout = requested_block_size > 1
+                    block_size = requested_block_size
+        use_block_matrices = bool(use_block_layout) and block_size > 1
+        tol = _env_float("PYCUTFEM_LINEAR_AMGCL_RTOL", _env_float("PYCUTFEM_LINEAR_AMGCL_TOL", 1.0e-6))
+        max_iteration = _env_int("PYCUTFEM_LINEAR_AMGCL_MAX_IT", 100)
+        coarse_enough = _env_int("PYCUTFEM_LINEAR_AMGCL_COARSE_ENOUGH", 1000)
+        gmres_dim = _env_int("PYCUTFEM_LINEAR_AMGCL_GMRES_DIM", 100)
+        max_levels = _env_int("PYCUTFEM_LINEAR_AMGCL_MAX_LEVELS", -1)
+        pre_sweeps = _env_int("PYCUTFEM_LINEAR_AMGCL_PRE_SWEEPS", 1)
+        post_sweeps = _env_int("PYCUTFEM_LINEAR_AMGCL_POST_SWEEPS", 1)
+        verbosity = _env_int("PYCUTFEM_LINEAR_AMGCL_VERBOSITY", 1)
+        scaling = _env_bool("PYCUTFEM_LINEAR_AMGCL_SCALING", False)
+        kratos_pattern_enabled = (
+            bool(use_block_layout)
+            and getattr(self, "_last_amgcl_kratos_dirichlet_pattern", None) is not None
+            and _env_bool("PYCUTFEM_LINEAR_AMGCL_KRATOS_DIRICHLET_PATTERN", True)
+        )
+        preserve_explicit_zeros = _env_bool(
+            "PYCUTFEM_LINEAR_AMGCL_PRESERVE_EXPLICIT_ZEROS",
+            bool(kratos_pattern_enabled),
+        )
+        work_A = A
+        work_rhs = rhs
+        active_system = None
+        if bool(use_block_layout):
+            work_A, work_rhs, active_system = self._amgcl_expand_reduced_system(A, rhs)
+            perm = np.asarray(block_layout["perm"], dtype=int)
+            if int(perm.size) != int(work_A.shape[0]):
+                raise RuntimeError(
+                    "AMGCL block permutation size does not match the expanded system: "
+                    f"{int(perm.size)} != {int(work_A.shape[0])}."
+                )
+            work_A = work_A[perm, :][:, perm].tocsr()
+            work_rhs = np.asarray(work_rhs[perm], dtype=np.float64)
+        else:
+            perm = None
+        trace_amgcl = _env_bool("PYCUTFEM_LINEAR_AMGCL_TRACE", False)
+        params = AMGCLSettings(
+            preconditioner_type=_env_str("PYCUTFEM_LINEAR_AMGCL_PRECONDITIONER", "amg"),
+            smoother_type=_env_str("PYCUTFEM_LINEAR_AMGCL_SMOOTHER", "ilu0"),
+            krylov_type=_env_str("PYCUTFEM_LINEAR_AMGCL_KRYLOV", "gmres"),
+            coarsening_type=_env_str("PYCUTFEM_LINEAR_AMGCL_COARSENING", "aggregation"),
+            tolerance=float(tol),
+            max_iteration=int(max_iteration),
+            gmres_krylov_space_dimension=gmres_dim,
+            verbosity=int(verbosity),
+            scaling=scaling,
+            block_size=block_size,
+            use_block_matrices_if_possible=use_block_matrices,
+            coarse_enough=coarse_enough,
+            max_levels=max_levels,
+            pre_sweeps=pre_sweeps,
+            post_sweeps=post_sweeps,
+            preserve_explicit_zeros=preserve_explicit_zeros,
+        )
+        if bool(trace_amgcl):
+            fields = tuple(block_layout.get("fields", tuple())) if isinstance(block_layout, dict) else tuple()
+            print(
+                "        [lin-amgcl] "
+                f"shape={tuple(work_A.shape)} block_size={int(block_size)} "
+                f"use_block_matrices={int(bool(use_block_matrices))} "
+                f"preserve_explicit_zeros={int(bool(preserve_explicit_zeros))} "
+                f"fields={fields}",
+                flush=True,
+            )
+        dump_dir_raw = str(os.getenv("PYCUTFEM_LINEAR_AMGCL_DUMP_DIR", "") or "").strip()
+        if dump_dir_raw:
+            try:
+                dump_dir = Path(dump_dir_raw).expanduser().resolve()
+                dump_dir.mkdir(parents=True, exist_ok=True)
+                step_now = int(getattr(self, "_current_step_no", -1))
+                it_now = int(getattr(self, "_current_newton_it", -1))
+                counter = int(getattr(self, "_amgcl_dump_counter", 0)) + 1
+                self._amgcl_dump_counter = counter
+                stem = f"step{step_now:04d}_it{it_now:02d}_solve{counter:04d}"
+                sp.save_npz(dump_dir / f"{stem}_A.npz", work_A.tocsr())
+                np.savez(
+                    dump_dir / f"{stem}_meta.npz",
+                    rhs=np.asarray(work_rhs, dtype=np.float64),
+                    active_system=np.asarray([] if active_system is None else active_system, dtype=np.int64),
+                    perm=np.asarray([] if perm is None else perm, dtype=np.int64),
+                    block_size=np.asarray(int(block_size), dtype=int),
+                    use_block_matrices=np.asarray(bool(use_block_matrices), dtype=bool),
+                    preserve_explicit_zeros=np.asarray(bool(preserve_explicit_zeros), dtype=bool),
+                )
+                print(f"        [lin-amgcl-dump] saved {dump_dir}/{stem}_*", flush=True)
+            except Exception as exc:
+                print(f"        [lin-amgcl-dump] failed: {exc}", flush=True)
+        sol, report = solve_sparse_amgcl(work_A, work_rhs, params=params)
+        if bool(trace_amgcl):
+            print(
+                "        [lin-amgcl] "
+                f"converged={int(bool(report.converged))} "
+                f"iterations={int(report.iterations)} residual={float(report.residual_norm):.3e}",
+                flush=True,
+            )
+        if not bool(report.converged):
+            raise RuntimeError(
+                "AMGCL linear solve did not converge "
+                f"(iterations={int(report.iterations)}, residual={float(report.residual_norm):.3e}, "
+                f"tol={float(params.tolerance):.3e})."
+            )
+        sol = np.asarray(sol, dtype=np.float64).ravel()
+        if not np.all(np.isfinite(sol)):
+            raise RuntimeError("AMGCL linear solve returned non-finite solution values.")
+        if bool(use_block_layout):
+            inv_perm = np.asarray(block_layout["inv_perm"], dtype=int)
+            sol = np.asarray(sol[inv_perm], dtype=np.float64)
+            if active_system is None:
+                active_system = np.asarray(block_layout["active_system_indices"], dtype=int)
+            return np.asarray(sol[np.asarray(active_system, dtype=int)], dtype=np.float64)
+        return sol
 
 
     def _phi(self, vec):                 # ½‖·‖² helper
@@ -8110,6 +8920,18 @@ class NewtonSolver:
         n = indptr.size - 1
         data = np.zeros(indices.size, dtype=float)
         R = np.zeros(n, dtype=float)
+        amgcl_backend = str(getattr(getattr(self, "lp", None), "backend", "") or "").strip().lower()
+        diag_mode = str(os.getenv("PYCUTFEM_LINEAR_AMGCL_KRATOS_DIRICHLET_DIAG", "1") or "1").strip().lower()
+        track_kratos_dirichlet_diag = (
+            amgcl_backend == "amgcl"
+            and getattr(self, "constraints", None) is None
+            and diag_mode not in {"0", "false", "no", "off"}
+        )
+        kratos_full_diag = (
+            np.zeros((int(self.full_to_red.size),), dtype=float)
+            if track_kratos_dirichlet_diag
+            else None
+        )
 
         profile = os.getenv("PYCUTFEM_PROFILE_KERNELS", "").lower() in {"1", "true", "yes"}
         prof_entries = []
@@ -8140,6 +8962,15 @@ class NewtonSolver:
             exec_time = time.perf_counter() - t_exec
             if not isinstance(Kloc, np.ndarray) or Kloc.size == 0:
                 continue
+            if kratos_full_diag is not None and isinstance(gdofs, np.ndarray):
+                try:
+                    diag_loc = np.diagonal(np.asarray(Kloc, dtype=float), axis1=1, axis2=2)
+                    if diag_loc.shape == gdofs.shape:
+                        valid_diag = (gdofs >= 0) & (gdofs < int(kratos_full_diag.size))
+                        if np.any(valid_diag):
+                            np.add.at(kratos_full_diag, gdofs[valid_diag], diag_loc[valid_diag])
+                except Exception:
+                    kratos_full_diag = None
             if trace_exec:
                 print(
                     f"        [kern] done jacobian dom={getattr(ker,'domain','?')} exec={exec_time:.3e}s",
@@ -8435,6 +9266,8 @@ class NewtonSolver:
                 )
 
         A = sp.csr_matrix((data, indices, indptr), shape=(n, n))
+        if kratos_full_diag is not None:
+            self._last_amgcl_kratos_dirichlet_diag = np.asarray(kratos_full_diag, dtype=float)
 
         if profile and prof_entries:
             print("        [profile] kernel timings (type, domain, exec, scatter, n_elem):")

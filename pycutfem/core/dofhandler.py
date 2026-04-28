@@ -5808,6 +5808,7 @@ class DofHandler:
         need_o3: bool = False,
         need_o4: bool = False,
         deformation: Any = None,
+        quadrature: str = "gauss",
     ) -> dict:
         """
         Pre-compute geometry and basis tables for integrals on a *non-matching*
@@ -5829,7 +5830,7 @@ class DofHandler:
         * Deformation of the nonmatching interface is not implemented yet.
         """
         import numpy as np
-        from pycutfem.integration.quadrature import gauss_legendre
+        from pycutfem.integration.quadrature import gauss_legendre, gauss_lobatto
         from pycutfem.fem import transform
         from pycutfem.integration.pre_tabulates import (
             _searchsorted_positions,
@@ -5858,6 +5859,11 @@ class DofHandler:
             )
 
         qdeg = int(qdeg)
+        quadrature_name = str(quadrature or "gauss").strip().lower().replace("-", "_")
+        if quadrature_name in {"gll", "lobatto"}:
+            quadrature_name = "gauss_lobatto"
+        if quadrature_name not in {"gauss", "gauss_legendre", "gauss_lobatto"}:
+            raise ValueError(f"Unsupported nonmatching-interface quadrature rule {quadrature!r}.")
         pos_ids = np.asarray(getattr(interface, "pos_elem_ids"), dtype=np.int32).ravel()
         neg_ids = np.asarray(getattr(interface, "neg_elem_ids"), dtype=np.int32).ravel()
         P0 = np.asarray(getattr(interface, "P0"), dtype=float)
@@ -5912,7 +5918,10 @@ class DofHandler:
             raise ValueError("Interface element-id arrays must have length equal to number of segments.")
 
         # Quadrature on straight overlap segments -------------------------------
-        xi_1d, w_ref = gauss_legendre(int(qdeg))
+        if quadrature_name == "gauss_lobatto":
+            xi_1d, w_ref = gauss_lobatto(max(2, int(qdeg)))
+        else:
+            xi_1d, w_ref = gauss_legendre(int(qdeg))
         xi_1d = np.asarray(xi_1d, dtype=float).ravel()
         w_ref = np.asarray(w_ref, dtype=float).ravel()
         nQ = int(xi_1d.size)
@@ -6010,6 +6019,7 @@ class DofHandler:
             me.signature(),
             int(n_union),
             derivs_key,
+            quadrature_name,
             bool(need_hess),
             bool(need_o3),
             bool(need_o4),

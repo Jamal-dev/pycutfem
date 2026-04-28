@@ -43,26 +43,45 @@ def _field_values_on_global_dofs(dh: DofHandler, field_name: str, values: np.nda
     return scattered
 
 
+def _triangle2d3_minimum_element_size(coords: np.ndarray) -> np.ndarray:
+    """Match Kratos ElementSizeCalculator<2,3>::MinimumElementSize."""
+    xyz = np.asarray(coords, dtype=float)
+    if xyz.ndim != 3 or xyz.shape[1:] != (3, 2):
+        raise ValueError("coords must have shape (n_elements, 3, 2).")
+    x10 = xyz[:, 1, 0] - xyz[:, 0, 0]
+    y10 = xyz[:, 1, 1] - xyz[:, 0, 1]
+    x20 = xyz[:, 2, 0] - xyz[:, 0, 0]
+    y20 = xyz[:, 2, 1] - xyz[:, 0, 1]
+
+    nx = -(y20 - y10)
+    ny = x20 - x10
+    num = x10 * nx + y10 * ny
+    den = nx * nx + ny * ny
+    hsq = np.where(den > 1.0e-30, (num * num) / den, 1.0e-30)
+
+    nx = -y20
+    ny = x20
+    num = x10 * nx + y10 * ny
+    den = nx * nx + ny * ny
+    cand = np.where(den > 1.0e-30, (num * num) / den, 1.0e-30)
+    hsq = np.minimum(cand, hsq)
+
+    nx = -y10
+    ny = x10
+    num = x20 * nx + y20 * ny
+    den = nx * nx + ny * ny
+    cand = np.where(den > 1.0e-30, (num * num) / den, 1.0e-30)
+    hsq = np.minimum(cand, hsq)
+    return np.sqrt(np.maximum(hsq, 0.0))
+
+
 def _kratos_dvms_element_size(mesh: Mesh, eid: int) -> float:
     conn = np.asarray(mesh.elements_connectivity[int(eid)], dtype=int).reshape(-1)
     coords = np.asarray(mesh.nodes_x_y_pos[conn], dtype=float)
     if coords.shape != (3, 2):
         area = float(np.asarray(mesh.areas_list, dtype=float).reshape(-1)[int(eid)])
         return float(np.sqrt(max(abs(area), 1.0e-30)))
-    area = float(abs(np.asarray(mesh.areas_list, dtype=float).reshape(-1)[int(eid)]))
-    edges = np.asarray(
-        [
-            np.linalg.norm(coords[0] - coords[1]),
-            np.linalg.norm(coords[1] - coords[2]),
-            np.linalg.norm(coords[2] - coords[0]),
-        ],
-        dtype=float,
-    )
-    max_edge = float(np.max(edges)) if edges.size else 0.0
-    if max_edge <= 1.0e-30:
-        return float(np.sqrt(max(area, 1.0e-30)))
-    # Kratos DVMS uses the minimum triangle altitude as the element size in 2D.
-    return float((2.0 * area) / max_edge)
+    return float(_triangle2d3_minimum_element_size(coords.reshape(1, 3, 2))[0])
 
 
 def _kratos_dvms_element_size_array(mesh: Mesh) -> np.ndarray:
@@ -71,15 +90,7 @@ def _kratos_dvms_element_size_array(mesh: Mesh) -> np.ndarray:
     if coords.ndim != 3 or coords.shape[1:] != (3, 2):
         areas = np.asarray(mesh.areas_list, dtype=float).reshape(-1)
         return np.sqrt(np.maximum(np.abs(areas), 1.0e-30))
-    areas = np.maximum(np.abs(np.asarray(mesh.areas_list, dtype=float).reshape(-1)), 1.0e-30)
-    edge01 = np.linalg.norm(coords[:, 0, :] - coords[:, 1, :], axis=1)
-    edge12 = np.linalg.norm(coords[:, 1, :] - coords[:, 2, :], axis=1)
-    edge20 = np.linalg.norm(coords[:, 2, :] - coords[:, 0, :], axis=1)
-    max_edge = np.maximum.reduce([edge01, edge12, edge20])
-    h = np.sqrt(areas)
-    mask = max_edge > 1.0e-30
-    h[mask] = (2.0 * areas[mask]) / max_edge[mask]
-    return h
+    return _triangle2d3_minimum_element_size(coords)
 
 
 def _kratos_dvms_element_size_coefficient(mesh: Mesh) -> ElementWiseConstant:
@@ -115,18 +126,7 @@ def _kratos_dvms_current_element_size_array(
     coords_cur[:, :, 0] += mx_local
     coords_cur[:, :, 1] += my_local
 
-    edge01 = np.linalg.norm(coords_cur[:, 0, :] - coords_cur[:, 1, :], axis=1)
-    edge12 = np.linalg.norm(coords_cur[:, 1, :] - coords_cur[:, 2, :], axis=1)
-    edge20 = np.linalg.norm(coords_cur[:, 2, :] - coords_cur[:, 0, :], axis=1)
-    max_edge = np.maximum.reduce([edge01, edge12, edge20])
-    twice_area = np.abs(
-        (coords_cur[:, 1, 0] - coords_cur[:, 0, 0]) * (coords_cur[:, 2, 1] - coords_cur[:, 0, 1])
-        - (coords_cur[:, 2, 0] - coords_cur[:, 0, 0]) * (coords_cur[:, 1, 1] - coords_cur[:, 0, 1])
-    )
-    h = np.sqrt(np.maximum(0.5 * twice_area, 1.0e-30))
-    mask = max_edge > 1.0e-30
-    h[mask] = twice_area[mask] / max_edge[mask]
-    return h
+    return _triangle2d3_minimum_element_size(coords_cur)
 
 
 def _kratos_dvms_current_element_size_coefficient(

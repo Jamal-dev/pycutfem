@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import argparse
 import csv
+import inspect
 import json
 import math
 import os
+import sys
 import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Sequence
 
 import numpy as np
 
@@ -20,7 +22,14 @@ from pycutfem.fem import transform
 from pycutfem.fem.reference import get_reference
 from pycutfem.fem.mixedelement import MixedElement
 from pycutfem.io.vtk import export_vtk
+from pycutfem.linalg import (
+    StructuralMeshMotionStrategy,
+    StructuralMeshMotionStrategySettings,
+    kratos_iqnils_iteration_matrices_cpp,
+    kratos_iqnils_next_iterate_cpp,
+)
 from pycutfem.mor.interface import build_restriction_matrix
+from pycutfem.nirb.coupling import NIRBSolidPredictor
 from pycutfem.operators import LocalAssemblyResult, RuntimeOperator
 from pycutfem.solvers.nonlinear_solver import (
     LinearSolverParameters,
@@ -67,10 +76,12 @@ from examples.NIRB.dvms import (
     _advance_fluid_dvms_history_after_step,
     _bossak_coefficients,
     _build_fluid_dvms_state,
+    _clear_fluid_dvms_oss_projections,
     _eval_scalar_with_grad,
     _eval_vector_with_grad,
     _fluid_dvms_summary,
     _kratos_dvms_current_element_size_coefficient,
+    _update_fluid_dvms_oss_projections,
     _update_fluid_dvms_predicted_subscale,
     _update_fluid_dvms_state_from_previous_step,
 )
@@ -82,7 +93,14 @@ from examples.NIRB.dvms.symbolics import (
 )
 from examples.NIRB.double_flap_reference import MDPAMesh, _load_json
 from examples.NIRB.example2_local_setup import load_example2_local_setup
-from examples.NIRB.example2_problem import _named_constant, build_conforming_mesh
+from examples.NIRB.example2_problem import (
+    _EX2_HALF,
+    _EX2_ONE,
+    _EX2_TWO,
+    _EX2_TWO_THIRDS,
+    _named_constant,
+    build_conforming_mesh,
+)
 
 
 _EX2L_HALF = _named_constant("example2_local_half", 0.5)
@@ -105,6 +123,17 @@ _EX2L_KRATOS_STRUCT_ONE_STEP_ACCEPT_FACTOR = 1.0e12
 
 def _coord_key(x: float, y: float, ndigits: int = 12) -> tuple[float, float]:
     return (round(float(x), ndigits), round(float(y), ndigits))
+
+
+def _call_with_supported_keywords(func: Callable[..., object], /, **kwargs):
+    try:
+        signature = inspect.signature(func)
+    except (TypeError, ValueError):
+        return func(**kwargs)
+    if any(param.kind is inspect.Parameter.VAR_KEYWORD for param in signature.parameters.values()):
+        return func(**kwargs)
+    accepted = {name: value for name, value in kwargs.items() if name in signature.parameters}
+    return func(**accepted)
 
 
 def _kratos_hyperelastic_plane_strain_pk1(F, mu_s: Constant, lambda_s: Constant):
@@ -142,6 +171,88 @@ def _section(enabled: bool, title: str) -> None:
         print("-" * 50, flush=True)
         print(title, flush=True)
         print("-" * 50, flush=True)
+
+
+def _should_monitor_stress_interface_loads(*, load_transfer: str, monitor_interface_loads: bool) -> bool:
+    if str(load_transfer).strip().lower() == "stress":
+        return True
+    if not bool(monitor_interface_loads):
+        return False
+    return _env_bool("PYCUTFEM_EX2_MONITOR_STRESS_LOADS", False)
+
+
+def _configure_kratos_thread_env(*, enable: bool) -> dict[str, object]:
+    info: dict[str, object] = {
+        "enabled": bool(enable),
+        "already_imported": "KratosMultiphysics" in sys.modules,
+        "changes": {},
+        "effective": {},
+        "runtime_openmp_library": "",
+        "runtime_openmp_max_threads": None,
+    }
+    if not bool(enable):
+        return info
+
+    omp_threads = _env_str("PYCUTFEM_EX2_KRATOS_OMP_NUM_THREADS", "1").strip() or "1"
+    blas_threads = _env_str("PYCUTFEM_EX2_KRATOS_BLAS_NUM_THREADS", "1").strip() or "1"
+    target_env = {
+        "OMP_NUM_THREADS": omp_threads,
+        "OPENBLAS_NUM_THREADS": blas_threads,
+        "MKL_NUM_THREADS": blas_threads,
+    }
+
+    changes: dict[str, str] = {}
+    effective: dict[str, str] = {}
+    for name, value in target_env.items():
+        current = str(os.getenv(name, "") or "").strip()
+        if not current:
+            os.environ[name] = str(value)
+            changes[name] = str(value)
+            current = str(value)
+        effective[name] = current
+
+    try:
+        import ctypes
+        import ctypes.util
+
+        omp_threads_int = max(1, int(float(omp_threads)))
+        openmp_lib_names: list[str] = []
+        for candidate in ("gomp", "omp", "iomp5"):
+            found = ctypes.util.find_library(candidate)
+            if found:
+                openmp_lib_names.append(str(found))
+        openmp_lib_names.extend(("libgomp.so.1", "libomp.so", "libomp.so.5", "libiomp5.so"))
+
+        seen_libs: set[str] = set()
+        for lib_name in openmp_lib_names:
+            if not lib_name or lib_name in seen_libs:
+                continue
+            seen_libs.add(lib_name)
+            try:
+                openmp_lib = ctypes.CDLL(lib_name)
+            except OSError:
+                continue
+            if not hasattr(openmp_lib, "omp_set_num_threads"):
+                continue
+            try:
+                if hasattr(openmp_lib, "omp_set_dynamic"):
+                    openmp_lib.omp_set_dynamic.argtypes = [ctypes.c_int]
+                    openmp_lib.omp_set_dynamic(0)
+                openmp_lib.omp_set_num_threads.argtypes = [ctypes.c_int]
+                openmp_lib.omp_set_num_threads(int(omp_threads_int))
+                info["runtime_openmp_library"] = str(lib_name)
+                if hasattr(openmp_lib, "omp_get_max_threads"):
+                    openmp_lib.omp_get_max_threads.restype = ctypes.c_int
+                    info["runtime_openmp_max_threads"] = int(openmp_lib.omp_get_max_threads())
+                break
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    info["changes"] = changes
+    info["effective"] = effective
+    return info
 
 
 def _scalar_field_matrix(dh: DofHandler, function: Function) -> tuple[np.ndarray, np.ndarray]:
@@ -188,6 +299,10 @@ def _maybe_dump_exact_fluid_probe(
     _, w_mesh_prev_values = _vector_field_matrix(fluid["dh"], fluid["w_mesh_prev"])
     _, a_mesh_prev_values = _vector_field_matrix(fluid["dh"], fluid["a_mesh_prev"])
     _, a_prev_values = _vector_field_matrix(fluid["dh"], fluid["a_prev"])
+    if "a_k" in fluid and fluid["a_k"] is not None:
+        _, a_k_values = _vector_field_matrix(fluid["dh"], fluid["a_k"])
+    else:
+        a_k_values = np.asarray(a_prev_values, dtype=float)
     if "w_mesh_k" in fluid and "a_mesh_k" in fluid:
         _, w_mesh_values = _vector_field_matrix(fluid["dh"], fluid["w_mesh_k"])
         _, a_mesh_values = _vector_field_matrix(fluid["dh"], fluid["a_mesh_k"])
@@ -215,22 +330,172 @@ def _maybe_dump_exact_fluid_probe(
         "w_mesh_prev_values": np.asarray(w_mesh_prev_values, dtype=float),
         "a_mesh_prev_values": np.asarray(a_mesh_prev_values, dtype=float),
         "a_prev_values": np.asarray(a_prev_values, dtype=float),
+        "a_k_values": np.asarray(a_k_values, dtype=float),
         "w_mesh_values": np.asarray(w_mesh_values, dtype=float),
         "a_mesh_values": np.asarray(a_mesh_values, dtype=float),
     }
     dvms_state = fluid.get("dvms_state")
     if isinstance(dvms_state, FluidDVMSState):
+        payload["dvms_sample_coords"] = np.asarray(dvms_state.sample_coords, dtype=float)
+        payload["dvms_sample_element_ids"] = np.asarray(dvms_state.sample_element_ids, dtype=int)
         payload["dvms_old_subscale_velocity"] = np.asarray(dvms_state.old_subscale_velocity, dtype=float)
         payload["dvms_predicted_subscale_velocity"] = np.asarray(dvms_state.predicted_subscale_velocity, dtype=float)
         payload["dvms_momentum_projection"] = np.asarray(dvms_state.momentum_projection, dtype=float)
         payload["dvms_mass_projection"] = np.asarray(dvms_state.mass_projection, dtype=float)
         payload["dvms_old_mass_residual"] = np.asarray(dvms_state.old_mass_residual, dtype=float)
+        nodal_momentum_projection = getattr(dvms_state, "_nodal_momentum_projection", None)
+        nodal_div_projection = getattr(dvms_state, "_nodal_div_projection", None)
+        prev_nodal_div_projection = getattr(dvms_state, "_prev_nodal_div_projection", None)
+        if nodal_momentum_projection is not None or nodal_div_projection is not None or prev_nodal_div_projection is not None:
+            dh = fluid["dh"]
+            try:
+                dh._ensure_dof_coords()
+                ux_ids = np.asarray(dh.get_field_slice("ux"), dtype=int).reshape(-1)
+                payload["dvms_projection_coords"] = np.asarray(dh._dof_coords[ux_ids], dtype=float)
+            except Exception:
+                pass
+        if nodal_momentum_projection is not None:
+            payload["dvms_nodal_momentum_projection"] = np.asarray(nodal_momentum_projection, dtype=float)
+        if nodal_div_projection is not None:
+            payload["dvms_nodal_div_projection"] = np.asarray(nodal_div_projection, dtype=float)
+        if prev_nodal_div_projection is not None:
+            payload["dvms_prev_nodal_div_projection"] = np.asarray(prev_nodal_div_projection, dtype=float)
     if reaction_point_load_lookup is not None:
         payload["reaction_point_coords"] = np.asarray(reaction_point_load_lookup.coords, dtype=float)
         payload["reaction_point_values"] = np.asarray(reaction_point_load_lookup.values, dtype=float)
     if reaction_solid_load_lookup is not None:
         payload["reaction_solid_coords"] = np.asarray(reaction_solid_load_lookup.coords, dtype=float)
         payload["reaction_solid_values"] = np.asarray(reaction_solid_load_lookup.values, dtype=float)
+    np.savez(probe_dir / f"step{int(step):04d}_iter{int(coupling_iter):04d}_{str(stage_label)}.npz", **payload)
+    abort_stage = str(os.getenv("PYCUTFEM_EX2_DUMP_FLUID_ABORT_AFTER_STAGE", "") or "").strip()
+    if abort_stage and abort_stage == str(stage_label):
+        raise RuntimeError(f"Aborting after requested fluid debug probe stage {stage_label!r}.")
+
+
+def _maybe_dump_structure_stage_probe(
+    *,
+    output_dir: Path,
+    step: int,
+    coupling_iter: int,
+    stage_label: str,
+    dt: float,
+    solid: dict[str, object],
+    interface_tag: str,
+    structure_load_lookup: CoordinateLookup | None,
+    point_load_full: np.ndarray | None,
+) -> None:
+    flag = str(os.getenv("PYCUTFEM_EX2_DUMP_STRUCTURE_STAGE", "0") or "0").strip().lower()
+    if flag not in {"1", "true", "yes"}:
+        return
+    target_step = int(os.getenv("PYCUTFEM_EX2_DUMP_STRUCTURE_STEP", "1") or "1")
+    target_iter = int(os.getenv("PYCUTFEM_EX2_DUMP_STRUCTURE_ITER", "1") or "1")
+    if int(step) != target_step or int(coupling_iter) != target_iter:
+        return
+
+    probe_dir = Path(output_dir) / "debug_structure_stage"
+    probe_dir.mkdir(parents=True, exist_ok=True)
+    coords_ref = np.asarray(solid["mesh"].nodes_x_y_pos, dtype=float)
+    disp_values = _vector_point_data_from_function(solid["dh"], solid["d_k"])
+    disp_prev_values = _vector_point_data_from_function(solid["dh"], solid["d_prev"])
+    iface_coords_ref, iface_disp_values = _boundary_vector_snapshot(
+        solid["dh"],
+        solid["d_k"],
+        str(interface_tag),
+    )
+    dt_value = max(float(dt), 1.0e-14)
+    vel_values = (disp_values - disp_prev_values) / dt_value
+    payload: dict[str, np.ndarray] = {
+        "step": np.asarray(int(step), dtype=int),
+        "coupling_iter": np.asarray(int(coupling_iter), dtype=int),
+        "node_ids": _mesh_node_ids(solid["mesh"]),
+        "coords_ref": coords_ref,
+        "coords_cur": coords_ref + disp_values,
+        "displacement_nodal_values": np.asarray(disp_values, dtype=float),
+        "displacement_prev_nodal_values": np.asarray(disp_prev_values, dtype=float),
+        "displacement_raw_values": np.asarray(solid["d_k"].nodal_values, dtype=float).copy(),
+        "displacement_prev_raw_values": np.asarray(solid["d_prev"].nodal_values, dtype=float).copy(),
+        "velocity_nodal_values": np.asarray(vel_values, dtype=float),
+        "interface_disp_coords_ref": np.asarray(iface_coords_ref, dtype=float),
+        "interface_disp_values": np.asarray(iface_disp_values, dtype=float),
+    }
+    if point_load_full is not None:
+        payload["point_load_nodal_values"] = _nodal_vector_point_data_from_global_values(
+            solid["dh"],
+            vector=solid["d_k"],
+            global_values=np.asarray(point_load_full, dtype=float),
+        )
+    if structure_load_lookup is not None:
+        payload["structure_load_coords_ref"] = np.asarray(structure_load_lookup.coords, dtype=float)
+        payload["structure_load_values"] = np.asarray(structure_load_lookup.values, dtype=float)
+    np.savez(probe_dir / f"step{int(step):04d}_iter{int(coupling_iter):04d}_{str(stage_label)}.npz", **payload)
+
+
+def _maybe_dump_coupling_update_probe(
+    *,
+    output_dir: Path,
+    step: int,
+    coupling_iter: int,
+    stage_label: str,
+    current_load_lookup: CoordinateLookup,
+    returned_accel_load_lookup: CoordinateLookup,
+    next_load_lookup: CoordinateLookup | None,
+    load_guess_history: list[np.ndarray],
+    load_return_history: list[np.ndarray],
+    iqn_old_dr_mats: list[np.ndarray],
+    iqn_old_dg_mats: list[np.ndarray],
+    omega_force: float,
+    active_force_update: str,
+    force_iteration_horizon: int,
+    force_regularization: float,
+    accel_backend: str,
+    v_new: np.ndarray | None,
+    w_new: np.ndarray | None,
+) -> None:
+    flag = str(os.getenv("PYCUTFEM_EX2_DUMP_COUPLING_STATE", "0") or "0").strip().lower()
+    if flag not in {"1", "true", "yes"}:
+        return
+    target_step = int(os.getenv("PYCUTFEM_EX2_DUMP_COUPLING_STEP", "1") or "1")
+    target_iter = int(os.getenv("PYCUTFEM_EX2_DUMP_COUPLING_ITER", "1") or "1")
+    if int(step) != target_step or int(coupling_iter) != target_iter:
+        return
+
+    probe_dir = Path(output_dir) / "debug_coupling_update"
+    probe_dir.mkdir(parents=True, exist_ok=True)
+    current_values = np.asarray(current_load_lookup.values, dtype=float)
+    returned_values = np.asarray(returned_accel_load_lookup.values, dtype=float)
+    payload: dict[str, np.ndarray] = {
+        "step": np.asarray(int(step), dtype=int),
+        "coupling_iter": np.asarray(int(coupling_iter), dtype=int),
+        "omega_force": np.asarray(float(omega_force), dtype=float),
+        "force_iteration_horizon": np.asarray(int(force_iteration_horizon), dtype=int),
+        "force_regularization": np.asarray(float(force_regularization), dtype=float),
+        "current_load_coords_ref": np.asarray(current_load_lookup.coords, dtype=float),
+        "current_load_values": np.asarray(current_values, dtype=float),
+        "returned_load_coords_ref": np.asarray(returned_accel_load_lookup.coords, dtype=float),
+        "returned_load_values": np.asarray(returned_values, dtype=float),
+        "returned_load_residual": np.asarray(returned_values - current_values, dtype=float),
+        "load_guess_history_count": np.asarray(int(len(load_guess_history)), dtype=int),
+        "load_return_history_count": np.asarray(int(len(load_return_history)), dtype=int),
+        "iqn_old_dr_count": np.asarray(int(len(iqn_old_dr_mats)), dtype=int),
+        "iqn_old_dg_count": np.asarray(int(len(iqn_old_dg_mats)), dtype=int),
+        "active_force_update_ascii": np.asarray([ord(ch) for ch in str(active_force_update)], dtype=np.int64),
+        "accel_backend_ascii": np.asarray([ord(ch) for ch in str(accel_backend)], dtype=np.int64),
+    }
+    if next_load_lookup is not None:
+        payload["next_load_coords_ref"] = np.asarray(next_load_lookup.coords, dtype=float)
+        payload["next_load_values"] = np.asarray(next_load_lookup.values, dtype=float)
+    if v_new is not None:
+        payload["v_new"] = np.asarray(v_new, dtype=float)
+    if w_new is not None:
+        payload["w_new"] = np.asarray(w_new, dtype=float)
+    for idx, values in enumerate(list(load_guess_history)):
+        payload[f"load_guess_history_{idx}"] = np.asarray(values, dtype=float)
+    for idx, values in enumerate(list(load_return_history)):
+        payload[f"load_return_history_{idx}"] = np.asarray(values, dtype=float)
+    for idx, mat in enumerate(list(iqn_old_dr_mats)):
+        payload[f"iqn_old_dr_{idx}"] = np.asarray(mat, dtype=float)
+    for idx, mat in enumerate(list(iqn_old_dg_mats)):
+        payload[f"iqn_old_dg_{idx}"] = np.asarray(mat, dtype=float)
     np.savez(probe_dir / f"step{int(step):04d}_iter{int(coupling_iter):04d}_{str(stage_label)}.npz", **payload)
 
 
@@ -298,12 +563,18 @@ class _FluidDVMSSolverOperator(FluidDVMSSolverOperator):
         self._reset_predicted_on_step_begin_once = bool(self.reset_predicted_to_old_on_step_begin)
         self._first_assembly_probe: dict[str, object] | None = None
         self._first_assembly_probe_dumped = False
+        self._probe_dumped_stage_labels: set[str] = set()
         super().__init__(**kwargs)
 
     def arm_initial_old_subscale_build(self) -> None:
         """Use old-step subscale data on the next solver step-begin only."""
         self._skip_refresh_once = True
         self._reset_predicted_on_step_begin_once = True
+
+    def preserve_initial_predicted_subscale(self) -> None:
+        """Keep the current predicted subscale for the next first assembly only."""
+        self._skip_refresh_once = True
+        self._reset_predicted_on_step_begin_once = False
 
     def configure_first_assembly_probe(
         self,
@@ -324,9 +595,13 @@ class _FluidDVMSSolverOperator(FluidDVMSSolverOperator):
             "bossak_alpha": float(bossak_alpha),
         }
         self._first_assembly_probe_dumped = False
+        self._probe_dumped_stage_labels = set()
 
     def _dump_first_assembly_probe(self, *, stage_label: str) -> None:
-        if self._first_assembly_probe is None or self._first_assembly_probe_dumped:
+        if self._first_assembly_probe is None:
+            return
+        stage_key = str(stage_label)
+        if stage_key in self._probe_dumped_stage_labels:
             return
         probe = self._first_assembly_probe
         _maybe_dump_exact_fluid_probe(
@@ -347,13 +622,16 @@ class _FluidDVMSSolverOperator(FluidDVMSSolverOperator):
                 "w_mesh_prev": self.mesh_v_prev,
                 "a_mesh_prev": self.mesh_a_prev,
                 "a_prev": self.a_prev,
+                "a_k": self.a_curr,
                 "w_mesh_k": self.mesh_v,
                 "dvms_state": self.state,
             },
             reaction_point_load_lookup=None,
             reaction_solid_load_lookup=None,
         )
-        self._first_assembly_probe_dumped = True
+        self._probe_dumped_stage_labels.add(stage_key)
+        if stage_key in {"first_assembly_skip_refresh", "first_assembly_after_refresh"}:
+            self._first_assembly_probe_dumped = True
 
     def on_step_begin(
         self,
@@ -379,11 +657,95 @@ class _FluidDVMSSolverOperator(FluidDVMSSolverOperator):
 
     def before_assembly(self, *, solver, coeffs, need_matrix: bool) -> None:
         if self._skip_refresh_once:
+            self._dump_first_assembly_probe(stage_label="before_predictor_refresh")
             self._dump_first_assembly_probe(stage_label="first_assembly_skip_refresh")
             self._skip_refresh_once = False
             return
+        if bool(need_matrix):
+            self._dump_first_assembly_probe(stage_label="before_predictor_refresh")
         super().before_assembly(solver=solver, coeffs=coeffs, need_matrix=need_matrix)
+        if bool(need_matrix):
+            self._dump_first_assembly_probe(stage_label="after_predictor_refresh")
         self._dump_first_assembly_probe(stage_label="first_assembly_after_refresh")
+
+    def after_nonlinear_update(self, *, solver, functions) -> None:
+        super().after_nonlinear_update(solver=solver, functions=functions)
+        self._dump_first_assembly_probe(stage_label="after_oss_projection_update")
+
+
+class _FluidBossakAccelerationOperator(RuntimeOperator):
+    """Seed Kratos-style prefluid acceleration, then update with accepted-step Bossak history."""
+
+    def __init__(
+        self,
+        *,
+        u_k: VectorFunction,
+        a_k: VectorFunction,
+        dt: float,
+        bossak_alpha: float,
+    ) -> None:
+        self.u_k = u_k
+        self.a_k = a_k
+        coeffs = _bossak_coefficients(alpha=float(bossak_alpha), dt=max(float(dt), 1.0e-14))
+        self.ma0 = float(coeffs["ma0"])
+        self.ma2 = float(coeffs["ma2"])
+        self._accepted_u_prev_snapshot: np.ndarray | None = None
+        self._accepted_a_prev_snapshot: np.ndarray | None = None
+        self._preserve_seed_on_first_assembly = True
+        self._first_assembly_pending = True
+
+    def prime_stage_state(
+        self,
+        *,
+        u_prev_snapshot: np.ndarray,
+        a_prev_snapshot: np.ndarray,
+        preserve_seed_on_first_assembly: bool = True,
+    ) -> None:
+        self._accepted_u_prev_snapshot = np.asarray(u_prev_snapshot, dtype=float).copy()
+        self._accepted_a_prev_snapshot = np.asarray(a_prev_snapshot, dtype=float).copy()
+        self._preserve_seed_on_first_assembly = bool(preserve_seed_on_first_assembly)
+        self._first_assembly_pending = True
+
+    def update_current_acceleration(self) -> None:
+        if self._accepted_u_prev_snapshot is None or self._accepted_a_prev_snapshot is None:
+            self._accepted_u_prev_snapshot = np.zeros_like(np.asarray(self.u_k.nodal_values, dtype=float))
+            self._accepted_a_prev_snapshot = np.zeros_like(np.asarray(self.a_k.nodal_values, dtype=float))
+        self.a_k.nodal_values[:] = (
+            float(self.ma0)
+            * (np.asarray(self.u_k.nodal_values, dtype=float) - np.asarray(self._accepted_u_prev_snapshot, dtype=float))
+            + float(self.ma2) * np.asarray(self._accepted_a_prev_snapshot, dtype=float)
+        )
+
+    def on_step_begin(
+        self,
+        *,
+        solver,
+        functions,
+        prev_functions,
+        aux_functions,
+        step: int,
+        step_no: int,
+        t: float,
+        dt: float,
+        bcs,
+    ) -> None:
+        del solver, functions, prev_functions, aux_functions, step, step_no, t, dt, bcs
+        if self._accepted_u_prev_snapshot is None:
+            self._accepted_u_prev_snapshot = np.zeros_like(np.asarray(self.u_k.nodal_values, dtype=float))
+        if self._accepted_a_prev_snapshot is None:
+            self._accepted_a_prev_snapshot = np.zeros_like(np.asarray(self.a_k.nodal_values, dtype=float))
+
+    def before_assembly(self, *, solver, coeffs, need_matrix: bool) -> None:
+        del solver, coeffs, need_matrix
+        if self._first_assembly_pending and bool(self._preserve_seed_on_first_assembly):
+            self._first_assembly_pending = False
+            return
+        self._first_assembly_pending = False
+        self.update_current_acceleration()
+
+    def after_nonlinear_update(self, *, solver, functions) -> None:
+        del solver, functions
+        self.update_current_acceleration()
 
 
 class _ReducedResidualShiftOperator(RuntimeOperator):
@@ -404,7 +766,8 @@ class _ReducedResidualShiftOperator(RuntimeOperator):
 
 def _fluid_cauchy_stress_ufl(*, p, grad_u_phys, div_u_phys, mu_const):
     identity = Identity(2)
-    viscous = mu_const * (grad_u_phys + grad_u_phys.T - _EX2L_TWO_THIRDS * div_u_phys * identity)
+    strain_rate = _EX2L_HALF * (grad_u_phys + grad_u_phys.T)
+    viscous = _EX2_TWO * mu_const * (strain_rate - (_EX2L_HALF * _EX2_TWO_THIRDS) * div_u_phys * identity)
     return -p * identity + viscous
 
 
@@ -412,7 +775,8 @@ def _fluid_cauchy_stress_numpy(*, p_val: float, grad_u_phys: np.ndarray, div_u_p
     identity = np.eye(2, dtype=float)
     grad_u_arr = np.asarray(grad_u_phys, dtype=float).reshape(2, 2)
     div_val = float(div_u_phys)
-    viscous = float(mu_f) * (grad_u_arr + grad_u_arr.T - (2.0 / 3.0) * div_val * identity)
+    strain_rate = 0.5 * (grad_u_arr + grad_u_arr.T)
+    viscous = 2.0 * float(mu_f) * (strain_rate - (1.0 / 3.0) * div_val * identity)
     return -float(p_val) * identity + viscous
 
 
@@ -501,6 +865,670 @@ def _solve_linear(
     dh.apply_bcs(bcs, *functions)
 
 
+def _solve_sparse_linear_system(
+    *,
+    A,
+    rhs: np.ndarray,
+    linear_backend: str,
+    solve_mode: str = "direct",
+    initial_guess: np.ndarray | None = None,
+) -> np.ndarray:
+    import scipy.sparse as sp
+    from scipy.sparse.linalg import bicgstab, spsolve
+
+    rhs_arr = np.asarray(rhs, dtype=float).reshape(-1)
+    if rhs_arr.size == 0:
+        return rhs_arr.copy()
+
+    A_csr = A.tocsr() if hasattr(A, "tocsr") else sp.csr_matrix(np.asarray(A, dtype=float))
+    mode = str(solve_mode or "direct").strip().lower()
+    backend_name = str(linear_backend or "scipy").strip().lower()
+    guess_arr = None if initial_guess is None else np.asarray(initial_guess, dtype=float).reshape(-1).copy()
+    if guess_arr is not None and guess_arr.size != rhs_arr.size:
+        raise ValueError(
+            "initial_guess size does not match the linear-system RHS: "
+            f"expected {rhs_arr.size}, got {guess_arr.size}."
+        )
+
+    if mode in {"amgcl", "pycutfem_amgcl", "cpp_amgcl", "local_amgcl"}:
+        from pycutfem.linalg import AMGCLSettings, solve_sparse_amgcl
+
+        rel_tol = float(_env_float("PYCUTFEM_EX2_MESH_LINEAR_RTOL", 1.0e-7))
+        max_it = int(_env_float("PYCUTFEM_EX2_MESH_LINEAR_MAX_IT", 200))
+        gmres_dim = int(_env_float("PYCUTFEM_EX2_MESH_LINEAR_GMRES_DIM", 100))
+        block_size_raw = _env_str("PYCUTFEM_EX2_MESH_LINEAR_BLOCK_SIZE", "1").strip().lower()
+        if block_size_raw == "auto":
+            block_size_value = 1
+        else:
+            block_size_value = max(1, int(float(block_size_raw)))
+        coarse_enough = int(_env_float("PYCUTFEM_EX2_MESH_LINEAR_COARSE_ENOUGH", 5000))
+
+        sol, report = solve_sparse_amgcl(
+            A_csr,
+            rhs_arr,
+            x0=guess_arr,
+            params=AMGCLSettings(
+                preconditioner_type="amg",
+                smoother_type="ilu0",
+                krylov_type="gmres",
+                coarsening_type="aggregation",
+                tolerance=float(rel_tol),
+                max_iteration=int(max_it),
+                gmres_krylov_space_dimension=int(gmres_dim),
+                verbosity=0,
+                scaling=False,
+                block_size=int(block_size_value),
+                use_block_matrices_if_possible=True,
+                coarse_enough=int(coarse_enough),
+            ),
+        )
+        sol = np.asarray(sol, dtype=float).reshape(-1)
+        if not bool(report.converged) or not np.all(np.isfinite(sol)):
+            raise RuntimeError(
+                "mesh-extension AMGCL solve did not converge "
+                f"(iterations={int(report.iterations)}, residual={float(report.residual_norm):.3e}, "
+                f"backend={backend_name}, mode={mode})."
+            )
+        return sol
+
+    if mode in {"kratos_amgcl", "kratos_like"}:
+        import KratosMultiphysics as KM
+        from KratosMultiphysics.python_linear_solver_factory import ConstructSolver
+
+        rel_tol = float(_env_float("PYCUTFEM_EX2_MESH_LINEAR_RTOL", 1.0e-7))
+        max_it = int(_env_float("PYCUTFEM_EX2_MESH_LINEAR_MAX_IT", 200))
+        gmres_dim = int(_env_float("PYCUTFEM_EX2_MESH_LINEAR_GMRES_DIM", 100))
+        block_size_raw = _env_str("PYCUTFEM_EX2_MESH_LINEAR_BLOCK_SIZE", "1").strip().lower()
+        coarse_enough = int(_env_float("PYCUTFEM_EX2_MESH_LINEAR_COARSE_ENOUGH", 5000))
+        if block_size_raw == "auto":
+            block_size_value: int | str = "auto"
+        else:
+            block_size_value = max(1, int(float(block_size_raw)))
+
+        A_kratos = KM.CompressedMatrix(int(A_csr.shape[0]), int(A_csr.shape[1]))
+        A_coo = A_csr.tocoo()
+        for row, col, value in zip(
+            A_coo.row.tolist(),
+            A_coo.col.tolist(),
+            A_coo.data.tolist(),
+            strict=False,
+        ):
+            A_kratos[int(row), int(col)] = float(value)
+
+        b_kratos = KM.Vector(int(rhs_arr.size))
+        x_kratos = KM.Vector(int(rhs_arr.size))
+        for idx, value in enumerate(rhs_arr.tolist()):
+            b_kratos[int(idx)] = float(value)
+            x_kratos[int(idx)] = 0.0 if guess_arr is None else float(guess_arr[int(idx)])
+
+        settings = {
+            "solver_type": "amgcl",
+            "krylov_type": "gmres",
+            "smoother_type": "ilu0",
+            "coarsening_type": "aggregation",
+            "tolerance": float(rel_tol),
+            "max_iteration": int(max_it),
+            "gmres_krylov_space_dimension": int(gmres_dim),
+            "verbosity": 0,
+            "provide_coordinates": False,
+            "scaling": False,
+            "use_block_matrices_if_possible": True,
+            "coarse_enough": int(coarse_enough),
+        }
+        if block_size_value != "auto":
+            settings["block_size"] = int(block_size_value)
+        solver = ConstructSolver(KM.Parameters(json.dumps(settings)))
+        solver.Solve(A_kratos, x_kratos, b_kratos)
+        return np.asarray([float(x_kratos[i]) for i in range(int(rhs_arr.size))], dtype=float)
+
+    if mode in {"petsc_gmres_ilu", "petsc_gmres"}:
+        try:
+            from petsc4py import PETSc  # type: ignore
+        except Exception as exc:  # pragma: no cover - environment-specific
+            raise RuntimeError(
+                "petsc4py is required for mesh solve mode "
+                f"{mode!r}."
+            ) from exc
+
+        rel_tol = float(_env_float("PYCUTFEM_EX2_MESH_LINEAR_RTOL", 1.0e-7))
+        abs_tol = float(_env_float("PYCUTFEM_EX2_MESH_LINEAR_ATOL", 0.0))
+        max_it = int(_env_float("PYCUTFEM_EX2_MESH_LINEAR_MAX_IT", 200))
+        gmres_dim = int(_env_float("PYCUTFEM_EX2_MESH_LINEAR_GMRES_DIM", 100))
+
+        mat = PETSc.Mat().createAIJ(
+            size=A_csr.shape,
+            csr=(
+                A_csr.indptr.astype(PETSc.IntType, copy=False),
+                A_csr.indices.astype(PETSc.IntType, copy=False),
+                np.asarray(A_csr.data, dtype=float),
+            ),
+            comm=PETSc.COMM_SELF,
+        )
+        mat.assemblyBegin()
+        mat.assemblyEnd()
+
+        b = PETSc.Vec().createSeq(A_csr.shape[0], comm=PETSc.COMM_SELF)
+        x = PETSc.Vec().createSeq(A_csr.shape[0], comm=PETSc.COMM_SELF)
+        idx = np.arange(A_csr.shape[0], dtype=PETSc.IntType)
+        b.setValues(idx, rhs_arr, addv=PETSc.InsertMode.INSERT_VALUES)
+        b.assemblyBegin()
+        b.assemblyEnd()
+        if guess_arr is not None:
+            x.setValues(idx, guess_arr, addv=PETSc.InsertMode.INSERT_VALUES)
+            x.assemblyBegin()
+            x.assemblyEnd()
+
+        ksp = PETSc.KSP().create(comm=PETSc.COMM_SELF)
+        ksp.setOperators(mat)
+        ksp.setType("gmres")
+        ksp.setTolerances(rtol=rel_tol, atol=abs_tol, max_it=max_it)
+        ksp.setGMRESRestart(gmres_dim)
+        pc = ksp.getPC()
+        pc.setType("ilu")
+        try:
+            pc.setFactorLevels(0)
+        except Exception:
+            pass
+        if guess_arr is not None:
+            ksp.setInitialGuessNonzero(True)
+        ksp.setFromOptions()
+        ksp.solve(b, x)
+        reason = int(ksp.getConvergedReason())
+        sol = x.getArray(readonly=True).copy()
+        if reason < 0 or not np.all(np.isfinite(sol)):
+            raise RuntimeError(
+                "mesh-extension PETSc GMRES+ILU solve did not converge "
+                f"(reason={reason}, backend={backend_name}, mode={mode})."
+            )
+        return np.asarray(sol, dtype=float).reshape(-1)
+
+    if mode in {"iterative", "bicgstab_ilu"}:
+        from pycutfem.linalg.preconditioners import build_subsolver
+
+        rel_tol = float(_env_float("PYCUTFEM_EX2_MESH_LINEAR_RTOL", 1.0e-7))
+        max_it = int(_env_float("PYCUTFEM_EX2_MESH_LINEAR_MAX_IT", 200))
+        ilu_drop_tol = float(_env_float("PYCUTFEM_EX2_MESH_LINEAR_ILU_DROP_TOL", 0.0))
+        ilu_fill_factor = float(_env_float("PYCUTFEM_EX2_MESH_LINEAR_ILU_FILL_FACTOR", 1.0))
+
+        pre = build_subsolver(
+            A_csr,
+            {
+                "kind": "ilu",
+                "drop_tol": ilu_drop_tol,
+                "fill_factor": ilu_fill_factor,
+            },
+        )
+        precond = sp.linalg.LinearOperator(A_csr.shape, matvec=pre.solve, dtype=float)
+        sol, info = bicgstab(
+            A_csr,
+            rhs_arr,
+            x0=guess_arr,
+            rtol=rel_tol,
+            atol=0.0,
+            maxiter=max_it,
+            M=precond,
+        )
+        sol = np.asarray(sol, dtype=float).reshape(-1)
+        if int(info) != 0 or not np.all(np.isfinite(sol)):
+            raise RuntimeError(
+                "mesh-extension iterative solve did not converge "
+                f"(info={int(info)}, backend={backend_name}, mode={mode})."
+            )
+        return sol
+
+    if backend_name == "petsc":
+        try:
+            from petsc4py import PETSc  # type: ignore
+        except Exception as exc:  # pragma: no cover - environment-specific
+            raise RuntimeError("petsc4py is required for linear_backend='petsc'.") from exc
+
+        mat = PETSc.Mat().createAIJ(
+            size=A_csr.shape,
+            csr=(
+                A_csr.indptr.astype(PETSc.IntType, copy=False),
+                A_csr.indices.astype(PETSc.IntType, copy=False),
+                np.asarray(A_csr.data, dtype=float),
+            ),
+            comm=PETSc.COMM_SELF,
+        )
+        mat.assemblyBegin()
+        mat.assemblyEnd()
+        b = PETSc.Vec().createSeq(A_csr.shape[0], comm=PETSc.COMM_SELF)
+        x = PETSc.Vec().createSeq(A_csr.shape[0], comm=PETSc.COMM_SELF)
+        idx = np.arange(A_csr.shape[0], dtype=PETSc.IntType)
+        b.setValues(idx, rhs_arr, addv=PETSc.InsertMode.INSERT_VALUES)
+        b.assemblyBegin()
+        b.assemblyEnd()
+        ksp = PETSc.KSP().create(comm=PETSc.COMM_SELF)
+        ksp.setOperators(mat)
+        ksp.setType("preonly")
+        ksp.getPC().setType("lu")
+        ksp.setFromOptions()
+        ksp.solve(b, x)
+        sol = x.getArray(readonly=True).copy()
+        if np.all(np.isfinite(sol)):
+            return np.asarray(sol, dtype=float).reshape(-1)
+
+    sol = spsolve(A_csr, rhs_arr)
+    sol = np.asarray(sol, dtype=float).reshape(-1)
+    if not np.all(np.isfinite(sol)):
+        raise RuntimeError(f"sparse solve returned non-finite values for backend={backend_name}, mode={mode}.")
+    return sol
+
+
+def _mesh_linear_amgcl_settings_from_env():
+    from pycutfem.linalg import AMGCLSettings
+
+    rel_tol = float(_env_float("PYCUTFEM_EX2_MESH_LINEAR_RTOL", 1.0e-7))
+    max_it = int(_env_float("PYCUTFEM_EX2_MESH_LINEAR_MAX_IT", 200))
+    gmres_dim = int(_env_float("PYCUTFEM_EX2_MESH_LINEAR_GMRES_DIM", 100))
+    block_size_raw = _env_str("PYCUTFEM_EX2_MESH_LINEAR_BLOCK_SIZE", "auto").strip().lower()
+    if block_size_raw in {"", "auto"}:
+        # The mesh-moving solver in ProjectParametersCFD.json pins AMGCL to
+        # block_size = 1. Keep the local default aligned with that production
+        # Kratos path; larger block sizes remain available as explicit opt-ins.
+        block_size_value = 1
+    else:
+        block_size_value = max(1, int(float(block_size_raw)))
+    coarse_enough = int(_env_float("PYCUTFEM_EX2_MESH_LINEAR_COARSE_ENOUGH", 5000))
+    return AMGCLSettings(
+        preconditioner_type="amg",
+        smoother_type="ilu0",
+        krylov_type="gmres",
+        coarsening_type="aggregation",
+        tolerance=float(rel_tol),
+        max_iteration=int(max_it),
+        gmres_krylov_space_dimension=int(gmres_dim),
+        verbosity=0,
+        scaling=False,
+        block_size=int(block_size_value),
+        use_block_matrices_if_possible=True,
+        coarse_enough=int(coarse_enough),
+    )
+
+
+def _mesh_extension_node_block_permutation(
+    dh: DofHandler,
+    *,
+    mesh: Mesh | None = None,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    total_dofs = int(dh.total_dofs)
+    node_map: dict[int, dict[str, int]] = {}
+    for gdof in range(total_dofs):
+        field_name, node_id = dh._dof_to_node_map[int(gdof)]
+        if node_id is None:
+            continue
+        node_map.setdefault(int(node_id), {})[str(field_name)] = int(gdof)
+
+    node_sort_ids: dict[int, int] = {}
+    if mesh is not None:
+        try:
+            old_node_ids = np.asarray(_mesh_node_ids(mesh), dtype=int).reshape(-1)
+            if old_node_ids.size == len(getattr(mesh, "nodes_list", ())):
+                node_sort_ids = {
+                    int(local_node_id): int(old_node_ids[int(local_node_id)])
+                    for local_node_id in node_map
+                    if 0 <= int(local_node_id) < old_node_ids.size
+                }
+        except Exception:
+            node_sort_ids = {}
+
+    perm: list[int] = []
+    for node_id in sorted(node_map, key=lambda nid: (node_sort_ids.get(int(nid), int(nid)), int(nid))):
+        entry = node_map[int(node_id)]
+        if "mx" not in entry or "my" not in entry:
+            return None
+        perm.extend([int(entry["mx"]), int(entry["my"])])
+
+    perm_arr = np.asarray(perm, dtype=int)
+    if perm_arr.size != total_dofs:
+        return None
+    inv_perm = np.empty_like(perm_arr)
+    inv_perm[perm_arr] = np.arange(total_dofs, dtype=int)
+    return perm_arr, inv_perm
+
+
+def _reference_geometry_mesh_extension_field(
+    prob: dict[str, object],
+) -> VectorFunction:
+    cached = prob.get("_mesh_extension_reference_geom")
+    if isinstance(cached, VectorFunction):
+        return cached
+
+    ref = VectorFunction("m_ref_geom", ["mx", "my"], dof_handler=prob["dh"])
+    ref.nodal_values.fill(0.0)
+    prob["_mesh_extension_reference_geom"] = ref
+    return ref
+
+
+def _cached_absolute_mesh_extension_system(
+    *,
+    prob: dict[str, object],
+    bcs: list[BoundaryCondition],
+) -> dict[str, object]:
+    import scipy.sparse as sp
+
+    dh: DofHandler = prob["dh"]
+    mesh: Mesh = dh.mixed_element.mesh
+    bc_map = dh.get_dirichlet_data(bcs) or {}
+    bc_rows = np.fromiter((int(g) for g in bc_map.keys()), dtype=int, count=len(bc_map))
+    bc_signature = tuple(sorted(int(row) for row in bc_rows.tolist()))
+
+    cache = prob.get("_mesh_extension_absolute_cache")
+    if (
+        isinstance(cache, dict)
+        and cache.get("bc_signature") == bc_signature
+        and cache.get("shape") == (int(dh.total_dofs), int(dh.total_dofs))
+    ):
+        return cache
+
+    A_raw = _assemble_structural_similarity_mesh_matrix(
+        dh=dh,
+        mesh=mesh,
+        # StructuralMeshMovingStrategy resets coordinates to the initial
+        # configuration before building the mesh system. Keep the cached local
+        # operator on that same reference geometry.
+        m_prev_geom=_reference_geometry_mesh_extension_field(prob),
+    )
+    A_raw_csr = A_raw.tocsr(copy=True) if hasattr(A_raw, "tocsr") else sp.csr_matrix(np.asarray(A_raw, dtype=float))
+    A_constrained = A_raw_csr.tolil(copy=True)
+    if bc_rows.size:
+        A_constrained[bc_rows, :] = 0.0
+        A_constrained[:, bc_rows] = 0.0
+        A_constrained[bc_rows, bc_rows] = 1.0
+    node_block_perm = _mesh_extension_node_block_permutation(dh, mesh=mesh)
+
+    cache = {
+        "shape": (int(dh.total_dofs), int(dh.total_dofs)),
+        "bc_signature": bc_signature,
+        "bc_rows": bc_rows,
+        "A_raw": A_raw_csr,
+        "A_constrained": A_constrained.tocsr(),
+        "node_block_perm": None if node_block_perm is None else node_block_perm[0],
+        "node_block_inv_perm": None if node_block_perm is None else node_block_perm[1],
+    }
+    prob["_mesh_extension_absolute_cache"] = cache
+    return cache
+
+
+def _cached_reference_mesh_extension_matrix(*, prob: dict[str, object]):
+    cache = prob.get("_mesh_extension_reference_matrix_cache")
+    dh: DofHandler = prob["dh"]
+    mesh: Mesh = dh.mixed_element.mesh
+    shape = (int(dh.total_dofs), int(dh.total_dofs))
+    if (
+        isinstance(cache, dict)
+        and cache.get("shape") == shape
+        and cache.get("mesh_elements") == int(mesh.n_elements)
+    ):
+        return cache["A_raw"]
+    A_raw = _assemble_structural_similarity_mesh_matrix(
+        dh=dh,
+        mesh=mesh,
+        # Kratos' StructuralMeshMovingStrategy resets coordinates to the
+        # initial configuration before building the mesh-motion operator.
+        m_prev_geom=_reference_geometry_mesh_extension_field(prob),
+    )
+    A_csr = A_raw.tocsr(copy=True) if hasattr(A_raw, "tocsr") else A_raw
+    cache = {
+        "shape": shape,
+        "mesh_elements": int(mesh.n_elements),
+        "A_raw": A_csr,
+    }
+    prob["_mesh_extension_reference_matrix_cache"] = cache
+    return A_csr
+
+
+def _solve_cached_absolute_mesh_extension_system(
+    *,
+    prob: dict[str, object],
+    cache: dict[str, object],
+    bcs: list[BoundaryCondition],
+    solve_mode_name: str,
+    linear_backend: str,
+) -> np.ndarray:
+    import scipy.sparse.linalg as spla
+
+    dh: DofHandler = prob["dh"]
+    total_dofs = int(dh.total_dofs)
+    bc_map = dh.get_dirichlet_data(bcs) or {}
+    bc_rows = np.asarray(cache["bc_rows"], dtype=int).reshape(-1)
+    A_raw = cache["A_raw"]
+    A_constrained = cache["A_constrained"]
+
+    rhs = np.zeros(total_dofs, dtype=float)
+    abs_guess = _global_dof_vector_from_function(dh, prob["m_k"])
+    if bc_rows.size:
+        x_bc = np.zeros(total_dofs, dtype=float)
+        bc_values = np.asarray([float(bc_map[int(row)]) for row in bc_rows.tolist()], dtype=float)
+        x_bc[bc_rows] = bc_values
+        rhs = -np.asarray(A_raw @ x_bc, dtype=float).reshape(-1)
+        rhs[bc_rows] = bc_values
+        abs_guess[bc_rows] = bc_values
+
+    mode = str(solve_mode_name).strip().lower()
+    iterative_modes = {
+        "amgcl",
+        "pycutfem_amgcl",
+        "cpp_amgcl",
+        "local_amgcl",
+        "kratos_amgcl",
+        "kratos_like",
+        "petsc_gmres_ilu",
+        "petsc_gmres",
+        "iterative",
+        "bicgstab_ilu",
+    }
+    use_kratos_order_permutation = _env_bool(
+        "PYCUTFEM_EX2_MESH_LINEAR_PERMUTE_TO_KRATOS_ORDER",
+        False,
+    )
+    perm = np.asarray(cache.get("node_block_perm"), dtype=int).reshape(-1) if cache.get("node_block_perm") is not None else None
+    use_permuted_iterative_system = bool(use_kratos_order_permutation) and perm is not None and mode in iterative_modes
+    A_iter = A_constrained
+    rhs_iter = rhs
+    guess_iter = abs_guess
+    if use_permuted_iterative_system:
+        A_iter = cache.get("A_constrained_node_order")
+        if A_iter is None:
+            A_iter = A_constrained[perm, :][:, perm].tocsr()
+            cache["A_constrained_node_order"] = A_iter
+        rhs_iter = rhs[perm]
+        guess_iter = abs_guess[perm]
+
+    if mode in {"amgcl", "pycutfem_amgcl", "cpp_amgcl", "local_amgcl"}:
+        from pycutfem.linalg import AMGCLSubsolver
+
+        amgcl_settings = _mesh_linear_amgcl_settings_from_env()
+        use_permuted_block_system = (
+            use_permuted_iterative_system
+            and int(amgcl_settings.block_size) == 2
+            and bool(amgcl_settings.use_block_matrices_if_possible)
+        )
+        A_solver = A_iter
+        rhs_solver = rhs_iter
+        guess_solver = guess_iter
+        solver_cache_key = "amgcl_subsolver"
+        if use_permuted_block_system:
+            A_solver = cache.get("A_constrained_block2")
+            if A_solver is None:
+                A_solver = A_iter
+                cache["A_constrained_block2"] = A_solver
+            solver_cache_key = "amgcl_subsolver_block2"
+        elif int(amgcl_settings.block_size) != 1:
+            amgcl_settings = type(amgcl_settings)(
+                preconditioner_type=amgcl_settings.preconditioner_type,
+                smoother_type=amgcl_settings.smoother_type,
+                krylov_type=amgcl_settings.krylov_type,
+                coarsening_type=amgcl_settings.coarsening_type,
+                tolerance=amgcl_settings.tolerance,
+                max_iteration=amgcl_settings.max_iteration,
+                gmres_krylov_space_dimension=amgcl_settings.gmres_krylov_space_dimension,
+                verbosity=amgcl_settings.verbosity,
+                scaling=amgcl_settings.scaling,
+                block_size=1,
+                use_block_matrices_if_possible=False,
+                coarse_enough=amgcl_settings.coarse_enough,
+                max_levels=amgcl_settings.max_levels,
+                pre_sweeps=amgcl_settings.pre_sweeps,
+                post_sweeps=amgcl_settings.post_sweeps,
+            )
+        amgcl_signature = (
+            float(amgcl_settings.tolerance),
+            int(amgcl_settings.max_iteration),
+            int(amgcl_settings.gmres_krylov_space_dimension),
+            int(amgcl_settings.block_size),
+            bool(amgcl_settings.use_block_matrices_if_possible),
+            int(amgcl_settings.coarse_enough),
+            int(amgcl_settings.max_levels),
+            int(amgcl_settings.pre_sweeps),
+            int(amgcl_settings.post_sweeps),
+        )
+        solver = cache.get(solver_cache_key)
+        if solver is None or cache.get("amgcl_signature") != amgcl_signature:
+            solver = AMGCLSubsolver(A_solver, params=amgcl_settings)
+            cache[solver_cache_key] = solver
+            cache["amgcl_signature"] = amgcl_signature
+        solution = np.asarray(solver.solve(rhs_solver, x0=guess_solver), dtype=float).reshape(-1)
+        if use_permuted_iterative_system:
+            unpermuted = np.empty_like(solution)
+            unpermuted[perm] = solution
+            return unpermuted
+        return solution
+
+    if mode == "direct":
+        factor = cache.get("direct_factor")
+        if factor is None:
+            factor = spla.factorized(A_constrained.tocsc())
+            cache["direct_factor"] = factor
+        return np.asarray(factor(rhs), dtype=float).reshape(-1)
+
+    solution = _solve_sparse_linear_system(
+        A=A_iter,
+        rhs=rhs_iter,
+        linear_backend=str(linear_backend),
+        solve_mode=mode,
+        initial_guess=guess_iter,
+    )
+    if use_permuted_iterative_system:
+        unpermuted = np.empty_like(np.asarray(solution, dtype=float).reshape(-1))
+        unpermuted[perm] = np.asarray(solution, dtype=float).reshape(-1)
+        return unpermuted
+    return solution
+
+
+def _mesh_extension_dirichlet_bcs(
+    *,
+    interface_disp: CoordinateLookup,
+    interface_tag: str,
+    fixed_tags: tuple[str, ...],
+) -> list[BoundaryCondition]:
+    zero = lambda x, y, t=0.0: 0.0
+    return [
+        *[BoundaryCondition("mx", "dirichlet", tag, zero) for tag in fixed_tags],
+        *[BoundaryCondition("my", "dirichlet", tag, zero) for tag in fixed_tags],
+        BoundaryCondition("mx", "dirichlet", interface_tag, interface_disp.component(0)),
+        BoundaryCondition("my", "dirichlet", interface_tag, interface_disp.component(1)),
+    ]
+
+
+def _apply_kratos_block_builder_dirichlet(
+    *,
+    A_raw,
+    rhs: np.ndarray,
+    fixed_rows: np.ndarray,
+) -> tuple["sp.csr_matrix", np.ndarray]:
+    import scipy.sparse as sp
+
+    A_csr = A_raw.tocsr(copy=True) if hasattr(A_raw, "tocsr") else sp.csr_matrix(np.asarray(A_raw, dtype=float))
+    rhs_out = np.asarray(rhs, dtype=float).reshape(-1).copy()
+    if rhs_out.size != int(A_csr.shape[0]):
+        raise ValueError(
+            "Kratos-like Dirichlet application expected rhs size "
+            f"{int(A_csr.shape[0])}, got {rhs_out.size}."
+        )
+
+    data = A_csr.data
+    indices = A_csr.indices
+    indptr = A_csr.indptr
+    nrows = int(A_csr.shape[0])
+    fixed_mask = np.zeros(nrows, dtype=bool)
+    fixed_mask[np.asarray(fixed_rows, dtype=int).reshape(-1)] = True
+
+    diag = np.asarray(A_csr.diagonal(), dtype=float).reshape(-1)
+    scale_factor = float(np.max(np.abs(diag))) if diag.size else 1.0
+    if not np.isfinite(scale_factor) or scale_factor <= 0.0:
+        scale_factor = 1.0
+    zero_tolerance = float(np.finfo(float).eps)
+
+    for i in range(nrows):
+        start = int(indptr[i])
+        end = int(indptr[i + 1])
+        row_cols = indices[start:end]
+        row_vals = data[start:end]
+        if row_vals.size == 0:
+            continue
+        if not np.any(np.abs(row_vals) > zero_tolerance):
+            diag_pos = np.flatnonzero(row_cols == i)
+            if diag_pos.size:
+                row_vals[int(diag_pos[0])] = scale_factor
+            rhs_out[i] = 0.0
+
+    for i in range(nrows):
+        start = int(indptr[i])
+        end = int(indptr[i + 1])
+        row_cols = indices[start:end]
+        row_vals = data[start:end]
+        if fixed_mask[i]:
+            keep_diag = row_cols == i
+            row_vals[~keep_diag] = 0.0
+            rhs_out[i] = 0.0
+        else:
+            row_vals[fixed_mask[row_cols]] = 0.0
+
+    return A_csr, rhs_out
+
+
+def _assemble_mesh_extension_increment_system(
+    *,
+    A_raw,
+    dh: DofHandler,
+    bcs: list[BoundaryCondition],
+    current_state: np.ndarray | None = None,
+    kratos_builder_dirichlet: bool = False,
+) -> tuple["sp.csr_matrix", np.ndarray, np.ndarray]:
+    bc_map = dh.get_dirichlet_data(bcs) or {}
+    if current_state is None:
+        x_curr = np.zeros(int(dh.total_dofs), dtype=float)
+    else:
+        x_curr = np.asarray(current_state, dtype=float).reshape(-1).copy()
+        if x_curr.size != int(dh.total_dofs):
+            raise ValueError(
+                "current_state size does not match mesh-extension dof count: "
+                f"expected {int(dh.total_dofs)}, got {x_curr.size}."
+            )
+    for gdof, value in bc_map.items():
+        x_curr[int(gdof)] = float(value)
+
+    rows = np.fromiter((int(g) for g in bc_map.keys()), dtype=int) if bc_map else np.empty((0,), dtype=int)
+    rhs = -(A_raw @ x_curr)
+    if kratos_builder_dirichlet:
+        A_constrained, rhs_constrained = _apply_kratos_block_builder_dirichlet(
+            A_raw=A_raw,
+            rhs=rhs,
+            fixed_rows=rows,
+        )
+        return A_constrained, np.asarray(rhs_constrained, dtype=float).reshape(-1), x_curr
+
+    A = A_raw.tolil(copy=True)
+    if rows.size:
+        A[rows, :] = 0.0
+        A[:, rows] = 0.0
+        A[rows, rows] = 1.0
+        rhs[rows] = 0.0
+    return A.tocsr(), np.asarray(rhs, dtype=float).reshape(-1), x_curr
+
+
 def _assemble_structural_similarity_mesh_matrix(
     *,
     dh: DofHandler,
@@ -509,42 +1537,9 @@ def _assemble_structural_similarity_mesh_matrix(
 ) -> "sp.csr_matrix":
     import scipy.sparse as sp
 
-    connectivity_data = getattr(mesh, "corner_connectivity", None)
-    if connectivity_data is None:
-        connectivity_data = getattr(mesh, "elements_connectivity", None)
-    if connectivity_data is None:
-        raise AttributeError("Mesh does not expose corner_connectivity/elements_connectivity for mesh-motion assembly.")
-    connectivity = np.asarray(connectivity_data, dtype=int)
-    if connectivity.ndim != 2 or connectivity.shape[1] != 3:
+    elemental_dofs = np.asarray(dh.get_elemental_dofs_map(dtype=np.int64, copy=False), dtype=int)
+    if elemental_dofs.ndim != 2 or elemental_dofs.shape[1] != 6:
         raise NotImplementedError("Kratos-matched structural-similarity assembly currently supports Triangle2D3 meshes only.")
-
-    node_coords_ref = np.asarray(mesh.nodes_x_y_pos, dtype=float)
-    node_coords_cur = node_coords_ref.copy()
-    if hasattr(m_prev_geom, "components") and len(getattr(m_prev_geom, "components")) >= 2:
-        disp_prev = np.column_stack(
-            [
-                np.asarray(m_prev_geom.components[0].nodal_values, dtype=float),
-                np.asarray(m_prev_geom.components[1].nodal_values, dtype=float),
-            ]
-        )
-        if disp_prev.shape == node_coords_cur.shape:
-            node_coords_cur = node_coords_cur + disp_prev
-        elif disp_prev.size != 0:
-            raise ValueError(
-                "m_prev_geom component shape mismatch for structural-similarity assembly: "
-                f"expected {node_coords_cur.shape}, got {disp_prev.shape}."
-            )
-
-    node_to_gdof_x = np.full(node_coords_ref.shape[0], -1, dtype=int)
-    node_to_gdof_y = np.full(node_coords_ref.shape[0], -1, dtype=int)
-    for gdof in range(int(dh.total_dofs)):
-        field_name, node_id = dh._dof_to_node_map[int(gdof)]
-        if node_id is None:
-            continue
-        if field_name == "mx":
-            node_to_gdof_x[int(node_id)] = int(gdof)
-        elif field_name == "my":
-            node_to_gdof_y[int(node_id)] = int(gdof)
 
     rows: list[int] = []
     cols: list[int] = []
@@ -563,10 +1558,19 @@ def _assemble_structural_similarity_mesh_matrix(
     factor = 100.0
     xi = 1.5
     eps = 1.0e-30
+    block_perm = np.asarray([0, 2, 4, 1, 3, 5], dtype=int)
 
-    for nodes in connectivity:
-        elem_nodes = np.asarray(nodes, dtype=int)
-        coords = np.asarray(node_coords_cur[elem_nodes], dtype=float)
+    for eid in range(int(mesh.n_elements)):
+        gdofs_x = np.asarray(dh.element_dofs("mx", eid), dtype=int).reshape(-1)
+        gdofs_y = np.asarray(dh.element_dofs("my", eid), dtype=int).reshape(-1)
+        if gdofs_x.size != 3 or gdofs_y.size != 3:
+            raise NotImplementedError(
+                "Kratos-matched structural-similarity assembly currently supports Triangle2D3 meshes only."
+            )
+        coords_ref = np.asarray(dh.element_dof_coords("mx", eid), dtype=float)
+        disp_x = np.asarray(m_prev_geom.components[0].get_nodal_values(gdofs_x), dtype=float).reshape(-1)
+        disp_y = np.asarray(m_prev_geom.components[1].get_nodal_values(gdofs_y), dtype=float).reshape(-1)
+        coords = coords_ref + np.column_stack([disp_x, disp_y])
         j = np.asarray(
             [
                 [coords[1, 0] - coords[0, 0], coords[2, 0] - coords[0, 0]],
@@ -598,20 +1602,14 @@ def _assemble_structural_similarity_mesh_matrix(
             ],
             dtype=float,
         )
+        # The mixed-element DofHandler stacks field-local DOFs as
+        # [mx(node0..2), my(node0..2)], while the local B-matrix above is built
+        # in the conventional interleaved order [ux0, uy0, ux1, uy1, ux2, uy2].
+        # Reorder the local stiffness before assembly so the global matrix lands
+        # in the exact element-local ordering used everywhere else in pycutfem.
         k_elem = ref_weight * (b.T @ c @ b)
-        gdofs = np.asarray(
-            [
-                node_to_gdof_x[int(elem_nodes[0])],
-                node_to_gdof_y[int(elem_nodes[0])],
-                node_to_gdof_x[int(elem_nodes[1])],
-                node_to_gdof_y[int(elem_nodes[1])],
-                node_to_gdof_x[int(elem_nodes[2])],
-                node_to_gdof_y[int(elem_nodes[2])],
-            ],
-            dtype=int,
-        )
-        if np.any(gdofs < 0):
-            raise RuntimeError("Could not resolve mesh-moving DOFs for a triangle element.")
+        k_elem = np.asarray(k_elem[np.ix_(block_perm, block_perm)], dtype=float)
+        gdofs = np.asarray(elemental_dofs[eid, :], dtype=int)
         rr, cc = np.meshgrid(gdofs, gdofs, indexing="ij")
         rows.extend(rr.reshape(-1).tolist())
         cols.extend(cc.reshape(-1).tolist())
@@ -620,12 +1618,231 @@ def _assemble_structural_similarity_mesh_matrix(
     return sp.csr_matrix((data, (rows, cols)), shape=(int(dh.total_dofs), int(dh.total_dofs)))
 
 
+def _build_kratos_local_mesh_backend(
+    *,
+    fluid_mdpa_path: Path,
+    dt: float,
+    bossak_alpha: float,
+    prob: dict[str, object],
+) -> dict[str, object]:
+    backend = _build_kratos_mesh_motion_backend(
+        fluid_mdpa_path=Path(fluid_mdpa_path),
+        dt=float(dt),
+        bossak_alpha=float(bossak_alpha),
+    )
+
+    mesh_model_part = backend["model"].GetModelPart("FluidModelPart_MeshPart")
+    mesh: Mesh = prob["dh"].mixed_element.mesh
+    dh: DofHandler = prob["dh"]
+    dh._ensure_dof_coords()
+    old_node_ids = np.asarray(_mesh_node_ids(mesh), dtype=int).reshape(-1)
+    old_id_by_coord = {
+        _coord_key(float(x), float(y)): int(old_node_ids[i])
+        for i, (x, y) in enumerate(np.asarray(mesh.nodes_x_y_pos[:, :2], dtype=float))
+    }
+
+    mx_ids = np.asarray(dh.get_field_slice("mx"), dtype=int)
+    my_ids = np.asarray(dh.get_field_slice("my"), dtype=int)
+    mx_coords = np.asarray(dh._dof_coords[mx_ids], dtype=float)
+    my_coords = np.asarray(dh._dof_coords[my_ids], dtype=float)
+    if mx_coords.shape != my_coords.shape or (mx_coords.size and not np.allclose(mx_coords, my_coords)):
+        raise RuntimeError("Kratos local mesh backend requires matching CG nodal coordinates for mx and my.")
+    field_index_by_old_id = {
+        old_id_by_coord[_coord_key(float(x), float(y))]: i
+        for i, (x, y) in enumerate(mx_coords.tolist())
+    }
+
+    kratos_elem_by_nodes: dict[frozenset[int], object] = {}
+    for elem in mesh_model_part.Elements:
+        geom_ids = frozenset(int(node.Id) for node in elem.GetGeometry())
+        kratos_elem_by_nodes[geom_ids] = elem
+
+    n_elem = int(mesh.n_elements)
+    gdofs_map = np.empty((n_elem, int(dh.mixed_element.n_dofs_per_elem)), dtype=int)
+    local_perm = np.empty((n_elem, 6), dtype=int)
+    kratos_elements: list[object] = [None] * n_elem
+    for eid in range(n_elem):
+        gdofs_map[eid, :] = np.asarray(dh.get_elemental_dofs(eid), dtype=int)
+        py_mx_coords = np.asarray(dh.element_dof_coords("mx", eid), dtype=float)
+        py_old_ids = [old_id_by_coord[_coord_key(float(x), float(y))] for x, y in py_mx_coords.tolist()]
+        elem = kratos_elem_by_nodes.get(frozenset(int(node_id) for node_id in py_old_ids))
+        if elem is None:
+            raise RuntimeError(f"Could not match pycutfem mesh element {eid} to a Kratos mesh-moving element.")
+        kratos_elements[eid] = elem
+        py_pos_by_old_id = {int(node_id): j for j, node_id in enumerate(py_old_ids)}
+        perm = np.empty(6, dtype=int)
+        for k, node in enumerate(elem.GetGeometry()):
+            py_pos = py_pos_by_old_id[int(node.Id)]
+            perm[2 * k] = py_pos
+            perm[2 * k + 1] = 3 + py_pos
+        local_perm[eid, :] = perm
+
+    return {
+        "KM": backend["KM"],
+        "analysis": backend["analysis"],
+        "model": backend["model"],
+        "solver": backend["solver"],
+        "mesh_solver": backend["mesh_solver"],
+        "main_model_part": backend["main_model_part"],
+        "mesh_model_part": mesh_model_part,
+        "interface_nodes": list(backend["interface_nodes"]),
+        "zero_parts": tuple(backend["zero_parts"]),
+        "all_nodes": list(mesh_model_part.Nodes),
+        "node_coords_ref": np.asarray(backend["node_coords_ref"], dtype=float),
+        "time": float(backend["time"]),
+        "field_index_by_old_id": field_index_by_old_id,
+        "kratos_row_by_old_id": {int(node.Id): i for i, node in enumerate(backend["all_nodes"])},
+        "mx_ids": mx_ids,
+        "my_ids": my_ids,
+        "kratos_elements": tuple(kratos_elements),
+        "gdofs_map": np.asarray(gdofs_map, dtype=int),
+        "local_perm": np.asarray(local_perm, dtype=int),
+    }
+
+
+def _sync_kratos_local_mesh_backend_state(
+    *,
+    backend: dict[str, object],
+    mesh_disp_nodal_values: np.ndarray | None = None,
+) -> None:
+    KM = backend["KM"]
+    disp_values = None
+    disp_order = "kratos_nodes"
+    if mesh_disp_nodal_values is not None:
+        disp_values = np.asarray(mesh_disp_nodal_values, dtype=float)
+        if disp_values.ndim == 1:
+            mx_ids = np.asarray(backend["mx_ids"], dtype=int)
+            my_ids = np.asarray(backend["my_ids"], dtype=int)
+            if disp_values.size <= int(max(np.max(mx_ids), np.max(my_ids), 0)):
+                raise ValueError(
+                    "Flat mesh_disp_nodal_values for Kratos local mesh backend is smaller than the required mesh DOF ids."
+                )
+            disp_values = np.column_stack([disp_values[mx_ids], disp_values[my_ids]])
+            disp_order = "pycutfem_field"
+        if disp_values.ndim != 2 or disp_values.shape[1] < 2:
+            raise ValueError(
+                "mesh_disp_nodal_values for Kratos local mesh backend must have shape (n_nodes, 2) or a flat mesh DOF vector."
+            )
+        if disp_values.shape[0] != len(backend["all_nodes"]):
+            raise ValueError(
+                "mesh_disp_nodal_values row count does not match the Kratos local mesh backend node count: "
+                f"expected {len(backend['all_nodes'])}, got {disp_values.shape[0]}."
+            )
+    for node in backend["all_nodes"]:
+        disp_x = 0.0
+        disp_y = 0.0
+        if disp_values is not None:
+            if disp_order == "pycutfem_field":
+                row_idx = backend["field_index_by_old_id"].get(int(node.Id))
+                if row_idx is None:
+                    raise RuntimeError(f"Missing field index for Kratos local mesh node {int(node.Id)}.")
+            else:
+                row_idx = backend["kratos_row_by_old_id"].get(int(node.Id))
+                if row_idx is None:
+                    raise RuntimeError(f"Missing Kratos row index for local mesh node {int(node.Id)}.")
+            disp_x = float(disp_values[int(row_idx), 0])
+            disp_y = float(disp_values[int(row_idx), 1])
+        node.X = float(node.X0) + disp_x
+        node.Y = float(node.Y0) + disp_y
+        node.Z = float(node.Z0)
+        disp_vec = KM.Array3()
+        disp_vec[0] = disp_x
+        disp_vec[1] = disp_y
+        disp_vec[2] = 0.0
+        node.SetSolutionStepValue(KM.MESH_DISPLACEMENT, 0, disp_vec)
+        node.SetSolutionStepValue(KM.MESH_DISPLACEMENT, 1, disp_vec)
+
+
+def _assemble_kratos_local_mesh_matrix_batch(
+    *,
+    backend: dict[str, object],
+    need_matrix: bool,
+    mesh_disp_nodal_values: np.ndarray | None = None,
+) -> tuple[np.ndarray | None, np.ndarray, np.ndarray, np.ndarray]:
+    _sync_kratos_local_mesh_backend_state(
+        backend=backend,
+        mesh_disp_nodal_values=mesh_disp_nodal_values,
+    )
+    KM = backend["KM"]
+    perm_map = np.asarray(backend["local_perm"], dtype=int)
+    gdofs_map = np.asarray(backend["gdofs_map"], dtype=int)
+    elements = tuple(backend["kratos_elements"])
+    process_info = backend["mesh_model_part"].ProcessInfo
+
+    n_elem = int(len(elements))
+    K_elem = np.zeros((n_elem, 6, 6), dtype=float) if bool(need_matrix) else None
+    F_elem = np.zeros((n_elem, 6), dtype=float)
+    for e, elem in enumerate(elements):
+        lhs = KM.Matrix()
+        rhs = KM.Vector()
+        elem.CalculateLocalSystem(lhs, rhs, process_info)
+        perm = np.asarray(perm_map[e], dtype=int)
+        rhs_kr = np.asarray(rhs, dtype=float).reshape(-1)
+        rhs_py = np.zeros((6,), dtype=float)
+        rhs_py[perm] = rhs_kr
+        F_elem[e, :] = rhs_py
+        if K_elem is not None:
+            lhs_kr = np.asarray(lhs, dtype=float)
+            lhs_py = np.zeros((6, 6), dtype=float)
+            lhs_py[np.ix_(perm, perm)] = lhs_kr
+            K_elem[e, :, :] = lhs_py
+    element_ids = np.arange(n_elem, dtype=int)
+    return K_elem, F_elem, element_ids, gdofs_map
+
+
+def _ensure_kratos_local_mesh_equation_map(
+    *,
+    backend: dict[str, object],
+) -> np.ndarray:
+    gdof_to_eq_cached = np.asarray(backend.get("gdof_to_eq", np.empty((0,), dtype=int)), dtype=int).reshape(-1)
+    if gdof_to_eq_cached.size:
+        return gdof_to_eq_cached
+
+    KM = backend["KM"]
+    field_index_by_old_id = dict(backend["field_index_by_old_id"])
+    mx_ids = np.asarray(backend["mx_ids"], dtype=int)
+    my_ids = np.asarray(backend["my_ids"], dtype=int)
+    eq_entries: list[tuple[int, int]] = []
+    for node in backend["all_nodes"]:
+        field_idx = int(field_index_by_old_id[int(node.Id)])
+        if node.HasDofFor(KM.MESH_DISPLACEMENT_X):
+            eq_entries.append((int(node.GetDof(KM.MESH_DISPLACEMENT_X).EquationId), int(mx_ids[field_idx])))
+        if node.HasDofFor(KM.MESH_DISPLACEMENT_Y):
+            eq_entries.append((int(node.GetDof(KM.MESH_DISPLACEMENT_Y).EquationId), int(my_ids[field_idx])))
+    ndof = max((int(eq_id) for eq_id, _ in eq_entries), default=-1) + 1
+    eq_to_gdof = np.full((ndof,), -1, dtype=int)
+    for eq_id, gdof in eq_entries:
+        eq_to_gdof[int(eq_id)] = int(gdof)
+    if ndof > 0 and np.any(eq_to_gdof < 0):
+        raise RuntimeError("Incomplete Kratos local mesh equation-to-gdof mapping.")
+    total_gdofs = 1 + max((int(gdof) for _eq_id, gdof in eq_entries), default=-1)
+    gdof_to_eq = np.full((total_gdofs,), -1, dtype=int)
+    if ndof > 0 and total_gdofs > 0:
+        gdof_to_eq[eq_to_gdof] = np.arange(ndof, dtype=int)
+    backend["eq_to_gdof"] = np.asarray(eq_to_gdof, dtype=int)
+    backend["gdof_to_eq"] = np.asarray(gdof_to_eq, dtype=int)
+    return np.asarray(gdof_to_eq, dtype=int)
+
+
+def _solve_kratos_local_mesh_displacement(
+    *,
+    backend: dict[str, object],
+    interface_disp: CoordinateLookup,
+) -> CoordinateLookup:
+    disp_lookup, _, _ = _solve_kratos_mesh_motion_backend(
+        backend=backend,
+        interface_disp=interface_disp,
+    )
+    return disp_lookup
+
+
 def _solve_structural_similarity_mesh_extension(
     *,
     prob: dict[str, object],
     interface_disp: CoordinateLookup,
     interface_tag: str,
     fixed_tags: tuple[str, ...],
+    kratos_local_backend: dict[str, object] | None = None,
     quad_order: int = 6,
     backend: str = "cpp",
     linear_backend: str = "petsc",
@@ -633,8 +1850,51 @@ def _solve_structural_similarity_mesh_extension(
     dh: DofHandler = prob["dh"]
     solve_mode = _env_str(
         "PYCUTFEM_EX2_MESH_EXTENSION_SOLVER",
-        "reference_form",
+        "direct",
     ).strip().lower()
+    if solve_mode in {"cpp_kratos_strategy", "cpp_mesh_strategy", "cpp_strategy"}:
+        cpp_backend = _build_cpp_mesh_strategy_backend(
+            prob=prob,
+            interface_tag=interface_tag,
+            fixed_tags=fixed_tags,
+        )
+        interface_coords = np.asarray(cpp_backend["interface_coords"], dtype=float)
+        interface_values = np.asarray(
+            interface_disp(interface_coords[:, 0], interface_coords[:, 1]),
+            dtype=float,
+        ).reshape(interface_coords.shape[0], 2)
+        solution = np.asarray(
+            cpp_backend["strategy"].solve(
+                interface_values=interface_values,
+                current_state=_node_matrix_from_vector_function(dh, prob["m_k"]),
+                preserve_free_state=True,
+            ),
+            dtype=float,
+        )
+        _transfer_vector_field(
+            target_dh=dh,
+            target_vec=prob["m_k"],
+            source_lookup=CoordinateLookup(
+                np.asarray(cpp_backend["node_coords"], dtype=float),
+                solution,
+                dim=2,
+            ),
+        )
+        return
+    if solve_mode in {"kratos_local", "kratos"}:
+        if kratos_local_backend is None:
+            raise RuntimeError("kratos_local mesh-extension solver requested, but no Kratos local mesh backend is available.")
+        mesh_lookup = _solve_kratos_local_mesh_displacement(
+            backend=kratos_local_backend,
+            interface_disp=interface_disp,
+        )
+        _transfer_vector_field(
+            target_dh=dh,
+            target_vec=prob["m_k"],
+            source_lookup=mesh_lookup,
+        )
+        return
+
     if solve_mode in {"reference_form", "ufl", "equation"}:
         mesh_eq, mesh_bcs = _mesh_extension_equation(
             prob=prob,
@@ -660,40 +1920,197 @@ def _solve_structural_similarity_mesh_extension(
             f"{solve_mode!r}. Use one of: reference_form, direct."
         )
 
-    import scipy.sparse as sp
-    from scipy.sparse.linalg import spsolve
-
-    zero = lambda x, y, t=0.0: 0.0
-    bcs = [
-        BoundaryCondition("mx", "dirichlet", tag, zero) for tag in fixed_tags
-    ] + [
-        BoundaryCondition("my", "dirichlet", tag, zero) for tag in fixed_tags
-    ] + [
-        BoundaryCondition("mx", "dirichlet", interface_tag, interface_disp.component(0)),
-        BoundaryCondition("my", "dirichlet", interface_tag, interface_disp.component(1)),
-    ]
-
-    mesh: Mesh = dh.mixed_element.mesh
-    A_raw = _assemble_structural_similarity_mesh_matrix(
-        dh=dh,
-        mesh=mesh,
-        m_prev_geom=prob["m_prev_geom"],
+    bcs = _mesh_extension_dirichlet_bcs(
+        interface_disp=interface_disp,
+        interface_tag=interface_tag,
+        fixed_tags=fixed_tags,
     )
-    rhs_raw = np.zeros(int(dh.total_dofs), dtype=float)
-    bc_map = dh.get_dirichlet_data(bcs) or {}
-    A = A_raw.tolil(copy=True)
-    rhs = np.asarray(rhs_raw, dtype=float).copy()
-    if bc_map:
-        rows = np.fromiter((int(g) for g in bc_map.keys()), dtype=int)
-        vals = np.fromiter((float(v) for v in bc_map.values()), dtype=float)
-        x_bc = np.zeros(int(dh.total_dofs), dtype=float)
-        x_bc[rows] = vals
-        rhs = rhs - A_raw @ x_bc
-        A[rows, :] = 0.0
-        A[:, rows] = 0.0
-        A[rows, rows] = 1.0
-        rhs[rows] = vals
-    sol = spsolve(A.tocsr(), rhs)
+
+    solve_mode_name_raw = os.getenv("PYCUTFEM_EX2_MESH_LINEAR_SOLVE_MODE", "").strip().lower()
+    # Kratos' structural mesh-moving strategy uses AMGCL/GMRES on the
+    # reference-configuration mesh operator. Mirror that by default so the
+    # local path follows the same runtime solve path.
+    solve_mode_name = solve_mode_name_raw or "amgcl"
+    system_form_raw = os.getenv("PYCUTFEM_EX2_MESH_EXTENSION_FORMULATION", "").strip().lower()
+    if system_form_raw:
+        system_form = system_form_raw
+    else:
+        # Kratos' structural mesh-moving strategy assembles the residual on the
+        # current mesh-displacement state and solves for an increment through
+        # ResidualBasedLinearStrategy + ResidualBasedBlockBuilderAndSolver.
+        # Mirror that incremental path for iterative mesh linear solvers.
+        if solve_mode_name in {
+            "amgcl",
+            "pycutfem_amgcl",
+            "cpp_amgcl",
+            "local_amgcl",
+            "kratos_amgcl",
+            "kratos_like",
+            "petsc_gmres_ilu",
+            "petsc_gmres",
+            "iterative",
+            "bicgstab_ilu",
+        }:
+            system_form = "incremental"
+        else:
+            system_form = "absolute"
+    if system_form not in {"incremental", "absolute"}:
+        raise ValueError(
+            "Unsupported mesh-extension formulation "
+            f"{system_form!r}. Use one of: incremental, absolute."
+        )
+
+    if system_form == "incremental":
+        mesh: Mesh = dh.mixed_element.mesh
+        A_raw = _cached_reference_mesh_extension_matrix(prob=prob)
+        current_state = _global_dof_vector_from_function(dh, prob["m_k"])
+        use_kratos_builder = solve_mode_name in {
+            "amgcl",
+            "pycutfem_amgcl",
+            "cpp_amgcl",
+            "local_amgcl",
+            "kratos_amgcl",
+            "kratos_like",
+        }
+        A_constrained, rhs_constrained, x_curr = _assemble_mesh_extension_increment_system(
+            A_raw=A_raw,
+            dh=dh,
+            bcs=bcs,
+            current_state=current_state,
+            kratos_builder_dirichlet=use_kratos_builder,
+        )
+        iterative_modes = {
+            "amgcl",
+            "pycutfem_amgcl",
+            "cpp_amgcl",
+            "local_amgcl",
+            "kratos_amgcl",
+            "kratos_like",
+            "petsc_gmres_ilu",
+            "petsc_gmres",
+            "iterative",
+            "bicgstab_ilu",
+        }
+        use_kratos_order_permutation = _env_bool(
+            "PYCUTFEM_EX2_MESH_LINEAR_PERMUTE_TO_KRATOS_ORDER",
+            True,
+        )
+        perm_info = _mesh_extension_node_block_permutation(dh, mesh=mesh)
+        perm = None if perm_info is None else np.asarray(perm_info[0], dtype=int).reshape(-1)
+        use_permuted_iterative_system = (
+            bool(use_kratos_order_permutation)
+            and perm is not None
+            and solve_mode_name in iterative_modes
+        )
+        A_solver = A_constrained
+        rhs_solver = rhs_constrained
+        delta_guess = None if use_kratos_builder else (current_state - np.asarray(x_curr, dtype=float).reshape(-1))
+        if use_permuted_iterative_system:
+            A_solver = A_constrained[perm, :][:, perm].tocsr()
+            rhs_solver = np.asarray(rhs_constrained, dtype=float).reshape(-1)[perm]
+            if delta_guess is not None:
+                delta_guess = np.asarray(delta_guess, dtype=float).reshape(-1)[perm]
+        local_amgcl_modes = {"amgcl", "pycutfem_amgcl", "cpp_amgcl", "local_amgcl"}
+        if solve_mode_name in local_amgcl_modes:
+            from pycutfem.linalg import AMGCLSettings, AMGCLSubsolver
+
+            amgcl_settings = _mesh_linear_amgcl_settings_from_env()
+            if int(amgcl_settings.block_size) != 1 and not use_permuted_iterative_system:
+                amgcl_settings = AMGCLSettings(
+                    preconditioner_type=amgcl_settings.preconditioner_type,
+                    smoother_type=amgcl_settings.smoother_type,
+                    krylov_type=amgcl_settings.krylov_type,
+                    coarsening_type=amgcl_settings.coarsening_type,
+                    tolerance=amgcl_settings.tolerance,
+                    max_iteration=amgcl_settings.max_iteration,
+                    gmres_krylov_space_dimension=amgcl_settings.gmres_krylov_space_dimension,
+                    verbosity=amgcl_settings.verbosity,
+                    scaling=amgcl_settings.scaling,
+                    block_size=1,
+                    use_block_matrices_if_possible=False,
+                    coarse_enough=amgcl_settings.coarse_enough,
+                    max_levels=amgcl_settings.max_levels,
+                    pre_sweeps=amgcl_settings.pre_sweeps,
+                    post_sweeps=amgcl_settings.post_sweeps,
+                )
+            use_cached_incremental_solver = True
+            delta_solver = None
+            delta_solver_signature = (
+                tuple(map(int, A_solver.shape)),
+                int(getattr(A_solver, "nnz", 0)),
+                float(amgcl_settings.tolerance),
+                int(amgcl_settings.max_iteration),
+                int(amgcl_settings.gmres_krylov_space_dimension),
+                int(amgcl_settings.block_size),
+                bool(amgcl_settings.use_block_matrices_if_possible),
+                int(amgcl_settings.coarse_enough),
+                int(amgcl_settings.max_levels),
+                int(amgcl_settings.pre_sweeps),
+                int(amgcl_settings.post_sweeps),
+                bool(use_permuted_iterative_system),
+            )
+            if use_cached_incremental_solver:
+                delta_solver = prob.get("_mesh_extension_incremental_amgcl_solver")
+                if delta_solver is None or prob.get("_mesh_extension_incremental_amgcl_signature") != delta_solver_signature:
+                    delta_solver = AMGCLSubsolver(A_solver, params=amgcl_settings)
+                    prob["_mesh_extension_incremental_amgcl_solver"] = delta_solver
+                    prob["_mesh_extension_incremental_amgcl_signature"] = delta_solver_signature
+            else:
+                delta_solver = AMGCLSubsolver(A_solver, params=amgcl_settings)
+            delta = np.asarray(delta_solver.solve(rhs_solver, x0=delta_guess), dtype=float).reshape(-1)
+        else:
+            delta = _solve_sparse_linear_system(
+                A=A_solver,
+                rhs=rhs_solver,
+                linear_backend=str(linear_backend),
+                solve_mode=solve_mode_name,
+                initial_guess=delta_guess,
+            )
+        if use_permuted_iterative_system:
+            delta_unpermuted = np.empty_like(np.asarray(delta, dtype=float).reshape(-1))
+            delta_unpermuted[perm] = np.asarray(delta, dtype=float).reshape(-1)
+            delta = delta_unpermuted
+        sol = np.asarray(x_curr, dtype=float).reshape(-1) + np.asarray(delta, dtype=float).reshape(-1)
+    else:
+        cache = _cached_absolute_mesh_extension_system(prob=prob, bcs=bcs)
+        if cache is None:
+            mesh: Mesh = dh.mixed_element.mesh
+            A_raw = _assemble_structural_similarity_mesh_matrix(
+                dh=dh,
+                mesh=mesh,
+                m_prev_geom=_reference_geometry_mesh_extension_field(prob),
+            )
+            rhs_raw = np.zeros(int(dh.total_dofs), dtype=float)
+            bc_map = dh.get_dirichlet_data(bcs) or {}
+            A = A_raw.tolil(copy=True)
+            rhs = np.asarray(rhs_raw, dtype=float).copy()
+            abs_guess = _global_dof_vector_from_function(dh, prob["m_k"])
+            if bc_map:
+                rows = np.fromiter((int(g) for g in bc_map.keys()), dtype=int)
+                vals = np.fromiter((float(v) for v in bc_map.values()), dtype=float)
+                x_bc = np.zeros(int(dh.total_dofs), dtype=float)
+                x_bc[rows] = vals
+                rhs = rhs - A_raw @ x_bc
+                A[rows, :] = 0.0
+                A[:, rows] = 0.0
+                A[rows, rows] = 1.0
+                rhs[rows] = vals
+                abs_guess[rows] = vals
+            sol = _solve_sparse_linear_system(
+                A=A.tocsr(),
+                rhs=rhs,
+                linear_backend=str(linear_backend),
+                solve_mode=solve_mode_name,
+                initial_guess=abs_guess,
+            )
+        else:
+            sol = _solve_cached_absolute_mesh_extension_system(
+                prob=prob,
+                cache=cache,
+                bcs=bcs,
+                solve_mode_name=solve_mode_name,
+                linear_backend=str(linear_backend),
+            )
     prob["m_k"].nodal_values.fill(0.0)
     dh.add_to_functions(np.asarray(sol, dtype=float), [prob["m_k"]])
     dh.apply_bcs(bcs, prob["m_k"])
@@ -744,6 +2161,9 @@ def _build_kratos_mesh_motion_backend(
     settings_data["solver_settings"]["fluid_solver_settings"]["echo_level"] = 0
     settings_data["solver_settings"]["fluid_solver_settings"]["time_stepping"]["time_step"] = float(dt)
     settings_data["solver_settings"]["mesh_motion_solver_settings"]["echo_level"] = 0
+    settings_data["solver_settings"]["mesh_motion_solver_settings"]["time_stepping"] = {
+        "time_step": float(dt),
+    }
     settings_data["solver_settings"]["mesh_motion_solver_settings"]["mesh_velocity_calculation"] = {
         "time_scheme": "bossak",
         "alpha_m": float(bossak_alpha),
@@ -800,6 +2220,7 @@ def _build_kratos_mesh_motion_backend(
 
     _zero_node_history(all_nodes)
     return {
+        "KM": KM,
         "analysis": analysis,
         "model": model,
         "solver": solver,
@@ -1262,16 +2683,18 @@ def _build_fluid_problem(
     *,
     poly_order: int,
     pressure_order: int,
+    mesh_order: int | None = None,
     quadrature_order: int | None = None,
 ) -> dict[str, object]:
+    mesh_order_value = int(mesh_order if mesh_order is not None else poly_order)
     me = MixedElement(
         mesh,
         field_specs={
             "ux": int(poly_order),
             "uy": int(poly_order),
             "p": int(pressure_order),
-            "mx": int(poly_order),
-            "my": int(poly_order),
+            "mx": int(mesh_order_value),
+            "my": int(mesh_order_value),
         },
     )
     dh = DofHandler(me, method="cg")
@@ -1286,6 +2709,7 @@ def _build_fluid_problem(
     u_k = VectorFunction("u_k", ["ux", "uy"], dof_handler=dh)
     u_prev = VectorFunction("u_prev", ["ux", "uy"], dof_handler=dh)
     a_prev = VectorFunction("a_prev", ["ux", "uy"], dof_handler=dh)
+    a_k = VectorFunction("a_k", ["ux", "uy"], dof_handler=dh)
     p_k = Function("p_k", "p", dof_handler=dh)
     p_prev = Function("p_prev", "p", dof_handler=dh)
     d_mesh = VectorFunction("d_mesh", ["mx", "my"], dof_handler=dh)
@@ -1295,7 +2719,7 @@ def _build_fluid_problem(
     a_mesh_prev = VectorFunction("a_mesh_prev", ["mx", "my"], dof_handler=dh)
     w_mesh_k = VectorFunction("w_mesh_k", ["mx", "my"], dof_handler=dh)
     a_mesh_k = VectorFunction("a_mesh_k", ["mx", "my"], dof_handler=dh)
-    for function in (u_k, u_prev, a_prev, d_mesh, d_prev, d_prev2, w_mesh_prev, a_mesh_prev, w_mesh_k, a_mesh_k):
+    for function in (u_k, u_prev, a_prev, a_k, d_mesh, d_prev, d_prev2, w_mesh_prev, a_mesh_prev, w_mesh_k, a_mesh_k):
         function.nodal_values.fill(0.0)
     for function in (p_k, p_prev):
         function.nodal_values.fill(0.0)
@@ -1317,6 +2741,7 @@ def _build_fluid_problem(
         "u_k": u_k,
         "u_prev": u_prev,
         "a_prev": a_prev,
+        "a_k": a_k,
         "p_k": p_k,
         "p_prev": p_prev,
         "d_mesh": d_mesh,
@@ -1327,6 +2752,9 @@ def _build_fluid_problem(
         "w_mesh_k": w_mesh_k,
         "a_mesh_k": a_mesh_k,
         "dvms_state": dvms_state,
+        "velocity_order": int(poly_order),
+        "pressure_order": int(pressure_order),
+        "mesh_order": int(mesh_order_value),
     }
 
 
@@ -1334,7 +2762,120 @@ def _build_mesh_extension_problem(mesh: Mesh, *, poly_order: int) -> dict[str, o
     me, dh, dm, z, m_k = _build_vector_problem(mesh, prefix="m", order=poly_order)
     m_prev_geom = VectorFunction("m_prev_geom", ["mx", "my"], dof_handler=dh)
     m_prev_geom.nodal_values.fill(0.0)
-    return {"me": me, "dh": dh, "dm": dm, "z": z, "m_k": m_k, "m_prev_geom": m_prev_geom}
+    return {
+        "me": me,
+        "dh": dh,
+        "dm": dm,
+        "z": z,
+        "m_k": m_k,
+        "m_prev_geom": m_prev_geom,
+        "_cpp_mesh_strategy_backend": None,
+    }
+
+
+def _boundary_field_node_ids(dh: DofHandler, field: str, tag: str) -> np.ndarray:
+    _, gdofs = _boundary_field_data(dh, field, tag)
+    node_ids: list[int] = []
+    seen: set[int] = set()
+    for gdof in np.asarray(gdofs, dtype=int).reshape(-1):
+        _field_name, node_id = dh._dof_to_node_map[int(gdof)]
+        if node_id is None:
+            continue
+        node_id_int = int(node_id)
+        if node_id_int in seen:
+            continue
+        seen.add(node_id_int)
+        node_ids.append(node_id_int)
+    return np.asarray(node_ids, dtype=int)
+
+
+def _node_matrix_from_vector_function(dh: DofHandler, vector: VectorFunction) -> np.ndarray:
+    num_nodes = int(len(dh.mixed_element.mesh.nodes_list))
+    out = np.zeros((num_nodes, 2), dtype=float)
+    for component_idx, component in enumerate(vector.components[:2]):
+        gdofs = np.asarray(dh.get_field_slice(component.field_name), dtype=int).reshape(-1)
+        values = np.asarray(component.get_nodal_values(gdofs), dtype=float).reshape(-1)
+        for local_idx, gdof in enumerate(gdofs):
+            _field_name, node_id = dh._dof_to_node_map[int(gdof)]
+            if node_id is None:
+                continue
+            out[int(node_id), int(component_idx)] = float(values[int(local_idx)])
+    return out
+
+
+def _global_dof_vector_from_function(
+    dh: DofHandler,
+    function: Function | VectorFunction,
+) -> np.ndarray:
+    """Gather values in true global DOF order.
+
+    Function/VectorFunction storage follows the object's `_g_dofs` order, which
+    is not guaranteed to coincide with the raw global numbering.
+    """
+    g_dofs = np.asarray(getattr(function, "_g_dofs", np.empty((0,), dtype=int)), dtype=int).reshape(-1)
+    values = np.asarray(getattr(function, "nodal_values", np.empty((0,), dtype=float)), dtype=float).reshape(-1)
+    if g_dofs.size != values.size:
+        raise ValueError(
+            f"Function '{getattr(function, 'name', '<unnamed>')}' has {values.size} stored values but {g_dofs.size} mapped DOFs."
+        )
+    out = np.zeros(int(dh.total_dofs), dtype=float)
+    if g_dofs.size:
+        out[g_dofs] = values
+    return out
+
+
+def _build_cpp_mesh_strategy_backend(
+    *,
+    prob: dict[str, object],
+    interface_tag: str,
+    fixed_tags: tuple[str, ...],
+) -> dict[str, object]:
+    cached = prob.get("_cpp_mesh_strategy_backend")
+    fixed_tags_norm = tuple(str(tag) for tag in fixed_tags)
+    if isinstance(cached, dict):
+        cached_key = (
+            str(cached.get("interface_tag", "")),
+            tuple(str(tag) for tag in cached.get("fixed_tags", ())),
+        )
+        if cached_key == (str(interface_tag), fixed_tags_norm):
+            return cached
+
+    dh: DofHandler = prob["dh"]
+    mesh: Mesh = dh.mixed_element.mesh
+    connectivity_data = getattr(mesh, "corner_connectivity", None)
+    if connectivity_data is None:
+        connectivity_data = getattr(mesh, "elements_connectivity", None)
+    if connectivity_data is None:
+        raise AttributeError("Mesh does not expose corner_connectivity/elements_connectivity for the C++ mesh strategy backend.")
+
+    interface_node_ids = _boundary_field_node_ids(dh, "mx", str(interface_tag))
+    fixed_chunks = [
+        _boundary_field_node_ids(dh, "mx", str(tag))
+        for tag in fixed_tags_norm
+    ]
+    fixed_node_ids = (
+        np.unique(np.concatenate([chunk for chunk in fixed_chunks if chunk.size]).astype(int, copy=False))
+        if any(chunk.size for chunk in fixed_chunks)
+        else np.empty((0,), dtype=int)
+    )
+
+    strategy = StructuralMeshMotionStrategy(
+        node_coords=np.asarray(mesh.nodes_x_y_pos[:, :2], dtype=float),
+        connectivity=np.asarray(connectivity_data, dtype=np.int64),
+        fixed_node_ids=np.asarray(fixed_node_ids, dtype=np.int64),
+        interface_node_ids=np.asarray(interface_node_ids, dtype=np.int64),
+        settings=StructuralMeshMotionStrategySettings(poisson=0.3, factor=100.0, xi=1.5),
+    )
+    backend = {
+        "strategy": strategy,
+        "interface_tag": str(interface_tag),
+        "fixed_tags": fixed_tags_norm,
+        "interface_node_ids": np.asarray(interface_node_ids, dtype=int),
+        "interface_coords": np.asarray(mesh.nodes_x_y_pos[np.asarray(interface_node_ids, dtype=int), :2], dtype=float),
+        "node_coords": np.asarray(mesh.nodes_x_y_pos[:, :2], dtype=float),
+    }
+    prob["_cpp_mesh_strategy_backend"] = backend
+    return backend
 
 
 def _build_solid_problem(mesh: Mesh, *, poly_order: int) -> dict[str, object]:
@@ -1352,8 +2893,20 @@ def _build_solid_problem(mesh: Mesh, *, poly_order: int) -> dict[str, object]:
 
 
 def _boundary_field_data(dh: DofHandler, field: str, tag: str) -> tuple[np.ndarray, np.ndarray]:
+    cache = getattr(dh, "_nirb_boundary_field_data_cache", None)
+    if not isinstance(cache, dict):
+        cache = {}
+        setattr(dh, "_nirb_boundary_field_data_cache", cache)
+    cache_key = (str(field), str(tag))
+    cached = cache.get(cache_key)
+    if cached is not None:
+        coords_cached, gdofs_cached = cached
+        return np.asarray(coords_cached, dtype=float), np.asarray(gdofs_cached, dtype=int)
+
     dh._ensure_dof_coords()
     mesh = dh.mixed_element.mesh
+    boundary_node_ids: list[int] = []
+    seen_nodes: set[int] = set()
     boundary_points: list[np.ndarray] = []
     boundary_segments: list[tuple[np.ndarray, np.ndarray]] = []
     for eid in mesh.edge_bitset(tag).to_indices():
@@ -1361,17 +2914,40 @@ def _boundary_field_data(dh: DofHandler, field: str, tag: str) -> tuple[np.ndarr
         if edge.right is not None:
             continue
         node_ids = list(getattr(edge, "all_nodes", None) or edge.nodes)
+        for node_id in node_ids:
+            node_id_int = int(node_id)
+            if node_id_int not in seen_nodes:
+                seen_nodes.add(node_id_int)
+                boundary_node_ids.append(node_id_int)
         pts = np.asarray(mesh.nodes_x_y_pos[node_ids], dtype=float)
         for point in pts:
             boundary_points.append(np.asarray(point, dtype=float))
         if pts.shape[0] >= 2:
             boundary_segments.append((pts[0], pts[-1]))
     if not boundary_points:
-        return np.empty((0, 2), dtype=float), np.empty((0,), dtype=int)
+        out = (np.empty((0, 2), dtype=float), np.empty((0,), dtype=int))
+        cache[cache_key] = out
+        return out
 
-    points_arr = np.asarray(boundary_points, dtype=float)
     field_ids = np.asarray(dh.get_field_slice(field), dtype=int)
     field_coords = np.asarray(dh._dof_coords[field_ids], dtype=float)
+    if boundary_node_ids:
+        boundary_node_set = set(int(v) for v in boundary_node_ids)
+        keep_node = []
+        for idx, gdof in enumerate(field_ids):
+            try:
+                _field_name, node_id = dh._dof_to_node_map[int(gdof)]
+            except Exception:
+                node_id = None
+            if node_id is not None and int(node_id) in boundary_node_set:
+                keep_node.append(idx)
+        if keep_node:
+            keep_arr = np.asarray(keep_node, dtype=int)
+            out = (field_coords[keep_arr], field_ids[keep_arr])
+            cache[cache_key] = out
+            return out
+
+    points_arr = np.asarray(boundary_points, dtype=float)
     span = np.ptp(np.asarray(mesh.nodes_x_y_pos, dtype=float), axis=0)
     span_max = float(np.max(span)) if span.size else 1.0
     tol_sq = (1.0e-8 * max(span_max, 1.0)) ** 2
@@ -1393,8 +2969,12 @@ def _boundary_field_data(dh: DofHandler, field: str, tag: str) -> tuple[np.ndarr
         if on_boundary:
             keep.append(idx)
     if not keep:
-        return np.empty((0, 2), dtype=float), np.empty((0,), dtype=int)
-    return field_coords[np.asarray(keep, dtype=int)], field_ids[np.asarray(keep, dtype=int)]
+        out = (np.empty((0, 2), dtype=float), np.empty((0,), dtype=int))
+        cache[cache_key] = out
+        return out
+    out = (field_coords[np.asarray(keep, dtype=int)], field_ids[np.asarray(keep, dtype=int)])
+    cache[cache_key] = out
+    return out
 
 
 def _vector_field_matrix(dh: DofHandler, vector: VectorFunction) -> tuple[np.ndarray, np.ndarray]:
@@ -1419,16 +2999,16 @@ def _vector_lookup_from_field(dh: DofHandler, vector: VectorFunction) -> Coordin
 def _vector_point_data_from_function(dh: DofHandler, vector: VectorFunction) -> np.ndarray:
     num_nodes = int(len(dh.mixed_element.mesh.nodes_list))
     point_data = np.zeros((num_nodes, 2), dtype=float)
-    for gdof, lidx in vector._g2l.items():
-        field, node_id = dh._dof_to_node_map[int(gdof)]
-        if node_id is None:
+    for component_idx, component in enumerate(vector.components[:2]):
+        gdofs = np.asarray(dh.get_field_slice(component.field_name), dtype=int).reshape(-1)
+        if gdofs.size == 0:
             continue
-        if field not in vector.field_names:
-            continue
-        component_idx = int(vector.field_names.index(field))
-        if component_idx >= 2:
-            continue
-        point_data[int(node_id), int(component_idx)] = float(vector.nodal_values[int(lidx)])
+        values = np.asarray(component.get_nodal_values(gdofs), dtype=float).reshape(-1)
+        for local_idx, gdof in enumerate(gdofs):
+            _field, node_id = dh._dof_to_node_map[int(gdof)]
+            if node_id is None:
+                continue
+            point_data[int(node_id), int(component_idx)] = float(values[int(local_idx)])
     return point_data
 
 
@@ -1476,11 +3056,15 @@ def _flatten_vector_snapshot(dh: DofHandler, vector: VectorFunction) -> np.ndarr
 def _scalar_point_data_from_function(dh: DofHandler, function: Function) -> np.ndarray:
     num_nodes = int(len(dh.mixed_element.mesh.nodes_list))
     point_data = np.zeros((num_nodes, 1), dtype=float)
-    for gdof, lidx in function._g2l.items():
+    gdofs = np.asarray(dh.get_field_slice(function.field_name), dtype=int).reshape(-1)
+    if gdofs.size == 0:
+        return point_data
+    values = np.asarray(function.get_nodal_values(gdofs), dtype=float).reshape(-1)
+    for local_idx, gdof in enumerate(gdofs):
         _field, node_id = dh._dof_to_node_map[int(gdof)]
         if node_id is None:
             continue
-        point_data[int(node_id), 0] = float(function.nodal_values[int(lidx)])
+        point_data[int(node_id), 0] = float(values[int(local_idx)])
     return point_data
 
 
@@ -1493,8 +3077,80 @@ def _mesh_node_ids(mesh: Mesh) -> np.ndarray:
     return np.arange(1, int(len(mesh.nodes_list)) + 1, dtype=int)
 
 
+def _structure_kratos_active_dof_permutation(
+    *,
+    dh: DofHandler,
+    mesh: Mesh,
+    active_dofs: np.ndarray,
+) -> np.ndarray | None:
+    active = np.asarray(active_dofs, dtype=int).reshape(-1)
+    if active.size == 0:
+        return np.empty((0,), dtype=int)
+
+    old_node_ids = np.asarray(_mesh_node_ids(mesh), dtype=int).reshape(-1)
+    items: list[tuple[int, int, int]] = []
+    for red_idx, gdof in enumerate(active.tolist()):
+        field_name, node_id = dh._dof_to_node_map[int(gdof)]
+        if node_id is None:
+            return None
+        if str(field_name) == "dx":
+            var_ord = 0
+        elif str(field_name) == "dy":
+            var_ord = 1
+        else:
+            return None
+        node_int = int(node_id)
+        if node_int < 0 or node_int >= old_node_ids.size:
+            return None
+        items.append((int(old_node_ids[node_int]), int(var_ord), int(red_idx)))
+
+    perm = np.asarray([int(red_idx) for _, _, red_idx in sorted(items)], dtype=int)
+    if perm.size != active.size:
+        return None
+    return perm
+
+
+def _map_kratos_structure_linear_solver_backend(solver_type: str) -> str:
+    solver_name = str(solver_type or "").strip().lower()
+    if "sparse_qr" in solver_name:
+        # Kratos' LinearSolversApplication.sparse_qr is Eigen::SparseQR with
+        # COLAMD ordering, not SuiteSparse SPQR.
+        return "eigen_sparseqr"
+    if solver_name.endswith("amgcl") or ".amgcl" in solver_name or "amgcl" in solver_name:
+        return "amgcl"
+    if "petsc" in solver_name:
+        return "petsc"
+    if "scipy" in solver_name or "klu" in solver_name:
+        return "scipy"
+    return "petsc"
+
+
+def _load_kratos_structure_solver_profile(*, benchmark_root: Path) -> dict[str, object]:
+    benchmark_root = Path(benchmark_root).resolve()
+    settings_data = _load_json(benchmark_root / "ProjectParametersCSM.json")
+    solver_settings = dict(settings_data.get("solver_settings", {}))
+    linear_solver_settings = dict(solver_settings.get("linear_solver_settings", {}))
+    return {
+        "convergence_criterion": str(solver_settings.get("convergence_criterion", "residual_criterion")),
+        "line_search": bool(solver_settings.get("line_search", False)),
+        "residual_absolute_tolerance": float(solver_settings.get("residual_absolute_tolerance", 1.0e-6)),
+        "residual_relative_tolerance": float(solver_settings.get("residual_relative_tolerance", 1.0e-6)),
+        "displacement_absolute_tolerance": float(solver_settings.get("displacement_absolute_tolerance", 1.0e-6)),
+        "displacement_relative_tolerance": float(solver_settings.get("displacement_relative_tolerance", 1.0e-6)),
+        "max_iteration": int(solver_settings.get("max_iteration", 25)),
+        "linear_solver_type": str(linear_solver_settings.get("solver_type", "")),
+        "linear_backend": _map_kratos_structure_linear_solver_backend(
+            str(linear_solver_settings.get("solver_type", ""))
+        ),
+    }
+
+
 def _solid_system_backend_mode() -> str:
-    return str(os.getenv("PYCUTFEM_EX2_SOLID_SYSTEM_BACKEND", "kratos_local") or "kratos_local").strip().lower()
+    return str(os.getenv("PYCUTFEM_EX2_SOLID_SYSTEM_BACKEND", "symbolic") or "symbolic").strip().lower()
+
+
+def _diagnostic_solid_system_backend_mode() -> str:
+    return str(os.getenv("PYCUTFEM_EX2_DIAGNOSTIC_SOLID_SYSTEM_BACKEND", "") or "").strip().lower()
 
 
 def _build_kratos_local_solid_backend(
@@ -1591,18 +3247,25 @@ def _build_kratos_local_solid_backend(
             perm[2 * k + 1] = 4 + py_pos
         local_perm[eid, :] = perm
 
+    eq_to_gdof = np.empty((0,), dtype=int)
+    gdof_to_eq = np.empty((0,), dtype=int)
+
     return {
         "KM": KM,
+        "KSM": KSM,
         "solver": solver,
         "main_model_part": main_model_part,
         "process_info": process_info,
         "all_nodes": all_nodes,
+        "point_conditions": tuple(point_conditions),
         "field_index_by_old_id": field_index_by_old_id,
         "dx_ids": dx_ids,
         "dy_ids": dy_ids,
         "kratos_elements": tuple(kratos_elements),
         "gdofs_map": np.asarray(gdofs_map, dtype=int),
         "local_perm": np.asarray(local_perm, dtype=int),
+        "eq_to_gdof": np.asarray(eq_to_gdof, dtype=int),
+        "gdof_to_eq": np.asarray(gdof_to_eq, dtype=int),
     }
 
 
@@ -1754,13 +3417,91 @@ def _sync_kratos_local_solid_backend_state(
         node.SetSolutionStepValue(KM.DISPLACEMENT, 1, vec)
 
 
+def _set_kratos_local_solid_point_loads(
+    *,
+    backend: dict[str, object],
+    structure_load: CoordinateLookup,
+) -> None:
+    KM = backend["KM"]
+    KSM = backend["KSM"]
+
+    zero_vec = KM.Array3()
+    zero_vec[0] = 0.0
+    zero_vec[1] = 0.0
+    zero_vec[2] = 0.0
+    for node in backend["all_nodes"]:
+        try:
+            node.SetSolutionStepValue(KSM.POINT_LOAD, 0, zero_vec)
+            node.SetSolutionStepValue(KSM.POINT_LOAD, 1, zero_vec)
+        except Exception:
+            pass
+    for cond in backend["point_conditions"]:
+        try:
+            cond.SetValue(KSM.POINT_LOAD, zero_vec)
+        except Exception:
+            pass
+
+    for cond in backend["point_conditions"]:
+        node = cond.GetGeometry()[0]
+        values = np.asarray(structure_load(float(node.X0), float(node.Y0)), dtype=float).reshape(2)
+        load_vec = KM.Array3()
+        load_vec[0] = float(values[0])
+        load_vec[1] = float(values[1])
+        load_vec[2] = 0.0
+        try:
+            node.SetSolutionStepValue(KSM.POINT_LOAD, 0, load_vec)
+            node.SetSolutionStepValue(KSM.POINT_LOAD, 1, load_vec)
+        except Exception:
+            pass
+
+
+def _ensure_kratos_local_solid_equation_map(
+    *,
+    backend: dict[str, object],
+) -> np.ndarray:
+    gdof_to_eq_cached = np.asarray(backend.get("gdof_to_eq", np.empty((0,), dtype=int)), dtype=int).reshape(-1)
+    if gdof_to_eq_cached.size:
+        return gdof_to_eq_cached
+
+    KM = backend["KM"]
+    field_index_by_old_id = dict(backend["field_index_by_old_id"])
+    dx_ids = np.asarray(backend["dx_ids"], dtype=int)
+    dy_ids = np.asarray(backend["dy_ids"], dtype=int)
+    eq_entries: list[tuple[int, int]] = []
+    for node in backend["all_nodes"]:
+        field_idx = int(field_index_by_old_id[int(node.Id)])
+        if node.HasDofFor(KM.DISPLACEMENT_X):
+            eq_entries.append((int(node.GetDof(KM.DISPLACEMENT_X).EquationId), int(dx_ids[field_idx])))
+        if node.HasDofFor(KM.DISPLACEMENT_Y):
+            eq_entries.append((int(node.GetDof(KM.DISPLACEMENT_Y).EquationId), int(dy_ids[field_idx])))
+    ndof = max((int(eq_id) for eq_id, _ in eq_entries), default=-1) + 1
+    eq_to_gdof = np.full((ndof,), -1, dtype=int)
+    for eq_id, gdof in eq_entries:
+        eq_to_gdof[int(eq_id)] = int(gdof)
+    if ndof > 0 and np.any(eq_to_gdof < 0):
+        raise RuntimeError("Incomplete Kratos local solid equation-to-gdof mapping.")
+    total_gdofs = 1 + max((int(gdof) for _eq_id, gdof in eq_entries), default=-1)
+    gdof_to_eq = np.full((total_gdofs,), -1, dtype=int)
+    if ndof > 0 and total_gdofs > 0:
+        gdof_to_eq[eq_to_gdof] = np.arange(ndof, dtype=int)
+    backend["eq_to_gdof"] = np.asarray(eq_to_gdof, dtype=int)
+    backend["gdof_to_eq"] = np.asarray(gdof_to_eq, dtype=int)
+    return np.asarray(gdof_to_eq, dtype=int)
+
+
 def _assemble_kratos_local_solid_system_batch(
     *,
     backend: dict[str, object],
     d_k: VectorFunction,
+    structure_load: CoordinateLookup | None = None,
     need_matrix: bool,
 ) -> tuple[np.ndarray | None, np.ndarray, np.ndarray, np.ndarray]:
     _sync_kratos_local_solid_backend_state(backend=backend, d_k=d_k)
+    if structure_load is not None:
+        _set_kratos_local_solid_point_loads(
+            backend=backend,
+            structure_load=structure_load,
+        )
     KM = backend["KM"]
     perm_map = np.asarray(backend["local_perm"], dtype=int)
     gdofs_map = np.asarray(backend["gdofs_map"], dtype=int)
@@ -1788,6 +3529,38 @@ def _assemble_kratos_local_solid_system_batch(
             K_elem[e, :, :] = lhs_py
     element_ids = np.arange(n_elem, dtype=int)
     return K_elem, F_elem, element_ids, gdofs_map
+
+
+def _assemble_kratos_local_solid_point_condition_batch(
+    *,
+    backend: dict[str, object],
+    need_matrix: bool,
+) -> tuple[np.ndarray | None, np.ndarray, np.ndarray, np.ndarray]:
+    KM = backend["KM"]
+    process_info = backend["process_info"]
+    point_conditions = tuple(backend["point_conditions"])
+    field_index_by_old_id = dict(backend["field_index_by_old_id"])
+    dx_ids = np.asarray(backend["dx_ids"], dtype=int)
+    dy_ids = np.asarray(backend["dy_ids"], dtype=int)
+
+    n_cond = int(len(point_conditions))
+    K_cond = np.zeros((n_cond, 2, 2), dtype=float) if bool(need_matrix) else None
+    F_cond = np.zeros((n_cond, 2), dtype=float)
+    gdofs_cond = np.empty((n_cond, 2), dtype=int)
+    for c, cond in enumerate(point_conditions):
+        lhs = KM.Matrix()
+        rhs = KM.Vector()
+        cond.CalculateLocalSystem(lhs, rhs, process_info)
+        node = cond.GetGeometry()[0]
+        field_idx = int(field_index_by_old_id[int(node.Id)])
+        gdofs_cond[c, :] = np.asarray([int(dx_ids[field_idx]), int(dy_ids[field_idx])], dtype=int)
+        F_cond[c, :] = -np.asarray(rhs, dtype=float).reshape(-1)[:2]
+        if K_cond is not None:
+            lhs_arr = np.asarray(lhs, dtype=float)
+            if lhs_arr.size:
+                K_cond[c, :, :] = lhs_arr[:2, :2]
+    cond_ids = np.arange(n_cond, dtype=int)
+    return K_cond, F_cond, cond_ids, gdofs_cond
 
 
 def _assemble_kratos_local_solid_system_full(
@@ -1819,12 +3592,63 @@ def _assemble_kratos_local_solid_system_full(
     return (A_full.tocsr() if A_full is not None else None), R_full
 
 
+def _assemble_kratos_local_solid_global_system_full(
+    *,
+    backend: dict[str, object],
+    d_k: VectorFunction,
+    structure_load: CoordinateLookup,
+    need_matrix: bool,
+):
+    import scipy.sparse as sp
+    from KratosMultiphysics import scipy_conversion_tools
+
+    _sync_kratos_local_solid_backend_state(backend=backend, d_k=d_k)
+    _set_kratos_local_solid_point_loads(
+        backend=backend,
+        structure_load=structure_load,
+    )
+
+    KM = backend["KM"]
+    solver = backend["solver"]
+    strategy = solver._GetSolutionStrategy()
+    builder = solver._GetBuilderAndSolver()
+    scheme = solver._GetScheme()
+    computing_model_part = solver.GetComputingModelPart()
+    space = KM.UblasSparseSpace()
+
+    A = strategy.GetSystemMatrix()
+    b = strategy.GetSystemVector()
+    space.SetToZeroVector(b)
+    if bool(need_matrix):
+        space.SetToZeroMatrix(A)
+    builder.Build(scheme, computing_model_part, A, b)
+
+    gdof_to_eq = _ensure_kratos_local_solid_equation_map(backend=backend)
+    rhs_py = -np.asarray(b, dtype=float).reshape(-1)[gdof_to_eq]
+    A_py = None
+    if bool(need_matrix):
+        A_raw = scipy_conversion_tools.to_csr(A).copy()
+        A_py = A_raw[gdof_to_eq, :][:, gdof_to_eq].tocsr()
+    elif gdof_to_eq.size:
+        A_py = sp.csr_matrix((gdof_to_eq.size, gdof_to_eq.size), dtype=float)
+    else:
+        A_py = sp.csr_matrix((0, 0), dtype=float)
+    return A_py, rhs_py
+
+
 class _KratosLocalSolidSystemOperator(RuntimeOperator):
     """Replace the symbolic solid assembly with the exact Kratos local system."""
 
-    def __init__(self, *, backend: dict[str, object], d_k: VectorFunction) -> None:
+    def __init__(
+        self,
+        *,
+        backend: dict[str, object],
+        d_k: VectorFunction,
+        structure_load: CoordinateLookup | None = None,
+    ) -> None:
         self.backend = backend
         self.d_k = d_k
+        self.structure_load = structure_load
 
     def after_assembly(self, *, solver, coeffs, A_red, R_red, need_matrix: bool):
         import scipy.sparse as sp
@@ -1833,6 +3657,7 @@ class _KratosLocalSolidSystemOperator(RuntimeOperator):
         K_elem, F_elem, element_ids, gdofs_map = _assemble_kratos_local_solid_system_batch(
             backend=self.backend,
             d_k=self.d_k,
+            structure_load=self.structure_load,
             need_matrix=bool(need_matrix),
         )
         A_exact = None
@@ -1843,7 +3668,7 @@ class _KratosLocalSolidSystemOperator(RuntimeOperator):
             A_exact = A_exact.copy()
             A_exact.data.fill(0.0)
         R_exact = np.zeros_like(np.asarray(R_red, dtype=float))
-        return solver.scatter_element_contribs_reduced(
+        A_exact, R_exact = solver.scatter_element_contribs_reduced(
             K_elem=K_elem,
             F_elem=F_elem,
             element_ids=element_ids,
@@ -1851,6 +3676,48 @@ class _KratosLocalSolidSystemOperator(RuntimeOperator):
             A_red=A_exact,
             R_red=R_exact,
         )
+        if self.structure_load is not None and self.backend["point_conditions"]:
+            K_cond, F_cond, cond_ids, gdofs_cond = _assemble_kratos_local_solid_point_condition_batch(
+                backend=self.backend,
+                need_matrix=bool(need_matrix),
+            )
+            A_exact, R_exact = solver.scatter_element_contribs_reduced(
+                K_elem=K_cond,
+                F_elem=F_cond,
+                element_ids=cond_ids,
+                gdofs_map=gdofs_cond,
+                A_red=A_exact,
+                R_red=R_exact,
+            )
+        return A_exact, R_exact
+
+
+class _KratosLocalSolidGlobalSystemOperator(RuntimeOperator):
+    """Replace the reduced solid system with the exact live Kratos global system."""
+
+    def __init__(
+        self,
+        *,
+        backend: dict[str, object],
+        d_k: VectorFunction,
+        structure_load: CoordinateLookup,
+    ) -> None:
+        self.backend = backend
+        self.d_k = d_k
+        self.structure_load = structure_load
+
+    def after_assembly(self, *, solver, coeffs, A_red, R_red, need_matrix: bool):
+        del coeffs, A_red, R_red
+        A_full, R_full = _assemble_kratos_local_solid_global_system_full(
+            backend=self.backend,
+            d_k=self.d_k,
+            structure_load=self.structure_load,
+            need_matrix=bool(need_matrix),
+        )
+        active = np.asarray(solver.active_dofs, dtype=int).reshape(-1)
+        A_exact = A_full[np.ix_(active, active)].tocsr() if bool(need_matrix) else None
+        R_exact = np.asarray(R_full, dtype=float).reshape(-1)[active]
+        return A_exact, R_exact
 
 
 def _write_local_step_history(
@@ -2117,10 +3984,34 @@ def _transfer_scalar_field(*, target_dh: DofHandler, target_fun: Function, sourc
     target_fun.set_nodal_values(ids, vals)
 
 
+def _apply_dirichlet_bcs_to_state(
+    *,
+    dh: DofHandler,
+    field_functions: dict[str, Function],
+    bcs: list[BoundaryCondition],
+) -> None:
+    if not bcs:
+        return
+    for bc in bcs:
+        if str(getattr(bc, "method", "")).strip().lower() != "dirichlet":
+            continue
+        field_name = str(getattr(bc, "field", "")).strip()
+        target = field_functions.get(field_name)
+        if target is None:
+            continue
+        dirichlet_data = dh.get_dirichlet_data([bc]) or {}
+        if not dirichlet_data:
+            continue
+        ids = np.fromiter((int(gd) for gd in dirichlet_data.keys()), dtype=int)
+        vals = np.fromiter((float(val) for val in dirichlet_data.values()), dtype=float)
+        target.set_nodal_values(ids, vals)
+
+
 def _fluid_boundary_conditions(
     *,
     iface_velocity: CoordinateLookup,
     inlet_lookup: Callable[[float, float], float],
+    inlet_tag: str = "inlet",
     interface_tag: str,
     outlet_tag: str,
     walls_tag: str,
@@ -2128,8 +4019,8 @@ def _fluid_boundary_conditions(
 ) -> tuple[list[BoundaryCondition], list[BoundaryCondition]]:
     zero = lambda x, y, t=0.0: 0.0
     bcs = [
-        BoundaryCondition("ux", "dirichlet", "inlet", inlet_lookup),
-        BoundaryCondition("uy", "dirichlet", "inlet", zero),
+        BoundaryCondition("ux", "dirichlet", inlet_tag, inlet_lookup),
+        BoundaryCondition("uy", "dirichlet", inlet_tag, zero),
         BoundaryCondition("ux", "dirichlet", walls_tag, zero),
         BoundaryCondition("uy", "dirichlet", walls_tag, zero),
         BoundaryCondition("ux", "dirichlet", cylinder_tag, zero),
@@ -2139,8 +4030,8 @@ def _fluid_boundary_conditions(
         BoundaryCondition("p", "dirichlet", outlet_tag, zero),
     ]
     bcs_homog = [
-        BoundaryCondition("ux", "dirichlet", "inlet", zero),
-        BoundaryCondition("uy", "dirichlet", "inlet", zero),
+        BoundaryCondition("ux", "dirichlet", inlet_tag, zero),
+        BoundaryCondition("uy", "dirichlet", inlet_tag, zero),
         BoundaryCondition("ux", "dirichlet", walls_tag, zero),
         BoundaryCondition("uy", "dirichlet", walls_tag, zero),
         BoundaryCondition("ux", "dirichlet", cylinder_tag, zero),
@@ -2157,6 +4048,7 @@ def _fluid_zero_local_operator_forms(
     prob: dict[str, object],
     iface_velocity: CoordinateLookup,
     inlet_lookup: Callable[[float, float], float],
+    inlet_tag: str = "inlet",
     interface_tag: str,
     outlet_tag: str,
     walls_tag: str,
@@ -2192,6 +4084,7 @@ def _fluid_zero_local_operator_forms(
     bcs, bcs_homog = _fluid_boundary_conditions(
         iface_velocity=iface_velocity,
         inlet_lookup=inlet_lookup,
+        inlet_tag=inlet_tag,
         interface_tag=interface_tag,
         outlet_tag=outlet_tag,
         walls_tag=walls_tag,
@@ -2249,6 +4142,36 @@ def _get_or_create_cached_stage_solver(
     return solver
 
 
+def _attach_runtime_operator_post_update_hook(
+    *,
+    solver: NewtonSolver,
+    operators: Sequence[RuntimeOperator],
+) -> None:
+    callbacks = []
+    for operator in tuple(operators or ()):
+        callback = getattr(operator, "after_nonlinear_update", None)
+        if callable(callback):
+            callbacks.append(callback)
+    if not callbacks:
+        solver.post_cb = None
+        return
+
+    def _callback(functions) -> None:
+        for callback in callbacks:
+            callback(solver=solver, functions=functions)
+
+    solver.post_cb = _callback
+
+
+def _is_newton_maxiter_nonconvergence(exc: BaseException) -> bool:
+    msg = str(exc)
+    return (
+        "Newton did not converge" in msg
+        or "Newton max_iter reached" in msg
+        or "max iterations" in msg
+    )
+
+
 def _warm_fluid_exact_operator_kernels(
     *,
     prob: dict[str, object],
@@ -2283,6 +4206,13 @@ def _warm_fluid_exact_operator_kernels(
         return
 
     first_eid = np.asarray([0], dtype=int)
+    mesh_v_curr = prob.get("w_mesh_k")
+    dvms_state = prob.get("dvms_state")
+    predicted_snapshot = None
+    if isinstance(dvms_state, FluidDVMSState) and int(dvms_state.sample_count) > 0:
+        # Warm the predictor kernels without perturbing the live hidden state
+        # that seeds the next real Newton assembly.
+        predicted_snapshot = np.asarray(dvms_state.predicted_subscale_velocity, dtype=float).copy()
     assemble_fluid_dvms_local_contribution_batch(
         mesh=mesh,
         dh=prob["dh"],
@@ -2292,7 +4222,7 @@ def _warm_fluid_exact_operator_kernels(
         p_k=prob["p_k"],
         d_mesh=prob["d_mesh"],
         d_prev=prob["d_prev"],
-        mesh_v=None,
+        mesh_v=mesh_v_curr,
         mesh_v_prev=prob["w_mesh_prev"],
         mesh_a_prev=prob["a_mesh_prev"],
         state=prob.get("dvms_state"),
@@ -2315,7 +4245,7 @@ def _warm_fluid_exact_operator_kernels(
         p_k=prob["p_k"],
         d_mesh=prob["d_mesh"],
         d_prev=prob["d_prev"],
-        mesh_v=None,
+        mesh_v=mesh_v_curr,
         mesh_v_prev=prob["w_mesh_prev"],
         mesh_a_prev=prob["a_mesh_prev"],
         rho_f=float(rho_f),
@@ -2325,6 +4255,9 @@ def _warm_fluid_exact_operator_kernels(
         dynamic_tau=float(dynamic_tau),
         backend=backend_name,
     )
+    if predicted_snapshot is not None:
+        dvms_state.predicted_subscale_velocity[:, :] = predicted_snapshot
+        dvms_state.sync_coefficient("predicted_subscale_velocity")
     warmed.add(cache_key)
 
 
@@ -2339,6 +4272,7 @@ def _fluid_residual_and_jacobian(
     pressure_gauge: float,
     iface_velocity: CoordinateLookup,
     inlet_lookup: Callable[[float, float], float],
+    inlet_tag: str = "inlet",
     interface_tag: str,
     outlet_tag: str,
     walls_tag: str,
@@ -2390,7 +4324,7 @@ def _fluid_residual_and_jacobian(
         d_mesh=d_mesh,
         d_prev=d_prev,
         d_prev2=d_prev2,
-        mesh_v=None,
+        mesh_v=w_mesh_k,
         mesh_v_prev=w_mesh_prev,
         mesh_a_prev=a_mesh_prev,
         dt=dt_const,
@@ -2413,7 +4347,7 @@ def _fluid_residual_and_jacobian(
     div_v_phys = inner(cof_F, grad(v)) / J
     a_scheme = predictor_symbolics.a_scheme
     conv_velocity = kin.resolved_conv_velocity + predicted_subscale
-    conv_speed = (dot(conv_velocity, conv_velocity) + _EX2L_CONV_EPS) ** _EX2L_HALF
+    conv_speed = (dot(conv_velocity, conv_velocity) + _EX2L_CONV_EPS) ** _EX2_HALF
     mu_const = _named_constant("example2_local_mu_f", float(mu_f))
     sigma = _fluid_cauchy_stress_ufl(
         p=p_k,
@@ -2426,12 +4360,12 @@ def _fluid_residual_and_jacobian(
     tau_c1 = _named_constant("example2_local_tau_c1", 8.0)
     tau_c2 = _named_constant("example2_local_tau_c2", 2.0)
     dynamic_tau_const = _named_constant("example2_local_dynamic_tau", float(dynamic_tau))
-    tau_one = dynamic_tau_const * _EX2L_ONE / (
+    tau_one = dynamic_tau_const * _EX2_ONE / (
         tau_c1 * mu_const / (h * h)
         + rho * (inv_dt + tau_c2 * conv_speed / h)
     )
     tau_two = mu_const + rho * conv_speed * h / _EX2L_FOUR
-    tau_p = rho * h * h * inv_dt / tau_c1
+    tau_p = rho * h * h / (tau_c1 * dt_const)
     grad_p_phys = predictor_symbolics.grad_p_phys
     grad_q_phys = dot(Finv.T, grad(q))
     grad_dp_phys = dot(Finv.T, grad(dp))
@@ -2487,6 +4421,7 @@ def _fluid_residual_and_jacobian(
     bcs, bcs_homog = _fluid_boundary_conditions(
         iface_velocity=iface_velocity,
         inlet_lookup=inlet_lookup,
+        inlet_tag=inlet_tag,
         interface_tag=interface_tag,
         outlet_tag=outlet_tag,
         walls_tag=walls_tag,
@@ -2544,14 +4479,9 @@ def _mesh_extension_equation(
     dm = prob["dm"]
     z = prob["z"]
     zero_vec = _EX2L_ZERO_VEC
-    # Kratos StructuralMeshMovingElement is a weighted linear-elastic mesh solve.
-    # The constitutive law is scaled pointwise with
-    #   weighting_factor = detJ * (100 / detJ)^1.5
-    # and the FE integration is carried out on the current mesh geometry. In
-    # the transformed reference-domain form below, the physical current-cell
-    # Jacobian is area_ref * J_prev for the reference partitioned triangles
-    # used here, so the constitutive part only needs the remaining stiffening
-    # factor (100 / (area_ref * J_prev))^1.5.
+    # The mesh-moving strategy resets the mesh part to the initial coordinates
+    # before each solve, so the structural-similarity operator is assembled on
+    # the reference geometry every time.
     poisson_ratio = 0.3
     young_modulus = 1.0
     mu_m = young_modulus / (2.0 * (1.0 + poisson_ratio))
@@ -2562,17 +4492,13 @@ def _mesh_extension_equation(
     mesh_stiffening_exponent = _named_constant("example2_local_mesh_stiffening_exponent", 1.5)
     mesh_jac_eps = _named_constant("example2_local_mesh_jac_eps", 1.0e-14)
     area_ref = _kratos_structural_mesh_area_coefficient(prob["dh"].mixed_element.mesh)
-    m_prev_geom: VectorFunction = prob["m_prev_geom"]
-    F_prev = Identity(2) + grad(m_prev_geom)
-    Finv_prev = inv(F_prev)
-    J_prev = det(F_prev)
-    stiffening = (mesh_stiffening_factor / (area_ref * J_prev + mesh_jac_eps)) ** mesh_stiffening_exponent
-    grad_dm_phys = dot(grad(dm), Finv_prev)
-    div_dm_phys = inner(Finv_prev.T, grad(dm))
+    stiffening = (mesh_stiffening_factor / (area_ref + mesh_jac_eps)) ** mesh_stiffening_exponent
+    grad_dm_phys = grad(dm)
+    div_dm_phys = div(dm)
     eps_dm_phys = _EX2L_HALF * (grad_dm_phys + grad_dm_phys.T)
     sigma_dm_phys = stiffening * (_EX2L_TWO * mesh_mu * eps_dm_phys + mesh_lambda * div_dm_phys * Identity(2))
     equation = Equation(
-        inner(J_prev * dot(sigma_dm_phys, Finv_prev.T), grad(z)) * dx(metadata={"q": int(quad_order)}),
+        inner(sigma_dm_phys, grad(z)) * dx(metadata={"q": int(quad_order)}),
         _EX2L_ZERO * dot(z, zero_vec) * dx(metadata={"q": int(quad_order)}),
     )
     zero = lambda x, y, t=0.0: 0.0
@@ -2664,6 +4590,7 @@ def _assemble_fluid_local_velocity_contribution_raw(
     contribution_mode: str = "system",
     apply_dirichlet_lift: bool = False,
     backend: str = "python",
+    element_ids: np.ndarray | None = None,
 ):
     import scipy.sparse as sp
 
@@ -2672,59 +4599,101 @@ def _assemble_fluid_local_velocity_contribution_raw(
     ndof = int(dh.total_dofs)
     A_full = sp.lil_matrix((ndof, ndof), dtype=float) if need_matrix else None
     R_full = np.zeros(ndof, dtype=float)
-    batch = assemble_fluid_dvms_local_contribution_batch(
-        mesh=mesh,
-        dh=dh,
-        u_k=prob["u_k"],
-        u_prev=prob.get("u_prev"),
-        a_prev=prob.get("a_prev"),
-        p_k=prob["p_k"],
-        d_mesh=prob["d_mesh"],
-        d_prev=prob["d_prev"],
-        mesh_v=None,
-        mesh_v_prev=prob.get("w_mesh_prev"),
-        mesh_a_prev=prob.get("a_mesh_prev"),
-        state=prob.get("dvms_state"),
-        rho_f=float(rho_f),
-        mu_f=float(mu_f),
-        dt=float(dt),
-        bossak_alpha=float(bossak_alpha),
-        element_ids=np.arange(int(mesh.n_elements), dtype=int),
-        quadrature_order=int(quad_order),
-        contribution_mode=str(contribution_mode),
-        backend=str(backend),
-    )
-    K_elem, F_elem, gdofs_map = _compress_batch_to_fluid_block(
-        dh,
-        LocalAssemblyResult(
-            K_elem=None if batch.K_elem is None else np.asarray(batch.K_elem, dtype=float),
-            F_elem=None if batch.F_elem is None else np.asarray(batch.F_elem, dtype=float),
-            element_ids=np.asarray(batch.element_ids, dtype=int),
-            gdofs_map=np.asarray(batch.gdofs_map, dtype=int),
-        ),
-    )
-    if bool(apply_dirichlet_lift) and K_elem is not None:
-        bcs_apply = prob.get("_current_bcs")
-        if not bcs_apply:
-            bcs_apply = prob.get("bcs")
-        bc_map = dh.get_dirichlet_data(bcs_apply) or {}
-        if bc_map:
-            bc_values_full = np.zeros(ndof, dtype=float)
-            bc_ids = np.fromiter((int(gdof) for gdof in bc_map.keys()), dtype=int)
-            bc_vals = np.fromiter((float(val) for val in bc_map.values()), dtype=float)
-            bc_values_full[bc_ids] = bc_vals
-            local_bc = np.asarray(bc_values_full[np.asarray(gdofs_map, dtype=int)], dtype=float)
-            lifted = np.einsum("eij,ej->ei", np.asarray(K_elem, dtype=float), local_bc, optimize=True)
-            if F_elem is None:
-                F_elem = -lifted
-            else:
-                F_elem = F_elem - lifted
+    if element_ids is None:
+        element_ids_arr = np.arange(int(mesh.n_elements), dtype=int)
+    else:
+        element_ids_arr = np.asarray(element_ids, dtype=int).reshape(-1)
+    raw_residualization = str(os.getenv("PYCUTFEM_EX2_DVMS_RESIDUALIZATION", "kratos") or "kratos").strip().lower()
+    if str(contribution_mode).strip().lower() == "system" and raw_residualization == "kratos":
+        op = FluidDVMSLocalVelocityContributionOperator(
+            mesh=mesh,
+            dh=dh,
+            u_k=prob["u_k"],
+            u_prev=prob.get("u_prev"),
+            a_prev=prob.get("a_prev"),
+            a_curr=prob.get("a_k"),
+            p_k=prob["p_k"],
+            d_mesh=prob["d_mesh"],
+            d_prev=prob["d_prev"],
+            d_prev2=prob.get("d_prev2"),
+            mesh_v=prob.get("w_mesh_k"),
+            mesh_v_prev=prob.get("w_mesh_prev"),
+            mesh_a_prev=prob.get("a_mesh_prev"),
+            state=prob.get("dvms_state"),
+            rho_f=float(rho_f),
+            mu_f=float(mu_f),
+            dt=float(dt),
+            bossak_alpha=float(bossak_alpha),
+            element_ids=element_ids_arr,
+            quadrature_order=int(quad_order),
+            contribution_mode=str(contribution_mode),
+            apply_dirichlet_lift=bool(apply_dirichlet_lift),
+            residualization="kratos",
+        )
+        solver_stub = NewtonSolver.__new__(NewtonSolver)
+        solver_stub.backend = str(backend)
+        workset = op.build_local_workset(solver=solver_stub, coeffs=None, need_matrix=bool(need_matrix))
+        local = op.assemble_local(workset)
+        K_elem = None if local.K_elem is None else np.asarray(local.K_elem, dtype=float)
+        F_elem = None if local.F_elem is None else -np.asarray(local.F_elem, dtype=float)
+        gdofs_map = np.asarray(local.gdofs_map, dtype=int)
+        batch_element_ids = np.asarray(local.element_ids, dtype=int)
+    else:
+        batch = assemble_fluid_dvms_local_contribution_batch(
+            mesh=mesh,
+            dh=dh,
+            u_k=prob["u_k"],
+            u_prev=prob.get("u_prev"),
+            a_prev=prob.get("a_prev"),
+            a_curr=prob.get("a_k"),
+            p_k=prob["p_k"],
+            d_mesh=prob["d_mesh"],
+            d_prev=prob["d_prev"],
+            mesh_v=prob.get("w_mesh_k"),
+            mesh_v_prev=prob.get("w_mesh_prev"),
+            mesh_a_prev=prob.get("a_mesh_prev"),
+            state=prob.get("dvms_state"),
+            rho_f=float(rho_f),
+            mu_f=float(mu_f),
+            dt=float(dt),
+            bossak_alpha=float(bossak_alpha),
+            element_ids=element_ids_arr,
+            quadrature_order=int(quad_order),
+            contribution_mode=str(contribution_mode),
+            backend=str(backend),
+        )
+        K_elem, F_elem, gdofs_map = _compress_batch_to_fluid_block(
+            dh,
+            LocalAssemblyResult(
+                K_elem=None if batch.K_elem is None else np.asarray(batch.K_elem, dtype=float),
+                F_elem=None if batch.F_elem is None else np.asarray(batch.F_elem, dtype=float),
+                element_ids=np.asarray(batch.element_ids, dtype=int),
+                gdofs_map=np.asarray(batch.gdofs_map, dtype=int),
+            ),
+        )
+        batch_element_ids = np.asarray(batch.element_ids, dtype=int)
+        if bool(apply_dirichlet_lift) and K_elem is not None:
+            bcs_apply = prob.get("_current_bcs")
+            if not bcs_apply:
+                bcs_apply = prob.get("bcs")
+            bc_map = dh.get_dirichlet_data(bcs_apply) or {}
+            if bc_map:
+                bc_values_full = np.zeros(ndof, dtype=float)
+                bc_ids = np.fromiter((int(gdof) for gdof in bc_map.keys()), dtype=int)
+                bc_vals = np.fromiter((float(val) for val in bc_map.values()), dtype=float)
+                bc_values_full[bc_ids] = bc_vals
+                local_bc = np.asarray(bc_values_full[np.asarray(gdofs_map, dtype=int)], dtype=float)
+                lifted = np.einsum("eij,ej->ei", np.asarray(K_elem, dtype=float), local_bc, optimize=True)
+                if F_elem is None:
+                    F_elem = -lifted
+                else:
+                    F_elem = F_elem - lifted
     scatter_owner = NewtonSolver.__new__(NewtonSolver)
     A_full, R_full = NewtonSolver.scatter_element_contribs_full(
         scatter_owner,
         K_elem=None if not need_matrix else K_elem,
         F_elem=F_elem,
-        element_ids=np.asarray(batch.element_ids, dtype=int),
+        element_ids=batch_element_ids,
         gdofs_map=np.asarray(gdofs_map, dtype=int),
         A_full=A_full,
         R_full=R_full,
@@ -2751,18 +4720,22 @@ def _refresh_fluid_reaction_reconstruction_state(
         return
     dh: DofHandler = prob["dh"]
     mesh: Mesh = dh.mixed_element.mesh
-    _update_fluid_dvms_predicted_subscale(
+    if hasattr(state, "sample_count"):
+        _clear_fluid_dvms_oss_projections(state)
+    _call_with_supported_keywords(
+        _update_fluid_dvms_predicted_subscale,
         state=state,
         dh=dh,
         mesh=mesh,
         u_k=prob["u_k"],
         u_prev=prob["u_prev"],
         a_prev=prob["a_prev"],
+        a_curr=prob.get("a_k"),
         p_k=prob["p_k"],
         d_mesh=prob["d_mesh"],
         d_prev=prob["d_prev"],
         d_prev2=prob.get("d_prev2"),
-        mesh_v=None,
+        mesh_v=prob.get("w_mesh_k"),
         mesh_v_prev=prob.get("w_mesh_prev"),
         mesh_a_prev=prob.get("a_mesh_prev"),
         rho_f=float(rho_f),
@@ -2771,6 +4744,7 @@ def _refresh_fluid_reaction_reconstruction_state(
         bossak_alpha=float(bossak_alpha),
         dynamic_tau=float(dynamic_tau),
         backend=str(backend),
+        use_oss=False,
     )
 
 
@@ -2790,6 +4764,168 @@ def _fluid_interface_velocity_dofs(
         dtype=int,
     ).reshape(-1)
     return np.unique(np.concatenate([ux_ids, uy_ids]).astype(int, copy=False))
+
+
+def _fluid_interface_reaction_element_ids(
+    prob: dict[str, object],
+    *,
+    interface_tag: str,
+) -> np.ndarray:
+    """Elements whose local velocity rows can contribute to interface reactions."""
+    cache = prob.get("_interface_reaction_element_ids_cache")
+    if not isinstance(cache, dict):
+        cache = {}
+        prob["_interface_reaction_element_ids_cache"] = cache
+    key = str(interface_tag)
+    cached = cache.get(key)
+    if cached is not None:
+        return np.asarray(cached, dtype=int)
+
+    dh: DofHandler = prob["dh"]
+    u_k: VectorFunction = prob["u_k"]
+    interface_rows = _fluid_interface_velocity_dofs(prob, interface_tag=interface_tag)
+    if interface_rows.size == 0:
+        out = np.zeros((0,), dtype=int)
+        cache[key] = out
+        return out
+
+    ux_map = np.asarray(dh.element_maps[u_k.components[0].field_name], dtype=int)
+    uy_map = np.asarray(dh.element_maps[u_k.components[1].field_name], dtype=int)
+    mask = np.isin(ux_map, interface_rows).any(axis=1) | np.isin(uy_map, interface_rows).any(axis=1)
+    out = np.flatnonzero(mask).astype(int, copy=False)
+    cache[key] = out
+    return out
+
+
+def _cached_fluid_reaction_operator(
+    *,
+    prob: dict[str, object],
+    rho_f: float,
+    mu_f: float,
+    dt: float,
+    quad_order: int,
+    bossak_alpha: float,
+    contribution_mode: str,
+    element_ids: np.ndarray,
+) -> FluidDVMSLocalVelocityContributionOperator:
+    cache = prob.get("_interface_reaction_operator_cache")
+    if not isinstance(cache, dict):
+        cache = {}
+        prob["_interface_reaction_operator_cache"] = cache
+    element_ids_arr = np.asarray(element_ids, dtype=int).reshape(-1)
+    key = (
+        float(rho_f),
+        float(mu_f),
+        float(dt),
+        int(quad_order),
+        float(bossak_alpha),
+        str(contribution_mode).strip().lower(),
+        tuple(int(v) for v in element_ids_arr),
+    )
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
+
+    dh: DofHandler = prob["dh"]
+    mesh: Mesh = dh.mixed_element.mesh
+    op = FluidDVMSLocalVelocityContributionOperator(
+        mesh=mesh,
+        dh=dh,
+        u_k=prob["u_k"],
+        u_prev=prob.get("u_prev"),
+        a_prev=prob.get("a_prev"),
+        a_curr=prob.get("a_k"),
+        p_k=prob["p_k"],
+        d_mesh=prob["d_mesh"],
+        d_prev=prob["d_prev"],
+        d_prev2=prob.get("d_prev2"),
+        mesh_v=prob.get("w_mesh_k"),
+        mesh_v_prev=prob.get("w_mesh_prev"),
+        mesh_a_prev=prob.get("a_mesh_prev"),
+        state=prob.get("dvms_state"),
+        rho_f=float(rho_f),
+        mu_f=float(mu_f),
+        dt=float(dt),
+        bossak_alpha=float(bossak_alpha),
+        element_ids=element_ids_arr,
+        quadrature_order=int(quad_order),
+        contribution_mode=str(contribution_mode),
+    )
+    cache[key] = op
+    return op
+
+
+def _assemble_fluid_reaction_residual_cached(
+    *,
+    prob: dict[str, object],
+    rho_f: float,
+    mu_f: float,
+    dt: float,
+    quad_order: int,
+    bossak_alpha: float,
+    interface_tag: str,
+    backend: str,
+    contribution_mode: str,
+) -> np.ndarray:
+    dh: DofHandler = prob["dh"]
+    t0 = time.perf_counter()
+    element_ids = _fluid_interface_reaction_element_ids(prob, interface_tag=interface_tag)
+    t_ids = time.perf_counter()
+    op = _cached_fluid_reaction_operator(
+        prob=prob,
+        rho_f=float(rho_f),
+        mu_f=float(mu_f),
+        dt=float(dt),
+        quad_order=int(quad_order),
+        bossak_alpha=float(bossak_alpha),
+        contribution_mode=str(contribution_mode),
+        element_ids=element_ids,
+    )
+    t_op = time.perf_counter()
+    solver_stub = NewtonSolver.__new__(NewtonSolver)
+    solver_stub.backend = str(backend)
+    workset = op.build_local_workset(solver=solver_stub, coeffs=None, need_matrix=False)
+    t_workset = time.perf_counter()
+    local = op.assemble_local(workset)
+    t_assemble = time.perf_counter()
+    # Runtime operators expose the Newton residual sign. Reaction reconstruction
+    # needs the raw Kratos local-system RHS convention used by the legacy helper.
+    F_elem = None if local.F_elem is None else -np.asarray(local.F_elem, dtype=float)
+    rhs = np.zeros(int(dh.total_dofs), dtype=float)
+    scatter_owner = NewtonSolver.__new__(NewtonSolver)
+    _, rhs = NewtonSolver.scatter_element_contribs_full(
+        scatter_owner,
+        K_elem=None,
+        F_elem=F_elem,
+        element_ids=np.asarray(local.element_ids, dtype=int),
+        gdofs_map=np.asarray(local.gdofs_map, dtype=int),
+        A_full=None,
+        R_full=rhs,
+    )
+    if _env_bool("PYCUTFEM_EX2_STAGE_TIMING", False):
+        _log(
+            True,
+            "[timing] reaction_residual "
+            f"elements={int(np.asarray(element_ids).size)} "
+            f"ids={t_ids - t0:.6f}s "
+            f"operator={t_op - t_ids:.6f}s "
+            f"workset={t_workset - t_op:.6f}s "
+            f"assemble={t_assemble - t_workset:.6f}s "
+            f"scatter={time.perf_counter() - t_assemble:.6f}s",
+        )
+    return rhs
+
+
+def _can_use_cached_fluid_reaction_operator(prob: dict[str, object]) -> bool:
+    dh = prob.get("dh")
+    u_k = prob.get("u_k")
+    if dh is None or u_k is None:
+        return False
+    if not hasattr(dh, "element_maps") or not hasattr(dh, "mixed_element") or not hasattr(dh, "total_dofs"):
+        return False
+    if not hasattr(u_k, "components"):
+        return False
+    return all(key in prob for key in ("p_k", "d_mesh", "d_prev"))
 
 
 def _fluid_interface_constrained_reaction_vector(
@@ -2812,6 +4948,9 @@ def _fluid_interface_constrained_reaction_vector(
         bcs_apply = prob.get("bcs_homog")
     if not bcs_apply:
         bcs_apply = prob.get("bcs")
+    if _env_bool("PYCUTFEM_EX2_REACTION_ASSUME_INTERFACE_CONSTRAINED", True) and not bcs_apply:
+        reaction[interface_rows] = -rhs[interface_rows]
+        return reaction
     bc_map = dh.get_dirichlet_data(bcs_apply) or {}
     if bc_map:
         bc_rows = np.fromiter((int(gdof) for gdof in bc_map.keys()), dtype=int)
@@ -2841,28 +4980,58 @@ def _fluid_interface_reaction_loads(
     backend: str = "python",
     contribution_mode: str = "system",
     apply_dirichlet_lift: bool = False,
+    refresh_state: bool = True,
 ) -> CoordinateLookup:
-    _refresh_fluid_reaction_reconstruction_state(
-        prob=prob,
-        rho_f=float(rho_f),
-        mu_f=float(mu_f),
-        dt=float(dt),
-        bossak_alpha=float(bossak_alpha),
-        dynamic_tau=float(dynamic_tau),
-        backend=str(backend),
-    )
-    _, raw_residual = _assemble_fluid_local_velocity_contribution_raw(
-        prob=prob,
-        rho_f=float(rho_f),
-        mu_f=float(mu_f),
-        dt=float(dt),
-        quad_order=int(quad_order),
-        bossak_alpha=float(bossak_alpha),
-        need_matrix=False,
-        contribution_mode=str(contribution_mode),
-        apply_dirichlet_lift=bool(apply_dirichlet_lift),
-        backend=str(backend),
-    )
+    state_snapshot = _snapshot_fluid_dvms_state(prob.get("dvms_state")) if bool(refresh_state) else None
+    try:
+        if bool(refresh_state):
+            _refresh_fluid_reaction_reconstruction_state(
+                prob=prob,
+                rho_f=float(rho_f),
+                mu_f=float(mu_f),
+                dt=float(dt),
+                bossak_alpha=float(bossak_alpha),
+                dynamic_tau=float(dynamic_tau),
+                backend=str(backend),
+            )
+        use_cached_reaction_operator = (
+            (not bool(apply_dirichlet_lift)) and _can_use_cached_fluid_reaction_operator(prob)
+        )
+        if use_cached_reaction_operator:
+            raw_residual = _assemble_fluid_reaction_residual_cached(
+                prob=prob,
+                rho_f=float(rho_f),
+                mu_f=float(mu_f),
+                dt=float(dt),
+                quad_order=int(quad_order),
+                bossak_alpha=float(bossak_alpha),
+                interface_tag=interface_tag,
+                backend=str(backend),
+                contribution_mode=str(contribution_mode),
+            )
+        else:
+            element_ids = (
+                _fluid_interface_reaction_element_ids(prob, interface_tag=interface_tag)
+                if _can_use_cached_fluid_reaction_operator(prob)
+                else None
+            )
+            _, raw_residual = _call_with_supported_keywords(
+                _assemble_fluid_local_velocity_contribution_raw,
+                prob=prob,
+                rho_f=float(rho_f),
+                mu_f=float(mu_f),
+                dt=float(dt),
+                quad_order=int(quad_order),
+                bossak_alpha=float(bossak_alpha),
+                need_matrix=False,
+                contribution_mode=str(contribution_mode),
+                apply_dirichlet_lift=bool(apply_dirichlet_lift),
+                backend=str(backend),
+                element_ids=element_ids,
+            )
+    finally:
+        if state_snapshot is not None:
+            _restore_fluid_dvms_state(prob.get("dvms_state"), state_snapshot)
     reaction_vector = _fluid_interface_constrained_reaction_vector(
         prob=prob,
         system_rhs=np.asarray(raw_residual, dtype=float),
@@ -2978,15 +5147,91 @@ def _solid_interface_disp_velocity(
     d_prev: VectorFunction,
     iface_coords: np.ndarray,
     dt: float,
+    v_prev_lookup: CoordinateLookup | None = None,
+    a_prev_lookup: CoordinateLookup | None = None,
+    bossak_alpha: float | None = None,
 ) -> tuple[CoordinateLookup, CoordinateLookup]:
     disp_vals = np.empty((iface_coords.shape[0], 2), dtype=float)
-    vel_vals = np.empty((iface_coords.shape[0], 2), dtype=float)
+    disp_prev_vals = np.empty((iface_coords.shape[0], 2), dtype=float)
     for i, xy in enumerate(np.asarray(iface_coords, dtype=float)):
         disp_curr, _ = _eval_vector_with_grad(dh, mesh, d_curr, tuple(xy))
         disp_prev_val, _ = _eval_vector_with_grad(dh, mesh, d_prev, tuple(xy))
         disp_vals[i, :] = disp_curr
-        vel_vals[i, :] = (disp_curr - disp_prev_val) / max(float(dt), 1.0e-14)
-    return CoordinateLookup(iface_coords, disp_vals, dim=2), CoordinateLookup(iface_coords, vel_vals, dim=2)
+        disp_prev_vals[i, :] = disp_prev_val
+    return _interface_disp_velocity_from_values(
+        iface_coords=iface_coords,
+        disp_vals=disp_vals,
+        disp_prev_vals=disp_prev_vals,
+        dt=dt,
+        v_prev_lookup=v_prev_lookup,
+        a_prev_lookup=a_prev_lookup,
+        bossak_alpha=bossak_alpha,
+    )
+
+
+def _interface_disp_velocity_from_values(
+    *,
+    iface_coords: np.ndarray,
+    disp_vals: np.ndarray,
+    disp_prev_vals: np.ndarray,
+    dt: float,
+    v_prev_lookup: CoordinateLookup | None = None,
+    a_prev_lookup: CoordinateLookup | None = None,
+    bossak_alpha: float | None = None,
+) -> tuple[CoordinateLookup, CoordinateLookup]:
+    iface_coords_arr = np.asarray(iface_coords, dtype=float)
+    disp_curr_arr = np.asarray(disp_vals, dtype=float).reshape(-1, 2)
+    disp_prev_arr = np.asarray(disp_prev_vals, dtype=float).reshape(-1, 2)
+    if disp_curr_arr.shape != disp_prev_arr.shape or disp_curr_arr.shape[0] != iface_coords_arr.shape[0]:
+        raise ValueError("interface displacement arrays must match interface coordinates")
+    vel_vals = np.empty_like(disp_curr_arr)
+    if v_prev_lookup is not None and a_prev_lookup is not None and bossak_alpha is not None:
+        prev_vel_vals = np.asarray(
+            v_prev_lookup(iface_coords_arr[:, 0], iface_coords_arr[:, 1]),
+            dtype=float,
+        ).reshape(-1, 2)
+        prev_acc_vals = np.asarray(
+            a_prev_lookup(iface_coords_arr[:, 0], iface_coords_arr[:, 1]),
+            dtype=float,
+        ).reshape(-1, 2)
+        vel_vals[:, :], _ = _bossak_displacement_kinematics_values(
+            d_curr=disp_curr_arr,
+            d_prev=disp_prev_arr,
+            v_prev=prev_vel_vals,
+            a_prev=prev_acc_vals,
+            dt=dt,
+            alpha=float(bossak_alpha),
+        )
+    else:
+        vel_vals[:, :] = (disp_curr_arr - disp_prev_arr) / max(float(dt), 1.0e-14)
+    return CoordinateLookup(iface_coords_arr, disp_curr_arr, dim=2), CoordinateLookup(iface_coords_arr, vel_vals, dim=2)
+
+
+def _assign_nirb_full_displacement(
+    *,
+    predictor: NIRBSolidPredictor,
+    prediction,
+    solid_displacement: VectorFunction,
+) -> np.ndarray:
+    if prediction.full_displacement is not None:
+        full_displacement = np.asarray(prediction.full_displacement, dtype=float).reshape(-1)
+    else:
+        if prediction.reduced_displacement is None:
+            raise RuntimeError("NIRB prediction does not contain reduced coordinates for full reconstruction.")
+        full_displacement = np.asarray(
+            predictor.reconstruct_full(prediction.reduced_displacement),
+            dtype=float,
+        ).reshape(-1)
+    if not np.all(np.isfinite(full_displacement)):
+        raise RuntimeError("NIRB full displacement reconstruction returned non-finite values.")
+    target_shape = np.asarray(solid_displacement.nodal_values).shape
+    if full_displacement.size != int(np.prod(target_shape)):
+        raise RuntimeError(
+            "NIRB full displacement size does not match the solid field: "
+            f"{full_displacement.size} != {int(np.prod(target_shape))}"
+        )
+    solid_displacement.nodal_values[:] = full_displacement.reshape(target_shape)
+    return full_displacement
 
 
 def _bossak_displacement_kinematics_values(
@@ -3110,22 +5355,73 @@ def _restore_function_values(functions: list[Function | VectorFunction], snapsho
         function.nodal_values[:] = np.asarray(values, dtype=float)
 
 
+def _predict_fluid_bossak_step_state(
+    *,
+    fluid: dict[str, object],
+    dt: float,
+    bossak_alpha: float,
+    predictor_bcs: list[BoundaryCondition] | None = None,
+) -> None:
+    """Match the Kratos fluid Bossak Predict() call made once per time step.
+
+    Kratos applies the process-level Dirichlet conditions before the underlying
+    fluid solver Predict() call. The ALE interface velocity copy happens later,
+    immediately before solving the fluid, and does not refresh ACCELERATION.
+    """
+    bossak = _bossak_coefficients(alpha=float(bossak_alpha), dt=max(float(dt), 1.0e-14))
+    fluid["u_k"].nodal_values[:] = fluid["u_prev"].nodal_values[:]
+    fluid["p_k"].nodal_values[:] = fluid["p_prev"].nodal_values[:]
+    if predictor_bcs:
+        _apply_dirichlet_bcs_to_state(
+            dh=fluid["dh"],
+            field_functions={
+                str(fluid["u_k"].components[0].field_name): fluid["u_k"].components[0],
+                str(fluid["u_k"].components[1].field_name): fluid["u_k"].components[1],
+                str(fluid["p_k"].field_name): fluid["p_k"],
+            },
+            bcs=predictor_bcs,
+        )
+    fluid["a_k"].nodal_values[:] = (
+        float(bossak["ma0"])
+        * (fluid["u_k"].nodal_values[:] - fluid["u_prev"].nodal_values[:])
+        + float(bossak["ma2"]) * fluid["a_prev"].nodal_values[:]
+    )
+
+
 def _snapshot_fluid_dvms_state(state: FluidDVMSState | None) -> dict[str, np.ndarray] | None:
     if not isinstance(state, FluidDVMSState):
         return None
-    return {
+    snapshot = {
         "old_subscale_velocity": np.asarray(state.old_subscale_velocity, dtype=float).copy(),
         "predicted_subscale_velocity": np.asarray(state.predicted_subscale_velocity, dtype=float).copy(),
         "momentum_projection": np.asarray(state.momentum_projection, dtype=float).copy(),
         "mass_projection": np.asarray(state.mass_projection, dtype=float).copy(),
         "old_mass_residual": np.asarray(state.old_mass_residual, dtype=float).copy(),
     }
+    nodal_momentum_projection = getattr(state, "_nodal_momentum_projection", None)
+    nodal_div_projection = getattr(state, "_nodal_div_projection", None)
+    prev_nodal_div_projection = getattr(state, "_prev_nodal_div_projection", None)
+    if nodal_momentum_projection is not None:
+        snapshot["nodal_momentum_projection"] = np.asarray(nodal_momentum_projection, dtype=float).copy()
+    if nodal_div_projection is not None:
+        snapshot["nodal_div_projection"] = np.asarray(nodal_div_projection, dtype=float).copy()
+    if prev_nodal_div_projection is not None:
+        snapshot["prev_nodal_div_projection"] = np.asarray(prev_nodal_div_projection, dtype=float).copy()
+    return snapshot
 
 
 def _restore_fluid_dvms_state(state: FluidDVMSState | None, snapshot: dict[str, np.ndarray] | None) -> None:
     if not isinstance(state, FluidDVMSState) or snapshot is None:
         return
+    nodal_attr_map = {
+        "nodal_momentum_projection": "_nodal_momentum_projection",
+        "nodal_div_projection": "_nodal_div_projection",
+        "prev_nodal_div_projection": "_prev_nodal_div_projection",
+    }
     for key, values in snapshot.items():
+        if key in nodal_attr_map:
+            setattr(state, nodal_attr_map[key], np.asarray(values, dtype=float).copy())
+            continue
         getattr(state, key)[:, ...] = np.asarray(values, dtype=float)
     state.sync_coefficients_from_samples()
 
@@ -3139,11 +5435,59 @@ def _restore_fluid_dvms_state_except(
     if not isinstance(state, FluidDVMSState) or snapshot is None:
         return
     skip = set() if skip_keys is None else {str(key) for key in skip_keys}
+    nodal_attr_map = {
+        "nodal_momentum_projection": "_nodal_momentum_projection",
+        "nodal_div_projection": "_nodal_div_projection",
+        "prev_nodal_div_projection": "_prev_nodal_div_projection",
+    }
     for key, values in snapshot.items():
         if key in skip:
             continue
+        if key in nodal_attr_map:
+            setattr(state, nodal_attr_map[key], np.asarray(values, dtype=float).copy())
+            continue
         getattr(state, key)[:, ...] = np.asarray(values, dtype=float)
     state.sync_coefficients_from_samples()
+
+
+def _fluid_dvms_restart_snapshot_from_payload(
+    state: FluidDVMSState | None,
+    restart_payload: dict[str, np.ndarray],
+) -> dict[str, np.ndarray] | None:
+    if not isinstance(state, FluidDVMSState):
+        return None
+    snapshot: dict[str, np.ndarray] = {
+        "old_subscale_velocity": np.asarray(
+            restart_payload.get("dvms_old_subscale_velocity", np.zeros_like(state.old_subscale_velocity)),
+            dtype=float,
+        ),
+        "predicted_subscale_velocity": np.asarray(
+            restart_payload.get("dvms_predicted_subscale_velocity", np.zeros_like(state.predicted_subscale_velocity)),
+            dtype=float,
+        ),
+        "momentum_projection": np.asarray(
+            restart_payload.get("dvms_momentum_projection", np.zeros_like(state.momentum_projection)),
+            dtype=float,
+        ),
+        "mass_projection": np.asarray(
+            restart_payload.get("dvms_mass_projection", np.zeros_like(state.mass_projection)),
+            dtype=float,
+        ),
+        "old_mass_residual": np.asarray(
+            restart_payload.get("dvms_old_mass_residual", np.zeros_like(state.old_mass_residual)),
+            dtype=float,
+        ),
+    }
+    optional_nodal_keys = (
+        "nodal_momentum_projection",
+        "nodal_div_projection",
+        "prev_nodal_div_projection",
+    )
+    for key in optional_nodal_keys:
+        payload_key = f"dvms_{key}"
+        if payload_key in restart_payload:
+            snapshot[key] = np.asarray(restart_payload[payload_key], dtype=float)
+    return snapshot
 
 
 def _snapshot_fluid_stage_state(prob: dict[str, object]) -> dict[str, object]:
@@ -3153,6 +5497,7 @@ def _snapshot_fluid_stage_state(prob: dict[str, object]) -> dict[str, object]:
         "u_prev": np.asarray(prob["u_prev"].nodal_values, dtype=float).copy(),
         "p_prev": np.asarray(prob["p_prev"].nodal_values, dtype=float).copy(),
         "a_prev": np.asarray(prob["a_prev"].nodal_values, dtype=float).copy(),
+        "a_k": np.asarray(prob["a_k"].nodal_values, dtype=float).copy(),
         "d_mesh": np.asarray(prob["d_mesh"].nodal_values, dtype=float).copy(),
         "d_prev": np.asarray(prob["d_prev"].nodal_values, dtype=float).copy(),
         "d_prev2": np.asarray(prob["d_prev2"].nodal_values, dtype=float).copy(),
@@ -3172,6 +5517,7 @@ def _restore_fluid_stage_state(prob: dict[str, object], snapshot: dict[str, obje
     prob["u_prev"].nodal_values[:] = np.asarray(snapshot["u_prev"], dtype=float)
     prob["p_prev"].nodal_values[:] = np.asarray(snapshot["p_prev"], dtype=float)
     prob["a_prev"].nodal_values[:] = np.asarray(snapshot["a_prev"], dtype=float)
+    prob["a_k"].nodal_values[:] = np.asarray(snapshot["a_k"], dtype=float)
     prob["d_mesh"].nodal_values[:] = np.asarray(snapshot["d_mesh"], dtype=float)
     prob["d_prev"].nodal_values[:] = np.asarray(snapshot["d_prev"], dtype=float)
     prob["d_prev2"].nodal_values[:] = np.asarray(snapshot["d_prev2"], dtype=float)
@@ -3249,6 +5595,7 @@ def _checkpoint_payload(
         "fluid_u_prev": np.asarray(fluid["u_prev"].nodal_values, dtype=float).copy(),
         "fluid_p_prev": np.asarray(fluid["p_prev"].nodal_values, dtype=float).copy(),
         "fluid_a_prev": np.asarray(fluid["a_prev"].nodal_values, dtype=float).copy(),
+        "fluid_a_k": np.asarray(fluid["a_k"].nodal_values, dtype=float).copy(),
         "fluid_d_mesh": np.asarray(fluid["d_mesh"].nodal_values, dtype=float).copy(),
         "fluid_d_prev": np.asarray(fluid["d_prev"].nodal_values, dtype=float).copy(),
         "fluid_d_prev2": np.asarray(fluid["d_prev2"].nodal_values, dtype=float).copy(),
@@ -3516,6 +5863,20 @@ def _iqnils_next_iterate(
     horizon: int,
     regularization: float,
 ) -> np.ndarray:
+    backend_mode = _env_str("PYCUTFEM_EX2_IQN_BACKEND", "python").strip().lower()
+    if backend_mode == "cpp":
+        return kratos_iqnils_next_iterate_cpp(
+            x_curr=np.asarray(x_curr, dtype=float),
+            g_curr=np.asarray(g_curr, dtype=float),
+            x_history=[np.asarray(values, dtype=float) for values in list(x_history)],
+            g_history=[np.asarray(values, dtype=float) for values in list(g_history)],
+            dr_old_mats=[np.asarray(block, dtype=float) for block in list(dr_old_mats or [])],
+            dg_old_mats=[np.asarray(block, dtype=float) for block in list(dg_old_mats or [])],
+            alpha=float(omega),
+            horizon=int(horizon),
+            regularization=float(regularization),
+        )
+
     x_curr_arr = np.asarray(x_curr, dtype=float)
     g_curr_arr = np.asarray(g_curr, dtype=float)
     x_curr_vec = x_curr_arr.reshape(-1)
@@ -3594,6 +5955,14 @@ def _iqnils_iteration_matrices(
     g_history: list[np.ndarray],
     iteration_horizon: int,
 ) -> tuple[np.ndarray | None, np.ndarray | None]:
+    backend_mode = _env_str("PYCUTFEM_EX2_IQN_BACKEND", "python").strip().lower()
+    if backend_mode == "cpp":
+        return kratos_iqnils_iteration_matrices_cpp(
+            x_history=[np.asarray(values, dtype=float) for values in list(x_history)],
+            g_history=[np.asarray(values, dtype=float) for values in list(g_history)],
+            iteration_horizon=int(iteration_horizon),
+        )
+
     keep_count = min(max(int(iteration_horizon), 1), len(x_history), len(g_history))
     if keep_count <= 1:
         return None, None
@@ -3616,7 +5985,8 @@ def _advance_coupling_load_guess(
     *,
     step_converged: bool,
     active_force_update: str,
-    iface_coords: np.ndarray,
+    iface_coords: np.ndarray | None = None,
+    solid_iface_coords: np.ndarray | None = None,
     load_guess_vals: np.ndarray,
     returned_load_vals: np.ndarray,
     load_guess_history: list[np.ndarray],
@@ -3626,16 +5996,43 @@ def _advance_coupling_load_guess(
     omega_force: float,
     force_iteration_horizon: int,
     force_regularization: float,
-) -> tuple[CoordinateLookup, bool]:
+    include_debug: bool = False,
+) -> tuple[CoordinateLookup, bool] | tuple[CoordinateLookup, bool, dict[str, object]]:
+    if iface_coords is None:
+        iface_coords = solid_iface_coords
+    if iface_coords is None:
+        raise TypeError("_advance_coupling_load_guess() requires 'iface_coords'.")
+
+    def _result(
+        lookup: CoordinateLookup,
+        update_applied: bool,
+        debug: dict[str, object],
+    ) -> tuple[CoordinateLookup, bool] | tuple[CoordinateLookup, bool, dict[str, object]]:
+        if bool(include_debug):
+            return lookup, bool(update_applied), debug
+        return lookup, bool(update_applied)
+
+    iface_coords_arr = np.asarray(iface_coords, dtype=float)
     load_guess_arr = np.asarray(load_guess_vals, dtype=float).copy()
     returned_arr = np.asarray(returned_load_vals, dtype=float).copy()
-    returned_lookup = CoordinateLookup(iface_coords, returned_arr, dim=2)
+    returned_lookup = CoordinateLookup(iface_coords_arr, returned_arr, dim=2)
     if bool(step_converged):
-        return returned_lookup, False
+        return _result(returned_lookup, False, {
+            "backend": str(_env_str("PYCUTFEM_EX2_IQN_BACKEND", "python")).strip().lower(),
+            "used_history": False,
+            "v_new": None,
+            "w_new": None,
+        })
 
     load_guess_history.append(load_guess_arr.copy())
     load_return_history.append(returned_arr.copy())
+    active_backend = str(_env_str("PYCUTFEM_EX2_IQN_BACKEND", "python")).strip().lower()
     if str(active_force_update).lower() == "iqnils":
+        v_new, w_new = _iqnils_iteration_matrices(
+            x_history=load_guess_history,
+            g_history=load_return_history,
+            iteration_horizon=int(force_iteration_horizon),
+        )
         next_load_values = _iqnils_next_iterate(
             x_curr=load_guess_arr,
             g_curr=returned_arr,
@@ -3647,16 +6044,30 @@ def _advance_coupling_load_guess(
             horizon=int(force_iteration_horizon),
             regularization=float(force_regularization),
         )
-        return CoordinateLookup(iface_coords, next_load_values, dim=2), True
+        return _result(CoordinateLookup(iface_coords_arr, next_load_values, dim=2), True, {
+            "backend": active_backend,
+            "used_history": bool(
+                (v_new is not None and int(v_new.size) > 0)
+                or any(np.asarray(block).size for block in (iqn_old_dr_mats or []))
+            ),
+            "v_new": None if v_new is None else np.asarray(v_new, dtype=float),
+            "w_new": None if w_new is None else np.asarray(w_new, dtype=float),
+        })
 
-    return (
+    return _result(
         _relaxed_lookup(
-            iface_coords,
+            iface_coords_arr,
             load_guess_arr,
             returned_arr,
             omega=float(omega_force),
         ),
         True,
+        {
+            "backend": "python",
+            "used_history": False,
+            "v_new": None,
+            "w_new": None,
+        },
     )
 
 
@@ -3664,7 +6075,13 @@ def _advance_coupling_load_guess(
 class _CouplingRetryPolicy:
     force_update: str
     force_relaxation: float
+    max_coupling_iters: int
     reset_interface_history: bool = False
+    fluid_max_newton_iter: int | None = None
+    fluid_globalization: str | None = None
+    fluid_line_search: bool | None = None
+    fluid_ls_fail_hard: bool | None = None
+    fluid_continuation_scales: tuple[float, ...] = ()
 
 
 def _build_coupling_retry_policies(
@@ -3673,23 +6090,166 @@ def _build_coupling_retry_policies(
     force_relaxation: float,
     force_relaxation_min: float,
     force_relaxation_max: float,
+    base_max_coupling_iters: int,
+    base_max_newton_iter: int,
     max_retries: int,
 ) -> list[_CouplingRetryPolicy]:
     policies: list[_CouplingRetryPolicy] = []
 
-    def _append(mode: str, omega: float, *, reset: bool) -> None:
+    def _append(
+        mode: str,
+        omega: float,
+        *,
+        max_iters: int,
+        reset: bool,
+        fluid_max_newton_iter: int | None = None,
+        fluid_globalization: str | None = None,
+        fluid_line_search: bool | None = None,
+        fluid_ls_fail_hard: bool | None = None,
+        fluid_continuation_scales: tuple[float, ...] = (),
+    ) -> None:
         omega_clamped = float(np.clip(float(omega), float(force_relaxation_min), float(force_relaxation_max)))
-        policy = _CouplingRetryPolicy(str(mode), omega_clamped, bool(reset))
+        policy = _CouplingRetryPolicy(
+            str(mode),
+            omega_clamped,
+            max(int(max_iters), 1),
+            bool(reset),
+            None if fluid_max_newton_iter is None else max(int(fluid_max_newton_iter), 1),
+            None if fluid_globalization is None else str(fluid_globalization),
+            None if fluid_line_search is None else bool(fluid_line_search),
+            None if fluid_ls_fail_hard is None else bool(fluid_ls_fail_hard),
+            tuple(float(v) for v in fluid_continuation_scales),
+        )
         if policy not in policies:
             policies.append(policy)
 
-    _append(str(force_update).lower(), float(force_relaxation), reset=False)
-    fallback_omegas = [min(float(force_relaxation), 0.10), 0.05, 0.02]
-    for omega in fallback_omegas:
-        _append("constant", omega, reset=True)
+    base_iters = max(int(base_max_coupling_iters), 1)
+    base_newton = max(int(base_max_newton_iter), 1)
+    _append(str(force_update).lower(), float(force_relaxation), max_iters=base_iters, reset=False)
+    fallback_specs = [
+        {
+            "omega": 0.05,
+            "max_iters": max(base_iters, 8 * base_iters),
+            "fluid_max_newton_iter": max(base_newton, 32),
+            "fluid_globalization": "line_search_then_trust",
+            "fluid_line_search": True,
+            "fluid_ls_fail_hard": False,
+        },
+        {
+            "omega": 0.02,
+            "max_iters": max(base_iters, 12 * base_iters),
+            "fluid_max_newton_iter": max(base_newton, 50),
+            "fluid_globalization": "line_search_then_trust",
+            "fluid_line_search": True,
+            "fluid_ls_fail_hard": False,
+        },
+        {
+            "omega": 0.01,
+            "max_iters": max(base_iters, 16 * base_iters),
+            "fluid_max_newton_iter": max(base_newton, 64),
+            "fluid_globalization": "line_search_then_trust",
+            "fluid_line_search": True,
+            "fluid_ls_fail_hard": False,
+        },
+        {
+            "omega": 0.005,
+            "max_iters": max(base_iters, 20 * base_iters),
+            "fluid_max_newton_iter": max(base_newton, 80),
+            "fluid_globalization": "line_search_then_trust",
+            "fluid_line_search": True,
+            "fluid_ls_fail_hard": False,
+        },
+    ]
+    for spec in fallback_specs:
+        _append("constant", reset=True, **spec)
         if len(policies) >= int(max_retries) + 1:
             break
     return policies[: max(int(max_retries), 0) + 1]
+
+
+def _copy_lookup(lookup: CoordinateLookup) -> CoordinateLookup:
+    return CoordinateLookup(
+        np.asarray(lookup.coords, dtype=float).copy(),
+        np.asarray(lookup.values, dtype=float).copy(),
+        dim=int(lookup.dim),
+    )
+
+
+def _step_progress_marker(
+    *,
+    disp_snapshots: list[np.ndarray],
+    load_snapshots: list[np.ndarray],
+    load_guess_snapshots: list[np.ndarray],
+    load_return_snapshots: list[np.ndarray],
+    fluid_load_guess_snapshots: list[np.ndarray],
+    fluid_load_return_snapshots: list[np.ndarray],
+    interface_disp_snapshots: list[np.ndarray],
+    interface_velocity_snapshots: list[np.ndarray],
+    interface_traction_snapshots: list[np.ndarray],
+    reaction_load_snapshots: list[np.ndarray],
+    stress_load_snapshots: list[np.ndarray],
+    snapshot_rows: list[dict[str, object]],
+    step_rows: list[dict[str, object]],
+    fluid_times: list[float],
+    structure_times: list[float],
+    increment_times: list[float],
+) -> dict[str, int]:
+    return {
+        "disp_snapshots": len(disp_snapshots),
+        "load_snapshots": len(load_snapshots),
+        "load_guess_snapshots": len(load_guess_snapshots),
+        "load_return_snapshots": len(load_return_snapshots),
+        "fluid_load_guess_snapshots": len(fluid_load_guess_snapshots),
+        "fluid_load_return_snapshots": len(fluid_load_return_snapshots),
+        "interface_disp_snapshots": len(interface_disp_snapshots),
+        "interface_velocity_snapshots": len(interface_velocity_snapshots),
+        "interface_traction_snapshots": len(interface_traction_snapshots),
+        "reaction_load_snapshots": len(reaction_load_snapshots),
+        "stress_load_snapshots": len(stress_load_snapshots),
+        "snapshot_rows": len(snapshot_rows),
+        "step_rows": len(step_rows),
+        "fluid_times": len(fluid_times),
+        "structure_times": len(structure_times),
+        "increment_times": len(increment_times),
+    }
+
+
+def _truncate_step_progress(
+    *,
+    marker: dict[str, int],
+    disp_snapshots: list[np.ndarray],
+    load_snapshots: list[np.ndarray],
+    load_guess_snapshots: list[np.ndarray],
+    load_return_snapshots: list[np.ndarray],
+    fluid_load_guess_snapshots: list[np.ndarray],
+    fluid_load_return_snapshots: list[np.ndarray],
+    interface_disp_snapshots: list[np.ndarray],
+    interface_velocity_snapshots: list[np.ndarray],
+    interface_traction_snapshots: list[np.ndarray],
+    reaction_load_snapshots: list[np.ndarray],
+    stress_load_snapshots: list[np.ndarray],
+    snapshot_rows: list[dict[str, object]],
+    step_rows: list[dict[str, object]],
+    fluid_times: list[float],
+    structure_times: list[float],
+    increment_times: list[float],
+) -> None:
+    del disp_snapshots[int(marker["disp_snapshots"]):]
+    del load_snapshots[int(marker["load_snapshots"]):]
+    del load_guess_snapshots[int(marker["load_guess_snapshots"]):]
+    del load_return_snapshots[int(marker["load_return_snapshots"]):]
+    del fluid_load_guess_snapshots[int(marker["fluid_load_guess_snapshots"]):]
+    del fluid_load_return_snapshots[int(marker["fluid_load_return_snapshots"]):]
+    del interface_disp_snapshots[int(marker["interface_disp_snapshots"]):]
+    del interface_velocity_snapshots[int(marker["interface_velocity_snapshots"]):]
+    del interface_traction_snapshots[int(marker["interface_traction_snapshots"]):]
+    del reaction_load_snapshots[int(marker["reaction_load_snapshots"]):]
+    del stress_load_snapshots[int(marker["stress_load_snapshots"]):]
+    del snapshot_rows[int(marker["snapshot_rows"]):]
+    del step_rows[int(marker["step_rows"]):]
+    del fluid_times[int(marker["fluid_times"]):]
+    del structure_times[int(marker["structure_times"]):]
+    del increment_times[int(marker["increment_times"]):]
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -3750,7 +6310,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dt", type=float, default=None)
     parser.add_argument("--end-time", type=float, default=None)
     parser.add_argument("--max-steps", type=int, default=None)
-    parser.add_argument("--max-coupling-iters", type=int, default=6)
+    parser.add_argument("--max-coupling-iters", type=int, default=50)
     parser.add_argument("--coupling-rel-tol", type=float, default=5.0e-3)
     parser.add_argument("--coupling-abs-tol", type=float, default=5.0e-3)
     parser.add_argument("--load-transfer", choices=("stress", "reaction"), default="reaction")
@@ -3761,15 +6321,38 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--force-iteration-horizon", type=int, default=50)
     parser.add_argument("--force-history", type=int, default=3)
     parser.add_argument("--force-regularization", type=float, default=0.0)
-    parser.add_argument("--step-retries", type=int, default=2, help="Retry a failed outer FSI step with safer interface updates.")
+    parser.add_argument(
+        "--step-retries",
+        type=int,
+        default=0,
+        help="Optional rollback/retry ladder for failed outer FSI steps. Default: disabled on the production path.",
+    )
     parser.add_argument("--newton-tol", type=float, default=1.0e-6)
     parser.add_argument("--max-newton-iter", type=int, default=20)
     parser.add_argument("--bossak-alpha", type=float, default=-0.3)
     parser.add_argument("--dynamic-tau", type=float, default=1.0)
     parser.add_argument("--pressure-gauge", type=float, default=1.0e-5)
     parser.add_argument("--fluid-operator", choices=("exact", "continuous"), default="exact")
-    parser.add_argument("--backend", choices=("python", "jit", "cpp"), default="python")
-    parser.add_argument("--linear-backend", choices=("scipy", "petsc"), default="scipy")
+    parser.add_argument(
+        "--solid-operator",
+        choices=("exact", "nirb"),
+        default="exact",
+        help="Use the full structural solve or a trained NIRB solid surrogate.",
+    )
+    parser.add_argument(
+        "--nirb-model-path",
+        type=Path,
+        default=None,
+        help="Path to a trained pycutfem NIRB model when --solid-operator=nirb.",
+    )
+    parser.add_argument(
+        "--nirb-start-step",
+        type=int,
+        default=1,
+        help="First accepted global step that uses the NIRB solid surrogate.",
+    )
+    parser.add_argument("--backend", choices=("python", "jit", "cpp"), default="cpp")
+    parser.add_argument("--linear-backend", choices=("scipy", "sparseqr", "petsc", "amgcl"), default="scipy")
     parser.add_argument("--snapshot-mode", choices=("all", "converged"), default="all")
     parser.add_argument("--save-vtk", action="store_true", help="Write fluid/solid VTK outputs under output_dir/vtk_data.")
     parser.add_argument("--vtk-every", type=int, default=1, help="Write VTK every N accepted steps when --save-vtk is enabled.")
@@ -3803,7 +6386,7 @@ def run_local_example2(
     dt: float | None = None,
     end_time: float | None = None,
     max_steps: int | None = None,
-    max_coupling_iters: int = 6,
+    max_coupling_iters: int = 50,
     coupling_rel_tol: float = 5.0e-3,
     coupling_abs_tol: float = 5.0e-3,
     load_transfer: str = "reaction",
@@ -3814,14 +6397,17 @@ def run_local_example2(
     force_iteration_horizon: int = 50,
     force_history: int = 3,
     force_regularization: float = 0.0,
-    step_retries: int = 2,
+    step_retries: int = 0,
     newton_tol: float = 1.0e-6,
     max_newton_iter: int = 12,
     bossak_alpha: float = -0.3,
     dynamic_tau: float = 1.0,
     pressure_gauge: float = 1.0e-5,
     fluid_operator: str = "exact",
-    backend: str = "python",
+    solid_operator: str = "exact",
+    nirb_model_path: Path | None = None,
+    nirb_start_step: int = 1,
+    backend: str = "cpp",
     linear_backend: str = "scipy",
     snapshot_mode: str = "all",
     save_vtk: bool = False,
@@ -3935,6 +6521,13 @@ def run_local_example2(
         if legacy_exact_flag in {"1", "true", "yes"}:
             fluid_operator_mode = "exact"
     use_exact_fluid_operator = fluid_operator_mode == "exact"
+    solid_operator_mode = str(solid_operator).strip().lower()
+    if solid_operator_mode not in {"exact", "nirb"}:
+        raise ValueError(f"Unsupported solid_operator={solid_operator!r}")
+    if solid_operator_mode == "nirb" and nirb_model_path is None:
+        raise ValueError("--nirb-model-path is required when --solid-operator=nirb")
+    nirb_start_step_value = max(1, int(nirb_start_step))
+    exact_backend_notes: list[str] = []
     requested_exact_fluid_backend_mode = _env_str(
         "PYCUTFEM_EX2_EXACT_FLUID_BACKEND",
         "auto",
@@ -3955,6 +6548,18 @@ def run_local_example2(
             f"{requested_exact_fluid_backend_mode!r}. "
             "Use one of: auto, local, kratos_live."
         )
+    if requested_exact_fluid_backend_mode in {"", "auto"} and exact_fluid_backend_mode == "local":
+        fluid_auto_reasons: list[str] = []
+        if not bool(use_exact_fluid_operator):
+            fluid_auto_reasons.append("fluid_operator != exact")
+        if mesh_source_value != "reference":
+            fluid_auto_reasons.append("mesh_source != reference")
+        if restart_payload is not None:
+            fluid_auto_reasons.append("restart_from is set")
+        if fluid_auto_reasons:
+            exact_backend_notes.append(
+                "exact fluid backend auto -> local because " + ", ".join(fluid_auto_reasons)
+            )
     if exact_fluid_backend_mode == "kratos_live" and mesh_source_value != "reference":
         raise RuntimeError("The persistent Kratos exact-fluid backend requires mesh_source='reference'.")
     if exact_fluid_backend_mode == "kratos_live" and restart_payload is not None:
@@ -3966,7 +6571,12 @@ def run_local_example2(
     if requested_exact_structure_backend_mode in {"", "auto"}:
         exact_structure_backend_mode = (
             "kratos_live"
-            if bool(use_exact_fluid_operator) and mesh_source_value == "reference" and restart_payload is None
+            if (
+                solid_operator_mode != "nirb"
+                and bool(use_exact_fluid_operator)
+                and mesh_source_value == "reference"
+                and restart_payload is None
+            )
             else "local"
         )
     elif requested_exact_structure_backend_mode in {"local", "pycutfem"}:
@@ -3979,23 +6589,112 @@ def run_local_example2(
             f"{requested_exact_structure_backend_mode!r}. "
             "Use one of: auto, local, kratos_live."
         )
+    if requested_exact_structure_backend_mode in {"", "auto"} and exact_structure_backend_mode == "local":
+        structure_auto_reasons: list[str] = []
+        if solid_operator_mode == "nirb":
+            structure_auto_reasons.append("solid_operator=nirb")
+        if not bool(use_exact_fluid_operator):
+            structure_auto_reasons.append("fluid_operator != exact")
+        if mesh_source_value != "reference":
+            structure_auto_reasons.append("mesh_source != reference")
+        if restart_payload is not None:
+            structure_auto_reasons.append("restart_from is set")
+        if structure_auto_reasons:
+            exact_backend_notes.append(
+                "exact structure backend auto -> local because " + ", ".join(structure_auto_reasons)
+            )
     if exact_structure_backend_mode == "kratos_live" and mesh_source_value != "reference":
         raise RuntimeError("The persistent Kratos exact-structure backend requires mesh_source='reference'.")
     if exact_structure_backend_mode == "kratos_live" and restart_payload is not None:
         raise RuntimeError("The persistent Kratos exact-structure backend is not yet supported with restart_from.")
+    if solid_operator_mode == "nirb" and exact_structure_backend_mode == "kratos_live":
+        raise RuntimeError("solid_operator='nirb' cannot be combined with the kratos_live structure backend.")
+    requested_exact_fluid_linear_backend = str(
+        os.getenv("PYCUTFEM_EX2_EXACT_FLUID_LINEAR_BACKEND", "") or ""
+    ).strip().lower()
+    allowed_linear_backends = {"scipy", "sparseqr", "petsc", "amgcl"}
+
+    def _select_exact_fluid_linear_backend() -> str:
+        selected = (
+            requested_exact_fluid_linear_backend
+            if requested_exact_fluid_linear_backend
+            else (
+                "amgcl"
+                if bool(use_exact_fluid_operator) and exact_fluid_backend_mode == "local"
+                else str(linear_backend)
+            )
+        )
+        selected = str(selected).strip().lower()
+        if selected not in allowed_linear_backends:
+            raise ValueError(
+                "Unsupported exact-fluid linear backend "
+                f"{selected!r}. Use one of: {', '.join(sorted(allowed_linear_backends))}."
+            )
+        return selected
+
+    exact_fluid_linear_backend = _select_exact_fluid_linear_backend()
+    structure_solver_profile = _load_kratos_structure_solver_profile(
+        benchmark_root=Path(setup.reference.root),
+    )
 
     fluid = _build_fluid_problem(
         mesh_f,
         poly_order=int(poly_order),
         pressure_order=pressure_order_value,
+        mesh_order=int(mesh_order),
         quadrature_order=quad_order,
     )
-    mesh_ext = _build_mesh_extension_problem(mesh_f, poly_order=int(poly_order))
+    mesh_ext = _build_mesh_extension_problem(mesh_f, poly_order=int(mesh_order))
     solid = _build_solid_problem(mesh_s, poly_order=int(poly_order))
-    kratos_local_solid_backend = _maybe_build_kratos_local_solid_backend(
-        benchmark_root=Path(setup.reference.root),
-        prob=solid,
-    ) if exact_structure_backend_mode == "local" else None
+    diagnostic_solid_system_backend = _diagnostic_solid_system_backend_mode()
+    if diagnostic_solid_system_backend in {"", "none", "symbolic"}:
+        kratos_local_solid_backend = None
+    elif diagnostic_solid_system_backend == "kratos_local":
+        kratos_local_solid_backend = _build_kratos_local_solid_backend(
+            benchmark_root=Path(setup.reference.root),
+            prob=solid,
+        )
+    else:
+        raise ValueError(
+            "Unsupported diagnostic solid-system backend mode "
+            f"{diagnostic_solid_system_backend!r}."
+        )
+    requested_mesh_extension_solver = _env_str("PYCUTFEM_EX2_MESH_EXTENSION_SOLVER", "").strip().lower()
+    requested_mesh_linear_solve_mode = _env_str("PYCUTFEM_EX2_MESH_LINEAR_SOLVE_MODE", "").strip().lower()
+    need_kratos_local_mesh_backend = (
+        mesh_source_value == "reference"
+        and mesh_backend_value == "python"
+        and requested_mesh_extension_solver in {"kratos_local", "kratos"}
+    )
+    need_local_amgcl_openmp_cap = requested_mesh_linear_solve_mode in {
+        "amgcl",
+        "pycutfem_amgcl",
+        "cpp_amgcl",
+        "local_amgcl",
+    }
+    need_kratos_runtime = (
+        diagnostic_solid_system_backend == "kratos_local"
+        or bool(need_kratos_local_mesh_backend)
+        or exact_structure_backend_mode == "kratos_live"
+        or exact_fluid_backend_mode == "kratos_live"
+        or mesh_backend_value == "kratos"
+    )
+    kratos_thread_env = _configure_kratos_thread_env(enable=bool(need_kratos_runtime or need_local_amgcl_openmp_cap))
+    if bool(kratos_thread_env.get("already_imported")) and bool(kratos_thread_env.get("changes")):
+        exact_backend_notes.append(
+            "Kratos thread defaults were applied after KratosMultiphysics was already imported; "
+            "restart the process if you need the new thread cap to take effect"
+        )
+    kratos_local_mesh_backend = (
+        _build_kratos_local_mesh_backend(
+            fluid_mdpa_path=Path(mesh_descriptor["fluid_mesh_path"]),
+            dt=float(dt_value),
+            bossak_alpha=float(bossak_alpha),
+            prob=mesh_ext,
+        )
+        if need_kratos_local_mesh_backend
+        else None
+    )
     kratos_exact_structure_backend = (
         _build_kratos_exact_structure_backend(
             benchmark_root=Path(setup.reference.root),
@@ -4015,7 +6714,11 @@ def run_local_example2(
         except ModuleNotFoundError:
             if requested_exact_fluid_backend_mode not in {"", "auto"}:
                 raise
+            exact_backend_notes.append(
+                "exact fluid backend auto -> local because kratos_live imports are unavailable in the current environment"
+            )
             exact_fluid_backend_mode = "local"
+            exact_fluid_linear_backend = _select_exact_fluid_linear_backend()
     kratos_mesh_backend = (
         _build_kratos_mesh_motion_backend(
             fluid_mdpa_path=Path(mesh_descriptor["fluid_mesh_path"]),
@@ -4025,8 +6728,53 @@ def run_local_example2(
         if mesh_backend_value == "kratos" and kratos_exact_fluid_backend is None
         else None
     )
+    _section(verbose, "[config] Example 2 backend resolution")
+    _log(
+        verbose,
+        "[config] "
+        f"mesh_source={mesh_source_value} mesh_backend={mesh_backend_value} "
+        f"fluid_operator={fluid_operator_mode} restart_from={'none' if restart_path is None else restart_path}",
+    )
+    _log(
+        verbose,
+        "[config] "
+        f"exact_fluid_backend requested={requested_exact_fluid_backend_mode or 'auto'} "
+        f"resolved={exact_fluid_backend_mode} linear_backend={exact_fluid_linear_backend}",
+    )
+    _log(
+        verbose,
+        "[config] "
+        f"exact_structure_backend requested={requested_exact_structure_backend_mode or 'auto'} "
+        f"resolved={exact_structure_backend_mode}",
+    )
+    if bool(kratos_thread_env.get("enabled")):
+        effective_env = dict(kratos_thread_env.get("effective", {}))
+        _log(
+            verbose,
+            "[config] "
+            "kratos_threads "
+            + " ".join(f"{name}={value}" for name, value in effective_env.items()),
+        )
+        runtime_omp_max_threads = kratos_thread_env.get("runtime_openmp_max_threads")
+        runtime_omp_library = str(kratos_thread_env.get("runtime_openmp_library", "") or "").strip()
+        if runtime_omp_max_threads is not None or runtime_omp_library:
+            _log(
+                verbose,
+                "[config] "
+                f"kratos_openmp_runtime library={runtime_omp_library or 'unknown'} "
+                f"max_threads={runtime_omp_max_threads if runtime_omp_max_threads is not None else 'unknown'}",
+            )
+    _log(
+        verbose,
+        "[config] "
+        f"monitor_interface_loads={int(bool(monitor_interface_loads))} "
+        f"monitor_stress_interface_loads={int(bool(_should_monitor_stress_interface_loads(load_transfer=load_transfer, monitor_interface_loads=monitor_interface_loads)))}",
+    )
+    for note in exact_backend_notes:
+        _log(verbose, f"[config-warning] {note}")
     fluid["mesh"] = mesh_f
     solid["mesh"] = mesh_s
+    nirb_solid_predictor: NIRBSolidPredictor | None = None
     if mesh_source_value == "reference":
         clamp_part = setup.reference.solid.submodelparts.get("DISPLACEMENT_BCDisp")
         old_to_new = getattr(mesh_s, "_mdpa_old_to_new_node", {})
@@ -4051,6 +6799,19 @@ def run_local_example2(
     np.save(co_sim_dir / "map_used.npy", map_used)
     np.save(co_sim_dir / "coords_interf.npy", solid_iface_coords)
     np.save(co_sim_dir / "coords_interf_fluid.npy", fluid_iface_coords)
+    if solid_operator_mode == "nirb":
+        nirb_solid_predictor = NIRBSolidPredictor.from_path(
+            Path(nirb_model_path),
+            full_shape=tuple(np.asarray(solid["d_k"].nodal_values).shape),
+            interface_matrix=map_used,
+            interface_shape=(int(solid_iface_coords.shape[0]), 2),
+        )
+        _log(
+            verbose,
+            "[nirb] "
+            f"loaded solid model from {Path(nirb_model_path)} "
+            f"with interface restriction {tuple(map_used.shape)}",
+        )
     solid_interface_mass = _build_interface_mass_matrix(mesh_s, solid_iface_coords, geometry.interface_tag)
 
     zero_load_lookup = CoordinateLookup(
@@ -4058,13 +6819,17 @@ def run_local_example2(
         np.zeros((solid_iface_coords.shape[0], 2), dtype=float),
         dim=2,
     )
+    load_transfer_value = str(load_transfer).lower()
+    accelerate_on_fluid_load = load_transfer_value == "reaction"
+    monitor_stress_interface_loads = _should_monitor_stress_interface_loads(
+        load_transfer=load_transfer_value,
+        monitor_interface_loads=bool(monitor_interface_loads),
+    )
     zero_fluid_load_lookup = CoordinateLookup(
         fluid_iface_coords,
         np.zeros((fluid_iface_coords.shape[0], 2), dtype=float),
         dim=2,
     )
-    load_transfer_value = str(load_transfer).lower()
-    accelerate_on_fluid_load = load_transfer_value == "reaction"
     current_load_lookup = zero_fluid_load_lookup if accelerate_on_fluid_load else zero_load_lookup
     prev_disp_iter_vals = np.zeros((solid_iface_coords.shape[0], 2), dtype=float)
 
@@ -4170,7 +6935,7 @@ def run_local_example2(
         float(
             _env_float(
                 "PYCUTFEM_EX2_EXACT_FLUID_NEWTON_TOL",
-                1.0e-8,
+                1.0e-6,
             )
         ),
     )
@@ -4180,13 +6945,9 @@ def run_local_example2(
     )
     if _env_bool("PYCUTFEM_EX2_DISABLE_EXACT_FLUID_MIXED_CRITERIA", False):
         fluid_mixed_solution_criteria = ()
-    # Kratos' monolithic fluid solve is driven by residual tolerances. Keep the
-    # local mixed-solution shortcut, but guard it with the same residual scale
-    # so the exact-operator path cannot accept an iterate purely on small state
-    # updates while the nonlinear residual is still above the Kratos tolerance.
     fluid_mixed_solution_residual_factor = _env_float(
         "PYCUTFEM_EX2_EXACT_FLUID_MIXED_RES_FACTOR",
-        1.0,
+        0.0,
     )
 
     if restart_payload is not None:
@@ -4197,6 +6958,10 @@ def run_local_example2(
         fluid["u_prev"].nodal_values[:] = np.asarray(restart_payload["fluid_u_prev"], dtype=float)
         fluid["p_prev"].nodal_values[:] = np.asarray(restart_payload["fluid_p_prev"], dtype=float)
         fluid["a_prev"].nodal_values[:] = np.asarray(restart_payload["fluid_a_prev"], dtype=float)
+        fluid["a_k"].nodal_values[:] = np.asarray(
+            restart_payload.get("fluid_a_k", restart_payload["fluid_a_prev"]),
+            dtype=float,
+        )
         fluid["d_mesh"].nodal_values[:] = np.asarray(restart_payload["fluid_d_mesh"], dtype=float)
         fluid["d_prev"].nodal_values[:] = np.asarray(restart_payload["fluid_d_prev"], dtype=float)
         fluid["d_prev2"].nodal_values[:] = np.asarray(restart_payload["fluid_d_prev2"], dtype=float)
@@ -4206,13 +6971,7 @@ def run_local_example2(
         fluid["a_mesh_k"].nodal_values[:] = fluid["a_mesh_prev"].nodal_values[:]
         _restore_fluid_dvms_state(
             fluid.get("dvms_state"),
-            {
-                "old_subscale_velocity": np.asarray(restart_payload.get("dvms_old_subscale_velocity", np.zeros_like(fluid["dvms_state"].old_subscale_velocity)), dtype=float),
-                "predicted_subscale_velocity": np.asarray(restart_payload.get("dvms_predicted_subscale_velocity", np.zeros_like(fluid["dvms_state"].predicted_subscale_velocity)), dtype=float),
-                "momentum_projection": np.asarray(restart_payload.get("dvms_momentum_projection", np.zeros_like(fluid["dvms_state"].momentum_projection)), dtype=float),
-                "mass_projection": np.asarray(restart_payload.get("dvms_mass_projection", np.zeros_like(fluid["dvms_state"].mass_projection)), dtype=float),
-                "old_mass_residual": np.asarray(restart_payload.get("dvms_old_mass_residual", np.zeros_like(fluid["dvms_state"].old_mass_residual)), dtype=float),
-            },
+            _fluid_dvms_restart_snapshot_from_payload(fluid.get("dvms_state"), restart_payload),
         )
         current_load_lookup = CoordinateLookup(
             fluid_iface_coords if accelerate_on_fluid_load else solid_iface_coords,
@@ -4241,7 +7000,11 @@ def run_local_example2(
         _transfer_vector_field(
             target_dh=mesh_ext["dh"],
             target_vec=mesh_ext["m_prev_geom"],
-            source_lookup=mesh_restart_lookup,
+            source_lookup=CoordinateLookup(
+                np.asarray(mesh_restart_lookup.coords, dtype=float),
+                np.zeros_like(np.asarray(mesh_restart_lookup.values, dtype=float)),
+                dim=2,
+            ),
         )
         _section(
             verbose,
@@ -4257,6 +7020,8 @@ def run_local_example2(
             _advance_kratos_exact_fluid_backend_step(backend=kratos_exact_fluid_backend)
         elif kratos_mesh_backend is not None:
             _advance_kratos_mesh_motion_backend_step(backend=kratos_mesh_backend)
+        elif kratos_local_mesh_backend is not None:
+            _advance_kratos_mesh_motion_backend_step(backend=kratos_local_mesh_backend)
         increment_start = time.perf_counter()
         solid_prev_step = _snapshot_function_values([solid["d_prev"]])
         fluid_prev_step = _snapshot_function_values([fluid["u_prev"], fluid["p_prev"]])
@@ -4273,6 +7038,75 @@ def run_local_example2(
             del x
             return geometry.inlet_velocity(y, t_now, reference_velocity=reference_velocity_value)
 
+        if kratos_exact_fluid_backend is None:
+            zero_predictor_iface_velocity = CoordinateLookup(
+                fluid_iface_coords,
+                np.zeros((fluid_iface_coords.shape[0], 2), dtype=float),
+                dim=2,
+            )
+            fluid_predictor_bcs, _ = _fluid_boundary_conditions(
+                iface_velocity=zero_predictor_iface_velocity,
+                inlet_lookup=inlet_profile,
+                interface_tag=geometry.interface_tag,
+                outlet_tag=geometry.outlet_tag,
+                walls_tag=geometry.walls_tag,
+                cylinder_tag=geometry.cylinder_tag,
+            )
+            _predict_fluid_bossak_step_state(
+                fluid=fluid,
+                dt=float(dt_value),
+                bossak_alpha=float(bossak_alpha),
+                predictor_bcs=fluid_predictor_bcs,
+            )
+
+        step_prev_disp_iter_vals = np.asarray(prev_disp_iter_vals, dtype=float).copy()
+        solid_step_state = _snapshot_function_values([solid["d_k"], solid["d_prev"]])
+        fluid_step_state = _snapshot_function_values(
+            [
+                fluid["u_k"],
+                fluid["p_k"],
+                fluid["u_prev"],
+                fluid["p_prev"],
+                fluid["a_prev"],
+                fluid["a_k"],
+                fluid["d_mesh"],
+                fluid["d_prev"],
+                fluid["d_prev2"],
+                fluid["w_mesh_prev"],
+                fluid["a_mesh_prev"],
+                fluid["w_mesh_k"],
+                fluid["a_mesh_k"],
+            ]
+        )
+        mesh_ext_step_state = _snapshot_function_values([mesh_ext["m_k"], mesh_ext["m_prev_geom"]])
+        current_load_lookup_step_start = _copy_lookup(current_load_lookup)
+        iqn_old_dr_step_start = [np.asarray(mat, dtype=float).copy() for mat in iqn_old_dr_mats]
+        iqn_old_dg_step_start = [np.asarray(mat, dtype=float).copy() for mat in iqn_old_dg_mats]
+        allow_step_retries = (
+            kratos_exact_structure_backend is None
+            and kratos_exact_fluid_backend is None
+            and kratos_mesh_backend is None
+        )
+        if allow_step_retries:
+            retry_policies = _build_coupling_retry_policies(
+                force_update=str(force_update).lower(),
+                force_relaxation=float(force_relaxation),
+                force_relaxation_min=float(force_relaxation_min),
+                force_relaxation_max=float(force_relaxation_max),
+                base_max_coupling_iters=int(max_coupling_iters),
+                base_max_newton_iter=int(max_newton_iter),
+                max_retries=int(step_retries),
+            )
+        else:
+            retry_policies = [
+                _CouplingRetryPolicy(
+                    force_update=str(force_update).lower(),
+                    force_relaxation=float(force_relaxation),
+                    max_coupling_iters=int(max_coupling_iters),
+                    reset_interface_history=False,
+                )
+            ]
+
         step_converged = False
         last_disp_abs = last_disp_rel = last_load_abs = last_load_rel = float("nan")
         last_force_omega = float(force_relaxation)
@@ -4280,771 +7114,1382 @@ def run_local_example2(
         last_mesh_vel_fluid_lookup: CoordinateLookup | None = None
         last_mesh_accel_fluid_lookup: CoordinateLookup | None = None
         last_fluid_accel_lookup: CoordinateLookup | None = None
+        last_nirb_prediction = None
         coupling_iter = 0
         active_force_update = str(force_update).lower()
         active_force_relaxation = float(force_relaxation)
-        prev_force_residual: np.ndarray | None = None
-        load_guess_history: list[np.ndarray] = []
-        load_return_history: list[np.ndarray] = []
+        attempt_index = 1
+        increment_elapsed = float("nan")
 
-        for coupling_iter in range(1, int(max_coupling_iters) + 1):
-            _section(verbose, f"[fsi] step={step} fixed-point iter={coupling_iter}/{max_coupling_iters}")
-            if accelerate_on_fluid_load:
-                current_structure_load_lookup = _resample_lookup_to_coords(
-                    _negate_lookup(current_load_lookup),
-                    solid_iface_coords,
-                )
-            else:
-                current_structure_load_lookup = current_load_lookup
-            load_guess_vals = np.asarray(current_structure_load_lookup.values, dtype=float).copy()
-
-            t_solid0 = time.perf_counter()
-            if kratos_exact_structure_backend is not None:
-                kratos_structure_state = _solve_kratos_exact_structure_backend(
-                    backend=kratos_exact_structure_backend,
-                    structure_load=current_structure_load_lookup,
-                )
-                _transfer_vector_field(
-                    target_dh=solid["dh"],
-                    target_vec=solid["d_k"],
-                    source_lookup=kratos_structure_state["displacement"],
-                )
-            else:
-                solid_res, solid_jac, solid_bcs, solid_bcs_homog = _solid_residual_and_jacobian(
-                    prob=solid,
-                    traction_lookup=zero_load_lookup,
-                    mu_s=mu_s,
-                    lambda_s=lambda_s,
-                    interface_tag=geometry.interface_tag,
-                    clamp_tag=geometry.clamp_tag,
-                    quad_order=solid_quad_order,
-                )
-                use_struct_one_step = _env_bool(
-                    "PYCUTFEM_EX2_STRUCT_ONE_STEP",
-                    False,
-                )
-                solid_solver = NewtonSolver(
-                    residual_form=solid_res,
-                    jacobian_form=solid_jac,
-                    dof_handler=solid["dh"],
-                    mixed_element=solid["me"],
-                    bcs=solid_bcs,
-                    bcs_homog=solid_bcs_homog,
-                    newton_params=NewtonParameters(
-                        newton_tol=float(newton_tol),
-                        max_newton_iter=1 if bool(use_struct_one_step) else int(max_newton_iter),
-                        print_level=3,
-                        accept_nonconverged_atol_factor=(
-                            float(_EX2L_KRATOS_STRUCT_ONE_STEP_ACCEPT_FACTOR)
-                            if bool(use_struct_one_step)
-                            else 0.0
-                        ),
-                        line_search=False,
-                        globalization="none",
-                    ),
-                    lin_params=LinearSolverParameters(backend=str(linear_backend)),
-                    quad_order=solid_quad_order,
-                    backend=str(backend),
-                )
-                solid_point_load_full = _boundary_point_load_vector(
-                    solid["dh"],
-                    vector=solid["d_k"],
-                    tag=geometry.interface_tag,
-                    values=load_guess_vals,
-                )
-                solid_point_load_red = np.asarray(
-                    solid_point_load_full[np.asarray(solid_solver.active_dofs, dtype=int)],
-                    dtype=float,
-                )
-                solid_runtime_ops: list[RuntimeOperator] = []
-                if kratos_local_solid_backend is not None:
-                    solid_runtime_ops.append(
-                        _KratosLocalSolidSystemOperator(
-                            backend=kratos_local_solid_backend,
-                            d_k=solid["d_k"],
-                        )
-                    )
-                solid_runtime_ops.append(_ReducedResidualShiftOperator(solid_point_load_red))
-                solid_solver.set_runtime_operators(solid_runtime_ops)
-                solid_guess = _snapshot_function_values([solid["d_k"]])
-                _restore_function_values([solid["d_prev"]], solid_prev_step)
-                solid_solver.solve_time_interval(
-                    functions=[solid["d_k"]],
-                    prev_functions=[solid["d_prev"]],
-                    time_params=TimeStepperParameters(
-                        dt=1.0,
-                        max_steps=1,
-                        final_time=1.0,
-                        stop_on_steady=False,
-                        step_initial_guess_callback=_guess_callback_from_snapshots(solid_guess),
-                    ),
-                )
-                _restore_function_values([solid["d_prev"]], solid_prev_step)
-            solid_elapsed = time.perf_counter() - t_solid0
-            structure_times.append(float(solid_elapsed))
-
-            solid_disp_solid_lookup, _ = _solid_interface_disp_velocity(
-                dh=solid["dh"],
-                mesh=mesh_s,
-                d_curr=solid["d_k"],
-                d_prev=solid["d_prev"],
-                iface_coords=solid_iface_coords,
-                dt=dt_value,
+        for attempt_index, retry_policy in enumerate(retry_policies, start=1):
+            step_marker = _step_progress_marker(
+                disp_snapshots=disp_snapshots,
+                load_snapshots=load_snapshots,
+                load_guess_snapshots=load_guess_snapshots,
+                load_return_snapshots=load_return_snapshots,
+                fluid_load_guess_snapshots=fluid_load_guess_snapshots,
+                fluid_load_return_snapshots=fluid_load_return_snapshots,
+                interface_disp_snapshots=interface_disp_snapshots,
+                interface_velocity_snapshots=interface_velocity_snapshots,
+                interface_traction_snapshots=interface_traction_snapshots,
+                reaction_load_snapshots=reaction_load_snapshots,
+                stress_load_snapshots=stress_load_snapshots,
+                snapshot_rows=snapshot_rows,
+                step_rows=step_rows,
+                fluid_times=fluid_times,
+                structure_times=structure_times,
+                increment_times=increment_times,
             )
-            # Kratos uses a nearest-neighbor mapper for structure
-            # DISPLACEMENT -> fluid MESH_DISPLACEMENT in DoubleFlap. Replicate
-            # that transfer instead of evaluating the solid FE field directly
-            # at the fluid interface coordinates.
-            solid_disp_fluid_lookup = _resample_lookup_to_coords(
-                solid_disp_solid_lookup,
-                fluid_iface_coords,
+            _restore_function_values([solid["d_k"], solid["d_prev"]], solid_step_state)
+            _restore_function_values(
+                [
+                    fluid["u_k"],
+                    fluid["p_k"],
+                    fluid["u_prev"],
+                    fluid["p_prev"],
+                    fluid["a_prev"],
+                    fluid["a_k"],
+                    fluid["d_mesh"],
+                    fluid["d_prev"],
+                    fluid["d_prev2"],
+                    fluid["w_mesh_prev"],
+                    fluid["a_mesh_prev"],
+                    fluid["w_mesh_k"],
+                    fluid["a_mesh_k"],
+                ],
+                fluid_step_state,
             )
-            disp_snapshot = _flatten_vector_snapshot(solid["dh"], solid["d_k"])
-
-            reaction_point_load_lookup = None
-            reaction_solid_load_lookup = None
-            stress_point_load_lookup = None
-            if kratos_exact_fluid_backend is not None:
-                t_fluid0 = time.perf_counter()
-                kratos_fluid_state = _solve_kratos_exact_fluid_backend(
-                    backend=kratos_exact_fluid_backend,
-                    interface_disp=solid_disp_fluid_lookup,
-                )
-                mesh_lookup = kratos_fluid_state["mesh_displacement"]
-                mesh_vel_fluid_lookup = kratos_fluid_state["mesh_velocity"]
-                mesh_accel_fluid_lookup = kratos_fluid_state["mesh_acceleration"]
-                last_fluid_accel_lookup = kratos_fluid_state["acceleration"]
-                _transfer_vector_field(target_dh=fluid["dh"], target_vec=fluid["d_mesh"], source_lookup=mesh_lookup)
-                _transfer_vector_field(
-                    target_dh=fluid["dh"],
-                    target_vec=fluid["w_mesh_k"],
-                    source_lookup=mesh_vel_fluid_lookup,
-                )
-                _transfer_vector_field(
-                    target_dh=fluid["dh"],
-                    target_vec=fluid["a_mesh_k"],
-                    source_lookup=mesh_accel_fluid_lookup,
-                )
-                _transfer_vector_field(
-                    target_dh=fluid["dh"],
-                    target_vec=fluid["u_k"],
-                    source_lookup=kratos_fluid_state["velocity"],
-                )
-                _transfer_scalar_field(
-                    target_dh=fluid["dh"],
-                    target_fun=fluid["p_k"],
-                    source_lookup=kratos_fluid_state["pressure"],
-                )
-                _transfer_vector_field(target_dh=mesh_ext["dh"], target_vec=mesh_ext["m_k"], source_lookup=mesh_lookup)
-                _transfer_vector_field(
-                    target_dh=mesh_ext["dh"],
-                    target_vec=mesh_ext["m_prev_geom"],
-                    source_lookup=mesh_lookup,
-                )
-                last_mesh_vel_fluid_lookup = mesh_vel_fluid_lookup
-                last_mesh_accel_fluid_lookup = mesh_accel_fluid_lookup
-                fluid_elapsed = time.perf_counter() - t_fluid0
-                fluid_times.append(float(fluid_elapsed))
-                _log(
-                    verbose,
-                    "[fluid-stage] "
-                    f"mode={fluid_operator_mode}/{exact_fluid_backend_mode} "
-                    f"u_max={_field_abs_max(fluid['u_k']):.3e} "
-                    f"p_max={_field_abs_max(fluid['p_k']):.3e}",
-                )
-                if load_transfer_value == "reaction" or bool(monitor_interface_loads):
-                    reaction_point_load_lookup = _resample_lookup_to_coords(
-                        kratos_fluid_state["reaction"],
-                        fluid_iface_coords,
-                    )
-                    reaction_solid_load_lookup = _resample_lookup_to_coords(
-                        _negate_lookup(reaction_point_load_lookup),
-                        solid_iface_coords,
-                    )
-                if load_transfer_value == "stress" or bool(monitor_interface_loads):
-                    stress_point_load_lookup = _fluid_interface_point_loads_on_solid(
-                        fluid_dh=fluid["dh"],
-                        fluid_mesh=mesh_f,
-                        solid_mesh=mesh_s,
-                        u=fluid["u_k"],
-                        p=fluid["p_k"],
-                        d_mesh=fluid["d_mesh"],
-                        solid_iface_coords=solid_iface_coords,
-                        interface_tag=geometry.interface_tag,
-                        mu_f=mu_f,
-                        quad_order=quad_order,
-                    )
-                if use_exact_fluid_operator:
-                    _maybe_dump_exact_fluid_probe(
-                        output_dir=output_dir,
-                        step=int(step),
-                        coupling_iter=int(coupling_iter),
-                        stage_label="post_fluid_solve",
-                        bc_scale=1.0,
-                        dt=float(dt_value),
-                        bossak_alpha=float(bossak_alpha),
-                        fluid=fluid,
-                        reaction_point_load_lookup=reaction_point_load_lookup,
-                        reaction_solid_load_lookup=reaction_solid_load_lookup,
-                    )
-                continuation_scales = (1.0,)
+            _restore_function_values([mesh_ext["m_k"], mesh_ext["m_prev_geom"]], mesh_ext_step_state)
+            _restore_fluid_dvms_state(
+                fluid.get("dvms_state"),
+                fluid_dvms_prev_step,
+            )
+            current_load_lookup = _copy_lookup(current_load_lookup_step_start)
+            if bool(retry_policy.reset_interface_history):
+                iqn_old_dr_mats = deque(maxlen=max(int(force_history) - 1, 0))
+                iqn_old_dg_mats = deque(maxlen=max(int(force_history) - 1, 0))
             else:
-                if kratos_mesh_backend is not None:
-                    if (
-                        int(coupling_iter) > 1
-                        and _env_bool("PYCUTFEM_EX2_SYNC_KRATOS_MESH_CURRENT_STATE", False)
-                        and last_mesh_vel_fluid_lookup is not None
-                        and last_mesh_accel_fluid_lookup is not None
-                    ):
-                        _sync_kratos_mesh_motion_backend_current_state(
-                            backend=kratos_mesh_backend,
-                            mesh_disp=_vector_lookup_from_field(fluid["dh"], fluid["d_mesh"]),
-                            mesh_vel=last_mesh_vel_fluid_lookup,
-                            mesh_acc=last_mesh_accel_fluid_lookup,
+                iqn_old_dr_mats = deque(
+                    [np.asarray(mat, dtype=float).copy() for mat in iqn_old_dr_step_start],
+                    maxlen=max(int(force_history) - 1, 0),
+                )
+                iqn_old_dg_mats = deque(
+                    [np.asarray(mat, dtype=float).copy() for mat in iqn_old_dg_step_start],
+                    maxlen=max(int(force_history) - 1, 0),
+                )
+
+            step_converged = False
+            coupling_iter = 0
+            active_force_update = str(retry_policy.force_update).lower()
+            active_force_relaxation = float(retry_policy.force_relaxation)
+            step_max_coupling_iters = int(retry_policy.max_coupling_iters)
+            prev_force_residual: np.ndarray | None = None
+            load_guess_history = []
+            load_return_history = []
+            prev_disp_iter_vals = np.asarray(step_prev_disp_iter_vals, dtype=float).copy()
+            last_disp_abs = last_disp_rel = last_load_abs = last_load_rel = float("nan")
+            last_force_omega = float(active_force_relaxation)
+            last_returned_load_lookup = None
+            last_mesh_vel_fluid_lookup = None
+            last_mesh_accel_fluid_lookup = None
+            last_fluid_accel_lookup = None
+            last_nirb_prediction = None
+            increment_start = time.perf_counter()
+
+            try:
+                for coupling_iter in range(1, int(step_max_coupling_iters) + 1):
+                    _section(verbose, f"[fsi] step={step} fixed-point iter={coupling_iter}/{step_max_coupling_iters}")
+                    if accelerate_on_fluid_load:
+                        current_structure_load_lookup = _resample_lookup_to_coords(
+                            _negate_lookup(current_load_lookup),
+                            solid_iface_coords,
                         )
-                    mesh_lookup, mesh_vel_fluid_lookup, mesh_accel_fluid_lookup = _solve_kratos_mesh_motion_backend(
-                        backend=kratos_mesh_backend,
-                        interface_disp=solid_disp_fluid_lookup,
-                    )
-                    _transfer_vector_field(target_dh=fluid["dh"], target_vec=fluid["d_mesh"], source_lookup=mesh_lookup)
-                    _transfer_vector_field(
-                        target_dh=fluid["dh"],
-                        target_vec=fluid["w_mesh_k"],
-                        source_lookup=mesh_vel_fluid_lookup,
-                    )
-                    _transfer_vector_field(
-                        target_dh=fluid["dh"],
-                        target_vec=fluid["a_mesh_k"],
-                        source_lookup=mesh_accel_fluid_lookup,
-                    )
-                    _transfer_vector_field(target_dh=mesh_ext["dh"], target_vec=mesh_ext["m_k"], source_lookup=mesh_lookup)
-                    _transfer_vector_field(
-                        target_dh=mesh_ext["dh"],
-                        target_vec=mesh_ext["m_prev_geom"],
-                        source_lookup=mesh_lookup,
-                    )
-                else:
-                    mesh_ext["m_prev_geom"].nodal_values[:] = mesh_ext["m_k"].nodal_values[:]
-                    if np.max(np.abs(np.asarray(solid_disp_fluid_lookup.values, dtype=float))) <= 1.0e-18:
-                        mesh_ext["m_k"].nodal_values.fill(0.0)
                     else:
-                        _solve_structural_similarity_mesh_extension(
-                            prob=mesh_ext,
-                            interface_disp=solid_disp_fluid_lookup,
+                        current_structure_load_lookup = current_load_lookup
+                    load_guess_vals = np.asarray(current_structure_load_lookup.values, dtype=float).copy()
+
+                    t_solid0 = time.perf_counter()
+                    nirb_prediction = None
+                    if kratos_exact_structure_backend is not None:
+                        kratos_structure_state = _solve_kratos_exact_structure_backend(
+                            backend=kratos_exact_structure_backend,
+                            structure_load=current_structure_load_lookup,
+                        )
+                        _transfer_vector_field(
+                            target_dh=solid["dh"],
+                            target_vec=solid["d_k"],
+                            source_lookup=kratos_structure_state["displacement"],
+                        )
+                    elif nirb_solid_predictor is not None and int(step) >= int(nirb_start_step_value):
+                        nirb_prediction = nirb_solid_predictor.predict_interface(load_guess_vals)
+                        predicted_interface = np.asarray(nirb_prediction.interface_displacement, dtype=float)
+                        if not np.all(np.isfinite(predicted_interface)):
+                            raise RuntimeError("NIRB solid predictor returned non-finite interface displacement values.")
+                        last_nirb_prediction = nirb_prediction
+                    else:
+                        solid_res, solid_jac, solid_bcs, solid_bcs_homog = _solid_residual_and_jacobian(
+                            prob=solid,
+                            traction_lookup=zero_load_lookup,
+                            mu_s=mu_s,
+                            lambda_s=lambda_s,
                             interface_tag=geometry.interface_tag,
-                            fixed_tags=fixed_mesh_tags,
-                            quad_order=max(6, int(quad_order)),
-                            backend=str(backend),
-                            linear_backend=str(linear_backend),
+                            clamp_tag=geometry.clamp_tag,
+                            quad_order=solid_quad_order,
                         )
-                    mesh_lookup = _vector_lookup_from_field(mesh_ext["dh"], mesh_ext["m_k"])
-                    _transfer_vector_field(target_dh=fluid["dh"], target_vec=fluid["d_mesh"], source_lookup=mesh_lookup)
-                    mesh_vel_full_lookup, mesh_accel_full_lookup = _vector_history_full_lookup(
-                        dh=fluid["dh"],
-                        d_curr=fluid["d_mesh"],
-                        d_prev=fluid["d_prev"],
-                        v_prev=fluid["w_mesh_prev"],
-                        a_prev=fluid["a_mesh_prev"],
-                        dt=dt_value,
-                        alpha=float(bossak_alpha),
-                    )
-                    _transfer_vector_field(
-                        target_dh=fluid["dh"],
-                        target_vec=fluid["w_mesh_k"],
-                        source_lookup=mesh_vel_full_lookup,
-                    )
-                    _transfer_vector_field(
-                        target_dh=fluid["dh"],
-                        target_vec=fluid["a_mesh_k"],
-                        source_lookup=mesh_accel_full_lookup,
-                    )
-                    mesh_vel_fluid_lookup = _resample_lookup_to_coords(mesh_vel_full_lookup, fluid_iface_coords)
-                    mesh_accel_fluid_lookup = _resample_lookup_to_coords(mesh_accel_full_lookup, fluid_iface_coords)
-                last_mesh_vel_fluid_lookup = mesh_vel_fluid_lookup
-                last_mesh_accel_fluid_lookup = mesh_accel_fluid_lookup
-                _restore_fluid_dvms_state(
-                    fluid.get("dvms_state"),
-                    fluid_dvms_prev_step,
-                )
-                _update_fluid_dvms_state_from_previous_step(
-                    state=fluid["dvms_state"],
-                    dh=fluid["dh"],
-                    mesh=mesh_f,
-                    u_prev=fluid["u_prev"],
-                    d_prev=fluid["d_prev"],
-                    d_geo=fluid["d_mesh"],
-                    backend=str(backend),
-                )
-                _warm_fluid_exact_operator_kernels(
-                    prob=fluid,
-                    mesh=mesh_f,
-                    rho_f=float(setup.material.density),
-                    mu_f=mu_f,
-                    dt=dt_value,
-                    bossak_alpha=float(bossak_alpha),
-                    dynamic_tau=float(dynamic_tau),
-                    quad_order=quad_order,
-                    backend=str(backend),
-                    contribution_mode="system",
-                )
-
-                # Kratos does not use an artificial step-1 continuation path for
-                # the fluid stage. Keep the production default on the direct
-                # Kratos-matched solve, with an opt-in escape hatch only for
-                # robustness experiments.
-                use_step1_fluid_continuation = _env_bool(
-                    "PYCUTFEM_EX2_STEP1_FLUID_CONTINUATION",
-                    False,
-                )
-                continuation_scales = (
-                    (0.25, 0.5, 1.0)
-                    if (bool(use_step1_fluid_continuation) and int(step) == 1)
-                    else (1.0,)
-                )
-                t_fluid0 = time.perf_counter()
-                fluid_guess = _snapshot_function_values([fluid["u_k"], fluid["p_k"]])
-                fluid_exact_operator = FluidDVMSCondensedLocalSystemOperator(
-                    mesh=mesh_f,
-                    dh=fluid["dh"],
-                    u_k=fluid["u_k"],
-                    u_prev=fluid["u_prev"],
-                    a_prev=fluid["a_prev"],
-                    p_k=fluid["p_k"],
-                    d_mesh=fluid["d_mesh"],
-                    d_prev=fluid["d_prev"],
-                    d_prev2=fluid["d_prev2"],
-                    mesh_v=None,
-                    mesh_v_prev=fluid["w_mesh_prev"],
-                    mesh_a_prev=fluid["a_mesh_prev"],
-                    state=fluid["dvms_state"],
-                    rho_f=float(setup.material.density),
-                    mu_f=mu_f,
-                    dt=dt_value,
-                    bossak_alpha=float(bossak_alpha),
-                    quadrature_order=quad_order,
-                    dynamic_tau=float(dynamic_tau),
-                    refresh_predicted_subscale=False,
-                    apply_dirichlet_lift=False,
-                )
-                fluid_predictor_operator = _FluidDVMSSolverOperator(
-                    state=fluid["dvms_state"],
-                    dh=fluid["dh"],
-                    mesh=mesh_f,
-                    u_k=fluid["u_k"],
-                    u_prev=fluid["u_prev"],
-                    a_prev=fluid["a_prev"],
-                    p_k=fluid["p_k"],
-                    d_mesh=fluid["d_mesh"],
-                    d_prev=fluid["d_prev"],
-                    d_prev2=fluid["d_prev2"],
-                    mesh_v=None,
-                    mesh_v_prev=fluid["w_mesh_prev"],
-                    mesh_a_prev=fluid["a_mesh_prev"],
-                    rho_f=float(setup.material.density),
-                    mu_f=mu_f,
-                    dt=dt_value,
-                    bossak_alpha=float(bossak_alpha),
-                    dynamic_tau=float(dynamic_tau),
-                )
-                use_first_build_old_subscale = _env_bool(
-                    "PYCUTFEM_EX2_FIRST_BUILD_OLD_SUBSCALE",
-                    True,
-                )
-                if int(coupling_iter) == 1 and bool(use_first_build_old_subscale):
-                    fluid_predictor_operator.arm_initial_old_subscale_build()
-                for bc_scale in continuation_scales:
-                    fluid_predictor_operator.configure_first_assembly_probe(
-                        output_dir=output_dir,
-                        step=int(step),
-                        coupling_iter=int(coupling_iter),
-                        bc_scale=float(bc_scale),
-                        dt=float(dt_value),
-                        bossak_alpha=float(bossak_alpha),
-                    )
-                    scaled_iface_velocity = _scaled_lookup(mesh_vel_fluid_lookup, float(bc_scale))
-                    scale_value = float(bc_scale)
-
-                    def _scaled_inlet_profile(x: float, y: float) -> float:
-                        return scale_value * float(inlet_profile(x, y))
-
-                    if use_exact_fluid_operator:
-                        fluid_res, fluid_jac, fluid_bcs, fluid_bcs_homog = _fluid_zero_local_operator_forms(
-                            prob=fluid,
-                            iface_velocity=scaled_iface_velocity,
-                            inlet_lookup=_scaled_inlet_profile,
-                            interface_tag=geometry.interface_tag,
-                            outlet_tag=geometry.outlet_tag,
-                            walls_tag=geometry.walls_tag,
-                            cylinder_tag=geometry.cylinder_tag,
-                            quad_order=quad_order,
-                        )
-                        stage_ops = [fluid_predictor_operator, fluid_exact_operator]
-                        stage_max_newton_iter = int(max_newton_iter)
-                        stage_globalization = _env_str(
-                            "PYCUTFEM_EX2_EXACT_FLUID_GLOBALIZATION",
-                            "line_search",
-                        )
-                        stage_line_search = _env_bool(
-                            "PYCUTFEM_EX2_EXACT_FLUID_LINE_SEARCH",
+                        use_struct_one_step = _env_bool(
+                            "PYCUTFEM_EX2_STRUCT_ONE_STEP",
                             False,
                         )
-                        stage_ls_fail_hard = _env_bool(
-                            "PYCUTFEM_EX2_EXACT_FLUID_LS_FAIL_HARD",
-                            True,
+                        default_use_kratos_structure_profile = bool(
+                            mesh_source_value == "reference" and fluid_operator_mode == "exact"
                         )
-                    else:
-                        fluid_res, fluid_jac, fluid_bcs, fluid_bcs_homog = _fluid_residual_and_jacobian(
-                            prob=fluid,
-                            rho_f=float(setup.material.density),
-                            mu_f=mu_f,
-                            dt=dt_value,
-                            bossak_alpha=float(bossak_alpha),
-                            dynamic_tau=float(dynamic_tau),
-                            pressure_gauge=float(pressure_gauge),
-                            iface_velocity=scaled_iface_velocity,
-                            inlet_lookup=_scaled_inlet_profile,
-                            interface_tag=geometry.interface_tag,
-                            outlet_tag=geometry.outlet_tag,
-                            walls_tag=geometry.walls_tag,
-                            cylinder_tag=geometry.cylinder_tag,
-                            quad_order=quad_order,
+                        use_kratos_structure_profile = _env_bool(
+                            "PYCUTFEM_EX2_LOCAL_STRUCTURE_USE_KRATOS_PROFILE",
+                            default_use_kratos_structure_profile,
                         )
-                        stage_ops = [fluid_predictor_operator]
-                        stage_max_newton_iter = max(2, min(int(max_newton_iter), 4))
-                        stage_globalization = "line_search_then_trust"
-                        stage_line_search = True
-                        stage_ls_fail_hard = True
-                    fluid["_current_bcs"] = fluid_bcs
-                    fluid["_current_bcs_homog"] = fluid_bcs_homog
-                    _section(
-                        verbose,
-                        "[fluid-solver] "
-                        f"step={step} coupling_iter={coupling_iter} scale={float(bc_scale):.3f} "
-                        f"mode={fluid_operator_mode} globalization={stage_globalization} "
-                        f"line_search={stage_line_search} ls_fail_hard={stage_ls_fail_hard} "
-                        f"max_newton_iter={stage_max_newton_iter}",
-                    )
-                    stage_newton_params = NewtonParameters(
-                        newton_tol=float(exact_fluid_newton_tol if use_exact_fluid_operator else newton_tol),
-                        max_newton_iter=int(stage_max_newton_iter),
-                        line_search=bool(stage_line_search),
-                        ls_fail_hard=bool(stage_ls_fail_hard),
-                        globalization=str(stage_globalization),
-                        mixed_solution_criteria=fluid_mixed_solution_criteria,
-                        mixed_solution_max_residual_factor=float(fluid_mixed_solution_residual_factor),
-                    )
-                    stage_lin_params = LinearSolverParameters(backend=str(linear_backend))
-                    if use_exact_fluid_operator:
-                        stage_solver = _get_or_create_cached_stage_solver(
-                            cache_owner=fluid,
-                            cache_name="_stage_solver_cache",
-                            cache_key=(
-                                "exact",
-                                int(id(fluid_res)),
-                                int(id(fluid_jac)),
-                                int(quad_order),
-                                str(backend),
-                                str(linear_backend),
-                                int(stage_max_newton_iter),
-                                bool(stage_line_search),
-                                bool(stage_ls_fail_hard),
-                                str(stage_globalization),
+                        default_structure_newton_tol = (
+                            float(structure_solver_profile["residual_absolute_tolerance"])
+                            if bool(use_kratos_structure_profile)
+                            else float(newton_tol)
+                        )
+                        default_structure_newton_rtol = (
+                            float(structure_solver_profile["residual_relative_tolerance"])
+                            if bool(use_kratos_structure_profile)
+                            else 0.0
+                        )
+                        default_structure_max_newton_iter = (
+                            int(structure_solver_profile["max_iteration"])
+                            if bool(use_kratos_structure_profile)
+                            else int(max_newton_iter)
+                        )
+                        default_structure_linear_backend = (
+                            str(structure_solver_profile["linear_backend"])
+                            if bool(use_kratos_structure_profile)
+                            else str(linear_backend)
+                        )
+                        default_structure_residual_norm = (
+                            "kratos_l2_over_ndof"
+                            if bool(use_kratos_structure_profile)
+                            else "linf"
+                        )
+                        exact_structure_newton_tol = max(
+                            0.0,
+                            float(
+                                _env_float(
+                                    "PYCUTFEM_EX2_LOCAL_STRUCTURE_NEWTON_TOL",
+                                    float(default_structure_newton_tol),
+                                )
                             ),
-                            residual_form=fluid_res,
-                            jacobian_form=fluid_jac,
-                            dof_handler=fluid["dh"],
-                            mixed_element=fluid["me"],
-                            bcs=fluid_bcs,
-                            bcs_homog=fluid_bcs_homog,
-                            newton_params=stage_newton_params,
-                            lin_params=stage_lin_params,
-                            quad_order=quad_order,
-                            backend=str(backend),
-                            operators=stage_ops,
-                            active_fields=("ux", "uy", "p"),
                         )
-                    else:
-                        stage_solver = NewtonSolver(
-                            residual_form=fluid_res,
-                            jacobian_form=fluid_jac,
-                            dof_handler=fluid["dh"],
-                            mixed_element=fluid["me"],
-                            bcs=fluid_bcs,
-                            bcs_homog=fluid_bcs_homog,
-                            newton_params=stage_newton_params,
-                            lin_params=stage_lin_params,
-                            quad_order=quad_order,
-                            backend=str(backend),
-                            operators=stage_ops,
+                        exact_structure_newton_rtol = max(
+                            0.0,
+                            float(
+                                _env_float(
+                                    "PYCUTFEM_EX2_LOCAL_STRUCTURE_NEWTON_RTOL",
+                                    float(default_structure_newton_rtol),
+                                )
+                            ),
                         )
-                        stage_solver.set_active_fields(["ux", "uy", "p"])
-                    _restore_function_values([fluid["u_prev"], fluid["p_prev"]], fluid_prev_step)
-                    _restore_function_values(
-                        [fluid["d_prev"], fluid["d_prev2"], fluid["w_mesh_prev"], fluid["a_mesh_prev"]],
-                        fluid_mesh_prev_step,
-                    )
-                    if use_exact_fluid_operator:
-                        _maybe_dump_exact_fluid_probe(
+                        exact_structure_max_newton_iter = int(
+                            max(
+                                1,
+                                _env_float(
+                                    "PYCUTFEM_EX2_LOCAL_STRUCTURE_MAX_NEWTON_ITER",
+                                    float(default_structure_max_newton_iter),
+                                ),
+                            )
+                        )
+                        exact_structure_linear_backend = _env_str(
+                            "PYCUTFEM_EX2_LOCAL_STRUCTURE_LINEAR_BACKEND",
+                            str(default_structure_linear_backend),
+                        ).strip().lower()
+                        exact_structure_residual_norm = _env_str(
+                            "PYCUTFEM_EX2_LOCAL_STRUCTURE_RESIDUAL_NORM",
+                            str(default_structure_residual_norm),
+                        ).strip().lower()
+                        solid_solver = NewtonSolver(
+                            residual_form=solid_res,
+                            jacobian_form=solid_jac,
+                            dof_handler=solid["dh"],
+                            mixed_element=solid["me"],
+                            bcs=solid_bcs,
+                            bcs_homog=solid_bcs_homog,
+                            newton_params=NewtonParameters(
+                                newton_tol=float(exact_structure_newton_tol),
+                                newton_rtol=float(exact_structure_newton_rtol),
+                                residual_norm=str(exact_structure_residual_norm),
+                                max_newton_iter=1 if bool(use_struct_one_step) else int(exact_structure_max_newton_iter),
+                                print_level=3,
+                                accept_nonconverged_atol_factor=(
+                                    float(_EX2L_KRATOS_STRUCT_ONE_STEP_ACCEPT_FACTOR)
+                                    if bool(use_struct_one_step)
+                                    else 0.0
+                                ),
+                                line_search=False,
+                                globalization="none",
+                            ),
+                            lin_params=LinearSolverParameters(backend=str(exact_structure_linear_backend)),
+                            quad_order=solid_quad_order,
+                            backend=str(backend),
+                        )
+                        use_kratos_structure_linear_permutation = _env_bool(
+                            "PYCUTFEM_EX2_LOCAL_STRUCTURE_PERMUTE_TO_KRATOS_ORDER",
+                            bool(use_kratos_structure_profile),
+                        )
+                        if bool(use_kratos_structure_linear_permutation):
+                            structure_linear_perm = _structure_kratos_active_dof_permutation(
+                                dh=solid["dh"],
+                                mesh=mesh_s,
+                                active_dofs=np.asarray(solid_solver.active_dofs, dtype=int),
+                            )
+                            if structure_linear_perm is not None and structure_linear_perm.size:
+                                solid_solver._linear_solve_perm = np.asarray(structure_linear_perm, dtype=int)
+                        solid_point_load_full = _boundary_point_load_vector(
+                            solid["dh"],
+                            vector=solid["d_k"],
+                            tag=geometry.interface_tag,
+                            values=load_guess_vals,
+                        )
+                        solid_point_load_red = np.asarray(
+                            solid_point_load_full[np.asarray(solid_solver.active_dofs, dtype=int)],
+                            dtype=float,
+                        )
+                        solid_runtime_ops: list[RuntimeOperator] = []
+                        use_kratos_local_global_solid_system = (
+                            kratos_local_solid_backend is not None
+                            and _env_bool(
+                                "PYCUTFEM_EX2_LOCAL_STRUCTURE_USE_KRATOS_GLOBAL_SYSTEM",
+                                False,
+                            )
+                        )
+                        use_kratos_local_structure_conditions = (
+                            kratos_local_solid_backend is not None
+                            and _env_bool(
+                                "PYCUTFEM_EX2_LOCAL_STRUCTURE_USE_KRATOS_POINT_CONDITIONS",
+                                False,
+                            )
+                        )
+                        if bool(use_kratos_local_global_solid_system):
+                            solid_runtime_ops.append(
+                                _KratosLocalSolidGlobalSystemOperator(
+                                    backend=kratos_local_solid_backend,
+                                    d_k=solid["d_k"],
+                                    structure_load=current_structure_load_lookup,
+                                )
+                            )
+                        else:
+                            if kratos_local_solid_backend is not None:
+                                solid_runtime_ops.append(
+                                    _KratosLocalSolidSystemOperator(
+                                        backend=kratos_local_solid_backend,
+                                        d_k=solid["d_k"],
+                                        structure_load=(
+                                            current_structure_load_lookup
+                                            if bool(use_kratos_local_structure_conditions)
+                                            else None
+                                        ),
+                                    )
+                                )
+                            if not bool(use_kratos_local_structure_conditions):
+                                solid_runtime_ops.append(_ReducedResidualShiftOperator(solid_point_load_red))
+                        solid_solver.set_runtime_operators(solid_runtime_ops)
+                        solid_guess = _snapshot_function_values([solid["d_k"]])
+                        _restore_function_values([solid["d_prev"]], solid_prev_step)
+                        _maybe_dump_structure_stage_probe(
                             output_dir=output_dir,
                             step=int(step),
                             coupling_iter=int(coupling_iter),
-                            stage_label="pre_fluid_solve",
-                            bc_scale=float(bc_scale),
+                            stage_label="pre_structure_solve",
                             dt=float(dt_value),
-                            bossak_alpha=float(bossak_alpha),
-                            fluid=fluid,
-                            reaction_point_load_lookup=None,
-                            reaction_solid_load_lookup=None,
+                            solid=solid,
+                            interface_tag=geometry.interface_tag,
+                            structure_load_lookup=current_structure_load_lookup,
+                            point_load_full=solid_point_load_full,
                         )
-                    try:
-                        stage_solver.solve_time_interval(
-                            functions=[fluid["u_k"], fluid["p_k"]],
-                            prev_functions=[fluid["u_prev"], fluid["p_prev"]],
-                            aux_functions={
-                                "a_prev": fluid["a_prev"],
-                                "d_mesh": fluid["d_mesh"],
-                                "d_prev": fluid["d_prev"],
-                                "d_prev2": fluid["d_prev2"],
-                            },
+                        solid_solver.solve_time_interval(
+                            functions=[solid["d_k"]],
+                            prev_functions=[solid["d_prev"]],
                             time_params=TimeStepperParameters(
-                                dt=dt_value,
+                                dt=1.0,
                                 max_steps=1,
-                                final_time=dt_value,
+                                final_time=1.0,
                                 stop_on_steady=False,
                                 step_initial_guess_callback=_guess_callback_from_snapshots_with_dirichlet(
-                                    snapshots=fluid_guess,
-                                    dh=fluid["dh"],
-                                    bcs=fluid_bcs,
+                                    snapshots=solid_guess,
+                                    dh=solid["dh"],
+                                    bcs=solid_bcs,
                                 ),
                             ),
                         )
-                    except Exception:
+                        _maybe_dump_structure_stage_probe(
+                            output_dir=output_dir,
+                            step=int(step),
+                            coupling_iter=int(coupling_iter),
+                            stage_label="post_structure_solve",
+                            dt=float(dt_value),
+                            solid=solid,
+                            interface_tag=geometry.interface_tag,
+                            structure_load_lookup=current_structure_load_lookup,
+                            point_load_full=solid_point_load_full,
+                        )
+                        _restore_function_values([solid["d_prev"]], solid_prev_step)
+                    solid_elapsed = time.perf_counter() - t_solid0
+                    structure_times.append(float(solid_elapsed))
+
+                    if kratos_exact_structure_backend is not None:
+                        solid_disp_solid_lookup = _resample_lookup_to_coords(
+                            kratos_structure_state["interface_displacement"],
+                            solid_iface_coords,
+                        )
+                    elif nirb_prediction is not None:
+                        prev_iface_mesh_vel_lookup = _resample_lookup_to_coords(
+                            _vector_lookup_from_field(fluid["dh"], fluid["w_mesh_prev"]),
+                            solid_iface_coords,
+                        )
+                        prev_iface_mesh_acc_lookup = _resample_lookup_to_coords(
+                            _vector_lookup_from_field(fluid["dh"], fluid["a_mesh_prev"]),
+                            solid_iface_coords,
+                        )
+                        _, disp_prev_vals = _boundary_vector_snapshot(
+                            solid["dh"],
+                            solid["d_prev"],
+                            geometry.interface_tag,
+                        )
+                        solid_disp_solid_lookup, _ = _interface_disp_velocity_from_values(
+                            iface_coords=solid_iface_coords,
+                            disp_vals=np.asarray(nirb_prediction.interface_displacement, dtype=float).reshape(-1, 2),
+                            disp_prev_vals=disp_prev_vals,
+                            dt=dt_value,
+                            v_prev_lookup=prev_iface_mesh_vel_lookup,
+                            a_prev_lookup=prev_iface_mesh_acc_lookup,
+                            bossak_alpha=float(bossak_alpha),
+                        )
+                    else:
+                        prev_iface_mesh_vel_lookup = _resample_lookup_to_coords(
+                            _vector_lookup_from_field(fluid["dh"], fluid["w_mesh_prev"]),
+                            solid_iface_coords,
+                        )
+                        prev_iface_mesh_acc_lookup = _resample_lookup_to_coords(
+                            _vector_lookup_from_field(fluid["dh"], fluid["a_mesh_prev"]),
+                            solid_iface_coords,
+                        )
+                        solid_disp_solid_lookup, _ = _solid_interface_disp_velocity(
+                            dh=solid["dh"],
+                            mesh=mesh_s,
+                            d_curr=solid["d_k"],
+                            d_prev=solid["d_prev"],
+                            iface_coords=solid_iface_coords,
+                            dt=dt_value,
+                            v_prev_lookup=prev_iface_mesh_vel_lookup,
+                            a_prev_lookup=prev_iface_mesh_acc_lookup,
+                            bossak_alpha=float(bossak_alpha),
+                        )
+                    # Kratos uses a nearest-neighbor mapper for structure
+                    # DISPLACEMENT -> fluid MESH_DISPLACEMENT in DoubleFlap. Replicate
+                    # that transfer instead of evaluating the solid FE field directly
+                    # at the fluid interface coordinates.
+                    solid_disp_fluid_lookup = _resample_lookup_to_coords(
+                        solid_disp_solid_lookup,
+                        fluid_iface_coords,
+                    )
+                    disp_snapshot = None if nirb_prediction is not None else _flatten_vector_snapshot(solid["dh"], solid["d_k"])
+        
+                    reaction_point_load_lookup = None
+                    reaction_solid_load_lookup = None
+                    stress_point_load_lookup = None
+                    if kratos_exact_fluid_backend is not None:
+                        t_fluid0 = time.perf_counter()
+                        kratos_fluid_state = _solve_kratos_exact_fluid_backend(
+                            backend=kratos_exact_fluid_backend,
+                            interface_disp=solid_disp_fluid_lookup,
+                        )
+                        mesh_lookup = kratos_fluid_state["mesh_displacement"]
+                        mesh_vel_fluid_lookup = kratos_fluid_state["mesh_velocity"]
+                        mesh_accel_fluid_lookup = kratos_fluid_state["mesh_acceleration"]
+                        last_fluid_accel_lookup = kratos_fluid_state["acceleration"]
+                        _transfer_vector_field(target_dh=fluid["dh"], target_vec=fluid["d_mesh"], source_lookup=mesh_lookup)
+                        _transfer_vector_field(
+                            target_dh=fluid["dh"],
+                            target_vec=fluid["w_mesh_k"],
+                            source_lookup=mesh_vel_fluid_lookup,
+                        )
+                        _transfer_vector_field(
+                            target_dh=fluid["dh"],
+                            target_vec=fluid["a_mesh_k"],
+                            source_lookup=mesh_accel_fluid_lookup,
+                        )
+                        _transfer_vector_field(
+                            target_dh=fluid["dh"],
+                            target_vec=fluid["u_k"],
+                            source_lookup=kratos_fluid_state["velocity"],
+                        )
+                        _transfer_vector_field(
+                            target_dh=fluid["dh"],
+                            target_vec=fluid["a_k"],
+                            source_lookup=kratos_fluid_state["acceleration"],
+                        )
+                        _transfer_scalar_field(
+                            target_dh=fluid["dh"],
+                            target_fun=fluid["p_k"],
+                            source_lookup=kratos_fluid_state["pressure"],
+                        )
+                        _transfer_vector_field(target_dh=mesh_ext["dh"], target_vec=mesh_ext["m_k"], source_lookup=mesh_lookup)
+                        _transfer_vector_field(
+                            target_dh=mesh_ext["dh"],
+                            target_vec=mesh_ext["m_prev_geom"],
+                            source_lookup=mesh_lookup,
+                        )
+                        last_mesh_vel_fluid_lookup = mesh_vel_fluid_lookup
+                        last_mesh_accel_fluid_lookup = mesh_accel_fluid_lookup
+                        fluid_elapsed = time.perf_counter() - t_fluid0
+                        fluid_times.append(float(fluid_elapsed))
+                        _log(
+                            verbose,
+                            "[fluid-stage] "
+                            f"mode={fluid_operator_mode}/{exact_fluid_backend_mode} "
+                            f"u_max={_field_abs_max(fluid['u_k']):.3e} "
+                            f"p_max={_field_abs_max(fluid['p_k']):.3e}",
+                        )
+                        if load_transfer_value == "reaction" or bool(monitor_interface_loads):
+                            reaction_point_load_lookup = _resample_lookup_to_coords(
+                                kratos_fluid_state["reaction"],
+                                fluid_iface_coords,
+                            )
+                            reaction_solid_load_lookup = _resample_lookup_to_coords(
+                                _negate_lookup(reaction_point_load_lookup),
+                                solid_iface_coords,
+                            )
+                        if bool(monitor_stress_interface_loads):
+                            stress_point_load_lookup = _fluid_interface_point_loads_on_solid(
+                                fluid_dh=fluid["dh"],
+                                fluid_mesh=mesh_f,
+                                solid_mesh=mesh_s,
+                                u=fluid["u_k"],
+                                p=fluid["p_k"],
+                                d_mesh=fluid["d_mesh"],
+                                solid_iface_coords=solid_iface_coords,
+                                interface_tag=geometry.interface_tag,
+                                mu_f=mu_f,
+                                quad_order=quad_order,
+                            )
                         if use_exact_fluid_operator:
                             _maybe_dump_exact_fluid_probe(
                                 output_dir=output_dir,
                                 step=int(step),
                                 coupling_iter=int(coupling_iter),
-                                stage_label="failed_fluid_solve",
-                                bc_scale=float(bc_scale),
+                                stage_label="post_fluid_solve",
+                                bc_scale=1.0,
                                 dt=float(dt_value),
                                 bossak_alpha=float(bossak_alpha),
                                 fluid=fluid,
-                                reaction_point_load_lookup=None,
-                                reaction_solid_load_lookup=None,
+                                reaction_point_load_lookup=reaction_point_load_lookup,
+                                reaction_solid_load_lookup=reaction_solid_load_lookup,
                             )
-                        raise
-                    fluid_guess = _snapshot_function_values([fluid["u_k"], fluid["p_k"]])
+                        continuation_scales = (1.0,)
+                    else:
+                        t_mesh_stage0 = time.perf_counter()
+                        if kratos_mesh_backend is not None:
+                            if (
+                                int(coupling_iter) > 1
+                                and _env_bool("PYCUTFEM_EX2_SYNC_KRATOS_MESH_CURRENT_STATE", False)
+                                and last_mesh_vel_fluid_lookup is not None
+                                and last_mesh_accel_fluid_lookup is not None
+                            ):
+                                _sync_kratos_mesh_motion_backend_current_state(
+                                    backend=kratos_mesh_backend,
+                                    mesh_disp=_vector_lookup_from_field(fluid["dh"], fluid["d_mesh"]),
+                                    mesh_vel=last_mesh_vel_fluid_lookup,
+                                    mesh_acc=last_mesh_accel_fluid_lookup,
+                                )
+                            mesh_lookup, mesh_vel_fluid_lookup, mesh_accel_fluid_lookup = _solve_kratos_mesh_motion_backend(
+                                backend=kratos_mesh_backend,
+                                interface_disp=solid_disp_fluid_lookup,
+                            )
+                            _transfer_vector_field(target_dh=fluid["dh"], target_vec=fluid["d_mesh"], source_lookup=mesh_lookup)
+                            _transfer_vector_field(
+                                target_dh=fluid["dh"],
+                                target_vec=fluid["w_mesh_k"],
+                                source_lookup=mesh_vel_fluid_lookup,
+                            )
+                            _transfer_vector_field(
+                                target_dh=fluid["dh"],
+                                target_vec=fluid["a_mesh_k"],
+                                source_lookup=mesh_accel_fluid_lookup,
+                            )
+                            _transfer_vector_field(target_dh=mesh_ext["dh"], target_vec=mesh_ext["m_k"], source_lookup=mesh_lookup)
+                            _transfer_vector_field(
+                                target_dh=mesh_ext["dh"],
+                                target_vec=mesh_ext["m_prev_geom"],
+                                source_lookup=CoordinateLookup(
+                                    np.asarray(mesh_lookup.coords, dtype=float),
+                                    np.zeros_like(np.asarray(mesh_lookup.values, dtype=float)),
+                                    dim=2,
+                                ),
+                            )
+                        elif kratos_local_mesh_backend is not None:
+                            if (
+                                int(coupling_iter) > 1
+                                and _env_bool("PYCUTFEM_EX2_SYNC_KRATOS_MESH_CURRENT_STATE", False)
+                                and last_mesh_vel_fluid_lookup is not None
+                                and last_mesh_accel_fluid_lookup is not None
+                            ):
+                                _sync_kratos_mesh_motion_backend_current_state(
+                                    backend=kratos_local_mesh_backend,
+                                    mesh_disp=_vector_lookup_from_field(fluid["dh"], fluid["d_mesh"]),
+                                    mesh_vel=last_mesh_vel_fluid_lookup,
+                                    mesh_acc=last_mesh_accel_fluid_lookup,
+                                )
+                            mesh_lookup, mesh_vel_fluid_lookup, mesh_accel_fluid_lookup = _solve_kratos_mesh_motion_backend(
+                                backend=kratos_local_mesh_backend,
+                                interface_disp=solid_disp_fluid_lookup,
+                            )
+                            _transfer_vector_field(target_dh=fluid["dh"], target_vec=fluid["d_mesh"], source_lookup=mesh_lookup)
+                            _transfer_vector_field(
+                                target_dh=fluid["dh"],
+                                target_vec=fluid["w_mesh_k"],
+                                source_lookup=mesh_vel_fluid_lookup,
+                            )
+                            _transfer_vector_field(
+                                target_dh=fluid["dh"],
+                                target_vec=fluid["a_mesh_k"],
+                                source_lookup=mesh_accel_fluid_lookup,
+                            )
+                            _transfer_vector_field(target_dh=mesh_ext["dh"], target_vec=mesh_ext["m_k"], source_lookup=mesh_lookup)
+                            _transfer_vector_field(
+                                target_dh=mesh_ext["dh"],
+                                target_vec=mesh_ext["m_prev_geom"],
+                                source_lookup=CoordinateLookup(
+                                    np.asarray(mesh_lookup.coords, dtype=float),
+                                    np.zeros_like(np.asarray(mesh_lookup.values, dtype=float)),
+                                    dim=2,
+                                ),
+                            )
+                        else:
+                            use_local_mesh_current_geometry = _env_bool(
+                                "PYCUTFEM_EX2_LOCAL_MESH_USE_CURRENT_GEOMETRY",
+                                True,
+                            )
+                            if use_local_mesh_current_geometry:
+                                _transfer_vector_field(
+                                    target_dh=mesh_ext["dh"],
+                                    target_vec=mesh_ext["m_prev_geom"],
+                                    source_lookup=_vector_lookup_from_field(fluid["dh"], fluid["d_mesh"]),
+                                )
+                            else:
+                                mesh_ext["m_prev_geom"].nodal_values.fill(0.0)
+                            if np.max(np.abs(np.asarray(solid_disp_fluid_lookup.values, dtype=float))) <= 1.0e-18:
+                                mesh_ext["m_k"].nodal_values.fill(0.0)
+                            else:
+                                _solve_structural_similarity_mesh_extension(
+                                    prob=mesh_ext,
+                                    interface_disp=solid_disp_fluid_lookup,
+                                    interface_tag=geometry.interface_tag,
+                                    fixed_tags=fixed_mesh_tags,
+                                    kratos_local_backend=kratos_local_mesh_backend,
+                                    quad_order=max(6, int(quad_order)),
+                                    backend=str(backend),
+                                    linear_backend=str(linear_backend),
+                                )
+                            mesh_lookup = _vector_lookup_from_field(mesh_ext["dh"], mesh_ext["m_k"])
+                            _transfer_vector_field(target_dh=fluid["dh"], target_vec=fluid["d_mesh"], source_lookup=mesh_lookup)
+                            mesh_vel_full_lookup, mesh_accel_full_lookup = _vector_history_full_lookup(
+                                dh=fluid["dh"],
+                                d_curr=fluid["d_mesh"],
+                                d_prev=fluid["d_prev"],
+                                v_prev=fluid["w_mesh_prev"],
+                                a_prev=fluid["a_mesh_prev"],
+                                dt=dt_value,
+                                alpha=float(bossak_alpha),
+                            )
+                            _transfer_vector_field(
+                                target_dh=fluid["dh"],
+                                target_vec=fluid["w_mesh_k"],
+                                source_lookup=mesh_vel_full_lookup,
+                            )
+                            _transfer_vector_field(
+                                target_dh=fluid["dh"],
+                                target_vec=fluid["a_mesh_k"],
+                                source_lookup=mesh_accel_full_lookup,
+                            )
+                            mesh_vel_fluid_lookup = _resample_lookup_to_coords(mesh_vel_full_lookup, fluid_iface_coords)
+                            mesh_accel_fluid_lookup = _resample_lookup_to_coords(mesh_accel_full_lookup, fluid_iface_coords)
+                        if _env_bool("PYCUTFEM_EX2_STAGE_TIMING", False):
+                            _log(
+                                True,
+                                "[timing] "
+                                f"step={step} iter={coupling_iter} "
+                                f"mesh_stage={time.perf_counter() - t_mesh_stage0:.6f}s",
+                            )
+                        last_mesh_vel_fluid_lookup = mesh_vel_fluid_lookup
+                        last_mesh_accel_fluid_lookup = mesh_accel_fluid_lookup
+                        # Kratos keeps the predicted DVMS subscale live across
+                        # outer coupling iterations within a time step. The
+                        # nonlinear-iteration state (predicted subscale and OSS
+                        # projections) must therefore remain live here; only the
+                        # accepted-step history fields are re-synced from the
+                        # previous accepted step.
+                        _restore_fluid_dvms_state_except(
+                            fluid.get("dvms_state"),
+                            fluid_dvms_prev_step,
+                            skip_keys={
+                                "predicted_subscale_velocity",
+                                "momentum_projection",
+                                "mass_projection",
+                            },
+                        )
+                        _update_fluid_dvms_state_from_previous_step(
+                            state=fluid["dvms_state"],
+                            dh=fluid["dh"],
+                            mesh=mesh_f,
+                            u_prev=fluid["u_prev"],
+                            d_prev=fluid["d_prev"],
+                            d_geo=fluid["d_mesh"],
+                            backend=str(backend),
+                        )
+                        _warm_fluid_exact_operator_kernels(
+                            prob=fluid,
+                            mesh=mesh_f,
+                            rho_f=float(setup.material.density),
+                            mu_f=mu_f,
+                            dt=dt_value,
+                            bossak_alpha=float(bossak_alpha),
+                            dynamic_tau=float(dynamic_tau),
+                            quad_order=quad_order,
+                            backend=str(backend),
+                            contribution_mode="system",
+                        )
+        
+                        # Kratos does not use an artificial step-1 continuation path for
+                        # the fluid stage. Keep the production default on the direct
+                        # Kratos-matched solve, with an opt-in escape hatch only for
+                        # robustness experiments.
+                        use_step1_fluid_continuation = _env_bool(
+                            "PYCUTFEM_EX2_STEP1_FLUID_CONTINUATION",
+                            False,
+                        )
+                        continuation_scales = tuple(float(v) for v in retry_policy.fluid_continuation_scales)
+                        if not continuation_scales:
+                            continuation_scales = (
+                                (0.25, 0.5, 1.0)
+                                if (bool(use_step1_fluid_continuation) and int(step) == 1)
+                                else (1.0,)
+                            )
+                        t_fluid0 = time.perf_counter()
+                        fluid_guess = _snapshot_function_values([fluid["u_k"], fluid["p_k"]])
+                        if _env_bool("PYCUTFEM_EX2_ZERO_PRESSURE_GUESS", False):
+                            fluid_guess[1].fill(0.0)
+                        if _env_bool("PYCUTFEM_EX2_ZERO_VELOCITY_GUESS", False):
+                            fluid_guess[0].fill(0.0)
+                        fluid_exact_operator = FluidDVMSCondensedLocalSystemOperator(
+                            mesh=mesh_f,
+                            dh=fluid["dh"],
+                            u_k=fluid["u_k"],
+                            u_prev=fluid["u_prev"],
+                            a_prev=fluid["a_prev"],
+                            a_curr=fluid["a_k"],
+                            p_k=fluid["p_k"],
+                            d_mesh=fluid["d_mesh"],
+                            d_prev=fluid["d_prev"],
+                            d_prev2=fluid["d_prev2"],
+                            mesh_v=fluid["w_mesh_k"],
+                            mesh_v_prev=fluid["w_mesh_prev"],
+                            mesh_a_prev=fluid["a_mesh_prev"],
+                            state=fluid["dvms_state"],
+                            rho_f=float(setup.material.density),
+                            mu_f=mu_f,
+                            dt=dt_value,
+                            bossak_alpha=float(bossak_alpha),
+                            quadrature_order=quad_order,
+                            dynamic_tau=float(dynamic_tau),
+                            refresh_predicted_subscale=False,
+                            apply_dirichlet_lift=False,
+                        )
+                        fluid_predictor_operator = _FluidDVMSSolverOperator(
+                            state=fluid["dvms_state"],
+                            dh=fluid["dh"],
+                            mesh=mesh_f,
+                            u_k=fluid["u_k"],
+                            u_prev=fluid["u_prev"],
+                            a_prev=fluid["a_prev"],
+                            a_curr=fluid["a_k"],
+                            p_k=fluid["p_k"],
+                            d_mesh=fluid["d_mesh"],
+                            d_prev=fluid["d_prev"],
+                            d_prev2=fluid["d_prev2"],
+                            mesh_v=fluid["w_mesh_k"],
+                            mesh_v_prev=fluid["w_mesh_prev"],
+                            mesh_a_prev=fluid["a_mesh_prev"],
+                            rho_f=float(setup.material.density),
+                            mu_f=mu_f,
+                            dt=dt_value,
+                            bossak_alpha=float(bossak_alpha),
+                            dynamic_tau=float(dynamic_tau),
+                            reset_predicted_to_old_on_step_begin=_env_bool(
+                                "PYCUTFEM_EX2_RESET_PREDICTED_SUBSCALE_EACH_FLUID_STAGE",
+                                False,
+                            ),
+                        )
+                        fluid_acceleration_operator = _FluidBossakAccelerationOperator(
+                            u_k=fluid["u_k"],
+                            a_k=fluid["a_k"],
+                            dt=dt_value,
+                            bossak_alpha=float(bossak_alpha),
+                        )
+                        first_build_old_subscale_mode = _env_str(
+                            "PYCUTFEM_EX2_FIRST_BUILD_OLD_SUBSCALE_MODE",
+                            "",
+                        ).strip().lower()
+                        use_first_build_old_subscale = _env_bool(
+                            "PYCUTFEM_EX2_FIRST_BUILD_OLD_SUBSCALE",
+                            False,
+                        )
+                        preserve_predicted_subscale = _env_bool(
+                            "PYCUTFEM_EX2_PRESERVE_PREDICTED_SUBSCALE_EACH_FLUID_STAGE",
+                            False,
+                        )
+                        # Keep the last converged predicted subscale live by
+                        # default. Rebuilding from old-step subscale on the
+                        # first coupling iteration is an opt-in experiment,
+                        # not the production Kratos-matched path.
+                        apply_first_build_old_subscale = False
+                        if first_build_old_subscale_mode in {"off", "false", "never", "none"}:
+                            apply_first_build_old_subscale = False
+                        elif first_build_old_subscale_mode in {"all", "each", "every", "stage"}:
+                            apply_first_build_old_subscale = True
+                        elif first_build_old_subscale_mode in {"first", "step_first", "iter1"}:
+                            apply_first_build_old_subscale = int(coupling_iter) == 1
+                        elif bool(use_first_build_old_subscale):
+                            apply_first_build_old_subscale = int(coupling_iter) == 1
+                        apply_preserve_predicted_subscale = bool(
+                            use_exact_fluid_operator
+                            and bool(preserve_predicted_subscale)
+                            and not bool(apply_first_build_old_subscale)
+                        )
+                        # Keep the first-assembly skip as an opt-in probe only.
+                        # Kratos still refreshes the predictor before each
+                        # nonlinear iteration; the carried predicted subscale is
+                        # the Newton initial guess inside that refresh, not a
+                        # replacement for the refresh itself.
+                        if bool(apply_first_build_old_subscale):
+                            fluid_predictor_operator.arm_initial_old_subscale_build()
+                        elif bool(apply_preserve_predicted_subscale):
+                            fluid_predictor_operator.preserve_initial_predicted_subscale()
+                        for bc_scale in continuation_scales:
+                            fluid_predictor_operator.configure_first_assembly_probe(
+                                output_dir=output_dir,
+                                step=int(step),
+                                coupling_iter=int(coupling_iter),
+                                bc_scale=float(bc_scale),
+                                dt=float(dt_value),
+                                bossak_alpha=float(bossak_alpha),
+                            )
+                            scaled_iface_velocity = _scaled_lookup(mesh_vel_fluid_lookup, float(bc_scale))
+                            scale_value = float(bc_scale)
+        
+                            def _scaled_inlet_profile(x: float, y: float) -> float:
+                                return scale_value * float(inlet_profile(x, y))
+        
+                            if use_exact_fluid_operator:
+                                fluid_res, fluid_jac, fluid_bcs, fluid_bcs_homog = _fluid_zero_local_operator_forms(
+                                    prob=fluid,
+                                    iface_velocity=scaled_iface_velocity,
+                                    inlet_lookup=_scaled_inlet_profile,
+                                    interface_tag=geometry.interface_tag,
+                                    outlet_tag=geometry.outlet_tag,
+                                    walls_tag=geometry.walls_tag,
+                                    cylinder_tag=geometry.cylinder_tag,
+                                    quad_order=quad_order,
+                                )
+                                stage_ops = [
+                                    fluid_acceleration_operator,
+                                    fluid_predictor_operator,
+                                    fluid_exact_operator,
+                                ]
+                                stage_max_newton_iter = int(
+                                    retry_policy.fluid_max_newton_iter
+                                    if retry_policy.fluid_max_newton_iter is not None
+                                    else max(
+                                        int(max_newton_iter),
+                                        int(
+                                            _env_float(
+                                                "PYCUTFEM_EX2_EXACT_FLUID_MAX_NEWTON_ITER",
+                                                20,
+                                            )
+                                        ),
+                                    )
+                                )
+                                stage_globalization = (
+                                    str(retry_policy.fluid_globalization)
+                                    if retry_policy.fluid_globalization is not None
+                                    else _env_str(
+                                        "PYCUTFEM_EX2_EXACT_FLUID_GLOBALIZATION",
+                                        "line_search",
+                                    )
+                                )
+                                stage_line_search = (
+                                    bool(retry_policy.fluid_line_search)
+                                    if retry_policy.fluid_line_search is not None
+                                    else _env_bool(
+                                        "PYCUTFEM_EX2_EXACT_FLUID_LINE_SEARCH",
+                                        False,
+                                    )
+                                )
+                                stage_ls_fail_hard = (
+                                    bool(retry_policy.fluid_ls_fail_hard)
+                                    if retry_policy.fluid_ls_fail_hard is not None
+                                    else _env_bool(
+                                        "PYCUTFEM_EX2_EXACT_FLUID_LS_FAIL_HARD",
+                                        True,
+                                    )
+                                )
+                            else:
+                                fluid_res, fluid_jac, fluid_bcs, fluid_bcs_homog = _fluid_residual_and_jacobian(
+                                    prob=fluid,
+                                    rho_f=float(setup.material.density),
+                                    mu_f=mu_f,
+                                    dt=dt_value,
+                                    bossak_alpha=float(bossak_alpha),
+                                    dynamic_tau=float(dynamic_tau),
+                                    pressure_gauge=float(pressure_gauge),
+                                    iface_velocity=scaled_iface_velocity,
+                                    inlet_lookup=_scaled_inlet_profile,
+                                    interface_tag=geometry.interface_tag,
+                                    outlet_tag=geometry.outlet_tag,
+                                    walls_tag=geometry.walls_tag,
+                                    cylinder_tag=geometry.cylinder_tag,
+                                    quad_order=quad_order,
+                                )
+                                stage_ops = [fluid_predictor_operator]
+                                stage_max_newton_iter = max(2, min(int(max_newton_iter), 4))
+                                stage_globalization = "line_search_then_trust"
+                                stage_line_search = True
+                                stage_ls_fail_hard = True
+                            fluid["_current_bcs"] = fluid_bcs
+                            fluid["_current_bcs_homog"] = fluid_bcs_homog
+                            _apply_dirichlet_bcs_to_state(
+                                dh=fluid["dh"],
+                                field_functions={
+                                    str(fluid["u_k"].components[0].field_name): fluid["u_k"].components[0],
+                                    str(fluid["u_k"].components[1].field_name): fluid["u_k"].components[1],
+                                    str(fluid["p_k"].field_name): fluid["p_k"],
+                                },
+                                bcs=fluid_bcs,
+                            )
+                            stage_linear_backend = (
+                                str(exact_fluid_linear_backend)
+                                if use_exact_fluid_operator
+                                else str(linear_backend)
+                            )
+                            fluid_guess = _snapshot_function_values([fluid["u_k"], fluid["p_k"]])
+                            _section(
+                                verbose,
+                                "[fluid-solver] "
+                                f"step={step} coupling_iter={coupling_iter} scale={float(bc_scale):.3f} "
+                                f"mode={fluid_operator_mode} globalization={stage_globalization} "
+                                f"linear_backend={stage_linear_backend} "
+                                f"line_search={stage_line_search} ls_fail_hard={stage_ls_fail_hard} "
+                                f"max_newton_iter={stage_max_newton_iter}",
+                            )
+                            stage_newton_tol = float(newton_tol)
+                            if use_exact_fluid_operator:
+                                # Kratos' transient monolithic fluid solver uses
+                                # MixedGenericCriteria(VELOCITY, PRESSURE), not a
+                                # separate raw residual-norm stop. Keep the local
+                                # residual gate disabled by default so Newton
+                                # acceptance follows the Kratos criterion.
+                                stage_newton_tol = float(
+                                    _env_float(
+                                        "PYCUTFEM_EX2_EXACT_FLUID_RESIDUAL_GATE_TOL",
+                                        0.0 if fluid_mixed_solution_criteria else float(exact_fluid_newton_tol),
+                                    )
+                                )
+                            stage_newton_params = NewtonParameters(
+                                newton_tol=float(stage_newton_tol),
+                                max_newton_iter=int(stage_max_newton_iter),
+                                line_search=bool(stage_line_search),
+                                ls_fail_hard=bool(stage_ls_fail_hard),
+                                globalization=str(stage_globalization),
+                                mixed_solution_criteria=fluid_mixed_solution_criteria,
+                                mixed_solution_max_residual_factor=float(fluid_mixed_solution_residual_factor),
+                                mixed_solution_residual_tol=float(exact_fluid_newton_tol),
+                            )
+                            stage_lin_params = LinearSolverParameters(backend=str(stage_linear_backend))
+                            if use_exact_fluid_operator:
+                                stage_solver = _get_or_create_cached_stage_solver(
+                                    cache_owner=fluid,
+                                    cache_name="_stage_solver_cache",
+                                    cache_key=(
+                                        "exact",
+                                        int(id(fluid_res)),
+                                        int(id(fluid_jac)),
+                                        int(quad_order),
+                                        str(backend),
+                                        str(stage_linear_backend),
+                                        int(stage_max_newton_iter),
+                                        bool(stage_line_search),
+                                        bool(stage_ls_fail_hard),
+                                        str(stage_globalization),
+                                    ),
+                                    residual_form=fluid_res,
+                                    jacobian_form=fluid_jac,
+                                    dof_handler=fluid["dh"],
+                                    mixed_element=fluid["me"],
+                                    bcs=fluid_bcs,
+                                    bcs_homog=fluid_bcs_homog,
+                                    newton_params=stage_newton_params,
+                                    lin_params=stage_lin_params,
+                                    quad_order=quad_order,
+                                    backend=str(backend),
+                                    operators=stage_ops,
+                                    active_fields=("ux", "uy", "p"),
+                                )
+                            else:
+                                stage_solver = NewtonSolver(
+                                    residual_form=fluid_res,
+                                    jacobian_form=fluid_jac,
+                                    dof_handler=fluid["dh"],
+                                    mixed_element=fluid["me"],
+                                    bcs=fluid_bcs,
+                                    bcs_homog=fluid_bcs_homog,
+                                    newton_params=stage_newton_params,
+                                    lin_params=stage_lin_params,
+                                    quad_order=quad_order,
+                                    backend=str(backend),
+                                    operators=stage_ops,
+                                )
+                                stage_solver.set_active_fields(["ux", "uy", "p"])
+                            _attach_runtime_operator_post_update_hook(
+                                solver=stage_solver,
+                                operators=stage_ops,
+                            )
+                            _restore_function_values([fluid["u_prev"], fluid["p_prev"]], fluid_prev_step)
+                            _restore_function_values(
+                                [fluid["d_prev"], fluid["d_prev2"], fluid["w_mesh_prev"], fluid["a_mesh_prev"]],
+                                fluid_mesh_prev_step,
+                            )
+                            fluid_a_prev_stage = np.asarray(fluid["a_prev"].nodal_values, dtype=float).copy()
+                            fluid_acceleration_operator.prime_stage_state(
+                                u_prev_snapshot=np.asarray(fluid_prev_step[0], dtype=float),
+                                a_prev_snapshot=np.asarray(fluid_a_prev_stage, dtype=float),
+                                # Kratos does not refresh ACCELERATION when the
+                                # ALE/interface boundary state is synchronized
+                                # before the fluid solve. The first nonlinear
+                                # assembly sees the carried value from the
+                                # previous fluid solve; subsequent assemblies
+                                # are refreshed after Newton velocity updates.
+                                preserve_seed_on_first_assembly=_env_bool(
+                                    "PYCUTFEM_EX2_PRESERVE_FLUID_ACCELERATION_SEED",
+                                    True,
+                                ),
+                            )
+                            if use_exact_fluid_operator:
+                                _maybe_dump_exact_fluid_probe(
+                                    output_dir=output_dir,
+                                    step=int(step),
+                                    coupling_iter=int(coupling_iter),
+                                    stage_label="pre_fluid_solve",
+                                    bc_scale=float(bc_scale),
+                                    dt=float(dt_value),
+                                    bossak_alpha=float(bossak_alpha),
+                                    fluid=fluid,
+                                    reaction_point_load_lookup=None,
+                                    reaction_solid_load_lookup=None,
+                                )
+                            fluid_newton_accepted_after_maxiter = False
+                            try:
+                                stage_solver.solve_time_interval(
+                                    functions=[fluid["u_k"], fluid["p_k"]],
+                                    prev_functions=[fluid["u_prev"], fluid["p_prev"]],
+                                    aux_functions={
+                                        "a_prev": fluid["a_prev"],
+                                        "a_k": fluid["a_k"],
+                                        "d_mesh": fluid["d_mesh"],
+                                        "d_prev": fluid["d_prev"],
+                                        "d_prev2": fluid["d_prev2"],
+                                    },
+                                    time_params=TimeStepperParameters(
+                                        dt=dt_value,
+                                        max_steps=1,
+                                        final_time=dt_value,
+                                        stop_on_steady=False,
+                                        step_initial_guess_callback=_guess_callback_from_snapshots_with_dirichlet(
+                                            snapshots=fluid_guess,
+                                            dh=fluid["dh"],
+                                            bcs=fluid_bcs,
+                                        ),
+                                    ),
+                                )
+                            except Exception as exc:
+                                if use_exact_fluid_operator:
+                                    _maybe_dump_exact_fluid_probe(
+                                        output_dir=output_dir,
+                                        step=int(step),
+                                        coupling_iter=int(coupling_iter),
+                                        stage_label="failed_fluid_solve",
+                                        bc_scale=float(bc_scale),
+                                        dt=float(dt_value),
+                                        bossak_alpha=float(bossak_alpha),
+                                        fluid=fluid,
+                                        reaction_point_load_lookup=None,
+                                        reaction_solid_load_lookup=None,
+                                    )
+                                accept_maxiter = _env_bool(
+                                    "PYCUTFEM_EX2_EXACT_FLUID_ACCEPT_MAXITER",
+                                    True,
+                                )
+                                if (
+                                    bool(use_exact_fluid_operator)
+                                    and bool(accept_maxiter)
+                                    and _is_newton_maxiter_nonconvergence(exc)
+                                ):
+                                    fluid_newton_accepted_after_maxiter = True
+                                    _log(
+                                        verbose,
+                                        "[fluid-stage] "
+                                        f"step={step} coupling_iter={coupling_iter} "
+                                        "Newton reached the iteration cap; continuing with the last iterate "
+                                        "to match Kratos NavierStokesMonolithicSolver warning semantics.",
+                                    )
+                                else:
+                                    raise
+                            # Kratos stores the solved-step ACCELERATION field as the
+                            # Bossak recurrence against the previous accepted-step
+                            # history, then carries that hidden state into the next
+                            # outer coupling iteration.
+                            fluid_bossak = _bossak_coefficients(
+                                alpha=float(bossak_alpha),
+                                dt=max(float(dt_value), 1.0e-14),
+                            )
+                            fluid["a_k"].nodal_values[:] = (
+                                float(fluid_bossak["ma0"])
+                                * (fluid["u_k"].nodal_values[:] - np.asarray(fluid_prev_step[0], dtype=float))
+                                + float(fluid_bossak["ma2"]) * fluid_a_prev_stage
+                            )
+                            fluid_guess = _snapshot_function_values([fluid["u_k"], fluid["p_k"]])
+                            _log(
+                                verbose,
+                                "[fluid-stage] "
+                                f"scale={float(bc_scale):.3f} "
+                                f"mode={fluid_operator_mode} "
+                                f"u_max={_field_abs_max(fluid['u_k']):.3e} "
+                                f"p_max={_field_abs_max(fluid['p_k']):.3e} "
+                                f"accepted_after_maxiter={int(fluid_newton_accepted_after_maxiter)}",
+                            )
+                        _restore_function_values([fluid["u_prev"], fluid["p_prev"]], fluid_prev_step)
+                        _restore_function_values(
+                            [fluid["d_prev"], fluid["d_prev2"], fluid["w_mesh_prev"], fluid["a_mesh_prev"]],
+                            fluid_mesh_prev_step,
+                        )
+                        fluid_elapsed = time.perf_counter() - t_fluid0
+                        fluid_times.append(float(fluid_elapsed))
+        
+                        if load_transfer_value == "reaction" or bool(monitor_interface_loads):
+                            t_reaction0 = time.perf_counter()
+                            reaction_point_load_lookup = _fluid_interface_reaction_loads(
+                                prob=fluid,
+                                rho_f=float(setup.material.density),
+                                mu_f=mu_f,
+                                dt=dt_value,
+                                quad_order=quad_order,
+                                bossak_alpha=float(bossak_alpha),
+                                dynamic_tau=float(dynamic_tau),
+                                interface_tag=geometry.interface_tag,
+                                backend=str(backend),
+                                contribution_mode="system",
+                                refresh_state=False,
+                            )
+                            reaction_solid_load_lookup = _resample_lookup_to_coords(
+                                _negate_lookup(reaction_point_load_lookup),
+                                solid_iface_coords,
+                            )
+                            if _env_bool("PYCUTFEM_EX2_STAGE_TIMING", False):
+                                _log(
+                                    True,
+                                    "[timing] "
+                                    f"step={step} iter={coupling_iter} "
+                                    f"reaction_stage={time.perf_counter() - t_reaction0:.6f}s",
+                                )
+                        if bool(monitor_stress_interface_loads):
+                            stress_point_load_lookup = _fluid_interface_point_loads_on_solid(
+                                fluid_dh=fluid["dh"],
+                                fluid_mesh=mesh_f,
+                                solid_mesh=mesh_s,
+                                u=fluid["u_k"],
+                                p=fluid["p_k"],
+                                d_mesh=fluid["d_mesh"],
+                                solid_iface_coords=solid_iface_coords,
+                                interface_tag=geometry.interface_tag,
+                                mu_f=mu_f,
+                                quad_order=quad_order,
+                            )
+                        if use_exact_fluid_operator:
+                            _maybe_dump_exact_fluid_probe(
+                                output_dir=output_dir,
+                                step=int(step),
+                                coupling_iter=int(coupling_iter),
+                                stage_label="post_fluid_solve",
+                                bc_scale=float(continuation_scales[-1]),
+                                dt=float(dt_value),
+                                bossak_alpha=float(bossak_alpha),
+                                fluid=fluid,
+                                reaction_point_load_lookup=reaction_point_load_lookup,
+                                reaction_solid_load_lookup=reaction_solid_load_lookup,
+                            )
+                    if load_transfer_value == "reaction":
+                        if reaction_solid_load_lookup is None:
+                            raise RuntimeError("Reaction load lookup was not computed.")
+                        fluid_point_load_lookup = reaction_solid_load_lookup
+                    elif load_transfer_value == "stress":
+                        if stress_point_load_lookup is None:
+                            raise RuntimeError("Stress load lookup was not computed.")
+                        fluid_point_load_lookup = stress_point_load_lookup
+                    else:
+                        raise ValueError(f"Unsupported load_transfer={load_transfer!r}")
+                    if accelerate_on_fluid_load:
+                        returned_accel_load_lookup = reaction_point_load_lookup
+                    else:
+                        returned_accel_load_lookup = fluid_point_load_lookup
+                    returned_load_lookup = _resample_lookup_to_coords(fluid_point_load_lookup, solid_iface_coords)
+                    last_returned_load_lookup = returned_load_lookup
+                    mesh_vel_solid_lookup = _resample_lookup_to_coords(mesh_vel_fluid_lookup, solid_iface_coords)
+                    interface_velocity_snapshot = np.asarray(mesh_vel_solid_lookup.values, dtype=float).reshape(-1)
+                    interface_disp_snapshot = np.asarray(solid_disp_solid_lookup.values, dtype=float).reshape(-1)
+                    load_snapshot = np.asarray(returned_load_lookup.values, dtype=float).reshape(-1)
+                    traction_snapshot = _interface_traction_from_load(
+                        solid_interface_mass,
+                        np.asarray(returned_load_lookup.values, dtype=float),
+                    ).reshape(-1)
+                    accel_guess_vals = np.asarray(current_load_lookup.values, dtype=float)
+                    accel_return_vals = np.asarray(returned_accel_load_lookup.values, dtype=float)
+                    load_residual = accel_return_vals - accel_guess_vals
+                    disp_abs, disp_rel = _relative_change(solid_disp_solid_lookup.values, prev_disp_iter_vals)
+                    load_abs, load_rel = _relative_change(accel_return_vals, accel_guess_vals)
+                    last_disp_abs = disp_abs
+                    last_disp_rel = disp_rel
+                    last_load_abs = load_abs
+                    last_load_rel = load_rel
+                    omega_force = float(active_force_relaxation)
+                    if str(active_force_update).lower() == "aitken":
+                        omega_force = _aitken_relaxation_factor(
+                            omega_prev=float(last_force_omega),
+                            residual_prev=prev_force_residual,
+                            residual_curr=load_residual,
+                            omega_min=float(force_relaxation_min),
+                            omega_max=float(force_relaxation_max),
+                        )
+                    else:
+                        omega_force = float(
+                            np.clip(float(active_force_relaxation), float(force_relaxation_min), float(force_relaxation_max))
+                        )
+
+                    disp_max = float(np.max(np.linalg.norm(np.asarray(solid_disp_solid_lookup.values, dtype=float), axis=1)))
+                    load_guess_max = float(np.max(np.linalg.norm(accel_guess_vals, axis=1)))
+                    load_return_max = float(np.max(np.linalg.norm(accel_return_vals, axis=1)))
+                    row = {
+                        "step": int(step),
+                        "time_s": float(t_now),
+                        "attempt": int(attempt_index),
+                        "coupling_iter": int(coupling_iter),
+                        "disp_abs": float(disp_abs),
+                        "disp_rel": float(disp_rel),
+                        "load_abs": float(load_abs),
+                        "load_rel": float(load_rel),
+                        "solid_time_s": float(solid_elapsed),
+                        "fluid_time_s": float(fluid_elapsed),
+                        "disp_max": disp_max,
+                        "load_guess_max": load_guess_max,
+                        "load_return_max": load_return_max,
+                        "force_update_active": str(active_force_update),
+                        "force_omega": float(omega_force),
+                    }
+                    keep_snapshot = snapshot_mode == "all"
+                    disp_converged = bool((disp_abs <= coupling_abs_tol) or (disp_rel <= coupling_rel_tol))
+                    load_converged = bool((load_abs <= coupling_abs_tol) or (load_rel <= coupling_rel_tol))
+                    step_converged = bool(disp_converged and load_converged)
+                    kratos_coupling_tol = 5.0e-3
+                    kratos_disp_converged = bool((disp_abs <= kratos_coupling_tol) or (disp_rel <= kratos_coupling_tol))
+                    kratos_load_converged = bool((load_abs <= kratos_coupling_tol) or (load_rel <= kratos_coupling_tol))
+                    kratos_step_converged = bool(kratos_disp_converged and kratos_load_converged)
+                    row["strict_converged"] = bool(step_converged)
+                    row["kratos_disp_converged_5e-3"] = bool(kratos_disp_converged)
+                    row["kratos_load_converged_5e-3"] = bool(kratos_load_converged)
+                    row["kratos_step_converged_5e-3"] = bool(kratos_step_converged)
+                    step_rows.append(row)
+                    if snapshot_mode == "converged" and step_converged:
+                        keep_snapshot = True
+                    if keep_snapshot:
+                        if disp_snapshot is None:
+                            if nirb_prediction is None or nirb_solid_predictor is None:
+                                disp_snapshot = _flatten_vector_snapshot(solid["dh"], solid["d_k"])
+                            else:
+                                disp_snapshot = _assign_nirb_full_displacement(
+                                    predictor=nirb_solid_predictor,
+                                    prediction=nirb_prediction,
+                                    solid_displacement=solid["d_k"],
+                                )
+                        load_guess_snapshots.append(np.asarray(load_guess_vals, dtype=float).reshape(-1))
+                        load_return_snapshots.append(load_snapshot)
+                        fluid_load_guess_snapshots.append(np.asarray(accel_guess_vals, dtype=float).reshape(-1))
+                        fluid_load_return_snapshots.append(np.asarray(accel_return_vals, dtype=float).reshape(-1))
+                        disp_snapshots.append(disp_snapshot)
+                        load_snapshots.append(load_snapshot)
+                        interface_disp_snapshots.append(interface_disp_snapshot)
+                        interface_velocity_snapshots.append(interface_velocity_snapshot)
+                        interface_traction_snapshots.append(traction_snapshot)
+                        if bool(monitor_interface_loads):
+                            reaction_values = (
+                                np.asarray(reaction_solid_load_lookup.values, dtype=float).reshape(-1)
+                                if reaction_solid_load_lookup is not None
+                                else np.zeros_like(load_snapshot)
+                            )
+                            stress_values = (
+                                np.asarray(stress_point_load_lookup.values, dtype=float).reshape(-1)
+                                if stress_point_load_lookup is not None
+                                else np.zeros_like(load_snapshot)
+                            )
+                            reaction_load_snapshots.append(reaction_values)
+                            stress_load_snapshots.append(stress_values)
+                        snapshot_rows.append(
+                            {
+                                "step": int(step),
+                                "time_s": float(t_now),
+                                "coupling_iter": int(coupling_iter),
+                                "converged": bool(step_converged),
+                            }
+                        )
+
                     _log(
                         verbose,
-                        "[fluid-stage] "
-                        f"scale={float(bc_scale):.3f} "
-                        f"mode={fluid_operator_mode} "
-                        f"u_max={_field_abs_max(fluid['u_k']):.3e} "
-                        f"p_max={_field_abs_max(fluid['p_k']):.3e}",
+                        "[fixed-point] "
+                        f"step={step} iter={coupling_iter} "
+                        f"disp_abs={disp_abs:.3e} disp_rel={disp_rel:.3e} "
+                        f"load_abs={load_abs:.3e} load_rel={load_rel:.3e} "
+                        f"disp_max={disp_max:.3e} load_guess_max={load_guess_max:.3e} "
+                        f"load_return_max={load_return_max:.3e} omega={omega_force:.3e} "
+                        f"strict_ok={int(step_converged)} kratos_5e-3_ok={int(kratos_step_converged)}",
                     )
-                _restore_function_values([fluid["u_prev"], fluid["p_prev"]], fluid_prev_step)
-                _restore_function_values(
-                    [fluid["d_prev"], fluid["d_prev2"], fluid["w_mesh_prev"], fluid["a_mesh_prev"]],
-                    fluid_mesh_prev_step,
-                )
-                fluid_elapsed = time.perf_counter() - t_fluid0
-                fluid_times.append(float(fluid_elapsed))
-
-                if load_transfer_value == "reaction" or bool(monitor_interface_loads):
-                    reaction_point_load_lookup = _fluid_interface_reaction_loads(
-                        prob=fluid,
-                        rho_f=float(setup.material.density),
-                        mu_f=mu_f,
-                        dt=dt_value,
-                        quad_order=quad_order,
-                        bossak_alpha=float(bossak_alpha),
-                        dynamic_tau=float(dynamic_tau),
-                        interface_tag=geometry.interface_tag,
-                        backend=str(backend),
-                        contribution_mode="system",
-                    )
-                    reaction_solid_load_lookup = _resample_lookup_to_coords(
-                        _negate_lookup(reaction_point_load_lookup),
-                        solid_iface_coords,
-                    )
-                if load_transfer_value == "stress" or bool(monitor_interface_loads):
-                    stress_point_load_lookup = _fluid_interface_point_loads_on_solid(
-                        fluid_dh=fluid["dh"],
-                        fluid_mesh=mesh_f,
-                        solid_mesh=mesh_s,
-                        u=fluid["u_k"],
-                        p=fluid["p_k"],
-                        d_mesh=fluid["d_mesh"],
-                        solid_iface_coords=solid_iface_coords,
-                        interface_tag=geometry.interface_tag,
-                        mu_f=mu_f,
-                        quad_order=quad_order,
-                    )
-                if use_exact_fluid_operator:
-                    _maybe_dump_exact_fluid_probe(
+                    _maybe_dump_coupling_update_probe(
                         output_dir=output_dir,
                         step=int(step),
                         coupling_iter=int(coupling_iter),
-                        stage_label="post_fluid_solve",
-                        bc_scale=float(continuation_scales[-1]),
-                        dt=float(dt_value),
-                        bossak_alpha=float(bossak_alpha),
-                        fluid=fluid,
-                        reaction_point_load_lookup=reaction_point_load_lookup,
-                        reaction_solid_load_lookup=reaction_solid_load_lookup,
+                        stage_label="pre_update",
+                        current_load_lookup=current_load_lookup,
+                        returned_accel_load_lookup=returned_accel_load_lookup,
+                        next_load_lookup=None,
+                        load_guess_history=load_guess_history,
+                        load_return_history=load_return_history,
+                        iqn_old_dr_mats=list(iqn_old_dr_mats),
+                        iqn_old_dg_mats=list(iqn_old_dg_mats),
+                        omega_force=float(omega_force),
+                        active_force_update=str(active_force_update),
+                        force_iteration_horizon=int(force_iteration_horizon),
+                        force_regularization=float(force_regularization),
+                        accel_backend=str(_env_str("PYCUTFEM_EX2_IQN_BACKEND", "python")).strip().lower(),
+                        v_new=None,
+                        w_new=None,
                     )
-            if load_transfer_value == "reaction":
-                if reaction_solid_load_lookup is None:
-                    raise RuntimeError("Reaction load lookup was not computed.")
-                fluid_point_load_lookup = reaction_solid_load_lookup
-            elif load_transfer_value == "stress":
-                if stress_point_load_lookup is None:
-                    raise RuntimeError("Stress load lookup was not computed.")
-                fluid_point_load_lookup = stress_point_load_lookup
-            else:
-                raise ValueError(f"Unsupported load_transfer={load_transfer!r}")
-            if accelerate_on_fluid_load:
-                returned_accel_load_lookup = reaction_point_load_lookup
-            else:
-                returned_accel_load_lookup = fluid_point_load_lookup
-            returned_load_lookup = _resample_lookup_to_coords(fluid_point_load_lookup, solid_iface_coords)
-            last_returned_load_lookup = returned_load_lookup
-            mesh_vel_solid_lookup = _resample_lookup_to_coords(mesh_vel_fluid_lookup, solid_iface_coords)
-            interface_velocity_snapshot = np.asarray(mesh_vel_solid_lookup.values, dtype=float).reshape(-1)
-            interface_disp_snapshot = np.asarray(solid_disp_solid_lookup.values, dtype=float).reshape(-1)
-            load_snapshot = np.asarray(returned_load_lookup.values, dtype=float).reshape(-1)
-            traction_snapshot = _interface_traction_from_load(
-                solid_interface_mass,
-                np.asarray(returned_load_lookup.values, dtype=float),
-            ).reshape(-1)
-            accel_guess_vals = np.asarray(current_load_lookup.values, dtype=float)
-            accel_return_vals = np.asarray(returned_accel_load_lookup.values, dtype=float)
-            load_residual = accel_return_vals - accel_guess_vals
-            disp_abs, disp_rel = _relative_change(solid_disp_solid_lookup.values, prev_disp_iter_vals)
-            load_abs, load_rel = _relative_change(accel_return_vals, accel_guess_vals)
-            last_disp_abs = disp_abs
-            last_disp_rel = disp_rel
-            last_load_abs = load_abs
-            last_load_rel = load_rel
-            omega_force = float(active_force_relaxation)
-            if str(active_force_update).lower() == "aitken":
-                omega_force = _aitken_relaxation_factor(
-                    omega_prev=float(last_force_omega),
-                    residual_prev=prev_force_residual,
-                    residual_curr=load_residual,
-                    omega_min=float(force_relaxation_min),
-                    omega_max=float(force_relaxation_max),
-                )
-            else:
-                omega_force = float(
-                    np.clip(float(active_force_relaxation), float(force_relaxation_min), float(force_relaxation_max))
-                )
-
-            disp_max = float(np.max(np.linalg.norm(np.asarray(solid_disp_solid_lookup.values, dtype=float), axis=1)))
-            load_guess_max = float(np.max(np.linalg.norm(accel_guess_vals, axis=1)))
-            load_return_max = float(np.max(np.linalg.norm(accel_return_vals, axis=1)))
-            row = {
-                "step": int(step),
-                "time_s": float(t_now),
-                "attempt": 1,
-                "coupling_iter": int(coupling_iter),
-                "disp_abs": float(disp_abs),
-                "disp_rel": float(disp_rel),
-                "load_abs": float(load_abs),
-                "load_rel": float(load_rel),
-                "solid_time_s": float(solid_elapsed),
-                "fluid_time_s": float(fluid_elapsed),
-                "disp_max": disp_max,
-                "load_guess_max": load_guess_max,
-                "load_return_max": load_return_max,
-                "force_update_active": str(active_force_update),
-                "force_omega": float(omega_force),
-            }
-            keep_snapshot = snapshot_mode == "all"
-            disp_converged = bool((disp_abs <= coupling_abs_tol) or (disp_rel <= coupling_rel_tol))
-            load_converged = bool((load_abs <= coupling_abs_tol) or (load_rel <= coupling_rel_tol))
-            step_converged = bool(disp_converged and load_converged)
-            kratos_coupling_tol = 5.0e-3
-            kratos_disp_converged = bool((disp_abs <= kratos_coupling_tol) or (disp_rel <= kratos_coupling_tol))
-            kratos_load_converged = bool((load_abs <= kratos_coupling_tol) or (load_rel <= kratos_coupling_tol))
-            kratos_step_converged = bool(kratos_disp_converged and kratos_load_converged)
-            row["strict_converged"] = bool(step_converged)
-            row["kratos_disp_converged_5e-3"] = bool(kratos_disp_converged)
-            row["kratos_load_converged_5e-3"] = bool(kratos_load_converged)
-            row["kratos_step_converged_5e-3"] = bool(kratos_step_converged)
-            step_rows.append(row)
-            if snapshot_mode == "converged" and step_converged:
-                keep_snapshot = True
-            if keep_snapshot:
-                load_guess_snapshots.append(np.asarray(load_guess_vals, dtype=float).reshape(-1))
-                load_return_snapshots.append(load_snapshot)
-                fluid_load_guess_snapshots.append(np.asarray(accel_guess_vals, dtype=float).reshape(-1))
-                fluid_load_return_snapshots.append(np.asarray(accel_return_vals, dtype=float).reshape(-1))
-                disp_snapshots.append(disp_snapshot)
-                load_snapshots.append(load_snapshot)
-                interface_disp_snapshots.append(interface_disp_snapshot)
-                interface_velocity_snapshots.append(interface_velocity_snapshot)
-                interface_traction_snapshots.append(traction_snapshot)
-                if bool(monitor_interface_loads):
-                    reaction_values = (
-                        np.asarray(reaction_solid_load_lookup.values, dtype=float).reshape(-1)
-                        if reaction_solid_load_lookup is not None
-                        else np.zeros_like(load_snapshot)
+                    current_load_lookup, _, load_update_debug = _advance_coupling_load_guess(
+                        step_converged=bool(step_converged),
+                        active_force_update=str(active_force_update),
+                        iface_coords=fluid_iface_coords if accelerate_on_fluid_load else solid_iface_coords,
+                        load_guess_vals=accel_guess_vals,
+                        returned_load_vals=accel_return_vals,
+                        load_guess_history=load_guess_history,
+                        load_return_history=load_return_history,
+                        iqn_old_dr_mats=list(iqn_old_dr_mats),
+                        iqn_old_dg_mats=list(iqn_old_dg_mats),
+                        omega_force=float(omega_force),
+                        force_iteration_horizon=int(force_iteration_horizon),
+                        force_regularization=float(force_regularization),
+                        include_debug=True,
                     )
-                    stress_values = (
-                        np.asarray(stress_point_load_lookup.values, dtype=float).reshape(-1)
-                        if stress_point_load_lookup is not None
-                        else np.zeros_like(load_snapshot)
+                    _maybe_dump_coupling_update_probe(
+                        output_dir=output_dir,
+                        step=int(step),
+                        coupling_iter=int(coupling_iter),
+                        stage_label="post_update",
+                        current_load_lookup=CoordinateLookup(
+                            np.asarray(
+                                fluid_iface_coords if accelerate_on_fluid_load else solid_iface_coords,
+                                dtype=float,
+                            ),
+                            np.asarray(accel_guess_vals, dtype=float),
+                            dim=2,
+                        ),
+                        returned_accel_load_lookup=returned_accel_load_lookup,
+                        next_load_lookup=current_load_lookup,
+                        load_guess_history=load_guess_history,
+                        load_return_history=load_return_history,
+                        iqn_old_dr_mats=list(iqn_old_dr_mats),
+                        iqn_old_dg_mats=list(iqn_old_dg_mats),
+                        omega_force=float(omega_force),
+                        active_force_update=str(active_force_update),
+                        force_iteration_horizon=int(force_iteration_horizon),
+                        force_regularization=float(force_regularization),
+                        accel_backend=str(load_update_debug.get("backend", "python")),
+                        v_new=load_update_debug.get("v_new"),
+                        w_new=load_update_debug.get("w_new"),
                     )
-                    reaction_load_snapshots.append(reaction_values)
-                    stress_load_snapshots.append(stress_values)
-                snapshot_rows.append(
-                    {
-                        "step": int(step),
-                        "time_s": float(t_now),
-                        "coupling_iter": int(coupling_iter),
-                        "converged": bool(step_converged),
-                    }
+                    if step_converged:
+                        break
+
+                    prev_disp_iter_vals = np.asarray(solid_disp_solid_lookup.values, dtype=float).copy()
+                    prev_force_residual = np.asarray(load_residual, dtype=float).copy()
+                    last_force_omega = float(omega_force)
+
+                if not step_converged:
+                    raise RuntimeError(
+                        "FSI fixed-point did not converge for step "
+                        f"{int(step)} after {int(coupling_iter)} iterations "
+                        f"(disp_rel={float(last_disp_rel):.6e}, load_rel={float(last_load_rel):.6e})."
+                    )
+            except Exception as exc:
+                _truncate_step_progress(
+                    marker=step_marker,
+                    disp_snapshots=disp_snapshots,
+                    load_snapshots=load_snapshots,
+                    load_guess_snapshots=load_guess_snapshots,
+                    load_return_snapshots=load_return_snapshots,
+                    fluid_load_guess_snapshots=fluid_load_guess_snapshots,
+                    fluid_load_return_snapshots=fluid_load_return_snapshots,
+                    interface_disp_snapshots=interface_disp_snapshots,
+                    interface_velocity_snapshots=interface_velocity_snapshots,
+                    interface_traction_snapshots=interface_traction_snapshots,
+                    reaction_load_snapshots=reaction_load_snapshots,
+                    stress_load_snapshots=stress_load_snapshots,
+                    snapshot_rows=snapshot_rows,
+                    step_rows=step_rows,
+                    fluid_times=fluid_times,
+                    structure_times=structure_times,
+                    increment_times=increment_times,
                 )
+                if attempt_index < len(retry_policies):
+                    next_policy = retry_policies[int(attempt_index)]
+                    _log(
+                        verbose,
+                        "[retry] "
+                        f"step={step} attempt={attempt_index} failed: {exc}. "
+                        f"Retrying with force_update={next_policy.force_update} "
+                        f"omega={next_policy.force_relaxation:.3e} "
+                        f"max_coupling_iters={next_policy.max_coupling_iters} "
+                        f"reset_history={int(next_policy.reset_interface_history)} "
+                        f"fluid_newton={int(next_policy.fluid_max_newton_iter or max_newton_iter)} "
+                        f"fluid_globalization={next_policy.fluid_globalization or 'inherit'} "
+                        f"fluid_continuation={next_policy.fluid_continuation_scales or (1.0,)}.",
+                    )
+                    continue
+                raise
 
-            _log(
-                verbose,
-                "[fixed-point] "
-                f"step={step} iter={coupling_iter} "
-                f"disp_abs={disp_abs:.3e} disp_rel={disp_rel:.3e} "
-                f"load_abs={load_abs:.3e} load_rel={load_rel:.3e} "
-                f"disp_max={disp_max:.3e} load_guess_max={load_guess_max:.3e} "
-                f"load_return_max={load_return_max:.3e} omega={omega_force:.3e} "
-                f"strict_ok={int(step_converged)} kratos_5e-3_ok={int(kratos_step_converged)}",
-            )
-            current_load_lookup, _ = _advance_coupling_load_guess(
-                step_converged=bool(step_converged),
-                active_force_update=str(active_force_update),
-                iface_coords=fluid_iface_coords if accelerate_on_fluid_load else solid_iface_coords,
-                load_guess_vals=accel_guess_vals,
-                returned_load_vals=accel_return_vals,
-                load_guess_history=load_guess_history,
-                load_return_history=load_return_history,
-                iqn_old_dr_mats=list(iqn_old_dr_mats),
-                iqn_old_dg_mats=list(iqn_old_dg_mats),
-                omega_force=float(omega_force),
-                force_iteration_horizon=int(force_iteration_horizon),
-                force_regularization=float(force_regularization),
-            )
-            if step_converged:
-                break
-
-            prev_disp_iter_vals = np.asarray(solid_disp_solid_lookup.values, dtype=float).copy()
-            prev_force_residual = np.asarray(load_residual, dtype=float).copy()
-            last_force_omega = float(omega_force)
+            increment_elapsed = time.perf_counter() - increment_start
+            increment_times.append(float(increment_elapsed))
+            break
 
         if not step_converged:
             _log(
                 verbose,
                 "[time] "
-                f"step={step} failed to converge after {coupling_iter} fixed-point iterations; "
-                f"disp_rel={last_disp_rel:.3e} load_rel={last_load_rel:.3e}. "
-                "Refusing to commit the step state.",
+                f"step={step} failed after {attempt_index} attempt(s); "
+                f"disp_rel={last_disp_rel:.3e} load_rel={last_load_rel:.3e}.",
             )
             raise RuntimeError(
                 "FSI fixed-point did not converge for step "
@@ -5054,8 +8499,12 @@ def run_local_example2(
 
         converged_steps += 1
         coupling_iters_per_step.append(int(coupling_iter))
-        increment_elapsed = time.perf_counter() - increment_start
-        increment_times.append(float(increment_elapsed))
+        if last_nirb_prediction is not None and nirb_solid_predictor is not None:
+            _assign_nirb_full_displacement(
+                predictor=nirb_solid_predictor,
+                prediction=last_nirb_prediction,
+                solid_displacement=solid["d_k"],
+            )
 
         bossak = _bossak_coefficients(alpha=float(bossak_alpha), dt=float(dt_value))
         u_prev_old = np.asarray(fluid["u_prev"].nodal_values, dtype=float).copy()
@@ -5092,6 +8541,7 @@ def run_local_example2(
                 target_vec=fluid["a_prev"],
                 source_lookup=last_fluid_accel_lookup,
             )
+            fluid["a_k"].nodal_values[:] = fluid["a_prev"].nodal_values[:]
             _finalize_kratos_exact_fluid_backend_step(backend=kratos_exact_fluid_backend)
         elif kratos_mesh_backend is not None:
             if last_mesh_vel_fluid_lookup is None or last_mesh_accel_fluid_lookup is None:
@@ -5109,27 +8559,69 @@ def run_local_example2(
             fluid["w_mesh_k"].nodal_values[:] = fluid["w_mesh_prev"].nodal_values[:]
             fluid["a_mesh_k"].nodal_values[:] = fluid["a_mesh_prev"].nodal_values[:]
             _finalize_kratos_mesh_motion_backend_step(backend=kratos_mesh_backend)
-        else:
-            w_mesh_prev_old = np.asarray(fluid["w_mesh_prev"].nodal_values, dtype=float).copy()
-            a_mesh_prev_old = np.asarray(fluid["a_mesh_prev"].nodal_values, dtype=float).copy()
-            w_mesh_curr, a_mesh_curr = _bossak_displacement_kinematics_values(
-                d_curr=np.asarray(fluid["d_mesh"].nodal_values, dtype=float),
-                d_prev=d_prev_old,
-                v_prev=w_mesh_prev_old,
-                a_prev=a_mesh_prev_old,
-                dt=dt_value,
-                alpha=float(bossak_alpha),
+        elif kratos_local_mesh_backend is not None:
+            if last_mesh_vel_fluid_lookup is None or last_mesh_accel_fluid_lookup is None:
+                raise RuntimeError("Kratos local mesh backend did not produce mesh kinematics for the accepted step.")
+            _transfer_vector_field(
+                target_dh=fluid["dh"],
+                target_vec=fluid["w_mesh_prev"],
+                source_lookup=last_mesh_vel_fluid_lookup,
             )
-            fluid["w_mesh_prev"].nodal_values[:] = w_mesh_curr
-            fluid["a_mesh_prev"].nodal_values[:] = a_mesh_curr
-            fluid["w_mesh_k"].nodal_values[:] = w_mesh_curr
-            fluid["a_mesh_k"].nodal_values[:] = a_mesh_curr
+            _transfer_vector_field(
+                target_dh=fluid["dh"],
+                target_vec=fluid["a_mesh_prev"],
+                source_lookup=last_mesh_accel_fluid_lookup,
+            )
+            fluid["w_mesh_k"].nodal_values[:] = fluid["w_mesh_prev"].nodal_values[:]
+            fluid["a_mesh_k"].nodal_values[:] = fluid["a_mesh_prev"].nodal_values[:]
+            _finalize_kratos_mesh_motion_backend_step(backend=kratos_local_mesh_backend)
+        else:
+            fluid["w_mesh_prev"].nodal_values[:] = fluid["w_mesh_k"].nodal_values[:]
+            fluid["a_mesh_prev"].nodal_values[:] = fluid["a_mesh_k"].nodal_values[:]
+        mesh_ext["m_prev_geom"].nodal_values.fill(0.0)
         if kratos_exact_fluid_backend is None:
             fluid["a_prev"].nodal_values[:] = (
                 float(bossak["ma0"]) * (fluid["u_k"].nodal_values[:] - u_prev_old)
                 + float(bossak["ma2"]) * a_prev_old
             )
-        _advance_fluid_dvms_history_after_step(fluid["dvms_state"])
+            fluid["a_k"].nodal_values[:] = fluid["a_prev"].nodal_values[:]
+        # Kratos persists the last converged predicted subscale across steps and
+        # only promotes it to the old-step history at FinalizeSolutionStep.
+        # Rebuilding the predictor here collapses those two distinct states and
+        # perturbs the next step's first nonlinear iteration.
+        _advance_fluid_dvms_history_after_step(
+            fluid["dvms_state"],
+            dh=fluid["dh"],
+            mesh=mesh_f,
+            u_curr=fluid["u_prev"],
+            a_curr=fluid["a_prev"],
+            p_curr=fluid["p_prev"],
+            d_curr=fluid["d_prev"],
+            mesh_v_curr=fluid["w_mesh_prev"],
+            rho_f=float(setup.material.density),
+            mu_f=mu_f,
+            dt=float(dt_value),
+            dynamic_tau=float(dynamic_tau),
+            backend=str(backend),
+        )
+        if use_exact_fluid_operator:
+            _maybe_dump_exact_fluid_probe(
+                output_dir=output_dir,
+                step=int(step),
+                coupling_iter=int(coupling_iter),
+                stage_label="after_accepted_old_subscale_promotion",
+                bc_scale=1.0,
+                dt=float(dt_value),
+                bossak_alpha=float(bossak_alpha),
+                fluid=fluid,
+                reaction_point_load_lookup=None,
+                reaction_solid_load_lookup=None,
+            )
+        # The dynamic pressure-subscale old-mass residual for step n+1 uses the
+        # previous-step velocity and the previous-step DIVPROJ history. Promote
+        # the accepted-step DIVPROJ buffer first, then rebuild old_mass_residual
+        # on the carried current geometry so it sees the same (VELOCITY,1,
+        # DIVPROJ,1) state that Kratos exposes after the step buffer shift.
         _update_fluid_dvms_state_from_previous_step(
             state=fluid["dvms_state"],
             dh=fluid["dh"],
@@ -5139,6 +8631,19 @@ def run_local_example2(
             d_geo=fluid["d_mesh"],
             backend=str(backend),
         )
+        if use_exact_fluid_operator:
+            _maybe_dump_exact_fluid_probe(
+                output_dir=output_dir,
+                step=int(step),
+                coupling_iter=int(coupling_iter),
+                stage_label="accepted_step_after_dvms_history",
+                bc_scale=1.0,
+                dt=float(dt_value),
+                bossak_alpha=float(bossak_alpha),
+                fluid=fluid,
+                reaction_point_load_lookup=None,
+                reaction_solid_load_lookup=None,
+            )
         if str(active_force_update).lower() == "iqnils" and len(load_guess_history) >= 2 and len(load_return_history) >= 2:
             v_new, w_new = _iqnils_iteration_matrices(
                 x_history=load_guess_history,
@@ -5267,6 +8772,10 @@ def run_local_example2(
         "mesh_path": str(mesh_descriptor["fluid_mesh_path"]),
         "fluid_mesh_path": str(mesh_descriptor["fluid_mesh_path"]),
         "solid_mesh_path": str(mesh_descriptor["solid_mesh_path"]),
+        "velocity_order": int(poly_order),
+        "pressure_order": int(pressure_order_value),
+        "fluid_mesh_order": int(mesh_order),
+        "solid_order": int(poly_order),
         "reynolds": float(reynolds),
         "reference_velocity": float(reference_velocity_value),
         "dt": float(dt_value),
@@ -5278,8 +8787,37 @@ def run_local_example2(
         "dynamic_tau": float(dynamic_tau),
         "solid_quad_order": int(solid_quad_order),
         "fluid_operator": str(fluid_operator_mode),
+        "solid_operator": str(solid_operator_mode),
+        "nirb_model_path": None if nirb_model_path is None else str(Path(nirb_model_path)),
+        "nirb_start_step": int(nirb_start_step_value),
         "exact_structure_backend": str(exact_structure_backend_mode),
         "exact_fluid_backend": str(exact_fluid_backend_mode),
+        "exact_fluid_linear_backend": str(exact_fluid_linear_backend),
+        "solid_system_backend": str(_solid_system_backend_mode()),
+        "diagnostic_solid_system_backend": str(_diagnostic_solid_system_backend_mode()),
+        "kratos_structure_solver_profile": dict(structure_solver_profile),
+        "mesh_extension_solver": str(_env_str("PYCUTFEM_EX2_MESH_EXTENSION_SOLVER", "direct").strip().lower()),
+        "mesh_extension_formulation": str(
+            _env_str(
+                "PYCUTFEM_EX2_MESH_EXTENSION_FORMULATION",
+                "auto",
+            ).strip().lower()
+            or "auto"
+        ),
+        "mesh_linear_solve_mode": str(
+            _env_str(
+                "PYCUTFEM_EX2_MESH_LINEAR_SOLVE_MODE",
+                "",
+            ).strip().lower()
+            or "direct"
+        ),
+        "mesh_linear_block_size": str(
+            _env_str(
+                "PYCUTFEM_EX2_MESH_LINEAR_BLOCK_SIZE",
+                "auto",
+            ).strip().lower()
+            or "auto"
+        ),
         "steps_requested": int(step_count),
         "steps_converged": int(converged_steps),
         "max_coupling_iters": int(max_coupling_iters),
@@ -5358,6 +8896,9 @@ def main() -> None:
         dynamic_tau=float(args.dynamic_tau),
         pressure_gauge=float(args.pressure_gauge),
         fluid_operator=str(args.fluid_operator),
+        solid_operator=str(args.solid_operator),
+        nirb_model_path=args.nirb_model_path,
+        nirb_start_step=int(args.nirb_start_step),
         backend=str(args.backend),
         linear_backend=str(args.linear_backend),
         snapshot_mode=str(args.snapshot_mode),

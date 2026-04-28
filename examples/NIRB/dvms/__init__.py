@@ -32,6 +32,9 @@ from .state import (
     _fluid_dvms_summary,
 )
 from .update import (
+    _clear_fluid_dvms_oss_projections,
+    _report_fluid_dvms_subscale_after_step,
+    _update_fluid_dvms_oss_projections,
     _update_fluid_dvms_predicted_subscale,
     _update_fluid_dvms_state_from_previous_step,
 )
@@ -46,6 +49,7 @@ __all__ = [
     "_advance_fluid_dvms_history_after_step",
     "_bossak_coefficients",
     "_build_fluid_dvms_state",
+    "_clear_fluid_dvms_oss_projections",
     "_eval_scalar_with_grad",
     "_eval_vector_with_grad",
     "_field_values_on_global_dofs",
@@ -56,6 +60,8 @@ __all__ = [
     "_kratos_dvms_element_size",
     "_kratos_dvms_element_size_array",
     "_kratos_dvms_element_size_coefficient",
+    "_report_fluid_dvms_subscale_after_step",
+    "_update_fluid_dvms_oss_projections",
     "_update_fluid_dvms_predicted_subscale",
     "_update_fluid_dvms_state_from_previous_step",
     "assemble_dvms_add_mass_lhs_p1_tri",

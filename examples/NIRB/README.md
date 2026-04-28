@@ -95,11 +95,11 @@ END_TIME=6.008 VTK_EVERY=1 MAX_COUPLING_ITERS=12 \
 Kratos comparison utilities:
 
 ```bash
-python examples/NIRB/run_kratos_example2_reference.py --help
-python examples/NIRB/dump_kratos_example2_stage_state.py --help
-python examples/NIRB/check_example2_fluid_gate.py --help
-python examples/NIRB/check_example2_solid_gate.py --help
-python examples/NIRB/check_example2_interface_gate.py --help
+python examples/NIRB/debug/run_kratos_example2_reference.py --help
+python examples/NIRB/debug/dump_kratos_example2_stage_state.py --help
+python examples/NIRB/debug/check_example2_fluid_gate.py --help
+python examples/NIRB/debug/check_example2_solid_gate.py --help
+python examples/NIRB/debug/check_example2_interface_gate.py --help
 ```
 
 ## Benchmark definition

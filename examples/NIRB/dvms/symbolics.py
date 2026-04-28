@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from examples.NIRB.example2_problem import _EX2_ONE
 from pycutfem.ufl.expressions import (
     Constant,
     Expression,
@@ -180,6 +181,7 @@ def build_fluid_dvms_predictor_symbolics(
     u_k: VectorFunction,
     u_prev: VectorFunction,
     a_prev: VectorFunction,
+    a_curr: VectorFunction | None = None,
     p_k: Function,
     d_mesh: VectorFunction,
     d_prev: VectorFunction,
@@ -215,9 +217,12 @@ def build_fluid_dvms_predictor_symbolics(
     # The predictor/velocity contribution uses the current acceleration a_n
     # reconstructed from the Bossak recurrence. The monolithic mass action,
     # however, must use the scheme acceleration a_{n+alpha}.
-    a_curr = bossak_ma0_expr * (u_k - u_prev) + bossak_ma2_expr * a_prev
-    a_relaxed = a_curr
-    a_scheme = (Constant(1.0) - bossak_alpha_expr) * a_curr + bossak_alpha_expr * a_prev
+    if a_curr is None:
+        current_acceleration = bossak_ma0_expr * (u_k - u_prev) + bossak_ma2_expr * a_prev
+    else:
+        current_acceleration = a_curr
+    a_relaxed = current_acceleration
+    a_scheme = (_EX2_ONE - bossak_alpha_expr) * current_acceleration + bossak_alpha_expr * a_prev
     grad_p_phys = dot(kin.Finv.T, grad(p_k))
     # The predictor update uses the same Bossak acceleration variable that
     # Kratos stores in ACCELERATION together with the old-subscale history term.
@@ -231,7 +236,7 @@ def build_fluid_dvms_predictor_symbolics(
     return FluidDVMSPredictorSymbolics(
         kinematics=kin,
         grad_p_phys=grad_p_phys,
-        a_curr=a_curr,
+        a_curr=current_acceleration,
         a_relaxed=a_relaxed,
         a_scheme=a_scheme,
         static_residual=static_residual,
@@ -243,6 +248,7 @@ def build_fluid_dvms_predictor_iteration_symbolics(
     u_k: VectorFunction,
     u_prev: VectorFunction,
     a_prev: VectorFunction,
+    a_curr: VectorFunction | None = None,
     p_k: Function,
     d_mesh: VectorFunction,
     d_prev: VectorFunction,
@@ -265,6 +271,7 @@ def build_fluid_dvms_predictor_iteration_symbolics(
         u_k=u_k,
         u_prev=u_prev,
         a_prev=a_prev,
+        a_curr=a_curr,
         p_k=p_k,
         d_mesh=d_mesh,
         d_prev=d_prev,
@@ -311,6 +318,7 @@ def build_fluid_dvms_local_forms(
     u_k: VectorFunction,
     u_prev: VectorFunction,
     a_prev: VectorFunction,
+    a_curr: VectorFunction | None = None,
     p_k: Function,
     d_mesh: VectorFunction,
     d_prev: VectorFunction,
@@ -342,11 +350,18 @@ def build_fluid_dvms_local_forms(
     bossak_ma2_expr = _as_expression(bossak_ma2)
     bossak_alpha_expr = _as_expression(bossak_alpha)
     body_expr = Constant(np.zeros((2,), dtype=float), dim=1) if body_force is None else _as_expression(body_force)
+    active_momentum_projection = (
+        momentum_projection
+        if bool(use_oss)
+        else Constant(np.zeros((2,), dtype=float), dim=1)
+    )
+    active_mass_projection = mass_projection if bool(use_oss) else Constant(0.0)
 
     predictor = build_fluid_dvms_predictor_symbolics(
         u_k=u_k,
         u_prev=u_prev,
         a_prev=a_prev,
+        a_curr=a_curr,
         p_k=p_k,
         d_mesh=d_mesh,
         d_prev=d_prev,
@@ -360,7 +375,7 @@ def build_fluid_dvms_local_forms(
         bossak_alpha=bossak_alpha_expr,
         rho=rho_expr,
         old_subscale=old_subscale,
-        momentum_projection=momentum_projection,
+        momentum_projection=active_momentum_projection,
     )
     kin = predictor.kinematics
     conv_velocity = kin.resolved_conv_velocity + predicted_subscale
@@ -402,7 +417,7 @@ def build_fluid_dvms_local_forms(
     )
 
     old_uss_term = rho_expr * inv_dt * old_subscale
-    add_velocity_source = body_expr - momentum_projection + old_uss_term
+    add_velocity_source = body_expr - active_momentum_projection + old_uss_term
 
     tau_test_conv = rho_expr * dot(dot(grad(v), kin.Finv), conv_velocity)
     tau_test_pres = grad_q_phys
@@ -419,7 +434,7 @@ def build_fluid_dvms_local_forms(
         kin.J * dot(body_expr + old_uss_term, v) * dx_measure
         + kin.J * tau_one * dot(tau_test_source_v, add_velocity_source) * dx_measure
         + kin.J * tau_one * dot(grad_q_phys, add_velocity_source) * dx_measure
-        - kin.J * ((tau_two + tau_p) * mass_projection * div_v_phys) * dx_measure
+        - kin.J * ((tau_two + tau_p) * active_mass_projection * div_v_phys) * dx_measure
         - kin.J * (tau_p * old_mass_residual * div_v_phys) * dx_measure
         - kin.J * rho_expr * dot(dot(kin.grad_u_phys, conv_velocity), v) * dx_measure
         - kin.J * tau_one * dot(tau_test_source_v, tau_res_static_conv) * dx_measure
@@ -445,9 +460,9 @@ def build_fluid_dvms_local_forms(
         + inner(kin.J * dot(viscous_sigma_du, kin.Finv.T), grad(v)) * dx_measure
     )
 
-    bossak_mam = (Constant(1.0) - bossak_alpha_expr) * bossak_ma0_expr
     mass_lhs = kin.J * rho_expr * dot(du, v) * dx_measure
     scheme_acceleration = predictor.a_scheme
+    bossak_mam = (Constant(1.0) - bossak_alpha_expr) * bossak_ma0_expr
     if bool(use_oss):
         mass_stabilization = Constant(0.0) * dot(du, v) * dx_measure
         mass_stabilization_action = Constant(0.0) * dot(body_expr, v) * dx_measure
@@ -555,6 +570,7 @@ def build_fluid_dvms_kratos_split_forms(
     u_k: VectorFunction,
     u_prev: VectorFunction,
     a_prev: VectorFunction,
+    a_curr: VectorFunction | None = None,
     p_k: Function,
     d_mesh: VectorFunction,
     d_prev: VectorFunction,
@@ -586,10 +602,17 @@ def build_fluid_dvms_kratos_split_forms(
     bossak_ma2_expr = _as_expression(bossak_ma2)
     bossak_alpha_expr = _as_expression(bossak_alpha)
     body_expr = Constant(np.zeros((2,), dtype=float), dim=1) if body_force is None else _as_expression(body_force)
+    active_momentum_projection = (
+        momentum_projection
+        if bool(use_oss)
+        else Constant(np.zeros((2,), dtype=float), dim=1)
+    )
+    active_mass_projection = mass_projection if bool(use_oss) else Constant(0.0)
     predictor = build_fluid_dvms_predictor_symbolics(
         u_k=u_k,
         u_prev=u_prev,
         a_prev=a_prev,
+        a_curr=a_curr,
         p_k=p_k,
         d_mesh=d_mesh,
         d_prev=d_prev,
@@ -603,7 +626,7 @@ def build_fluid_dvms_kratos_split_forms(
         bossak_alpha=bossak_alpha_expr,
         rho=rho_expr,
         old_subscale=old_subscale,
-        momentum_projection=momentum_projection,
+        momentum_projection=active_momentum_projection,
     )
     kin = predictor.kinematics
     conv_velocity = kin.resolved_conv_velocity + predicted_subscale
@@ -624,7 +647,7 @@ def build_fluid_dvms_kratos_split_forms(
     tau_res_static_conv = rho_expr * dot(kin.grad_u_phys, conv_velocity)
     tau_dres_static_conv_1 = rho_expr * dot(grad_du_phys, conv_velocity)
     old_uss_term = rho_expr * inv_dt * old_subscale
-    add_velocity_source = body_expr - momentum_projection + old_uss_term
+    add_velocity_source = body_expr - active_momentum_projection + old_uss_term
     tau_test_conv = rho_expr * dot(dot(grad(v), kin.Finv), conv_velocity)
     tau_test_source_v = tau_test_conv - rho_expr * inv_dt * v
     tau_test_mass = tau_test_conv - inv_dt * v + grad_q_phys
@@ -655,7 +678,7 @@ def build_fluid_dvms_kratos_split_forms(
         "body_old_subscale": kin.J * dot(body_expr + old_uss_term, v) * dx_measure,
         "tau_velocity_source": kin.J * tau_one * dot(tau_test_source_v, add_velocity_source) * dx_measure,
         "tau_q_source": kin.J * tau_one * dot(grad_q_phys, add_velocity_source) * dx_measure,
-        "mass_projection": -kin.J * ((tau_two + tau_p) * mass_projection * div_v_phys) * dx_measure,
+        "mass_projection": -kin.J * ((tau_two + tau_p) * active_mass_projection * div_v_phys) * dx_measure,
         "old_mass_residual": -kin.J * (tau_p * old_mass_residual * div_v_phys) * dx_measure,
         "minus_advective_current": -kin.J * rho_expr * dot(dot(kin.grad_u_phys, conv_velocity), v) * dx_measure,
         "minus_tau_advective_current": -kin.J * tau_one * dot(tau_test_source_v, tau_res_static_conv) * dx_measure,

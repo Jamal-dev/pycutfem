@@ -139,6 +139,12 @@ def _compile_args_for_mode(mode: str) -> list[str]:
         "-DPYBIND11_HAS_SUBINTERPRETER_SUPPORT=0",
     ]
 
+    if mode == "opt":
+        # Release-mode JIT kernels should behave like production C++ builds.
+        # This strips assertion-heavy debug paths from template libraries such
+        # as AMGCL and matches the intended "Release" configuration.
+        args.append("-DNDEBUG")
+
     if mode == "fast" and opt_flag == "-O0":
         # Conda toolchains often inject -D_FORTIFY_SOURCE=2 globally; under -O0 that
         # produces noisy preprocessor warnings on every kernel compile. Undefine it for

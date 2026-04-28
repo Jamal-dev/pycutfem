@@ -23,6 +23,7 @@ import math
 import os
 import time
 import traceback
+from collections.abc import Collection
 from dataclasses import dataclass, replace
 from pathlib import Path
 import sys
@@ -77,6 +78,7 @@ from pycutfem.ufl.expressions import (
     HdivTestFunction,
     HdivTrialFunction,
     Identity,
+    MeshSize,
     TestFunction,
     TrialFunction,
     VectorFunction,
@@ -169,6 +171,9 @@ def _named_constant(name: str, value, *, dim: int | None = None) -> Constant:
         _B7_NAMED_CONSTANT_CACHE[cache_key] = const
     setattr(const, "_jit_name", str(name))
     setattr(const, "_name", str(name))
+    # Treat named benchmark constants as runtime parameters, not algebraic
+    # literals, so value changes do not collapse the expression structure.
+    setattr(const, "_preserve_runtime_structure", True)
     return const
 
 
@@ -604,6 +609,7 @@ def _parse_float_list(raw: str) -> list[float]:
 
 def _parse_args() -> argparse.Namespace:
     here = Path(__file__).resolve().parent
+    raw_argv = list(sys.argv[1:])
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--outdir", type=str, default="out/benchmark7_seboldt")
     ap.add_argument("--backend", type=str, default="cpp", choices=("python", "jit", "cpp"))
@@ -1119,6 +1125,58 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     ap.add_argument(
+        "--final-form-quasistatic-porous-media",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Use the simplified quasi-static porous-media debug hook on the final_form branch: "
+            "pressure-only pore stress, combined porous continuity, direct grad(alpha) transfer terms, "
+            "and no active interface multipliers."
+        ),
+    )
+    ap.add_argument(
+        "--final-form-quasistatic-flip-pore-stress-sign",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Experimental: on the quasi-static final_form debug hook, use sigma_p = +p_pore I "
+            "instead of sigma_p = -p_pore I."
+        ),
+    )
+    ap.add_argument(
+        "--final-form-direct-interface-transfer",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Use direct grad(alpha)-driven interface transfer terms on the final_form branch instead of "
+            "activating the interface multiplier rows. When left unspecified, the quasi-static hook keeps "
+            "the historical direct-transfer default; pass --no-final-form-direct-interface-transfer to "
+            "keep the interface multiplier rows active instead."
+        ),
+    )
+    ap.add_argument(
+        "--final-form-disable-pore-momentum",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Disable the separate pore-fluid momentum row on the simplified final_form debug branch.",
+    )
+    ap.add_argument(
+        "--final-form-disable-solid-momentum",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Disable the separate porous-solid momentum row on the simplified final_form debug branch.",
+    )
+    ap.add_argument(
+        "--final-form-combined-porous-momentum",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Add the debug combined porous-body momentum row on the solid test space. Use together with "
+            "--final-form-disable-pore-momentum and --final-form-disable-solid-momentum to replace the "
+            "separate porous momentum equations."
+        ),
+    )
+    ap.add_argument(
         "--final-form-mass-interface-weight",
         type=float,
         default=1.0,
@@ -1199,6 +1257,15 @@ def _parse_args() -> argparse.Namespace:
         help="Weight for the optional D_phi regularization term in the porosity equation.",
     )
     ap.add_argument("--gamma-phi", type=float, default=5.0, help="Penalty enforcing phi->1 in the free-fluid region.")
+    ap.add_argument(
+        "--final-form-lag-phi-in-main",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Override whether phi is lagged during the main post_accept flow/solid Newton solve on the "
+            "final_form branch. Default is auto: constant-density final_form lags phi in the main solve."
+        ),
+    )
     ap.add_argument("--gamma-v", type=float, default=0.0, help="Free-fluid velocity extension penalty in the porous region.")
     ap.add_argument(
         "--v-extension",
@@ -1266,6 +1333,16 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     ap.add_argument(
+        "--final-form-auto-free-side-inactive-closure",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Automatically deactivate porous/support fields deep in the free-fluid interior on the active "
+            "quasi-static final_form branch. This leaves the diffuse band untouched and addresses the first "
+            "coupled wrong-side blocker before the explicit interface rows act."
+        ),
+    )
+    ap.add_argument(
         "--final-form-domain-lm",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -1273,6 +1350,66 @@ def _parse_args() -> argparse.Namespace:
             "Add bulk-domain Lagrange multipliers that weakly suppress cross-domain contamination on the "
             "final_form branch by enforcing alpha*v_f=0, alpha*p=0, (1-alpha)*(vP,vS,p_pore,u)=0, "
             "and (1-alpha)*(phi-1)=0 with complementary off-domain pinning of the multipliers."
+        ),
+    )
+    ap.add_argument(
+        "--final-form-domain-lm-vf",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable only the bulk LM that suppresses v_f on the porous side when explicitly set.",
+    )
+    ap.add_argument(
+        "--final-form-domain-lm-p",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable only the bulk LM that suppresses free-fluid p on the porous side when explicitly set.",
+    )
+    ap.add_argument(
+        "--final-form-domain-lm-vP",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable only the bulk LM that suppresses v_p on the free-fluid side when explicitly set.",
+    )
+    ap.add_argument(
+        "--final-form-domain-lm-vS",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable only the bulk LM that suppresses v_s on the free-fluid side when explicitly set.",
+    )
+    ap.add_argument(
+        "--final-form-domain-lm-p-pore",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable only the bulk LM that suppresses p_pore on the free-fluid side when explicitly set.",
+    )
+    ap.add_argument(
+        "--final-form-domain-lm-phi",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable only the bulk LM that suppresses phi-1 on the free-fluid side when explicitly set.",
+    )
+    ap.add_argument(
+        "--final-form-domain-lm-u",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable only the bulk LM that suppresses u on the free-fluid side when explicitly set.",
+    )
+    ap.add_argument(
+        "--final-form-domain-lm-vP-tie-vf",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "When the free-side vP bulk LM is enabled, enforce vP=v_f instead of vP=0 "
+            "in the free-fluid interior."
+        ),
+    )
+    ap.add_argument(
+        "--final-form-domain-lm-p-pore-tie-p",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "When the free-side p_pore bulk LM is enabled, enforce p_pore=p instead of p_pore=0 "
+            "in the free-fluid interior."
         ),
     )
     ap.add_argument(
@@ -1285,16 +1422,109 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     ap.add_argument(
+        "--final-form-domain-lm-free-weight-mode",
+        choices=("diffuse", "sharp16", "step_cutoff"),
+        default="diffuse",
+        help=(
+            "Membership weight used by free-side final_form bulk domain-LM constraints. "
+            "'diffuse' uses 1-alpha_support across the diffuse interface; 'sharp16' uses "
+            "(1-alpha_support)^16 so the LM acts only in the free-fluid interior; "
+            "'step_cutoff' uses the previous accepted alpha-state and a sharp cutoff so the "
+            "LM only acts in the deep free-fluid interior outside the diffuse band."
+        ),
+    )
+    ap.add_argument(
+        "--final-form-domain-lm-free-alpha-max",
+        type=float,
+        default=None,
+        help=(
+            "Maximum previous-step alpha_support at which free-side final_form bulk domain-LM "
+            "constraints remain active when --final-form-domain-lm-free-weight-mode=step_cutoff. "
+            "If omitted, reuse the internal-zero-dirichlet alpha_low cutoff when available, "
+            "otherwise fall back to --final-form-inactive-alpha-low."
+        ),
+    )
+    ap.add_argument(
         "--final-form-inactive-alpha-low",
         type=float,
         default=0.05,
         help="Low-alpha threshold for deactivating porous/support fields in final_form-inactive-domains mode.",
     )
     ap.add_argument(
+        "--final-form-support-inactive-alpha-low",
+        type=float,
+        default=None,
+        help=(
+            "Optional low-alpha threshold used only for support-family fields (phi, vS, u, etc.) in the "
+            "automatic free-side final_form closure. If omitted, the quasi-static no-direct branch uses a "
+            "wider internal support cutoff while Darcy-side fields keep --final-form-inactive-alpha-low."
+        ),
+    )
+    ap.add_argument(
         "--final-form-inactive-alpha-high",
         type=float,
         default=0.95,
         help="High-alpha threshold for deactivating free-fluid fields in final_form-inactive-domains mode.",
+    )
+    ap.add_argument(
+        "--final-form-internal-zero-dirichlet",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Strongly eliminate off-domain CG fields on the final_form branch by tagging DOFs whose full support "
+            "lies outside a user-chosen diffuse-interface band: v_f=0 on the porous side, vP=vS=u=0 on the "
+            "free-fluid side, and optionally phi=1 in the deep free-fluid interior. Pressure fields are not constrained."
+        ),
+    )
+    ap.add_argument(
+        "--final-form-internal-zero-dirichlet-distance-multiple",
+        type=float,
+        default=1.5,
+        help=(
+            "Distance-from-interface cutoff, in multiples of eps_alpha, used by "
+            "--final-form-internal-zero-dirichlet. DOFs are constrained only when their full support lies beyond "
+            "this diffuse-interface distance."
+        ),
+    )
+    ap.add_argument(
+        "--final-form-internal-zero-dirichlet-vf",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable only the internal zero-Dirichlet clamp on the free-fluid velocity inside the porous side.",
+    )
+    ap.add_argument(
+        "--final-form-internal-zero-dirichlet-vP",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable only the internal zero-Dirichlet clamp on vP inside the free-fluid side.",
+    )
+    ap.add_argument(
+        "--final-form-internal-zero-dirichlet-vS",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable only the internal zero-Dirichlet clamp on vS inside the free-fluid side.",
+    )
+    ap.add_argument(
+        "--final-form-internal-zero-dirichlet-u",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable only the internal zero-Dirichlet clamp on u inside the free-fluid side.",
+    )
+    ap.add_argument(
+        "--final-form-internal-zero-dirichlet-phi",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable only the internal Dirichlet clamp phi=1 inside the free-fluid side.",
+    )
+    ap.add_argument(
+        "--final-form-internal-zero-dirichlet-retag-mode",
+        type=str,
+        choices=("per_newton", "per_step"),
+        default="per_newton",
+        help=(
+            "When --final-form-internal-zero-dirichlet is enabled, retag constrained off-domain DOFs either "
+            "before every Newton iteration (per_newton) or only once after each accepted time step (per_step)."
+        ),
     )
     ap.add_argument("--phi-supg", type=float, default=0.0, help="SUPG stabilization for phi advection in full-model mode.")
     ap.add_argument(
@@ -2674,7 +2904,16 @@ def _parse_args() -> argparse.Namespace:
         default=str(here / "reference_profiles_fig6.csv"),
         help="Figure 6 reference CSV produced by extract_seboldt_fig6_reference.py",
     )
-    return ap.parse_args()
+    args = ap.parse_args()
+    args._phi_b_explicit = any(arg == "--phi-b" or arg.startswith("--phi-b=") for arg in raw_argv)
+    args._gamma_phi_explicit = any(arg == "--gamma-phi" or arg.startswith("--gamma-phi=") for arg in raw_argv)
+    args._gamma_v_explicit = any(arg == "--gamma-v" or arg.startswith("--gamma-v=") for arg in raw_argv)
+    args._gamma_p_explicit = any(arg == "--gamma-p" or arg.startswith("--gamma-p=") for arg in raw_argv)
+    args._gamma_vP_explicit = any(arg == "--gamma-vP" or arg.startswith("--gamma-vP=") for arg in raw_argv)
+    args._gamma_p_pore_explicit = any(
+        arg == "--gamma-p-pore" or arg.startswith("--gamma-p-pore=") for arg in raw_argv
+    )
+    return args
 
 
 def _configure_benchmark7_cpp_fuse_integrals(
@@ -2972,6 +3211,27 @@ def _startup_first_step_relaxed_accept_ginf(
     base_relaxed_accept_ginf: float = 0.0,
 ) -> float:
     relaxed = max(float(base_relaxed_accept_ginf), 2.0e-2)
+    if (
+        str(getattr(args, "one_domain_formulation", "")).strip().lower() == "final_form"
+        and bool(getattr(args, "final_form_constant_rho_s", False))
+        and bool(getattr(args, "final_form_quasistatic_porous_media", False))
+        and str(getattr(args, "transport_update_mode", "")).strip().lower() == "monolithic"
+        and not bool(getattr(args, "final_form_disable_pore_momentum", False))
+        and not bool(getattr(args, "final_form_disable_solid_momentum", False))
+        and not bool(getattr(args, "final_form_combined_porous_momentum", False))
+        and bool(getattr(args, "final_form_domain_lm_phi", False))
+        and bool(getattr(args, "final_form_domain_lm_p_pore", False))
+        and bool(getattr(args, "final_form_internal_zero_dirichlet", False))
+        and abs(float(getattr(args, "alpha_vS_gate_alpha0", 0.0) or 0.0)) <= 1.0e-12
+    ):
+        # On the cleaned quasi-static final_form branch, the frozen-transport
+        # nonlinear preconditioner can reach a stable identified manifold with
+        # |G| in the high-1e-2/low-1e-1 range, after which the exact
+        # bound-preserving line search may report zero feasible alpha because
+        # the candidate is already projection-limited on that manifold. Keep
+        # that materially improved first-step basin instead of forcing an
+        # unreducible dt cut.
+        relaxed = max(relaxed, 5.0e-2)
     # On the one-domain stored-support Seboldt branch, once the explicit BJS
     # over-constraint has been removed and only the scalar entry closure remains,
     # the restarted first-step PDAS solve often reaches a useful semismooth
@@ -3216,14 +3476,20 @@ def _benchmark7_block_schur_enabled(args: argparse.Namespace) -> bool:
 
 
 def _final_form_interface_lm_active_fields(problem: dict[str, object]) -> list[str]:
+    if bool(problem.get("final_form_direct_interface_transfer", False)):
+        return []
+    if bool(problem.get("final_form_disable_interface_physics", False)):
+        return []
     fields: list[str] = []
+    use_normal_multiplier = not bool(problem.get("final_form_disable_normal_interface", False))
     for name, key in (
         ("mu_mass", "mu_mass_k"),
-        ("mu_normal", "mu_normal_k"),
         ("mu_tangent", "mu_tangent_k"),
     ):
         if problem.get(key) is not None:
             fields.append(name)
+    if use_normal_multiplier and problem.get("mu_normal_k") is not None:
+        fields.append("mu_normal")
     if problem.get("mu_kin_k") is not None:
         fields.extend(["mu_kin_x", "mu_kin_y"])
     return fields
@@ -3566,7 +3832,7 @@ def _condition_balanced_solid_cutoff_y(
         return None
     if solid_dof_y_cut is not None:
         return float(solid_dof_y_cut)
-    return None
+    return float(y_interface)
 
 
 def _function_global_values(func, *, total_dofs: int) -> np.ndarray:
@@ -3761,6 +4027,8 @@ def _tag_inactive_fields_below_alpha(
     alpha_threshold: float | None,
     field_names: list[str] | tuple[str, ...] | None = None,
     alpha_state_key: str = "alpha_k",
+    tag_store_key: str = "_inactive_alpha_threshold_tagged_dofs",
+    record_prefix: str | None = "_inactive_alpha_threshold",
 ) -> dict[str, int]:
     if alpha_threshold is None:
         return {}
@@ -3769,7 +4037,7 @@ def _tag_inactive_fields_below_alpha(
         return {}
     dh = problem["dh"]
     mesh = problem["mesh"]
-    prev_tagged = set(int(d) for d in list(problem.get("_inactive_alpha_threshold_tagged_dofs", set()) or set()))
+    prev_tagged = set(int(d) for d in list(problem.get(str(tag_store_key), set()) or set()))
     inactive_base = set(int(d) for d in list(getattr(dh, "dof_tags", {}).get("inactive", set()) or set()))
     inactive_base.difference_update(prev_tagged)
     dh.dof_tags["inactive"] = inactive_base
@@ -3807,10 +4075,12 @@ def _tag_inactive_fields_below_alpha(
         selected_set = set(int(g) for g in selected)
         counts[field] = int(len(selected_set))
         selected_all.update(selected_set)
-    problem["_inactive_alpha_threshold"] = float(thr)
-    problem["_inactive_alpha_threshold_element_count"] = int(np.count_nonzero(elem_mask))
-    problem["_inactive_alpha_threshold_counts"] = dict(counts)
-    problem["_inactive_alpha_threshold_tagged_dofs"] = set(selected_all)
+    if record_prefix is not None:
+        prefix = str(record_prefix)
+        problem[f"{prefix}"] = float(thr)
+        problem[f"{prefix}_element_count"] = int(np.count_nonzero(elem_mask))
+        problem[f"{prefix}_counts"] = dict(counts)
+    problem[str(tag_store_key)] = set(selected_all)
     return counts
 
 
@@ -3865,6 +4135,199 @@ def _tag_inactive_fields_above_alpha(
     problem["_inactive_alpha_high_counts"] = dict(counts)
     problem["_inactive_alpha_high_tagged_dofs"] = set(selected_all)
     return counts
+
+
+def _retag_dof_tag_set(
+    dh: DofHandler,
+    *,
+    tag: str,
+    previous: set[int] | list[int] | tuple[int, ...] | None,
+) -> None:
+    existing = set(int(d) for d in list(getattr(dh, "dof_tags", {}).get(tag, set()) or set()))
+    existing.difference_update(int(d) for d in list(previous or set()))
+    if existing:
+        dh.dof_tags[tag] = existing
+    else:
+        getattr(dh, "dof_tags", {}).pop(tag, None)
+
+
+def _tag_final_form_internal_zero_dirichlet_dofs(
+    problem: dict[str, object],
+    *,
+    distance_multiple: float | None,
+    alpha_state_key: str = "alpha_k",
+) -> dict[str, dict[str, int] | float]:
+    dh = problem["dh"]
+    fluid_tag = _FINAL_FORM_INTERNAL_ZERO_FLUID_TAG
+    porous_tag = _FINAL_FORM_INTERNAL_ZERO_POROUS_TAG
+    targets = _resolve_final_form_internal_zero_dirichlet_targets(problem)
+    _retag_dof_tag_set(
+        dh,
+        tag=fluid_tag,
+        previous=set(problem.get("_final_form_internal_zero_fluid_tagged_dofs", set()) or set()),
+    )
+    _retag_dof_tag_set(
+        dh,
+        tag=porous_tag,
+        previous=set(problem.get("_final_form_internal_zero_porous_tagged_dofs", set()) or set()),
+    )
+
+    raw_mult = float(distance_multiple) if distance_multiple is not None else float("nan")
+    if (not bool(problem.get("final_form", False))) or (not np.isfinite(raw_mult)) or raw_mult < 0.0:
+        return {
+            "distance_multiple": float("nan"),
+            "alpha_low": float("nan"),
+            "alpha_high": float("nan"),
+            "fluid_counts": {},
+            "porous_counts": {},
+        }
+
+    alpha_func = problem.get(alpha_state_key) or problem.get("alpha_k") or problem.get("alpha_n")
+    if alpha_func is None or "alpha" not in getattr(dh, "field_names", ()):
+        return {
+            "distance_multiple": float(raw_mult),
+            "alpha_low": float("nan"),
+            "alpha_high": float("nan"),
+            "fluid_counts": {},
+            "porous_counts": {},
+        }
+
+    alpha_low, alpha_high = _alpha_cutoffs_for_distance_multiple(raw_mult)
+    fluid_fields, porous_zero_fields, porous_one_fields = _final_form_internal_zero_target_fields(
+        getattr(dh, "field_names", ()),
+        targets=targets,
+    )
+    porous_fields = tuple(list(porous_zero_fields) + list(porous_one_fields))
+
+    fluid_counts: dict[str, int] = {}
+    porous_counts: dict[str, int] = {}
+    fluid_tagged: set[int] = set()
+    porous_tagged: set[int] = set()
+    for field in fluid_fields:
+        cache = _build_field_point_eval_cache(problem, target_field=str(field))
+        alpha_vals, _ = _eval_scalar_with_grad_from_cache(problem, f_scalar=alpha_func, cache=cache)
+        field_ids = np.asarray(dh.get_field_slice(str(field)), dtype=int).ravel()
+        selected_set = set(int(g) for g in field_ids[np.asarray(alpha_vals, dtype=float) >= alpha_high])
+        if selected_set:
+            dh.dof_tags.setdefault(fluid_tag, set()).update(selected_set)
+        fluid_counts[field] = int(len(selected_set))
+        fluid_tagged.update(selected_set)
+    for field in porous_fields:
+        cache = _build_field_point_eval_cache(problem, target_field=str(field))
+        alpha_vals, _ = _eval_scalar_with_grad_from_cache(problem, f_scalar=alpha_func, cache=cache)
+        field_ids = np.asarray(dh.get_field_slice(str(field)), dtype=int).ravel()
+        selected_set = set(int(g) for g in field_ids[np.asarray(alpha_vals, dtype=float) <= alpha_low])
+        if selected_set:
+            dh.dof_tags.setdefault(porous_tag, set()).update(selected_set)
+        porous_counts[field] = int(len(selected_set))
+        porous_tagged.update(selected_set)
+
+    problem["_final_form_internal_zero_distance_multiple"] = float(raw_mult)
+    problem["_final_form_internal_zero_alpha_low"] = float(alpha_low)
+    problem["_final_form_internal_zero_alpha_high"] = float(alpha_high)
+    problem["_final_form_internal_zero_fluid_counts"] = dict(fluid_counts)
+    problem["_final_form_internal_zero_porous_counts"] = dict(porous_counts)
+    problem["_final_form_internal_zero_fluid_tagged_dofs"] = set(fluid_tagged)
+    problem["_final_form_internal_zero_porous_tagged_dofs"] = set(porous_tagged)
+    problem["_final_form_internal_zero_fluid_element_count"] = int(0)
+    problem["_final_form_internal_zero_porous_element_count"] = int(0)
+    info = {
+        "distance_multiple": float(raw_mult),
+        "alpha_low": float(alpha_low),
+        "alpha_high": float(alpha_high),
+        "targets": list(targets),
+        "fluid_counts": dict(fluid_counts),
+        "porous_counts": dict(porous_counts),
+    }
+    problem["_final_form_internal_zero_dirichlet_info"] = dict(info)
+    return info
+
+
+def _zero_tagged_internal_zero_dirichlet_state(problem: dict[str, object]) -> None:
+    fluid_tagged = np.asarray(
+        sorted(int(d) for d in list(problem.get("_final_form_internal_zero_fluid_tagged_dofs", set()) or set())),
+        dtype=int,
+    )
+    porous_tagged = np.asarray(
+        sorted(int(d) for d in list(problem.get("_final_form_internal_zero_porous_tagged_dofs", set()) or set())),
+        dtype=int,
+    )
+
+    def _set_on_function(func, gdofs: np.ndarray, value: float) -> None:
+        if func is None:
+            return
+        gd_arr = np.asarray(gdofs, dtype=int).ravel()
+        if gd_arr.size == 0:
+            return
+        func.set_nodal_values(gd_arr, np.full((gd_arr.size,), float(value), dtype=float))
+
+    for key in ("v_k", "v_n"):
+        _set_on_function(problem.get(key), fluid_tagged, 0.0)
+    for key in ("vP_k", "vP_n", "vS_k", "vS_n", "u_k", "u_n"):
+        _set_on_function(problem.get(key), porous_tagged, 0.0)
+    for key in ("phi_k", "phi_n"):
+        _set_on_function(problem.get(key), porous_tagged, 1.0)
+
+
+def _refresh_solver_final_form_internal_zero_dirichlet(
+    *,
+    problem: dict[str, object],
+    target_solver,
+    alpha_state_key: str = "alpha_k",
+) -> dict[str, dict[str, int] | float]:
+    info = _tag_final_form_internal_zero_dirichlet_dofs(
+        problem,
+        distance_multiple=problem.get("final_form_internal_zero_dirichlet_distance_multiple", None),
+        alpha_state_key=alpha_state_key,
+    )
+    _zero_tagged_internal_zero_dirichlet_state(problem)
+    signature = (
+        tuple(sorted(int(d) for d in list(problem.get("_final_form_internal_zero_fluid_tagged_dofs", set()) or set()))),
+        tuple(sorted(int(d) for d in list(problem.get("_final_form_internal_zero_porous_tagged_dofs", set()) or set()))),
+    )
+    if signature != getattr(target_solver, "_benchmark7_internal_zero_dirichlet_signature", None):
+        requested_fields = tuple(
+            str(name)
+            for name in tuple(getattr(target_solver, "_benchmark7_requested_active_fields", tuple()) or tuple())
+            if str(name).strip()
+        ) or None
+        target_solver.set_active_dofs(_solver_requested_active_dofs(target_solver, requested_fields))
+        block_refresh_cb = getattr(target_solver, "_benchmark7_refresh_block_linear_solver", None)
+        if callable(block_refresh_cb):
+            block_refresh_cb()
+        refresh_cb = getattr(target_solver, "_benchmark7_refresh_active_field_constraints", None)
+        if callable(refresh_cb):
+            refresh_cb()
+        target_solver._benchmark7_internal_zero_dirichlet_signature = signature
+    return info
+
+
+def _bind_solver_final_form_internal_zero_dirichlet(
+    *,
+    problem: dict[str, object],
+    target_solver,
+) -> None:
+    if not bool(problem.get("final_form_internal_zero_dirichlet", False)):
+        return
+    retag_mode = _final_form_internal_zero_retag_mode(problem)
+    base_pre_cb = getattr(target_solver, "pre_cb", None)
+    target_solver._benchmark7_internal_zero_dirichlet_signature = (
+        tuple(sorted(int(d) for d in list(problem.get("_final_form_internal_zero_fluid_tagged_dofs", set()) or set()))),
+        tuple(sorted(int(d) for d in list(problem.get("_final_form_internal_zero_porous_tagged_dofs", set()) or set()))),
+    )
+    if retag_mode != "per_newton":
+        return
+
+    def _wrapped_pre_cb(funcs) -> None:
+        if callable(base_pre_cb):
+            base_pre_cb(funcs)
+        _refresh_solver_final_form_internal_zero_dirichlet(
+            problem=problem,
+            target_solver=target_solver,
+            alpha_state_key="alpha_k",
+        )
+
+    target_solver.pre_cb = _wrapped_pre_cb
 
 
 def _solver_requested_active_dofs(target_solver, requested_fields: tuple[str, ...] | None) -> np.ndarray:
@@ -3946,7 +4409,70 @@ def _primary_darcy_field_names(problem: dict[str, object]) -> list[str]:
     return []
 
 
-def _final_form_domain_lm_active_fields(problem: dict[str, object]) -> list[str]:
+def _resolve_final_form_domain_lm_targets(
+    *,
+    enabled: bool = False,
+    vf: bool | None = None,
+    p: bool | None = None,
+    vP: bool | None = None,
+    vS: bool | None = None,
+    p_pore: bool | None = None,
+    phi: bool | None = None,
+    u: bool | None = None,
+) -> tuple[dict[str, bool], bool]:
+    overrides = {
+        "vf": vf,
+        "p": p,
+        "vP": vP,
+        "vS": vS,
+        "p_pore": p_pore,
+        "phi": phi,
+        "u": u,
+    }
+    explicit_subset = any(value is not None for value in overrides.values())
+    default_on = bool(enabled) and not explicit_subset
+    targets = {
+        "vf": default_on,
+        "p": default_on,
+        "vP": default_on,
+        "vS": default_on,
+        "p_pore": default_on,
+        "phi": default_on,
+        "u": default_on,
+    }
+    for name, value in overrides.items():
+        if value is not None:
+            targets[name] = bool(value)
+    return targets, any(targets.values())
+
+
+def _apply_final_form_domain_lm_selection(args: argparse.Namespace) -> argparse.Namespace:
+    targets, enabled = _resolve_final_form_domain_lm_targets(
+        enabled=bool(getattr(args, "final_form_domain_lm", False)),
+        vf=getattr(args, "final_form_domain_lm_vf", None),
+        p=getattr(args, "final_form_domain_lm_p", None),
+        vP=getattr(args, "final_form_domain_lm_vP", None),
+        vS=getattr(args, "final_form_domain_lm_vS", None),
+        p_pore=getattr(args, "final_form_domain_lm_p_pore", None),
+        phi=getattr(args, "final_form_domain_lm_phi", None),
+        u=getattr(args, "final_form_domain_lm_u", None),
+    )
+    args.final_form_domain_lm = bool(enabled)
+    args.final_form_domain_lm_vf = bool(targets["vf"])
+    args.final_form_domain_lm_p = bool(targets["p"])
+    args.final_form_domain_lm_vP = bool(targets["vP"])
+    args.final_form_domain_lm_vS = bool(targets["vS"])
+    args.final_form_domain_lm_p_pore = bool(targets["p_pore"])
+    args.final_form_domain_lm_phi = bool(targets["phi"])
+    args.final_form_domain_lm_u = bool(targets["u"])
+    return args
+
+
+def _final_form_domain_lm_active_fields(
+    problem: dict[str, object],
+    *,
+    include_phi_lm: bool = True,
+) -> list[str]:
     if not bool(problem.get("final_form_domain_lm", False)):
         return []
     fields: list[str] = []
@@ -3959,6 +4485,8 @@ def _final_form_domain_lm_active_fields(problem: dict[str, object]) -> list[str]
         (("lm_phi",), "lm_phi_k"),
         (("lm_u_x", "lm_u_y"), "lm_u_k"),
     ):
+        if key == "lm_phi_k" and not bool(include_phi_lm):
+            continue
         if problem.get(key) is not None:
             fields.extend(list(names))
     return fields
@@ -4034,18 +4562,42 @@ def _final_form_constant_rho_s(problem: dict[str, object]) -> bool:
     return bool(problem.get("final_form_constant_rho_s", False))
 
 
+def _final_form_direct_interface_transfer_enabled(args) -> bool:
+    return bool(
+        bool(getattr(args, "final_form_quasistatic_porous_media", False))
+        if getattr(args, "final_form_direct_interface_transfer", None) is None
+        else bool(getattr(args, "final_form_direct_interface_transfer", False))
+    )
+
+
+def _final_form_phi_is_algebraic(problem: dict[str, object]) -> bool:
+    return bool(problem.get("final_form", False)) and (
+        _final_form_phi_mode_key(problem.get("final_form_phi_mode", "auto")) == "alpha_closure"
+    )
+
+
 def _post_accept_lag_phi_in_main(problem: dict[str, object]) -> bool:
     if not bool(problem.get("final_form", False)):
         return True
+    override = problem.get("final_form_lag_phi_in_main", None)
+    if override is not None:
+        return bool(override)
+    if _final_form_phi_is_algebraic(problem):
+        return True
     # On the constant-density final_form branch the post_accept split is the
     # only robust path. Keeping phi active in the main flow/solid Newton solve
-    # leaves the exact step dominated by the coupled (vP, phi) block, while the
+    # leaves the exact step dominated by the coupled transport block, while the
     # accepted-step transport update is already responsible for restoring the
     # bounded transport state. Lag phi consistently there and update it together
-    # with alpha after the mechanics step accepts.
+    # with alpha after the mechanics step accepts unless the caller explicitly
+    # requests otherwise.
     if _final_form_constant_rho_s(problem):
         return True
     return False
+
+
+def _post_accept_transport_include_phi(problem: dict[str, object]) -> bool:
+    return bool(_post_accept_lag_phi_in_main(problem) and not _final_form_phi_is_algebraic(problem))
 
 
 def _solid_only_diagnostic_active_fields(problem: dict[str, object]) -> list[str]:
@@ -4187,6 +4739,42 @@ def _should_use_staggered_predictor_after_large_step(
     return delta_val >= float(threshold)
 
 
+def _predictor_reset_is_multiplier_like_field(name: str) -> bool:
+    key = str(name or "").strip()
+    if not key:
+        return False
+    if key.startswith("lm_") or key.startswith("mu_"):
+        return True
+    if key.endswith("_lm") or key == "p_mean":
+        return True
+    return False
+
+
+def _predictor_reset_delta_inf(
+    *,
+    funcs,
+    prev_funcs,
+) -> tuple[float | None, float | None]:
+    raw_max: float | None = None
+    filtered_max: float | None = None
+    for f, f_prev in zip(list(funcs or []), list(prev_funcs or [])):
+        try:
+            name = str(getattr(f, "name", "") or "")
+            delta = np.asarray(f.nodal_values, dtype=float) - np.asarray(f_prev.nodal_values, dtype=float)
+            delta_inf = float(np.linalg.norm(np.ravel(delta), ord=np.inf))
+        except Exception:
+            continue
+        if not np.isfinite(delta_inf):
+            continue
+        raw_max = delta_inf if raw_max is None else max(float(raw_max), float(delta_inf))
+        if _predictor_reset_is_multiplier_like_field(name):
+            continue
+        filtered_max = delta_inf if filtered_max is None else max(float(filtered_max), float(delta_inf))
+    if filtered_max is None:
+        filtered_max = raw_max
+    return filtered_max, raw_max
+
+
 def _should_use_frozen_transport_restart(
     *,
     enable_phi_evolution: bool,
@@ -4252,12 +4840,22 @@ def _benchmark7_requires_constrained_solver(args: argparse.Namespace) -> bool:
 
 
 def _normalize_benchmark7_solver_choice(args: argparse.Namespace) -> argparse.Namespace:
+    args = _apply_final_form_domain_lm_selection(args)
     solver_key = str(getattr(args, "nonlinear_solver", "pdas")).strip().lower()
     if _final_form_enabled(args):
         final_form_phi_mode_key = _final_form_phi_mode_key(getattr(args, "final_form_phi_mode", "auto"))
         if final_form_phi_mode_key == "auto":
-            print("[info] forcing final_form_phi_mode=transport on one_domain_formulation=final_form.")
-            args.final_form_phi_mode = "transport"
+            if bool(getattr(args, "final_form_quasistatic_porous_media", False)):
+                print(
+                    "[info] forcing final_form_phi_mode=alpha_closure on the quasi-static final_form branch: "
+                    "Seboldt Example 2 is a Biot-style quasi-static benchmark, so the automatic mode keeps "
+                    "phi slaved to the support closure instead of activating the transported-phi branch."
+                )
+                args.final_form_phi_mode = "alpha_closure"
+            else:
+                print("[info] forcing final_form_phi_mode=transport on one_domain_formulation=final_form.")
+                args.final_form_phi_mode = "transport"
+        final_form_phi_mode_key = _final_form_phi_mode_key(getattr(args, "final_form_phi_mode", "auto"))
         if not bool(getattr(args, "enable_phi_evolution", False)):
             print("[info] enabling enable_phi_evolution for one_domain_formulation=final_form.")
             args.enable_phi_evolution = True
@@ -4304,10 +4902,23 @@ def _normalize_benchmark7_solver_choice(args: argparse.Namespace) -> argparse.Na
         if bool(getattr(args, "startup_bootstrap", False)):
             print("[info] disabling startup_bootstrap on one_domain_formulation=final_form.")
             args.startup_bootstrap = False
-        if bool(getattr(args, "final_form_domain_lm", False)) and bool(getattr(args, "predictor_corrector_startup", False)):
+        disable_pc_startup_on_final_form = bool(getattr(args, "final_form_domain_lm", False))
+        if (
+            (not disable_pc_startup_on_final_form)
+            and bool(getattr(args, "final_form_quasistatic_porous_media", False))
+            and bool(_use_post_accept_transport_update(args))
+            and (not bool(_final_form_direct_interface_transfer_enabled(args)))
+        ):
+            # On the explicit quasi-static interface branch the main step is
+            # intentionally a PDAS-reduced mechanics/interface solve with
+            # transport lagged out. Keeping the predictor-corrector P2 startup
+            # here front-runs that branch with an expensive continuation that
+            # can stall before the actual interface law is exercised.
+            disable_pc_startup_on_final_form = True
+        if disable_pc_startup_on_final_form and bool(getattr(args, "predictor_corrector_startup", False)):
             print(
-                "[info] disabling predictor_corrector_startup on one_domain_formulation=final_form with "
-                "final_form_domain_lm so the constrained PDAS mixed step is used directly."
+                "[info] disabling predictor_corrector_startup on one_domain_formulation=final_form so the "
+                "constrained PDAS mixed step is used directly on this branch."
             )
             args.predictor_corrector_startup = False
         elif bool(getattr(args, "predictor_corrector_startup", False)):
@@ -4316,8 +4927,10 @@ def _normalize_benchmark7_solver_choice(args: argparse.Namespace) -> argparse.Na
                 "the P2 continuation can relax the normal interface law before the exact corrector."
             )
         if bool(getattr(args, "stall_frozen_transport_restart", False)):
-            print("[info] disabling stall_frozen_transport_restart on one_domain_formulation=final_form.")
-            args.stall_frozen_transport_restart = False
+            print(
+                "[info] keeping stall_frozen_transport_restart on one_domain_formulation=final_form so "
+                "stalled monolithic solves can use the frozen-transport nonlinear preconditioner."
+            )
         transport_mode_key = _transport_update_mode_key(getattr(args, "transport_update_mode", "auto"))
         if transport_mode_key == "auto":
             if bool(getattr(args, "final_form_constant_rho_s", False)):
@@ -4340,22 +4953,25 @@ def _normalize_benchmark7_solver_choice(args: argparse.Namespace) -> argparse.Na
                 print("[info] enabling phi_box_constraints on one_domain_formulation=final_form for constrained solve.")
                 args.phi_box_constraints = True
         if bool(getattr(args, "final_form_constant_rho_s", False)):
-            if float(getattr(args, "gamma_phi", 0.0)) == 0.0:
+            if float(getattr(args, "gamma_phi", 0.0)) == 0.0 and not bool(getattr(args, "_gamma_phi_explicit", False)):
                 print("[info] enabling gamma_phi=1 on constant-density final_form to drive phi->1 on the free-fluid side.")
                 args.gamma_phi = 1.0
-            if float(getattr(args, "gamma_v", 0.0)) == 0.0:
+            if float(getattr(args, "gamma_v", 0.0)) == 0.0 and not bool(getattr(args, "_gamma_v_explicit", False)):
                 print("[info] enabling gamma_v=1 on constant-density final_form to neutralize free-fluid velocity inside the support.")
                 args.gamma_v = 1.0
-            if float(getattr(args, "gamma_p", 0.0)) == 0.0:
+            if float(getattr(args, "gamma_p", 0.0)) == 0.0 and not bool(getattr(args, "_gamma_p_explicit", False)):
                 print("[info] enabling gamma_p=1 on constant-density final_form to neutralize free-fluid pressure inside the support.")
                 args.gamma_p = 1.0
-            if float(getattr(args, "gamma_vP", 0.0)) == 0.0:
+            if float(getattr(args, "gamma_vP", 0.0)) == 0.0 and not bool(getattr(args, "_gamma_vP_explicit", False)):
                 print("[info] enabling gamma_vP=1 on constant-density final_form to neutralize pore velocity in the free-fluid region.")
                 args.gamma_vP = 1.0
-            if float(getattr(args, "gamma_p_pore", 0.0)) == 0.0:
+            if float(getattr(args, "gamma_p_pore", 0.0)) == 0.0 and not bool(getattr(args, "_gamma_p_pore_explicit", False)):
                 print("[info] enabling gamma_p_pore=1 on constant-density final_form to neutralize pore pressure in the free-fluid region.")
                 args.gamma_p_pore = 1.0
-            if abs(float(getattr(args, "phi_b", 0.18)) - 0.18) < 1.0e-12:
+            if (
+                not bool(getattr(args, "_phi_b_explicit", False))
+                and abs(float(getattr(args, "phi_b", 0.18)) - 0.18) < 1.0e-12
+            ):
                 print("[info] promoting phi_b from the legacy default 0.18 to 0.30 on constant-density final_form startup.")
                 args.phi_b = 0.30
     ratio_free_full_state = _full_ratio_free_state_enabled(args)
@@ -5388,6 +6004,108 @@ def _alpha_equilibrium(y: np.ndarray, *, y_interface: float, eps_alpha: float) -
     return 0.5 * (1.0 + np.tanh((yy - float(y_interface)) / (math.sqrt(2.0) * eps)))
 
 
+_FINAL_FORM_INTERNAL_ZERO_FLUID_TAG = "final_form_internal_zero_fluid"
+_FINAL_FORM_INTERNAL_ZERO_POROUS_TAG = "final_form_internal_zero_porous"
+_FINAL_FORM_INTERNAL_ZERO_TARGET_FIELDS: dict[str, tuple[str, ...]] = {
+    "vf": ("v_x", "v_y"),
+    "vP": ("vP_x", "vP_y"),
+    "vS": ("vS_x", "vS_y"),
+    "u": ("u_x", "u_y"),
+    "phi": ("phi",),
+}
+_FINAL_FORM_INTERNAL_ZERO_DEFAULT_TARGETS: tuple[str, ...] = ("vf", "vP", "vS", "u")
+
+
+def _alpha_cutoffs_for_distance_multiple(distance_multiple: float) -> tuple[float, float]:
+    mult = max(float(distance_multiple), 0.0)
+    arg = mult / math.sqrt(2.0)
+    alpha_low = 0.5 * (1.0 - math.tanh(arg))
+    alpha_high = 0.5 * (1.0 + math.tanh(arg))
+    return float(alpha_low), float(alpha_high)
+
+
+def _resolve_final_form_internal_zero_dirichlet_targets(config: object) -> tuple[str, ...]:
+    target_order = tuple(_FINAL_FORM_INTERNAL_ZERO_TARGET_FIELDS)
+    direct = config.get("final_form_internal_zero_dirichlet_targets", None) if isinstance(config, dict) else getattr(
+        config,
+        "final_form_internal_zero_dirichlet_targets",
+        None,
+    )
+    if direct is not None:
+        selected = tuple(str(name) for name in tuple(direct or tuple()) if str(name).strip())
+        if not selected:
+            raise ValueError(
+                "final_form_internal_zero_dirichlet requires at least one target field family "
+                "(vf, vP, vS, u, phi)."
+            )
+        invalid = [name for name in selected if name not in target_order]
+        if invalid:
+            raise ValueError(
+                f"Unsupported final_form_internal_zero_dirichlet_targets={tuple(invalid)!r}. "
+                f"Supported targets are {target_order}."
+            )
+        return tuple(target for target in target_order if target in selected)
+    explicit: dict[str, bool] = {}
+    for target in target_order:
+        key = f"final_form_internal_zero_dirichlet_{target}"
+        value = config.get(key, None) if isinstance(config, dict) else getattr(config, key, None)
+        if value is not None:
+            explicit[target] = bool(value)
+    if explicit:
+        selected = tuple(target for target in target_order if bool(explicit.get(target, False)))
+    else:
+        selected = tuple(target for target in _FINAL_FORM_INTERNAL_ZERO_DEFAULT_TARGETS if target in target_order)
+    if not selected:
+        raise ValueError(
+            "final_form_internal_zero_dirichlet requires at least one target field family "
+            "(vf, vP, vS, u, phi)."
+        )
+    return selected
+
+
+def _final_form_internal_zero_retag_mode(config: object) -> str:
+    raw = config.get("final_form_internal_zero_dirichlet_retag_mode", "per_newton") if isinstance(config, dict) else getattr(
+        config,
+        "final_form_internal_zero_dirichlet_retag_mode",
+        "per_newton",
+    )
+    mode = str(raw or "per_newton").strip().lower().replace("-", "_")
+    if mode not in {"per_newton", "per_step"}:
+        raise ValueError(
+            f"Unsupported final_form_internal_zero_dirichlet_retag_mode={raw!r}. "
+            "Use 'per_newton' or 'per_step'."
+        )
+    return mode
+
+
+def _final_form_internal_zero_target_fields(
+    available_fields: Collection[str],
+    *,
+    targets: Collection[str],
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    selected = {str(name).strip() for name in tuple(targets or tuple()) if str(name).strip()}
+    fluid_fields: list[str] = []
+    if "vf" in selected:
+        if "v_x" in available_fields:
+            fluid_fields.extend(["v_x", "v_y"])
+        elif "v" in available_fields:
+            raise ValueError(
+                "final_form_internal_zero_dirichlet currently requires CG fluid velocity fields; "
+                "H(div) fluid_space is not supported."
+            )
+    porous_zero_fields: list[str] = []
+    for target in ("vP", "vS", "u"):
+        if target not in selected:
+            continue
+        for field in _FINAL_FORM_INTERNAL_ZERO_TARGET_FIELDS[target]:
+            if field in available_fields:
+                porous_zero_fields.append(field)
+    porous_one_fields: list[str] = []
+    if "phi" in selected and "phi" in available_fields:
+        porous_one_fields.append("phi")
+    return tuple(fluid_fields), tuple(porous_zero_fields), tuple(porous_one_fields)
+
+
 def _smoothstep01_array(values: np.ndarray) -> np.ndarray:
     vv = np.clip(np.asarray(values, dtype=float), 0.0, 1.0)
     return vv * vv * (3.0 - (2.0 * vv))
@@ -6309,6 +7027,8 @@ def _compute_interface_probe_diagnostics(
         porous_mix_n = vS_n + q_n
         mass_flux_jump_n = v_n - porous_mix_n
         free_flux_n = v_n
+        mass_transfer_target_q_n = v_n - vS_n
+        mass_transfer_residual_n = q_n - mass_transfer_target_q_n
     else:
         q_vec_vals = P_vals[:, None] * rel
         q_n = P_vals * rel_n
@@ -6635,6 +7355,12 @@ def _compute_interface_probe_diagnostics(
             prefix="free_fluid_alpha_lt_0p25_p_pore_support",
         )
     )
+    porous_support_cutoff = 0.75
+    porous_support_mask = np.isfinite(alpha_vals) & (alpha_vals > porous_support_cutoff)
+    summary["porous_support_alpha_cutoff"] = float(porous_support_cutoff)
+    summary["porous_support_alpha_gt_0p75_point_count"] = float(np.count_nonzero(porous_support_mask))
+    summary.update(_masked_abs_summary(v_vals, porous_support_mask, prefix="porous_support_alpha_gt_0p75_v_mag"))
+    summary.update(_masked_abs_summary(p_vals, porous_support_mask, prefix="porous_support_alpha_gt_0p75_p"))
     if np.any(band_mask):
         band_p = np.asarray(p_vals[band_mask], dtype=float)
         band_p_pore = np.asarray(p_pore_vals[band_mask], dtype=float)
@@ -7012,8 +7738,26 @@ def _create_problem(
     final_form_phi_mode: str = "auto",
     final_form_implementation: str = "tensor",
     final_form_constant_rho_s: bool = False,
+    final_form_lag_phi_in_main: bool | None = None,
     final_form_domain_lm: bool = False,
+    final_form_domain_lm_vf: bool | None = None,
+    final_form_domain_lm_p: bool | None = None,
+    final_form_domain_lm_vP: bool | None = None,
+    final_form_domain_lm_vS: bool | None = None,
+    final_form_domain_lm_p_pore: bool | None = None,
+    final_form_domain_lm_phi: bool | None = None,
+    final_form_domain_lm_u: bool | None = None,
+    final_form_domain_lm_vP_tie_vf: bool = False,
+    final_form_domain_lm_p_pore_tie_p: bool = False,
+    final_form_quasistatic_porous_media: bool = False,
+    final_form_quasistatic_flip_pore_stress_sign: bool = False,
+    final_form_direct_interface_transfer: bool | None = None,
+    final_form_disable_pore_momentum: bool = False,
+    final_form_disable_solid_momentum: bool = False,
+    final_form_combined_porous_momentum: bool = False,
     final_form_domain_lm_aug_gamma: float = 10.0,
+    final_form_domain_lm_free_weight_mode: str = "diffuse",
+    final_form_domain_lm_free_alpha_max: float | None = None,
     final_form_mass_lm_aug_gamma: float = 1.0,
     final_form_normal_lm_aug_gamma: float = 1.0,
     y_interface: float = 1.0,
@@ -7025,6 +7769,16 @@ def _create_problem(
     formulation_key = str(one_domain_formulation or "legacy").strip().lower().replace("-", "_")
     use_final_form = formulation_key == "final_form"
     use_final_form_constant_rho_s = bool(use_final_form) and bool(final_form_constant_rho_s)
+    final_form_domain_lm_targets, final_form_domain_lm = _resolve_final_form_domain_lm_targets(
+        enabled=bool(use_final_form) and bool(final_form_domain_lm),
+        vf=final_form_domain_lm_vf,
+        p=final_form_domain_lm_p,
+        vP=final_form_domain_lm_vP,
+        vS=final_form_domain_lm_vS,
+        p_pore=final_form_domain_lm_p_pore,
+        phi=final_form_domain_lm_phi,
+        u=final_form_domain_lm_u,
+    )
     fluid_space_key = str(fluid_space).strip().lower()
     if fluid_space_key not in {"cg", "hdiv"}:
         raise ValueError(f"Unsupported fluid_space={fluid_space!r}.")
@@ -7104,17 +7858,33 @@ def _create_problem(
                 "mu_kin_y": ("DG", 0),
                 **(
                     {
-                        "lm_vf_x": ("DG", 0),
-                        "lm_vf_y": ("DG", 0),
-                        "lm_p": ("DG", 0),
-                        "lm_vP_x": ("DG", 0),
-                        "lm_vP_y": ("DG", 0),
-                        "lm_vS_x": ("DG", 0),
-                        "lm_vS_y": ("DG", 0),
-                        "lm_p_pore": ("DG", 0),
-                        "lm_phi": ("DG", 0),
-                        "lm_u_x": ("DG", 0),
-                        "lm_u_y": ("DG", 0),
+                        **(
+                            {"lm_vf_x": ("DG", 0), "lm_vf_y": ("DG", 0)}
+                            if bool(final_form_domain_lm_targets["vf"])
+                            else {}
+                        ),
+                        **({"lm_p": ("DG", 0)} if bool(final_form_domain_lm_targets["p"]) else {}),
+                        **(
+                            {"lm_vP_x": ("DG", 0), "lm_vP_y": ("DG", 0)}
+                            if bool(final_form_domain_lm_targets["vP"])
+                            else {}
+                        ),
+                        **(
+                            {"lm_vS_x": ("DG", 0), "lm_vS_y": ("DG", 0)}
+                            if bool(final_form_domain_lm_targets["vS"])
+                            else {}
+                        ),
+                        **(
+                            {"lm_p_pore": ("DG", 0)}
+                            if bool(final_form_domain_lm_targets["p_pore"])
+                            else {}
+                        ),
+                        **({"lm_phi": ("DG", 0)} if bool(final_form_domain_lm_targets["phi"]) else {}),
+                        **(
+                            {"lm_u_x": ("DG", 0), "lm_u_y": ("DG", 0)}
+                            if bool(final_form_domain_lm_targets["u"])
+                            else {}
+                        ),
                     }
                     if bool(final_form_domain_lm)
                     else {}
@@ -7161,22 +7931,22 @@ def _create_problem(
     MU_KIN = FunctionSpace("MU_KIN", ["mu_kin_x", "mu_kin_y"], dim=1) if bool(use_final_form) else None
     LM_VF = (
         FunctionSpace("LM_VF", ["lm_vf_x", "lm_vf_y"], dim=1)
-        if bool(use_final_form) and bool(final_form_domain_lm)
+        if ("lm_vf_x" in field_specs and "lm_vf_y" in field_specs)
         else None
     )
     LM_VP = (
         FunctionSpace("LM_VP", ["lm_vP_x", "lm_vP_y"], dim=1)
-        if bool(use_final_form) and bool(final_form_domain_lm)
+        if ("lm_vP_x" in field_specs and "lm_vP_y" in field_specs)
         else None
     )
     LM_VS = (
         FunctionSpace("LM_VS", ["lm_vS_x", "lm_vS_y"], dim=1)
-        if bool(use_final_form) and bool(final_form_domain_lm)
+        if ("lm_vS_x" in field_specs and "lm_vS_y" in field_specs)
         else None
     )
     LM_U = (
         FunctionSpace("LM_U", ["lm_u_x", "lm_u_y"], dim=1)
-        if bool(use_final_form) and bool(final_form_domain_lm)
+        if ("lm_u_x" in field_specs and "lm_u_y" in field_specs)
         else None
     )
     lambda_drag_space = None
@@ -7383,8 +8153,34 @@ def _create_problem(
         "final_form_phi_mode": _final_form_phi_mode_key(final_form_phi_mode),
         "final_form_implementation": _final_form_implementation_key(final_form_implementation),
         "final_form_constant_rho_s": bool(use_final_form_constant_rho_s),
+        "final_form_lag_phi_in_main": (
+            None if final_form_lag_phi_in_main is None else bool(final_form_lag_phi_in_main)
+        ),
+        "final_form_quasistatic_porous_media": bool(use_final_form) and bool(final_form_quasistatic_porous_media),
+        "final_form_direct_interface_transfer": bool(use_final_form)
+        and (
+            bool(final_form_quasistatic_porous_media)
+            if final_form_direct_interface_transfer is None
+            else bool(final_form_direct_interface_transfer)
+        ),
+        "final_form_disable_pore_momentum": bool(use_final_form) and bool(final_form_disable_pore_momentum),
+        "final_form_disable_solid_momentum": bool(use_final_form) and bool(final_form_disable_solid_momentum),
+        "final_form_combined_porous_momentum": bool(use_final_form) and bool(final_form_combined_porous_momentum),
         "final_form_domain_lm": bool(use_final_form) and bool(final_form_domain_lm),
+        "final_form_domain_lm_vf": bool(use_final_form) and bool(final_form_domain_lm_targets["vf"]),
+        "final_form_domain_lm_p": bool(use_final_form) and bool(final_form_domain_lm_targets["p"]),
+        "final_form_domain_lm_vP": bool(use_final_form) and bool(final_form_domain_lm_targets["vP"]),
+        "final_form_domain_lm_vS": bool(use_final_form) and bool(final_form_domain_lm_targets["vS"]),
+        "final_form_domain_lm_p_pore": bool(use_final_form) and bool(final_form_domain_lm_targets["p_pore"]),
+        "final_form_domain_lm_phi": bool(use_final_form) and bool(final_form_domain_lm_targets["phi"]),
+        "final_form_domain_lm_u": bool(use_final_form) and bool(final_form_domain_lm_targets["u"]),
+        "final_form_domain_lm_vP_tie_vf": bool(use_final_form) and bool(final_form_domain_lm_vP_tie_vf),
+        "final_form_domain_lm_p_pore_tie_p": bool(use_final_form) and bool(final_form_domain_lm_p_pore_tie_p),
         "final_form_domain_lm_aug_gamma": float(final_form_domain_lm_aug_gamma),
+        "final_form_domain_lm_free_weight_mode": str(final_form_domain_lm_free_weight_mode),
+        "final_form_domain_lm_free_alpha_max": (
+            None if final_form_domain_lm_free_alpha_max is None else float(final_form_domain_lm_free_alpha_max)
+        ),
         "final_form_mass_lm_aug_gamma": float(final_form_mass_lm_aug_gamma),
         "final_form_normal_lm_aug_gamma": float(final_form_normal_lm_aug_gamma),
         "enable_phi_evolution": bool(enable_phi_evolution),
@@ -7557,24 +8353,34 @@ def _build_forms(
     D_phi: float,
     phi_diffusion_weight: str,
     gamma_phi: float,
-    gamma_v: float,
-    v_extension_mode: str,
-    gamma_v_pin: float,
-    gamma_p: float,
-    p_extension_mode: str,
-    gamma_p_pin: float,
-    gamma_vP: float,
-    vP_extension_mode: str,
-    gamma_vP_pin: float,
-    gamma_p_pore: float,
-    p_pore_extension_mode: str,
-    gamma_p_pore_pin: float,
-    gamma_rho_s: float,
-    rho_s_extension_mode: str,
-    gamma_rho_s_pin: float,
+    gamma_v: float = 0.0,
+    v_extension_mode: str = "h1",
+    gamma_v_pin: float = 0.0,
+    gamma_p: float = 0.0,
+    p_extension_mode: str = "h1",
+    gamma_p_pin: float = 0.0,
+    gamma_vP: float = 0.0,
+    vP_extension_mode: str = "h1",
+    gamma_vP_pin: float = 0.0,
+    gamma_p_pore: float = 0.0,
+    p_pore_extension_mode: str = "h1",
+    gamma_p_pore_pin: float = 0.0,
+    gamma_rho_s: float = 0.0,
+    rho_s_extension_mode: str = "h1",
+    gamma_rho_s_pin: float = 0.0,
     final_form_constant_rho_s: bool = False,
     final_form_domain_lm: bool = False,
+    final_form_domain_lm_vP_tie_vf: bool = False,
+    final_form_domain_lm_p_pore_tie_p: bool = False,
+    final_form_quasistatic_porous_media: bool = False,
+    final_form_quasistatic_flip_pore_stress_sign: bool = False,
+    final_form_direct_interface_transfer: bool | None = None,
+    final_form_disable_pore_momentum: bool = False,
+    final_form_disable_solid_momentum: bool = False,
+    final_form_combined_porous_momentum: bool = False,
     final_form_domain_lm_aug_gamma: float = 10.0,
+    final_form_domain_lm_free_weight_mode: str = "diffuse",
+    final_form_domain_lm_free_alpha_max: float | None = None,
     final_form_mass_lm_aug_gamma: float = 1.0,
     final_form_normal_lm_aug_gamma: float = 1.0,
     phi_supg: float,
@@ -7711,6 +8517,22 @@ def _build_forms(
         problem["final_form_normal_interface_weight_c"] = final_form_normal_interface_weight_c
     problem["final_form_disable_interface_physics"] = bool(final_form_disable_interface_physics)
     problem["final_form_disable_normal_interface"] = bool(final_form_disable_normal_interface)
+    final_form_domain_lm = bool(problem.get("final_form_domain_lm", final_form_domain_lm))
+    final_form_quasistatic_porous_media = bool(
+        problem.get("final_form_quasistatic_porous_media", final_form_quasistatic_porous_media)
+    )
+    final_form_direct_interface_transfer = bool(
+        problem.get("final_form_direct_interface_transfer", final_form_direct_interface_transfer)
+    )
+    final_form_disable_pore_momentum = bool(
+        problem.get("final_form_disable_pore_momentum", final_form_disable_pore_momentum)
+    )
+    final_form_disable_solid_momentum = bool(
+        problem.get("final_form_disable_solid_momentum", final_form_disable_solid_momentum)
+    )
+    final_form_combined_porous_momentum = bool(
+        problem.get("final_form_combined_porous_momentum", final_form_combined_porous_momentum)
+    )
     solid_model_key = _benchmark7_solid_model_key(solid_model)
     reduced_support_uses_B = _reduced_support_uses_B(
         enable_phi_evolution=bool(enable_phi_evolution),
@@ -7720,6 +8542,15 @@ def _build_forms(
             else reduced_support_state
         ),
     )
+    support_physics_problem = (
+        str(problem.get("support_physics", "")).strip()
+        if isinstance(problem, dict)
+        else ""
+    )
+    support_physics_eff = str(support_physics_problem or support_physics).strip()
+    alpha_advect_with_eff = str(alpha_advect_with)
+    alpha_advection_form_eff = str(alpha_advection_form)
+    problem["support_physics"] = str(support_physics_eff)
     use_ratio_free_full_state = bool(problem.get("full_ratio_free_state", full_ratio_free_state))
     use_primary_darcy_flux = bool(
         problem.get(
@@ -7809,6 +8640,18 @@ def _build_forms(
     mu_s_c = _named_constant("b7_mu_s", float(mu_s))
     lambda_s_c = _named_constant("b7_lambda_s", float(lambda_s))
     rho_s0_tilde_c = _named_constant("b7_rho_s0_tilde", float(rho_s0_tilde))
+    final_form_domain_lm_free_alpha_max_eff = final_form_domain_lm_free_alpha_max
+    if (
+        str(final_form_domain_lm_free_weight_mode).strip().lower().replace("-", "_")
+        in {"step_cutoff", "interior_cutoff", "step_interior"}
+        and final_form_domain_lm_free_alpha_max_eff is None
+    ):
+        raw_mult = problem.get("final_form_internal_zero_dirichlet_distance_multiple", None)
+        if raw_mult is not None and np.isfinite(float(raw_mult)):
+            alpha_low_eff, _ = _alpha_cutoffs_for_distance_multiple(float(raw_mult))
+            final_form_domain_lm_free_alpha_max_eff = float(alpha_low_eff)
+        else:
+            final_form_domain_lm_free_alpha_max_eff = float(problem.get("final_form_inactive_alpha_low", 0.05))
     if bool(problem.get("final_form", False)):
         if problem.get("vP_k") is None or problem.get("p_pore_k") is None:
             raise ValueError("one_domain_formulation=final_form requires vP and p_pore fields.")
@@ -7922,7 +8765,23 @@ def _build_forms(
             rho_s_ref=float(rho_s0_tilde),
             constant_rho_s=bool(final_form_constant_rho_s),
             domain_lm=bool(final_form_domain_lm),
+            quasi_static_porous_media=bool(final_form_quasistatic_porous_media),
+            quasi_static_flip_pore_stress_sign=bool(final_form_quasistatic_flip_pore_stress_sign),
+            quasi_static_disable_pore_momentum=bool(final_form_disable_pore_momentum),
+            quasi_static_disable_solid_momentum=bool(final_form_disable_solid_momentum),
+            quasi_static_use_combined_porous_momentum=bool(final_form_combined_porous_momentum),
+            direct_interface_transfer=bool(final_form_direct_interface_transfer),
+            domain_lm_free_tie_vP_to_vf=bool(final_form_domain_lm_vP_tie_vf),
+            domain_lm_free_tie_p_pore_to_p=bool(final_form_domain_lm_p_pore_tie_p),
+            alpha_advect_with=str(alpha_advect_with),
+            alpha_advection_form=str(alpha_advection_form),
+            support_physics=str(support_physics),
+            alpha_vS_gate_alpha0=float(alpha_vS_gate_alpha0),
+            alpha_vS_gate_power=int(alpha_vS_gate_power),
+            ds_alpha_transport=ds_alpha_transport,
             domain_lm_aug_gamma=float(final_form_domain_lm_aug_gamma),
+            domain_lm_free_weight_mode=str(final_form_domain_lm_free_weight_mode),
+            domain_lm_free_alpha_max=final_form_domain_lm_free_alpha_max_eff,
             mass_lm_aug_gamma=float(final_form_mass_lm_aug_gamma),
             normal_lm_aug_gamma=float(final_form_normal_lm_aug_gamma),
             gamma_u=float(gamma_u),
@@ -7948,6 +8807,7 @@ def _build_forms(
                 else _final_form_phi_mode_key(problem.get("final_form_phi_mode", "auto"))
             ),
             phi_b=float(phi_b),
+            alpha_biot=(1.0 if alpha_biot is None else float(alpha_biot)),
             bjs_coefficient=(
                 float(interface_bjs_gamma)
                 if bool(interface_bjs_closure) and float(interface_bjs_closure_strength) != 0.0
@@ -7984,6 +8844,7 @@ def _build_forms(
                 float(p_pore_fluid_gauge_strength),
             )
             dx_q = dx(metadata={"q": int(qdeg)})
+            gauge_inv_h2 = _B7_ONE / (MeshSize() * MeshSize() + _named_constant("b7_p_pore_fluid_gauge_h2_eps", 1.0e-12))
             one_m_alpha_k = _B7_ONE - alpha_support_stab_k_eff
             p_pore_fluid_w4_k = one_m_alpha_k * one_m_alpha_k
             p_pore_fluid_w4_k = p_pore_fluid_w4_k * p_pore_fluid_w4_k
@@ -7995,12 +8856,14 @@ def _build_forms(
             ) * dalpha_support_stab_eff
             r_p_pore_fluid_gauge = (
                 p_pore_fluid_gauge_strength_c
+                * gauge_inv_h2
                 * p_pore_fluid_w_k
                 * problem["p_pore_k"]
                 * problem["q_pore_test"]
             ) * dx_q
             a_p_pore_fluid_gauge = (
                 p_pore_fluid_gauge_strength_c
+                * gauge_inv_h2
                 * (
                     d_p_pore_fluid_w * problem["p_pore_k"]
                     + p_pore_fluid_w_k * problem["dp_pore"]
@@ -8135,7 +8998,7 @@ def _build_forms(
         (not bool(enable_phi_evolution))
         and bool(reduced_support_uses_B)
         and (not bool(use_ratio_free_full_state))
-        and str(support_physics).strip().lower() == "stored_support"
+        and str(support_physics_eff).strip().lower() == "stored_support"
     )
     if not bool(enable_phi_evolution):
         if single_pressure_stored_support_core:
@@ -8229,11 +9092,11 @@ def _build_forms(
                 alpha_interface_reg_eps_tangent=_named_constant("b7_alpha_reg_eps_tangent", float(alpha_reg_eps_tangent)),
                 alpha_interface_reg_eta=_named_constant("b7_alpha_reg_eta", float(alpha_reg_eta)),
                 alpha_mu_aux_pin=1.0,
-                alpha_advect_with=str(alpha_advect_with),
-                alpha_advection_form=str(alpha_advection_form),
+                alpha_advect_with=str(alpha_advect_with_eff),
+                alpha_advection_form=str(alpha_advection_form_eff),
                 alpha_vS_gate_alpha0=float(alpha_vS_gate_alpha0),
                 alpha_vS_gate_power=int(alpha_vS_gate_power),
-                support_physics=str(support_physics),
+                support_physics=str(support_physics_eff),
                 stored_support_content_mode=str(stored_support_content_mode_key),
                 phi_b=_named_constant("b7_phi_b", float(phi_b)),
                 ds_alpha_transport=ds_alpha_transport,
@@ -8304,9 +9167,9 @@ def _build_forms(
                 M_alpha=_named_constant("b7_M_alpha", float(M_alpha)),
                 gamma_alpha=_named_constant("b7_gamma_alpha", float(gamma_alpha)),
                 eps_alpha=_named_constant("b7_eps_alpha", float(eps_alpha)),
-                support_physics=str(support_physics),
-                alpha_advect_with=str(alpha_advect_with),
-                alpha_advection_form=str(alpha_advection_form),
+                support_physics=str(support_physics_eff),
+                alpha_advect_with=str(alpha_advect_with_eff),
+                alpha_advection_form=str(alpha_advection_form_eff),
                 fluid_convection=str(fluid_convection),
                 g_t_k=g_t_k,
                 g_t_n=g_t_n,
@@ -8411,11 +9274,11 @@ def _build_forms(
             alpha_interface_reg_eps_tangent=_named_constant("b7_alpha_reg_eps_tangent", float(alpha_reg_eps_tangent)),
             alpha_interface_reg_eta=_named_constant("b7_alpha_reg_eta", float(alpha_reg_eta)),
             alpha_mu_aux_pin=1.0,
-            alpha_advect_with=("vS" if bool(use_ratio_free_full_state) else str(alpha_advect_with)),
-            alpha_advection_form=str(alpha_advection_form),
+            alpha_advect_with=("vS" if bool(use_ratio_free_full_state) else str(alpha_advect_with_eff)),
+            alpha_advection_form=str(alpha_advection_form_eff),
             alpha_vS_gate_alpha0=float(alpha_vS_gate_alpha0),
             alpha_vS_gate_power=int(alpha_vS_gate_power),
-            support_physics=("stored_support" if bool(use_ratio_free_full_state) else str(support_physics)),
+            support_physics=("stored_support" if bool(use_ratio_free_full_state) else str(support_physics_eff)),
             stored_support_content_mode=str(stored_support_content_mode_key),
             phi_b=_named_constant("b7_phi_b", float(phi_b)),
             ds_alpha_transport=ds_alpha_transport,
@@ -8479,12 +9342,24 @@ def _build_forms(
         a_alpha_embed = (problem["dalpha"] - (_latent_map_prime_expr(problem["alpha_latent_k"], map_kind=latent_map_kind) * problem["dalpha_latent"])) * problem["alpha_test"] * dx_q
         residual_form = residual_form + r_alpha_embed
         jacobian_form = jacobian_form + a_alpha_embed
+        r_alpha_transport = getattr(forms, "r_alpha_transport", None)
+        if r_alpha_transport is None:
+            r_alpha_transport = forms.r_alpha
+        a_alpha_transport = getattr(forms, "a_alpha_transport", None)
+        if a_alpha_transport is None:
+            a_alpha_transport = forms.a_alpha
         forms = replace(
             forms,
             residual_form=residual_form,
             jacobian_form=jacobian_form,
             r_alpha=(forms.r_alpha + r_alpha_embed),
+            r_alpha_transport=(r_alpha_transport + r_alpha_embed),
             a_alpha=((forms.a_alpha + a_alpha_embed) if forms.a_alpha is not None else a_alpha_embed),
+            a_alpha_transport=(
+                (a_alpha_transport + a_alpha_embed)
+                if a_alpha_transport is not None
+                else a_alpha_embed
+            ),
         )
     if use_phi_latent and bool(enable_phi_evolution) and latent_formulation_key != "transformed":
         phi_sig_k = _latent_map_expr(problem["phi_latent_k"], map_kind=latent_map_kind)
@@ -8638,6 +9513,7 @@ def _build_forms(
             "b7_p_pore_fluid_gauge_strength",
             float(p_pore_fluid_gauge_strength),
         )
+        gauge_inv_h2 = _B7_ONE / (MeshSize() * MeshSize() + _named_constant("b7_p_pore_fluid_gauge_h2_eps", 1.0e-12))
         one_m_alpha_k = _B7_ONE - alpha_support_k_eff
         p_pore_fluid_w4_k = one_m_alpha_k * one_m_alpha_k
         p_pore_fluid_w4_k = p_pore_fluid_w4_k * p_pore_fluid_w4_k
@@ -8649,12 +9525,14 @@ def _build_forms(
         ) * dalpha_eff
         r_p_pore_fluid_gauge = (
             p_pore_fluid_gauge_strength_c
+            * gauge_inv_h2
             * p_pore_fluid_w_k
             * problem["p_pore_k"]
             * problem["q_pore_test"]
         ) * dx_q
         a_p_pore_fluid_gauge = (
             p_pore_fluid_gauge_strength_c
+            * gauge_inv_h2
             * (
                 d_p_pore_fluid_w * problem["p_pore_k"]
                 + p_pore_fluid_w_k * problem["dp_pore"]
@@ -9171,6 +10049,8 @@ def _build_bcs(
     full_ratio_free_state: bool = False,
     split_primary_darcy_flux: bool = False,
     one_pressure_primary_darcy_flux: bool = False,
+    final_form_internal_zero_dirichlet: bool = False,
+    final_form_internal_zero_targets: tuple[str, ...] = tuple(),
 ) -> list[BoundaryCondition]:
     final_form = str(one_domain_formulation or "legacy").strip().lower().replace("-", "_") == "final_form"
     use_pressure_mean_constraint = bool(pressure_mean_constraint) and bool(full_ratio_free_state)
@@ -9307,6 +10187,26 @@ def _build_bcs(
         bcs.append(BoundaryCondition("alpha", "dirichlet", "top", _as_float_time(alpha_bc)))
     if bool(enable_phi_evolution) and phi_bc_mode_key == "equilibrium":
         bcs.append(BoundaryCondition("phi", "dirichlet", "top", _as_float_time(phi_eq)))
+    if bool(final_form) and bool(final_form_internal_zero_dirichlet):
+        fluid_space_key = str(fluid_space).strip().lower()
+        if fluid_space_key == "hdiv":
+            raise ValueError(
+                "final_form_internal_zero_dirichlet is only implemented for CG fluid velocity fields."
+            )
+        selected_targets = (
+            tuple(str(name) for name in tuple(final_form_internal_zero_targets or tuple()) if str(name).strip())
+            or tuple(_FINAL_FORM_INTERNAL_ZERO_DEFAULT_TARGETS)
+        )
+        fluid_fields, porous_zero_fields, porous_one_fields = _final_form_internal_zero_target_fields(
+            ("v_x", "v_y", "vP_x", "vP_y", "vS_x", "vS_y", "u_x", "u_y", "phi"),
+            targets=selected_targets,
+        )
+        for field, tag, value in (
+            *((field, _FINAL_FORM_INTERNAL_ZERO_FLUID_TAG, zero) for field in fluid_fields),
+            *((field, _FINAL_FORM_INTERNAL_ZERO_POROUS_TAG, zero) for field in porous_zero_fields),
+            *((field, _FINAL_FORM_INTERNAL_ZERO_POROUS_TAG, alpha_one) for field in porous_one_fields),
+        ):
+            bcs.append(BoundaryCondition(field, "dirichlet", tag, _as_float_time(value)))
     latent_field_set = {str(name).strip() for name in tuple(latent_bounded_fields or tuple()) if str(name).strip()}
     if latent_field_set:
         latent_bcs: list[BoundaryCondition] = []
@@ -9843,6 +10743,7 @@ def _write_combined_profiles_plot(path: Path, results: list[CaseResult], *, refe
 
 def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseResult:
     io_root = _mpi_io_root()
+    main_qs_final_form_semismooth_tuning = False
     poly_order, pressure_order, scalar_order = _resolved_orders(args)
     qdeg = int(args.quad_order) if args.quad_order is not None else max(6, 2 * int(poly_order) + 2)
     if qdeg < 1:
@@ -9916,8 +10817,35 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         final_form_phi_mode=str(getattr(args, "final_form_phi_mode", "auto")),
         final_form_implementation=str(getattr(args, "final_form_implementation", "tensor")),
         final_form_constant_rho_s=bool(getattr(args, "final_form_constant_rho_s", False)),
+        final_form_lag_phi_in_main=getattr(args, "final_form_lag_phi_in_main", None),
         final_form_domain_lm=bool(getattr(args, "final_form_domain_lm", False)),
+        final_form_domain_lm_vf=getattr(args, "final_form_domain_lm_vf", None),
+        final_form_domain_lm_p=getattr(args, "final_form_domain_lm_p", None),
+        final_form_domain_lm_vP=getattr(args, "final_form_domain_lm_vP", None),
+        final_form_domain_lm_vS=getattr(args, "final_form_domain_lm_vS", None),
+        final_form_domain_lm_p_pore=getattr(args, "final_form_domain_lm_p_pore", None),
+        final_form_domain_lm_phi=getattr(args, "final_form_domain_lm_phi", None),
+        final_form_domain_lm_u=getattr(args, "final_form_domain_lm_u", None),
+        final_form_domain_lm_vP_tie_vf=bool(getattr(args, "final_form_domain_lm_vP_tie_vf", False)),
+        final_form_domain_lm_p_pore_tie_p=bool(getattr(args, "final_form_domain_lm_p_pore_tie_p", False)),
+        final_form_quasistatic_porous_media=bool(
+            getattr(args, "final_form_quasistatic_porous_media", False)
+        ),
+        final_form_direct_interface_transfer=getattr(args, "final_form_direct_interface_transfer", None),
+        final_form_disable_pore_momentum=bool(
+            getattr(args, "final_form_disable_pore_momentum", False)
+        ),
+        final_form_disable_solid_momentum=bool(
+            getattr(args, "final_form_disable_solid_momentum", False)
+        ),
+        final_form_combined_porous_momentum=bool(
+            getattr(args, "final_form_combined_porous_momentum", False)
+        ),
         final_form_domain_lm_aug_gamma=float(getattr(args, "final_form_domain_lm_aug_gamma", 10.0)),
+        final_form_domain_lm_free_weight_mode=str(
+            getattr(args, "final_form_domain_lm_free_weight_mode", "diffuse")
+        ),
+        final_form_domain_lm_free_alpha_max=getattr(args, "final_form_domain_lm_free_alpha_max", None),
         final_form_mass_lm_aug_gamma=float(getattr(args, "final_form_mass_lm_aug_gamma", 1.0)),
         y_interface=float(args.y_interface),
         eps_alpha=float(eps_alpha_eff),
@@ -9965,6 +10893,25 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
     )
     problem["final_form_disable_normal_interface"] = bool(
         getattr(args, "final_form_disable_normal_interface", False)
+    )
+    problem["final_form_quasistatic_porous_media"] = bool(
+        getattr(args, "final_form_quasistatic_porous_media", False)
+    )
+    final_form_direct_interface_transfer_arg = getattr(args, "final_form_direct_interface_transfer", None)
+    if final_form_direct_interface_transfer_arg is None:
+        problem["final_form_direct_interface_transfer"] = bool(
+            problem.get("final_form_quasistatic_porous_media", False)
+        )
+    else:
+        problem["final_form_direct_interface_transfer"] = bool(final_form_direct_interface_transfer_arg)
+    problem["final_form_disable_pore_momentum"] = bool(
+        getattr(args, "final_form_disable_pore_momentum", False)
+    )
+    problem["final_form_disable_solid_momentum"] = bool(
+        getattr(args, "final_form_disable_solid_momentum", False)
+    )
+    problem["final_form_combined_porous_momentum"] = bool(
+        getattr(args, "final_form_combined_porous_momentum", False)
     )
     problem["final_form_mass_lm_aug_gamma"] = float(
         getattr(args, "final_form_mass_lm_aug_gamma", 1.0) or 0.0
@@ -10201,6 +11148,7 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                 problem["mu_k"].nodal_values[:] = 0.0
             if problem.get("alpha_mass_lm_k") is not None:
                 problem["alpha_mass_lm_k"].nodal_values[:] = 0.0
+            _sync_alpha_closure_phi_state(suffixes=("k",))
             if sync_previous:
                 problem["alpha_n"].nodal_values[:] = _alpha_from_refmap_values(problem["u_n"])
                 if problem.get("B_n") is not None and not bool(problem.get("full_ratio_free_state", False)):
@@ -10209,6 +11157,7 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                     problem["mu_n"].nodal_values[:] = 0.0
                 if problem.get("alpha_mass_lm_n") is not None:
                     problem["alpha_mass_lm_n"].nodal_values[:] = 0.0
+                _sync_alpha_closure_phi_state(suffixes=("n",))
 
         _sync_alpha_from_refmap(sync_previous=True)
         inactive_alpha_counts = _tag_inactive_fields(
@@ -10262,25 +11211,27 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             f"vS_y={inactive_alpha_threshold_counts.get('vS_y', 0)})."
         )
 
-    final_form_inactive_domain_counts: dict[str, dict[str, int]] = {}
-    if bool(problem.get("final_form", False)) and bool(getattr(args, "final_form_inactive_domains", False)):
-        porous_fields: list[str] = []
+    def _final_form_wrong_side_field_sets() -> tuple[list[str], list[str], list[str]]:
+        porous_flow_fields: list[str] = []
         if problem.get("p_pore_k") is not None:
-            porous_fields.append("p_pore")
-        porous_fields.extend(_primary_darcy_field_names(problem))
-        for name in ("phi", "rho_s", "vS_x", "vS_y", "u_x", "u_y"):
+            porous_flow_fields.append("p_pore")
+        porous_flow_fields.extend(_primary_darcy_field_names(problem))
+        support_fields: list[str] = []
+        for name in ("phi", "rho_s", "vS_x", "vS_y", "u_x", "u_y", "pi_s"):
             if name in getattr(problem["dh"], "field_names", ()):
-                porous_fields.append(name)
+                support_fields.append(name)
         if bool(problem.get("final_form_domain_lm", False)):
             for name in ("lm_vf_x", "lm_vf_y", "lm_p"):
                 if name in getattr(problem["dh"], "field_names", ()):
-                    porous_fields.append(name)
-        for name in ("mu_mass", "mu_normal", "mu_tangent", "mu_kin_x", "mu_kin_y"):
+                    porous_flow_fields.append(name)
+        for name in ("mu_mass", "mu_normal", "mu_tangent"):
             if name in getattr(problem["dh"], "field_names", ()):
-                porous_fields.append(name)
-        fluid_fields: list[str]
+                porous_flow_fields.append(name)
+        for name in ("mu_kin_x", "mu_kin_y"):
+            if name in getattr(problem["dh"], "field_names", ()):
+                support_fields.append(name)
         if str(problem["fluid_space"]).strip().lower() == "hdiv":
-            fluid_fields = ["v", "p"]
+            fluid_fields: list[str] = ["v", "p"]
         else:
             fluid_fields = ["v_x", "v_y", "p"]
         if bool(problem.get("final_form_domain_lm", False)):
@@ -10299,27 +11250,121 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         for name in ("mu_mass", "mu_normal", "mu_tangent", "mu_kin_x", "mu_kin_y"):
             if name in getattr(problem["dh"], "field_names", ()):
                 fluid_fields.append(name)
-        low_counts = _tag_inactive_fields_below_alpha(
-            problem,
-            alpha_threshold=float(getattr(args, "final_form_inactive_alpha_low", 0.05)),
-            field_names=porous_fields,
+        return porous_flow_fields, support_fields, fluid_fields
+
+    final_form_auto_free_side_inactive_closure = False
+    final_form_auto_free_side_inactive_counts: dict[str, int] = {}
+    final_form_auto_free_side_support_counts: dict[str, int] = {}
+    final_form_auto_free_side_support_alpha_low = float("nan")
+    final_form_inactive_domain_counts: dict[str, dict[str, int]] = {}
+    if bool(problem.get("final_form", False)):
+        porous_flow_fields, support_fields, fluid_fields = _final_form_wrong_side_field_sets()
+        porous_fields = list(porous_flow_fields) + list(support_fields)
+        final_form_auto_free_side_inactive_closure = bool(
+            bool(getattr(args, "final_form_quasistatic_porous_media", False))
+            and bool(getattr(args, "final_form_auto_free_side_inactive_closure", True))
+            and not bool(getattr(args, "final_form_inactive_domains", False))
+            and not bool(getattr(args, "final_form_domain_lm", False))
+            and not bool(getattr(args, "final_form_internal_zero_dirichlet", False))
+            and not bool(getattr(args, "all_porous_sideflow_diagnostic", False))
+            and not bool(getattr(args, "all_fluid_freeflow_diagnostic", False))
         )
-        high_counts = _tag_inactive_fields_above_alpha(
-            problem,
-            alpha_threshold=float(getattr(args, "final_form_inactive_alpha_high", 0.95)),
-            field_names=fluid_fields,
-        )
-        final_form_inactive_domain_counts = {
-            "porous_in_free_fluid": dict(low_counts),
-            "fluid_in_support": dict(high_counts),
-        }
-        print(
-            "[setup] final_form_inactive_domains: deactivating porous/support fields on alpha <= "
-            f"{float(getattr(args, 'final_form_inactive_alpha_low', 0.05)):.6g} and free-fluid fields on alpha >= "
-            f"{float(getattr(args, 'final_form_inactive_alpha_high', 0.95)):.6g}: "
-            f"porous/support={sum(int(v) for v in low_counts.values())}, fluid={sum(int(v) for v in high_counts.values())}."
-        )
+        if final_form_auto_free_side_inactive_closure:
+            final_form_auto_free_side_inactive_counts = _tag_inactive_fields_below_alpha(
+                problem,
+                alpha_threshold=float(getattr(args, "final_form_inactive_alpha_low", 0.05)),
+                field_names=porous_flow_fields,
+                tag_store_key="_final_form_auto_free_side_inactive_tagged_dofs",
+                record_prefix=None,
+            )
+            support_alpha_raw = getattr(args, "final_form_support_inactive_alpha_low", None)
+            if support_alpha_raw is None:
+                support_alpha_low = float(getattr(args, "final_form_inactive_alpha_low", 0.05))
+                if not bool(problem.get("final_form_direct_interface_transfer", False)):
+                    support_alpha_low = max(support_alpha_low, 0.15)
+            else:
+                support_alpha_low = float(support_alpha_raw)
+            final_form_auto_free_side_support_alpha_low = float(support_alpha_low)
+            final_form_auto_free_side_support_counts = _tag_inactive_fields_below_alpha(
+                problem,
+                alpha_threshold=float(support_alpha_low),
+                field_names=support_fields,
+                tag_store_key="_final_form_auto_free_side_support_tagged_dofs",
+                record_prefix=None,
+            )
+            merged_auto_counts = dict(final_form_auto_free_side_inactive_counts)
+            for name, count in list(final_form_auto_free_side_support_counts.items()):
+                merged_auto_counts[str(name)] = int(merged_auto_counts.get(str(name), 0)) + int(count)
+            final_form_auto_free_side_inactive_counts = merged_auto_counts
+            if final_form_auto_free_side_inactive_counts:
+                porous_low = float(getattr(args, "final_form_inactive_alpha_low", 0.05))
+                print(
+                    "[setup] final_form_auto_free_side_inactive_closure: deactivating Darcy-side fields on alpha <= "
+                    f"{porous_low:.6g}"
+                    + (
+                        f" and support-family fields on alpha <= {float(support_alpha_low):.6g}"
+                        if abs(float(support_alpha_low) - porous_low) > 1.0e-12
+                        else ""
+                    )
+                    + " before the interface rows act: "
+                    f"Darcy-side={sum(int(v) for v in final_form_auto_free_side_inactive_counts.values()) - sum(int(v) for v in final_form_auto_free_side_support_counts.values())}, "
+                    f"support={sum(int(v) for v in final_form_auto_free_side_support_counts.values())}."
+                )
+        if bool(getattr(args, "final_form_inactive_domains", False)):
+            low_counts = _tag_inactive_fields_below_alpha(
+                problem,
+                alpha_threshold=float(getattr(args, "final_form_inactive_alpha_low", 0.05)),
+                field_names=porous_fields,
+            )
+            high_counts = _tag_inactive_fields_above_alpha(
+                problem,
+                alpha_threshold=float(getattr(args, "final_form_inactive_alpha_high", 0.95)),
+                field_names=fluid_fields,
+            )
+            final_form_inactive_domain_counts = {
+                "porous_in_free_fluid": dict(low_counts),
+                "fluid_in_support": dict(high_counts),
+            }
+            print(
+                "[setup] final_form_inactive_domains: deactivating porous/support fields on alpha <= "
+                f"{float(getattr(args, 'final_form_inactive_alpha_low', 0.05)):.6g} and free-fluid fields on alpha >= "
+                f"{float(getattr(args, 'final_form_inactive_alpha_high', 0.95)):.6g}: "
+                f"porous/support={sum(int(v) for v in low_counts.values())}, fluid={sum(int(v) for v in high_counts.values())}."
+            )
+    problem["_final_form_auto_free_side_inactive_closure"] = bool(final_form_auto_free_side_inactive_closure)
+    problem["_final_form_auto_free_side_inactive_counts"] = dict(final_form_auto_free_side_inactive_counts)
+    problem["_final_form_auto_free_side_support_counts"] = dict(final_form_auto_free_side_support_counts)
+    problem["_final_form_auto_free_side_support_alpha_low"] = float(final_form_auto_free_side_support_alpha_low)
     problem["_final_form_inactive_domain_counts"] = dict(final_form_inactive_domain_counts)
+    problem["final_form_internal_zero_dirichlet"] = bool(
+        getattr(args, "final_form_internal_zero_dirichlet", False)
+    )
+    problem["final_form_internal_zero_dirichlet_distance_multiple"] = float(
+        getattr(args, "final_form_internal_zero_dirichlet_distance_multiple", 1.5)
+    )
+    problem["final_form_internal_zero_dirichlet_retag_mode"] = _final_form_internal_zero_retag_mode(args)
+    problem["final_form_internal_zero_dirichlet_targets"] = _resolve_final_form_internal_zero_dirichlet_targets(args)
+    final_form_internal_zero_info: dict[str, object] = {}
+    if bool(problem.get("final_form_internal_zero_dirichlet", False)):
+        final_form_internal_zero_info = _tag_final_form_internal_zero_dirichlet_dofs(
+            problem,
+            distance_multiple=problem.get("final_form_internal_zero_dirichlet_distance_multiple", None),
+            alpha_state_key="alpha_k",
+        )
+        _zero_tagged_internal_zero_dirichlet_state(problem)
+        fluid_counts = dict(final_form_internal_zero_info.get("fluid_counts", {}) or {})
+        porous_counts = dict(final_form_internal_zero_info.get("porous_counts", {}) or {})
+        print(
+            "[setup] final_form_internal_zero_dirichlet: constraining off-domain DOFs beyond "
+            f"{float(problem.get('final_form_internal_zero_dirichlet_distance_multiple', 1.5)):.6g} eps "
+            f"(alpha <= {float(final_form_internal_zero_info.get('alpha_low', float('nan'))):.6g} for porous/support in "
+            "free fluid, "
+            f"alpha >= {float(final_form_internal_zero_info.get('alpha_high', float('nan'))):.6g} for fluid in support): "
+            f"porous/support={sum(int(v) for v in porous_counts.values())}, fluid={sum(int(v) for v in fluid_counts.values())}, "
+            f"targets={tuple(problem.get('final_form_internal_zero_dirichlet_targets', tuple()) or tuple())}, "
+            f"retag_mode={str(problem.get('final_form_internal_zero_dirichlet_retag_mode', 'per_newton'))}."
+        )
+    problem["_final_form_internal_zero_dirichlet_info"] = dict(final_form_internal_zero_info)
 
     rigid_support_diagnostic = bool(getattr(args, "rigid_support_diagnostic", False))
     if rigid_support_diagnostic:
@@ -10384,9 +11429,18 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         gamma_rho_s_pin=float(args.gamma_rho_s_pin),
         final_form_constant_rho_s=bool(args.final_form_constant_rho_s),
         final_form_domain_lm=bool(getattr(args, "final_form_domain_lm", False)),
+        final_form_domain_lm_vP_tie_vf=bool(getattr(args, "final_form_domain_lm_vP_tie_vf", False)),
+        final_form_domain_lm_p_pore_tie_p=bool(getattr(args, "final_form_domain_lm_p_pore_tie_p", False)),
         final_form_domain_lm_aug_gamma=float(getattr(args, "final_form_domain_lm_aug_gamma", 10.0)),
+        final_form_domain_lm_free_weight_mode=str(
+            getattr(args, "final_form_domain_lm_free_weight_mode", "diffuse")
+        ),
+        final_form_domain_lm_free_alpha_max=getattr(args, "final_form_domain_lm_free_alpha_max", None),
         final_form_mass_lm_aug_gamma=float(getattr(args, "final_form_mass_lm_aug_gamma", 1.0)),
         final_form_normal_lm_aug_gamma=float(getattr(args, "final_form_normal_lm_aug_gamma", 1.0)),
+        final_form_quasistatic_flip_pore_stress_sign=bool(
+            getattr(args, "final_form_quasistatic_flip_pore_stress_sign", False)
+        ),
         phi_supg=float(args.phi_supg),
         phi_cip=float(args.phi_cip),
         alpha_supg=float(args.alpha_supg),
@@ -10467,6 +11521,8 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         latent_bounded_eps=float(getattr(args, "latent_bounded_eps", 1.0e-8)),
         latent_bounded_map=str(getattr(args, "latent_bounded_map", "sigmoid")),
         pressure_mean_constraint=bool(args.pressure_mean_constraint),
+        final_form_internal_zero_dirichlet=bool(getattr(args, "final_form_internal_zero_dirichlet", False)),
+        final_form_internal_zero_targets=tuple(problem.get("final_form_internal_zero_dirichlet_targets", tuple()) or tuple()),
     )
     bcs_homog = [BoundaryCondition(b.field, b.method, b.domain_tag, (lambda x, y: 0.0)) for b in bcs]
 
@@ -10659,9 +11715,46 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
     base_vi_anderson_ginf_max = float(
         getattr(getattr(solver, "vi_params", None), "anderson_ginf_max", 0.0) or 0.0
     ) if "solver" in locals() else 0.0
+    main_qs_final_form_semismooth_tuning = bool(
+        str(getattr(args, "one_domain_formulation", "")).strip().lower() == "final_form"
+        and bool(getattr(args, "final_form_constant_rho_s", False))
+        and bool(getattr(args, "final_form_quasistatic_porous_media", False))
+        and str(getattr(args, "transport_update_mode", "")).strip().lower() == "monolithic"
+        and not bool(getattr(args, "final_form_disable_pore_momentum", False))
+        and not bool(getattr(args, "final_form_disable_solid_momentum", False))
+        and not bool(getattr(args, "final_form_combined_porous_momentum", False))
+        and bool(getattr(args, "final_form_domain_lm_phi", False))
+        and bool(getattr(args, "final_form_domain_lm_p_pore", False))
+        and bool(getattr(args, "final_form_internal_zero_dirichlet", False))
+        and abs(float(getattr(args, "alpha_vS_gate_alpha0", 0.0) or 0.0)) <= 1.0e-12
+    )
+    qs_final_form_semismooth_tuning = bool(main_qs_final_form_semismooth_tuning)
+    if qs_final_form_semismooth_tuning:
+        # The cleaned quasi-static final_form branch reaches a useful local
+        # semismooth regime by step 5, then the default strictly monotone VI
+        # globalization rejects every tiny filtered decrease at step 6. Keep
+        # the PDE path unchanged and relax only the semismooth globalization on
+        # this branch so the accepted trajectory can continue.
+        base_vi_nonmono_window = max(int(base_vi_nonmono_window), 5)
+        base_vi_nonmono_stable_iters = max(int(base_vi_nonmono_stable_iters), 1)
+        base_vi_nonmono_ginf_trigger = max(float(base_vi_nonmono_ginf_trigger), 2.0)
+        base_vi_nonmono_gap_ratio = max(float(base_vi_nonmono_gap_ratio), 1.0)
+        base_vi_nonmono_eq_abs = max(float(base_vi_nonmono_eq_abs), 1.0e-10)
+        base_vi_nonmono_disable_filter = True
+        base_vi_accept_best_filtered_descent = True
+        base_vi_lm_max_tries = max(int(base_vi_lm_max_tries), 12)
+        base_vi_lm_lambda_max = max(float(base_vi_lm_lambda_max), 1.0e10)
     base_solver_newton_tol = float(
         getattr(getattr(solver, "np", None), "newton_tol", float(args.newton_tol)) or float(args.newton_tol)
     ) if "solver" in locals() else float(args.newton_tol)
+    base_solver_linear_backend = str(
+        (
+            getattr(getattr(solver, "lp", None), "backend", str(getattr(args, "linear_backend", "")) or "")
+            if "solver" in locals()
+            else str(getattr(args, "linear_backend", "") or "")
+        )
+        or str(getattr(args, "linear_backend", "") or "")
+    ).strip().lower()
     startup_monolithic_budget = int(_startup_monolithic_max_it(args))
 
     def _restore_base_monolithic_controls() -> None:
@@ -10669,6 +11762,11 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             solver.np.max_newton_iter = int(base_solver_max_newton_iter)
         if float(getattr(solver.np, "newton_tol", base_solver_newton_tol) or base_solver_newton_tol) != float(base_solver_newton_tol):
             solver.np.newton_tol = float(base_solver_newton_tol)
+        target_lp = getattr(solver, "lp", None)
+        if target_lp is not None and base_solver_linear_backend:
+            current_backend = str(getattr(target_lp, "backend", "") or "").strip().lower()
+            if current_backend != base_solver_linear_backend:
+                target_lp.backend = str(base_solver_linear_backend)
         if getattr(solver, "vi_params", None) is not None:
             relaxed_now = float(getattr(solver.vi_params, "relaxed_filter_accept_ginf", 0.0) or 0.0)
             if relaxed_now != float(base_solver_relaxed_accept_ginf):
@@ -10734,12 +11832,43 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         if int(step_no) == 1 and bool(startup_retry_state.get("step1_relaxed_mechanics_tol_active", False)):
             _restore_base_monolithic_controls()
             startup_retry_state["step1_relaxed_mechanics_tol_active"] = False
+        restore_relaxed_step = startup_retry_state.get("restore_relaxed_accept_after_step_no", None)
+        restore_relaxed_value = startup_retry_state.get("restore_relaxed_accept_value", None)
+        if (
+            restore_relaxed_step is not None
+            and int(restore_relaxed_step) == int(step_no)
+            and getattr(solver, "vi_params", None) is not None
+        ):
+            solver.vi_params.relaxed_filter_accept_ginf = float(
+                base_solver_relaxed_accept_ginf if restore_relaxed_value is None else restore_relaxed_value
+            )
+            startup_retry_state["restore_relaxed_accept_after_step_no"] = None
+            startup_retry_state["restore_relaxed_accept_value"] = None
+        restore_backend_step = startup_retry_state.get("restore_linear_backend_after_step_no", None)
+        restore_backend_name = startup_retry_state.get("restore_linear_backend_name", None)
+        if restore_backend_step is not None and int(restore_backend_step) == int(step_no):
+            target_lp = getattr(solver, "lp", None)
+            original_backend = str(restore_backend_name or "").strip().lower()
+            if target_lp is not None and original_backend:
+                current_backend = str(getattr(target_lp, "backend", "") or "").strip().lower()
+                if current_backend != original_backend:
+                    target_lp.backend = original_backend
+                    print(
+                        f"    [retry] restoring monolithic linear backend to {original_backend} "
+                        f"after the accepted rescued step {int(step_no)}."
+                    )
+            startup_retry_state["restore_linear_backend_after_step_no"] = None
+            startup_retry_state["restore_linear_backend_name"] = None
         t_now = float(getattr(solver, "_current_t", 0.0) + getattr(solver, "_current_dt", float(args.dt)))
-        delta_inf_raw = getattr(solver, "_last_accepted_step_delta_inf", None)
+        delta_inf, delta_inf_raw = _predictor_reset_delta_inf(
+            funcs=functions,
+            prev_funcs=previous_functions,
+        )
+        if delta_inf_raw is None:
+            delta_inf_raw = getattr(solver, "_last_accepted_step_delta_inf", None)
         if delta_inf_raw is None:
             delta_inf_raw = getattr(solver, "_last_nonlinear_update_inf", None)
-        delta_inf = None
-        if delta_inf_raw is not None:
+        if delta_inf is None and delta_inf_raw is not None:
             try:
                 delta_inf_candidate = float(delta_inf_raw)
                 if np.isfinite(delta_inf_candidate):
@@ -10748,6 +11877,7 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                 delta_inf = None
         startup_retry_state["last_accepted_step_no"] = int(step_no)
         startup_retry_state["last_accepted_delta_inf"] = delta_inf
+        startup_retry_state["last_accepted_delta_inf_raw"] = delta_inf_raw
         alpha_diag = alpha_diagnostics.evaluate(alpha_coeffs)
         alpha_area = float(alpha_diag.get("alpha_area", float("nan")))
         alpha_band = float(alpha_diag.get("alpha_band", float("nan")))
@@ -10989,6 +12119,35 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             if str(getattr(f, "name", "")) == str(getattr(template, "name", "")):
                 return f
         return template
+
+    def _sync_alpha_closure_phi_state(*, suffixes=("k",), funcs_in=None) -> None:
+        if not _final_form_phi_is_algebraic(problem):
+            return
+        phi_scale = max(0.0, min(1.0, 1.0 - float(args.phi_b)))
+        latent_eps = float(getattr(args, "latent_bounded_eps", 1.0e-8))
+        latent_map_kind = _latent_bounded_map_key(problem)
+        for suffix in tuple(suffixes or ("k",)):
+            alpha_template = problem.get(f"alpha_{suffix}")
+            phi_template = problem.get(f"phi_{suffix}")
+            if alpha_template is None or phi_template is None:
+                continue
+            alpha_obj = _find_named_function(funcs_in, alpha_template) if funcs_in is not None else alpha_template
+            phi_obj = _find_named_function(funcs_in, phi_template) if funcs_in is not None else phi_template
+            alpha_vals = np.asarray(alpha_obj.nodal_values, dtype=float)
+            phi_vals = np.clip(1.0 - phi_scale * alpha_vals, 0.0, 1.0)
+            phi_obj.nodal_values[:] = phi_vals
+            phi_latent_template = problem.get(f"phi_latent_{suffix}")
+            if phi_latent_template is not None:
+                phi_latent_obj = (
+                    _find_named_function(funcs_in, phi_latent_template)
+                    if funcs_in is not None
+                    else phi_latent_template
+                )
+                phi_latent_obj.nodal_values[:] = _latent_inverse_array(
+                    phi_vals,
+                    eps=latent_eps,
+                    map_kind=latent_map_kind,
+                )
 
     def _latent_transformed_active_fields(fields_in) -> list[str]:
         fields = []
@@ -11343,6 +12502,62 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                 _configure_vi_box_bounds(target_solver, funcs_in=funcs)
 
             target_solver.pre_cb = _refresh_vi_constraints
+            if isinstance(target_solver, PdasNewtonSolver) and not isinstance(target_solver, InteriorPointNewtonSolver):
+                skip_identified_manifold_recovery = bool(
+                    str(getattr(args, "one_domain_formulation", "")).strip().lower() == "final_form"
+                    and bool(getattr(args, "final_form_constant_rho_s", False))
+                    and bool(getattr(args, "final_form_quasistatic_porous_media", False))
+                    and str(getattr(args, "transport_update_mode", "")).strip().lower() == "monolithic"
+                    and not bool(getattr(args, "final_form_disable_pore_momentum", False))
+                    and not bool(getattr(args, "final_form_disable_solid_momentum", False))
+                    and not bool(getattr(args, "final_form_combined_porous_momentum", False))
+                    and bool(getattr(args, "final_form_internal_zero_dirichlet", False))
+                    and abs(float(getattr(args, "alpha_vS_gate_alpha0", 0.0) or 0.0)) <= 1.0e-12
+                )
+                available_fields = {str(name) for name in getattr(problem["dh"], "field_names", [])}
+                robust_prox_fields = tuple(
+                    name
+                    for name in (
+                        "v_x",
+                        "v_y",
+                        "p",
+                        "p_pore",
+                        "vS_x",
+                        "vS_y",
+                    )
+                    if name in available_fields
+                )
+                robust_ptc_fields = tuple(
+                    name
+                    for name in (
+                        "v_x",
+                        "v_y",
+                        "p",
+                        "p_pore",
+                        "vS_x",
+                        "vS_y",
+                        "u_x",
+                        "u_y",
+                    )
+                    if name in available_fields
+                )
+                if skip_identified_manifold_recovery:
+                    print(
+                        "    [solver] skipping identified-manifold PDAS recovery on the cleaned "
+                        "quasi-static final_form branch; it can lock a large working set and stall "
+                        "the resolved solve."
+                    )
+                else:
+                    target_solver.configure_identified_manifold_recovery(
+                        proximal_fields=robust_prox_fields,
+                        ptc_fields=robust_ptc_fields,
+                        arm_initial=False,
+                    )
+                    if robust_prox_fields or robust_ptc_fields:
+                        print(
+                            "    [solver] enabling identified-manifold PDAS recovery "
+                            f"(prox={robust_prox_fields}, ptc={robust_ptc_fields})."
+                        )
         else:
             target_solver = NewtonSolver(
                 forms_obj.residual_form,
@@ -11478,6 +12693,10 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             target_solver=target_solver,
         )
         _bind_solver_inactive_solid_interface_retagging(
+            problem=problem,
+            target_solver=target_solver,
+        )
+        _bind_solver_final_form_internal_zero_dirichlet(
             problem=problem,
             target_solver=target_solver,
         )
@@ -11626,14 +12845,134 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                 "physical alpha/phi state after the materially improved mechanics step."
             )
 
+    use_pdas_main_step_on_post_accept_interface_branch = bool(
+        bool(transport_update_post_accept)
+        and str(getattr(args, "one_domain_formulation", "")).strip().lower() == "final_form"
+        and bool(getattr(args, "final_form_constant_rho_s", False))
+        and bool(getattr(args, "final_form_quasistatic_porous_media", False))
+        and not bool(_final_form_direct_interface_transfer_enabled(args))
+    )
+    if use_pdas_main_step_on_post_accept_interface_branch:
+        print(
+            "    [solver] keeping PDAS on the post_accept main flow/solid step for the "
+            "quasi-static no-direct interface branch so the interface solve can reuse "
+            "the semismooth recovery package after transport is lagged out."
+        )
+
+    def _sum_main_stage_forms_now(*parts):
+        kept = [part for part in parts if part is not None]
+        if not kept:
+            raise ValueError("Main post_accept form assembly received no residual/Jacobian terms.")
+        total = kept[0]
+        for part in kept[1:]:
+            total = total + part
+        return total
+
+    def _build_post_accept_main_solver_forms_now(*, include_phi: bool):
+        return SimpleNamespace(
+            residual_form=_sum_main_stage_forms_now(
+                getattr(forms, "r_momentum", None),
+                getattr(forms, "r_mass", None),
+                getattr(forms, "r_pore", None),
+                getattr(forms, "r_skeleton", None),
+                getattr(forms, "r_kinematics", None),
+                (getattr(forms, "r_phi", None) if include_phi else None),
+                (getattr(forms, "r_substrate", None) if include_phi else None),
+                problem.get("_pressure_mean_residual_form"),
+                problem.get("_pressure_interface_residual_form"),
+                problem.get("_p_pore_fluid_gauge_residual_form"),
+                problem.get("_velocity_interface_residual_form"),
+                problem.get("_traction_interface_residual_form"),
+                problem.get("_entry_interface_residual_form"),
+                problem.get("_bjs_interface_residual_form"),
+                problem.get("_exact_interface_pressure_residual_form"),
+            ),
+            jacobian_form=_sum_main_stage_forms_now(
+                getattr(forms, "a_momentum", None),
+                getattr(forms, "a_mass", None),
+                getattr(forms, "a_pore", None),
+                getattr(forms, "a_skeleton", None),
+                getattr(forms, "a_kinematics", None),
+                (getattr(forms, "a_phi", None) if include_phi else None),
+                (getattr(forms, "a_substrate", None) if include_phi else None),
+                problem.get("_pressure_mean_jacobian_form"),
+                problem.get("_pressure_interface_jacobian_form"),
+                problem.get("_p_pore_fluid_gauge_jacobian_form"),
+                problem.get("_velocity_interface_jacobian_form"),
+                problem.get("_traction_interface_jacobian_form"),
+                problem.get("_entry_interface_jacobian_form"),
+                problem.get("_bjs_interface_jacobian_form"),
+                problem.get("_exact_interface_pressure_jacobian_form"),
+            ),
+        )
+
+    main_solver_forms = forms
+    if bool(transport_update_post_accept):
+        main_solver_forms = _build_post_accept_main_solver_forms_now(
+            include_phi=(not _post_accept_lag_phi_in_main(problem))
+        )
     solver = _make_solver(
-        forms,
+        main_solver_forms,
         postproc_cb=_record_step,
         max_newton_iter=int(args.max_it),
         accept_factor=float(main_accept_factor),
-        solver_kind=("newton" if bool(transport_update_post_accept) else None),
+        solver_kind=(
+            None
+            if bool(use_pdas_main_step_on_post_accept_interface_branch)
+            else ("newton" if bool(transport_update_post_accept) else None)
+        ),
         freeze_support_phi_bounds=True,
     )
+    if (
+        isinstance(solver, PdasNewtonSolver)
+        and not isinstance(solver, InteriorPointNewtonSolver)
+        and bool(main_qs_final_form_semismooth_tuning)
+        and (
+            (not bool(transport_update_post_accept))
+            or bool(use_pdas_main_step_on_post_accept_interface_branch)
+        )
+    ):
+        available_fields = {str(name) for name in getattr(problem["dh"], "field_names", [])}
+        robust_prox_fields = tuple(
+            name
+            for name in ("v_x", "v_y", "p", "p_pore", "vS_x", "vS_y")
+            if name in available_fields
+        )
+        robust_ptc_fields = tuple(
+            name
+            for name in ("v_x", "v_y", "p", "p_pore", "vS_x", "vS_y", "u_x", "u_y")
+            if name in available_fields
+        )
+        skip_main_identified_manifold_recovery = bool(
+            str(getattr(args, "one_domain_formulation", "")).strip().lower() == "final_form"
+            and bool(getattr(args, "final_form_constant_rho_s", False))
+            and bool(getattr(args, "final_form_quasistatic_porous_media", False))
+            and str(getattr(args, "transport_update_mode", "")).strip().lower() == "monolithic"
+            and not bool(getattr(args, "final_form_disable_pore_momentum", False))
+            and not bool(getattr(args, "final_form_disable_solid_momentum", False))
+            and not bool(getattr(args, "final_form_combined_porous_momentum", False))
+            and bool(getattr(args, "final_form_domain_lm_phi", False))
+            and bool(getattr(args, "final_form_domain_lm_p_pore", False))
+            and bool(getattr(args, "final_form_internal_zero_dirichlet", False))
+            and abs(float(getattr(args, "alpha_vS_gate_alpha0", 0.0) or 0.0)) <= 1.0e-12
+        )
+        if skip_main_identified_manifold_recovery:
+            print(
+                "    [solver] leaving main-step identified-manifold PDAS recovery disabled on the "
+                "cleaned quasi-static final_form branch; the main exact solve needs the resolved "
+                "monolithic step more than another identified-manifold lock-in."
+            )
+        else:
+            solver.configure_identified_manifold_recovery(
+                proximal_fields=robust_prox_fields,
+                ptc_fields=robust_ptc_fields,
+                arm_initial=False,
+            )
+            if robust_prox_fields or robust_ptc_fields:
+                print(
+                    "    [solver] enabling main-step identified-manifold PDAS recovery "
+                    f"(prox={robust_prox_fields}, ptc={robust_ptc_fields})."
+                )
     if bool(transport_update_post_accept):
         solver.np.newton_rtol = max(float(getattr(args, "newton_rtol", 0.0) or 0.0), 0.0)
         if mesh_mode == "adaptive_interface_band_numba" and float(solver.np.newton_rtol) == 0.0:
@@ -11651,7 +12990,7 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             transport_fields_preview.append("alpha_mass_lm")
         if problem.get("alpha_latent_k") is not None:
             transport_fields_preview.append("alpha_latent")
-        if lag_phi_in_main and problem["phi_k"] is not None:
+        if bool(_post_accept_transport_include_phi(problem)) and problem["phi_k"] is not None:
             transport_fields_preview.append("phi")
             if problem.get("phi_latent_k") is not None:
                 transport_fields_preview.append("phi_latent")
@@ -11681,16 +13020,13 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         if problem.get("pi_s_k") is not None:
             main_active_fields.append("pi_s")
         if bool(problem.get("final_form", False)):
-            for name, key in (
-                ("mu_mass", "mu_mass_k"),
-                ("mu_normal", "mu_normal_k"),
-                ("mu_tangent", "mu_tangent_k"),
-            ):
-                if problem.get(key) is not None:
-                    main_active_fields.append(name)
-            if problem.get("mu_kin_k") is not None:
-                main_active_fields.extend(["mu_kin_x", "mu_kin_y"])
-            main_active_fields.extend(_final_form_domain_lm_active_fields(problem))
+            main_active_fields.extend(_final_form_interface_lm_active_fields(problem))
+            main_active_fields.extend(
+                _final_form_domain_lm_active_fields(
+                    problem,
+                    include_phi_lm=(not lag_phi_in_main),
+                )
+            )
         main_active_fields = _latent_transformed_active_fields(main_active_fields)
         _set_solver_active_fields_with_tracking(solver, main_active_fields)
         if hasattr(solver, "set_linear_equalities"):
@@ -11753,6 +13089,162 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             "    [solver] rigid_support_diagnostic active fields "
             f"{tuple(rigid_active_fields)}; support/solid/transport fields are frozen."
         )
+
+    def _snapshot_solver_vi_recovery_baseline(solver_obj) -> None:
+        nonlocal base_vi_nonmono_window
+        nonlocal base_vi_nonmono_stable_iters
+        nonlocal base_vi_nonmono_ginf_trigger
+        nonlocal base_vi_nonmono_gap_ratio
+        nonlocal base_vi_nonmono_eq_abs
+        nonlocal base_vi_nonmono_disable_filter
+        nonlocal base_vi_accept_best_filtered_descent
+        nonlocal base_vi_lm_max_tries
+        nonlocal base_vi_lm_lambda_max
+        nonlocal base_vi_affine_cycle_fallback
+        nonlocal base_vi_affine_identified_acceleration
+        nonlocal base_vi_affine_identified_stable_iters
+        nonlocal base_vi_affine_identified_ginf_trigger
+        nonlocal base_vi_working_set_guard_after_affine
+        nonlocal base_vi_field_proximal_recovery
+        nonlocal base_vi_field_proximal_recovery_fields
+        nonlocal base_vi_field_proximal_recovery_lambda0
+        nonlocal base_vi_field_proximal_recovery_lambda_max
+        nonlocal base_vi_field_proximal_recovery_growth
+        nonlocal base_vi_field_proximal_recovery_max_tries
+        nonlocal base_vi_field_proximal_recovery_stable_iters
+        nonlocal base_vi_field_proximal_recovery_ginf_trigger
+        nonlocal base_vi_field_proximal_recovery_gap_ratio
+        nonlocal base_vi_field_proximal_recovery_eq_abs
+        nonlocal base_vi_field_proximal_recovery_identified_window
+        nonlocal base_vi_field_proximal_recovery_ginf_max
+        nonlocal base_vi_ptc_recovery
+        nonlocal base_vi_ptc_fields
+        nonlocal base_vi_ptc_sigma0
+        nonlocal base_vi_ptc_sigma_max
+        nonlocal base_vi_ptc_growth
+        nonlocal base_vi_ptc_decay
+        nonlocal base_vi_ptc_stable_iters
+        nonlocal base_vi_ptc_ginf_trigger
+        nonlocal base_vi_ptc_gap_ratio
+        nonlocal base_vi_ptc_eq_abs
+        nonlocal base_vi_ptc_ginf_max
+        nonlocal base_vi_ptc_identified_window
+        nonlocal base_vi_ptc_freeze_complement
+        nonlocal base_vi_anderson_acceleration
+        nonlocal base_vi_anderson_history
+        nonlocal base_vi_anderson_regularization
+        nonlocal base_vi_anderson_damping
+        nonlocal base_vi_anderson_stable_iters
+        nonlocal base_vi_anderson_ginf_trigger
+        nonlocal base_vi_anderson_gap_ratio
+        nonlocal base_vi_anderson_eq_abs
+        nonlocal base_vi_anderson_ginf_max
+
+        vi = getattr(solver_obj, "vi_params", None)
+        if vi is None:
+            return
+        base_vi_nonmono_window = int(getattr(vi, "line_search_nonmonotone_window", 0) or 0)
+        base_vi_nonmono_stable_iters = int(getattr(vi, "line_search_nonmonotone_active_stable_iters", 0) or 0)
+        base_vi_nonmono_ginf_trigger = float(getattr(vi, "line_search_nonmonotone_ginf_trigger", 0.0) or 0.0)
+        base_vi_nonmono_gap_ratio = float(getattr(vi, "line_search_nonmonotone_gap_ratio", 1.0) or 1.0)
+        base_vi_nonmono_eq_abs = float(getattr(vi, "line_search_nonmonotone_eq_abs", 1.0e-10) or 1.0e-10)
+        base_vi_nonmono_disable_filter = bool(getattr(vi, "line_search_nonmonotone_disable_filter", False))
+        base_vi_accept_best_filtered_descent = bool(getattr(vi, "accept_best_filtered_descent", False))
+        base_vi_lm_max_tries = int(getattr(vi, "unconstrained_lm_max_tries", base_vi_lm_max_tries) or base_vi_lm_max_tries)
+        base_vi_lm_lambda_max = float(getattr(vi, "unconstrained_lm_lambda_max", base_vi_lm_lambda_max) or base_vi_lm_lambda_max)
+        base_vi_affine_cycle_fallback = bool(getattr(vi, "affine_cycle_fallback", False))
+        base_vi_affine_identified_acceleration = bool(getattr(vi, "affine_identified_acceleration", False))
+        base_vi_affine_identified_stable_iters = int(
+            getattr(vi, "affine_identified_stable_iters", base_vi_affine_identified_stable_iters)
+            or base_vi_affine_identified_stable_iters
+        )
+        base_vi_affine_identified_ginf_trigger = float(
+            getattr(vi, "affine_identified_ginf_trigger", base_vi_affine_identified_ginf_trigger)
+            or base_vi_affine_identified_ginf_trigger
+        )
+        base_vi_working_set_guard_after_affine = int(
+            getattr(vi, "working_set_guard_after_affine", base_vi_working_set_guard_after_affine)
+            or base_vi_working_set_guard_after_affine
+        )
+        base_vi_field_proximal_recovery = bool(getattr(vi, "field_proximal_recovery", False))
+        base_vi_field_proximal_recovery_fields = tuple(getattr(vi, "field_proximal_recovery_fields", ()) or ())
+        base_vi_field_proximal_recovery_lambda0 = float(
+            getattr(vi, "field_proximal_recovery_lambda0", base_vi_field_proximal_recovery_lambda0)
+            or base_vi_field_proximal_recovery_lambda0
+        )
+        base_vi_field_proximal_recovery_lambda_max = float(
+            getattr(vi, "field_proximal_recovery_lambda_max", base_vi_field_proximal_recovery_lambda_max)
+            or base_vi_field_proximal_recovery_lambda_max
+        )
+        base_vi_field_proximal_recovery_growth = float(
+            getattr(vi, "field_proximal_recovery_growth", base_vi_field_proximal_recovery_growth)
+            or base_vi_field_proximal_recovery_growth
+        )
+        base_vi_field_proximal_recovery_max_tries = int(
+            getattr(vi, "field_proximal_recovery_max_tries", base_vi_field_proximal_recovery_max_tries)
+            or base_vi_field_proximal_recovery_max_tries
+        )
+        base_vi_field_proximal_recovery_stable_iters = int(
+            getattr(vi, "field_proximal_recovery_stable_iters", base_vi_field_proximal_recovery_stable_iters)
+            or base_vi_field_proximal_recovery_stable_iters
+        )
+        base_vi_field_proximal_recovery_ginf_trigger = float(
+            getattr(vi, "field_proximal_recovery_ginf_trigger", base_vi_field_proximal_recovery_ginf_trigger)
+            or base_vi_field_proximal_recovery_ginf_trigger
+        )
+        base_vi_field_proximal_recovery_gap_ratio = float(
+            getattr(vi, "field_proximal_recovery_gap_ratio", base_vi_field_proximal_recovery_gap_ratio)
+            or base_vi_field_proximal_recovery_gap_ratio
+        )
+        base_vi_field_proximal_recovery_eq_abs = float(
+            getattr(vi, "field_proximal_recovery_eq_abs", base_vi_field_proximal_recovery_eq_abs)
+            or base_vi_field_proximal_recovery_eq_abs
+        )
+        base_vi_field_proximal_recovery_identified_window = bool(
+            getattr(vi, "field_proximal_recovery_identified_window", base_vi_field_proximal_recovery_identified_window)
+        )
+        base_vi_field_proximal_recovery_ginf_max = float(
+            getattr(vi, "field_proximal_recovery_ginf_max", base_vi_field_proximal_recovery_ginf_max)
+            or base_vi_field_proximal_recovery_ginf_max
+        )
+        base_vi_ptc_recovery = bool(getattr(vi, "ptc_recovery", False))
+        base_vi_ptc_fields = tuple(getattr(vi, "ptc_fields", ()) or ())
+        base_vi_ptc_sigma0 = float(getattr(vi, "ptc_sigma0", base_vi_ptc_sigma0) or base_vi_ptc_sigma0)
+        base_vi_ptc_sigma_max = float(getattr(vi, "ptc_sigma_max", base_vi_ptc_sigma_max) or base_vi_ptc_sigma_max)
+        base_vi_ptc_growth = float(getattr(vi, "ptc_growth", base_vi_ptc_growth) or base_vi_ptc_growth)
+        base_vi_ptc_decay = float(getattr(vi, "ptc_decay", base_vi_ptc_decay) or base_vi_ptc_decay)
+        base_vi_ptc_stable_iters = int(getattr(vi, "ptc_stable_iters", base_vi_ptc_stable_iters) or base_vi_ptc_stable_iters)
+        base_vi_ptc_ginf_trigger = float(
+            getattr(vi, "ptc_ginf_trigger", base_vi_ptc_ginf_trigger) or base_vi_ptc_ginf_trigger
+        )
+        base_vi_ptc_gap_ratio = float(getattr(vi, "ptc_gap_ratio", base_vi_ptc_gap_ratio) or base_vi_ptc_gap_ratio)
+        base_vi_ptc_eq_abs = float(getattr(vi, "ptc_eq_abs", base_vi_ptc_eq_abs) or base_vi_ptc_eq_abs)
+        base_vi_ptc_ginf_max = float(getattr(vi, "ptc_ginf_max", base_vi_ptc_ginf_max) or base_vi_ptc_ginf_max)
+        base_vi_ptc_identified_window = bool(getattr(vi, "ptc_identified_window", base_vi_ptc_identified_window))
+        base_vi_ptc_freeze_complement = bool(getattr(vi, "ptc_freeze_complement", base_vi_ptc_freeze_complement))
+        base_vi_anderson_acceleration = bool(getattr(vi, "anderson_acceleration", False))
+        base_vi_anderson_history = int(getattr(vi, "anderson_history", base_vi_anderson_history) or base_vi_anderson_history)
+        base_vi_anderson_regularization = float(
+            getattr(vi, "anderson_regularization", base_vi_anderson_regularization) or base_vi_anderson_regularization
+        )
+        base_vi_anderson_damping = float(getattr(vi, "anderson_damping", base_vi_anderson_damping) or base_vi_anderson_damping)
+        base_vi_anderson_stable_iters = int(
+            getattr(vi, "anderson_stable_iters", base_vi_anderson_stable_iters) or base_vi_anderson_stable_iters
+        )
+        base_vi_anderson_ginf_trigger = float(
+            getattr(vi, "anderson_ginf_trigger", base_vi_anderson_ginf_trigger) or base_vi_anderson_ginf_trigger
+        )
+        base_vi_anderson_gap_ratio = float(
+            getattr(vi, "anderson_gap_ratio", base_vi_anderson_gap_ratio) or base_vi_anderson_gap_ratio
+        )
+        base_vi_anderson_eq_abs = float(
+            getattr(vi, "anderson_eq_abs", base_vi_anderson_eq_abs) or base_vi_anderson_eq_abs
+        )
+        base_vi_anderson_ginf_max = float(
+            getattr(vi, "anderson_ginf_max", base_vi_anderson_ginf_max) or base_vi_anderson_ginf_max
+        )
+
+    _snapshot_solver_vi_recovery_baseline(solver)
     base_solver_relaxed_accept_ginf = float(
         getattr(getattr(solver, "vi_params", None), "relaxed_filter_accept_ginf", 0.0) or 0.0
     )
@@ -11933,7 +13425,10 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                 1.0e-10,
             )
             solver.vi_params.field_proximal_recovery_identified_window = True
-            solver.vi_params.field_proximal_recovery_ginf_max = 2.0e-1
+            solver.vi_params.field_proximal_recovery_ginf_max = max(
+                float(base_vi_field_proximal_recovery_ginf_max),
+                2.0,
+            )
             # True identified-manifold local solve on the mechanics block:
             # freeze transport, regularize the mechanics saddle block with a
             # pseudo-time term, and let Anderson accelerate the resulting fixed
@@ -11956,8 +13451,8 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             solver.vi_params.ptc_gap_ratio = max(float(base_vi_ptc_gap_ratio), 1.0)
             solver.vi_params.ptc_eq_abs = max(float(base_vi_ptc_eq_abs), 1.0e-10)
             solver.vi_params.ptc_identified_window = True
-            solver.vi_params.ptc_ginf_max = max(float(base_vi_ptc_ginf_max), 2.0e-1)
-            solver.vi_params.ptc_freeze_complement = True
+            solver.vi_params.ptc_ginf_max = max(float(base_vi_ptc_ginf_max), 2.0)
+            solver.vi_params.ptc_freeze_complement = False
             solver.vi_params.anderson_acceleration = True
             solver.vi_params.anderson_history = max(int(base_vi_anderson_history), 3)
             solver.vi_params.anderson_regularization = max(
@@ -11981,7 +13476,7 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             )
             solver.vi_params.anderson_gap_ratio = max(float(base_vi_anderson_gap_ratio), 1.0)
             solver.vi_params.anderson_eq_abs = max(float(base_vi_anderson_eq_abs), 1.0e-10)
-            solver.vi_params.anderson_ginf_max = max(float(base_vi_anderson_ginf_max), 2.0e-1)
+            solver.vi_params.anderson_ginf_max = max(float(base_vi_anderson_ginf_max), 2.0)
 
     def _on_dt_change(new_dt: float) -> None:
         dt_c.value = float(new_dt)
@@ -12157,13 +13652,21 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         "near_converged_retry_attempts": 0,
         "later_step_stage_retry_attempts": 0,
         "frozen_transport_retry_attempts": 0,
+        "linear_quality_retry_attempts": 0,
         "pc_p2_reentry_retry_attempts": 0,
         "pc_last_successful_lambda": None,
         "last_accepted_step_no": None,
         "last_accepted_delta_inf": None,
+        "last_accepted_delta_inf_raw": None,
         "step1_relaxed_mechanics_tol_active": False,
         "step1_transport_predictor_snapshot": None,
         "step1_transport_predictor_vi_state": None,
+        "restore_linear_backend_after_step_no": None,
+        "restore_linear_backend_name": None,
+        "restore_relaxed_accept_after_step_no": None,
+        "restore_relaxed_accept_value": None,
+        "skip_later_step_staggered_guess_until_step_no": None,
+        "substep_continuation_active": False,
     }
     bootstrap_solver_cache: dict[str, object] = {}
     startup_stage_solver_cache: dict[str, object] = {}
@@ -12457,7 +13960,7 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         return [bc for bc in list(bcs_in or []) if str(getattr(bc, "field", "")) in allowed]
 
     def _post_accept_lag_phi_enabled() -> bool:
-        return _post_accept_lag_phi_in_main(problem)
+        return _post_accept_transport_include_phi(problem)
 
     def _set_final_form_mass_interface_weight(weight: float) -> None:
         weight_c = problem.get("final_form_mass_interface_weight_c", None)
@@ -12540,13 +14043,7 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         if problem.get("p_mean_k") is not None:
             fields.append("p_mean")
         fields.extend(_primary_darcy_field_names(problem))
-        for name, key in (
-            ("mu_mass", "mu_mass_k"),
-            ("mu_normal", "mu_normal_k"),
-            ("mu_tangent", "mu_tangent_k"),
-        ):
-            if problem.get(key) is not None:
-                fields.append(name)
+        fields.extend(_final_form_interface_lm_active_fields(problem))
         _extend_unique_startup_fields(fields, _final_form_domain_lm_flow_stage_fields(problem))
         return fields
 
@@ -12566,6 +14063,7 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             fields.append("alpha_mass_lm")
         if problem.get("alpha_latent_k") is not None:
             fields.append("alpha_latent")
+        include_phi = bool(include_phi and not _final_form_phi_is_algebraic(problem))
         if include_phi and problem["phi_k"] is not None:
             fields.append("phi")
             if problem.get("phi_latent_k") is not None:
@@ -12604,13 +14102,7 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         if problem.get("pi_s_k") is not None:
             fields.append("pi_s")
         if bool(problem.get("final_form", False)):
-            for name, key in (
-                ("mu_mass", "mu_mass_k"),
-                ("mu_normal", "mu_normal_k"),
-                ("mu_tangent", "mu_tangent_k"),
-            ):
-                if problem.get(key) is not None:
-                    fields.append(name)
+            fields.extend(_final_form_interface_lm_active_fields(problem))
         _extend_unique_startup_fields(fields, _final_form_domain_lm_solid_stage_fields(problem))
         return _latent_transformed_active_fields(fields)
 
@@ -12625,17 +14117,13 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             "mu_alpha": "mu_k",
             "alpha_mass_lm": "alpha_mass_lm_k",
             "alpha_latent": "alpha_latent_k",
-            "mu_mass": "mu_mass_k",
-            "mu_normal": "mu_normal_k",
-            "mu_tangent": "mu_tangent_k",
         }
         for name, key in field_keys.items():
             if problem.get(key) is not None and name not in fields:
                 fields.append(name)
-        if problem.get("mu_kin_k") is not None:
-            for name in ("mu_kin_x", "mu_kin_y"):
-                if name not in fields:
-                    fields.append(name)
+        for name in _final_form_interface_lm_active_fields(problem):
+            if name not in fields:
+                fields.append(name)
         return _latent_transformed_active_fields(fields)
 
     def _startup_predictor_p2_fields() -> list[str]:
@@ -12656,11 +14144,6 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             ("u_y", "u_k"),
             ("alpha", "alpha_k"),
             ("rho_s", "rho_s_k"),
-            ("mu_mass", "mu_mass_k"),
-            ("mu_normal", "mu_normal_k"),
-            ("mu_tangent", "mu_tangent_k"),
-            ("mu_kin_x", "mu_kin_k"),
-            ("mu_kin_y", "mu_kin_k"),
             ("B", "B_k"),
             ("mu_alpha", "mu_k"),
             ("alpha_latent", "alpha_latent_k"),
@@ -12672,6 +14155,9 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             if name == "rho_s" and (_final_form_freeze_rho_s(problem) or _final_form_constant_rho_s(problem)):
                 continue
             if problem.get(key) is not None and name not in fields:
+                fields.append(name)
+        for name in _final_form_interface_lm_active_fields(problem):
+            if name not in fields:
                 fields.append(name)
         for name in _primary_darcy_field_names(problem):
             if name not in fields:
@@ -12716,6 +14202,7 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             transport_solver_kind_override=str(getattr(args, "startup_transport_solver", "auto")),
         )
         stage_relaxed_accept_ginf = float(startup_stage_relaxed_ginf)
+        stage_accept_factor = float(startup_stage_accept_factor)
         if stage_name == "transport" and stage_solver_kind in {"pdas", "ipm"}:
             # The staged transport solve is only a predictor for the monolithic
             # retry. If it already reaches a tightly identified bounded state
@@ -12752,6 +14239,26 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             # stage residual is in that range and let the following exact
             # monolithic/P1/P2 solves recouple phi and interface physics.
             stage_relaxed_accept_ginf = max(stage_relaxed_accept_ginf, 2.0e-3)
+            if (
+                str(getattr(args, "one_domain_formulation", "")).strip().lower() == "final_form"
+                and bool(getattr(args, "final_form_constant_rho_s", False))
+                and bool(getattr(args, "final_form_quasistatic_porous_media", False))
+                and str(getattr(args, "transport_update_mode", "")).strip().lower() == "monolithic"
+                and not bool(getattr(args, "final_form_disable_pore_momentum", False))
+                and not bool(getattr(args, "final_form_disable_solid_momentum", False))
+                and not bool(getattr(args, "final_form_combined_porous_momentum", False))
+                and bool(getattr(args, "final_form_internal_zero_dirichlet", False))
+                and abs(float(getattr(args, "alpha_vS_gate_alpha0", 0.0) or 0.0)) <= 1.0e-12
+            ):
+                # The frozen-transport solid stage is only a nonlinear
+                # preconditioner. On the cleaned quasi-static final_form branch
+                # it can reach a useful O(1e-5..1e-4) exact residual and then
+                # stall while the frozen transport rows keep the coupled raw
+                # residual large. Keep that best-effort mechanics iterate so the
+                # outer frozen-transport homotopy can continue instead of
+                # aborting the whole restart at the first partially converged
+                # solid sweep.
+                stage_accept_factor = max(stage_accept_factor, 100.0)
         target_solver = _make_solver(
             SimpleNamespace(residual_form=residual_form, jacobian_form=jacobian_form),
             postproc_cb=None,
@@ -12768,7 +14275,7 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             # Keep this relaxed, but cap it tightly enough that obviously
             # nonconverged PDAS states (|G|=O(1..10)) are not accepted as
             # startup guesses in the stiff low-kappa cases.
-            accept_factor=float(startup_stage_accept_factor),
+            accept_factor=float(stage_accept_factor),
             relaxed_accept_ginf=float(stage_relaxed_accept_ginf),
             solver_kind=stage_solver_kind,
             bcs_in=stage_bcs,
@@ -12784,6 +14291,56 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         startup_stage_solver_cache[cache_key] = target_solver
         return target_solver
 
+    def _get_post_accept_main_solver_forms(*, include_phi: bool):
+        return SimpleNamespace(
+            residual_form=_sum_stage_forms(
+                getattr(forms, "r_momentum", None),
+                getattr(forms, "r_mass", None),
+                getattr(forms, "r_pore", None),
+                getattr(forms, "r_skeleton", None),
+                getattr(forms, "r_kinematics", None),
+                (getattr(forms, "r_phi", None) if include_phi else None),
+                (getattr(forms, "r_substrate", None) if include_phi else None),
+                problem.get("_pressure_mean_residual_form"),
+                problem.get("_pressure_interface_residual_form"),
+                problem.get("_p_pore_fluid_gauge_residual_form"),
+                problem.get("_velocity_interface_residual_form"),
+                problem.get("_traction_interface_residual_form"),
+                problem.get("_entry_interface_residual_form"),
+                problem.get("_bjs_interface_residual_form"),
+                problem.get("_exact_interface_pressure_residual_form"),
+            ),
+            jacobian_form=_sum_stage_forms(
+                getattr(forms, "a_momentum", None),
+                getattr(forms, "a_mass", None),
+                getattr(forms, "a_pore", None),
+                getattr(forms, "a_skeleton", None),
+                getattr(forms, "a_kinematics", None),
+                (getattr(forms, "a_phi", None) if include_phi else None),
+                (getattr(forms, "a_substrate", None) if include_phi else None),
+                problem.get("_pressure_mean_jacobian_form"),
+                problem.get("_pressure_interface_jacobian_form"),
+                problem.get("_p_pore_fluid_gauge_jacobian_form"),
+                problem.get("_velocity_interface_jacobian_form"),
+                problem.get("_traction_interface_jacobian_form"),
+                problem.get("_entry_interface_jacobian_form"),
+                problem.get("_bjs_interface_jacobian_form"),
+                problem.get("_exact_interface_pressure_jacobian_form"),
+            ),
+        )
+
+    def _get_transport_alpha_stage_forms():
+        return SimpleNamespace(
+            residual_form=getattr(forms, "r_alpha_transport", getattr(forms, "r_alpha", None)),
+            jacobian_form=getattr(forms, "a_alpha_transport", getattr(forms, "a_alpha", None)),
+        )
+
+    def _get_transport_phi_stage_forms():
+        return SimpleNamespace(
+            residual_form=getattr(forms, "r_phi_transport", getattr(forms, "r_phi", None)),
+            jacobian_form=getattr(forms, "a_phi_transport", getattr(forms, "a_phi", None)),
+        )
+
     def _get_startup_staggered_solvers():
         flow_solver = startup_stage_solver_cache.get("flow")
         transport_solver = startup_stage_solver_cache.get("transport")
@@ -12793,8 +14350,10 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         if not _forms_support_startup_staggered(forms):
             return None
         flow_fields = _startup_flow_stage_fields()
-        transport_fields = _startup_transport_stage_fields()
+        transport_fields = _startup_transport_stage_fields(include_phi=_post_accept_transport_include_phi(problem))
         solid_fields = _startup_solid_stage_fields()
+        transport_alpha_forms = _get_transport_alpha_stage_forms()
+        transport_phi_forms = _get_transport_phi_stage_forms()
         r_mom_terms = getattr(forms, "r_momentum_terms", None) or {}
         a_mom_terms = getattr(forms, "a_momentum_terms", None) or {}
         flow_solver = _make_startup_stage_solver(
@@ -12816,20 +14375,20 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         transport_solver = _make_startup_stage_solver(
             stage_name="transport",
             residual_form=_sum_stage_forms(
-                getattr(forms, "r_alpha", None),
+                transport_alpha_forms.residual_form,
                 getattr(forms, "r_B", None),
                 getattr(forms, "r_mu_alpha", None),
                 problem.get("_alpha_mass_constraint_residual_form"),
-                getattr(forms, "r_phi", None),
-                getattr(forms, "r_substrate", None),
+                (transport_phi_forms.residual_form if _post_accept_transport_include_phi(problem) else None),
+                (getattr(forms, "r_substrate", None) if _post_accept_transport_include_phi(problem) else None),
             ),
             jacobian_form=_sum_stage_forms(
-                getattr(forms, "a_alpha", None),
+                transport_alpha_forms.jacobian_form,
                 getattr(forms, "a_B", None),
                 getattr(forms, "a_mu_alpha", None),
                 problem.get("_alpha_mass_constraint_jacobian_form"),
-                getattr(forms, "a_phi", None),
-                getattr(forms, "a_substrate", None),
+                (transport_phi_forms.jacobian_form if _post_accept_transport_include_phi(problem) else None),
+                (getattr(forms, "a_substrate", None) if _post_accept_transport_include_phi(problem) else None),
             ),
             active_fields=transport_fields,
         )
@@ -12876,22 +14435,24 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             return None
         if not _forms_support_startup_staggered(forms):
             return None
+        transport_alpha_forms = _get_transport_alpha_stage_forms()
+        transport_phi_forms = _get_transport_phi_stage_forms()
         target_solver = _make_startup_stage_solver(
             stage_name="post_accept_transport",
             residual_form=_sum_stage_forms(
-                getattr(forms, "r_alpha", None),
+                transport_alpha_forms.residual_form,
                 getattr(forms, "r_B", None),
                 getattr(forms, "r_mu_alpha", None),
                 problem.get("_alpha_mass_constraint_residual_form"),
-                (getattr(forms, "r_phi", None) if include_phi else None),
+                (transport_phi_forms.residual_form if include_phi else None),
                 (getattr(forms, "r_substrate", None) if include_phi else None),
             ),
             jacobian_form=_sum_stage_forms(
-                getattr(forms, "a_alpha", None),
+                transport_alpha_forms.jacobian_form,
                 getattr(forms, "a_B", None),
                 getattr(forms, "a_mu_alpha", None),
                 problem.get("_alpha_mass_constraint_jacobian_form"),
-                (getattr(forms, "a_phi", None) if include_phi else None),
+                (transport_phi_forms.jacobian_form if include_phi else None),
                 (getattr(forms, "a_substrate", None) if include_phi else None),
             ),
             active_fields=transport_fields,
@@ -13149,13 +14710,16 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             aux_funcs=aux_funcs,
             bcs_now=bcs_now,
         )
-        homotopy_raw_inf = _current_stage_raw_residual_inf(
-            stage_solver=stage_solver,
-            funcs=funcs,
-            prev_funcs=prev_funcs,
-            aux_funcs=aux_funcs,
-            bcs_now=(bcs_now if stage_bcs_now is None else stage_bcs_now),
-        )
+        if stage_solver is None and stage_bcs_now is None:
+            homotopy_raw_inf = float(exact_raw_inf)
+        else:
+            homotopy_raw_inf = _current_stage_raw_residual_inf(
+                stage_solver=stage_solver,
+                funcs=funcs,
+                prev_funcs=prev_funcs,
+                aux_funcs=aux_funcs,
+                bcs_now=(bcs_now if stage_bcs_now is None else stage_bcs_now),
+            )
         alpha_mass_rel = _current_alpha_mass_relative_defect(funcs=funcs, prev_funcs=prev_funcs)
         mass_weight = max(0.0, float(getattr(args, "pc_energy_mass_weight", 1.0) or 0.0))
         exact_energy = float("nan")
@@ -13462,6 +15026,20 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         if abs(delta_lambda) <= 1.0e-15:
             return None
         predictor_snapshot = _snapshot_function_values(funcs)
+        capture_vi_classification = getattr(p2_solver, "_vi_capture_classification_state", None)
+        restore_vi_classification = getattr(p2_solver, "_vi_restore_classification_state", None)
+        predictor_vi_classification = (
+            capture_vi_classification()
+            if callable(capture_vi_classification)
+            else None
+        )
+        export_vi_state = getattr(p2_solver, "export_vi_state", None)
+        import_vi_state = getattr(p2_solver, "import_vi_state", None)
+        predictor_vi_state = (
+            export_vi_state()
+            if callable(export_vi_state)
+            else None
+        )
         try:
             p2_lambda.value = float(lam0)
             problem["dh"].apply_bcs(p2_bcs_now, *funcs)
@@ -13576,13 +15154,39 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                 best_stats = dict(cand_stats)
                 best_alpha = float(alpha)
                 best_mass_ok = bool(cand_mass_ok)
-        _restore_function_values(funcs, best_snapshot)
-        p2_lambda.value = float(lam1)
         if best_stats is None:
+            _restore_function_values(funcs, predictor_snapshot)
+            p2_lambda.value = float(lam1)
+            if callable(restore_vi_classification):
+                restore_vi_classification(predictor_vi_classification)
+            elif callable(import_vi_state) and predictor_vi_state is not None:
+                import_vi_state(predictor_vi_state, force_once=True)
             return {
                 "used": False,
                 "exception": "no_finite_candidate",
             }
+        if best_alpha <= 1.0e-15:
+            _restore_function_values(funcs, predictor_snapshot)
+        else:
+            _restore_function_values(funcs, best_snapshot)
+        p2_lambda.value = float(lam1)
+        problem["dh"].apply_bcs(p2_bcs_now, *funcs)
+        if getattr(p2_solver, "constraints", None) is not None:
+            p2_solver._enforce_constraints_on_functions(funcs)
+        if callable(restore_vi_classification):
+            restore_vi_classification(predictor_vi_classification)
+        elif callable(import_vi_state) and predictor_vi_state is not None:
+            import_vi_state(predictor_vi_state, force_once=True)
+        if best_alpha <= 1.0e-15:
+            best_snapshot = _snapshot_function_values(funcs)
+            best_stats = _current_predictor_corrector_energy(
+                funcs=funcs,
+                prev_funcs=prev_funcs,
+                aux_funcs=aux_funcs,
+                bcs_now=bcs_now,
+                stage_solver=p2_solver,
+                stage_bcs_now=p2_bcs_now,
+            )
         print(
             f"    [pc] {stage_label} tangent predictor solved H_z z_dot + H_lambda = 0 "
             f"for delta_lambda={delta_lambda:.3f} and kept alpha={best_alpha:.3f} "
@@ -13731,9 +15335,18 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             gamma_rho_s_pin=float(args.gamma_rho_s_pin),
             final_form_constant_rho_s=bool(args.final_form_constant_rho_s),
             final_form_domain_lm=bool(getattr(args, "final_form_domain_lm", False)),
+            final_form_domain_lm_vP_tie_vf=bool(getattr(args, "final_form_domain_lm_vP_tie_vf", False)),
+            final_form_domain_lm_p_pore_tie_p=bool(getattr(args, "final_form_domain_lm_p_pore_tie_p", False)),
             final_form_domain_lm_aug_gamma=float(getattr(args, "final_form_domain_lm_aug_gamma", 10.0)),
+            final_form_domain_lm_free_weight_mode=str(
+                getattr(args, "final_form_domain_lm_free_weight_mode", "diffuse")
+            ),
+            final_form_domain_lm_free_alpha_max=getattr(args, "final_form_domain_lm_free_alpha_max", None),
             final_form_mass_lm_aug_gamma=float(getattr(args, "final_form_mass_lm_aug_gamma", 1.0)),
             final_form_normal_lm_aug_gamma=float(getattr(args, "final_form_normal_lm_aug_gamma", 1.0)),
+            final_form_quasistatic_flip_pore_stress_sign=bool(
+                getattr(args, "final_form_quasistatic_flip_pore_stress_sign", False)
+            ),
             phi_supg=float(args.phi_supg),
             phi_cip=float(args.phi_cip),
             alpha_supg=float(args.alpha_supg),
@@ -14280,8 +15893,13 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         t_fail: float,
         dt_fail: float,
         reason: str,
+        require_startup_enabled: bool = True,
+        stage_label_prefix: str = "P2-reentry",
     ) -> dict[str, object] | None:
-        if not _predictor_corrector_startup_enabled(args, problem):
+        if require_startup_enabled:
+            if not _predictor_corrector_startup_enabled(args, problem):
+                return None
+        elif (not bool(getattr(args, "enable_phi_evolution", False))) or problem.get("phi_k") is None:
             return None
         p2_solver = _prime_predictor_corrector_p2_solver()
         if p2_solver is None:
@@ -14297,13 +15915,22 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         p2_solver._current_dt = float(dt_fail)
         p2_solver._current_step_no = int(step_no)
         base_snapshot = _snapshot_function_values(funcs)
+        p2_export_vi_state = getattr(p2_solver, "export_vi_state", None)
+        p2_import_vi_state = getattr(p2_solver, "import_vi_state", None)
+        base_vi_state = (
+            p2_export_vi_state()
+            if callable(p2_export_vi_state)
+            else None
+        )
         base_stats = _current_predictor_corrector_energy(
             funcs=funcs,
             prev_funcs=prev_funcs,
             aux_funcs=aux_funcs,
             bcs_now=bcs_now,
         )
+        initial_stats = dict(base_stats)
         exact_reference_stats = dict(base_stats)
+        stage_prefix = str(stage_label_prefix or "P2-reentry").strip() or "P2-reentry"
         anchor_attempt = _run_predictor_corrector_p2_lambda_attempt(
             funcs=funcs,
             prev_funcs=prev_funcs,
@@ -14314,31 +15941,115 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             p2_lambda=p2_lambda,
             lam_from=None,
             lam=0.0,
-            stage_label="P2-reentry-anchor",
+            stage_label=f"{stage_prefix}-anchor",
             anchor_snapshot=base_snapshot,
             exact_reference_stats=exact_reference_stats,
         )
         anchor_kept = bool(anchor_attempt["keep"])
+        total_iters = int(anchor_attempt.get("iters", 0) or 0)
         if anchor_kept:
             base_snapshot = anchor_attempt["projected_snapshot"]
             base_stats = dict(anchor_attempt["projected_after"])
-        lam0_raw = float(getattr(args, "pc_p2_reentry_lambda0", 0.0) or 0.0)
-        if not np.isfinite(lam0_raw) or lam0_raw <= 0.0:
-            lam0_raw = float(_predictor_p2_initial_lambda_step())
-        lam0_cfg = min(max(lam0_raw, 1.0e-8), 1.0 - 1.0e-8)
+            _restore_function_values(funcs, base_snapshot)
+            problem["dh"].apply_bcs(bcs_now, *funcs)
+            base_vi_state = (
+                p2_export_vi_state()
+                if callable(p2_export_vi_state)
+                else base_vi_state
+            )
+            anchor_h = float(base_stats.get("homotopy_raw_inf", float("nan")))
+            anchor_r = float(base_stats.get("raw_inf", float("nan")))
+            relaxed_accept_ginf = 0.0
+            if getattr(solver, "vi_params", None) is not None:
+                try:
+                    relaxed_accept_ginf = float(
+                        getattr(solver.vi_params, "relaxed_filter_accept_ginf", 0.0) or 0.0
+                    )
+                except Exception:
+                    relaxed_accept_ginf = 0.0
+            if relaxed_accept_ginf > 0.0 and np.isfinite(anchor_r) and anchor_r <= relaxed_accept_ginf:
+                if p2_lambda is not None:
+                    p2_lambda.value = 1.0
+                _restore_function_values(funcs, base_snapshot)
+                print(
+                    "    [pc] retry-P2 anchor already lies inside the same-step relaxed acceptance band; "
+                    "skipping the positive lambda stages and keeping the recovered anchor."
+                )
+                return {
+                    "mode": "reentry_anchor",
+                    "reason": str(reason),
+                    "lambda": 0.0,
+                    "attempts": 0,
+                    "completed_lambdas": 0,
+                    "before": dict(initial_stats),
+                    "after": dict(base_stats),
+                    "iters": int(total_iters),
+                    "converged": bool(anchor_attempt["converged"]),
+                    "exception": (None if anchor_attempt["exception"] is None else str(anchor_attempt["exception"])),
+                }
+            if (
+                np.isfinite(anchor_h)
+                and np.isfinite(anchor_r)
+                and abs(anchor_h - anchor_r)
+                <= 1.0e-8 * max(1.0, abs(anchor_h), abs(anchor_r))
+            ):
+                if p2_lambda is not None:
+                    p2_lambda.value = 1.0
+                _restore_function_values(funcs, base_snapshot)
+                print(
+                    "    [pc] retry-P2 anchor already sits on an effectively exact homotopy state; "
+                    "skipping the positive lambda stages and keeping the improved anchor."
+                )
+                return {
+                    "mode": "reentry_anchor",
+                    "reason": str(reason),
+                    "lambda": 0.0,
+                    "attempts": 0,
+                    "completed_lambdas": 0,
+                    "before": dict(initial_stats),
+                    "after": dict(base_stats),
+                    "iters": int(total_iters),
+                    "converged": bool(anchor_attempt["converged"]),
+                    "exception": (None if anchor_attempt["exception"] is None else str(anchor_attempt["exception"])),
+                }
+        lam_step = float(getattr(args, "pc_p2_reentry_lambda0", 0.0) or 0.0)
+        if not np.isfinite(lam_step) or lam_step <= 0.0:
+            lam_step = float(_predictor_p2_initial_lambda_step())
+        lam_step = min(max(lam_step, 1.0e-8), 1.0)
         lam_hint = startup_retry_state.get("pc_last_successful_lambda", None)
         try:
             lam_hint_val = float(lam_hint) if lam_hint is not None else float("nan")
         except Exception:
             lam_hint_val = float("nan")
         if np.isfinite(lam_hint_val) and lam_hint_val > 0.0:
-            lam0_cfg = min(lam0_cfg, max(lam_hint_val, 1.0e-8))
-        lam = float(lam0_cfg)
-        lam_min = min(max(float(getattr(args, "pc_p2_reentry_lambda_min", 1.0e-3) or 1.0e-3), 1.0e-8), lam)
+            lam_step = min(lam_step, max(lam_hint_val, 1.0e-8))
+        lam_growth = max(1.0, float(getattr(args, "pc_p2_lambda_growth", 1.5) or 1.5))
+        lam_shrink = min(0.99, max(1.0e-3, float(getattr(args, "pc_p2_lambda_shrink", 0.5) or 0.5)))
+        lam_min_step = max(
+            1.0e-8,
+            float(getattr(args, "pc_p2_reentry_lambda_min", 1.0e-3) or 1.0e-3),
+        )
+        lam_step = max(lam_step, lam_min_step)
+        lam_max_substeps = max(
+            1,
+            int(
+                max(
+                    float(getattr(args, "pc_p2_max_substeps", 32) or 32),
+                    float(getattr(args, "pc_p2_lambda_steps", 4) or 4),
+                )
+            ),
+        )
+        lam_curr = 0.0
         attempt_no = 0
-        while lam >= lam_min - 1.0e-15:
+        completed_lambdas = 0
+        last_exception = anchor_attempt.get("exception", None)
+        while lam_curr < 1.0 - 1.0e-14 and attempt_no < lam_max_substeps:
+            lam = min(1.0, lam_curr + lam_step)
             attempt_no += 1
             _restore_function_values(funcs, base_snapshot)
+            problem["dh"].apply_bcs(bcs_now, *funcs)
+            if callable(p2_import_vi_state) and base_vi_state is not None:
+                p2_import_vi_state(base_vi_state, force_once=True)
             attempt = _run_predictor_corrector_p2_lambda_attempt(
                 funcs=funcs,
                 prev_funcs=prev_funcs,
@@ -14347,39 +16058,63 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                 p2_solver=p2_solver,
                 p2_bcs_now=p2_bcs_now,
                 p2_lambda=p2_lambda,
-                lam_from=(0.0 if anchor_kept else None),
+                lam_from=(float(lam_curr) if (anchor_kept or lam_curr > 0.0) else None),
                 lam=float(lam),
-                stage_label="P2-reentry",
+                stage_label=stage_prefix,
                 anchor_snapshot=base_snapshot,
                 exact_reference_stats=exact_reference_stats,
             )
+            total_iters += int(attempt.get("iters", 0) or 0)
+            last_exception = attempt.get("exception", None)
             if bool(attempt["keep"]):
-                if p2_lambda is not None:
-                    p2_lambda.value = 1.0
                 startup_retry_state["pc_last_successful_lambda"] = float(lam)
-                improved_stats = dict(attempt["projected_after"])
-                print(
-                    "    [pc] exact-corrector stall handed control back to P2 and recovered a new homotopy state "
-                    f"({reason}; lambda={float(lam):.3f}, |H|_∞ {float(base_stats['homotopy_raw_inf']):.3e} -> "
-                    f"{float(improved_stats['homotopy_raw_inf']):.3e}, |R_raw|_∞ {float(base_stats['raw_inf']):.3e} -> "
-                    f"{float(improved_stats['raw_inf']):.3e})."
+                base_snapshot = attempt["projected_snapshot"]
+                base_stats = dict(attempt["projected_after"])
+                _restore_function_values(funcs, base_snapshot)
+                problem["dh"].apply_bcs(bcs_now, *funcs)
+                base_vi_state = (
+                    p2_export_vi_state()
+                    if callable(p2_export_vi_state)
+                    else base_vi_state
                 )
-                return {
-                    "mode": "reentry",
-                    "reason": str(reason),
-                    "lambda": float(lam),
-                    "attempts": int(attempt_no),
-                    "before": dict(base_stats),
-                    "after": dict(improved_stats),
-                    "iters": int(attempt["iters"]),
-                    "converged": bool(attempt["converged"]),
-                    "exception": (None if attempt["exception"] is None else str(attempt["exception"])),
-                }
-            lam *= 0.5
-        if anchor_kept:
-            if p2_lambda is not None:
-                p2_lambda.value = 1.0
+                lam_curr = float(lam)
+                completed_lambdas += 1
+                if attempt["exception"] is not None or not bool(attempt["converged"]):
+                    lam_step = min(lam_step, max(1.0 - lam_curr, lam_min_step))
+                else:
+                    lam_step = min(
+                        max(lam_step * lam_growth, lam_min_step),
+                        max(1.0 - lam_curr, lam_min_step),
+                    )
+                continue
+            next_step = float(lam_step * lam_shrink)
             _restore_function_values(funcs, base_snapshot)
+            if not np.isfinite(next_step) or next_step < lam_min_step:
+                break
+            lam_step = min(next_step, max(1.0 - lam_curr, lam_min_step))
+        if p2_lambda is not None:
+            p2_lambda.value = 1.0
+        _restore_function_values(funcs, base_snapshot)
+        if completed_lambdas > 0:
+            print(
+                "    [pc] exact-corrector stall handed control back to P2 and recovered a new homotopy state "
+                f"({reason}; lambda={float(lam_curr):.3f}, stages={int(completed_lambdas)}, "
+                f"|H|_∞ {float(initial_stats['homotopy_raw_inf']):.3e} -> {float(base_stats['homotopy_raw_inf']):.3e}, "
+                f"|R_raw|_∞ {float(initial_stats['raw_inf']):.3e} -> {float(base_stats['raw_inf']):.3e})."
+            )
+            return {
+                "mode": "reentry",
+                "reason": str(reason),
+                "lambda": float(lam_curr),
+                "attempts": int(attempt_no),
+                "completed_lambdas": int(completed_lambdas),
+                "before": dict(initial_stats),
+                "after": dict(base_stats),
+                "iters": int(total_iters),
+                "converged": bool(lam_curr >= 1.0 - 1.0e-14),
+                "exception": (None if last_exception is None else str(last_exception)),
+            }
+        if anchor_kept:
             print(
                 "    [pc] exact-corrector stall re-entered P2 and kept the lambda=0 anchor state "
                 f"({reason}; |H|_∞={float(base_stats['homotopy_raw_inf']):.3e}, |R_raw|_∞={float(base_stats['raw_inf']):.3e})."
@@ -14389,15 +16124,13 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                 "reason": str(reason),
                 "lambda": 0.0,
                 "attempts": int(attempt_no),
-                "before": dict(base_stats),
+                "completed_lambdas": 0,
+                "before": dict(initial_stats),
                 "after": dict(base_stats),
                 "iters": int(anchor_attempt["iters"]),
                 "converged": bool(anchor_attempt["converged"]),
                 "exception": (None if anchor_attempt["exception"] is None else str(anchor_attempt["exception"])),
             }
-        if p2_lambda is not None:
-            p2_lambda.value = 1.0
-        _restore_function_values(funcs, base_snapshot)
         print(
             "    [pc] exact-corrector stall re-entered P2 but no lambda stage produced a meaningful homotopy improvement; "
             f"reason={reason}."
@@ -14418,16 +16151,24 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             raise RuntimeError("predictor-corrector startup is only defined for step 1.")
         _copy_prev_into_current(funcs, prev_funcs)
         initial_snapshot = _snapshot_function_values(funcs)
+        print("    [pc] startup guess: evaluating initial exact mechanics/interface residual.")
         initial_stats = _current_predictor_corrector_energy(
             funcs=funcs,
             prev_funcs=prev_funcs,
             aux_funcs=aux_funcs,
             bcs_now=bcs_now,
         )
+        print(
+            "    [pc] startup guess: initial state "
+            f"|R_raw|_∞={float(initial_stats['raw_inf']):.3e}, "
+            f"|H|_∞={float(initial_stats.get('homotopy_raw_inf', initial_stats['raw_inf'])):.3e}, "
+            f"alpha_mass_rel={float(initial_stats['alpha_mass_rel']):.3e}."
+        )
         best_snapshot = initial_snapshot
         best_stats = dict(initial_stats)
         stage_log: list[dict[str, object]] = []
         if bool(args.enable_phi_evolution) and problem.get("phi_k") is not None:
+            print("    [pc] startup guess: launching G-anchor staggered micro-step.")
             anchor_info = _run_predictor_corrector_p2_staggered_anchor(
                 funcs=funcs,
                 prev_funcs=prev_funcs,
@@ -14733,6 +16474,13 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             p2_before_snapshot = _snapshot_function_values(funcs)
             p2_before = dict(best_stats)
             problem["dh"].apply_bcs(p2_bcs_now, *funcs)
+            p2_export_vi_state = getattr(p2_solver, "export_vi_state", None)
+            p2_import_vi_state = getattr(p2_solver, "import_vi_state", None)
+            p2_best_vi_state = (
+                p2_export_vi_state()
+                if callable(p2_export_vi_state)
+                else None
+            )
             p2_exception = None
             p2_converged = True
             p2_iters = 0
@@ -14764,8 +16512,17 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                 p2_best_snapshot = anchor_attempt["projected_snapshot"]
                 p2_best_stats = dict(anchor_attempt["projected_after"])
                 _restore_function_values(funcs, p2_best_snapshot)
+                problem["dh"].apply_bcs(p2_bcs_now, *funcs)
+                p2_best_vi_state = (
+                    p2_export_vi_state()
+                    if callable(p2_export_vi_state)
+                    else p2_best_vi_state
+                )
             else:
                 _restore_function_values(funcs, p2_before_snapshot)
+                problem["dh"].apply_bcs(p2_bcs_now, *funcs)
+                if callable(p2_import_vi_state) and p2_best_vi_state is not None:
+                    p2_import_vi_state(p2_best_vi_state, force_once=True)
             lam_step = float(_predictor_p2_initial_lambda_step())
             lam_step = min(max(lam_step, 1.0e-8), 1.0)
             lam_growth = max(1.0, float(getattr(args, "pc_p2_lambda_growth", 1.5) or 1.5))
@@ -14775,6 +16532,10 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             while lam_curr < 1.0 - 1.0e-14 and completed_lambdas < lam_max_substeps:
                 lam = min(1.0, lam_curr + lam_step)
                 p2_lambda_attempts.append(float(lam))
+                _restore_function_values(funcs, p2_best_snapshot)
+                problem["dh"].apply_bcs(p2_bcs_now, *funcs)
+                if callable(p2_import_vi_state) and p2_best_vi_state is not None:
+                    p2_import_vi_state(p2_best_vi_state, force_once=True)
                 attempt = _run_predictor_corrector_p2_lambda_attempt(
                     funcs=funcs,
                     prev_funcs=prev_funcs,
@@ -14796,6 +16557,13 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                     p2_best_stats = dict(attempt["projected_after"])
                     p2_lambda_kept.append(float(lam))
                     startup_retry_state["pc_last_successful_lambda"] = float(lam)
+                    _restore_function_values(funcs, p2_best_snapshot)
+                    problem["dh"].apply_bcs(p2_bcs_now, *funcs)
+                    p2_best_vi_state = (
+                        p2_export_vi_state()
+                        if callable(p2_export_vi_state)
+                        else p2_best_vi_state
+                    )
                     lam_curr = float(lam)
                     completed_lambdas += 1
                     if attempt["exception"] is not None:
@@ -14969,7 +16737,46 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         aa_pairs: list[dict[str, np.ndarray]] = []
         best_norm = float(before_norm)
         best_snapshot = _snapshot_function_values(funcs)
+        best_stage_exact_norm = float("inf")
+        best_stage_exact_label = ""
+        best_stage_name = ""
+        best_stage_snapshot = None
+        best_stage_exact_by_name: dict[str, dict[str, object]] = {}
         exact_interface_eval = bool(mass_interface_h_info["enabled"]) or bool(normal_interface_h_info["enabled"])
+
+        def _update_best_stage_exact(stage_solver, stage_name: str) -> None:
+            nonlocal best_stage_exact_norm
+            nonlocal best_stage_exact_label
+            nonlocal best_stage_name
+            nonlocal best_stage_snapshot
+            try:
+                stage_norm = float(getattr(stage_solver, "_last_nonlinear_norm", float("nan")))
+            except Exception:
+                stage_norm = float("nan")
+            stage_label = str(getattr(stage_solver, "_last_nonlinear_norm_label", "") or "")
+            if (
+                np.isfinite(stage_norm)
+                and stage_label == "|R|_∞"
+            ):
+                stage_snapshot = _snapshot_function_values(funcs)
+                stage_record = best_stage_exact_by_name.get(str(stage_name), None)
+                stage_record_norm = float("inf")
+                if isinstance(stage_record, dict):
+                    try:
+                        stage_record_norm = float(stage_record.get("norm", float("inf")))
+                    except Exception:
+                        stage_record_norm = float("inf")
+                if not np.isfinite(stage_record_norm) or float(stage_norm) < float(stage_record_norm):
+                    best_stage_exact_by_name[str(stage_name)] = {
+                        "norm": float(stage_norm),
+                        "label": str(stage_label),
+                        "snapshot": stage_snapshot,
+                    }
+                if float(stage_norm) < float(best_stage_exact_norm):
+                    best_stage_exact_norm = float(stage_norm)
+                    best_stage_exact_label = str(stage_label)
+                    best_stage_name = str(stage_name)
+                    best_stage_snapshot = stage_snapshot
 
         def _current_exact_problem_raw_residual(
             *,
@@ -15059,6 +16866,7 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                         aux_funcs,
                         flow_bcs_now,
                     )
+                    _update_best_stage_exact(flow_solver, "flow")
                     if not bool(flow_converged):
                         raise RuntimeError(
                             f"frozen-transport flow solve did not converge on outer sweep {int(outer_it) + 1}"
@@ -15096,12 +16904,15 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                         aux_funcs,
                         solid_bcs_now,
                     )
+                    _update_best_stage_exact(solid_solver, "solid")
                     if not bool(solid_converged):
                         raise RuntimeError(
                             f"frozen-transport solid solve did not converge on outer sweep {int(outer_it) + 1}"
                         )
                     solid_hist.append(int(solid_iters))
                 except Exception as stage_exc:
+                    _update_best_stage_exact(flow_solver, "flow")
+                    _update_best_stage_exact(solid_solver, "solid")
                     candidate_snapshot = _snapshot_function_values(funcs)
                     candidate_norm = _current_exact_problem_raw_residual(
                         stage_mass_weight=float(stage_mass_weight),
@@ -15196,6 +17007,19 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             "partial_reason": partial_reason,
             "residual_before": float(before_norm),
             "residual_after": float(best_norm),
+            "best_stage_exact_norm": float(best_stage_exact_norm),
+            "best_stage_exact_label": str(best_stage_exact_label),
+            "best_stage_name": str(best_stage_name),
+            "best_stage_exact_snapshot": best_stage_snapshot,
+            "best_stage_exact_by_name": {
+                str(name): {
+                    "norm": float(record.get("norm", float("nan"))),
+                    "label": str(record.get("label", "") or ""),
+                    "snapshot": record.get("snapshot", None),
+                }
+                for name, record in best_stage_exact_by_name.items()
+                if isinstance(record, dict)
+            },
         }
 
     def _run_post_accept_transport_update(
@@ -15210,9 +17034,11 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         include_phi = bool(_post_accept_lag_phi_enabled())
         target_solver = _get_post_accept_transport_solver(include_phi=include_phi)
         if target_solver is None:
+            _sync_alpha_closure_phi_state(suffixes=("k",), funcs_in=funcs)
             return None
         transport_fields = _startup_transport_stage_fields(include_phi=include_phi)
         if not transport_fields:
+            _sync_alpha_closure_phi_state(suffixes=("k",), funcs_in=funcs)
             return None
         transport_bcs_now = _filter_bcs_by_fields(bcs_now, transport_fields)
         stage_t = float(getattr(solver, "_current_t", 0.0) + getattr(solver, "_current_dt", float(args.dt)))
@@ -15251,7 +17077,7 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                 )
         if int(step_no) == 1 and bool(problem.get("final_form", False)) and _final_form_constant_rho_s(problem):
             print(
-                "    [startup] reusing the predictor-corrector alpha/phi snapshot for the first "
+                "    [startup] reusing the predictor-corrector transport snapshot for the first "
                 "post_accept transport update."
             )
         transport_snapshot = _snapshot_selected_function_values(funcs, transport_fields)
@@ -15270,6 +17096,7 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                     label=f"post-accept-transport[{int(step_no)}]",
                 )
             )
+            _sync_alpha_closure_phi_state(suffixes=("k",), funcs_in=funcs)
         except Exception as transport_exc:
             eligible_subcycling = (
                 bool(problem.get("final_form", False))
@@ -15302,7 +17129,9 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                                 label=f"post-accept-transport[{int(step_no)}:{int(sub_idx) + 1}/{int(n_sub)}]",
                             )
                         )
+                        _sync_alpha_closure_phi_state(suffixes=("k",), funcs_in=funcs)
                         _copy_selected_current_into_prev(funcs, prev_funcs, transport_fields)
+                        _sync_alpha_closure_phi_state(suffixes=("n",), funcs_in=prev_funcs)
                     transport_iters = int(total_iters)
                     subcycling_exc = None
                     break
@@ -15445,6 +17274,37 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         summary += ")"
         return summary
 
+    def _retry_has_petsc_backend() -> bool:
+        cached = startup_stage_solver_cache.get("_retry_has_petsc_backend", None)
+        if cached is not None:
+            return bool(cached)
+        try:
+            import petsc4py  # type: ignore  # noqa: F401
+        except Exception:
+            cached = False
+        else:
+            cached = True
+        startup_stage_solver_cache["_retry_has_petsc_backend"] = bool(cached)
+        return bool(cached)
+
+    def _preferred_same_step_retry_linear_backend(current_backend: str) -> str | None:
+        backend_key = str(current_backend or "").strip().lower()
+        if backend_key in {"", "petsc"}:
+            return None
+        if backend_key in {"pardiso", "pypardiso", "scipy"} and _retry_has_petsc_backend():
+            return "petsc"
+        if backend_key in {"pardiso", "pypardiso"}:
+            return "scipy"
+        return None
+
+    def _preferred_low_quality_retry_linear_backend(current_backend: str) -> str | None:
+        backend_key = str(current_backend or "").strip().lower()
+        if backend_key == "petsc":
+            return "scipy"
+        if backend_key in {"pardiso", "pypardiso"}:
+            return _preferred_same_step_retry_linear_backend(backend_key)
+        return None
+
     def _attempt_frozen_transport_retry(
         *,
         funcs,
@@ -15468,6 +17328,22 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             bcs_now=bcs_now,
         )
         try:
+            recovery_stats = None
+            if bool(qs_final_form_semismooth_tuning):
+                frozen_transport_fields = _startup_transport_stage_fields(
+                    include_phi=_post_accept_transport_include_phi(problem)
+                )
+                frozen_transport_snapshot = _snapshot_selected_function_values(
+                    funcs,
+                    frozen_transport_fields,
+                )
+                _copy_prev_into_current(funcs, prev_funcs)
+                _restore_selected_function_values(funcs, frozen_transport_snapshot)
+                _sync_alpha_closure_phi_state(suffixes=("k",), funcs_in=funcs)
+                print(
+                    "    [retry] rebuilding the frozen-transport preconditioner from the previous "
+                    "accepted mechanics state while keeping the current transport fields."
+                )
             if int(step_no) == 1:
                 recovery_stats = _run_step1_mechanics_recovery(
                     funcs=funcs,
@@ -15524,15 +17400,206 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                 and after_norm < before_norm
                 and (before_norm <= 0.0 or rel_improve >= min_rel_improve)
             )
-            if improved:
-                print(
-                    "    [retry] frozen-transport nonlinear restart improved the full raw residual "
-                    f"{_format_frozen_transport_stats(restart_stats)}; retrying the same full step."
-                )
+            p2_reentry_applied = False
+            stage_records = restart_stats.get("best_stage_exact_by_name", {}) if bool(restart_stats) else {}
+            solid_stage_record = None
+            if isinstance(stage_records, dict):
+                solid_stage_record = stage_records.get("solid", None)
+            solid_stage_exact_norm = float("nan")
+            solid_stage_exact_label = ""
+            solid_stage_snapshot = None
+            if isinstance(solid_stage_record, dict):
+                solid_stage_exact_norm = float(solid_stage_record.get("norm", float("nan")))
+                solid_stage_exact_label = str(solid_stage_record.get("label", "") or "")
+                solid_stage_snapshot = solid_stage_record.get("snapshot", None)
+            promote_step1_mechanics_retry = (
+                bool(restart_stats)
+                and int(step_no) == 1
+                and bool(qs_final_form_semismooth_tuning)
+                and int(restart_stats.get("outer_it", 0) or 0) > 0
+            )
+            promote_later_step_exact_stage_retry = False
+            if (
+                (not improved)
+                and (not promote_step1_mechanics_retry)
+                and bool(qs_final_form_semismooth_tuning)
+                and int(step_no) > 1
+            ):
+                if isinstance(solid_stage_record, dict):
+                    stage_exact_norm = float(solid_stage_record.get("norm", float("nan")))
+                    stage_exact_label = str(solid_stage_record.get("label", "") or "")
+                    stage_name = "solid"
+                    stage_snapshot = solid_stage_record.get("snapshot", None)
+                else:
+                    stage_exact_norm = float(restart_stats.get("best_stage_exact_norm", float("nan")))
+                    stage_exact_label = str(restart_stats.get("best_stage_exact_label", "") or "")
+                    stage_name = str(restart_stats.get("best_stage_name", "") or "")
+                    stage_snapshot = restart_stats.get("best_stage_exact_snapshot", None)
+                if (
+                    stage_snapshot is not None
+                    and stage_name == "solid"
+                    and stage_exact_label == "|R|_∞"
+                    and np.isfinite(stage_exact_norm)
+                    and float(stage_exact_norm) <= 1.0e-4
+                ):
+                    _restore_function_values(funcs, stage_snapshot)
+                    p2_reentry = _attempt_predictor_corrector_p2_reentry(
+                        funcs=funcs,
+                        prev_funcs=prev_funcs,
+                        aux_funcs=aux_funcs,
+                        bcs_now=bcs_now,
+                        step_no=int(step_no),
+                        t_fail=float(t_fail),
+                        dt_fail=float(dt_fail),
+                        reason=(
+                            "frozen-transport solid corrector reached "
+                            f"|R|_∞={float(stage_exact_norm):.3e} before the coupled raw residual flattened"
+                        ),
+                        require_startup_enabled=False,
+                        stage_label_prefix="retry-P2",
+                    )
+                    p2_reentry_applied = bool(p2_reentry is not None)
+                    if p2_reentry is not None:
+                        p2_after = dict(p2_reentry.get("after", {}) or {})
+                        p2_after_norm = float(p2_after.get("raw_inf", float("nan")))
+                        if np.isfinite(p2_after_norm) and (
+                            (not np.isfinite(before_norm)) or p2_after_norm < float(before_norm)
+                        ):
+                            after_norm = float(p2_after_norm)
+                            restart_stats = dict(restart_stats)
+                            restart_stats["residual_after"] = float(after_norm)
+                            improved = True
+                            promote_later_step_exact_stage_retry = True
+                            print(
+                                "    [retry] frozen-transport exported a locally converged solid mechanics state "
+                                f"(|R|_∞={float(stage_exact_norm):.3e}); retry-P2 then reduced the coupled raw "
+                                f"residual to |R_raw|_∞={float(after_norm):.3e}, so retrying the same full step."
+                            )
+                        else:
+                            _restore_function_values(funcs, snapshot_before)
+                            p2_reentry_applied = False
+            if improved or promote_step1_mechanics_retry:
+                if improved and promote_later_step_exact_stage_retry:
+                    msg = None
+                elif improved:
+                    msg = (
+                        "    [retry] frozen-transport nonlinear restart improved the full raw residual "
+                        f"{_format_frozen_transport_stats(restart_stats)}; retrying the same full step."
+                    )
+                else:
+                    msg = (
+                        "    [retry] frozen-transport nonlinear preconditioner built a new step-1 mechanics state "
+                        f"{_format_frozen_transport_stats(restart_stats)}; retrying the same full step even though "
+                        "the frozen-model raw residual did not drop enough on its own."
+                    )
+                if msg is not None:
+                    print(msg)
                 solver._ls_alpha_prev = 1.0
+                if int(step_no) == 1:
+                    _arm_startup_monolithic_budget(
+                        step_no=int(step_no),
+                        reason="frozen-transport nonlinear preconditioner retry",
+                    )
+                if (
+                    bool(promote_step1_mechanics_retry)
+                    and solid_stage_snapshot is not None
+                    and solid_stage_exact_label == "|R|_∞"
+                    and np.isfinite(solid_stage_exact_norm)
+                    and float(solid_stage_exact_norm) <= 1.0e-4
+                ):
+                    _restore_function_values(funcs, solid_stage_snapshot)
+                    print(
+                        "    [retry] using the locally converged frozen-transport solid state "
+                        f"(|R|_∞={float(solid_stage_exact_norm):.3e}) as the retry-P2 anchor "
+                        "for the first monolithic step."
+                    )
+                if bool(qs_final_form_semismooth_tuning) and (not p2_reentry_applied):
+                    p2_reentry = _attempt_predictor_corrector_p2_reentry(
+                        funcs=funcs,
+                        prev_funcs=prev_funcs,
+                        aux_funcs=aux_funcs,
+                        bcs_now=bcs_now,
+                        step_no=int(step_no),
+                        t_fail=float(t_fail),
+                        dt_fail=float(dt_fail),
+                        reason="frozen-transport nonlinear preconditioner recovery",
+                        require_startup_enabled=False,
+                        stage_label_prefix="retry-P2",
+                    )
+                    if p2_reentry is not None:
+                        p2_after = dict(p2_reentry.get("after", {}) or {})
+                        p2_after_norm = float(p2_after.get("raw_inf", float("nan")))
+                        if np.isfinite(p2_after_norm) and (
+                            (not np.isfinite(after_norm)) or p2_after_norm < float(after_norm)
+                        ):
+                            after_norm = float(p2_after_norm)
+                if (
+                    bool(qs_final_form_semismooth_tuning)
+                    and getattr(solver, "vi_params", None) is not None
+                    and np.isfinite(after_norm)
+                    and float(after_norm) > 0.0
+                ):
+                    relaxed_prev = float(
+                        getattr(solver.vi_params, "relaxed_filter_accept_ginf", 0.0) or 0.0
+                    )
+                    # After the frozen-transport restart, the exact/raw residual can
+                    # already sit on a good branch while the immediate monolithic retry
+                    # reactivates a modest box-gap component. Allow a somewhat wider
+                    # same-step PDAS acceptance band so we keep the recovered iterate
+                    # instead of cutting dt again on a projection-only stall.
+                    relaxed_target = max(relaxed_prev, 2.0 * float(after_norm))
+                    relaxed_cap = 2.5e-1
+                    if (
+                        int(step_no) == 1
+                        and solid_stage_snapshot is not None
+                        and solid_stage_exact_label == "|R|_∞"
+                        and np.isfinite(solid_stage_exact_norm)
+                        and float(solid_stage_exact_norm) <= 1.0e-4
+                    ):
+                        # On the first monolithic step, the frozen-transport
+                        # solid corrector can already converge tightly while the
+                        # bounded exact retry stalls at |G|≈O(1) on the same
+                        # projection-limited branch. Let the time-step
+                        # continuation carry that materially improved state
+                        # instead of forcing repeated retries on an unreducible
+                        # semismooth plateau.
+                        relaxed_cap = 1.0
+                    relaxed_target = min(relaxed_target, float(relaxed_cap))
+                    if relaxed_target > relaxed_prev + 1.0e-15:
+                        solver.vi_params.relaxed_filter_accept_ginf = float(relaxed_target)
+                        startup_retry_state["restore_relaxed_accept_after_step_no"] = int(step_no)
+                        startup_retry_state["restore_relaxed_accept_value"] = float(relaxed_prev)
+                        print(
+                            "    [retry] allowing same-step semismooth acceptance up to "
+                            f"|G|_∞<={float(relaxed_target):.3e} after the frozen-transport nonlinear "
+                            "preconditioner because the recovered exact residual is already on a stable "
+                            "projection-limited manifold."
+                        )
+                current_backend = str(getattr(getattr(solver, "lp", None), "backend", "") or "").strip().lower()
+                retry_backend = _preferred_same_step_retry_linear_backend(current_backend)
+                if bool(qs_final_form_semismooth_tuning) and retry_backend is not None:
+                    startup_retry_state["restore_linear_backend_after_step_no"] = int(step_no) + 1
+                    startup_retry_state["restore_linear_backend_name"] = str(current_backend)
+                    solver.lp.backend = str(retry_backend)
+                    if str(retry_backend) == "petsc":
+                        print(
+                            "    [retry] switching the same-step monolithic retry linear backend to PETSc "
+                            "after the frozen-transport preconditioner because PETSc/MUMPS is available "
+                            "and the post-recovery VI system is failing the direct-solve quality checks."
+                        )
+                    else:
+                        print(
+                            "    [retry] switching the same-step monolithic retry linear backend to scipy "
+                            "after the frozen-transport preconditioner because the post-recovery VI system "
+                            "is failing the direct-solve quality checks."
+                        )
                 reset_bounds_cb = getattr(solver, "_reset_benchmark7_vi_bounds_freeze", None)
                 if callable(reset_bounds_cb):
                     reset_bounds_cb()
+                startup_retry_state["skip_later_step_staggered_guess_until_step_no"] = max(
+                    int(step_no) + 1,
+                    int(startup_retry_state.get("skip_later_step_staggered_guess_until_step_no", 0) or 0),
+                )
                 return "retry_keep_guess"
             _restore_function_values(funcs, snapshot_before)
             print(
@@ -15551,6 +17618,99 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             last_step_delta_inf=startup_retry_state.get("last_accepted_delta_inf", None),
             threshold=float(args.delta_predictor_reset_threshold),
         )
+
+    def _attempt_later_step_staggered_retry(
+        *,
+        funcs,
+        prev_funcs,
+        aux_funcs,
+        bcs_now,
+        step_no: int,
+        t_fail: float,
+        dt_fail: float,
+        message: str,
+    ):
+        startup_retry_state["later_step_stage_retry_attempts"] = int(
+            startup_retry_state.get("later_step_stage_retry_attempts", 0)
+        ) + 1
+        print(message)
+        try:
+            startup_stats = _run_startup_staggered_guess(
+                funcs=funcs,
+                prev_funcs=prev_funcs,
+                aux_funcs=aux_funcs,
+                bcs_now=bcs_now,
+                step_no=int(step_no),
+                t_fail=float(t_fail),
+                dt_fail=float(dt_fail),
+                outer_it_override=int(args.later_step_staggered_outer_it),
+            )
+            print(
+                "    [retry] later-step staggered refresh converged "
+                f"{_format_startup_stats(startup_stats)}; retrying the same full step with the staged state."
+            )
+            _reset_main_solver_vi_carry_state()
+            solver._ls_alpha_prev = 1.0
+            reset_bounds_cb = getattr(solver, "_reset_benchmark7_vi_bounds_freeze", None)
+            if callable(reset_bounds_cb):
+                reset_bounds_cb()
+            return "retry_keep_guess"
+        except Exception as stage_exc:
+            _copy_prev_into_current(funcs, prev_funcs)
+            print(f"    [retry] later-step staggered refresh failed: {stage_exc}")
+        return None
+
+    def _reset_main_solver_vi_carry_state(*, keep_eq_lambdas: bool = True) -> None:
+        if getattr(solver, "vi_params", None) is None:
+            return
+        if hasattr(solver, "_vi_prev_state"):
+            solver._vi_prev_state = None
+        if hasattr(solver, "_vi_pending_state"):
+            solver._vi_pending_state = None
+        if hasattr(solver, "_vi_pending_count"):
+            solver._vi_pending_count = None
+        if hasattr(solver, "_vi_forced_state"):
+            solver._vi_forced_state = None
+        if hasattr(solver, "_vi_working_set_guard_state"):
+            solver._vi_working_set_guard_state = None
+        if hasattr(solver, "_vi_working_set_guard_remaining"):
+            solver._vi_working_set_guard_remaining = 0
+        if hasattr(solver, "_vi_working_set_guard_active"):
+            solver._vi_working_set_guard_active = None
+        if hasattr(solver, "_vi_ptc_sigma_current"):
+            solver._vi_ptc_sigma_current = 0.0
+        if hasattr(solver, "_vi_anderson_history"):
+            solver._vi_anderson_history = []
+        if hasattr(solver, "_vi_preserve_state_on_next_solve"):
+            solver._vi_preserve_state_on_next_solve = False
+        if hasattr(solver, "_vi_last_metrics"):
+            solver._vi_last_metrics = None
+        if hasattr(solver, "_vi_last_retry_count"):
+            solver._vi_last_retry_count = 0
+        if hasattr(solver, "_vi_lambda_current"):
+            try:
+                solver._vi_lambda_current = float(
+                    getattr(solver.vi_params, "inactive_reg_lambda0", 0.0) or 0.0
+                )
+            except Exception:
+                solver._vi_lambda_current = 0.0
+        if hasattr(solver, "_vi_lm_lambda_current"):
+            try:
+                solver._vi_lm_lambda_current = float(
+                    getattr(solver.vi_params, "unconstrained_lm_lambda0", 0.0) or 0.0
+                )
+            except Exception:
+                solver._vi_lm_lambda_current = 0.0
+        if hasattr(solver, "_vi_eq_lambda_current") and hasattr(solver, "_vi_eq_lambda_accepted"):
+            if keep_eq_lambdas:
+                solver._vi_eq_lambda_current = np.asarray(
+                    getattr(solver, "_vi_eq_lambda_accepted", np.array([], dtype=float)),
+                    dtype=float,
+                ).copy()
+            else:
+                n_eq = len(getattr(solver, "_vi_linear_equalities", []) or [])
+                solver._vi_eq_lambda_current = np.zeros((n_eq,), dtype=float)
+                solver._vi_eq_lambda_accepted = solver._vi_eq_lambda_current.copy()
 
     def _get_startup_bootstrap_solver():
         target_solver = bootstrap_solver_cache.get("solver")
@@ -15607,9 +17767,18 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             gamma_rho_s_pin=float(args.gamma_rho_s_pin),
             final_form_constant_rho_s=bool(args.final_form_constant_rho_s),
             final_form_domain_lm=bool(getattr(args, "final_form_domain_lm", False)),
+            final_form_domain_lm_vP_tie_vf=bool(getattr(args, "final_form_domain_lm_vP_tie_vf", False)),
+            final_form_domain_lm_p_pore_tie_p=bool(getattr(args, "final_form_domain_lm_p_pore_tie_p", False)),
             final_form_domain_lm_aug_gamma=float(getattr(args, "final_form_domain_lm_aug_gamma", 10.0)),
+            final_form_domain_lm_free_weight_mode=str(
+                getattr(args, "final_form_domain_lm_free_weight_mode", "diffuse")
+            ),
+            final_form_domain_lm_free_alpha_max=getattr(args, "final_form_domain_lm_free_alpha_max", None),
             final_form_mass_lm_aug_gamma=float(getattr(args, "final_form_mass_lm_aug_gamma", 1.0)),
             final_form_normal_lm_aug_gamma=float(getattr(args, "final_form_normal_lm_aug_gamma", 1.0)),
+            final_form_quasistatic_flip_pore_stress_sign=bool(
+                getattr(args, "final_form_quasistatic_flip_pore_stress_sign", False)
+            ),
             phi_supg=float(args.phi_supg),
             phi_cip=float(args.phi_cip),
             alpha_supg=float(args.alpha_supg),
@@ -15670,6 +17839,97 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         )
         bootstrap_solver_cache["solver"] = target_solver
         return target_solver
+
+    def _failed_probe_form_items() -> list[tuple[str, object]]:
+        post_accept_main_stage = bool(transport_update_post_accept)
+        total_form = (
+            getattr(main_solver_forms, "residual_form", None)
+            if bool(post_accept_main_stage)
+            else getattr(forms, "residual_form", None)
+        )
+        items: list[tuple[str, object]] = [
+            ("total", total_form),
+            ("momentum", getattr(forms, "r_momentum", None)),
+            ("mass", getattr(forms, "r_mass", None)),
+            ("pore", getattr(forms, "r_pore", None)),
+            ("kinematics", getattr(forms, "r_kinematics", None)),
+            ("skeleton", getattr(forms, "r_skeleton", None)),
+        ]
+        if bool(post_accept_main_stage):
+            if not bool(_post_accept_lag_phi_in_main(problem)):
+                items.extend(
+                    [
+                        ("phi", getattr(forms, "r_phi", None)),
+                        ("substrate", getattr(forms, "r_substrate", None)),
+                    ]
+                )
+        else:
+            items.extend(
+                [
+                    ("phi", getattr(forms, "r_phi", None)),
+                    ("alpha", getattr(forms, "r_alpha", None)),
+                    ("B", getattr(forms, "r_B", None)),
+                    ("mu_alpha", getattr(forms, "r_mu_alpha", None)),
+                    ("substrate", getattr(forms, "r_substrate", None)),
+                    ("damage", getattr(forms, "r_damage", None)),
+                    ("detached", getattr(forms, "r_detached", None)),
+                    ("alpha_mass_constraint", problem.get("_alpha_mass_constraint_residual_form")),
+                ]
+            )
+        items.extend(
+            [
+                ("pressure_mean_constraint", problem.get("_pressure_mean_residual_form")),
+                ("pressure_interface_closure", problem.get("_pressure_interface_residual_form")),
+                ("p_pore_fluid_gauge", problem.get("_p_pore_fluid_gauge_residual_form")),
+                ("velocity_interface_closure", problem.get("_velocity_interface_residual_form")),
+                ("exact_interface_pressure_transfer", problem.get("_exact_interface_pressure_residual_form")),
+                ("traction_interface_closure", problem.get("_traction_interface_residual_form")),
+                ("entry_interface_closure", problem.get("_entry_interface_residual_form")),
+                ("bjs_interface_closure", problem.get("_bjs_interface_residual_form")),
+            ]
+        )
+        terms_obj = getattr(forms, "r_momentum_terms", None)
+        if isinstance(terms_obj, dict):
+            for term_name, form_obj in terms_obj.items():
+                items.append((f"momentum_term:{term_name}", form_obj))
+        return [(str(name), form_obj) for name, form_obj in items if form_obj is not None]
+
+    def _prewarm_failed_probe_kernels() -> None:
+        if not io_root or str(args.backend).strip().lower() != "cpp":
+            return
+        dh = problem["dh"]
+        bcs_apply = bcs_homog if bcs_homog else getattr(solver, "_current_bcs", None)
+        if bcs_apply is None:
+            bcs_apply = bcs
+        warmed = 0
+        failed_names: list[str] = []
+        seen_ids: set[int] = set()
+        for form_name, form_obj in _failed_probe_form_items():
+            form_id = id(form_obj)
+            if form_id in seen_ids:
+                continue
+            seen_ids.add(form_id)
+            try:
+                assemble_form(
+                    Equation(None, form_obj),
+                    dof_handler=dh,
+                    bcs=list(bcs_apply or []),
+                    quad_order=int(qdeg),
+                    backend=str(args.backend),
+                )
+                warmed += 1
+            except Exception:
+                failed_names.append(str(form_name))
+        if warmed > 0:
+            print(
+                "    [setup] prewarmed "
+                f"{int(warmed)} failed-iterate diagnostic kernel(s) so the first retry does not compile them."
+            )
+        if failed_names:
+            print(
+                "    [setup] skipped failed-iterate diagnostic prewarm for "
+                f"{tuple(failed_names)}."
+            )
 
     def _write_failed_iterate_interface_probe(
         *,
@@ -15754,32 +18014,10 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             }
 
         def _collect_failed_residual_blocks() -> dict[str, object]:
-            block_forms: list[tuple[str, object]] = [
-                ("total", forms.residual_form),
-                ("momentum", getattr(forms, "r_momentum", None)),
-                ("mass", getattr(forms, "r_mass", None)),
-                ("pore", getattr(forms, "r_pore", None)),
-                ("kinematics", getattr(forms, "r_kinematics", None)),
-                ("skeleton", getattr(forms, "r_skeleton", None)),
-                ("phi", getattr(forms, "r_phi", None)),
-                ("alpha", getattr(forms, "r_alpha", None)),
-                ("B", getattr(forms, "r_B", None)),
-                ("mu_alpha", getattr(forms, "r_mu_alpha", None)),
-                ("substrate", getattr(forms, "r_substrate", None)),
-                ("damage", getattr(forms, "r_damage", None)),
-                ("detached", getattr(forms, "r_detached", None)),
-                ("alpha_mass_constraint", problem.get("_alpha_mass_constraint_residual_form")),
-                ("pressure_mean_constraint", problem.get("_pressure_mean_residual_form")),
-                ("pressure_interface_closure", problem.get("_pressure_interface_residual_form")),
-                ("p_pore_fluid_gauge", problem.get("_p_pore_fluid_gauge_residual_form")),
-                ("velocity_interface_closure", problem.get("_velocity_interface_residual_form")),
-                ("exact_interface_pressure_transfer", problem.get("_exact_interface_pressure_residual_form")),
-                ("traction_interface_closure", problem.get("_traction_interface_residual_form")),
-                ("entry_interface_closure", problem.get("_entry_interface_residual_form")),
-                ("bjs_interface_closure", problem.get("_bjs_interface_residual_form")),
-            ]
             out: dict[str, object] = {}
-            for block_name, form_obj in block_forms:
+            for block_name, form_obj in _failed_probe_form_items():
+                if str(block_name).startswith("momentum_term:"):
+                    continue
                 if form_obj is None:
                     continue
                 try:
@@ -16035,9 +18273,6 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             if hasattr(solver, "_tr_radius_prev"):
                 solver._tr_radius_prev = None
             return None
-        if not bool(args.startup_bootstrap):
-            return None
-        last_accepted = bool(getattr(solver, "_last_nonlinear_accepted", False))
         if startup_retry_state.get("step_no", None) != step_no:
             startup_retry_state["step_no"] = int(step_no)
             startup_retry_state["bootstrap_attempts"] = 0
@@ -16045,7 +18280,154 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             startup_retry_state["near_converged_retry_attempts"] = 0
             startup_retry_state["later_step_stage_retry_attempts"] = 0
             startup_retry_state["frozen_transport_retry_attempts"] = 0
+            startup_retry_state["linear_quality_retry_attempts"] = 0
             startup_retry_state["pc_p2_reentry_retry_attempts"] = 0
+        if (
+            not bool(args.startup_bootstrap)
+            and bool(getattr(args, "stall_frozen_transport_restart", True))
+            and bool(qs_final_form_semismooth_tuning)
+            and int(step_no) == 1
+            and int(startup_retry_state.get("frozen_transport_retry_attempts", 0)) < 1
+        ):
+            funcs = list(info.get("functions", []) or [])
+            prev_funcs = list(info.get("prev_functions", []) or [])
+            bcs_now = info.get("bcs", [])
+            aux_funcs = info.get("aux_functions", aux_solver_functions)
+            retry_action = _attempt_frozen_transport_retry(
+                funcs=funcs,
+                prev_funcs=prev_funcs,
+                aux_funcs=aux_funcs,
+                bcs_now=bcs_now,
+                step_no=int(step_no),
+                t_fail=float(t_fail),
+                dt_fail=float(dt_fail),
+                message=(
+                    "    [retry] first-step monolithic final_form solve stalled without startup bootstrap; "
+                    "running the frozen-transport flow/solid nonlinear preconditioner before reducing dt."
+                ),
+            )
+            if retry_action is not None:
+                return retry_action
+        if (
+            not bool(args.startup_bootstrap)
+            and bool(getattr(args, "stall_frozen_transport_restart", True))
+            and int(startup_retry_state.get("frozen_transport_retry_attempts", 0)) < 1
+        ):
+            vi_metrics = dict(getattr(solver, "_vi_last_metrics", {}) or {})
+            startup_guess_applied_step_no = startup_retry_state.get("startup_guess_applied_step_no", None)
+            if _should_use_frozen_transport_restart(
+                enable_phi_evolution=bool(args.enable_phi_evolution),
+                step_no=int(step_no),
+                startup_guess_applied_step_no=(
+                    None if startup_guess_applied_step_no is None else int(startup_guess_applied_step_no)
+                ),
+                metrics=vi_metrics,
+                max_delta_active=int(args.stall_frozen_transport_max_delta_active),
+                max_gap=float(args.stall_frozen_transport_max_gap),
+                max_eq=float(args.stall_frozen_transport_max_eq),
+                min_ginf=float(args.stall_frozen_transport_min_ginf),
+            ):
+                funcs = list(info.get("functions", []) or [])
+                prev_funcs = list(info.get("prev_functions", []) or [])
+                bcs_now = info.get("bcs", [])
+                aux_funcs = info.get("aux_functions", aux_solver_functions)
+                retry_action = _attempt_frozen_transport_retry(
+                    funcs=funcs,
+                    prev_funcs=prev_funcs,
+                    aux_funcs=aux_funcs,
+                    bcs_now=bcs_now,
+                    step_no=int(step_no),
+                    t_fail=float(t_fail),
+                    dt_fail=float(dt_fail),
+                    message=(
+                        "    [retry] monolithic solve stalled with a nearly fixed transport active set "
+                        "while startup bootstrap is disabled; running a frozen-transport flow/solid "
+                        "restart before reducing dt."
+                    ),
+                )
+                if retry_action is not None:
+                    return retry_action
+        if (
+            not bool(args.startup_bootstrap)
+            and bool(getattr(args, "stall_frozen_transport_restart", True))
+            and bool(qs_final_form_semismooth_tuning)
+            and int(step_no) > 1
+            and int(startup_retry_state.get("frozen_transport_retry_attempts", 0)) < 1
+            and last_label == "|G|_∞"
+        ):
+            funcs = list(info.get("functions", []) or [])
+            prev_funcs = list(info.get("prev_functions", []) or [])
+            bcs_now = info.get("bcs", [])
+            aux_funcs = info.get("aux_functions", aux_solver_functions)
+            retry_action = _attempt_frozen_transport_retry(
+                funcs=funcs,
+                prev_funcs=prev_funcs,
+                aux_funcs=aux_funcs,
+                bcs_now=bcs_now,
+                step_no=int(step_no),
+                t_fail=float(t_fail),
+                dt_fail=float(dt_fail),
+                message=(
+                    "    [retry] later-step monolithic final_form solve stalled on the semismooth corrector; "
+                    "running the frozen-transport flow/solid nonlinear preconditioner before falling back "
+                    "to the staggered refresh."
+                ),
+            )
+            if retry_action is not None:
+                return retry_action
+        current_backend = str(getattr(getattr(solver, "lp", None), "backend", "") or "").strip().lower()
+        if (
+            not bool(args.startup_bootstrap)
+            and bool(qs_final_form_semismooth_tuning)
+            and "low-quality solution" in str(exc_text).lower()
+            and int(startup_retry_state.get("linear_quality_retry_attempts", 0)) < 1
+        ):
+            retry_backend = _preferred_low_quality_retry_linear_backend(current_backend)
+            if retry_backend is not None and getattr(solver, "lp", None) is not None:
+                startup_retry_state["linear_quality_retry_attempts"] = int(
+                    startup_retry_state.get("linear_quality_retry_attempts", 0)
+                ) + 1
+                solver.lp.backend = str(retry_backend)
+                solver._ls_alpha_prev = 1.0
+                reset_bounds_cb = getattr(solver, "_reset_benchmark7_vi_bounds_freeze", None)
+                if callable(reset_bounds_cb):
+                    reset_bounds_cb()
+                print(
+                    "    [retry] same-step monolithic solve hit only a linear-solve quality gate on the "
+                    f"current quasi-static state; switching the backend from {current_backend} to "
+                    f"{str(retry_backend)} and retrying the current iterate before giving up."
+                )
+                return "retry_keep_guess"
+        if not bool(args.startup_bootstrap):
+            if bool(qs_final_form_semismooth_tuning) and int(step_no) > 1:
+                print(
+                    "    [retry] skipping the same-dt later-step staggered rebuild on the quasi-static final_form "
+                    "branch; handing control to the monolithic time-substep continuation if this step still "
+                    "cannot be accepted."
+                )
+                return None
+            if int(step_no) > 1 and int(startup_retry_state.get("later_step_stage_retry_attempts", 0)) < 1:
+                funcs = list(info.get("functions", []) or [])
+                prev_funcs = list(info.get("prev_functions", []) or [])
+                bcs_now = info.get("bcs", [])
+                aux_funcs = info.get("aux_functions", aux_solver_functions)
+                retry_action = _attempt_later_step_staggered_retry(
+                    funcs=funcs,
+                    prev_funcs=prev_funcs,
+                    aux_funcs=aux_funcs,
+                    bcs_now=bcs_now,
+                    step_no=int(step_no),
+                    t_fail=float(t_fail),
+                    dt_fail=float(dt_fail),
+                    message=(
+                        "    [retry] later-step monolithic solve stalled; rebuilding the same step with a "
+                        "staggered flow/transport/solid refresh from the previous accepted state."
+                    ),
+                )
+                if retry_action is not None:
+                    return retry_action
+            return None
+        last_accepted = bool(getattr(solver, "_last_nonlinear_accepted", False))
         exact_pc_failure = bool(
             solver_key == "newton"
             and last_label == "|R|_∞"
@@ -16220,39 +18602,21 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             prev_funcs = list(info.get("prev_functions", []) or [])
             bcs_now = info.get("bcs", [])
             aux_funcs = info.get("aux_functions", aux_solver_functions)
-            startup_retry_state["later_step_stage_retry_attempts"] = int(
-                startup_retry_state.get("later_step_stage_retry_attempts", 0)
-            ) + 1
-            print(
-                "    [retry] later-step monolithic solve stalled; rebuilding the same step with a "
-                "staggered fluid/solid refresh from the previous accepted state."
+            retry_action = _attempt_later_step_staggered_retry(
+                funcs=funcs,
+                prev_funcs=prev_funcs,
+                aux_funcs=aux_funcs,
+                bcs_now=bcs_now,
+                step_no=int(step_no),
+                t_fail=float(t_fail),
+                dt_fail=float(dt_fail),
+                message=(
+                    "    [retry] later-step monolithic solve stalled; rebuilding the same step with a "
+                    "staggered flow/transport/solid refresh from the previous accepted state."
+                ),
             )
-            try:
-                startup_stats = _run_startup_staggered_guess(
-                    funcs=funcs,
-                    prev_funcs=prev_funcs,
-                    aux_funcs=aux_funcs,
-                    bcs_now=bcs_now,
-                    step_no=int(step_no),
-                    t_fail=float(t_fail),
-                    dt_fail=float(dt_fail),
-                    outer_it_override=int(args.later_step_staggered_outer_it),
-                )
-                print(
-                    "    [retry] later-step staggered refresh converged "
-                    f"({int(startup_stats['outer_it'])} sweep(s), flow {int(startup_stats['flow_iters_total'])} it "
-                    f"{list(startup_stats['flow_iters_hist'])}, transport {int(startup_stats['transport_iters_total'])} it "
-                    f"{list(startup_stats['transport_iters_hist'])}, solid {int(startup_stats['solid_iters_total'])} it "
-                    f"{list(startup_stats['solid_iters_hist'])}); retrying the same full step with the staged state."
-                )
-                solver._ls_alpha_prev = 1.0
-                reset_bounds_cb = getattr(solver, "_reset_benchmark7_vi_bounds_freeze", None)
-                if callable(reset_bounds_cb):
-                    reset_bounds_cb()
-                return "retry_keep_guess"
-            except Exception as stage_exc:
-                _copy_prev_into_current(funcs, prev_funcs)
-                print(f"    [retry] later-step staggered refresh failed: {stage_exc}")
+            if retry_action is not None:
+                return retry_action
         if int(step_no) != 1 or abs(float(t_fail)) > 1.0e-14:
             return None
         if startup_retry_state.get("startup_guess_applied_step_no", None) == int(step_no):
@@ -16390,6 +18754,11 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                 bcs_now = info.get("bcs", [])
                 aux_funcs = info.get("aux_functions", aux_solver_functions)
                 dt_now = float(info.get("dt", float(args.dt)))
+                if (
+                    (not _predictor_corrector_startup_enabled(args, problem))
+                    and (not bool(getattr(args, "stall_frozen_transport_restart", True)))
+                ):
+                    return None
                 startup_signature = (int(step_no), float(dt_now))
                 if startup_retry_state.get("post_accept_startup_guess_signature", None) != startup_signature:
                     startup_retry_state["post_accept_startup_guess_signature"] = startup_signature
@@ -16398,12 +18767,10 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                         funcs,
                         transport_fields_preview,
                     )
-                    before_norm = _current_monolithic_raw_residual_inf(
-                        funcs=funcs,
-                        prev_funcs=prev_funcs,
-                        aux_funcs=aux_funcs,
-                        bcs_now=bcs_now,
-                    )
+                    fast_startup_pc_accept = str(
+                        os.environ.get("B7_FAST_STARTUP_PC_ACCEPT", "")
+                    ).strip().lower() in {"1", "true", "yes", "on"}
+                    before_norm = float("nan")
                     startup_improved = False
                     if _predictor_corrector_startup_enabled(args, problem):
                         try:
@@ -16427,30 +18794,70 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                             )
                             _restore_selected_function_values(funcs, lagged_transport_snapshot)
                             problem["dh"].apply_bcs(bcs_now, *funcs)
-                            after_norm = _current_monolithic_raw_residual_inf(
-                                funcs=funcs,
-                                prev_funcs=prev_funcs,
-                                aux_funcs=aux_funcs,
-                                bcs_now=bcs_now,
-                            )
-                            startup_improved = (
-                                np.isfinite(before_norm)
-                                and np.isfinite(after_norm)
-                                and float(after_norm) < float(before_norm)
-                            )
-                            if startup_improved:
-                                print(
-                                    "    [startup] post_accept predictor-corrector initial guess improved the "
-                                    "main mechanics/interface residual while restoring lagged transport fields "
-                                    f"(|R_raw|_∞ {float(before_norm):.3e} -> {float(after_norm):.3e}; "
-                                    f"PC exact |R_raw|_∞ {float(pc_stats['initial']['raw_inf']):.3e} -> "
-                                    f"{float(pc_stats['final']['raw_inf']):.3e})."
+                            if fast_startup_pc_accept:
+                                after_norm = float("nan")
+                                startup_improved = (
+                                    np.isfinite(float(pc_stats["initial"]["raw_inf"]))
+                                    and np.isfinite(float(pc_stats["final"]["raw_inf"]))
+                                    and float(pc_stats["final"]["raw_inf"])
+                                    < float(pc_stats["initial"]["raw_inf"])
                                 )
+                            else:
+                                after_snapshot = _snapshot_function_values(funcs)
+                                _restore_function_values(funcs, startup_snapshot)
+                                problem["dh"].apply_bcs(bcs_now, *funcs)
+                                before_norm = _current_monolithic_raw_residual_inf(
+                                    funcs=funcs,
+                                    prev_funcs=prev_funcs,
+                                    aux_funcs=aux_funcs,
+                                    bcs_now=bcs_now,
+                                )
+                                _restore_function_values(funcs, after_snapshot)
+                                problem["dh"].apply_bcs(bcs_now, *funcs)
+                                after_norm = _current_monolithic_raw_residual_inf(
+                                    funcs=funcs,
+                                    prev_funcs=prev_funcs,
+                                    aux_funcs=aux_funcs,
+                                    bcs_now=bcs_now,
+                                )
+                                startup_improved = (
+                                    np.isfinite(before_norm)
+                                    and np.isfinite(after_norm)
+                                    and float(after_norm) < float(before_norm)
+                                )
+                            if startup_improved:
+                                if fast_startup_pc_accept:
+                                    print(
+                                        "    [startup] post_accept predictor-corrector initial guess improved the "
+                                        "internal exact residual and was kept without the extra main raw-residual "
+                                        "comparison "
+                                        f"(PC exact |R_raw|_∞ {float(pc_stats['initial']['raw_inf']):.3e} -> "
+                                        f"{float(pc_stats['final']['raw_inf']):.3e})."
+                                    )
+                                else:
+                                    print(
+                                        "    [startup] post_accept predictor-corrector initial guess improved the "
+                                        "main mechanics/interface residual while restoring lagged transport fields "
+                                        f"(|R_raw|_∞ {float(before_norm):.3e} -> {float(after_norm):.3e}; "
+                                        f"PC exact |R_raw|_∞ {float(pc_stats['initial']['raw_inf']):.3e} -> "
+                                        f"{float(pc_stats['final']['raw_inf']):.3e})."
+                                    )
                                 if (
                                     bool(problem.get("final_form", False))
                                     and _final_form_constant_rho_s(problem)
-                                    and np.isfinite(float(after_norm))
-                                    and float(after_norm) <= float(step1_relaxed_mechanics_tol)
+                                    and (
+                                        (
+                                            fast_startup_pc_accept
+                                            and np.isfinite(float(pc_stats["final"]["raw_inf"]))
+                                            and float(pc_stats["final"]["raw_inf"])
+                                            <= float(step1_relaxed_mechanics_tol)
+                                        )
+                                        or (
+                                            (not fast_startup_pc_accept)
+                                            and np.isfinite(float(after_norm))
+                                            and float(after_norm) <= float(step1_relaxed_mechanics_tol)
+                                        )
+                                    )
                                 ):
                                     solver.np.newton_tol = max(
                                         float(base_solver_newton_tol),
@@ -16467,12 +18874,28 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                                 _restore_function_values(funcs, startup_snapshot)
                                 startup_retry_state["step1_transport_predictor_snapshot"] = None
                         except Exception as pc_exc:
+                            import traceback
                             _restore_function_values(funcs, startup_snapshot)
                             startup_retry_state["step1_transport_predictor_snapshot"] = None
                             print(f"    [startup] post_accept predictor-corrector initial guess failed: {pc_exc}")
+                            print(traceback.format_exc())
                     if startup_improved:
                         return None
+                    if not np.isfinite(before_norm):
+                        current_after_startup = _snapshot_function_values(funcs)
+                        _restore_function_values(funcs, startup_snapshot)
+                        problem["dh"].apply_bcs(bcs_now, *funcs)
+                        before_norm = _current_monolithic_raw_residual_inf(
+                            funcs=funcs,
+                            prev_funcs=prev_funcs,
+                            aux_funcs=aux_funcs,
+                            bcs_now=bcs_now,
+                        )
+                        _restore_function_values(funcs, current_after_startup)
+                        problem["dh"].apply_bcs(bcs_now, *funcs)
                     try:
+                        if not bool(getattr(args, "stall_frozen_transport_restart", True)):
+                            raise RuntimeError("post_accept step-1 mechanics initializer disabled")
                         outer_override = int(getattr(args, "stall_frozen_transport_outer_it", 1))
                         if int(outer_override) <= 0:
                             raise RuntimeError("post_accept step-1 mechanics initializer disabled")
@@ -16502,9 +18925,6 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                     except Exception:
                         _restore_function_values(funcs, startup_snapshot)
             return None
-        if not bool(args.startup_bootstrap):
-            _restore_base_monolithic_controls()
-            return None
         try:
             step_no = int(info.get("step_no", -1))
         except Exception:
@@ -16515,8 +18935,17 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             t_now = 0.0
         if int(step_no) != 1 or abs(float(t_now)) > 1.0e-14:
             _restore_base_monolithic_controls()
+            skip_until_step = startup_retry_state.get("skip_later_step_staggered_guess_until_step_no", None)
+            skip_later_step_guess = bool(
+                startup_retry_state.get("substep_continuation_active", False)
+                or (
+                    skip_until_step is not None
+                    and int(step_no) <= int(skip_until_step)
+                )
+            )
             if (
-                _should_use_later_step_staggered_guess(step_no=int(step_no))
+                (not skip_later_step_guess)
+                and _should_use_later_step_staggered_guess(step_no=int(step_no))
                 and startup_retry_state.get("later_step_stage_guess_applied_step_no", None) != int(step_no)
             ):
                 funcs = list(info.get("functions", []) or [])
@@ -16525,9 +18954,17 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                 aux_funcs = info.get("aux_functions", aux_solver_functions)
                 dt_now = float(info.get("dt", float(args.dt)))
                 last_delta_inf = startup_retry_state.get("last_accepted_delta_inf", None)
+                last_delta_inf_raw = startup_retry_state.get("last_accepted_delta_inf_raw", None)
+                if last_delta_inf_raw is not None and np.isfinite(float(last_delta_inf_raw)):
+                    delta_msg = (
+                        f"ΔU_step∞(primal)={float(last_delta_inf):.3e}, "
+                        f"ΔU_step∞(raw)={float(last_delta_inf_raw):.3e}"
+                    )
+                else:
+                    delta_msg = f"ΔU_step∞(primal)={float(last_delta_inf):.3e}"
                 print(
                     "    [startup] previous accepted step was large "
-                    f"(ΔU_step∞={float(last_delta_inf):.3e}); replacing the later-step delta predictor "
+                    f"({delta_msg}); replacing the later-step delta predictor "
                     f"with a staggered flow/transport/solid guess ({int(max(1, int(args.later_step_staggered_outer_it)))} outer sweep(s))."
                 )
                 startup_stats = _run_startup_staggered_guess(
@@ -16541,6 +18978,7 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                     outer_it_override=int(args.later_step_staggered_outer_it),
                 )
                 startup_retry_state["later_step_stage_guess_applied_step_no"] = int(step_no)
+                _reset_main_solver_vi_carry_state()
                 solver._ls_alpha_prev = 1.0
                 reset_bounds_cb = getattr(solver, "_reset_benchmark7_vi_bounds_freeze", None)
                 if callable(reset_bounds_cb):
@@ -16549,6 +18987,19 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                     "    [startup] later-step staggered guess converged "
                     f"{_format_startup_stats(startup_stats)}."
                 )
+            elif skip_later_step_guess and _should_use_later_step_staggered_guess(step_no=int(step_no)):
+                reason = (
+                    "the step is inside an active continuation substep interval"
+                    if bool(startup_retry_state.get("substep_continuation_active", False))
+                    else "the previous step was accepted from a same-step rescue"
+                )
+                print(
+                    "    [startup] keeping the direct monolithic predictor on this later step because "
+                    f"{reason}."
+                )
+            return None
+        if not bool(args.startup_bootstrap):
+            _restore_base_monolithic_controls()
             return None
         if startup_retry_state.get("startup_guess_applied_step_no", None) == int(step_no):
             return None
@@ -16764,21 +19215,49 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                 startup_retry_state["step1_transport_predictor_vi_state"] = None
         if alpha_from_refmap_enabled:
             _sync_alpha_from_refmap()
+        if (
+            bool(problem.get("final_form_internal_zero_dirichlet", False))
+            and _final_form_internal_zero_retag_mode(problem) == "per_step"
+        ):
+            _refresh_solver_final_form_internal_zero_dirichlet(
+                problem=problem,
+                target_solver=solver,
+                alpha_state_key="alpha_k",
+            )
 
-    def _make_time_params(*, final_time: float) -> TimeStepperParameters:
+    def _make_time_params(
+        *,
+        final_time: float,
+        dt: float | None = None,
+        t0: float = 0.0,
+        step0: int = 0,
+        dt_min: float | None = None,
+        dt_max: float | None = None,
+    ) -> TimeStepperParameters:
+        debug_step_preamble = str(os.environ.get("B7_DEBUG_STEP_PREAMBLE", "")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
         return TimeStepperParameters(
-            dt=float(args.dt),
+            dt=float(args.dt if dt is None else dt),
             final_time=float(final_time),
             max_steps=int(1.0e9),
             theta=float(args.theta),
-            t0=0.0,
+            t0=float(t0),
+            step0=int(step0),
             stop_on_steady=False,
             on_dt_change=_on_dt_change,
             on_step_failure=_on_step_failure,
             step_initial_guess_callback=_step_initial_guess_callback,
             allow_dt_reduction=not bool(args.no_dt_reduction),
-            dt_min=float(args.dt_min),
-            dt_max=(None if args.dt_max is None else float(args.dt_max)),
+            dt_min=float(args.dt_min if dt_min is None else dt_min),
+            dt_max=(
+                None
+                if (args.dt_max is None and dt_max is None)
+                else float(args.dt_max if dt_max is None else dt_max)
+            ),
             dt_reduction_factor=float(args.dt_reduction_factor),
             dt_increase_factor=float(args.dt_increase_factor),
             dt_iters_increase_threshold=int(args.dt_iters_increase_threshold),
@@ -16789,16 +19268,102 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             predictor=str(args.predictor),
             predictor_damping=float(args.predictor_damping),
             predictor_clip_01=False,
+            debug_step_preamble=bool(debug_step_preamble),
         )
 
     def _run_time_interval(*, final_time: float) -> None:
-        solver.solve_time_interval(
-            functions=current_functions,
-            prev_functions=previous_functions,
-            aux_functions=aux_solver_functions,
-            time_params=_make_time_params(final_time=float(final_time)),
-            post_step_refiner=_post_step_refiner,
-        )
+        overall_final = float(final_time)
+        segment_start = 0.0
+        segment_step0 = 0
+        segment_dt = float(args.dt)
+        rescue_factor = 0.5
+        rescue_dt_min = max(1.0e-6, 0.03125 * float(args.dt))
+        rescue_attempts = 0
+        max_rescue_attempts = 12
+        while float(segment_start) < overall_final - 1.0e-14:
+            try:
+                solver.solve_time_interval(
+                    functions=current_functions,
+                    prev_functions=previous_functions,
+                    aux_functions=aux_solver_functions,
+                    time_params=_make_time_params(
+                        final_time=float(overall_final),
+                        dt=float(segment_dt),
+                        t0=float(segment_start),
+                        step0=int(segment_step0),
+                        dt_min=min(float(segment_dt), float(args.dt_min)),
+                        dt_max=(None if args.dt_max is None else max(float(segment_dt), float(args.dt_max))),
+                    ),
+                    post_step_refiner=_post_step_refiner,
+                )
+                break
+            except RuntimeError as exc:
+                if not bool(qs_final_form_semismooth_tuning):
+                    raise
+                if rescue_attempts >= max_rescue_attempts:
+                    raise
+                failed_t0 = float(getattr(solver, "_current_t", segment_start) or segment_start)
+                failed_dt = float(getattr(solver, "_current_dt", segment_dt) or segment_dt)
+                failed_step_no = int(
+                    getattr(
+                        solver,
+                        "_current_step_no",
+                        startup_retry_state.get("last_accepted_step_no", int(segment_step0)) or int(segment_step0),
+                    )
+                    or (int(segment_step0) + 1)
+                )
+                exc_text = str(exc)
+                failed_from_dt_floor = (
+                    "cannot be reduced further" in exc_text
+                    or "drop below dt_min" in exc_text
+                )
+                next_dt = float(failed_dt) * float(rescue_factor)
+                if (
+                    not failed_from_dt_floor
+                    or not np.isfinite(failed_t0)
+                    or not np.isfinite(failed_dt)
+                    or failed_dt <= 0.0
+                    or next_dt >= failed_dt
+                    or next_dt < rescue_dt_min - 1.0e-15
+                    or failed_t0 + failed_dt <= failed_t0 + 1.0e-15
+                ):
+                    raise
+                substep_final = min(float(failed_t0 + failed_dt), float(overall_final))
+                rescue_attempts += 1
+                _copy_prev_into_current(current_functions, previous_functions)
+                _restore_base_monolithic_controls()
+                _reset_main_solver_vi_carry_state()
+                solver._ls_alpha_prev = 1.0
+                if hasattr(solver, "_tr_radius_prev"):
+                    solver._tr_radius_prev = None
+                print(
+                    "    [continuation] restarting failed step "
+                    f"{int(failed_step_no)} over [{float(failed_t0):.6e}, {float(substep_final):.6e}] "
+                    f"with monolithic substeps dt={float(next_dt):.3e} after the direct step failed at "
+                    f"dt={float(failed_dt):.3e}."
+                )
+                startup_retry_state["substep_continuation_active"] = True
+                try:
+                    solver.solve_time_interval(
+                        functions=current_functions,
+                        prev_functions=previous_functions,
+                        aux_functions=aux_solver_functions,
+                        time_params=_make_time_params(
+                            final_time=float(substep_final),
+                            dt=float(next_dt),
+                            t0=float(failed_t0),
+                            step0=int(failed_step_no - 1),
+                            dt_min=float(next_dt),
+                            dt_max=float(failed_dt),
+                        ),
+                        post_step_refiner=_post_step_refiner,
+                    )
+                finally:
+                    startup_retry_state["substep_continuation_active"] = False
+                segment_start = float(substep_final)
+                segment_step0 = int(startup_retry_state.get("last_accepted_step_no", failed_step_no) or failed_step_no)
+                segment_dt = float(args.dt)
+                rescue_attempts = 0
 
     def _set_fixed_free_fluid_reference_state() -> None:
         v_in_now = float(_cosine_ramp_value(float(args.dt), float(args.t_ramp))) * float(args.v_in)
@@ -17407,6 +19972,8 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             )
         )
 
+    _prewarm_failed_probe_kernels()
+
     try:
         if bool(getattr(args, "solid_only_diagnostic", False)):
             _run_solid_only_diagnostic()
@@ -17752,14 +20319,101 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         "rho_s_extension": str(args.rho_s_extension),
         "gamma_rho_s_pin": float(args.gamma_rho_s_pin),
         "final_form_constant_rho_s": float(1.0 if bool(getattr(args, "final_form_constant_rho_s", False)) else 0.0),
+        "final_form_phi_mode": str(getattr(args, "final_form_phi_mode", "auto")),
+        "final_form_quasistatic_porous_media": float(
+            1.0 if bool(getattr(args, "final_form_quasistatic_porous_media", False)) else 0.0
+        ),
+        "final_form_direct_interface_transfer": float(
+            1.0
+            if bool(
+                bool(getattr(args, "final_form_quasistatic_porous_media", False))
+                if getattr(args, "final_form_direct_interface_transfer", None) is None
+                else bool(getattr(args, "final_form_direct_interface_transfer", False))
+            )
+            else 0.0
+        ),
+        "final_form_disable_pore_momentum": float(
+            1.0 if bool(getattr(args, "final_form_disable_pore_momentum", False)) else 0.0
+        ),
+        "final_form_disable_solid_momentum": float(
+            1.0 if bool(getattr(args, "final_form_disable_solid_momentum", False)) else 0.0
+        ),
+        "final_form_combined_porous_momentum": float(
+            1.0 if bool(getattr(args, "final_form_combined_porous_momentum", False)) else 0.0
+        ),
         "final_form_domain_lm": float(1.0 if bool(getattr(args, "final_form_domain_lm", False)) else 0.0),
+        "final_form_domain_lm_vf": float(1.0 if bool(getattr(args, "final_form_domain_lm_vf", False)) else 0.0),
+        "final_form_domain_lm_p": float(1.0 if bool(getattr(args, "final_form_domain_lm_p", False)) else 0.0),
+        "final_form_domain_lm_vP": float(1.0 if bool(getattr(args, "final_form_domain_lm_vP", False)) else 0.0),
+        "final_form_domain_lm_vS": float(1.0 if bool(getattr(args, "final_form_domain_lm_vS", False)) else 0.0),
+        "final_form_domain_lm_p_pore": float(
+            1.0 if bool(getattr(args, "final_form_domain_lm_p_pore", False)) else 0.0
+        ),
+        "final_form_domain_lm_phi": float(1.0 if bool(getattr(args, "final_form_domain_lm_phi", False)) else 0.0),
+        "final_form_domain_lm_u": float(1.0 if bool(getattr(args, "final_form_domain_lm_u", False)) else 0.0),
+        "final_form_domain_lm_vP_tie_vf": float(
+            1.0 if bool(getattr(args, "final_form_domain_lm_vP_tie_vf", False)) else 0.0
+        ),
+        "final_form_domain_lm_p_pore_tie_p": float(
+            1.0 if bool(getattr(args, "final_form_domain_lm_p_pore_tie_p", False)) else 0.0
+        ),
         "final_form_domain_lm_aug_gamma": float(getattr(args, "final_form_domain_lm_aug_gamma", 10.0)),
+        "final_form_domain_lm_free_weight_mode": str(
+            getattr(args, "final_form_domain_lm_free_weight_mode", "diffuse")
+        ),
+        "final_form_domain_lm_free_alpha_max": (
+            float(getattr(args, "final_form_domain_lm_free_alpha_max"))
+            if getattr(args, "final_form_domain_lm_free_alpha_max", None) is not None
+            else float("nan")
+        ),
         "final_form_mass_lm_aug_gamma": float(getattr(args, "final_form_mass_lm_aug_gamma", 1.0)),
         "final_form_normal_lm_aug_gamma": float(getattr(args, "final_form_normal_lm_aug_gamma", 1.0)),
         "final_form_freeze_rho_s": float(1.0 if bool(getattr(args, "final_form_freeze_rho_s", False)) else 0.0),
+        "final_form_auto_free_side_inactive_closure": float(
+            1.0 if bool(problem.get("_final_form_auto_free_side_inactive_closure", False)) else 0.0
+        ),
+        "final_form_auto_free_side_inactive_counts": json.dumps(
+            dict(problem.get("_final_form_auto_free_side_inactive_counts", {}) or {}),
+            sort_keys=True,
+        ),
+        "final_form_auto_free_side_support_counts": json.dumps(
+            dict(problem.get("_final_form_auto_free_side_support_counts", {}) or {}),
+            sort_keys=True,
+        ),
+        "final_form_auto_free_side_support_alpha_low": (
+            float("nan")
+            if not np.isfinite(float(problem.get("_final_form_auto_free_side_support_alpha_low", float("nan"))))
+            else float(problem.get("_final_form_auto_free_side_support_alpha_low", float("nan")))
+        ),
         "final_form_inactive_domains": float(1.0 if bool(getattr(args, "final_form_inactive_domains", False)) else 0.0),
         "final_form_inactive_alpha_low": float(getattr(args, "final_form_inactive_alpha_low", 0.05)),
+        "final_form_support_inactive_alpha_low": (
+            float(getattr(args, "final_form_support_inactive_alpha_low"))
+            if getattr(args, "final_form_support_inactive_alpha_low", None) is not None
+            else float("nan")
+        ),
         "final_form_inactive_alpha_high": float(getattr(args, "final_form_inactive_alpha_high", 0.95)),
+        "final_form_internal_zero_dirichlet": float(
+            1.0 if bool(getattr(args, "final_form_internal_zero_dirichlet", False)) else 0.0
+        ),
+        "final_form_internal_zero_dirichlet_distance_multiple": float(
+            getattr(args, "final_form_internal_zero_dirichlet_distance_multiple", 1.5)
+        ),
+        "final_form_internal_zero_dirichlet_retag_mode": str(
+            getattr(args, "final_form_internal_zero_dirichlet_retag_mode", "per_newton")
+        ),
+        "final_form_internal_zero_dirichlet_vf": (
+            "default" if getattr(args, "final_form_internal_zero_dirichlet_vf", None) is None else float(bool(getattr(args, "final_form_internal_zero_dirichlet_vf", False)))
+        ),
+        "final_form_internal_zero_dirichlet_vP": (
+            "default" if getattr(args, "final_form_internal_zero_dirichlet_vP", None) is None else float(bool(getattr(args, "final_form_internal_zero_dirichlet_vP", False)))
+        ),
+        "final_form_internal_zero_dirichlet_vS": (
+            "default" if getattr(args, "final_form_internal_zero_dirichlet_vS", None) is None else float(bool(getattr(args, "final_form_internal_zero_dirichlet_vS", False)))
+        ),
+        "final_form_internal_zero_dirichlet_u": (
+            "default" if getattr(args, "final_form_internal_zero_dirichlet_u", None) is None else float(bool(getattr(args, "final_form_internal_zero_dirichlet_u", False)))
+        ),
         "final_form_solid_interface_weight": float(getattr(args, "final_form_solid_interface_weight", 1.0)),
         "final_form_mass_interface_weight": float(
             getattr(args, "final_form_mass_interface_weight", 1.0)
@@ -17794,6 +20448,10 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         ),
         "final_form_inactive_domain_counts": json.dumps(
             dict(problem.get("_final_form_inactive_domain_counts", {}) or {}),
+            sort_keys=True,
+        ),
+        "final_form_internal_zero_dirichlet_info": json.dumps(
+            dict(problem.get("_final_form_internal_zero_dirichlet_info", {}) or {}),
             sort_keys=True,
         ),
         "gamma_u": float(args.gamma_u),

@@ -3,9 +3,15 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 import math
+import os
 from typing import Optional
 
 import numpy as np
+
+from pycutfem.linalg.iqnils import (
+    kratos_iqnils_iteration_matrices_cpp,
+    kratos_iqnils_next_iterate_cpp,
+)
 
 
 def _as_flat_vector(values: np.ndarray) -> np.ndarray:
@@ -144,6 +150,7 @@ class IQNILSCouplingAccelerator(CouplingAccelerator):
         fallback_alpha: Optional[float] = None,
         regularization: float = 0.0,
         method_name: str = "iqn_ils",
+        backend: str = "python",
     ) -> None:
         self.iteration_horizon = max(int(iteration_horizon), 1)
         self.timestep_horizon = max(int(timestep_horizon), 1)
@@ -151,6 +158,7 @@ class IQNILSCouplingAccelerator(CouplingAccelerator):
         self.fallback_alpha = float(alpha if fallback_alpha is None else fallback_alpha)
         self.regularization = max(float(regularization), 0.0)
         self.method_name = str(method_name)
+        self.backend = str(backend).strip().lower()
         self._residual_history: deque[np.ndarray] = deque(maxlen=self.iteration_horizon)
         self._prediction_history: deque[np.ndarray] = deque(maxlen=self.iteration_horizon)
         reuse_count = max(self.timestep_horizon - 1, 0)
@@ -206,42 +214,72 @@ class IQNILSCouplingAccelerator(CouplingAccelerator):
                 method=self.method_name,
             )
 
-        if k > 0:
-            self._v_new = np.column_stack(
-                [self._residual_history[i] - self._residual_history[i + 1] for i in range(k)]
-            )
-            self._w_new = np.column_stack(
-                [self._prediction_history[i] - self._prediction_history[i + 1] for i in range(k)]
-            )
-        else:
-            self._v_new = None
-            self._w_new = None
+        history_backend = self.backend or os.getenv("PYCUTFEM_IQNILS_BACKEND", "python").strip().lower()
+        x_history = [np.asarray(pred - res, dtype=float) for pred, res in zip(reversed(self._prediction_history), reversed(self._residual_history))]
+        g_history = [np.asarray(pred, dtype=float) for pred in reversed(self._prediction_history)]
 
-        if has_old:
-            v_mat = v_old if self._v_new is None else np.hstack((self._v_new, v_old))
-            w_mat = w_old if self._w_new is None else np.hstack((self._w_new, w_old))
-        else:
-            v_mat = self._v_new
-            w_mat = self._w_new
-
-        if v_mat is None or w_mat is None or int(v_mat.size) == 0 or int(w_mat.size) == 0:
-            delta = self.fallback_alpha * r_vec
-            return CouplingAccelerationStep(
-                next_iterate=x_vec + delta,
-                delta=delta,
-                relaxation=float(self.fallback_alpha),
-                used_history=False,
-                method=self.method_name,
+        if history_backend == "cpp":
+            self._v_new, self._w_new = kratos_iqnils_iteration_matrices_cpp(
+                x_history=x_history,
+                g_history=g_history,
+                iteration_horizon=int(self.iteration_horizon),
             )
-
-        delta_r = -self._residual_history[0]
-        coeffs = _regularized_lstsq(v_mat, delta_r, self.regularization)
-        delta = w_mat @ coeffs - delta_r
-        if not np.all(np.isfinite(delta)):
-            delta = self.fallback_alpha * r_vec
-            used_history = False
+            next_iterate = kratos_iqnils_next_iterate_cpp(
+                x_curr=np.asarray(x_curr, dtype=float),
+                g_curr=np.asarray(x_curr, dtype=float) + np.asarray(residual_curr, dtype=float),
+                x_history=x_history,
+                g_history=g_history,
+                dr_old_mats=list(self._v_old_mats),
+                dg_old_mats=list(self._w_old_mats),
+                alpha=float(self.fallback_alpha),
+                horizon=int(self.iteration_horizon),
+                regularization=float(self.regularization),
+            ).reshape(-1)
+            delta = next_iterate - x_vec
+            used_history = bool(
+                (self._v_new is not None and int(self._v_new.size) > 0)
+                or (v_old is not None and w_old is not None and int(v_old.size) > 0 and int(w_old.size) > 0)
+            )
+            if not np.all(np.isfinite(delta)):
+                delta = self.fallback_alpha * r_vec
+                used_history = False
         else:
-            used_history = True
+            if k > 0:
+                self._v_new = np.column_stack(
+                    [self._residual_history[i] - self._residual_history[i + 1] for i in range(k)]
+                )
+                self._w_new = np.column_stack(
+                    [self._prediction_history[i] - self._prediction_history[i + 1] for i in range(k)]
+                )
+            else:
+                self._v_new = None
+                self._w_new = None
+
+            if has_old:
+                v_mat = v_old if self._v_new is None else np.hstack((self._v_new, v_old))
+                w_mat = w_old if self._w_new is None else np.hstack((self._w_new, w_old))
+            else:
+                v_mat = self._v_new
+                w_mat = self._w_new
+
+            if v_mat is None or w_mat is None or int(v_mat.size) == 0 or int(w_mat.size) == 0:
+                delta = self.fallback_alpha * r_vec
+                return CouplingAccelerationStep(
+                    next_iterate=x_vec + delta,
+                    delta=delta,
+                    relaxation=float(self.fallback_alpha),
+                    used_history=False,
+                    method=self.method_name,
+                )
+
+            delta_r = -self._residual_history[0]
+            coeffs = _regularized_lstsq(v_mat, delta_r, self.regularization)
+            delta = w_mat @ coeffs - delta_r
+            if not np.all(np.isfinite(delta)):
+                delta = self.fallback_alpha * r_vec
+                used_history = False
+            else:
+                used_history = True
         return CouplingAccelerationStep(
             next_iterate=x_vec + delta,
             delta=delta,
@@ -341,6 +379,7 @@ def create_coupling_accelerator(
     history: int = 6,
     regularization: float = 0.0,
     timestep_horizon: int = 1,
+    backend: str = "python",
 ) -> CouplingAccelerator:
     key = str(kind).strip().lower()
     if key == "constant":
@@ -362,6 +401,7 @@ def create_coupling_accelerator(
             fallback_alpha=float(relaxation),
             regularization=float(regularization),
             method_name="iqn_ils",
+            backend=str(backend),
         )
     if key == "iqln":
         return IQNILSCouplingAccelerator(
@@ -371,6 +411,7 @@ def create_coupling_accelerator(
             fallback_alpha=float(relaxation),
             regularization=float(regularization),
             method_name="iqln",
+            backend=str(backend),
         )
     if key == "mvqn":
         return MVQNCouplingAccelerator(horizon=int(history), alpha=float(relaxation))

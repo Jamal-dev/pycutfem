@@ -292,11 +292,67 @@ def _build_fluid_dvms_state(
     )
 
 
-def _advance_fluid_dvms_history_after_step(state: FluidDVMSState) -> None:
+def _advance_fluid_dvms_history_after_step(
+    state: FluidDVMSState,
+    *,
+    dh: DofHandler | None = None,
+    mesh: Mesh | None = None,
+    u_curr=None,
+    a_curr=None,
+    p_curr=None,
+    d_curr=None,
+    mesh_v_curr=None,
+    rho_f: float | None = None,
+    mu_f: float | None = None,
+    dt: float | None = None,
+    dynamic_tau: float | None = None,
+    body_force: np.ndarray | None = None,
+    backend: str | None = None,
+    use_oss: bool = False,
+) -> None:
     if int(state.sample_count) == 0:
+        return
+    if (
+        dh is not None
+        and mesh is not None
+        and u_curr is not None
+        and a_curr is not None
+        and p_curr is not None
+        and d_curr is not None
+        and mesh_v_curr is not None
+        and rho_f is not None
+        and mu_f is not None
+        and dt is not None
+        and dynamic_tau is not None
+    ):
+        from .update import _update_fluid_dvms_old_subscale_after_step
+
+        _update_fluid_dvms_old_subscale_after_step(
+            state=state,
+            dh=dh,
+            mesh=mesh,
+            u_curr=u_curr,
+            a_curr=a_curr,
+            p_curr=p_curr,
+            d_curr=d_curr,
+            mesh_v_curr=mesh_v_curr,
+            rho_f=float(rho_f),
+            mu_f=float(mu_f),
+            dt=float(dt),
+            dynamic_tau=float(dynamic_tau),
+            body_force=body_force,
+            backend=backend,
+            use_oss=bool(use_oss),
+        )
+        nodal_divproj = getattr(state, "_nodal_div_projection", None)
+        if nodal_divproj is not None:
+            state._prev_nodal_div_projection = np.asarray(nodal_divproj, dtype=float).copy()
         return
     state.old_subscale_velocity[:, :] = np.asarray(state.predicted_subscale_velocity, dtype=float)
     state.sync_coefficients_from_samples()
+    nodal_divproj = getattr(state, "_nodal_div_projection", None)
+    if nodal_divproj is not None:
+        state._prev_nodal_div_projection = np.asarray(nodal_divproj, dtype=float).copy()
 
 
 def _fluid_dvms_summary(prob: dict[str, object]) -> dict[str, object]:

@@ -81,6 +81,14 @@ def _as_constant(val) -> Constant:
     return val if isinstance(val, Constant) else _c(float(val))
 
 
+def _mark_runtime_parameter(val, name: str):
+    if isinstance(val, Constant):
+        setattr(val, "_preserve_runtime_structure", True)
+        if not getattr(val, "_jit_name", None):
+            setattr(val, "_jit_name", str(name))
+    return val
+
+
 def _as_scalar_expr(val):
     if isinstance(val, Constant):
         return val
@@ -675,16 +683,20 @@ class BiofilmOneDomainForms:
     r_mu_alpha: object | None
     r_damage: object | None
     r_substrate: object
+    r_phi_transport: object | None = None
+    r_alpha_transport: object | None = None
     r_B: object | None = None
     r_pore: object | None = None
     r_total_mass: object | None = None
     r_momentum_terms: dict[str, object] | None = None
+    r_mass_terms: dict[str, object] | None = None
     r_kinematics_terms: dict[str, object] | None = None
     r_skeleton_terms: dict[str, object] | None = None
     # Optional per-block Jacobian contributions (useful for debugging/verification)
     a_momentum: object | None = None
     a_momentum_terms: dict[str, object] | None = None
     a_mass: object | None = None
+    a_mass_terms: dict[str, object] | None = None
     a_pore: object | None = None
     a_total_mass: object | None = None
     a_kinematics: object | None = None
@@ -693,6 +705,8 @@ class BiofilmOneDomainForms:
     a_phi: object | None = None
     a_B: object | None = None
     a_alpha: object | None = None
+    a_phi_transport: object | None = None
+    a_alpha_transport: object | None = None
     a_mu_alpha: object | None = None
     a_damage: object | None = None
     a_substrate: object | None = None
@@ -1133,6 +1147,19 @@ def build_biofilm_one_domain_forms(
 
     if rho_f is None or mu_f is None or kappa_inv is None:
         raise ValueError("Missing required physical parameters: rho_f, mu_f, kappa_inv.")
+
+    dt = _mark_runtime_parameter(_as_constant(dt), "one_domain_dt")
+    rho_f = _mark_runtime_parameter(_as_constant(rho_f), "one_domain_rho_f")
+    mu_f = _mark_runtime_parameter(_as_constant(mu_f), "one_domain_mu_f")
+    kappa_inv = _mark_runtime_parameter(_as_constant(kappa_inv), "one_domain_kappa_inv")
+    if mu_s is not None:
+        mu_s = _mark_runtime_parameter(_as_constant(mu_s), "one_domain_mu_s")
+    if lambda_s is not None:
+        lambda_s = _mark_runtime_parameter(_as_constant(lambda_s), "one_domain_lambda_s")
+    if c_nh is not None:
+        c_nh = _mark_runtime_parameter(_as_constant(c_nh), "one_domain_c_nh")
+    if beta_nh is not None:
+        beta_nh = _mark_runtime_parameter(_as_constant(beta_nh), "one_domain_beta_nh")
 
     solid_model_key = str(solid_model).strip().lower()
     if solid_model_key in {"linear", "small_strain", "linear_elastic"}:
@@ -2046,7 +2073,7 @@ def build_biofilm_one_domain_forms(
     # liquid row rather than being lost from the interface transfer.
     if bool(use_split_pore_pressure):
         if bool(use_primary_darcy_flux):
-            momentum_terms["pressure"] = -(F_free_k * p_k * div(v_test)) * dx
+            momentum_terms["pressure"] = -(p_k * div_Ffree_vtest_k) * dx
         else:
             if split_pore_momentum_model_key == "band_alpha":
                 if bool(solid_volumetric_split) and skel_press_key == "seboldt":
@@ -2054,20 +2081,18 @@ def build_biofilm_one_domain_forms(
                     # porous pressure traction is carried by the alpha-weighted
                     # support stress (via the volumetric split), not by an extra
                     # liquid-row body-force band.
-                    momentum_terms["pressure"] = -(F_free_k * p_k * div(v_test)) * dx
+                    momentum_terms["pressure"] = -(p_k * div_Ffree_vtest_k) * dx
                 else:
                     momentum_terms["pressure"] = (
-                        -(F_free_k * p_k * div(v_test))
+                        -(p_k * div_Ffree_vtest_k)
                         + p_pore_k * dot(grad_alpha_support_k, v_test)
                     ) * dx
             else:
-                momentum_terms["pressure"] = -(
-                    (F_free_k * p_k + P_k * p_pore_k) * div(v_test)
-                ) * dx
+                momentum_terms["pressure"] = -(p_k * div_Ffree_vtest_k + p_pore_k * div_P_vtest_k) * dx
     elif bool(use_single_pressure_primary_darcy_flux):
-        momentum_terms["pressure"] = -(F_free_k * p_k * div(v_test)) * dx
+        momentum_terms["pressure"] = -(p_k * div_Ffree_vtest_k) * dx
     else:
-        momentum_terms["pressure"] = -(C_k * p_k * div(v_test)) * dx
+        momentum_terms["pressure"] = -(p_k * div_C_vtest_k) * dx
     r_mom += momentum_terms["pressure"]
     if float(gamma_div) != 0.0 and not bool(use_split_pore_pressure) and not bool(use_single_pressure_primary_darcy_flux):
         gamma_div_c = _as_constant(gamma_div)
@@ -2148,9 +2173,9 @@ def build_biofilm_one_domain_forms(
     # Jacobian of the weighted pressure-stress terms.
     if bool(use_split_pore_pressure):
         if bool(use_primary_darcy_flux):
-            a_mom += -((F_free_k * dp + p_k * dF_free_k) * div(v_test)) * dx
+            a_mom += -(dp * div_Ffree_vtest_k + p_k * d_div_Ffree_vtest_k) * dx
         else:
-            a_mom += -((F_free_k * dp + p_k * dF_free_k) * div(v_test)) * dx
+            a_mom += -(dp * div_Ffree_vtest_k + p_k * d_div_Ffree_vtest_k) * dx
             if split_pore_momentum_model_key == "band_alpha":
                 if not (bool(solid_volumetric_split) and skel_press_key == "seboldt"):
                     a_mom += (
@@ -2158,11 +2183,11 @@ def build_biofilm_one_domain_forms(
                         + p_pore_k * dot(dgrad_alpha_support_k, v_test)
                     ) * dx
             else:
-                a_mom += -((P_k * dp_pore + p_pore_k * dP_k) * div(v_test)) * dx
+                a_mom += -(dp_pore * div_P_vtest_k + p_pore_k * d_div_P_vtest_k) * dx
     elif bool(use_single_pressure_primary_darcy_flux):
-        a_mom += -((F_free_k * dp + p_k * dF_free_k) * div(v_test)) * dx
+        a_mom += -(dp * div_Ffree_vtest_k + p_k * d_div_Ffree_vtest_k) * dx
     else:
-        a_mom += -((C_k * dp + p_k * dC) * div(v_test)) * dx
+        a_mom += -(dp * div_C_vtest_k + p_k * d_div_C_vtest_k) * dx
     if float(gamma_div) != 0.0 and not bool(use_split_pore_pressure) and not bool(use_single_pressure_primary_darcy_flux):
         gamma_div_c = _as_constant(gamma_div)
         d_divF_k = d_divCv_k + d_divBvS_k
@@ -2722,6 +2747,7 @@ def build_biofilm_one_domain_forms(
     #     ψ⁺ = μ||E⁺||² + (λ/2)⟨tr E⟩₊²,
     #   and the corresponding Cauchy-stress split σ = σ⁺ + σ⁻ is obtained by
     #   differentiating the split energy (Kirchhoff stress conjugate to log strain).
+    skeleton_elastic_jac_split_terms: dict[str, object] = {}
     if solid_model_key in {"hencky", "hencky_log", "hencky_log_strain"} and use_miehe_stiff_split:
         eta_pos = float(damage_eta_pos)
         sig_plus_k, sig_minus_k = sigma_hencky_miehe_split(
@@ -2803,7 +2829,6 @@ def build_biofilm_one_domain_forms(
         a_el_minus = inner(dsig_minus_k, grad(vS_test))
     else:
         # Full-stress (legacy) elastic residual/Jacobian.
-        skeleton_elastic_jac_split_terms: dict[str, object] = {}
         mean_dr_k = None
         dmean_dr_k = None
         if solid_model_key in {"linear", "small_strain", "linear_elastic"}:
@@ -3025,7 +3050,7 @@ def build_biofilm_one_domain_forms(
         r_skel_press_k += gamma_div_c * divF_k * div_B_vStest_k
 
     r_skel_fluid_interface_traction_k = _c(0.0) * dot(vS_k, vS_test)
-    a_skel_fluid_interface_traction = _c(0.0) * dot(dvS, vS_test) * dx
+    a_skel_fluid_interface_traction = _c(0.0) * dot(dvS, vS_test)
     if bool(use_split_pore_pressure) and (not bool(use_primary_darcy_flux)) and split_pore_momentum_model_key == "band_alpha":
         # The production Seboldt split-pressure branch still needs the explicit
         # free-fluid traction transfer onto the support row; without it the
@@ -3035,7 +3060,7 @@ def build_biofilm_one_domain_forms(
         r_skel_fluid_interface_traction_k = p_k * dot(grad_alpha_support_k, vS_test)
         a_skel_fluid_interface_traction = (
             dp * dot(grad_alpha_support_k, vS_test) + p_k * dot(dgrad_alpha_support_k, vS_test)
-        ) * dx
+        )
 
     # drag reaction: -β (v - vS)
     # Since beta already contains α, if we use alpha again then it would square and it won't 
@@ -3261,7 +3286,7 @@ def build_biofilm_one_domain_forms(
         a_skel_pressure += sk_th * gamma_div_c * (d_divF_k * div_B_vStest_k + divF_k * d_div_B_vStest_k) * dx
     skeleton_jac_terms["pressure"] = a_skel_pressure
     a_skel += a_skel_pressure
-    skeleton_jac_terms["fluid_interface_traction"] = sk_th * a_skel_fluid_interface_traction
+    skeleton_jac_terms["fluid_interface_traction"] = sk_th * a_skel_fluid_interface_traction * dx
     a_skel += skeleton_jac_terms["fluid_interface_traction"]
     # Drag term is *not* multiplied by alpha again: beta already contains alpha (one-domain blend).
     skeleton_jac_terms["drag"] = sk_th * d_drag_term_k * dx
@@ -3469,8 +3494,15 @@ def build_biofilm_one_domain_forms(
 
         rho_s0_c = rho_s0_tilde
 
-        rhoS_k = rho_s0_c
-        rhoS_n = rho_s0_c
+        # Keep the full one-domain internal-conversion branch consistent with
+        # the reduced deformation-only model: the Eulerian skeleton inertia is
+        # carried only by the support-bearing phase B = alpha * (1 - phi).
+        if support_physics_key == "internal_conversion":
+            rhoS_k = rho_s0_c * B_k
+            rhoS_n = rho_s0_c * B_n
+        else:
+            rhoS_k = rho_s0_c
+            rhoS_n = rho_s0_c
 
         if use_parametric_skeleton_inertia:
             skel_accel_w = _as_scalar_expr(
@@ -3507,12 +3539,18 @@ def build_biofilm_one_domain_forms(
         grad_vS_k = grad(vS_k)
         grad_vS_n = grad(vS_n)
 
-        div_rhoS_vS_n = rho_s0_c * div_vS_n
+        if support_physics_key == "internal_conversion":
+            div_rhoS_vS_n = rho_s0_c * (B_n * div_vS_n + dot(gradB_n, vS_n))
+        else:
+            div_rhoS_vS_n = rho_s0_c * div_vS_n
         advS_full_k = dot(grad_vS_k, vS_k)
         advS_full_n = dot(grad_vS_n, vS_n)
         convS_full_k = dot(advS_full_k, vS_test)
         convS_full_n = dot(advS_full_n, vS_test)
-        div_rhoS_vS_k = rho_s0_c * div_vS_k
+        if support_physics_key == "internal_conversion":
+            div_rhoS_vS_k = rho_s0_c * (B_k * div_vS_k + dot(gradB_k, vS_k))
+        else:
+            div_rhoS_vS_k = rho_s0_c * div_vS_k
         # Lagged/Picard form: div(ρ^n v^n ⊗ v^k) = ρ^n (v^n·∇)v^k + v^k div(ρ^n v^n).
         advS_lagged_k = dot(grad_vS_k, vS_n)
         convS_lagged_k = dot(advS_lagged_k, vS_test)
@@ -3531,7 +3569,10 @@ def build_biofilm_one_domain_forms(
         r_skeleton += skeleton_terms["inertia_convection_n"]
 
         # Jacobian (k-part only): always include δ[ (ρ_S v^S)/dt ].
-        d_rhoS_k = _c(0.0)
+        if support_physics_key == "internal_conversion":
+            d_rhoS_k = rho_s0_c * dB_k
+        else:
+            d_rhoS_k = _c(0.0)
         d_momS_dot_vtest = _c(0.0)
         for i in range(int(dim)):
             d_momS_dot_vtest += (
@@ -3543,7 +3584,15 @@ def build_biofilm_one_domain_forms(
         grad_dvS = grad(dvS)
         d_advS_full_k = dot(grad_dvS, vS_k) + dot(grad_vS_k, dvS)
         d_convS_full_k = dot(d_advS_full_k, vS_test)
-        d_div_rhoS_vS_k = rho_s0_c * div_dvS
+        if support_physics_key == "internal_conversion":
+            d_div_rhoS_vS_k = rho_s0_c * (
+                dB_k * div_vS_k
+                + B_k * div_dvS
+                + dot(dgradB_k, vS_k)
+                + dot(gradB_k, dvS)
+            )
+        else:
+            d_div_rhoS_vS_k = rho_s0_c * div_dvS
         d_advS_lagged_k = dot(grad_dvS, vS_n)
         d_convS_lagged_k = dot(d_advS_lagged_k, vS_test)
         skeleton_jac_terms["inertia_convection_density"] = (

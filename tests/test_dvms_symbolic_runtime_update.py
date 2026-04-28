@@ -10,6 +10,7 @@ from examples.NIRB.dvms import (
     FluidDVMSSolverOperator,
     _bossak_coefficients,
     _build_fluid_dvms_state,
+    _kratos_dvms_current_element_size_array,
 )
 from examples.NIRB.dvms.local_operator import (
     _compress_batch_to_fluid_block,
@@ -221,6 +222,7 @@ def _manual_predicted_subscale(
     max_iterations: int,
     rel_tol: float,
     abs_tol: float,
+    use_oss: bool = False,
 ) -> np.ndarray:
     c1 = 8.0
     c2 = 2.0
@@ -246,7 +248,11 @@ def _manual_predicted_subscale(
         ) * np.asarray(a_prev_val, dtype=float)
         a_relaxed = a_curr
         old_subscale = np.asarray(state.old_subscale_velocity[idx], dtype=float)
-        momentum_proj = np.asarray(state.momentum_projection[idx], dtype=float)
+        momentum_proj = (
+            np.asarray(state.momentum_projection[idx], dtype=float)
+            if bool(use_oss)
+            else np.zeros((2,), dtype=float)
+        )
         static_residual = -(
             float(rho_f) * a_relaxed
             + float(rho_f) * (grad_u_phys @ resolved_conv_velocity)
@@ -256,7 +262,8 @@ def _manual_predicted_subscale(
 
         eid = int(state.sample_element_ids[idx])
         q = idx - eid * int(state.n_qp_per_element)
-        h = max(float(mesh.element_char_length(eid)), 1.0e-14)
+        h_values = _kratos_dvms_current_element_size_array(mesh, dh, d_mesh)
+        h = max(float(h_values[eid]), 1.0e-14)
         pred0 = float(expected[eid, q, 0])
         pred1 = float(expected[eid, q, 1])
         converged = False
@@ -271,6 +278,7 @@ def _manual_predicted_subscale(
             a22 = float(rho_f) * grad_u_phys[1, 1] + inv_tau
             rhs0 = static_residual[0] - (a11 * pred0 + a12 * pred1)
             rhs1 = static_residual[1] - (a21 * pred0 + a22 * pred1)
+            residual_norm_sq = rhs0 * rhs0 + rhs1 * rhs1
             det_a = a11 * a22 - a12 * a21
             if abs(det_a) <= 1.0e-20:
                 pred0 = 0.0
@@ -280,9 +288,11 @@ def _manual_predicted_subscale(
             delta1 = (-a21 * rhs0 + a11 * rhs1) / det_a
             pred0 += delta0
             pred1 += delta1
-            err = math.sqrt(delta0 * delta0 + delta1 * delta1)
-            norm_u = math.sqrt(pred0 * pred0 + pred1 * pred1)
-            if err <= abs_tol or (norm_u > rel_tol and err / norm_u <= rel_tol):
+            velocity_error = delta0 * delta0 + delta1 * delta1
+            norm_u_sq = pred0 * pred0 + pred1 * pred1
+            if norm_u_sq > rel_tol:
+                velocity_error /= norm_u_sq
+            if velocity_error <= rel_tol or residual_norm_sq <= abs_tol:
                 converged = True
                 break
         if converged:
@@ -482,6 +492,32 @@ def test_dvms_runtime_update_matches_manual_p2_pointwise_path() -> None:
     )
 
 
+def test_dvms_predictor_zeroes_capped_nonconverged_points() -> None:
+    mesh, dh, state, u_k, u_prev, a_prev, p_k, d_mesh, d_prev = _make_dvms_problem()
+
+    _update_fluid_dvms_predicted_subscale(
+        state=state,
+        dh=dh,
+        mesh=mesh,
+        u_k=u_k,
+        u_prev=u_prev,
+        a_prev=a_prev,
+        p_k=p_k,
+        d_mesh=d_mesh,
+        d_prev=d_prev,
+        rho_f=1.5,
+        mu_f=0.05,
+        dt=0.2,
+        bossak_alpha=-0.2,
+        dynamic_tau=1.0,
+        max_iterations=1,
+        rel_tol=0.0,
+        abs_tol=0.0,
+    )
+
+    np.testing.assert_allclose(state.predicted_subscale_velocity, 0.0, atol=0.0)
+
+
 @pytest.mark.parametrize("backend", ["jit", "cpp"])
 def test_dvms_runtime_update_compiled_backends_match_python_p2(
     backend: str,
@@ -603,7 +639,15 @@ def test_dvms_runtime_operator_matches_update_helper(
         abs_tol=1.0e-12,
     )
     solver = type("SolverStub", (), {"backend": backend})()
+    initial_predicted = state_op._reshape_vector_quadrature(state_op.predicted_subscale_velocity).copy()
     op.before_assembly(solver=solver, coeffs={"unused": True}, need_matrix=False)
+    np.testing.assert_allclose(
+        state_op._reshape_vector_quadrature(state_op.predicted_subscale_velocity),
+        initial_predicted,
+        rtol=0.0,
+        atol=0.0,
+    )
+    op.before_assembly(solver=solver, coeffs={"unused": True}, need_matrix=True)
 
     _update_fluid_dvms_predicted_subscale(
         state=state_ref,

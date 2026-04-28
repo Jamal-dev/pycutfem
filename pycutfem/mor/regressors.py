@@ -156,6 +156,50 @@ class PolynomialLassoRegressor:
         return np.abs(self.coefficients_) > 0.0
 
 
+@dataclass
+class PolynomialLeastSquaresRegressor:
+    degree: int = 2
+    regularization: float = 0.0
+    standardize_inputs: bool = True
+    rcond: float | None = None
+    scaler_: SklearnStandardScaler | None = None
+    feature_map_: PolynomialFeatureMap | None = None
+    coefficients_: np.ndarray | None = None
+
+    def fit(self, inputs: np.ndarray, outputs: np.ndarray) -> "PolynomialLeastSquaresRegressor":
+        x_train = _as_sample_matrix(inputs)
+        y_train = _as_target_matrix(outputs, n_samples=x_train.shape[0])
+
+        if self.standardize_inputs:
+            self.scaler_ = SklearnStandardScaler(with_mean=True, with_std=True)
+            x_scaled = self.scaler_.fit_transform(x_train)
+        else:
+            self.scaler_ = None
+            x_scaled = x_train
+
+        self.feature_map_ = PolynomialFeatureMap(rank=x_scaled.shape[1], degree=self.degree)
+        design = self.feature_map_.transform(x_scaled)
+        regularization = float(self.regularization)
+        if regularization > 0.0:
+            normal = design.T @ design
+            penalty = regularization * np.eye(normal.shape[0], dtype=float)
+            if self.feature_map_.include_bias:
+                penalty[0, 0] = 0.0
+            self.coefficients_ = np.linalg.solve(normal + penalty, design.T @ y_train).T
+        else:
+            self.coefficients_ = np.linalg.lstsq(design, y_train, rcond=self.rcond)[0].T
+        return self
+
+    def predict(self, inputs: np.ndarray) -> np.ndarray:
+        if self.feature_map_ is None or self.coefficients_ is None:
+            raise RuntimeError("PolynomialLeastSquaresRegressor must be fit before predict")
+        x_eval = _as_sample_matrix(inputs)
+        if self.scaler_ is not None:
+            x_eval = self.scaler_.transform(x_eval)
+        design = self.feature_map_.transform(x_eval)
+        return design @ self.coefficients_.T
+
+
 def fit_tps_rbf(inputs: np.ndarray, outputs: np.ndarray, *, smoothing: float = 0.0) -> ThinPlateSplineRBF:
     return ThinPlateSplineRBF(smoothing=smoothing).fit(inputs, outputs)
 
@@ -171,5 +215,20 @@ def fit_poly_lasso(
     return PolynomialLassoRegressor(
         degree=degree,
         criterion=criterion,
+        standardize_inputs=standardize_inputs,
+    ).fit(inputs, outputs)
+
+
+def fit_poly_least_squares(
+    inputs: np.ndarray,
+    outputs: np.ndarray,
+    *,
+    degree: int = 2,
+    regularization: float = 0.0,
+    standardize_inputs: bool = True,
+) -> PolynomialLeastSquaresRegressor:
+    return PolynomialLeastSquaresRegressor(
+        degree=degree,
+        regularization=regularization,
         standardize_inputs=standardize_inputs,
     ).fit(inputs, outputs)

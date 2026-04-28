@@ -7,6 +7,7 @@ import numpy as np
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 
+from .amgcl import AMGCLSettings, AMGCLSubsolver
 from .block import BlockLinearSystem
 
 
@@ -145,6 +146,14 @@ def build_subsolver(matrix, spec) -> object:
         return DiagonalSubsolver.from_matrix(matrix, rel_floor=spec_obj.diag_rel_floor)
     if kind in {"direct", "lu"}:
         return DirectSubsolver(matrix, shift=spec_obj.shift)
+    if kind == "amgcl":
+        params = AMGCLSettings()
+        if isinstance(spec, dict):
+            raw = dict(spec)
+            raw.pop("kind", None)
+            if raw:
+                params = AMGCLSettings(**raw)
+        return AMGCLSubsolver(matrix, params=params)
     if kind == "ilu":
         return ILUSubsolver(
             matrix,

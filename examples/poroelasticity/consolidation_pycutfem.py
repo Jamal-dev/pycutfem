@@ -34,22 +34,21 @@ from pycutfem.fem.mixedelement import MixedElement
 from pycutfem.ufl.expressions import (
     Constant,
     Function,
-    Identity,
     TestFunction,
     TrialFunction,
     VectorFunction,
     VectorTestFunction,
     VectorTrialFunction,
-    div,
-    dot,
-    grad,
-    inner,
-    trace,
 )
 from pycutfem.ufl.compilers import FormCompiler
-from pycutfem.ufl.forms import BoundaryCondition, Equation
+from pycutfem.ufl.forms import BoundaryCondition
 from pycutfem.ufl.spaces import FunctionSpace
 from pycutfem.ufl.measures import dS, dx
+from examples.utils.poromechanics import (
+    UPlMaterial2D,
+    build_upl_theta_system_2d,
+    displacement_neumann_rhs,
+)
 
 
 def _generate_points(*, L: float, H: float, nx: int, ny: int) -> np.ndarray:
@@ -290,42 +289,34 @@ def solve_consolidation_pycutfem(
     dt_c = Constant(dt)
     dt_c._jit_name = "dt"
 
-    mu = Constant(mp.mu)
-    mu._jit_name = "mu_s"
-    lam = Constant(mp.lambda_)
-    lam._jit_name = "lambda_s"
-    biot = Constant(mp.biot_coef)
-    biot._jit_name = "biot_coef"
-    invM = Constant(1.0 / mp.biot_modulus)
-    invM._jit_name = "inv_biot_modulus"
-    k_perm = Constant(mp.permeability)
-    k_perm._jit_name = "permeability"
-    I2 = Identity(2)
-
-    def eps(w):
-        return 0.5 * (grad(w) + grad(w).T)
-
-    def sigma_s(w):
-        return Constant(2.0) * mu * eps(w) + lam * trace(eps(w)) * I2
-
-    H_pq = inner(k_perm * grad(p), grad(q))
-    H0_pq = inner(k_perm * grad(p0), grad(q))
-
-    a = (
-        inner(sigma_s(u), eps(v)) * dx(metadata={"q": 5})
-        - biot * p * div(v) * dx(metadata={"q": 5})
-        + biot * div(u) * q * dx(metadata={"q": 5})
-        + invM * p * q * dx(metadata={"q": 5})
-        + theta * dt_c * H_pq * dx(metadata={"q": 5})
+    upl_material = UPlMaterial2D(
+        young_modulus=mp.E,
+        poisson_ratio=mp.poisson_ratio,
+        porosity=mp.porosity,
+        biot_coefficient=mp.biot_coef,
+        permeability_xx=mp.permeability,
+        storage_inverse=1.0 / mp.biot_modulus,
+    )
+    volume_measure = dx(metadata={"q": 5})
+    upl_system = build_upl_theta_system_2d(
+        u_trial=u,
+        p_trial=p,
+        u_test=v,
+        p_test=q,
+        u_prev=u0,
+        p_prev=p0,
+        material=upl_material,
+        dt=dt_c,
+        theta=theta,
+        dx_measure=volume_measure,
     )
 
-    L = (
-        inner(sigma_s(u0), eps(v)) * dx(metadata={"q": 5})
-        - biot * p0 * div(v) * dx(metadata={"q": 5})
-        + dt_c * dot(traction_rate, v) * dS(mesh.edge_bitset("pressure_load"), metadata={"q": 5})
-        + biot * div(u0) * q * dx(metadata={"q": 5})
-        + invM * p0 * q * dx(metadata={"q": 5})
-        - (Constant(1.0) - theta) * dt_c * H0_pq * dx(metadata={"q": 5})
+    a = upl_system.lhs_form
+    L = upl_system.rhs_form + displacement_neumann_rhs(
+        v,
+        traction_rate,
+        dS(mesh.edge_bitset("pressure_load"), metadata={"q": 5}),
+        scale=dt_c,
     )
 
     bcs = [
@@ -369,8 +360,7 @@ def solve_consolidation_pycutfem(
         u_bc[bc_rows] = bc_vals
     bc_shift = K_raw @ u_bc
 
-    K_bc = K_lil.copy()
-    compiler._apply_bcs(K_bc, np.zeros(ndofs, dtype=float), bcs)
+    K_bc = compiler._apply_bcs(K_lil.copy(), np.zeros(ndofs, dtype=float), bcs)
     lu = sp_la.splu(K_bc.tocsc())
 
     t = 0.0

@@ -233,10 +233,10 @@ def build_biofilm_one_domain_mms_affine(
         phin = phi_n(x, y)
 
         Ck = _capacity(ak, phik)
-        Cn = _capacity(an, phin)
-        rho = float(rho_f) * Ck
-        rho_n = float(rho_f) * Cn
-        mu = float(mu_f) * Ck  # phi_mu choice
+        Fk = 1.0 - ak
+        Fn = 1.0 - an
+        rho = float(rho_f) * Fk
+        rho_n = float(rho_f) * Fn
         beta = ak * float(mu_f) * (phik * phik) * float(kappa_inv)
 
         # Conservative-in-time momentum: (rho_k v_k - rho_n v_n)/dt.
@@ -244,8 +244,10 @@ def build_biofilm_one_domain_mms_affine(
         conv = np.stack((float(v_amp) ** 2 * x, float(v_amp) ** 2 * y), axis=-1)
 
         Cx, Cy = _grad_capacity(ak, phik)
-        mu_x = float(mu_f) * Cx
-        mu_y = float(mu_f) * Cy
+        F_x = -grad_alpha[0]
+        F_y = -grad_alpha[1]
+        mu_x = float(mu_f) * F_x
+        mu_y = float(mu_f) * F_y
 
         # For the affine shear v = a*[y,x]: ε(v) is constant [[0,a],[a,0]].
         # -div(2μ ε(v)) = [-2a * ∂y μ, -2a * ∂x μ].
@@ -253,10 +255,10 @@ def build_biofilm_one_domain_mms_affine(
 
         drag = beta[..., None] * (vk - vS)
         # Conservative convection correction: v * div(rho v) with rho=rho_f*C.
-        divCv = Cx * vk[..., 0] + Cy * vk[..., 1]  # div(v)=0 for this affine shear
-        div_rhov = float(rho_f) * divCv
+        divFfree = F_x * vk[..., 0] + F_y * vk[..., 1]  # div(v)=0 for this affine shear
+        div_rhov = float(rho_f) * divFfree
         # Pressure gradient consistent with the implemented weak form:
-        #   R_v^{(p)} = -(p, div(C w))  -> strong term is  C ∇p  (not ∇(C p)).
+        #   R_v^{(p)} = -(p, div(C w))  -> strong term is  C ∇p.
         pressure = Ck[..., None] * grad_p
         return momdot + rho[..., None] * conv + vk * div_rhov[..., None] + visc + pressure + drag
 

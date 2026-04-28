@@ -24,6 +24,20 @@ def gauss_legendre(order: int):
         raise ValueError(order)
     return leggauss(order)  # (points, weights)
 
+def gauss_lobatto(order: int):
+    """Gauss-Lobatto-Legendre nodes and weights on [-1, 1]."""
+    order = int(order)
+    if order < 2:
+        raise ValueError("Gauss-Lobatto quadrature requires at least two points.")
+    if order == 2:
+        return np.asarray([-1.0, 1.0], dtype=float), np.asarray([1.0, 1.0], dtype=float)
+    basis = np.polynomial.legendre.Legendre.basis(order - 1)
+    interior = np.sort(basis.deriv().roots())
+    xi = np.concatenate(([-1.0], interior, [1.0])).astype(float)
+    p = basis(xi)
+    weights = 2.0 / (order * (order - 1) * p * p)
+    return xi, weights.astype(float)
+
 def _gl01(order: int):
     """Gauss–Legendre nodes and weights mapped to [0,1]."""
     xi, w = gauss_legendre(int(order))
@@ -46,10 +60,15 @@ def tri_rule(order: int,dunavant_deg: int = None):
     degree = 2 * order if dunavant_deg is None else dunavant_deg
     if degree in range(1, 21):
         pts = DUNAVANT[degree].points
+        wts = DUNAVANT[degree].weights
         # Guard against accidental barycentric triplets
         if pts.ndim == 2 and pts.shape[1] == 3:
             pts = pts[:, 1:]  # (xi, eta) = (L2, L3)
-        return pts, DUNAVANT[degree].weights
+        if degree == 2 and pts.shape == (3, 2):
+            # Match Kratos TriangleGaussLegendreIntegrationPoints2 q-loop order.
+            kratos_order = np.array([2, 1, 0], dtype=np.int64)
+            return pts[kratos_order], wts[kratos_order]
+        return pts, wts
     
     xi, wi = gauss_legendre(order)
     u = 0.5 * (xi + 1.0)   # [0,1]
