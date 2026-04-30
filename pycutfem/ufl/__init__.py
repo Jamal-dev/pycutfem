@@ -29,7 +29,7 @@ from pycutfem.ufl.expressions import (
     dot,
     inner,
 )
-from pycutfem.ufl.measures import dx, ds, dInterface, dGhost  # noqa: F401
+from pycutfem.ufl.measures import dx, ds, dInterface, dNonmatchingInterface, dTraceLink, dGhost  # noqa: F401
 from pycutfem.ufl.analytic import Analytic, x, y  # noqa: F401
 from pycutfem.ufl.spaces import FunctionSpace
 
@@ -64,6 +64,8 @@ __all__ = [
     "dx",
     "ds",
     "dInterface",
+    "dNonmatchingInterface",
+    "dTraceLink",
     "dGhost",
 ]
 

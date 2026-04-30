@@ -657,13 +657,14 @@ class DofHandler:
         element_maps: dict[str, list[list[int]]] = {f: [] for f in fields}
         element_signs: dict[str, list[list[float]]] = {f: [] for f in fields}
 
-        # within-field dictionary: (qx, qy) -> gdof  (keeps CG continuity per field)
+        # within-field dictionary: key -> gdof  (keeps CG continuity per field)
         # Include component id to avoid merging across disconnected components.
-        key2gdof: dict[str, dict[tuple[int, float, float], int]] = {f: {} for f in fields}
+        key2gdof: dict[str, dict[tuple, int]] = {f: {} for f in fields}
 
         # accumulation of coords and field membership
         dof_coords: list[tuple[float, float]] = []
         dof_comp: list[int] = []
+        dof_node_origin: list[int | None] = []
         field_gsets: dict[str, set[int]] = {f: set() for f in fields}
 
         next_gid = 0
@@ -676,6 +677,7 @@ class DofHandler:
                         num_gid[f] = next_gid; next_gid += 1
                         dof_coords.append((0.0, 0.0))
                         dof_comp.append(int(cid))
+                        dof_node_origin.append(None)
                     field_gsets[f].add(num_gid[f])
                     element_maps[f].append([int(num_gid[f])]) 
                     element_signs[f].append([1.0])
@@ -683,11 +685,18 @@ class DofHandler:
                 is_dg_field = bool(getattr(self, "_field_methods", {}).get(f, "cg") == "dg")
                 p = int(me._field_orders[f])
                 lat = _lattice_tri(p) if mesh.element_type == "tri" else _lattice_quad(p)
+                same_order_nodal = p == int(getattr(mesh, "poly_order", p))
+                elem_conn = np.asarray(mesh.elements_connectivity[int(eid)], dtype=np.int64)
                 loc_gids: list[int] = []
 
-                for (xi, eta) in lat:
+                for local_i, (xi, eta) in enumerate(lat):
                     X = transform.x_mapping(mesh, int(eid), (xi, eta))  # (x,y)
-                    k = (int(cid), _q(float(X[0])), _q(float(X[1])))
+                    node_origin = None
+                    if same_order_nodal and int(local_i) < int(elem_conn.size):
+                        node_origin = int(elem_conn[int(local_i)])
+                        k = ("node", int(node_origin))
+                    else:
+                        k = ("coord", int(cid), _q(float(X[0])), _q(float(X[1])))
 
                     gd = None if is_dg_field else key2gdof[f].get(k)
                     if gd is None:
@@ -697,6 +706,7 @@ class DofHandler:
                             key2gdof[f][k] = gd
                         dof_coords.append((float(X[0]), float(X[1])))
                         dof_comp.append(int(cid))
+                        dof_node_origin.append(node_origin)
 
                     loc_gids.append(gd)
                     field_gsets[f].add(gd)
@@ -887,6 +897,7 @@ class DofHandler:
         self.element_signs = element_signs
         self.total_dofs   = int(next_gid)
         self._dof_coords  = np.asarray(dof_coords, dtype=float)
+        self._dof_node_origin = tuple(dof_node_origin)
 
         # Per-field slices (all global DOFs belonging to that field)
         self._field_slices = {f: np.array(sorted(field_gsets[f]), dtype=int) for f in fields}
@@ -946,6 +957,11 @@ class DofHandler:
             if not self._is_dg_field(f):
                 # CG: one DOF per mesh node.
                 for gd in self._field_slices[f]:
+                    origin = self._dof_node_origin[int(gd)] if int(gd) < len(self._dof_node_origin) else None
+                    if origin is not None:
+                        self.dof_map[f][int(origin)] = int(gd)
+                        self._dof_to_node_map[int(gd)] = (f, int(origin))
+                        continue
                     x, y = self._dof_coords[int(gd)]
                     cid = int(dof_comp[int(gd)]) if int(gd) < len(dof_comp) else 0
                     nid = _find_node_id(float(x), float(y), cid)
@@ -5795,6 +5811,92 @@ class DofHandler:
 
 
     # --------------------------------------------------------------------
+    #  DofHandler.precompute_trace_link_factors
+    # --------------------------------------------------------------------------
+    def precompute_trace_link_factors(
+        self,
+        trace,
+        qdeg: int,
+        derivs: set[tuple[int, int]],
+        *,
+        reuse: bool = True,
+        need_hess: bool = False,
+        need_o3: bool = False,
+        need_o4: bool = False,
+        deformation: Any = None,
+        quadrature: str = "gauss",
+    ) -> dict:
+        """Return backend tables for a discrete trace/link integration domain.
+
+        Trace-link entities are not facets and not non-matching overlap
+        segments.  Their geometry and sided traces are supplied explicitly by a
+        ``TraceLinkInterface`` object, which makes them suitable for link
+        elements, station-based cohesive interfaces and other Trace-FEM style
+        couplings where each quadrature row owns its own DOF union.
+
+        The returned dictionary uses the same low-level table names consumed by
+        the python, jit and cpp kernels, but it is stamped with
+        ``domain_type == "trace_link"``.  The method validates the requested
+        1D reference quadrature against the trace object and raises clear
+        errors instead of inferring fallback geometry.
+        """
+        import numpy as np
+        from pycutfem.integration.quadrature import gauss_legendre, gauss_lobatto
+
+        del derivs, reuse, need_hess, need_o3, need_o4
+
+        if deformation is not None:
+            raise NotImplementedError("Trace-link precompute does not yet support deformation.")
+        me = self.mixed_element
+        if me is None:
+            raise RuntimeError("precompute_trace_link_factors requires a MixedElement-backed DofHandler.")
+        if getattr(trace, "mesh", None) is not me.mesh:
+            raise ValueError(
+                "Trace-link mesh mismatch: trace.mesh must match dof_handler.mixed_element.mesh."
+            )
+
+        qdeg = int(qdeg)
+        quadrature_name = str(quadrature or "gauss").strip().lower().replace("-", "_")
+        if quadrature_name in {"gll", "lobatto"}:
+            quadrature_name = "gauss_lobatto"
+        if quadrature_name not in {"gauss", "gauss_legendre", "gauss_lobatto"}:
+            raise ValueError(f"Unsupported trace-link quadrature rule {quadrature!r}.")
+        if quadrature_name == "gauss_lobatto":
+            xi_1d, w_ref = gauss_lobatto(max(2, int(qdeg)))
+        else:
+            xi_1d, w_ref = gauss_legendre(int(qdeg))
+        qref = np.asarray(xi_1d, dtype=float).reshape(-1, 1)
+        w_ref = np.asarray(w_ref, dtype=float).reshape(-1)
+
+        if hasattr(trace, "precomputed_factors") and callable(trace.precomputed_factors):
+            out = trace.precomputed_factors()
+        else:
+            out = dict(getattr(trace, "factors", {}))
+        if not out:
+            raise ValueError("Trace-link object did not provide precomputed factors.")
+
+        custom_qref = np.asarray(out.get("qref", out.get("qp_ref")), dtype=float)
+        custom_wref = np.asarray(out.get("qw_ref"), dtype=float).reshape(-1)
+        if custom_qref.shape != qref.shape or not np.allclose(custom_qref, qref, atol=1.0e-12, rtol=1.0e-12):
+            raise ValueError(
+                "Precomputed trace-link factors use a different reference quadrature "
+                f"than requested: expected qref shape/values {qref.shape}, got {custom_qref.shape}."
+            )
+        if custom_wref.shape != w_ref.shape or not np.allclose(custom_wref, w_ref, atol=1.0e-12, rtol=1.0e-12):
+            raise ValueError(
+                "Precomputed trace-link factors use different reference weights "
+                f"than requested: expected {w_ref.shape}, got {custom_wref.shape}."
+            )
+
+        out["qref"] = qref
+        out["qp_ref"] = qref
+        out["qw_ref"] = w_ref
+        out["domain"] = "trace_link"
+        out["domain_type"] = "trace_link"
+        out.setdefault("entity_kind", "edge")
+        return out
+
+    # --------------------------------------------------------------------------
     #  DofHandler.precompute_nonmatching_interface_factors
     # --------------------------------------------------------------------
     def precompute_nonmatching_interface_factors(
@@ -5870,15 +5972,53 @@ class DofHandler:
         P1 = np.asarray(getattr(interface, "P1"), dtype=float)
         n_seg = int(P0.shape[0])
 
+        # Quadrature on straight overlap segments -------------------------------
+        # Keep the 1D reference rule in the precompute payload. Interface history
+        # variables are indexed by (segment_entity, q), so qstate layout validation
+        # must compare against this reference rule, not against volume quadrature.
+        if quadrature_name == "gauss_lobatto":
+            xi_1d, w_ref = gauss_lobatto(max(2, int(qdeg)))
+        else:
+            xi_1d, w_ref = gauss_legendre(int(qdeg))
+        xi_1d = np.asarray(xi_1d, dtype=float).ravel()
+        w_ref = np.asarray(w_ref, dtype=float).ravel()
+        qref = xi_1d.reshape(-1, 1)
+        nQ = int(xi_1d.size)
+
+        custom_factors = getattr(interface, "precomputed_factors", None)
+        if custom_factors is not None:
+            out = dict(custom_factors)
+            custom_qref = np.asarray(out.get("qref", out.get("qp_ref")), dtype=float)
+            custom_wref = np.asarray(out.get("qw_ref"), dtype=float).reshape(-1)
+            if custom_qref.shape != qref.shape or not np.allclose(custom_qref, qref, atol=1.0e-12, rtol=1.0e-12):
+                raise ValueError(
+                    "Precomputed nonmatching-interface factors use a different reference quadrature "
+                    f"than requested: expected qref shape/values {qref.shape}, got {custom_qref.shape}."
+                )
+            if custom_wref.shape != w_ref.shape or not np.allclose(custom_wref, w_ref, atol=1.0e-12, rtol=1.0e-12):
+                raise ValueError(
+                    "Precomputed nonmatching-interface factors use different reference weights "
+                    f"than requested: expected {w_ref.shape}, got {custom_wref.shape}."
+                )
+            out.setdefault("qref", qref)
+            out.setdefault("qp_ref", qref)
+            out.setdefault("qw_ref", w_ref)
+            out.setdefault("domain", "nonmatching_interface")
+            out.setdefault("domain_type", "nonmatching_interface")
+            return out
+
         # Empty skeleton (allows kernel compilation even when interface is empty)
         if n_seg <= 0:
             derivs_eff = {(0, 0)} | set(tuple((int(dx), int(dy))) for (dx, dy) in (derivs or set()))
-            z2 = np.empty((0, 0, 2), dtype=float)
-            z1 = np.empty((0, 0), dtype=float)
-            z22 = np.empty((0, 0, 2, 2), dtype=float)
+            z2 = np.empty((0, nQ, 2), dtype=float)
+            z1 = np.empty((0, nQ), dtype=float)
+            z22 = np.empty((0, nQ, 2, 2), dtype=float)
             n_union = int(getattr(self, "union_dofs", getattr(me, "n_dofs_per_elem", 0)))
             out = {
                 "eids": np.empty((0,), dtype=np.int32),
+                "qref": qref,
+                "qp_ref": qref,
+                "qw_ref": w_ref,
                 "qp_phys": z2,
                 "qw": z1,
                 "normals": z2,
@@ -5898,9 +6038,13 @@ class DofHandler:
                 "phis": z1,
                 "h_arr": np.empty((0,), dtype=float),
                 "entity_kind": "edge",
+                "domain": "nonmatching_interface",
+                "domain_type": "nonmatching_interface",
                 "owner_pos_id": np.empty((0,), dtype=np.int32),
                 "owner_neg_id": np.empty((0,), dtype=np.int32),
                 "owner_id": np.empty((0,), dtype=np.int32),
+                "qstate_entity_id": np.empty((0,), dtype=np.int32),
+                "qstate_owner_id": np.empty((0,), dtype=np.int32),
             }
             for fld in me.field_names:
                 nloc_f = int(getattr(me, "_n_basis", {}).get(fld, 0))
@@ -5917,14 +6061,6 @@ class DofHandler:
         if pos_ids.shape[0] != n_seg or neg_ids.shape[0] != n_seg:
             raise ValueError("Interface element-id arrays must have length equal to number of segments.")
 
-        # Quadrature on straight overlap segments -------------------------------
-        if quadrature_name == "gauss_lobatto":
-            xi_1d, w_ref = gauss_lobatto(max(2, int(qdeg)))
-        else:
-            xi_1d, w_ref = gauss_legendre(int(qdeg))
-        xi_1d = np.asarray(xi_1d, dtype=float).ravel()
-        w_ref = np.asarray(w_ref, dtype=float).ravel()
-        nQ = int(xi_1d.size)
         mid = 0.5 * (P0 + P1)
         half = 0.5 * (P1 - P0)
         seg_J = np.linalg.norm(half, axis=1)
@@ -6246,6 +6382,9 @@ class DofHandler:
 
         out = {
             "eids": np.arange(n_seg, dtype=np.int32),
+            "qref": qref,
+            "qp_ref": qref,
+            "qw_ref": w_ref,
             "qp_phys": np.asarray(qp_phys, dtype=np.float64, order="C"),
             "qw": np.asarray(qw, dtype=np.float64, order="C"),
             "normals": np.asarray(normals, dtype=np.float64, order="C"),
@@ -6265,9 +6404,13 @@ class DofHandler:
             "phis": phis,
             "h_arr": h_arr_global,
             "entity_kind": "edge",
+            "domain": "nonmatching_interface",
+            "domain_type": "nonmatching_interface",
             "owner_pos_id": owner_pos_id,
             "owner_neg_id": owner_neg_id,
             "owner_id": owner_id,
+            "qstate_entity_id": np.arange(n_seg, dtype=np.int32),
+            "qstate_owner_id": np.arange(n_seg, dtype=np.int32),
         }
         out.update(basis_tables)
         out.update(maps_by_field)

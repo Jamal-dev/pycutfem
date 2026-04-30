@@ -13,6 +13,7 @@ def export_vtk(
     functions: Dict[str, Union[Function, VectorFunction, np.ndarray, Callable[[float, float], float]]],
     *,
     cell_data: Optional[Dict[str, np.ndarray]] = None,
+    point_displacement: Optional[np.ndarray] = None,
 ):
     """
     Exports simulation data to a VTK (.vtu) file for visualization. (CORRECTED)
@@ -23,9 +24,20 @@ def export_vtk(
         dof_handler: The DofHandler linking DOFs to nodes.
         functions: A dictionary mapping field names to the Function or
                    VectorFunction objects to be exported.
+        point_displacement: Optional nodal displacement used only for the
+                    written VTK coordinates. The original mesh is not modified.
     """
     # 1. Prepare mesh geometry 
-    points_3d = np.pad(mesh.nodes_x_y_pos, ((0, 0), (0, 1)), constant_values=0)
+    points_2d = np.asarray(mesh.nodes_x_y_pos, dtype=float).copy()
+    if point_displacement is not None:
+        disp = np.asarray(point_displacement, dtype=float)
+        if disp.ndim != 2 or disp.shape[0] != points_2d.shape[0] or disp.shape[1] not in (2, 3):
+            raise ValueError(
+                "point_displacement must have shape (num_nodes, 2) or (num_nodes, 3); "
+                f"got {disp.shape}."
+            )
+        points_2d[:, :2] += disp[:, :2]
+    points_3d = np.pad(points_2d, ((0, 0), (0, 1)), constant_values=0)
     if mesh.element_type == 'quad':
         cell_type = 'quad'
     elif mesh.element_type == 'tri':

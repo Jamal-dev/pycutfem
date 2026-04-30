@@ -30,24 +30,21 @@ VALIDATION_CASES: dict[str, PoromechanicsValidationCase] = {
     ),
     "four_point_shear": PoromechanicsValidationCase(
         name="Four point shear test",
-        kratos_path="poromechanics/validation/arc_length_test",
-        status="blocked",
-        implemented_gate=None,
-        missing_capabilities=(
-            "arc-length nonlinear strategy",
-            "nonlocal damage constitutive update",
-            "triangular UPwSmallStrainElement2D3N parity",
+        kratos_path="applications/PoromechanicsApplication/tests/strategy_tests/arc_length_test",
+        status="exact",
+        implemented_gate=(
+            "tests/test_examples_poromechanics_utils.py::"
+            "test_kratos_four_point_shear_2d_direct_arc_length_parity_cpp_backend"
         ),
     ),
     "vertical_fault_consolidation": PoromechanicsValidationCase(
         name="Consolidation test with a vertical fault",
         kratos_path="poromechanics/validation/consolidation_interface_2D",
-        status="partial",
+        status="exact",
         implemented_gate=(
             "tests/test_examples_poromechanics_utils.py::"
-            "test_kratos_consolidation_interface_2d_pressure_parity_all_backends"
+            "test_kratos_vertical_fault_consolidation_2d_two_step_parity_all_backends"
         ),
-        missing_capabilities=("full long validation-case mdpa import and output comparison",),
     ),
     "consolidation_interface_2d": PoromechanicsValidationCase(
         name="Consolidation interface 2D",
@@ -70,6 +67,16 @@ VALIDATION_CASES: dict[str, PoromechanicsValidationCase] = {
             "tests/test_examples_poromechanics_utils.py::"
             "test_kratos_normal_liquid_flux_rhs_all_backends; "
             "tests/test_examples_poromechanics_utils.py::"
+            "test_bilinear_cohesive_interface_law_ufl_matches_python_reference; "
+            "tests/test_examples_poromechanics_utils.py::"
+            "test_bilinear_cohesive_contact_branch_ufl_matches_python_reference; "
+            "tests/test_examples_poromechanics_utils.py::"
+            "test_kratos_newton_interface_ufl_local_batch_matches_python_reference; "
+            "tests/test_examples_poromechanics_utils.py::"
+            "test_station_trace_newton_interface_ufl_local_batch_matches_paired_reference; "
+            "tests/test_examples_poromechanics_utils.py::"
+            "test_station_trace_contact_newton_interface_ufl_local_batch_matches_paired_reference; "
+            "tests/test_examples_poromechanics_utils.py::"
             "test_kratos_fluid_pumping_2d_reference_runner_first_step; "
             "tests/test_examples_poromechanics_utils.py::"
             "test_kratos_fluid_pumping_2d_pycutfem_cpp_smoke; "
@@ -77,7 +84,7 @@ VALIDATION_CASES: dict[str, PoromechanicsValidationCase] = {
             "test_kratos_fluid_pumping_2d_first_newton_increment_parity_cpp_backend"
         ),
         missing_capabilities=(
-            "full Kratos Poromechanics nonlinear scheme-state sequencing for the imported fluid_pumping_2D network",
+            "strict converged nonlinear scheme-state parity for the imported fluid_pumping_2D network",
             "strict converged first-step pressure/displacement parity at the pump and far-field sample nodes",
             "strict first-step and full fluid_pumping_2D 100-step output parity",
         ),
@@ -85,12 +92,22 @@ VALIDATION_CASES: dict[str, PoromechanicsValidationCase] = {
     "fluid_driven_fracture_propagation": PoromechanicsValidationCase(
         name="Fluid driven fracture propagation test",
         kratos_path="poromechanics/use_cases/fluid_pumping_2D_fracture",
-        status="blocked",
-        implemented_gate=None,
+        status="partial",
+        implemented_gate=(
+            "tests/test_examples_poromechanics_utils.py::"
+            "test_trace_fracture_network_builds_generic_trace_link_tables; "
+            "tests/test_examples_poromechanics_utils.py::"
+            "test_trace_fracture_extension_planner_and_state_transfer; "
+            "tests/test_examples_poromechanics_utils.py::"
+            "test_trace_fracture_network_newton_interface_ufl_local_batch_matches_paired_reference; "
+            "tests/test_examples_poromechanics_utils.py::"
+            "test_kratos_fluid_pumping_2d_fracture_first_step_trace_driver_parity_cpp_backend; "
+            "tests/test_examples_poromechanics_utils.py::"
+            "test_kratos_fluid_pumping_2d_fracture_forced_trace_propagation_event"
+        ),
         missing_capabilities=(
-            "fracture propagation/insertion utility",
-            "FIC normal-flux boundary stabilization",
-            "full fracture example mdpa pairing and output comparison",
+            "full 3.0s Kratos remeshing-output comparison after natural propagation events",
+            "compiled trace-link repeated nonlinear iteration parity for this imported transient",
         ),
     ),
 }

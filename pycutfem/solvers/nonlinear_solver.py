@@ -1795,6 +1795,84 @@ class NewtonSolver:
             reason=None if reason is None else str(reason),
         )
 
+    def _notify_operator_nonlinear_iteration_begin(
+        self,
+        *,
+        functions,
+        prev_functions,
+        aux_functions,
+        iteration: int,
+        coeffs,
+        bcs,
+        metrics: dict | None = None,
+    ) -> None:
+        if self.operator_manager is None:
+            return
+        self.operator_manager.on_nonlinear_iteration_begin(
+            solver=self,
+            functions=functions,
+            prev_functions=prev_functions,
+            aux_functions=aux_functions,
+            iteration=int(iteration),
+            coeffs=coeffs,
+            bcs=bcs,
+            metrics=dict(metrics or {}),
+        )
+
+    def _notify_operator_nonlinear_update(
+        self,
+        *,
+        functions,
+        prev_functions,
+        aux_functions,
+        iteration: int,
+        coeffs,
+        delta_red=None,
+        delta_full=None,
+        bcs=None,
+        metrics: dict | None = None,
+    ) -> None:
+        if self.operator_manager is None:
+            return
+        self.operator_manager.on_nonlinear_update(
+            solver=self,
+            functions=functions,
+            prev_functions=prev_functions,
+            aux_functions=aux_functions,
+            iteration=int(iteration),
+            coeffs=coeffs,
+            delta_red=delta_red,
+            delta_full=delta_full,
+            bcs=bcs,
+            metrics=dict(metrics or {}),
+        )
+
+    def _notify_operator_nonlinear_iteration_end(
+        self,
+        *,
+        functions,
+        prev_functions,
+        aux_functions,
+        iteration: int,
+        coeffs,
+        converged: bool,
+        bcs,
+        metrics: dict | None = None,
+    ) -> None:
+        if self.operator_manager is None:
+            return
+        self.operator_manager.on_nonlinear_iteration_end(
+            solver=self,
+            functions=functions,
+            prev_functions=prev_functions,
+            aux_functions=aux_functions,
+            iteration=int(iteration),
+            coeffs=coeffs,
+            converged=bool(converged),
+            bcs=bcs,
+            metrics=dict(metrics or {}),
+        )
+
     @staticmethod
     def _field_name_scale_vector(field_names, field_scales: dict[str, float] | None) -> tuple[np.ndarray, dict[str, float]]:
         names = np.asarray(field_names, dtype=object)
@@ -4297,6 +4375,7 @@ class NewtonSolver:
         else:
             self._newton_ptc_sigma_current = 0.0
         for it in range(self.np.max_newton_iter):
+            self._current_newton_it = int(it + 1)
             if self.pre_cb is not None:
                 self.pre_cb(funcs)
 
@@ -4311,6 +4390,20 @@ class NewtonSolver:
             current.update({f.name: f for f in prev_funcs})
             if aux_funcs:
                 current.update(aux_funcs)
+            self._notify_operator_nonlinear_iteration_begin(
+                functions=funcs,
+                prev_functions=prev_funcs,
+                aux_functions=aux_funcs,
+                iteration=it + 1,
+                coeffs=current,
+                bcs=bcs_now,
+                metrics={
+                    "step": int(getattr(self, "_current_step", 0)),
+                    "step_no": int(getattr(self, "_current_step_no", 0)),
+                    "t": float(getattr(self, "_current_time", 0.0)),
+                    "dt": float(getattr(self, "_current_dt", 0.0)),
+                },
+            )
 
             # 1) Assemble reduced system: A_ff δU_f = -R_f
             assembly_time = 0.0
@@ -4715,6 +4808,24 @@ class NewtonSolver:
                                     assembly_time, 0.0, 0.0
                                 )
                             )
+                        self._notify_operator_nonlinear_iteration_end(
+                            functions=funcs,
+                            prev_functions=prev_funcs,
+                            aux_functions=aux_funcs,
+                            iteration=it + 1,
+                            coeffs=current,
+                            converged=True,
+                            bcs=bcs_now,
+                            metrics={
+                                "residual_norm": float(norm_R),
+                                "residual_label": _residual_norm_label(),
+                                "tol_eff": float(tol_eff),
+                                "reason": "stagnation_near_tolerance",
+                                "assembly_time": float(assembly_time),
+                                "linear_solve_time": 0.0,
+                                "line_search_time": 0.0,
+                            },
+                        )
                         return delta, converged, it + 1
             if norm_R <= tol_eff:
                 # Converged — return *time-step* increment for all fields
@@ -4743,6 +4854,24 @@ class NewtonSolver:
                             assembly_time, 0.0, 0.0
                         )
                     )
+                self._notify_operator_nonlinear_iteration_end(
+                    functions=funcs,
+                    prev_functions=prev_funcs,
+                    aux_functions=aux_funcs,
+                    iteration=it + 1,
+                    coeffs=current,
+                    converged=True,
+                    bcs=bcs_now,
+                    metrics={
+                        "residual_norm": float(norm_R),
+                        "residual_label": _residual_norm_label(),
+                        "tol_eff": float(tol_eff),
+                        "reason": "residual_converged_before_update",
+                        "assembly_time": float(assembly_time),
+                        "linear_solve_time": 0.0,
+                        "line_search_time": 0.0,
+                    },
+                )
                 return delta, converged, it + 1
             linear_time = 0.0
             line_search_time = 0.0
@@ -4782,6 +4911,24 @@ class NewtonSolver:
                 dU_solve = self._solve_linear_system(A_solve, -R_solve)
             except Exception:
                 if np.any(ptc_mask) and self._newton_try_grow_ptc_sigma(reason="linear solve failure"):
+                    self._notify_operator_nonlinear_iteration_end(
+                        functions=funcs,
+                        prev_functions=prev_funcs,
+                        aux_functions=aux_funcs,
+                        iteration=it + 1,
+                        coeffs=current,
+                        converged=False,
+                        bcs=bcs_now,
+                        metrics={
+                            "residual_norm": float(norm_R),
+                            "residual_label": _residual_norm_label(),
+                            "tol_eff": float(tol_eff),
+                            "reason": "ptc_retry_after_linear_solve_failure",
+                            "assembly_time": float(assembly_time),
+                            "linear_solve_time": float(time.perf_counter() - t_lin),
+                            "line_search_time": 0.0,
+                        },
+                    )
                     continue
                 raise
             dU_red = np.asarray(col_scale_red, dtype=float) * np.asarray(dU_solve, dtype=float)
@@ -5097,6 +5244,24 @@ class NewtonSolver:
                                             assembly_time, linear_time, line_search_time
                                         )
                                     )
+                                self._notify_operator_nonlinear_iteration_end(
+                                    functions=funcs,
+                                    prev_functions=prev_funcs,
+                                    aux_functions=aux_funcs,
+                                    iteration=it + 1,
+                                    coeffs=current,
+                                    converged=True,
+                                    bcs=bcs_now,
+                                    metrics={
+                                        "residual_norm": float(norm_R),
+                                        "residual_label": _residual_norm_label(),
+                                        "tol_eff": float(tol_eff),
+                                        "reason": "line_search_failed_near_convergence",
+                                        "assembly_time": float(assembly_time),
+                                        "linear_solve_time": float(linear_time),
+                                        "line_search_time": float(line_search_time),
+                                    },
+                                )
                                 return delta, converged, it + 1
 
                         fallback = os.getenv("PYCUTFEM_LS_FALLBACK", "armijo").strip().lower()
@@ -5174,8 +5339,44 @@ class NewtonSolver:
                                 assembly_time, linear_time, line_search_time
                             )
                         )
+                    self._notify_operator_nonlinear_iteration_end(
+                        functions=funcs,
+                        prev_functions=prev_funcs,
+                        aux_functions=aux_funcs,
+                        iteration=it + 1,
+                        coeffs=current,
+                        converged=True,
+                        bcs=bcs_now,
+                        metrics={
+                            "residual_norm": float(norm_R),
+                            "residual_label": _residual_norm_label(),
+                            "tol_eff": float(tol_eff),
+                            "reason": "globalization_failed_near_convergence",
+                            "assembly_time": float(assembly_time),
+                            "linear_solve_time": float(linear_time),
+                            "line_search_time": float(line_search_time),
+                        },
+                    )
                     return delta, converged, it + 1
                 if np.any(ptc_mask) and self._newton_try_grow_ptc_sigma(reason=str(exc)):
+                    self._notify_operator_nonlinear_iteration_end(
+                        functions=funcs,
+                        prev_functions=prev_funcs,
+                        aux_functions=aux_funcs,
+                        iteration=it + 1,
+                        coeffs=current,
+                        converged=False,
+                        bcs=bcs_now,
+                        metrics={
+                            "residual_norm": float(norm_R),
+                            "residual_label": _residual_norm_label(),
+                            "tol_eff": float(tol_eff),
+                            "reason": "ptc_retry_after_globalization_failure",
+                            "assembly_time": float(assembly_time),
+                            "linear_solve_time": float(linear_time),
+                            "line_search_time": float(line_search_time),
+                        },
+                    )
                     continue
                 raise
 
@@ -5232,6 +5433,26 @@ class NewtonSolver:
             self._last_nonlinear_update_inf = float(dx_inf)
             self._last_nonlinear_update_label = "Δx_newton∞"
             self._last_nonlinear_accepted = True
+            self._notify_operator_nonlinear_update(
+                functions=funcs,
+                prev_functions=prev_funcs,
+                aux_functions=aux_funcs,
+                iteration=it + 1,
+                coeffs=current,
+                delta_red=dU_red,
+                delta_full=dU_full,
+                bcs=bcs_now,
+                metrics={
+                    "residual_norm_before": float(norm_R),
+                    "residual_label": _residual_norm_label(),
+                    "tol_eff": float(tol_eff),
+                    "update_inf": float(dx_inf),
+                    "update_label": "Δx_newton∞",
+                    "assembly_time": float(assembly_time),
+                    "linear_solve_time": float(linear_time),
+                    "line_search_time": float(line_search_time),
+                },
+            )
 
             mixed_solution_ok, mixed_solution_reports = _mixed_solution_criteria_report(
                 dh=dh,
@@ -5332,6 +5553,26 @@ class NewtonSolver:
                     [f.nodal_values - f_prev.nodal_values for f, f_prev in zip(funcs, prev_funcs)]
                 )
                 self._last_iteration_totals = totals
+                self._notify_operator_nonlinear_iteration_end(
+                    functions=funcs,
+                    prev_functions=prev_funcs,
+                    aux_functions=aux_funcs,
+                    iteration=it + 1,
+                    coeffs=current,
+                    converged=True,
+                    bcs=bcs_now,
+                    metrics={
+                        "residual_norm": float(norm_after),
+                        "residual_norm_before": float(norm_R),
+                        "residual_label": _residual_norm_label(),
+                        "tol_eff": float(tol_eff),
+                        "update_inf": float(dx_inf),
+                        "reason": "residual_converged_after_update",
+                        "assembly_time": float(assembly_time),
+                        "linear_solve_time": float(linear_time),
+                        "line_search_time": float(line_search_time),
+                    },
+                )
                 return delta, converged, it + 1
 
             mixed_solution_residual_ok = True
@@ -5375,6 +5616,27 @@ class NewtonSolver:
                 )
                 self._last_nonlinear_reason = "mixed_solution_criteria"
                 self._last_iteration_totals = totals
+                self._notify_operator_nonlinear_iteration_end(
+                    functions=funcs,
+                    prev_functions=prev_funcs,
+                    aux_functions=aux_funcs,
+                    iteration=it + 1,
+                    coeffs=current,
+                    converged=True,
+                    bcs=bcs_now,
+                    metrics={
+                        "residual_norm": float(norm_after if norm_after is not None else norm_R),
+                        "residual_norm_before": float(norm_R),
+                        "residual_label": _residual_norm_label(),
+                        "tol_eff": float(tol_eff),
+                        "update_inf": float(dx_inf),
+                        "reason": "mixed_solution_criteria",
+                        "assembly_time": float(assembly_time),
+                        "linear_solve_time": float(linear_time),
+                        "line_search_time": float(line_search_time),
+                        "mixed_solution_reports": mixed_solution_reports,
+                    },
+                )
                 return delta, converged, it + 1
             if mixed_solution_ok and (not mixed_solution_residual_ok):
                 if int(getattr(self.np, "print_level", 2) or 0) >= 2:
@@ -5383,6 +5645,26 @@ class NewtonSolver:
                         f"({_residual_norm_label()}={float(mixed_solution_residual_value):.3e} > "
                         f"{float(mixed_solution_residual_limit):.3e})."
                     )
+            self._notify_operator_nonlinear_iteration_end(
+                functions=funcs,
+                prev_functions=prev_funcs,
+                aux_functions=aux_funcs,
+                iteration=it + 1,
+                coeffs=current,
+                converged=False,
+                bcs=bcs_now,
+                metrics={
+                    "residual_norm": float(norm_after if norm_after is not None else norm_R),
+                    "residual_norm_before": float(norm_R),
+                    "residual_label": _residual_norm_label(),
+                    "tol_eff": float(tol_eff),
+                    "update_inf": float(dx_inf),
+                    "reason": "continue",
+                    "assembly_time": float(assembly_time),
+                    "linear_solve_time": float(linear_time),
+                    "line_search_time": float(line_search_time),
+                },
+            )
 
         # If we get here, Newton did not converge within the iteration budget
         accept_factor_raw = os.getenv("PYCUTFEM_NEWTON_MAXITER_ACCEPT_FACTOR", "").strip()

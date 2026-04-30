@@ -12,6 +12,7 @@ from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Sequence
+from xml.sax.saxutils import escape as _xml_escape
 
 import numpy as np
 
@@ -100,6 +101,10 @@ from examples.NIRB.example2_problem import (
     _EX2_TWO_THIRDS,
     _named_constant,
     build_conforming_mesh,
+)
+from examples.utils.poromechanics import (
+    UPlMaterial2D,
+    build_kratos_quasistatic_upl_system_2d,
 )
 
 
@@ -2892,6 +2897,99 @@ def _build_solid_problem(mesh: Mesh, *, poly_order: int) -> dict[str, object]:
     }
 
 
+def _build_porous_solid_problem(
+    mesh: Mesh,
+    *,
+    displacement_order: int,
+    pressure_order: int,
+) -> dict[str, object]:
+    me = MixedElement(
+        mesh,
+        field_specs={
+            "dx": int(displacement_order),
+            "dy": int(displacement_order),
+            "pl": int(pressure_order),
+        },
+    )
+    dh = DofHandler(me, method="cg")
+    d_space = FunctionSpace("PorousDisplacement", ["dx", "dy"], dim=1)
+    dd = VectorTrialFunction(space=d_space, dof_handler=dh)
+    w = VectorTestFunction(space=d_space, dof_handler=dh)
+    dp = TrialFunction(name="dpl", field_name="pl", dof_handler=dh)
+    q = TestFunction(name="qpl", field_name="pl", dof_handler=dh)
+    d_k = VectorFunction("d_k", ["dx", "dy"], dof_handler=dh)
+    d_prev = VectorFunction("d_prev", ["dx", "dy"], dof_handler=dh)
+    p_k = Function("pl_k", "pl", dof_handler=dh)
+    p_prev = Function("pl_prev", "pl", dof_handler=dh)
+    for function in (d_k, d_prev):
+        function.nodal_values.fill(0.0)
+    for function in (p_k, p_prev):
+        function.nodal_values.fill(0.0)
+    return {
+        "me": me,
+        "dh": dh,
+        "dd": dd,
+        "w": w,
+        "dp": dp,
+        "q": q,
+        "d_k": d_k,
+        "d_prev": d_prev,
+        "p_k": p_k,
+        "p_prev": p_prev,
+    }
+
+
+def _solid_current_functions(solid: dict[str, object]) -> list[Function | VectorFunction]:
+    functions: list[Function | VectorFunction] = [solid["d_k"]]
+    if "p_k" in solid:
+        functions.append(solid["p_k"])
+    return functions
+
+
+def _solid_prev_functions(solid: dict[str, object]) -> list[Function | VectorFunction]:
+    functions: list[Function | VectorFunction] = [solid["d_prev"]]
+    if "p_prev" in solid:
+        functions.append(solid["p_prev"])
+    return functions
+
+
+def _solid_current_and_prev_functions(solid: dict[str, object]) -> list[Function | VectorFunction]:
+    return _solid_current_functions(solid) + _solid_prev_functions(solid)
+
+
+def _default_upl_material_from_lame(
+    *,
+    mu_s: float,
+    lambda_s: float,
+    porosity: float,
+    biot_coefficient: float,
+    permeability: float,
+    storage_inverse: float,
+    dynamic_viscosity_liquid: float,
+    density_solid: float,
+    density_liquid: float,
+) -> UPlMaterial2D:
+    mu = float(mu_s)
+    lam = float(lambda_s)
+    if mu <= 0.0:
+        raise ValueError("porous solid shear modulus must be positive.")
+    denom = max(2.0 * (lam + mu), 1.0e-14)
+    poisson = lam / denom
+    young = mu * (3.0 * lam + 2.0 * mu) / max(lam + mu, 1.0e-14)
+    return UPlMaterial2D(
+        young_modulus=float(young),
+        poisson_ratio=float(poisson),
+        porosity=float(porosity),
+        biot_coefficient=float(biot_coefficient),
+        permeability_xx=float(permeability),
+        permeability_yy=float(permeability),
+        dynamic_viscosity_liquid=float(dynamic_viscosity_liquid),
+        storage_inverse=float(storage_inverse),
+        density_solid=float(density_solid),
+        density_liquid=float(density_liquid),
+    )
+
+
 def _boundary_field_data(dh: DofHandler, field: str, tag: str) -> tuple[np.ndarray, np.ndarray]:
     cache = getattr(dh, "_nirb_boundary_field_data_cache", None)
     if not isinstance(cache, dict):
@@ -3744,6 +3842,11 @@ def _write_local_step_history(
     solid_coords_ref = np.asarray(mesh_s.nodes_x_y_pos, dtype=float)
     solid_displacement = _vector_point_data_from_function(solid["dh"], solid["d_k"])
     solid_coords_cur = solid_coords_ref + solid_displacement
+    solid_pressure = (
+        _scalar_point_data_from_function(solid["dh"], solid["p_k"])
+        if "p_k" in solid
+        else np.zeros((int(len(mesh_s.nodes_list)), 1), dtype=float)
+    )
 
     step_path = step_history_dir / f"step{int(step):04d}.npz"
     np.savez_compressed(
@@ -3761,6 +3864,7 @@ def _write_local_step_history(
         structure_coords_ref=solid_coords_ref,
         structure_coords_cur=solid_coords_cur,
         structure_displacement_nodal_values=solid_displacement,
+        structure_liquid_pressure_nodal_values=solid_pressure,
         interface_load_coords_ref=np.asarray(interface_load_lookup.coords, dtype=float),
         interface_load_values=np.asarray(interface_load_lookup.values, dtype=float),
         interface_disp_coords_ref=np.asarray(interface_disp_lookup.coords, dtype=float),
@@ -4455,6 +4559,66 @@ def _solid_residual_and_jacobian(
     deltaP = _kratos_hyperelastic_plane_strain_delta_pk1(F, grad(dd), mu_s_const, lambda_s_const)
     residual = inner(P, grad(w)) * dx_s - dot(traction, w) * ds_iface
     jacobian = inner(deltaP, grad(w)) * dx_s
+
+    zero = lambda x, y, t=0.0: 0.0
+    bcs = [
+        BoundaryCondition("dx", "dirichlet", clamp_tag, zero),
+        BoundaryCondition("dy", "dirichlet", clamp_tag, zero),
+    ]
+    bcs_homog = [
+        BoundaryCondition("dx", "dirichlet", clamp_tag, zero),
+        BoundaryCondition("dy", "dirichlet", clamp_tag, zero),
+    ]
+    return residual, jacobian, bcs, bcs_homog
+
+
+def _porous_solid_residual_and_jacobian(
+    *,
+    prob: dict[str, object],
+    material: UPlMaterial2D,
+    dt: float,
+    clamp_tag: str,
+    quad_order: int,
+):
+    d_k: VectorFunction = prob["d_k"]
+    p_k: Function = prob["p_k"]
+    d_prev: VectorFunction = prob["d_prev"]
+    p_prev: Function = prob["p_prev"]
+    dd = prob["dd"]
+    dp = prob["dp"]
+    w = prob["w"]
+    q = prob["q"]
+
+    dx_s = dx(metadata={"q": int(quad_order)})
+    theta = _named_constant("example2_porous_backward_euler_theta", 1.0)
+    current_system = build_kratos_quasistatic_upl_system_2d(
+        u_trial=d_k,
+        p_trial=p_k,
+        u_test=w,
+        p_test=q,
+        u_prev=d_prev,
+        p_prev=p_prev,
+        material=material,
+        dt=_named_constant("example2_porous_dt", float(dt)),
+        theta_u=theta,
+        theta_p=theta,
+        dx_measure=dx_s,
+    )
+    tangent_system = build_kratos_quasistatic_upl_system_2d(
+        u_trial=dd,
+        p_trial=dp,
+        u_test=w,
+        p_test=q,
+        u_prev=d_prev,
+        p_prev=p_prev,
+        material=material,
+        dt=_named_constant("example2_porous_dt", float(dt)),
+        theta_u=theta,
+        theta_p=theta,
+        dx_measure=dx_s,
+    )
+    residual = current_system.lhs_form - current_system.rhs_form
+    jacobian = tangent_system.lhs_form
 
     zero = lambda x, y, t=0.0: 0.0
     bcs = [
@@ -5286,6 +5450,62 @@ def _vector_history_full_lookup(
     return CoordinateLookup(curr_coords, vel_curr_vals, dim=2), CoordinateLookup(curr_coords, acc_curr_vals, dim=2)
 
 
+def _solid_velocity_point_data(
+    *,
+    dh: DofHandler,
+    d_curr: VectorFunction,
+    d_prev_values: np.ndarray,
+    dt: float,
+) -> np.ndarray:
+    current = _vector_point_data_from_function(dh, d_curr)
+    previous_fun_values = np.asarray(d_prev_values, dtype=float)
+    original = np.asarray(d_curr.nodal_values, dtype=float).copy()
+    try:
+        d_curr.nodal_values[:] = previous_fun_values.reshape(np.asarray(d_curr.nodal_values).shape)
+        previous = _vector_point_data_from_function(dh, d_curr)
+    finally:
+        d_curr.nodal_values[:] = original
+    return (current - previous) / max(float(dt), 1.0e-14)
+
+
+def _darcy_flux_point_data_from_pressure(
+    *,
+    dh: DofHandler,
+    mesh: Mesh,
+    pressure: Function,
+    material: UPlMaterial2D,
+) -> np.ndarray:
+    """Return nodal Darcy discharge ``q = -K/mu grad(p)`` for VTK output."""
+
+    conductivity = np.asarray(material.darcy_conductivity_matrix, dtype=float).reshape(2, 2)
+    out = np.zeros((int(len(mesh.nodes_list)), 2), dtype=float)
+    counts = np.zeros((int(len(mesh.nodes_list)),), dtype=float)
+    me = dh.mixed_element
+    field = str(pressure.field_name)
+    field_slice = me.slice(field)
+    conn_all = np.asarray(getattr(mesh, "elements_connectivity", mesh.corner_connectivity), dtype=int)
+    for elem in mesh.elements_list:
+        eid = int(elem.id)
+        if eid < 0 or eid >= int(conn_all.shape[0]):
+            continue
+        gdofs = dh.element_maps[field][eid]
+        vals = pressure.get_nodal_values(gdofs)
+        for node_id in np.unique(conn_all[eid]):
+            xy = np.asarray(mesh.nodes_x_y_pos[int(node_id)], dtype=float)
+            try:
+                xi, eta = transform.inverse_mapping(mesh, eid, xy)
+                grad_ref = me.grad_basis(field, float(xi), float(eta))[field_slice]
+                grad_phys = transform.map_grad_scalar(mesh, eid, grad_ref, (float(xi), float(eta)))
+            except Exception:
+                continue
+            grad_p = np.asarray(vals, dtype=float) @ np.asarray(grad_phys, dtype=float)
+            out[int(node_id), :] += -conductivity @ np.asarray(grad_p, dtype=float).reshape(2)
+            counts[int(node_id)] += 1.0
+    mask = counts > 0.0
+    out[mask, :] /= counts[mask, None]
+    return out
+
+
 def _write_vtk_outputs(
     *,
     output_dir: Path,
@@ -5295,6 +5515,9 @@ def _write_vtk_outputs(
     solid: dict[str, object],
     geometry,
     returned_load_lookup: CoordinateLookup | None,
+    dt: float,
+    porous_material: UPlMaterial2D | None = None,
+    solid_prev_displacement_values: np.ndarray | None = None,
 ) -> tuple[Path, Path]:
     vtk_root = Path(output_dir) / "vtk_data"
     fluid_dir = vtk_root / "vtk_output_fsi_cfd"
@@ -5305,6 +5528,7 @@ def _write_vtk_outputs(
     fluid_path = fluid_dir / f"FluidParts_FluidPart_0_{int(step):04d}.vtu"
     solid_path = solid_dir / f"Structure_0_{int(step):04d}.vtu"
 
+    fluid_mesh_displacement = _vector_point_data_from_function(fluid["dh"], fluid["d_mesh"])
     export_vtk(
         filename=str(fluid_path),
         mesh=fluid["mesh"],
@@ -5317,12 +5541,37 @@ def _write_vtk_outputs(
             "ACCELERATION": fluid["a_prev"],
             "TIME": np.full(int(len(fluid["mesh"].nodes_list)), float(time_value), dtype=float),
         },
+        point_displacement=fluid_mesh_displacement,
     )
 
+    solid_displacement = _vector_point_data_from_function(solid["dh"], solid["d_k"])
     solid_fields: dict[str, object] = {
         "DISPLACEMENT": solid["d_k"],
         "TIME": np.full(int(len(solid["mesh"].nodes_list)), float(time_value), dtype=float),
     }
+    solid_velocity = None
+    if solid_prev_displacement_values is not None:
+        solid_velocity = _solid_velocity_point_data(
+            dh=solid["dh"],
+            d_curr=solid["d_k"],
+            d_prev_values=np.asarray(solid_prev_displacement_values, dtype=float),
+            dt=float(dt),
+        )
+        solid_fields["VS"] = solid_velocity
+        solid_fields["SOLID_VELOCITY"] = solid_velocity
+    if "p_k" in solid:
+        solid_fields["LIQUID_PRESSURE"] = solid["p_k"]
+        if porous_material is not None:
+            darcy_flux = _darcy_flux_point_data_from_pressure(
+                dh=solid["dh"],
+                mesh=solid["mesh"],
+                pressure=solid["p_k"],
+                material=porous_material,
+            )
+            solid_fields["DARCY_FLUX"] = darcy_flux
+            if solid_velocity is not None:
+                porosity = max(float(porous_material.porosity), 1.0e-14)
+                solid_fields["PORE_VELOCITY"] = solid_velocity + darcy_flux / porosity
     if returned_load_lookup is not None:
         solid_point_load_full = _boundary_point_load_vector(
             dh=solid["dh"],
@@ -5340,6 +5589,7 @@ def _write_vtk_outputs(
         mesh=solid["mesh"],
         dof_handler=solid["dh"],
         functions=solid_fields,
+        point_displacement=solid_displacement,
     )
     return fluid_path, solid_path
 
@@ -5550,6 +5800,36 @@ def _write_csv_rows(path: Path, *, fieldnames: list[str], rows: list[dict[str, o
         writer.writerows(rows)
 
 
+def _write_vtk_pvd_collection(path: Path, *, rows: list[dict[str, object]], vtk_key: str) -> None:
+    """Write a ParaView time-series collection for the accepted-step VTK files."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        '<?xml version="1.0"?>',
+        '<VTKFile type="Collection" version="0.1" byte_order="LittleEndian">',
+        "  <Collection>",
+    ]
+    base_dir = path.parent
+    for row in rows:
+        vtk_raw = str(row.get(vtk_key, "") or "").strip()
+        if not vtk_raw:
+            continue
+        try:
+            time_value = float(row.get("time_s", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            time_value = 0.0
+        vtk_path = Path(vtk_raw)
+        if vtk_path.is_absolute():
+            file_name = os.path.relpath(vtk_path, base_dir)
+        else:
+            file_name = os.path.relpath((Path.cwd() / vtk_path).resolve(), base_dir.resolve())
+        lines.append(
+            f'    <DataSet timestep="{time_value:.16g}" group="" part="0" file="{_xml_escape(file_name)}"/>'
+        )
+    lines.extend(["  </Collection>", "</VTKFile>", ""])
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
 def _iqn_history_to_payload(prefix: str, history: deque[np.ndarray]) -> dict[str, np.ndarray]:
     payload: dict[str, np.ndarray] = {
         f"{prefix}_count": np.asarray(int(len(history)), dtype=int),
@@ -5603,6 +5883,10 @@ def _checkpoint_payload(
         "fluid_a_mesh_prev": np.asarray(fluid["a_mesh_prev"].nodal_values, dtype=float).copy(),
         "current_load_values": np.asarray(current_load_lookup.values, dtype=float).copy(),
     }
+    if "p_k" in solid:
+        payload["solid_p_k"] = np.asarray(solid["p_k"].nodal_values, dtype=float).copy()
+    if "p_prev" in solid:
+        payload["solid_p_prev"] = np.asarray(solid["p_prev"].nodal_values, dtype=float).copy()
     dvms_snapshot = _snapshot_fluid_dvms_state(fluid.get("dvms_state"))
     if isinstance(dvms_snapshot, dict):
         for key, values in dvms_snapshot.items():
@@ -5712,6 +5996,8 @@ def _flush_progress_artifacts(
         fieldnames=["step", "time_s", "fluid_vtk", "solid_vtk"],
         rows=vtk_rows,
     )
+    _write_vtk_pvd_collection(output_dir / "vtk_data" / "fluid_timeseries.pvd", rows=vtk_rows, vtk_key="fluid_vtk")
+    _write_vtk_pvd_collection(output_dir / "vtk_data" / "solid_timeseries.pvd", rows=vtk_rows, vtk_key="solid_vtk")
     _write_csv_rows(
         output_dir / "timeseries.csv",
         fieldnames=[
@@ -6335,10 +6621,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fluid-operator", choices=("exact", "continuous"), default="exact")
     parser.add_argument(
         "--solid-operator",
-        choices=("exact", "nirb"),
+        choices=("exact", "nirb", "porous"),
         default="exact",
-        help="Use the full structural solve or a trained NIRB solid surrogate.",
+        help="Use the full structural solve, a trained NIRB solid surrogate, or the U-Pl porous flap.",
     )
+    parser.add_argument("--porous-pressure-order", type=int, default=None)
+    parser.add_argument("--porous-porosity", type=float, default=0.32)
+    parser.add_argument("--porous-biot-coefficient", type=float, default=0.8)
+    parser.add_argument("--porous-permeability", type=float, default=1.0e-8)
+    parser.add_argument("--porous-storage-inverse", type=float, default=2.0e-4)
     parser.add_argument(
         "--nirb-model-path",
         type=Path,
@@ -6405,6 +6696,11 @@ def run_local_example2(
     pressure_gauge: float = 1.0e-5,
     fluid_operator: str = "exact",
     solid_operator: str = "exact",
+    porous_pressure_order: int | None = None,
+    porous_porosity: float = 0.32,
+    porous_biot_coefficient: float = 0.8,
+    porous_permeability: float = 1.0e-8,
+    porous_storage_inverse: float = 2.0e-4,
     nirb_model_path: Path | None = None,
     nirb_start_step: int = 1,
     backend: str = "cpp",
@@ -6522,10 +6818,13 @@ def run_local_example2(
             fluid_operator_mode = "exact"
     use_exact_fluid_operator = fluid_operator_mode == "exact"
     solid_operator_mode = str(solid_operator).strip().lower()
-    if solid_operator_mode not in {"exact", "nirb"}:
+    if solid_operator_mode not in {"exact", "nirb", "porous"}:
         raise ValueError(f"Unsupported solid_operator={solid_operator!r}")
     if solid_operator_mode == "nirb" and nirb_model_path is None:
         raise ValueError("--nirb-model-path is required when --solid-operator=nirb")
+    porous_pressure_order_value = int(
+        porous_pressure_order if porous_pressure_order is not None else max(1, int(poly_order) - 1)
+    )
     nirb_start_step_value = max(1, int(nirb_start_step))
     exact_backend_notes: list[str] = []
     requested_exact_fluid_backend_mode = _env_str(
@@ -6572,7 +6871,7 @@ def run_local_example2(
         exact_structure_backend_mode = (
             "kratos_live"
             if (
-                solid_operator_mode != "nirb"
+                solid_operator_mode not in {"nirb", "porous"}
                 and bool(use_exact_fluid_operator)
                 and mesh_source_value == "reference"
                 and restart_payload is None
@@ -6593,6 +6892,8 @@ def run_local_example2(
         structure_auto_reasons: list[str] = []
         if solid_operator_mode == "nirb":
             structure_auto_reasons.append("solid_operator=nirb")
+        if solid_operator_mode == "porous":
+            structure_auto_reasons.append("solid_operator=porous")
         if not bool(use_exact_fluid_operator):
             structure_auto_reasons.append("fluid_operator != exact")
         if mesh_source_value != "reference":
@@ -6609,6 +6910,8 @@ def run_local_example2(
         raise RuntimeError("The persistent Kratos exact-structure backend is not yet supported with restart_from.")
     if solid_operator_mode == "nirb" and exact_structure_backend_mode == "kratos_live":
         raise RuntimeError("solid_operator='nirb' cannot be combined with the kratos_live structure backend.")
+    if solid_operator_mode == "porous" and exact_structure_backend_mode == "kratos_live":
+        raise RuntimeError("solid_operator='porous' cannot be combined with the kratos_live structure backend.")
     requested_exact_fluid_linear_backend = str(
         os.getenv("PYCUTFEM_EX2_EXACT_FLUID_LINEAR_BACKEND", "") or ""
     ).strip().lower()
@@ -6645,7 +6948,14 @@ def run_local_example2(
         quadrature_order=quad_order,
     )
     mesh_ext = _build_mesh_extension_problem(mesh_f, poly_order=int(mesh_order))
-    solid = _build_solid_problem(mesh_s, poly_order=int(poly_order))
+    if solid_operator_mode == "porous":
+        solid = _build_porous_solid_problem(
+            mesh_s,
+            displacement_order=int(poly_order),
+            pressure_order=int(porous_pressure_order_value),
+        )
+    else:
+        solid = _build_solid_problem(mesh_s, poly_order=int(poly_order))
     diagnostic_solid_system_backend = _diagnostic_solid_system_backend_mode()
     if diagnostic_solid_system_backend in {"", "none", "symbolic"}:
         kratos_local_solid_backend = None
@@ -6836,6 +7146,17 @@ def run_local_example2(
     mu_f = float(setup.material.density * setup.material.kinematic_viscosity)
     mu_s = float(setup.material.shear_modulus)
     lambda_s = float(setup.material.lame_lambda)
+    porous_material = _default_upl_material_from_lame(
+        mu_s=mu_s,
+        lambda_s=lambda_s,
+        porosity=float(porous_porosity),
+        biot_coefficient=float(porous_biot_coefficient),
+        permeability=float(porous_permeability),
+        storage_inverse=float(porous_storage_inverse),
+        dynamic_viscosity_liquid=mu_f,
+        density_solid=float(setup.material.density),
+        density_liquid=float(setup.material.density),
+    )
 
     fixed_mesh_tags = (
         geometry.inlet_tag,
@@ -6953,6 +7274,10 @@ def run_local_example2(
     if restart_payload is not None:
         solid["d_k"].nodal_values[:] = np.asarray(restart_payload["solid_d_k"], dtype=float)
         solid["d_prev"].nodal_values[:] = np.asarray(restart_payload["solid_d_prev"], dtype=float)
+        if "p_k" in solid and "solid_p_k" in restart_payload:
+            solid["p_k"].nodal_values[:] = np.asarray(restart_payload["solid_p_k"], dtype=float)
+        if "p_prev" in solid and "solid_p_prev" in restart_payload:
+            solid["p_prev"].nodal_values[:] = np.asarray(restart_payload["solid_p_prev"], dtype=float)
         fluid["u_k"].nodal_values[:] = np.asarray(restart_payload["fluid_u_k"], dtype=float)
         fluid["p_k"].nodal_values[:] = np.asarray(restart_payload["fluid_p_k"], dtype=float)
         fluid["u_prev"].nodal_values[:] = np.asarray(restart_payload["fluid_u_prev"], dtype=float)
@@ -7023,7 +7348,7 @@ def run_local_example2(
         elif kratos_local_mesh_backend is not None:
             _advance_kratos_mesh_motion_backend_step(backend=kratos_local_mesh_backend)
         increment_start = time.perf_counter()
-        solid_prev_step = _snapshot_function_values([solid["d_prev"]])
+        solid_prev_step = _snapshot_function_values(_solid_prev_functions(solid))
         fluid_prev_step = _snapshot_function_values([fluid["u_prev"], fluid["p_prev"]])
         fluid_mesh_prev_step = _snapshot_function_values(
             [fluid["d_prev"], fluid["d_prev2"], fluid["w_mesh_prev"], fluid["a_mesh_prev"]]
@@ -7060,7 +7385,7 @@ def run_local_example2(
             )
 
         step_prev_disp_iter_vals = np.asarray(prev_disp_iter_vals, dtype=float).copy()
-        solid_step_state = _snapshot_function_values([solid["d_k"], solid["d_prev"]])
+        solid_step_state = _snapshot_function_values(_solid_current_and_prev_functions(solid))
         fluid_step_state = _snapshot_function_values(
             [
                 fluid["u_k"],
@@ -7140,7 +7465,7 @@ def run_local_example2(
                 structure_times=structure_times,
                 increment_times=increment_times,
             )
-            _restore_function_values([solid["d_k"], solid["d_prev"]], solid_step_state)
+            _restore_function_values(_solid_current_and_prev_functions(solid), solid_step_state)
             _restore_function_values(
                 [
                     fluid["u_k"],
@@ -7226,6 +7551,80 @@ def run_local_example2(
                         if not np.all(np.isfinite(predicted_interface)):
                             raise RuntimeError("NIRB solid predictor returned non-finite interface displacement values.")
                         last_nirb_prediction = nirb_prediction
+                    elif solid_operator_mode == "porous":
+                        solid_res, solid_jac, solid_bcs, solid_bcs_homog = _porous_solid_residual_and_jacobian(
+                            prob=solid,
+                            material=porous_material,
+                            dt=float(dt_value),
+                            clamp_tag=geometry.clamp_tag,
+                            quad_order=solid_quad_order,
+                        )
+                        exact_structure_newton_tol = max(
+                            0.0,
+                            float(_env_float("PYCUTFEM_EX2_POROUS_STRUCTURE_NEWTON_TOL", float(newton_tol))),
+                        )
+                        exact_structure_max_newton_iter = int(
+                            max(
+                                1,
+                                _env_float(
+                                    "PYCUTFEM_EX2_POROUS_STRUCTURE_MAX_NEWTON_ITER",
+                                    float(max_newton_iter),
+                                ),
+                            )
+                        )
+                        exact_structure_linear_backend = _env_str(
+                            "PYCUTFEM_EX2_POROUS_STRUCTURE_LINEAR_BACKEND",
+                            str(linear_backend),
+                        ).strip().lower()
+                        solid_solver = NewtonSolver(
+                            residual_form=solid_res,
+                            jacobian_form=solid_jac,
+                            dof_handler=solid["dh"],
+                            mixed_element=solid["me"],
+                            bcs=solid_bcs,
+                            bcs_homog=solid_bcs_homog,
+                            newton_params=NewtonParameters(
+                                newton_tol=float(exact_structure_newton_tol),
+                                newton_rtol=0.0,
+                                residual_norm="linf",
+                                max_newton_iter=int(exact_structure_max_newton_iter),
+                                print_level=3,
+                                line_search=False,
+                                globalization="none",
+                            ),
+                            lin_params=LinearSolverParameters(backend=str(exact_structure_linear_backend)),
+                            quad_order=solid_quad_order,
+                            backend=str(backend),
+                        )
+                        solid_point_load_full = _boundary_point_load_vector(
+                            solid["dh"],
+                            vector=solid["d_k"],
+                            tag=geometry.interface_tag,
+                            values=load_guess_vals,
+                        )
+                        solid_point_load_red = np.asarray(
+                            solid_point_load_full[np.asarray(solid_solver.active_dofs, dtype=int)],
+                            dtype=float,
+                        )
+                        solid_solver.set_runtime_operators([_ReducedResidualShiftOperator(solid_point_load_red)])
+                        solid_guess = _snapshot_function_values(_solid_current_functions(solid))
+                        _restore_function_values(_solid_prev_functions(solid), solid_prev_step)
+                        solid_solver.solve_time_interval(
+                            functions=_solid_current_functions(solid),
+                            prev_functions=_solid_prev_functions(solid),
+                            time_params=TimeStepperParameters(
+                                dt=1.0,
+                                max_steps=1,
+                                final_time=1.0,
+                                stop_on_steady=False,
+                                step_initial_guess_callback=_guess_callback_from_snapshots_with_dirichlet(
+                                    snapshots=solid_guess,
+                                    dh=solid["dh"],
+                                    bcs=solid_bcs,
+                                ),
+                            ),
+                        )
+                        _restore_function_values(_solid_prev_functions(solid), solid_prev_step)
                     else:
                         solid_res, solid_jac, solid_bcs, solid_bcs_homog = _solid_residual_and_jacobian(
                             prob=solid,
@@ -8510,7 +8909,10 @@ def run_local_example2(
         u_prev_old = np.asarray(fluid["u_prev"].nodal_values, dtype=float).copy()
         a_prev_old = np.asarray(fluid["a_prev"].nodal_values, dtype=float).copy()
         d_prev_old = np.asarray(fluid["d_prev"].nodal_values, dtype=float).copy()
+        solid_prev_displacement_for_vtk = np.asarray(solid["d_prev"].nodal_values, dtype=float).copy()
         solid["d_prev"].nodal_values[:] = solid["d_k"].nodal_values[:]
+        if "p_k" in solid and "p_prev" in solid:
+            solid["p_prev"].nodal_values[:] = solid["p_k"].nodal_values[:]
         if kratos_exact_structure_backend is not None:
             _finalize_kratos_exact_structure_backend_step(backend=kratos_exact_structure_backend)
         fluid["u_prev"].nodal_values[:] = fluid["u_k"].nodal_values[:]
@@ -8663,6 +9065,9 @@ def run_local_example2(
                 solid=solid,
                 geometry=geometry,
                 returned_load_lookup=last_returned_load_lookup,
+                dt=float(dt_value),
+                porous_material=porous_material if solid_operator_mode == "porous" else None,
+                solid_prev_displacement_values=solid_prev_displacement_for_vtk,
             )
             vtk_rows.append(
                 {
@@ -8764,6 +9169,8 @@ def run_local_example2(
     interface_disp_matrix = np.load(co_sim_dir / "interface_disp_data.npy")
     metadata_path = output_dir / "snapshot_metadata.csv"
     vtk_manifest_path = output_dir / "vtk_manifest.csv"
+    fluid_pvd_path = output_dir / "vtk_data" / "fluid_timeseries.pvd"
+    solid_pvd_path = output_dir / "vtk_data" / "solid_timeseries.pvd"
     timeseries_path = output_dir / "timeseries.csv"
 
     summary = {
@@ -8788,6 +9195,23 @@ def run_local_example2(
         "solid_quad_order": int(solid_quad_order),
         "fluid_operator": str(fluid_operator_mode),
         "solid_operator": str(solid_operator_mode),
+        "porous_pressure_order": int(porous_pressure_order_value) if solid_operator_mode == "porous" else None,
+        "porous_material": (
+            {
+                "young_modulus": float(porous_material.young_modulus),
+                "poisson_ratio": float(porous_material.poisson_ratio),
+                "porosity": float(porous_material.porosity),
+                "biot_coefficient": float(porous_material.biot_coefficient),
+                "permeability_xx": float(porous_material.permeability_xx),
+                "permeability_yy": (
+                    None if porous_material.permeability_yy is None else float(porous_material.permeability_yy)
+                ),
+                "storage_inverse": float(porous_material.biot_modulus_inverse),
+                "dynamic_viscosity_liquid": float(porous_material.dynamic_viscosity_liquid),
+            }
+            if solid_operator_mode == "porous"
+            else None
+        ),
         "nirb_model_path": None if nirb_model_path is None else str(Path(nirb_model_path)),
         "nirb_start_step": int(nirb_start_step_value),
         "exact_structure_backend": str(exact_structure_backend_mode),
@@ -8847,6 +9271,8 @@ def run_local_example2(
         "save_vtk": bool(save_vtk),
         "vtk_every": int(vtk_every),
         "vtk_manifest_path": str(vtk_manifest_path),
+        "fluid_pvd_path": str(fluid_pvd_path),
+        "solid_pvd_path": str(solid_pvd_path),
         "vtk_count": int(len(vtk_rows)),
         "monitor_interface_loads": bool(monitor_interface_loads),
         "checkpoint_every": int(checkpoint_every),
@@ -8897,6 +9323,11 @@ def main() -> None:
         pressure_gauge=float(args.pressure_gauge),
         fluid_operator=str(args.fluid_operator),
         solid_operator=str(args.solid_operator),
+        porous_pressure_order=args.porous_pressure_order,
+        porous_porosity=float(args.porous_porosity),
+        porous_biot_coefficient=float(args.porous_biot_coefficient),
+        porous_permeability=float(args.porous_permeability),
+        porous_storage_inverse=float(args.porous_storage_inverse),
         nirb_model_path=args.nirb_model_path,
         nirb_start_step=int(args.nirb_start_step),
         backend=str(args.backend),

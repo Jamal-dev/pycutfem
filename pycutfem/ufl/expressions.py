@@ -2152,6 +2152,22 @@ def outer(a, b): return Outer(a, b)
 def dyad(a, b): return Outer(a, b)
 def pos_part(x): return PositivePart(x)
 def heaviside(x): return Heaviside(x)
+
+
+def _named_scalar_constant(value, name: str):
+    c = Constant(value)
+    c._jit_name = str(name)
+    c._preserve_runtime_structure = True
+    return c
+
+
+def sqrt(x): return Power(x, _named_scalar_constant(0.5, "ufl_sqrt_half"))
+def abs_value(x):
+    minus_one = _named_scalar_constant(-1.0, "ufl_abs_minus_one")
+    return PositivePart(x) + PositivePart(minus_one * x)
+def signum(x):
+    minus_one = _named_scalar_constant(-1.0, "ufl_sign_minus_one")
+    return Heaviside(x) - Heaviside(minus_one * x)
 def log(x): return Log(x)
 def exp(x): return Exp(x)
 def tanh(x): return Tanh(x)

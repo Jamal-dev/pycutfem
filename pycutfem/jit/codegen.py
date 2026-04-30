@@ -1318,9 +1318,9 @@ class NumbaCodeGen:
                 )
             elif isinstance(op, LoadQuadratureState):
                 required_args.add(op.name)
-                required_args.add("owner_id")
+                required_args.add("qstate_owner_id")
                 var_name = new_var("qstate")
-                body_lines.append(f"{var_name} = {op.name}[owner_id[e], q]")
+                body_lines.append(f"{var_name} = {op.name}[qstate_owner_id[e], q]")
 
                 is_vec = len(op.tensor_shape) == 1
                 stack.append(

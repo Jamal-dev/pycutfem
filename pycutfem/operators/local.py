@@ -375,6 +375,23 @@ class FusedLocalAssemblyOperator(LocalAssemblyOperator):
             if hasattr(registry, "reset_iteration"):
                 registry.reset_iteration()
 
+    def on_nonlinear_iteration_begin(
+        self,
+        *,
+        solver: Any,
+        functions,
+        prev_functions,
+        aux_functions,
+        iteration: int,
+        coeffs,
+        bcs,
+        metrics: dict | None = None,
+    ) -> None:
+        del solver, functions, prev_functions, aux_functions, iteration, coeffs, bcs, metrics
+        for registry in self.state_registries:
+            if hasattr(registry, "reset_iteration"):
+                registry.reset_iteration()
+
     def on_step_accept(
         self,
         *,
@@ -613,6 +630,180 @@ class SymbolicLocalAssemblyOperator(LocalAssemblyOperator):
         self._compiler_cache[key] = compiler
         return compiler
 
+    def _integrals(self):
+        from pycutfem.ufl.expressions import Integral
+        from pycutfem.ufl.forms import Equation, Form
+
+        if isinstance(self.form_or_equation, Equation):
+            forms = [frm for frm in (self.form_or_equation.a, self.form_or_equation.L) if frm is not None]
+        elif isinstance(self.form_or_equation, (Form, Integral)):
+            forms = [self.form_or_equation]
+        else:
+            return ()
+        out = []
+        for form in forms:
+            out.extend([form] if isinstance(form, Integral) else list(getattr(form, "integrals", ())))
+        return tuple(out)
+
+    def _nonmatching_interface_for_updates(self):
+        interfaces = []
+        for integral in self._integrals():
+            measure = getattr(integral, "measure", None)
+            if str(getattr(measure, "domain_type", "")).strip().lower() != "nonmatching_interface":
+                continue
+            md = getattr(measure, "metadata", None) or {}
+            iface = md.get("interface", None)
+            if iface is None:
+                iface = getattr(measure, "interface", None)
+            if iface is not None:
+                interfaces.append(iface)
+        if not interfaces:
+            raise ValueError(
+                "Nonmatching-interface quadrature_state_updates require a form with "
+                "dNonmatchingInterface(metadata={'interface': ...})."
+            )
+        first = interfaces[0]
+        if any(iface is not first for iface in interfaces[1:]):
+            raise NotImplementedError(
+                "Nonmatching-interface quadrature_state_updates currently require all integrals "
+                "to use the same NonMatchingInterface object."
+            )
+        return first
+
+    def _nonmatching_quadrature_rule_for_updates(self) -> str:
+        rules = set()
+        for integral in self._integrals():
+            measure = getattr(integral, "measure", None)
+            if str(getattr(measure, "domain_type", "")).strip().lower() != "nonmatching_interface":
+                continue
+            md = getattr(measure, "metadata", None) or {}
+            rule = str(md.get("quadrature", md.get("rule", "gauss"))).strip().lower().replace("-", "_")
+            if rule in {"gll", "lobatto"}:
+                rule = "gauss_lobatto"
+            rules.add(rule)
+        if len(rules) > 1:
+            raise NotImplementedError(
+                "Nonmatching-interface quadrature_state_updates require one quadrature rule per operator."
+            )
+        return next(iter(rules), "gauss")
+
+    def _trace_link_for_updates(self):
+        traces = []
+        for integral in self._integrals():
+            measure = getattr(integral, "measure", None)
+            if str(getattr(measure, "domain_type", "")).strip().lower() != "trace_link":
+                continue
+            md = getattr(measure, "metadata", None) or {}
+            trace = md.get("trace", md.get("interface", None))
+            if trace is None:
+                trace = getattr(measure, "trace", None)
+            if trace is not None:
+                traces.append(trace)
+        if not traces:
+            raise ValueError(
+                "Trace-link quadrature_state_updates require a form with "
+                "dTraceLink(metadata={'trace': ...})."
+            )
+        first = traces[0]
+        if any(trace is not first for trace in traces[1:]):
+            raise NotImplementedError(
+                "Trace-link quadrature_state_updates currently require all integrals "
+                "to use the same TraceLinkInterface object."
+            )
+        return first
+
+    def _trace_link_quadrature_rule_for_updates(self) -> str:
+        rules = set()
+        for integral in self._integrals():
+            measure = getattr(integral, "measure", None)
+            if str(getattr(measure, "domain_type", "")).strip().lower() != "trace_link":
+                continue
+            md = getattr(measure, "metadata", None) or {}
+            rule = str(md.get("quadrature", md.get("rule", "gauss"))).strip().lower().replace("-", "_")
+            if rule in {"gll", "lobatto"}:
+                rule = "gauss_lobatto"
+            rules.add(rule)
+        if len(rules) > 1:
+            raise NotImplementedError(
+                "Trace-link quadrature_state_updates require one quadrature rule per operator."
+            )
+        return next(iter(rules), "gauss")
+
+    def _evaluate_symbolic_quadrature_state_updates(self, *, compiler, workset, entity_ids=None) -> tuple[LocalStateUpdate, ...]:
+        if not self.quadrature_state_updates:
+            return ()
+        grouped: dict[tuple[str, int, str, str], list[tuple[str, SymbolicQuadratureStateUpdateSpec]]] = {}
+        for idx, spec in enumerate(self.quadrature_state_updates):
+            layout = getattr(spec.field, "layout", None)
+            if layout is None:
+                raise TypeError("SymbolicFusedLocalAssemblyOperator quadrature_state_updates require fields with a 'layout'.")
+            key = (
+                str(layout.entity_kind),
+                layout.signature,
+                int(layout.quadrature_order),
+                str(layout.cell_type),
+            )
+            name = str(spec.name or getattr(spec.field, "name", f"state_update_{idx}"))
+            grouped.setdefault(key, []).append((name, spec))
+
+        updates: list[LocalStateUpdate] = []
+        for _, specs in grouped.items():
+            layout = specs[0][1].field.layout
+            exprs = {name: spec.expr for name, spec in specs}
+            entity_kind = str(layout.entity_kind)
+            if entity_kind == "volume_cell":
+                ids = np.asarray(workset.element_ids if entity_ids is None else entity_ids, dtype=int)
+                qp_values = compiler.evaluate_volume_expressions_on_quadrature(
+                    exprs,
+                    layout=layout,
+                    element_ids=ids,
+                )
+                update_entity_ids = ids
+            elif entity_kind == "nonmatching_interface":
+                if entity_ids is not None:
+                    raise NotImplementedError(
+                        "Filtered nonmatching-interface quadrature_state_updates are not implemented; "
+                        "assemble the full interface state update."
+                    )
+                iface = self._nonmatching_interface_for_updates()
+                qp_values = compiler.evaluate_nonmatching_interface_expressions_on_quadrature(
+                    exprs,
+                    layout=layout,
+                    interface=iface,
+                    quadrature=self._nonmatching_quadrature_rule_for_updates(),
+                )
+                n_entities = int(next(iter(qp_values.values())).shape[0]) if qp_values else 0
+                update_entity_ids = np.arange(n_entities, dtype=int)
+            elif entity_kind == "trace_link":
+                if entity_ids is not None:
+                    raise NotImplementedError(
+                        "Filtered trace-link quadrature_state_updates are not implemented; "
+                        "assemble the full trace-link state update."
+                    )
+                trace = self._trace_link_for_updates()
+                qp_values = compiler.evaluate_trace_link_expressions_on_quadrature(
+                    exprs,
+                    layout=layout,
+                    trace=trace,
+                    quadrature=self._trace_link_quadrature_rule_for_updates(),
+                )
+                n_entities = int(next(iter(qp_values.values())).shape[0]) if qp_values else 0
+                update_entity_ids = np.arange(n_entities, dtype=int)
+            else:
+                raise ValueError(
+                    f"Unsupported quadrature_state_updates layout.entity_kind={entity_kind!r}."
+                )
+            for name, spec in specs:
+                updates.append(
+                    LocalStateUpdate(
+                        field=spec.field,
+                        values=np.asarray(qp_values[name], dtype=float),
+                        entity_ids=np.asarray(update_entity_ids, dtype=int),
+                        staged=bool(spec.staged),
+                    )
+                )
+        return tuple(updates)
+
     def build_local_workset(self, *, solver: Any, coeffs, need_matrix: bool):
         del coeffs
         if self.entity_ids is not None:
@@ -806,6 +997,180 @@ class SymbolicFusedLocalAssemblyOperator(FusedLocalAssemblyOperator):
         self._compiler_cache[key] = compiler
         return compiler
 
+    def _integrals(self):
+        from pycutfem.ufl.expressions import Integral
+        from pycutfem.ufl.forms import Equation, Form
+
+        if isinstance(self.form_or_equation, Equation):
+            forms = [frm for frm in (self.form_or_equation.a, self.form_or_equation.L) if frm is not None]
+        elif isinstance(self.form_or_equation, (Form, Integral)):
+            forms = [self.form_or_equation]
+        else:
+            return ()
+        out = []
+        for form in forms:
+            out.extend([form] if isinstance(form, Integral) else list(getattr(form, "integrals", ())))
+        return tuple(out)
+
+    def _nonmatching_interface_for_updates(self):
+        interfaces = []
+        for integral in self._integrals():
+            measure = getattr(integral, "measure", None)
+            if str(getattr(measure, "domain_type", "")).strip().lower() != "nonmatching_interface":
+                continue
+            md = getattr(measure, "metadata", None) or {}
+            iface = md.get("interface", None)
+            if iface is None:
+                iface = getattr(measure, "interface", None)
+            if iface is not None:
+                interfaces.append(iface)
+        if not interfaces:
+            raise ValueError(
+                "Nonmatching-interface quadrature_state_updates require a form with "
+                "dNonmatchingInterface(metadata={'interface': ...})."
+            )
+        first = interfaces[0]
+        if any(iface is not first for iface in interfaces[1:]):
+            raise NotImplementedError(
+                "Nonmatching-interface quadrature_state_updates currently require all integrals "
+                "to use the same NonMatchingInterface object."
+            )
+        return first
+
+    def _nonmatching_quadrature_rule_for_updates(self) -> str:
+        rules = set()
+        for integral in self._integrals():
+            measure = getattr(integral, "measure", None)
+            if str(getattr(measure, "domain_type", "")).strip().lower() != "nonmatching_interface":
+                continue
+            md = getattr(measure, "metadata", None) or {}
+            rule = str(md.get("quadrature", md.get("rule", "gauss"))).strip().lower().replace("-", "_")
+            if rule in {"gll", "lobatto"}:
+                rule = "gauss_lobatto"
+            rules.add(rule)
+        if len(rules) > 1:
+            raise NotImplementedError(
+                "Nonmatching-interface quadrature_state_updates require one quadrature rule per operator."
+            )
+        return next(iter(rules), "gauss")
+
+    def _trace_link_for_updates(self):
+        traces = []
+        for integral in self._integrals():
+            measure = getattr(integral, "measure", None)
+            if str(getattr(measure, "domain_type", "")).strip().lower() != "trace_link":
+                continue
+            md = getattr(measure, "metadata", None) or {}
+            trace = md.get("trace", md.get("interface", None))
+            if trace is None:
+                trace = getattr(measure, "trace", None)
+            if trace is not None:
+                traces.append(trace)
+        if not traces:
+            raise ValueError(
+                "Trace-link quadrature_state_updates require a form with "
+                "dTraceLink(metadata={'trace': ...})."
+            )
+        first = traces[0]
+        if any(trace is not first for trace in traces[1:]):
+            raise NotImplementedError(
+                "Trace-link quadrature_state_updates currently require all integrals "
+                "to use the same TraceLinkInterface object."
+            )
+        return first
+
+    def _trace_link_quadrature_rule_for_updates(self) -> str:
+        rules = set()
+        for integral in self._integrals():
+            measure = getattr(integral, "measure", None)
+            if str(getattr(measure, "domain_type", "")).strip().lower() != "trace_link":
+                continue
+            md = getattr(measure, "metadata", None) or {}
+            rule = str(md.get("quadrature", md.get("rule", "gauss"))).strip().lower().replace("-", "_")
+            if rule in {"gll", "lobatto"}:
+                rule = "gauss_lobatto"
+            rules.add(rule)
+        if len(rules) > 1:
+            raise NotImplementedError(
+                "Trace-link quadrature_state_updates require one quadrature rule per operator."
+            )
+        return next(iter(rules), "gauss")
+
+    def _evaluate_symbolic_quadrature_state_updates(self, *, compiler, workset, entity_ids=None) -> tuple[LocalStateUpdate, ...]:
+        if not self.quadrature_state_updates:
+            return ()
+        grouped: dict[tuple[str, int, str, str], list[tuple[str, SymbolicQuadratureStateUpdateSpec]]] = {}
+        for idx, spec in enumerate(self.quadrature_state_updates):
+            layout = getattr(spec.field, "layout", None)
+            if layout is None:
+                raise TypeError("SymbolicFusedLocalAssemblyOperator quadrature_state_updates require fields with a 'layout'.")
+            key = (
+                str(layout.entity_kind),
+                layout.signature,
+                int(layout.quadrature_order),
+                str(layout.cell_type),
+            )
+            name = str(spec.name or getattr(spec.field, "name", f"state_update_{idx}"))
+            grouped.setdefault(key, []).append((name, spec))
+
+        updates: list[LocalStateUpdate] = []
+        for _, specs in grouped.items():
+            layout = specs[0][1].field.layout
+            exprs = {name: spec.expr for name, spec in specs}
+            entity_kind = str(layout.entity_kind)
+            if entity_kind == "volume_cell":
+                ids = np.asarray(workset.element_ids if entity_ids is None else entity_ids, dtype=int)
+                qp_values = compiler.evaluate_volume_expressions_on_quadrature(
+                    exprs,
+                    layout=layout,
+                    element_ids=ids,
+                )
+                update_entity_ids = ids
+            elif entity_kind == "nonmatching_interface":
+                if entity_ids is not None:
+                    raise NotImplementedError(
+                        "Filtered nonmatching-interface quadrature_state_updates are not implemented; "
+                        "assemble the full interface state update."
+                    )
+                iface = self._nonmatching_interface_for_updates()
+                qp_values = compiler.evaluate_nonmatching_interface_expressions_on_quadrature(
+                    exprs,
+                    layout=layout,
+                    interface=iface,
+                    quadrature=self._nonmatching_quadrature_rule_for_updates(),
+                )
+                n_entities = int(next(iter(qp_values.values())).shape[0]) if qp_values else 0
+                update_entity_ids = np.arange(n_entities, dtype=int)
+            elif entity_kind == "trace_link":
+                if entity_ids is not None:
+                    raise NotImplementedError(
+                        "Filtered trace-link quadrature_state_updates are not implemented; "
+                        "assemble the full trace-link state update."
+                    )
+                trace = self._trace_link_for_updates()
+                qp_values = compiler.evaluate_trace_link_expressions_on_quadrature(
+                    exprs,
+                    layout=layout,
+                    trace=trace,
+                    quadrature=self._trace_link_quadrature_rule_for_updates(),
+                )
+                n_entities = int(next(iter(qp_values.values())).shape[0]) if qp_values else 0
+                update_entity_ids = np.arange(n_entities, dtype=int)
+            else:
+                raise ValueError(
+                    f"Unsupported quadrature_state_updates layout.entity_kind={entity_kind!r}."
+                )
+            for name, spec in specs:
+                updates.append(
+                    LocalStateUpdate(
+                        field=spec.field,
+                        values=np.asarray(qp_values[name], dtype=float),
+                        entity_ids=np.asarray(update_entity_ids, dtype=int),
+                        staged=bool(spec.staged),
+                    )
+                )
+        return tuple(updates)
+
     def build_local_workset(self, *, solver: Any, coeffs, need_matrix: bool):
         del coeffs
         if self.entity_ids is not None:
@@ -840,33 +1205,10 @@ class SymbolicFusedLocalAssemblyOperator(FusedLocalAssemblyOperator):
             entity_ids=entity_ids,
             need_matrix=bool(workset.need_matrix),
         )
-        state_updates: list[LocalStateUpdate] = []
-        if self.quadrature_state_updates:
-            grouped: dict[tuple[str, int, str], list[tuple[str, SymbolicQuadratureStateUpdateSpec]]] = {}
-            for idx, spec in enumerate(self.quadrature_state_updates):
-                layout = getattr(spec.field, "layout", None)
-                if layout is None:
-                    raise TypeError("SymbolicFusedLocalAssemblyOperator quadrature_state_updates require fields with a 'layout'.")
-                key = (layout.signature, int(layout.quadrature_order), str(layout.cell_type))
-                name = str(spec.name or getattr(spec.field, "name", f"state_update_{idx}"))
-                grouped.setdefault(key, []).append((name, spec))
-            for _, specs in grouped.items():
-                layout = specs[0][1].field.layout
-                exprs = {name: spec.expr for name, spec in specs}
-                qp_values = compiler.evaluate_volume_expressions_on_quadrature(
-                    exprs,
-                    layout=layout,
-                    element_ids=np.asarray(workset.element_ids, dtype=int),
-                )
-                for name, spec in specs:
-                    state_updates.append(
-                        LocalStateUpdate(
-                            field=spec.field,
-                            values=np.asarray(qp_values[name], dtype=float),
-                            entity_ids=np.asarray(workset.element_ids, dtype=int),
-                            staged=bool(spec.staged),
-                        )
-                    )
+        state_updates = self._evaluate_symbolic_quadrature_state_updates(
+            compiler=compiler,
+            workset=workset,
+        )
         return LocalAssemblyResult(
             K_elem=batch.K_elem if workset.need_matrix else None,
             F_elem=batch.F_elem,
@@ -898,34 +1240,12 @@ class SymbolicFusedLocalAssemblyOperator(FusedLocalAssemblyOperator):
         elif domain_type in {"volume", "interface"}:
             entity_ids = workset.element_ids
         if self.quadrature_state_updates:
-            grouped: dict[tuple[str, int, str], list[tuple[str, SymbolicQuadratureStateUpdateSpec]]] = {}
-            for idx, spec in enumerate(self.quadrature_state_updates):
-                layout = getattr(spec.field, "layout", None)
-                if layout is None:
-                    raise TypeError("SymbolicFusedLocalAssemblyOperator quadrature_state_updates require fields with a 'layout'.")
-                key = (layout.signature, int(layout.quadrature_order), str(layout.cell_type))
-                name = str(spec.name or getattr(spec.field, "name", f"state_update_{idx}"))
-                grouped.setdefault(key, []).append((name, spec))
-            state_updates: list[LocalStateUpdate] = []
-            for _, specs in grouped.items():
-                layout = specs[0][1].field.layout
-                exprs = {name: spec.expr for name, spec in specs}
-                qp_values = compiler.evaluate_volume_expressions_on_quadrature(
-                    exprs,
-                    layout=layout,
-                    element_ids=np.asarray(workset.element_ids, dtype=int),
-                )
-                for name, spec in specs:
-                    state_updates.append(
-                        LocalStateUpdate(
-                            field=spec.field,
-                            values=np.asarray(qp_values[name], dtype=float),
-                            entity_ids=np.asarray(workset.element_ids, dtype=int),
-                            staged=bool(spec.staged),
-                        )
-                    )
+            state_updates = self._evaluate_symbolic_quadrature_state_updates(
+                compiler=compiler,
+                workset=workset,
+            )
             if state_updates:
-                _apply_local_state_updates(tuple(state_updates))
+                _apply_local_state_updates(state_updates)
         return compiler.assemble_and_scatter_local_contributions_reduced(
             self.form_or_equation,
             solver=solver,

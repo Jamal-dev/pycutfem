@@ -37,6 +37,51 @@ class RuntimeOperator:
         """Called after each reduced residual/Jacobian assembly."""
         return A_red, R_red
 
+    def on_nonlinear_iteration_begin(
+        self,
+        *,
+        solver: Any,
+        functions,
+        prev_functions,
+        aux_functions,
+        iteration: int,
+        coeffs,
+        bcs,
+        metrics: dict | None = None,
+    ) -> None:
+        """Called once at the start of a Newton/nonlinear iteration."""
+
+    def on_nonlinear_update(
+        self,
+        *,
+        solver: Any,
+        functions,
+        prev_functions,
+        aux_functions,
+        iteration: int,
+        coeffs,
+        delta_red=None,
+        delta_full=None,
+        bcs=None,
+        metrics: dict | None = None,
+    ) -> None:
+        """Called after the accepted nonlinear increment is applied."""
+
+    def on_nonlinear_iteration_end(
+        self,
+        *,
+        solver: Any,
+        functions,
+        prev_functions,
+        aux_functions,
+        iteration: int,
+        coeffs,
+        converged: bool,
+        bcs,
+        metrics: dict | None = None,
+    ) -> None:
+        """Called after a nonlinear iteration has completed."""
+
     def on_step_accept(
         self,
         *,

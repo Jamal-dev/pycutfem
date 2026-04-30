@@ -3009,32 +3009,62 @@ def compile_multi(form, *, dof_handler, mixed_element,
         # ------------------------------------------------------------------
         # GHOST EDGE (stabilization across a cut)
         # ------------------------------------------------------------------
-        if dom == "nonmatching_interface":
+        if dom in {"nonmatching_interface", "trace_link"}:
             md = intg.measure.metadata or {}
-            interface = md.get("interface", None)
-            if interface is None:
-                interface = getattr(intg.measure, "interface", None)
-            if interface is None:
-                raise ValueError(
-                    "dNonmatchingInterface requires metadata={'interface': <NonMatchingInterface>} "
-                    "(with element ids in the same mesh numbering as dof_handler.mixed_element.mesh)."
-                )
+            if dom == "trace_link":
+                interface = md.get("trace", md.get("interface", None))
+                if interface is None:
+                    interface = getattr(intg.measure, "trace", None)
+                if interface is None:
+                    raise ValueError(
+                        "dTraceLink requires metadata={'trace': <TraceLinkInterface>} "
+                        "(with trace.mesh in the same numbering as dof_handler.mixed_element.mesh)."
+                    )
+            else:
+                interface = md.get("interface", None)
+                if interface is None:
+                    interface = getattr(intg.measure, "interface", None)
+                if interface is None:
+                    raise ValueError(
+                        "dNonmatchingInterface requires metadata={'interface': <NonMatchingInterface>} "
+                        "(with element ids in the same mesh numbering as dof_handler.mixed_element.mesh)."
+                    )
 
+            quadrature_rule = str(md.get("quadrature", md.get("rule", "gauss"))).strip().lower().replace("-", "_")
+            if quadrature_rule in {"gll", "lobatto"}:
+                quadrature_rule = "gauss_lobatto"
             derivs = set(md.get("derivs", required_multi_indices(intg.integrand)))
             derivs |= {(0, 0)}
             max_total = max((ox + oy for (ox, oy) in derivs), default=0)
-            qdeg_eff = max(int(qdeg), 2 * int(max_total) + 4)
+            if quadrature_rule == "gauss_lobatto":
+                qdeg_eff = int(qdeg)
+            else:
+                qdeg_eff = max(int(qdeg), 2 * int(max_total) + 4)
 
-            geom = dof_handler.precompute_nonmatching_interface_factors(
-                interface=interface,
-                qdeg=int(qdeg_eff),
-                derivs=derivs,
-                reuse=True,
-                need_hess=need_hess,
-                need_o3=need_o3,
-                need_o4=need_o4,
-                deformation=getattr(intg.measure, "deformation", None),
-            )
+            if dom == "trace_link":
+                geom = dof_handler.precompute_trace_link_factors(
+                    trace=interface,
+                    qdeg=int(qdeg_eff),
+                    derivs=derivs,
+                    reuse=True,
+                    need_hess=need_hess,
+                    need_o3=need_o3,
+                    need_o4=need_o4,
+                    deformation=getattr(intg.measure, "deformation", None),
+                    quadrature=quadrature_rule,
+                )
+            else:
+                geom = dof_handler.precompute_nonmatching_interface_factors(
+                    interface=interface,
+                    qdeg=int(qdeg_eff),
+                    derivs=derivs,
+                    reuse=True,
+                    need_hess=need_hess,
+                    need_o3=need_o3,
+                    need_o4=need_o4,
+                    deformation=getattr(intg.measure, "deformation", None),
+                    quadrature=quadrature_rule,
+                )
 
             gdofs_map_raw = np.asarray(geom.get("gdofs_map", np.empty((0, 0), dtype=np.int32)), dtype=np.int32)
             ncols = gdofs_map_raw.shape[1] if gdofs_map_raw.ndim == 2 else 0
@@ -3047,7 +3077,15 @@ def compile_multi(form, *, dof_handler, mixed_element,
                     eff_cols = np.arange(ncols, dtype=np.int32)
             gdofs_map = gdofs_map_raw[:, eff_cols] if gdofs_map_raw.size else gdofs_map_raw
 
-            static = {**geom, "gdofs_map": gdofs_map, "is_ghost": False, "is_interface": True, "entity_kind": "edge"}
+            static = {
+                **geom,
+                "gdofs_map": gdofs_map,
+                "is_ghost": False,
+                "is_interface": True,
+                "entity_kind": "edge",
+                "domain": dom,
+                "domain_type": dom,
+            }
             static["_phi_sig"] = np.zeros((int(np.asarray(static.get("eids", [])).shape[0]),), dtype=float)
             static.update(
                 _build_jit_kernel_args(
@@ -3071,7 +3109,7 @@ def compile_multi(form, *, dof_handler, mixed_element,
                 _IntegralKernel(
                     runner,
                     static,
-                    "nonmatching_interface",
+                    dom,
                     eids=eids_arr,
                 ),
                 intg,

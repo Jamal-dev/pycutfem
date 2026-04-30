@@ -34,6 +34,18 @@ class OperatorManager:
                 A_red, R_red = result
         return A_red, R_red
 
+    def on_nonlinear_iteration_begin(self, **kwargs) -> None:
+        for operator in self.operators:
+            operator.on_nonlinear_iteration_begin(**kwargs)
+
+    def on_nonlinear_update(self, **kwargs) -> None:
+        for operator in self.operators:
+            operator.on_nonlinear_update(**kwargs)
+
+    def on_nonlinear_iteration_end(self, **kwargs) -> None:
+        for operator in self.operators:
+            operator.on_nonlinear_iteration_end(**kwargs)
+
     def on_step_accept(self, **kwargs) -> None:
         for operator in self.operators:
             operator.on_step_accept(**kwargs)

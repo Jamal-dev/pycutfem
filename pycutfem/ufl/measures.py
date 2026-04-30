@@ -48,6 +48,7 @@ class Measure:
             "exterior_facet",
             "interface",
             "nonmatching_interface",
+            "trace_link",
             "ghost_edge",
             "facet_patch",
         }
@@ -124,6 +125,16 @@ dInterface = Measure("interface")
 
 # Measure for integration over a non-matching interface (common-refinement segments).
 dNonmatchingInterface = Measure("nonmatching_interface")
+
+#: Measure for integration over discrete trace/link entities.
+#:
+#: ``dTraceLink`` is used for Trace-FEM style line entities whose traces are
+#: not a mesh facet and not a common refinement of two facets.  The integration
+#: domain supplies explicit quadrature/station tables through
+#: ``metadata={'trace': TraceLinkInterface(...)}``; UFL forms can still use
+#: ``Pos(...)``, ``Neg(...)``, ``FacetNormal()``, gradients and quadrature-state
+#: coefficients, but the sided values come from the trace-link table contract.
+dTraceLink = Measure("trace_link")
 
 # New: Measure for integration over ghost edges for CutFEM stabilization.
 dGhost = Measure("ghost_edge")

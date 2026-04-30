@@ -635,6 +635,8 @@ class FormCompiler:
             pre_built["qw"] = np.zeros((n_elem, n_q), dtype=float)
             pre_built["eids"] = np.ascontiguousarray(elem_ids)
             pre_built["owner_id"] = np.ascontiguousarray(elem_ids)
+            pre_built["qstate_owner_id"] = np.ascontiguousarray(elem_ids)
+            pre_built["qstate_entity_id"] = np.ascontiguousarray(elem_ids)
             pre_built["entity_kind"] = "element"
             pre_built["is_interface"] = False
             pre_built["normals"] = np.zeros_like(np.asarray(pre_built["qp_phys"], dtype=float))
@@ -682,6 +684,8 @@ class FormCompiler:
             "normals": np.zeros_like(qp_phys),
             "eids": np.ascontiguousarray(elem_ids),
             "owner_id": np.ascontiguousarray(elem_ids),
+            "qstate_owner_id": np.ascontiguousarray(elem_ids),
+            "qstate_entity_id": np.ascontiguousarray(elem_ids),
             "entity_kind": "element",
             "is_interface": False,
             "J_inv_pos": np.ascontiguousarray(J_inv),
@@ -925,6 +929,411 @@ class FormCompiler:
         if return_mapping:
             return results
         return [results[str(i)] for i in range(len(expr_items))]
+
+    def _nonmatching_python_entity_context(self, geo: dict, fields: list[str], ei: int) -> dict:
+        if str(geo.get("trace_kind", "")) in {"paired_station", "fracture_station"}:
+            global_dofs = np.asarray(geo["gdofs_map"][ei], dtype=int)
+            pos_map_by_field = {}
+            neg_map_by_field = {}
+            pos_union_mask_by_field = {}
+            neg_union_mask_by_field = {}
+            for fld in fields:
+                pos_key = f"pos_map_{fld}"
+                neg_key = f"neg_map_{fld}"
+                if pos_key not in geo or neg_key not in geo:
+                    raise KeyError(
+                        f"Precomputed station trace-link interface is missing '{pos_key}'/'{neg_key}'."
+                    )
+                pos_map_by_field[fld] = np.asarray(geo[pos_key][ei], dtype=int)
+                neg_map_by_field[fld] = np.asarray(geo[neg_key][ei], dtype=int)
+                pos_mask_key = f"restrict_mask_{fld}_pos"
+                neg_mask_key = f"restrict_mask_{fld}_neg"
+                if pos_mask_key in geo:
+                    pos_union_mask_by_field[fld] = np.asarray(geo[pos_mask_key][ei], dtype=float)
+                if neg_mask_key in geo:
+                    neg_union_mask_by_field[fld] = np.asarray(geo[neg_mask_key][ei], dtype=float)
+            return {
+                "eid": int(np.asarray(geo.get("owner_id", geo.get("owner_pos_id")), dtype=np.int32)[ei]),
+                "pos_eid": int(np.asarray(geo["owner_pos_id"], dtype=np.int32)[ei]),
+                "neg_eid": int(np.asarray(geo["owner_neg_id"], dtype=np.int32)[ei]),
+                "global_dofs": global_dofs,
+                "pos_map": np.asarray(geo.get("pos_map", np.empty((0, 0), dtype=int))[ei], dtype=int),
+                "neg_map": np.asarray(geo.get("neg_map", np.empty((0, 0), dtype=int))[ei], dtype=int),
+                "pos_map_by_field": pos_map_by_field,
+                "neg_map_by_field": neg_map_by_field,
+                "pos_union_mask_by_field": pos_union_mask_by_field,
+                "neg_union_mask_by_field": neg_union_mask_by_field,
+            }
+
+        pos_eid = int(np.asarray(geo["owner_pos_id"], dtype=np.int32)[ei])
+        neg_eid = int(np.asarray(geo["owner_neg_id"], dtype=np.int32)[ei])
+        pos_dofs = np.asarray(self.dh.get_elemental_dofs(pos_eid), dtype=int)
+        neg_dofs = np.asarray(self.dh.get_elemental_dofs(neg_eid), dtype=int)
+        global_dofs = np.unique(np.concatenate([pos_dofs, neg_dofs]))
+        pos_map = np.searchsorted(global_dofs, pos_dofs)
+        neg_map = np.searchsorted(global_dofs, neg_dofs)
+        pos_map_by_field, neg_map_by_field = _hfa.build_field_union_maps(
+            self.dh, fields, pos_eid, neg_eid, global_dofs
+        )
+        pos_union_mask_by_field = {}
+        neg_union_mask_by_field = {}
+        for fld, idxs in pos_map_by_field.items():
+            m = np.zeros(len(global_dofs), dtype=float)
+            m[np.asarray(idxs, dtype=int)] = 1.0
+            pos_union_mask_by_field[fld] = m
+        for fld, idxs in neg_map_by_field.items():
+            m = np.zeros(len(global_dofs), dtype=float)
+            m[np.asarray(idxs, dtype=int)] = 1.0
+            neg_union_mask_by_field[fld] = m
+        return {
+            "eid": int(np.asarray(geo.get("owner_id", geo.get("owner_pos_id")), dtype=np.int32)[ei]),
+            "pos_eid": pos_eid,
+            "neg_eid": neg_eid,
+            "global_dofs": global_dofs,
+            "pos_map": pos_map,
+            "neg_map": neg_map,
+            "pos_map_by_field": pos_map_by_field,
+            "neg_map_by_field": neg_map_by_field,
+            "pos_union_mask_by_field": pos_union_mask_by_field,
+            "neg_union_mask_by_field": neg_union_mask_by_field,
+        }
+
+    def _nonmatching_python_basis_values(self, geo: dict, fields: list[str], ei: int, q: int) -> dict:
+        if str(geo.get("trace_kind", "")) not in {"paired_station", "fracture_station"}:
+            return {"+": {}, "-": {}}
+        out = {"+": {}, "-": {}}
+        for side, suffix in (("+", "pos"), ("-", "neg")):
+            for fld in fields:
+                rows = {}
+                for alpha, prefix in (((0, 0), "r00"), ((1, 0), "r10"), ((0, 1), "r01")):
+                    key = f"{prefix}_{fld}_{suffix}"
+                    if key in geo:
+                        rows[alpha] = np.asarray(geo[key][ei, q], dtype=float)
+                out[side][fld] = rows
+        return out
+
+    def _evaluate_nonmatching_interface_expressions_on_quadrature_compiled(
+        self,
+        expr_items,
+        *,
+        expr_shapes,
+        interface,
+        layout,
+        quadrature: str,
+        domain_type: str = "nonmatching_interface",
+    ):
+        from pycutfem.ufl.measures import dNonmatchingInterface, dTraceLink
+
+        domain_type = str(domain_type).strip().lower()
+        measure_template = dTraceLink if domain_type == "trace_link" else dNonmatchingInterface
+        entity_count = interface.n_entities() if hasattr(interface, "n_entities") else interface.n_segments()
+        results = {
+            name: np.empty((entity_count, int(layout.n_qp), *expr_shapes[name]), dtype=float)
+            if expr_shapes[name]
+            else np.empty((entity_count, int(layout.n_qp)), dtype=float)
+            for name, _ in expr_items
+        }
+
+        for name, expr in expr_items:
+            scalar_components = self._scalarize_quadrature_expression(expr)
+            for idx, scalar_expr in scalar_components:
+                md_key = "trace" if domain_type == "trace_link" else "interface"
+                measure = measure_template(
+                    metadata={
+                        "q": int(layout.quadrature_order),
+                        md_key: interface,
+                        "quadrature": str(quadrature),
+                    }
+                )
+                integral = scalar_expr * measure
+                runner, ir = self._compile_backend(scalar_expr, self.dh, self.me, on_facet=True)
+                derivs, need_hess, need_o3, need_o4 = self._find_req_derivs(integral, runner)
+                geo = self._precompute_trace_domain_factors(
+                    integral,
+                    interface,
+                    qdeg=int(layout.quadrature_order),
+                    derivs=derivs,
+                    reuse=True,
+                    need_hess=need_hess,
+                    need_o3=need_o3,
+                    need_o4=need_o4,
+                    quadrature=str(quadrature),
+                )
+                layout.validate_against(
+                    reference_points=np.asarray(geo["qref"], dtype=float),
+                    reference_weights=np.asarray(geo["qw_ref"], dtype=float),
+                    context=f"{domain_type} quadrature evaluation for '{name}'",
+                )
+
+                valid_eids = np.asarray(geo.get("eids", []), dtype=np.int32)
+                if valid_eids.size == 0:
+                    continue
+                kernel_args = _build_jit_kernel_args(
+                    ir=ir,
+                    expression=scalar_expr,
+                    mixed_element=self.me,
+                    q_order=int(layout.quadrature_order),
+                    dof_handler=self.dh,
+                    gdofs_map=geo["gdofs_map"],
+                    param_order=runner.param_order,
+                    pre_built=geo,
+                )
+                if ("node_coords" in runner.param_order) and ("node_coords" not in kernel_args):
+                    kernel_args["node_coords"] = np.asarray(self.me.mesh.nodes_x_y_pos, dtype=float)
+                if ("element_nodes" in runner.param_order) and ("element_nodes" not in kernel_args):
+                    kernel_args["element_nodes"] = np.asarray(self.me.mesh.elements_connectivity, dtype=np.int64)
+                missing = [p for p in runner.param_order if p not in kernel_args]
+                missing = [p for p in missing if not (p.startswith("u_") and p.endswith("_loc"))]
+                if missing:
+                    raise KeyError(f"{domain_type} quadrature evaluation missing static args: {missing}")
+
+                # Pointwise quadrature evaluation reuses the integration kernel by
+                # selecting one quadrature point at a time with one-hot weights.
+                # ``kernel_args["qw"]`` often aliases the cached interface/trace
+                # precompute table when ``reuse=True``.  Mutating it in-place would
+                # corrupt later assemblies on the same trace domain, most visibly
+                # by zeroing the weights before the next Newton iteration.
+                qw = np.zeros_like(np.asarray(kernel_args["qw"], dtype=float))
+                kernel_args["qw"] = qw
+                current_funcs = self._collect_expression_data_functions(scalar_expr)
+                scalar_values = np.empty((int(valid_eids.shape[0]), int(layout.n_qp)), dtype=float)
+                for q in range(int(layout.n_qp)):
+                    qw[...] = 0.0
+                    qw[:, q] = 1.0
+                    _, _, J_loc = runner(current_funcs, kernel_args)
+                    scalar_values[:, q] = self._normalize_compiled_scalar_quadrature_values(
+                        J_loc,
+                        n_elem=int(valid_eids.shape[0]),
+                        expr_name=name if not idx else f"{name}{idx}",
+                    )
+                if idx == ():
+                    results[name][...] = scalar_values
+                else:
+                    results[name][(slice(None), slice(None)) + idx] = scalar_values
+        return results
+
+    def evaluate_nonmatching_interface_expressions_on_quadrature(
+        self,
+        expressions,
+        *,
+        layout,
+        interface,
+        quadrature: str = "gauss",
+        _domain_type: str = "nonmatching_interface",
+    ):
+        """
+        Evaluate coefficient-only UFL expressions at nonmatching-interface
+        quadrature points.
+
+        Interface quadrature state is indexed by the common-refinement segment
+        id, not by either adjacent volume element id. This keeps contact/damage
+        state distinct even when several interface segments share one owner
+        element.
+        """
+        from pycutfem.ufl.expressions import (
+            Expression,
+            HdivTestFunction as _HdivTestFunctionExpr,
+            HdivTrialFunction as _HdivTrialFunctionExpr,
+            TestFunction as _TestFunctionExpr,
+            TrialFunction as _TrialFunctionExpr,
+            VectorTestFunction as _VectorTestFunctionExpr,
+            VectorTrialFunction as _VectorTrialFunctionExpr,
+            _expr_shape,
+        )
+
+        domain_type = str(_domain_type).strip().lower()
+        label = "trace-link" if domain_type == "trace_link" else "nonmatching-interface"
+        if str(getattr(layout, "entity_kind", "")).strip().lower() != domain_type:
+            raise ValueError(
+                f"evaluate_{domain_type}_expressions_on_quadrature requires "
+                f"layout.entity_kind == {domain_type!r}."
+            )
+        if interface is None:
+            raise ValueError(f"A {label} object is required for quadrature evaluation.")
+
+        quadrature_rule = str(quadrature or "gauss").strip().lower().replace("-", "_")
+        if quadrature_rule in {"gll", "lobatto"}:
+            quadrature_rule = "gauss_lobatto"
+
+        if isinstance(expressions, Mapping):
+            expr_items = [(str(name), expr) for name, expr in expressions.items()]
+            return_mapping = True
+        else:
+            expr_items = [(str(i), expr) for i, expr in enumerate(list(expressions))]
+            return_mapping = False
+        if not expr_items:
+            return {} if return_mapping else []
+
+        basis_nodes = (
+            _TestFunctionExpr,
+            _VectorTestFunctionExpr,
+            _HdivTestFunctionExpr,
+            _TrialFunctionExpr,
+            _VectorTrialFunctionExpr,
+            _HdivTrialFunctionExpr,
+        )
+        for name, expr in expr_items:
+            if not isinstance(expr, Expression):
+                raise TypeError(
+                    f"Interface quadrature evaluation input '{name}' must be a UFL Expression, got {type(expr).__name__}."
+                )
+            if _find_all(expr, basis_nodes):
+                raise ValueError(
+                    f"Interface quadrature evaluation input '{name}' contains trial/test basis functions. "
+                    "Only coefficient/value expressions are supported."
+                )
+
+        expr_shapes = {name: tuple(int(v) for v in _expr_shape(expr)) for name, expr in expr_items}
+        for name, expr in expr_items:
+            self._validate_quadrature_state_usage(
+                expr,
+                reference_points=np.asarray(layout.reference_points, dtype=float),
+                reference_weights=np.asarray(layout.reference_weights, dtype=float),
+                context=f"interface quadrature evaluation for '{name}'",
+            )
+
+        if self._is_jit_backend():
+            results = self._evaluate_nonmatching_interface_expressions_on_quadrature_compiled(
+                expr_items,
+                expr_shapes=expr_shapes,
+                interface=interface,
+                layout=layout,
+                quadrature=quadrature_rule,
+                domain_type=domain_type,
+            )
+            if return_mapping:
+                return results
+            return [results[str(i)] for i in range(len(expr_items))]
+
+        derivs = {(0, 0), (1, 0), (0, 1)}
+        for _, expr in expr_items:
+            derivs |= set(required_multi_indices(expr))
+        from pycutfem.ufl.measures import dNonmatchingInterface, dTraceLink
+
+        md_key = "trace" if domain_type == "trace_link" else "interface"
+        measure = (dTraceLink if domain_type == "trace_link" else dNonmatchingInterface)(
+            metadata={
+                "q": int(layout.quadrature_order),
+                md_key: interface,
+                "quadrature": quadrature_rule,
+            }
+        )
+        integral_for_precompute = expr_items[0][1] * measure
+        geo = self._precompute_trace_domain_factors(
+            integral_for_precompute,
+            interface,
+            qdeg=int(layout.quadrature_order),
+            derivs=derivs,
+            reuse=True,
+            quadrature=quadrature_rule,
+        )
+        layout.validate_against(
+            reference_points=np.asarray(geo["qref"], dtype=float),
+            reference_weights=np.asarray(geo["qw_ref"], dtype=float),
+            context=f"{label} quadrature evaluation",
+        )
+
+        eids = np.asarray(geo.get("eids", np.empty((0,), dtype=np.int32)), dtype=np.int32)
+        results = {
+            name: np.empty((int(eids.size), int(layout.n_qp), *expr_shapes[name]), dtype=float)
+            if expr_shapes[name]
+            else np.empty((int(eids.size), int(layout.n_qp)), dtype=float)
+            for name, _ in expr_items
+        }
+        if eids.size == 0:
+            return results if return_mapping else [results[str(i)] for i in range(len(expr_items))]
+
+        fields = sorted({fld for _, expr in expr_items for fld in _all_fields(expr)})
+        if not fields:
+            fields = list(getattr(self.dh, "field_names", []))
+
+        old_rhs = self.ctx.get("rhs", None)
+        self.ctx["rhs"] = True
+        self.ctx["is_interface"] = True
+        self.ctx["is_ghost"] = False
+        self.ctx["measure_side"] = None
+        try:
+            for ei in range(int(eids.size)):
+                entity_ctx = self._nonmatching_python_entity_context(geo, fields, int(ei))
+
+                for q in range(int(layout.n_qp)):
+                    self._coeff_cache.clear()
+                    self._collapsed_cache.clear()
+                    self.ctx.update(
+                        {
+                            **entity_ctx,
+                            "qstate_owner_id": int(np.asarray(geo.get("qstate_owner_id", eids), dtype=np.int32)[ei]),
+                            "q": int(q),
+                            "normal": np.asarray(geo["normals"][ei, q], float),
+                            "x_phys": np.asarray(geo["qp_phys"][ei, q], float),
+                            "phi_val": 0.0,
+                            "use_union_local_dofs": True,
+                            "basis_values": self._nonmatching_python_basis_values(geo, fields, int(ei), int(q)),
+                            "_xi_eta_cache": {
+                                "+": (float(geo["xi_pos"][ei, q]), float(geo["eta_pos"][ei, q])),
+                                "-": (float(geo["xi_neg"][ei, q]), float(geo["eta_neg"][ei, q])),
+                            },
+                        }
+                    )
+                    for name, expr in expr_items:
+                        value = self._visit(expr)
+                        results[name][ei, q] = self._normalize_quadrature_expression_value(
+                            value,
+                            expected_shape=expr_shapes[name],
+                            expr_name=name,
+                        )
+        finally:
+            if old_rhs is None:
+                self.ctx.pop("rhs", None)
+            else:
+                self.ctx["rhs"] = old_rhs
+            for k in (
+                "basis_values",
+                "global_dofs",
+                "pos_map",
+                "neg_map",
+                "pos_map_by_field",
+                "neg_map_by_field",
+                "pos_union_mask_by_field",
+                "neg_union_mask_by_field",
+                "_xi_eta_cache",
+                "use_union_local_dofs",
+                "mask_basis",
+                "pos_eid",
+                "neg_eid",
+                "eid",
+                "qstate_owner_id",
+                "q",
+                "x_phys",
+                "phi_val",
+                "normal",
+                "is_interface",
+                "measure_side",
+            ):
+                self.ctx.pop(k, None)
+            self.ctx.pop("is_ghost", None)
+
+        if return_mapping:
+            return results
+        return [results[str(i)] for i in range(len(expr_items))]
+
+    def evaluate_trace_link_expressions_on_quadrature(
+        self,
+        expressions,
+        *,
+        layout,
+        trace,
+        quadrature: str = "gauss",
+    ):
+        """Evaluate coefficient-only UFL expressions on a ``dTraceLink`` domain."""
+
+        return self.evaluate_nonmatching_interface_expressions_on_quadrature(
+            expressions,
+            layout=layout,
+            interface=trace,
+            quadrature=quadrature,
+            _domain_type="trace_link",
+        )
 
     def _evaluate_volume_local_expression_compiled(
         self,
@@ -1926,6 +2335,27 @@ class FormCompiler:
                     batches.append(self._assemble_nonmatching_interface_python_local_batch(integral))
         return self._accumulate_local_batches(batches, default_entity_kind="edge")
 
+    def assemble_trace_link_local_contributions(
+        self,
+        form_or_equation,
+    ) -> LocalAssemblyBatch:
+        forms = self._local_forms_from_input(form_or_equation)
+        batches: list[LocalAssemblyBatch] = []
+        for form in forms:
+            integrals = [form] if isinstance(form, Integral) else list(getattr(form, "integrals", []))
+            for integral in integrals:
+                if not isinstance(integral, Integral):
+                    continue
+                if str(getattr(integral.measure, "domain_type", "")).strip().lower() != "trace_link":
+                    raise NotImplementedError(
+                        "assemble_trace_link_local_contributions only supports dTraceLink integrals."
+                    )
+                if self._is_jit_backend():
+                    batches.append(self._assemble_nonmatching_interface_jit_local_batch(integral))
+                else:
+                    batches.append(self._assemble_nonmatching_interface_python_local_batch(integral))
+        return self._accumulate_local_batches(batches, default_entity_kind="edge")
+
     def assemble_local_contributions(
         self,
         form_or_equation,
@@ -1967,6 +2397,12 @@ class FormCompiler:
                     "assemble_local_contributions does not yet support explicit entity_ids filtering for nonmatching interfaces."
                 )
             return self.assemble_nonmatching_interface_local_contributions(form_or_equation)
+        if domain_type == "trace_link":
+            if entity_ids is not None:
+                raise NotImplementedError(
+                    "assemble_local_contributions does not yet support explicit entity_ids filtering for trace-link domains."
+                )
+            return self.assemble_trace_link_local_contributions(form_or_equation)
         raise NotImplementedError(
             f"assemble_local_contributions does not yet support measure/domain type {domain_type!r}."
         )
@@ -3482,7 +3918,7 @@ class FormCompiler:
         q = self.ctx.get("q")
         if owner_id is None or q is None:
             raise RuntimeError(
-                "QuadratureStateCoefficient evaluated outside a supported volume quadrature loop."
+                "QuadratureStateCoefficient evaluated outside a supported quadrature loop."
             )
         return n.value_on_entity_qp(int(owner_id), int(q))
 
@@ -5284,6 +5720,10 @@ class FormCompiler:
         if integral.measure.domain_type == "nonmatching_interface":
             logger.info(f"Assembling nonmatching-interface integral: {integral} with backend {self.backend}")
             self._assemble_nonmatching_interface(integral, target)
+            return
+        if integral.measure.domain_type == "trace_link":
+            logger.info(f"Assembling trace-link integral: {integral} with backend {self.backend}")
+            self._assemble_trace_link(integral, target)
             return
         if integral.measure.domain_type == "volume":
             # Handle volume integrals
@@ -8047,7 +8487,10 @@ class FormCompiler:
 
         active_fields = _active_field_order(ir, me_used)
         active_cols = _active_columns(me_used, active_fields)
-        use_full_union = bool(geo.get("gdofs_map") is not None and geo["gdofs_map"].shape[1] != me_used.n_dofs_local)
+        use_full_union = bool(
+            str(geo.get("trace_kind", "")) in {"paired_station", "fracture_station"}
+            or (geo.get("gdofs_map") is not None and geo["gdofs_map"].shape[1] != me_used.n_dofs_local)
+        )
         if not use_full_union:
             kernel_args = _compress_static_for_active(kernel_args, me_used, active_cols)
             geo["gdofs_map"] = kernel_args.get("gdofs_map", geo.get("gdofs_map"))
@@ -8169,6 +8612,17 @@ class FormCompiler:
                 f"Unsupported backend: {self.backend}. Use 'python', 'jit', or 'cpp'."
             )
 
+    def _assemble_trace_link(self, intg: Integral, matvec):
+        """Assemble integrals over a discrete trace/link domain."""
+        if self.backend == "python":
+            self._assemble_nonmatching_interface_python(intg, matvec)
+        elif self._is_jit_backend():
+            self._assemble_nonmatching_interface_jit(intg, matvec)
+        else:
+            raise ValueError(
+                f"Unsupported backend: {self.backend}. Use 'python', 'jit', or 'cpp'."
+            )
+
     def _nonmatching_interface_obj(self, intg: Integral):
         md = getattr(intg.measure, "metadata", None) or {}
         iface = md.get("interface", None)
@@ -8181,6 +8635,78 @@ class FormCompiler:
             )
         return iface
 
+    def _trace_link_obj(self, intg: Integral):
+        md = getattr(intg.measure, "metadata", None) or {}
+        trace = md.get("trace", None)
+        if trace is None:
+            trace = md.get("interface", None)
+        if trace is None:
+            trace = getattr(intg.measure, "trace", None)
+        if trace is None:
+            raise ValueError(
+                "dTraceLink requires metadata={'trace': <TraceLinkInterface>} "
+                "(with trace.mesh in the same numbering as dof_handler.mixed_element.mesh)."
+            )
+        return trace
+
+    def _trace_domain_obj(self, intg: Integral):
+        domain = str(getattr(intg.measure, "domain_type", "")).strip().lower()
+        if domain == "trace_link":
+            return self._trace_link_obj(intg)
+        if domain == "nonmatching_interface":
+            return self._nonmatching_interface_obj(intg)
+        raise ValueError(f"Unsupported sided trace measure/domain type {domain!r}.")
+
+    def _trace_domain_label(self, intg: Integral) -> str:
+        domain = str(getattr(intg.measure, "domain_type", "")).strip().lower()
+        return "trace-link" if domain == "trace_link" else "nonmatching-interface"
+
+    def _precompute_trace_domain_factors(
+        self,
+        intg: Integral,
+        trace_obj,
+        *,
+        qdeg: int,
+        derivs,
+        reuse: bool = True,
+        need_hess: bool = False,
+        need_o3: bool = False,
+        need_o4: bool = False,
+        quadrature: str = "gauss",
+    ) -> dict:
+        domain = str(getattr(intg.measure, "domain_type", "")).strip().lower()
+        if domain == "trace_link":
+            geo = self.dh.precompute_trace_link_factors(
+                trace=trace_obj,
+                qdeg=int(qdeg),
+                derivs=derivs,
+                reuse=reuse,
+                need_hess=need_hess,
+                need_o3=need_o3,
+                need_o4=need_o4,
+                deformation=getattr(intg.measure, "deformation", None),
+                quadrature=quadrature,
+            )
+        elif domain == "nonmatching_interface":
+            geo = self.dh.precompute_nonmatching_interface_factors(
+                interface=trace_obj,
+                qdeg=int(qdeg),
+                derivs=derivs,
+                reuse=reuse,
+                need_hess=need_hess,
+                need_o3=need_o3,
+                need_o4=need_o4,
+                deformation=getattr(intg.measure, "deformation", None),
+                quadrature=quadrature,
+            )
+        else:
+            raise ValueError(f"Unsupported sided trace measure/domain type {domain!r}.")
+        geo["is_interface"] = True
+        geo["is_ghost"] = False
+        geo["domain"] = domain
+        geo["domain_type"] = domain
+        return geo
+
     def _assemble_nonmatching_interface_python(self, intg: Integral, matvec, *, _collector=None):
         import numpy as np
         import logging
@@ -8188,9 +8714,10 @@ class FormCompiler:
 
         log = logging.getLogger(__name__)
         rhs = bool(self.ctx.get("rhs", False))
-        log.info(f"Assembling nonmatching interface integral: {intg}, is_rhs={rhs}")
+        label = self._trace_domain_label(intg)
+        log.info(f"Assembling {label} integral: {intg}, is_rhs={rhs}")
 
-        interface = self._nonmatching_interface_obj(intg)
+        interface = self._trace_domain_obj(intg)
         dh, me, mesh = self.dh, self.me, self.me.mesh
 
         # context: we are on Γ_nm
@@ -8211,8 +8738,9 @@ class FormCompiler:
         p_geo = int(getattr(mesh, "poly_order", 1))
         qdeg += max(0, p_geo - 1)
 
-        geo = dh.precompute_nonmatching_interface_factors(
-            interface=interface,
+        geo = self._precompute_trace_domain_factors(
+            intg,
+            interface,
             qdeg=int(qdeg),
             derivs=derivs,
             reuse=True,
@@ -8228,7 +8756,7 @@ class FormCompiler:
         is_functional = (hook is not None) and (trial is None) and (test is None)
         if _collector is not None and is_functional:
             raise NotImplementedError(
-                "Local nonmatching-interface batches do not yet support pure scalar functionals."
+                f"Local {label} batches do not yet support pure scalar functionals."
             )
         if is_functional:
             self.ctx.setdefault("scalar_results", {}).setdefault(hook["name"], None)
@@ -8239,31 +8767,8 @@ class FormCompiler:
 
         try:
             for ei in range(int(eids.size)):
-                pos_eid = int(np.asarray(geo["owner_pos_id"], dtype=np.int32)[ei])
-                neg_eid = int(np.asarray(geo["owner_neg_id"], dtype=np.int32)[ei])
-
-                # True (unpadded) union DOFs for this segment entity
-                pos_dofs = np.asarray(dh.get_elemental_dofs(pos_eid), dtype=int)
-                neg_dofs = np.asarray(dh.get_elemental_dofs(neg_eid), dtype=int)
-                global_dofs = np.unique(np.concatenate([pos_dofs, neg_dofs]))
-                pos_map = np.searchsorted(global_dofs, pos_dofs)
-                neg_map = np.searchsorted(global_dofs, neg_dofs)
-
-                pos_map_by_field, neg_map_by_field = _hfa.build_field_union_maps(
-                    dh, fields, pos_eid, neg_eid, global_dofs
-                )
-
-                # Element-membership masks on the union (used by coefficient/basis alignment)
-                pos_union_mask_by_field = {}
-                neg_union_mask_by_field = {}
-                for fld, idxs in pos_map_by_field.items():
-                    m = np.zeros(len(global_dofs), dtype=float)
-                    m[np.asarray(idxs, dtype=int)] = 1.0
-                    pos_union_mask_by_field[fld] = m
-                for fld, idxs in neg_map_by_field.items():
-                    m = np.zeros(len(global_dofs), dtype=float)
-                    m[np.asarray(idxs, dtype=int)] = 1.0
-                    neg_union_mask_by_field[fld] = m
+                entity_ctx = self._nonmatching_python_entity_context(geo, fields, int(ei))
+                global_dofs = np.asarray(entity_ctx["global_dofs"], dtype=int)
 
                 if is_functional:
                     acc = None
@@ -8289,21 +8794,15 @@ class FormCompiler:
 
                     self.ctx.update(
                         {
+                            **entity_ctx,
                             "eid": owner_id,
-                            "pos_eid": pos_eid,
-                            "neg_eid": neg_eid,
+                            "qstate_owner_id": int(np.asarray(geo.get("qstate_owner_id", eids), dtype=np.int32)[ei]),
+                            "q": int(q),
                             "normal": np.asarray(normals[ei, q], float),
                             "x_phys": np.asarray(qp_phys[ei, q], float),
                             "phi_val": 0.0,
-                            "global_dofs": global_dofs,
-                            "pos_map": pos_map,
-                            "neg_map": neg_map,
-                            "pos_map_by_field": pos_map_by_field,
-                            "neg_map_by_field": neg_map_by_field,
-                            "pos_union_mask_by_field": pos_union_mask_by_field,
-                            "neg_union_mask_by_field": neg_union_mask_by_field,
                             "use_union_local_dofs": True,
-                            "basis_values": {"+": {}, "-": {}},
+                            "basis_values": self._nonmatching_python_basis_values(geo, fields, int(ei), int(q)),
                             "_xi_eta_cache": {
                                 "+": (float(xi_pos[ei, q]), float(eta_pos[ei, q])),
                                 "-": (float(xi_neg[ei, q]), float(eta_neg[ei, q])),
@@ -8356,6 +8855,8 @@ class FormCompiler:
                 "pos_eid",
                 "neg_eid",
                 "eid",
+                "qstate_owner_id",
+                "q",
                 "x_phys",
                 "phi_val",
                 "normal",
@@ -8372,7 +8873,7 @@ class FormCompiler:
         is_rhs = trial is None and test is not None
         if trial is None and test is None:
             raise NotImplementedError(
-                "Local nonmatching-interface batches do not yet support pure scalar functionals."
+                f"Local {self._trace_domain_label(intg)} batches do not yet support pure scalar functionals."
             )
         K_rows: list[np.ndarray] | None = [] if not is_rhs else None
         F_rows: list[np.ndarray] | None = [] if is_rhs else None
@@ -8408,11 +8909,11 @@ class FormCompiler:
         import numpy as np
 
         dh, me = self.dh, self.me
-        interface = self._nonmatching_interface_obj(intg)
+        interface = self._trace_domain_obj(intg)
         trial, test = _trial_test(intg.integrand)
         if trial is None and test is None:
             raise NotImplementedError(
-                "Local nonmatching-interface batches do not yet support pure scalar functionals."
+                f"Local {self._trace_domain_label(intg)} batches do not yet support pure scalar functionals."
             )
 
         # XFEM: compile facet kernels against the expanded local layout when enrichment is active.
@@ -8443,19 +8944,17 @@ class FormCompiler:
         p_geo = int(getattr(me_used.mesh, "poly_order", 1))
         qdeg += max(0, p_geo - 1)
 
-        geo = dh.precompute_nonmatching_interface_factors(
-            interface=interface,
+        geo = self._precompute_trace_domain_factors(
+            intg,
+            interface,
             qdeg=int(qdeg),
             derivs=derivs,
             reuse=True,
             need_hess=need_hess,
             need_o3=need_o3,
             need_o4=need_o4,
-            deformation=getattr(intg.measure, "deformation", None),
             quadrature=quadrature_rule,
         )
-        geo["is_interface"] = True
-        geo["is_ghost"] = False
 
         valid_eids = np.asarray(geo.get("eids", []), dtype=np.int32)
         if valid_eids.size == 0:
@@ -8474,7 +8973,10 @@ class FormCompiler:
 
         active_fields = _active_field_order(ir, me_used)
         active_cols = _active_columns(me_used, active_fields)
-        use_full_union = bool(geo.get("gdofs_map") is not None and geo["gdofs_map"].shape[1] != me_used.n_dofs_local)
+        use_full_union = bool(
+            str(geo.get("trace_kind", "")) in {"paired_station", "fracture_station"}
+            or (geo.get("gdofs_map") is not None and geo["gdofs_map"].shape[1] != me_used.n_dofs_local)
+        )
         if not use_full_union:
             kernel_args = _compress_static_for_active(kernel_args, me_used, active_cols)
             geo["gdofs_map"] = kernel_args.get("gdofs_map", geo.get("gdofs_map"))
@@ -8495,7 +8997,7 @@ class FormCompiler:
         missing = [p for p in runner.param_order if p not in kernel_args]
         missing = [p for p in missing if not (p.startswith("u_") and p.endswith("_loc"))]
         if missing:
-            raise KeyError(f"Nonmatching-interface kernel missing static args: {missing}")
+            raise KeyError(f"{self._trace_domain_label(intg)} kernel missing static args: {missing}")
 
         current_funcs = self._get_data_functions_objs(intg)
         K_ent, F_ent, J_ent = runner(current_funcs, kernel_args)

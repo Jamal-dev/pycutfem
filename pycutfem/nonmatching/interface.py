@@ -36,6 +36,7 @@ class NonMatchingInterface:
     n: np.ndarray  # (n_overlap, 2) oriented neg->pos
     h_neg: np.ndarray  # (n_overlap,)
     h_pos: np.ndarray  # (n_overlap,)
+    precomputed_factors: dict[str, object] | None = None
 
     def n_segments(self) -> int:
         return int(self.P0.shape[0])

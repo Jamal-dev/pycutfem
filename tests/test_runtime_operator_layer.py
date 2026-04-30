@@ -43,6 +43,45 @@ class _LogOperator(RuntimeOperator):
         self.log.append(("after_assembly", self.label, bool(need_matrix)))
         return A_red, np.asarray(R_red, dtype=float) + self.residual_shift
 
+    def on_nonlinear_iteration_begin(self, *, solver, functions, prev_functions, aux_functions, iteration: int, coeffs, bcs, metrics=None) -> None:
+        del solver, functions, prev_functions, aux_functions, bcs, metrics
+        self.log.append(("nonlinear_begin", self.label, int(iteration), float(coeffs["marker"])))
+
+    def on_nonlinear_update(
+        self,
+        *,
+        solver,
+        functions,
+        prev_functions,
+        aux_functions,
+        iteration: int,
+        coeffs,
+        delta_red=None,
+        delta_full=None,
+        bcs=None,
+        metrics=None,
+    ) -> None:
+        del solver, functions, prev_functions, aux_functions, coeffs, delta_red, delta_full, bcs
+        update_inf = 0.0 if metrics is None else float(metrics.get("update_inf", 0.0))
+        self.log.append(("nonlinear_update", self.label, int(iteration), update_inf))
+
+    def on_nonlinear_iteration_end(
+        self,
+        *,
+        solver,
+        functions,
+        prev_functions,
+        aux_functions,
+        iteration: int,
+        coeffs,
+        converged: bool,
+        bcs,
+        metrics=None,
+    ) -> None:
+        del solver, functions, prev_functions, aux_functions, coeffs, bcs
+        reason = None if metrics is None else metrics.get("reason")
+        self.log.append(("nonlinear_end", self.label, int(iteration), bool(converged), reason))
+
     def on_step_accept(self, *, solver, functions, prev_functions, aux_functions, step: int, step_no: int, t: float, dt: float, bcs) -> None:
         del solver, functions, prev_functions, aux_functions, bcs
         self.log.append(("step_accept", self.label, int(step), int(step_no), float(t), float(dt)))
@@ -164,6 +203,39 @@ def test_operator_manager_orders_runtime_hooks() -> None:
         R_red=np.array([2.0, 5.0]),
         need_matrix=False,
     )
+    manager.on_nonlinear_iteration_begin(
+        solver=solver,
+        functions=["u"],
+        prev_functions=["u_prev"],
+        aux_functions=None,
+        iteration=1,
+        coeffs={"marker": 4.0},
+        bcs=["bc"],
+        metrics={"dt": 0.1},
+    )
+    manager.on_nonlinear_update(
+        solver=solver,
+        functions=["u"],
+        prev_functions=["u_prev"],
+        aux_functions=None,
+        iteration=1,
+        coeffs={"marker": 4.0},
+        delta_red=np.array([1.0]),
+        delta_full=np.array([1.0, 0.0]),
+        bcs=["bc"],
+        metrics={"update_inf": 1.0},
+    )
+    manager.on_nonlinear_iteration_end(
+        solver=solver,
+        functions=["u"],
+        prev_functions=["u_prev"],
+        aux_functions=None,
+        iteration=1,
+        coeffs={"marker": 4.0},
+        converged=False,
+        bcs=["bc"],
+        metrics={"reason": "continue"},
+    )
     manager.on_step_accept(
         solver=solver,
         functions=["u"],
@@ -199,6 +271,12 @@ def test_operator_manager_orders_runtime_hooks() -> None:
         ("before_assembly", "b"),
         ("after_assembly", "a"),
         ("after_assembly", "b"),
+        ("nonlinear_begin", "a"),
+        ("nonlinear_begin", "b"),
+        ("nonlinear_update", "a"),
+        ("nonlinear_update", "b"),
+        ("nonlinear_end", "a"),
+        ("nonlinear_end", "b"),
         ("step_accept", "a"),
         ("step_accept", "b"),
         ("step_reject", "a"),
@@ -228,6 +306,55 @@ def test_newton_solver_reduced_assembly_applies_runtime_operators() -> None:
         ("before_assembly", "runtime"),
         ("after_assembly", "runtime"),
     ]
+
+
+def test_newton_solver_forwards_nonlinear_iteration_hooks() -> None:
+    log: list[tuple] = []
+    solver = NewtonSolver.__new__(NewtonSolver)
+    solver.set_runtime_operators([_LogOperator("runtime", log)])
+
+    coeffs = {"marker": 9.0}
+    NewtonSolver._notify_operator_nonlinear_iteration_begin(
+        solver,
+        functions=["u"],
+        prev_functions=["u_prev"],
+        aux_functions=None,
+        iteration=3,
+        coeffs=coeffs,
+        bcs=[],
+        metrics={"dt": 0.1},
+    )
+    NewtonSolver._notify_operator_nonlinear_update(
+        solver,
+        functions=["u"],
+        prev_functions=["u_prev"],
+        aux_functions=None,
+        iteration=3,
+        coeffs=coeffs,
+        delta_red=np.array([1.0]),
+        delta_full=np.array([1.0, 0.0]),
+        bcs=[],
+        metrics={"update_inf": 1.0},
+    )
+    NewtonSolver._notify_operator_nonlinear_iteration_end(
+        solver,
+        functions=["u"],
+        prev_functions=["u_prev"],
+        aux_functions=None,
+        iteration=3,
+        coeffs=coeffs,
+        converged=True,
+        bcs=[],
+        metrics={"reason": "unit"},
+    )
+
+    assert [entry[:2] for entry in log] == [
+        ("bind", "runtime"),
+        ("nonlinear_begin", "runtime"),
+        ("nonlinear_update", "runtime"),
+        ("nonlinear_end", "runtime"),
+    ]
+    assert log[-1] == ("nonlinear_end", "runtime", 3, True, "unit")
 
 
 def test_pointwise_operator_dispatches_backend_and_applies_result() -> None:
@@ -552,3 +679,191 @@ def test_symbolic_fused_local_operator_applies_quadrature_state_updates(monkeypa
     assert np.allclose(A_red[1, 1], 5.0)
     assert np.allclose(A_red[2, 2], 3.0)
     assert np.allclose(R_red, np.array([1.0, 5.0, 4.0], dtype=float))
+
+
+def test_symbolic_fused_local_operator_applies_nonmatching_quadrature_state_updates(monkeypatch) -> None:
+    class _FakeDH:
+        def __init__(self) -> None:
+            self.mixed_element = type("ME", (), {"mesh": type("MeshStub", (), {"n_elements": 1})()})()
+
+        def get_elemental_dofs(self, eid: int):
+            del eid
+            return np.asarray([0, 1], dtype=int)
+
+    class _FakeCompiler:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def assemble_and_scatter_local_contributions_reduced(
+            self,
+            form_or_equation,
+            *,
+            solver,
+            A_red,
+            R_red,
+            need_matrix: bool,
+            entity_ids=None,
+        ):
+            del form_or_equation, solver, need_matrix
+            if entity_ids is not None:
+                raise AssertionError("nonmatching interface updates must not receive volume entity_ids")
+            return A_red, R_red
+
+        def evaluate_nonmatching_interface_expressions_on_quadrature(self, exprs, *, layout, interface, quadrature):
+            self.calls.append((set(exprs), layout.entity_kind, interface, quadrature))
+            return {
+                "update_damage": np.asarray(
+                    [
+                        [0.2, 0.3],
+                        [0.4, 0.5],
+                    ],
+                    dtype=float,
+                )
+            }
+
+    registry = StateRegistry()
+    layout = QuadratureLayout(
+        entity_kind="nonmatching_interface",
+        cell_type="line",
+        quadrature_order=2,
+        reference_points=np.array([[-1.0], [1.0]], dtype=float),
+        reference_weights=np.array([1.0, 1.0], dtype=float),
+    )
+    qfield = registry.register_quadrature(
+        "damage",
+        layout=layout,
+        n_entities=2,
+        persistence="step",
+    )
+    qfield.assign(np.zeros((2, 2), dtype=float))
+
+    fake_compiler = _FakeCompiler()
+    fake_interface = object()
+    op = SymbolicFusedLocalAssemblyOperator(
+        dof_handler=_FakeDH(),
+        form_or_equation=object(),
+        quadrature_state_updates=(
+            SymbolicQuadratureStateUpdateSpec(
+                field=qfield,
+                expr=object(),
+                staged=True,
+                name="update_damage",
+            ),
+        ),
+        state_registries=(registry,),
+    )
+    monkeypatch.setattr(op, "_compiler", lambda backend: fake_compiler)
+    monkeypatch.setattr(op, "_local_domain_type", lambda: "nonmatching_interface")
+    monkeypatch.setattr(op, "_nonmatching_interface_for_updates", lambda: fake_interface)
+    monkeypatch.setattr(op, "_nonmatching_quadrature_rule_for_updates", lambda: "gauss_lobatto")
+
+    A_red = np.zeros((2, 2), dtype=float)
+    R_red = np.zeros((2,), dtype=float)
+    A_out, R_out = op.after_assembly(
+        solver=_ReducedScatterStub(backend="cpp"),
+        coeffs={},
+        A_red=A_red,
+        R_red=R_red,
+        need_matrix=True,
+    )
+
+    assert A_out is A_red
+    assert R_out is R_red
+    assert len(fake_compiler.calls) == 1
+    names, entity_kind, interface, quadrature = fake_compiler.calls[0]
+    assert names == {"update_damage"}
+    assert entity_kind == "nonmatching_interface"
+    assert interface is fake_interface
+    assert quadrature == "gauss_lobatto"
+    np.testing.assert_allclose(qfield.values, 0.0)
+    np.testing.assert_allclose(qfield.staged_values, np.asarray([[0.2, 0.3], [0.4, 0.5]], dtype=float))
+
+
+def test_symbolic_fused_local_operator_applies_trace_link_quadrature_state_updates(monkeypatch) -> None:
+    class _FakeDH:
+        def __init__(self) -> None:
+            self.mixed_element = type("ME", (), {"mesh": type("MeshStub", (), {"n_elements": 1})()})()
+
+        def get_elemental_dofs(self, eid: int):
+            del eid
+            return np.asarray([0, 1], dtype=int)
+
+    class _FakeCompiler:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def assemble_and_scatter_local_contributions_reduced(
+            self,
+            form_or_equation,
+            *,
+            solver,
+            A_red,
+            R_red,
+            need_matrix: bool,
+            entity_ids=None,
+        ):
+            del form_or_equation, solver, need_matrix
+            if entity_ids is not None:
+                raise AssertionError("trace-link updates must not receive volume entity_ids")
+            return A_red, R_red
+
+        def evaluate_trace_link_expressions_on_quadrature(self, exprs, *, layout, trace, quadrature):
+            self.calls.append((set(exprs), layout.entity_kind, trace, quadrature))
+            return {"update_damage": np.asarray([[0.6, 0.7]], dtype=float)}
+
+    registry = StateRegistry()
+    layout = QuadratureLayout(
+        entity_kind="trace_link",
+        cell_type="line",
+        quadrature_order=2,
+        reference_points=np.array([[-1.0], [1.0]], dtype=float),
+        reference_weights=np.array([1.0, 1.0], dtype=float),
+    )
+    qfield = registry.register_quadrature(
+        "damage",
+        layout=layout,
+        n_entities=1,
+        persistence="step",
+    )
+    qfield.assign(np.zeros((1, 2), dtype=float))
+
+    fake_compiler = _FakeCompiler()
+    fake_trace = object()
+    op = SymbolicFusedLocalAssemblyOperator(
+        dof_handler=_FakeDH(),
+        form_or_equation=object(),
+        quadrature_state_updates=(
+            SymbolicQuadratureStateUpdateSpec(
+                field=qfield,
+                expr=object(),
+                staged=True,
+                name="update_damage",
+            ),
+        ),
+        state_registries=(registry,),
+    )
+    monkeypatch.setattr(op, "_compiler", lambda backend: fake_compiler)
+    monkeypatch.setattr(op, "_local_domain_type", lambda: "trace_link")
+    monkeypatch.setattr(op, "_trace_link_for_updates", lambda: fake_trace)
+    monkeypatch.setattr(op, "_trace_link_quadrature_rule_for_updates", lambda: "gauss_lobatto")
+
+    A_red = np.zeros((2, 2), dtype=float)
+    R_red = np.zeros((2,), dtype=float)
+    A_out, R_out = op.after_assembly(
+        solver=_ReducedScatterStub(backend="cpp"),
+        coeffs={},
+        A_red=A_red,
+        R_red=R_red,
+        need_matrix=True,
+    )
+
+    assert A_out is A_red
+    assert R_out is R_red
+    assert len(fake_compiler.calls) == 1
+    names, entity_kind, trace, quadrature = fake_compiler.calls[0]
+    assert names == {"update_damage"}
+    assert entity_kind == "trace_link"
+    assert trace is fake_trace
+    assert quadrature == "gauss_lobatto"
+    np.testing.assert_allclose(qfield.values, 0.0)
+    np.testing.assert_allclose(qfield.staged_values, np.asarray([[0.6, 0.7]], dtype=float))

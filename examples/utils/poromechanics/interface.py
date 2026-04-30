@@ -18,15 +18,32 @@ import scipy.sparse as sp
 from pycutfem.integration.quadrature import gauss_legendre, gauss_lobatto
 from pycutfem.nonmatching.interface import NonMatchingInterface
 from pycutfem.operators import CallbackLocalAssemblyOperator, LocalAssemblyWorkset
+from pycutfem.tracefem import TraceLinkInterface
 from pycutfem.ufl.compilers import LocalAssemblyBatch
 from pycutfem.ufl.expressions import Constant, FacetNormal, Neg, Pos, grad, heaviside, pos_part
 from pycutfem.ufl.forms import Equation
-from pycutfem.ufl.measures import dNonmatchingInterface
+from pycutfem.ufl.measures import dNonmatchingInterface, dTraceLink
 
 
 QuadratureRule = Literal["lobatto", "gauss"]
 BackendName = Literal["python", "jit", "cpp"]
 InterfacePermeabilityLaw = Literal["fracture", "link"]
+
+
+def _named_constant(value, name: str | None = None, *, dim: int | None = None, preserve: bool = True):
+    """Create or annotate a JIT-stable constant used by interface UFL forms."""
+
+    if isinstance(value, Constant):
+        c = value
+    elif hasattr(value, "__dict__") and not isinstance(value, np.ndarray):
+        return value
+    else:
+        c = Constant(value, dim=dim) if dim is not None else Constant(value)
+    if name:
+        c._jit_name = name
+    if preserve:
+        c._preserve_runtime_structure = True
+    return c
 
 
 @dataclass(frozen=True)
@@ -143,6 +160,22 @@ class PairedUPlInterfaceNewtonBatch2D:
 
 
 @dataclass(frozen=True)
+class BilinearCohesiveUFLResponse2D:
+    """UFL expression bundle for Kratos' 2D bilinear cohesive law."""
+
+    D00: object
+    D01: object
+    D10: object
+    D11: object
+    stress_t: object
+    stress_n: object
+    equivalent: object
+    loading: object
+    state_next: object
+    open_flag: object
+
+
+@dataclass(frozen=True)
 class UPlInterfaceUFLSystem2D:
     """Symbolic U-Pl interface forms on a mesh-backed paired interface."""
 
@@ -150,7 +183,7 @@ class UPlInterfaceUFLSystem2D:
     rhs_form: object
     equation: Equation
     measure: object
-    interface: NonMatchingInterface
+    interface: object
     stiffness_lhs: object
     pressure_coupling_lhs: object
     rate_coupling_lhs: object
@@ -158,6 +191,29 @@ class UPlInterfaceUFLSystem2D:
     permeability_lhs: object
     rate_coupling_rhs: object
     storage_rhs: object
+    permeability_law: str = "fracture"
+
+
+@dataclass(frozen=True)
+class UPlInterfaceKratosNewtonUFLSystem2D:
+    """Symbolic Kratos Newton cohesive U-Pl interface system."""
+
+    tangent_form: object
+    residual_form: object
+    equation: Equation
+    measure: object
+    interface: object
+    response: BilinearCohesiveUFLResponse2D
+    state_update_expr: object
+    stiffness_tangent: object
+    pressure_coupling_tangent: object
+    rate_coupling_tangent: object
+    storage_tangent: object
+    permeability_tangent: object
+    displacement_residual: object
+    pressure_coupling_residual: object
+    storage_residual: object
+    permeability_residual: object
     permeability_law: str = "fracture"
 
 
@@ -216,6 +272,140 @@ def paired_upl_interface_to_nonmatching_interface_2d(
     )
 
 
+def paired_upl_interfaces_to_trace_link_interface_2d(
+    interfaces: Sequence[PairedUPlInterface2D],
+    *,
+    mesh,
+    negative_element_ids: int | Sequence[int],
+    positive_element_ids: int | Sequence[int],
+    quadrature: QuadratureRule = "lobatto",
+) -> TraceLinkInterface:
+    """Build a Trace-FEM link domain using Kratos station shape functions.
+
+    Kratos' finite-width U-Pl interface elements are discrete trace/link
+    entities: the negative and positive traces are line/station shape
+    functions on paired nodes, not volume traces on a common-refinement facet.
+    This helper returns a first-class ``TraceLinkInterface`` so UFL forms can
+    be assembled with ``dTraceLink`` through the python, jit and cpp backends
+    without coupling extra bulk-element DOFs.
+    """
+
+    interfaces = tuple(interfaces)
+    if not interfaces:
+        empty = np.empty((0,), dtype=np.int32)
+        empty2 = np.empty((0, 2), dtype=float)
+        xi, w_ref = _reference_quadrature_for_station_trace(2, quadrature)
+        factors = _empty_station_trace_factors(xi, w_ref, domain_type="trace_link")
+        return TraceLinkInterface(mesh=mesh, factors=factors, name="upl_station_trace")
+
+    n_stations = interfaces[0].n_stations
+    if any(iface.n_stations != n_stations for iface in interfaces):
+        raise ValueError("Station-trace UFL interface batches require one station count.")
+    n_entities = len(interfaces)
+    neg_ids = _expand_segment_ids(negative_element_ids, n_entities, "negative_element_ids")
+    pos_ids = _expand_segment_ids(positive_element_ids, n_entities, "positive_element_ids")
+
+    neg = np.asarray([iface.negative_coords for iface in interfaces], dtype=float)
+    pos = np.asarray([iface.positive_coords for iface in interfaces], dtype=float)
+    mids = 0.5 * (neg + pos)
+    station_s, tangents, normals, lengths = _interface_station_geometry_batch(neg, pos)
+    xi, w_ref = _reference_quadrature_for_station_trace(n_stations, quadrature)
+    q_s, q_w = _quadrature_on_station_intervals(station_s, n_stations, quadrature)
+    phi, dphi_ds = _lagrange_basis_and_derivative_batch(station_s, q_s)
+    qp_phys = mids[:, 0:1, :] + q_s[:, :, None] * tangents[:, None, :]
+    n_q = int(q_s.shape[1])
+    gdofs_map = np.asarray([iface.local_dofs() for iface in interfaces], dtype=np.int64)
+
+    factors: dict[str, object] = {
+        "trace_kind": "paired_station",
+        "eids": np.arange(n_entities, dtype=np.int32),
+        "qref": np.asarray(xi, dtype=float).reshape(-1, 1),
+        "qp_ref": np.asarray(xi, dtype=float).reshape(-1, 1),
+        "qw_ref": np.asarray(w_ref, dtype=float),
+        "qp_phys": np.asarray(qp_phys, dtype=float),
+        "qw": np.asarray(q_w, dtype=float),
+        "normals": np.broadcast_to(normals[:, None, :], (n_entities, n_q, 2)).copy(),
+        "xi_pos": np.zeros((n_entities, n_q), dtype=float),
+        "eta_pos": np.zeros((n_entities, n_q), dtype=float),
+        "xi_neg": np.zeros((n_entities, n_q), dtype=float),
+        "eta_neg": np.zeros((n_entities, n_q), dtype=float),
+        "gdofs_map": gdofs_map,
+        "J_inv_pos": _identity_jacobian_batch(n_entities, n_q),
+        "J_inv_neg": _identity_jacobian_batch(n_entities, n_q),
+        "J_inv": _identity_jacobian_batch(n_entities, n_q),
+        "detJ_pos": np.ones((n_entities, n_q), dtype=float),
+        "detJ_neg": np.ones((n_entities, n_q), dtype=float),
+        "detJ": np.ones((n_entities, n_q), dtype=float),
+        "phis": np.zeros((n_entities, n_q), dtype=float),
+        "h_arr": np.asarray(
+            [mesh.element_char_length(int(e)) for e in range(int(mesh.n_elements))],
+            dtype=float,
+        ),
+        "entity_kind": "edge",
+        "domain": "trace_link",
+        "domain_type": "trace_link",
+        "owner_pos_id": pos_ids.astype(np.int32, copy=False),
+        "owner_neg_id": neg_ids.astype(np.int32, copy=False),
+        "owner_id": pos_ids.astype(np.int32, copy=False),
+        "qstate_entity_id": np.arange(n_entities, dtype=np.int32),
+        "qstate_owner_id": np.arange(n_entities, dtype=np.int32),
+    }
+    _add_station_trace_field_tables(
+        factors,
+        phi=phi,
+        dphi_ds=dphi_ds,
+        tangents=tangents,
+        n_stations=n_stations,
+        gdofs_map=gdofs_map,
+    )
+
+    return TraceLinkInterface(mesh=mesh, factors=factors, name="upl_station_trace")
+
+
+def paired_upl_interfaces_to_station_trace_nonmatching_interface_2d(
+    interfaces: Sequence[PairedUPlInterface2D],
+    *,
+    mesh,
+    negative_element_ids: int | Sequence[int],
+    positive_element_ids: int | Sequence[int],
+    quadrature: QuadratureRule = "lobatto",
+) -> NonMatchingInterface:
+    """Compatibility wrapper for the previous station-trace nonmatching path.
+
+    New code should use ``paired_upl_interfaces_to_trace_link_interface_2d`` and
+    assemble the resulting domain with ``dTraceLink``.
+    """
+
+    trace = paired_upl_interfaces_to_trace_link_interface_2d(
+        interfaces,
+        mesh=mesh,
+        negative_element_ids=negative_element_ids,
+        positive_element_ids=positive_element_ids,
+        quadrature=quadrature,
+    )
+    factors = trace.precomputed_factors()
+    factors["domain"] = "nonmatching_interface"
+    factors["domain_type"] = "nonmatching_interface"
+    n_entities = trace.n_entities()
+    empty_ids = np.arange(n_entities, dtype=np.int32)
+    qp_phys = np.asarray(factors["qp_phys"], dtype=float)
+    normals = np.asarray(factors["normals"], dtype=float)
+    return NonMatchingInterface(
+        mesh_neg=mesh,
+        mesh_pos=mesh,
+        neg_edge_ids=empty_ids.copy(),
+        pos_edge_ids=empty_ids.copy(),
+        neg_elem_ids=np.asarray(factors.get("owner_neg_id", empty_ids), dtype=np.int32),
+        pos_elem_ids=np.asarray(factors.get("owner_pos_id", empty_ids), dtype=np.int32),
+        P0=np.asarray(qp_phys[:, 0, :], dtype=float) if n_entities else np.empty((0, 2), dtype=float),
+        P1=np.asarray(qp_phys[:, -1, :], dtype=float) if n_entities else np.empty((0, 2), dtype=float),
+        n=np.asarray(normals[:, 0, :], dtype=float) if n_entities else np.empty((0, 2), dtype=float),
+        h_neg=np.ones(n_entities, dtype=float),
+        h_pos=np.ones(n_entities, dtype=float),
+        precomputed_factors=factors,
+    )
+
+
 def build_upl_interface_ufl_system_2d(
     *,
     u_trial,
@@ -226,7 +416,7 @@ def build_upl_interface_ufl_system_2d(
     p_prev,
     u_current,
     material: UPlInterfaceMaterial2D,
-    interface: NonMatchingInterface,
+    interface: object,
     dt: float,
     theta_u: float = 1.0,
     theta_p: float = 1.0,
@@ -236,9 +426,11 @@ def build_upl_interface_ufl_system_2d(
 ) -> UPlInterfaceUFLSystem2D:
     """Build the Kratos-style 2D U-Pl interface as one symbolic UFL system."""
 
-    if dt <= 0.0:
+    if not hasattr(dt, "__dict__") and float(dt) <= 0.0:
         raise ValueError("dt must be positive.")
-    if theta_u <= 0.0 or theta_p <= 0.0:
+    if (not hasattr(theta_u, "__dict__") and float(theta_u) <= 0.0) or (
+        not hasattr(theta_p, "__dict__") and float(theta_p) <= 0.0
+    ):
         raise ValueError("theta_u and theta_p must be positive.")
     if permeability_law not in {"fracture", "link"}:
         raise ValueError("permeability_law must be 'fracture' or 'link'.")
@@ -248,26 +440,38 @@ def build_upl_interface_ufl_system_2d(
         q_order = 2 if q_rule == "gauss_lobatto" else 3
     else:
         q_order = int(quadrature_order)
-    dGamma = dNonmatchingInterface(metadata={"q": q_order, "interface": interface, "quadrature": q_rule})
+    if isinstance(interface, TraceLinkInterface):
+        dGamma = dTraceLink(metadata={"q": q_order, "trace": interface, "quadrature": q_rule})
+    else:
+        dGamma = dNonmatchingInterface(metadata={"q": q_order, "interface": interface, "quadrature": q_rule})
 
     n = FacetNormal()
-    thickness = Constant(float(material.thickness))
-    alpha = Constant(float(material.biot_coefficient))
-    invM = Constant(float(material.biot_modulus_inverse))
-    mu_inv = Constant(float(material.dynamic_viscosity_inverse))
-    velocity = Constant(1.0 / (float(theta_u) * float(dt)))
-    dt_pressure = Constant(1.0 / (float(theta_p) * float(dt)))
-    shear_stiff = Constant(float(material.shear_stiffness))
-    normal_stiff = Constant(float(material.normal_stiffness))
-    penalty = Constant(float(material.penalty_stiffness))
-    initial_width = Constant(float(material.initial_joint_width))
-    transversal_perm = Constant(float(material.transversal_permeability_coefficient))
+    thickness = _named_constant(material.thickness, "interface_thickness")
+    alpha = _named_constant(material.biot_coefficient, "interface_biot_coef")
+    invM = _named_constant(material.biot_modulus_inverse, "interface_inv_biot_modulus")
+    mu_inv = _named_constant(material.dynamic_viscosity_inverse, "interface_mu_inv")
+    dt_c = _named_constant(dt, "interface_dt")
+    theta_u_c = _named_constant(theta_u, "interface_theta_u")
+    theta_p_c = _named_constant(theta_p, "interface_theta_p")
+    one = _named_constant(1.0, "interface_one", preserve=False)
+    minus_one = _named_constant(-1.0, "interface_minus_one", preserve=False)
+    twelve = _named_constant(12.0, "interface_twelve", preserve=False)
+    velocity = one / (theta_u_c * dt_c)
+    dt_pressure = one / (theta_p_c * dt_c)
+    shear_stiff = _named_constant(material.shear_stiffness, "interface_shear_stiffness")
+    normal_stiff = _named_constant(material.normal_stiffness, "interface_normal_stiffness")
+    penalty = _named_constant(material.penalty_stiffness, "interface_penalty_stiffness")
+    initial_width = _named_constant(material.initial_joint_width, "interface_initial_joint_width")
+    transversal_perm = _named_constant(
+        material.transversal_permeability_coefficient,
+        "interface_transversal_permeability",
+    )
 
     normal_rel = _jump_normal_component(u_current, n)
     width = pos_part(initial_width + normal_rel)
-    tangential_perm = width * width / Constant(12.0)
+    tangential_perm = width * width / twelve
     transverse_perm = tangential_perm if permeability_law == "link" else transversal_perm
-    normal_stiff_eff = normal_stiff * (Constant(1.0) + (penalty - Constant(1.0)) * heaviside(-normal_rel))
+    normal_stiff_eff = normal_stiff * (one + (penalty - one) * heaviside(minus_one * normal_rel))
 
     jump_u_n = _jump_normal_component(u_trial, n)
     jump_v_n = _jump_normal_component(u_test, n)
@@ -284,7 +488,7 @@ def build_upl_interface_ufl_system_2d(
     dq_ds = _avg_tangential_derivative(p_test, n)
 
     stiffness_lhs = thickness * (shear_stiff * jump_u_t * jump_v_t + normal_stiff_eff * jump_u_n * jump_v_n) * dGamma
-    pressure_coupling_lhs = -thickness * alpha * p_avg * jump_v_n * dGamma
+    pressure_coupling_lhs = minus_one * thickness * alpha * p_avg * jump_v_n * dGamma
     rate_coupling_lhs = thickness * velocity * alpha * q_avg * jump_u_n * dGamma
     storage_lhs = thickness * dt_pressure * invM * width * p_avg * q_avg * dGamma
     permeability_lhs = (
@@ -322,6 +526,417 @@ def build_upl_link_interface_ufl_system_2d(**kwargs) -> UPlInterfaceUFLSystem2D:
     return build_upl_interface_ufl_system_2d(**kwargs)
 
 
+def build_upl_elastic_kratos_newton_interface_ufl_system_2d(
+    *,
+    u_trial,
+    p_trial,
+    u_test,
+    p_test,
+    u_current,
+    p_current,
+    velocity_current,
+    p_rate_current,
+    material: UPlInterfaceMaterial2D,
+    interface: object,
+    dt: float,
+    theta_u: float = 1.0,
+    theta_p: float = 1.0,
+    quadrature: QuadratureRule = "lobatto",
+    quadrature_order: int | None = None,
+    permeability_law: InterfacePermeabilityLaw = "fracture",
+) -> UPlInterfaceKratosNewtonUFLSystem2D:
+    """Build Kratos' elastic cohesive 2D U-Pl interface Newton block in UFL."""
+
+    if not hasattr(dt, "__dict__") and float(dt) <= 0.0:
+        raise ValueError("dt must be positive.")
+    if (not hasattr(theta_u, "__dict__") and float(theta_u) <= 0.0) or (
+        not hasattr(theta_p, "__dict__") and float(theta_p) <= 0.0
+    ):
+        raise ValueError("theta_u and theta_p must be positive.")
+    if permeability_law not in {"fracture", "link"}:
+        raise ValueError("permeability_law must be 'fracture' or 'link'.")
+
+    q_rule = "gauss_lobatto" if quadrature == "lobatto" else "gauss"
+    if quadrature_order is None:
+        q_order = 2 if q_rule == "gauss_lobatto" else 3
+    else:
+        q_order = int(quadrature_order)
+    if isinstance(interface, TraceLinkInterface):
+        dGamma = dTraceLink(metadata={"q": q_order, "trace": interface, "quadrature": q_rule})
+    else:
+        dGamma = dNonmatchingInterface(metadata={"q": q_order, "interface": interface, "quadrature": q_rule})
+
+    n = FacetNormal()
+    thickness = _named_constant(material.thickness, "interface_elastic_newton_thickness")
+    alpha = _named_constant(material.biot_coefficient, "interface_elastic_newton_biot_coef")
+    invM = _named_constant(material.biot_modulus_inverse, "interface_elastic_newton_inv_biot_modulus")
+    mu_inv = _named_constant(material.dynamic_viscosity_inverse, "interface_elastic_newton_mu_inv")
+    dt_c = _named_constant(dt, "interface_elastic_newton_dt")
+    theta_u_c = _named_constant(theta_u, "interface_elastic_newton_theta_u")
+    theta_p_c = _named_constant(theta_p, "interface_elastic_newton_theta_p")
+    one = _named_constant(1.0, "interface_elastic_newton_one", preserve=False)
+    minus_one = _named_constant(-1.0, "interface_elastic_newton_minus_one", preserve=False)
+    twelve = _named_constant(12.0, "interface_elastic_newton_twelve", preserve=False)
+    initial_width = _named_constant(material.initial_joint_width, "interface_elastic_newton_initial_joint_width")
+    shear_stiff = _named_constant(material.shear_stiffness, "interface_elastic_newton_shear_stiffness")
+    normal_stiff = _named_constant(material.normal_stiffness, "interface_elastic_newton_normal_stiffness")
+    penalty = _named_constant(material.penalty_stiffness, "interface_elastic_newton_penalty_stiffness")
+    transversal_perm = _named_constant(
+        material.transversal_permeability_coefficient,
+        "interface_elastic_newton_transversal_permeability",
+    )
+    velocity_coeff = one / (theta_u_c * dt_c)
+    dt_pressure_coeff = one / (theta_p_c * dt_c)
+
+    du_t = _jump_tangent_component(u_trial, n)
+    du_n = _jump_normal_component(u_trial, n)
+    v_t = _jump_tangent_component(u_test, n)
+    v_n = _jump_normal_component(u_test, n)
+    u_current_t = _jump_tangent_component(u_current, n)
+    u_current_n = _jump_normal_component(u_current, n)
+    velocity_n = _jump_normal_component(velocity_current, n)
+
+    p_avg = _avg_trace(p_trial)
+    q_avg = _avg_trace(p_test)
+    p_current_avg = _avg_trace(p_current)
+    p_rate_avg = _avg_trace(p_rate_current)
+    jump_p = Pos(p_trial) - Neg(p_trial)
+    jump_q = Pos(p_test) - Neg(p_test)
+    jump_p_current = Pos(p_current) - Neg(p_current)
+    dp_ds = _avg_tangential_derivative(p_trial, n)
+    dq_ds = _avg_tangential_derivative(p_test, n)
+    dp_current_ds = _avg_tangential_derivative(p_current, n)
+
+    width = pos_part(initial_width + u_current_n)
+    k_tangential = width * width / twelve
+    k_transverse = k_tangential if permeability_law == "link" else transversal_perm
+    normal_stiff_eff = normal_stiff * (one + (penalty - one) * heaviside(minus_one * u_current_n))
+    stress_t = shear_stiff * u_current_t
+    stress_n = normal_stiff_eff * u_current_n
+
+    stiffness_tangent = thickness * (shear_stiff * v_t * du_t + normal_stiff_eff * v_n * du_n) * dGamma
+    pressure_coupling_tangent = minus_one * thickness * alpha * p_avg * v_n * dGamma
+    rate_coupling_tangent = thickness * velocity_coeff * alpha * q_avg * du_n * dGamma
+    storage_tangent = thickness * dt_pressure_coeff * invM * width * p_avg * q_avg * dGamma
+    permeability_tangent = (
+        thickness
+        * mu_inv
+        * (k_tangential * width * dp_ds * dq_ds + k_transverse * width * jump_p * jump_q)
+        * dGamma
+    )
+
+    displacement_residual = minus_one * thickness * (stress_t * v_t + stress_n * v_n) * dGamma
+    pressure_coupling_residual = thickness * alpha * (p_current_avg * v_n - q_avg * velocity_n) * dGamma
+    storage_residual = minus_one * thickness * invM * width * p_rate_avg * q_avg * dGamma
+    permeability_residual = (
+        minus_one
+        * thickness
+        * mu_inv
+        * (
+            k_tangential * width * dp_current_ds * dq_ds
+            + k_transverse * width * jump_p_current * jump_q
+        )
+        * dGamma
+    )
+
+    tangent_form = (
+        stiffness_tangent
+        + pressure_coupling_tangent
+        + rate_coupling_tangent
+        + storage_tangent
+        + permeability_tangent
+    )
+    residual_form = (
+        displacement_residual
+        + pressure_coupling_residual
+        + storage_residual
+        + permeability_residual
+    )
+    return UPlInterfaceKratosNewtonUFLSystem2D(
+        tangent_form=tangent_form,
+        residual_form=residual_form,
+        equation=Equation(tangent_form, residual_form),
+        measure=dGamma,
+        interface=interface,
+        response=None,
+        state_update_expr=None,
+        stiffness_tangent=stiffness_tangent,
+        pressure_coupling_tangent=pressure_coupling_tangent,
+        rate_coupling_tangent=rate_coupling_tangent,
+        storage_tangent=storage_tangent,
+        permeability_tangent=permeability_tangent,
+        displacement_residual=displacement_residual,
+        pressure_coupling_residual=pressure_coupling_residual,
+        storage_residual=storage_residual,
+        permeability_residual=permeability_residual,
+        permeability_law=str(permeability_law),
+    )
+
+
+def build_upl_kratos_newton_interface_ufl_system_2d(
+    *,
+    u_trial,
+    p_trial,
+    u_test,
+    p_test,
+    u_current,
+    p_current,
+    velocity_current,
+    p_rate_current,
+    state,
+    material: UPlInterfaceMaterial2D,
+    interface: object,
+    dt: float,
+    theta_u: float = 1.0,
+    theta_p: float = 1.0,
+    quadrature: QuadratureRule = "lobatto",
+    quadrature_order: int | None = None,
+    permeability_law: InterfacePermeabilityLaw = "fracture",
+) -> UPlInterfaceKratosNewtonUFLSystem2D:
+    """Build Kratos' nonlinear 2D U-Pl cohesive interface Newton block in UFL."""
+
+    if not hasattr(dt, "__dict__") and float(dt) <= 0.0:
+        raise ValueError("dt must be positive.")
+    if (not hasattr(theta_u, "__dict__") and float(theta_u) <= 0.0) or (
+        not hasattr(theta_p, "__dict__") and float(theta_p) <= 0.0
+    ):
+        raise ValueError("theta_u and theta_p must be positive.")
+    if permeability_law not in {"fracture", "link"}:
+        raise ValueError("permeability_law must be 'fracture' or 'link'.")
+    _require_bilinear_cohesive_material(material)
+
+    q_rule = "gauss_lobatto" if quadrature == "lobatto" else "gauss"
+    if quadrature_order is None:
+        q_order = 2 if q_rule == "gauss_lobatto" else 3
+    else:
+        q_order = int(quadrature_order)
+    if isinstance(interface, TraceLinkInterface):
+        dGamma = dTraceLink(metadata={"q": q_order, "trace": interface, "quadrature": q_rule})
+    else:
+        dGamma = dNonmatchingInterface(metadata={"q": q_order, "interface": interface, "quadrature": q_rule})
+
+    n = FacetNormal()
+    thickness = _named_constant(material.thickness, "interface_newton_thickness")
+    alpha = _named_constant(material.biot_coefficient, "interface_newton_biot_coef")
+    invM = _named_constant(material.biot_modulus_inverse, "interface_newton_inv_biot_modulus")
+    mu_inv = _named_constant(material.dynamic_viscosity_inverse, "interface_newton_mu_inv")
+    dt_c = _named_constant(dt, "interface_newton_dt")
+    theta_u_c = _named_constant(theta_u, "interface_newton_theta_u")
+    theta_p_c = _named_constant(theta_p, "interface_newton_theta_p")
+    one = _named_constant(1.0, "interface_newton_one", preserve=False)
+    minus_one = _named_constant(-1.0, "interface_newton_minus_one", preserve=False)
+    twelve = _named_constant(12.0, "interface_newton_twelve", preserve=False)
+    initial_width = _named_constant(material.initial_joint_width, "interface_newton_initial_joint_width")
+    transversal_perm = _named_constant(
+        material.transversal_permeability_coefficient,
+        "interface_newton_transversal_permeability",
+    )
+    velocity_coeff = one / (theta_u_c * dt_c)
+    dt_pressure_coeff = one / (theta_p_c * dt_c)
+
+    du_t = _jump_tangent_component(u_trial, n)
+    du_n = _jump_normal_component(u_trial, n)
+    v_t = _jump_tangent_component(u_test, n)
+    v_n = _jump_normal_component(u_test, n)
+    u_current_t = _jump_tangent_component(u_current, n)
+    u_current_n = _jump_normal_component(u_current, n)
+    velocity_n = _jump_normal_component(velocity_current, n)
+
+    p_avg = _avg_trace(p_trial)
+    q_avg = _avg_trace(p_test)
+    p_current_avg = _avg_trace(p_current)
+    p_rate_avg = _avg_trace(p_rate_current)
+    jump_p = Pos(p_trial) - Neg(p_trial)
+    jump_q = Pos(p_test) - Neg(p_test)
+    jump_p_current = Pos(p_current) - Neg(p_current)
+    dp_ds = _avg_tangential_derivative(p_trial, n)
+    dq_ds = _avg_tangential_derivative(p_test, n)
+    dp_current_ds = _avg_tangential_derivative(p_current, n)
+
+    width = pos_part(initial_width + u_current_n)
+    k_tangential = width * width / twelve
+    k_transverse = k_tangential if permeability_law == "link" else transversal_perm
+
+    response = bilinear_cohesive_2d_ufl_response(
+        material,
+        tangential_jump=u_current_t,
+        normal_jump=u_current_n,
+        state=state,
+    )
+
+    stiffness_tangent = thickness * (
+        v_t * (response.D00 * du_t + response.D01 * du_n)
+        + v_n * (response.D10 * du_t + response.D11 * du_n)
+    ) * dGamma
+    pressure_coupling_tangent = minus_one * thickness * alpha * p_avg * v_n * dGamma
+    rate_coupling_tangent = thickness * velocity_coeff * alpha * q_avg * du_n * dGamma
+    storage_tangent = thickness * dt_pressure_coeff * invM * width * p_avg * q_avg * dGamma
+    permeability_tangent = (
+        thickness
+        * mu_inv
+        * (k_tangential * width * dp_ds * dq_ds + k_transverse * width * jump_p * jump_q)
+        * dGamma
+    )
+
+    displacement_residual = (
+        minus_one * thickness * (response.stress_t * v_t + response.stress_n * v_n) * dGamma
+    )
+    pressure_coupling_residual = thickness * alpha * (p_current_avg * v_n - q_avg * velocity_n) * dGamma
+    storage_residual = minus_one * thickness * invM * width * p_rate_avg * q_avg * dGamma
+    permeability_residual = (
+        minus_one
+        * thickness
+        * mu_inv
+        * (
+            k_tangential * width * dp_current_ds * dq_ds
+            + k_transverse * width * jump_p_current * jump_q
+        )
+        * dGamma
+    )
+
+    tangent_form = (
+        stiffness_tangent
+        + pressure_coupling_tangent
+        + rate_coupling_tangent
+        + storage_tangent
+        + permeability_tangent
+    )
+    residual_form = (
+        displacement_residual
+        + pressure_coupling_residual
+        + storage_residual
+        + permeability_residual
+    )
+    return UPlInterfaceKratosNewtonUFLSystem2D(
+        tangent_form=tangent_form,
+        residual_form=residual_form,
+        equation=Equation(tangent_form, residual_form),
+        measure=dGamma,
+        interface=interface,
+        response=response,
+        state_update_expr=response.state_next,
+        stiffness_tangent=stiffness_tangent,
+        pressure_coupling_tangent=pressure_coupling_tangent,
+        rate_coupling_tangent=rate_coupling_tangent,
+        storage_tangent=storage_tangent,
+        permeability_tangent=permeability_tangent,
+        displacement_residual=displacement_residual,
+        pressure_coupling_residual=pressure_coupling_residual,
+        storage_residual=storage_residual,
+        permeability_residual=permeability_residual,
+        permeability_law=str(permeability_law),
+    )
+
+
+def _reference_quadrature_for_station_trace(
+    n_stations: int,
+    quadrature: QuadratureRule,
+) -> tuple[np.ndarray, np.ndarray]:
+    if quadrature == "lobatto":
+        return gauss_lobatto(max(2, int(n_stations)))
+    if quadrature == "gauss":
+        return gauss_legendre(max(2, int(n_stations) + 1))
+    raise ValueError(f"Unknown interface quadrature rule '{quadrature}'.")
+
+
+def _empty_station_trace_factors(
+    xi: np.ndarray,
+    w_ref: np.ndarray,
+    *,
+    domain_type: str = "nonmatching_interface",
+) -> dict[str, object]:
+    qref = np.asarray(xi, dtype=float).reshape(-1, 1)
+    n_q = int(qref.shape[0])
+    z1 = np.empty((0, n_q), dtype=float)
+    z2 = np.empty((0, n_q, 2), dtype=float)
+    z22 = np.empty((0, n_q, 2, 2), dtype=float)
+    return {
+        "trace_kind": "paired_station",
+        "eids": np.empty((0,), dtype=np.int32),
+        "qref": qref,
+        "qp_ref": qref,
+        "qw_ref": np.asarray(w_ref, dtype=float),
+        "qp_phys": z2,
+        "qw": z1,
+        "normals": z2,
+        "xi_pos": z1,
+        "eta_pos": z1,
+        "xi_neg": z1,
+        "eta_neg": z1,
+        "gdofs_map": np.empty((0, 0), dtype=np.int64),
+        "J_inv_pos": z22,
+        "J_inv_neg": z22,
+        "J_inv": z22,
+        "detJ_pos": z1,
+        "detJ_neg": z1,
+        "detJ": z1,
+        "phis": z1,
+        "h_arr": np.empty((0,), dtype=float),
+        "entity_kind": "edge",
+        "domain": str(domain_type),
+        "domain_type": str(domain_type),
+        "owner_pos_id": np.empty((0,), dtype=np.int32),
+        "owner_neg_id": np.empty((0,), dtype=np.int32),
+        "owner_id": np.empty((0,), dtype=np.int32),
+        "qstate_entity_id": np.empty((0,), dtype=np.int32),
+        "qstate_owner_id": np.empty((0,), dtype=np.int32),
+    }
+
+
+def _identity_jacobian_batch(n_entities: int, n_q: int) -> np.ndarray:
+    eye = np.eye(2, dtype=float)
+    return np.broadcast_to(eye, (int(n_entities), int(n_q), 2, 2)).copy()
+
+
+def _add_station_trace_field_tables(
+    factors: dict[str, object],
+    *,
+    phi: np.ndarray,
+    dphi_ds: np.ndarray,
+    tangents: np.ndarray,
+    n_stations: int,
+    gdofs_map: np.ndarray,
+) -> None:
+    n_entities = int(np.asarray(gdofs_map).shape[0])
+    n_union = int(np.asarray(gdofs_map).shape[1]) if n_entities else 0
+    stations = np.arange(int(n_stations), dtype=np.int32)
+    neg_all = np.arange(0, 3 * int(n_stations), dtype=np.int32)
+    pos_all = np.arange(3 * int(n_stations), 6 * int(n_stations), dtype=np.int32)
+    factors["neg_map"] = np.broadcast_to(neg_all, (n_entities, neg_all.size)).copy()
+    factors["pos_map"] = np.broadcast_to(pos_all, (n_entities, pos_all.size)).copy()
+
+    field_offsets = {"ux": 0, "uy": 1, "p": 2}
+    dphi_dx = dphi_ds * tangents[:, None, 0:1]
+    dphi_dy = dphi_ds * tangents[:, None, 1:2]
+    for fld, offset in field_offsets.items():
+        neg_map = (3 * stations + int(offset)).astype(np.int32)
+        pos_map = (3 * int(n_stations) + 3 * stations + int(offset)).astype(np.int32)
+        factors[f"neg_map_{fld}"] = np.broadcast_to(neg_map, (n_entities, neg_map.size)).copy()
+        factors[f"pos_map_{fld}"] = np.broadcast_to(pos_map, (n_entities, pos_map.size)).copy()
+        for side_name, side_map in (("neg", neg_map), ("pos", pos_map)):
+            mask = np.zeros((n_entities, n_union), dtype=float)
+            if side_map.size:
+                mask[:, side_map] = 1.0
+            factors[f"restrict_mask_{fld}_{side_name}"] = mask
+
+        for side_name in ("neg", "pos"):
+            factors[f"r00_{fld}_{side_name}"] = np.asarray(phi, dtype=float)
+            factors[f"r10_{fld}_{side_name}"] = np.asarray(dphi_dx, dtype=float)
+            factors[f"r01_{fld}_{side_name}"] = np.asarray(dphi_dy, dtype=float)
+
+        b_union = np.zeros((n_entities, int(phi.shape[1]), n_union), dtype=float)
+        d10_union = np.zeros_like(b_union)
+        d01_union = np.zeros_like(b_union)
+        if pos_map.size:
+            b_union[:, :, pos_map] = phi
+            d10_union[:, :, pos_map] = dphi_dx
+            d01_union[:, :, pos_map] = dphi_dy
+        factors[f"b_{fld}"] = b_union
+        factors[f"d10_{fld}"] = d10_union
+        factors[f"d01_{fld}"] = d01_union
+        factors[f"g_{fld}"] = np.stack((d10_union, d01_union), axis=-1)
+
+
 def _expand_segment_ids(raw: int | Sequence[int], n_segments: int, name: str) -> np.ndarray:
     arr = np.asarray([raw] if np.isscalar(raw) else raw, dtype=np.int32).reshape(-1)
     if arr.size == 1:
@@ -332,7 +947,8 @@ def _expand_segment_ids(raw: int | Sequence[int], n_segments: int, name: str) ->
 
 
 def _avg_trace(expr):
-    return Constant(0.5) * (Pos(expr) + Neg(expr))
+    half = _named_constant(0.5, "interface_average_half", preserve=False)
+    return half * (Pos(expr) + Neg(expr))
 
 
 def _jump_normal_component(vec, normal):
@@ -348,7 +964,8 @@ def _tangential_derivative(expr, normal):
 
 
 def _avg_tangential_derivative(expr, normal):
-    return Constant(0.5) * (_tangential_derivative(Pos(expr), normal) + _tangential_derivative(Neg(expr), normal))
+    half = _named_constant(0.5, "interface_tangent_average_half", preserve=False)
+    return half * (_tangential_derivative(Pos(expr), normal) + _tangential_derivative(Neg(expr), normal))
 
 
 def build_paired_upl_interface_local_system_2d(
@@ -803,6 +1420,98 @@ def _require_bilinear_cohesive_material(material: UPlInterfaceMaterial2D) -> Non
     ]
     if missing:
         raise ValueError(f"Bilinear cohesive interface material is missing {', '.join(missing)}.")
+
+
+def bilinear_cohesive_2d_ufl_response(
+    material: UPlInterfaceMaterial2D,
+    *,
+    tangential_jump,
+    normal_jump,
+    state,
+) -> BilinearCohesiveUFLResponse2D:
+    """Return Kratos-compatible bilinear cohesive law components as UFL expressions.
+
+    The branch semantics intentionally mirror ``_bilinear_cohesive_2d_response``:
+    the open branch is active for positive normal jump, loading uses
+    ``equivalent >= state`` with the repo's strict ``Heaviside`` convention, and
+    contact friction uses Kratos' non-symmetric tangent.
+    """
+
+    _require_bilinear_cohesive_material(material)
+    young = _named_constant(material.young_modulus, "interface_cohesive_young")
+    crit = _named_constant(material.critical_displacement, "interface_cohesive_critical_displacement")
+    yield_stress = _named_constant(material.yield_stress, "interface_cohesive_yield_stress")
+    threshold = _named_constant(material.damage_threshold, "interface_cohesive_damage_threshold")
+    friction = _named_constant(material.friction_coefficient, "interface_cohesive_friction")
+    eps = _named_constant(1.0e-20, "interface_cohesive_friction_eps", preserve=False)
+    one = _named_constant(1.0, "interface_cohesive_one", preserve=False)
+    zero = _named_constant(0.0, "interface_cohesive_zero", preserve=False)
+    half = _named_constant(0.5, "interface_cohesive_half", preserve=False)
+    minus_one = _named_constant(-1.0, "interface_cohesive_minus_one", preserve=False)
+
+    t = tangential_jump
+    n = normal_jump
+    s = threshold + pos_part(state - threshold)
+    s2 = s * s
+    s3 = s2 * s
+    crit2 = crit * crit
+    crit3 = crit2 * crit
+
+    open_flag = heaviside(n)
+    contact_flag = one - open_flag
+    equivalent_open = ((t * t + n * n) ** half) / crit
+    equivalent_contact = (pos_part(t) + pos_part(minus_one * t)) / crit
+    equivalent = open_flag * equivalent_open + contact_flag * equivalent_contact
+    loading = one - heaviside(s - equivalent)
+
+    base = yield_stress / ((one - threshold) * crit)
+    secant = yield_stress * (one - s) / ((one - threshold) * crit * s)
+    normal_contact = young / (threshold * crit)
+
+    d00_loading = base * ((one - s) / s - (t * t) / (crit2 * s3))
+    d11_open_loading = base * ((one - s) / s - (n * n) / (crit2 * s3))
+    d01_damage = minus_one * yield_stress * t * n / ((one - threshold) * crit3 * s3)
+
+    sign_t = heaviside(t) - heaviside(minus_one * t)
+    sign_t_eps = heaviside(t - eps) - heaviside(minus_one * t - eps)
+
+    d00_open = loading * d00_loading + (one - loading) * secant
+    d01_open = loading * d01_damage
+    d11_open = loading * d11_open_loading + (one - loading) * secant
+
+    d00_contact = loading * d00_loading + (one - loading) * secant
+    d01_contact = loading * (d01_damage - normal_contact * friction * sign_t_eps) + (
+        one - loading
+    ) * (minus_one * normal_contact * friction * sign_t)
+    d11_contact = normal_contact
+
+    D00 = open_flag * d00_open + contact_flag * d00_contact
+    D01 = open_flag * d01_open + contact_flag * d01_contact
+    D10 = open_flag * d01_open + contact_flag * zero
+    D11 = open_flag * d11_open + contact_flag * d11_contact
+
+    stress_open_t = secant * t
+    stress_open_n = secant * n
+    stress_contact_n = normal_contact * n
+    stress_contact_t = secant * t - friction * stress_contact_n * sign_t
+    stress_t = open_flag * stress_open_t + contact_flag * stress_contact_t
+    stress_n = open_flag * stress_open_n + contact_flag * stress_contact_n
+
+    equivalent_capped = equivalent - pos_part(equivalent - one)
+    state_next = loading * equivalent_capped + (one - loading) * s
+
+    return BilinearCohesiveUFLResponse2D(
+        D00=D00,
+        D01=D01,
+        D10=D10,
+        D11=D11,
+        stress_t=stress_t,
+        stress_n=stress_n,
+        equivalent=equivalent,
+        loading=loading,
+        state_next=state_next,
+        open_flag=open_flag,
+    )
 
 
 def _assemble_kratos_newton_interface_numpy(

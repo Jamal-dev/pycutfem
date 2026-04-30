@@ -182,4 +182,5 @@ def lift_nonmatching_interface_to_composite(
         n=np.asarray(interface.n, dtype=float),
         h_neg=np.asarray(interface.h_neg, dtype=float),
         h_pos=np.asarray(interface.h_pos, dtype=float),
+        precomputed_factors=getattr(interface, "precomputed_factors", None),
     )

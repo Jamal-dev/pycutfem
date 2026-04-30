@@ -808,6 +808,8 @@ class CppCodeGen:
                 qstate_rank[op.name] = rank
                 if op.name not in param_order:
                     param_order.append(op.name)
+                if "qstate_owner_id" not in param_order:
+                    param_order.append("qstate_owner_id")
             if isinstance(op, (LoadFacetNormal, LoadFacetNormalComponent)):
                 needs_normals = True
             if isinstance(op, CellDiameter):
@@ -1410,17 +1412,17 @@ class CppCodeGen:
                     raise NotImplementedError("LoadElementWiseConstant only implemented for scalar/vector tensors in C++ backend")
             elif isinstance(op, LoadQuadratureState):
                 required_args.add(op.name)
-                required_args.add("owner_id")
+                required_args.add("qstate_owner_id")
                 tshape = tuple(op.tensor_shape or ())
                 if len(tshape) == 0:
                     nm = new_tmp("qstate")
-                    emit_line(f"double {nm} = {op.name}_view(owner_id_view(e), q);")
+                    emit_line(f"double {nm} = {op.name}_view(qstate_owner_id_view(e), q);")
                     stack.append(StackItem(nm, "scalar", "value", ()))
                 elif len(tshape) == 1:
                     k = int(tshape[0])
                     nm = new_tmp("qstate_vec")
                     emit_line(f"Eigen::VectorXd {nm}({k});")
-                    emit_line(f"for (int _i=0; _i<{k}; ++_i) {nm}(_i) = {op.name}_view(owner_id_view(e), q, _i);")
+                    emit_line(f"for (int _i=0; _i<{k}; ++_i) {nm}(_i) = {op.name}_view(qstate_owner_id_view(e), q, _i);")
                     stack.append(StackItem(nm, "vec", "value", (k,)))
                 elif len(tshape) == 2:
                     n0 = int(tshape[0])
@@ -1430,7 +1432,7 @@ class CppCodeGen:
                     emit_line(
                         f"for (int _i=0; _i<{n0}; ++_i) "
                         f"for (int _j=0; _j<{n1}; ++_j) "
-                        f"{nm}(_i, _j) = {op.name}_view(owner_id_view(e), q, _i, _j);"
+                        f"{nm}(_i, _j) = {op.name}_view(qstate_owner_id_view(e), q, _i, _j);"
                     )
                     stack.append(StackItem(nm, "mat", "value", (n0, n1)))
                 else:
@@ -7863,7 +7865,7 @@ class CppCodeGen:
         def _cpp_array_type(nm: str) -> str:
             if (
                 nm == "gdofs_map"
-                or nm in {"owner_id", "owner_pos_id", "owner_neg_id", "pos_eids", "neg_eids"}
+                or nm in {"owner_id", "owner_pos_id", "owner_neg_id", "pos_eids", "neg_eids", "qstate_owner_id"}
                 or nm.startswith(("pos_map", "neg_map"))
             ):
                 return "py::array_t<int32_t, py::array::forcecast>"
@@ -7960,7 +7962,7 @@ class CppCodeGen:
                 view_lines.append(f"    auto {name}_view = {name}.unchecked<2>();")
             if name.startswith("restrict_mask_"):
                 view_lines.append(f"    auto {name}_view = {name}.unchecked<2>();")
-            if name in {"owner_id", "owner_pos_id", "owner_neg_id", "pos_eids", "neg_eids"}:
+            if name in {"owner_id", "owner_pos_id", "owner_neg_id", "pos_eids", "neg_eids", "qstate_owner_id"}:
                 view_lines.append(f"    auto {name}_view = {name}.unchecked<1>();")
 
         view_lines.extend(const_arr_setup_lines)

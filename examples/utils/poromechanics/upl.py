@@ -15,7 +15,6 @@ import numpy as np
 from pycutfem.ufl.expressions import (
     Constant,
     ElementWiseConstant,
-    Identity,
     div,
     dot,
     grad,
@@ -26,17 +25,27 @@ from pycutfem.ufl.expressions import (
 from .materials import UPlMaterial2D
 
 
-def _named_constant(value, name: str | None = None):
-    c = Constant(value)
+def _named_constant(value, name: str | None = None, *, dim: int | None = None, preserve: bool = True):
+    """Create or annotate a JIT-stable constant used by poromechanics forms."""
+
+    if isinstance(value, (Constant, ElementWiseConstant)):
+        c = value
+    elif hasattr(value, "__dict__") and not isinstance(value, np.ndarray):
+        return value
+    else:
+        c = Constant(value, dim=dim) if dim is not None else Constant(value)
     if name:
         c._jit_name = name
+    if preserve:
+        c._preserve_runtime_structure = True
     return c
 
 
 def epsilon_2d(u):
     """Small-strain tensor epsilon(u)."""
 
-    return Constant(0.5) * (grad(u) + grad(u).T)
+    half = _named_constant(0.5, "upl_strain_half", preserve=False)
+    return half * (grad(u) + grad(u).T)
 
 
 def effective_stress_linear_2d(u, material: UPlMaterial2D):
@@ -45,7 +54,9 @@ def effective_stress_linear_2d(u, material: UPlMaterial2D):
     mu = _named_constant(material.mu, "mu_s")
     lam = _named_constant(material.lambda_, "lambda_s")
     eps_u = epsilon_2d(u)
-    return Constant(2.0) * mu * eps_u + lam * trace(eps_u) * Identity(2)
+    two = _named_constant(2.0, "upl_stress_two", preserve=False)
+    identity = _named_constant(np.eye(2, dtype=float), "upl_identity_2d", dim=2, preserve=False)
+    return two * mu * eps_u + lam * trace(eps_u) * identity
 
 
 def hydraulic_conductivity_form_2d(p, q, material: UPlMaterial2D):
@@ -56,8 +67,12 @@ def hydraulic_conductivity_form_2d(p, q, material: UPlMaterial2D):
         k_iso = _named_constant(float(K[0, 0]), "permeability_over_viscosity")
         return inner(k_iso * grad(p), grad(q))
 
-    K_c = Constant(np.asarray(K, dtype=float), dim=2)
-    K_c._jit_name = "permeability_over_viscosity"
+    K_c = _named_constant(
+        np.asarray(K, dtype=float),
+        "permeability_over_viscosity",
+        dim=2,
+        preserve=False,
+    )
     return dot(dot(K_c, grad(p)), grad(q))
 
 
@@ -103,6 +118,21 @@ class UPlKratosFICQuasistaticSystem2D:
     pressure_gradient_rhs: object
 
 
+@dataclass(frozen=True)
+class UPlKratosDamageQuasistaticSystem2D:
+    """Kratos quasi-static U-Pl system with a frozen quadrature damage coefficient."""
+
+    lhs_form: object
+    rhs_form: object
+    stiffness_lhs: object
+    coupling_lhs: object
+    rate_coupling_lhs: object
+    storage_lhs: object
+    permeability_lhs: object
+    rate_coupling_rhs: object
+    storage_rhs: object
+
+
 def build_upl_theta_system_2d(
     *,
     u_trial,
@@ -130,24 +160,25 @@ def build_upl_theta_system_2d(
 
     alpha = _named_constant(material.biot_coefficient, "biot_coef")
     invM = _named_constant(material.biot_modulus_inverse, "inv_biot_modulus")
-    dt_c = dt if hasattr(dt, "__dict__") else _named_constant(float(dt), "dt")
-    theta_c = theta if hasattr(theta, "__dict__") else _named_constant(float(theta), "theta")
-    one = Constant(1.0)
+    dt_c = _named_constant(dt, "dt")
+    theta_c = _named_constant(theta, "theta")
+    one = _named_constant(1.0, "upl_one", preserve=False)
+    minus_one = _named_constant(-1.0, "upl_minus_one", preserve=False)
 
     sigma_trial = effective_stress_linear_2d(u_trial, material)
     sigma_prev = effective_stress_linear_2d(u_prev, material)
     H_trial = hydraulic_conductivity_form_2d(p_trial, p_test, material)
     H_prev = hydraulic_conductivity_form_2d(p_prev, p_test, material)
 
-    stiffness_lhs = -inner(sigma_trial, epsilon_2d(u_test)) * dx_measure
+    stiffness_lhs = minus_one * inner(sigma_trial, epsilon_2d(u_test)) * dx_measure
     coupling_lhs = alpha * p_trial * div(u_test) * dx_measure + alpha * div(u_trial) * p_test * dx_measure
     storage_lhs = invM * p_trial * p_test * dx_measure
     permeability_lhs = theta_c * dt_c * H_trial * dx_measure
 
-    stiffness_rhs = -inner(sigma_prev, epsilon_2d(u_test)) * dx_measure
+    stiffness_rhs = minus_one * inner(sigma_prev, epsilon_2d(u_test)) * dx_measure
     coupling_rhs = alpha * p_prev * div(u_test) * dx_measure + alpha * div(u_prev) * p_test * dx_measure
     storage_rhs = invM * p_prev * p_test * dx_measure
-    permeability_rhs = -(one - theta_c) * dt_c * H_prev * dx_measure
+    permeability_rhs = (theta_c - one) * dt_c * H_prev * dx_measure
 
     rhs_form = stiffness_rhs + coupling_rhs + storage_rhs + permeability_rhs
     if body_acceleration is not None:
@@ -205,17 +236,19 @@ def build_kratos_quasistatic_upl_system_2d(
 
     alpha = _named_constant(material.biot_coefficient, "biot_coef")
     invM = _named_constant(material.biot_modulus_inverse, "inv_biot_modulus")
-    dt_c = dt if hasattr(dt, "__dict__") else _named_constant(float(dt), "dt")
-    theta_u_c = theta_u if hasattr(theta_u, "__dict__") else _named_constant(float(theta_u), "theta_u")
-    theta_p_c = theta_p if hasattr(theta_p, "__dict__") else _named_constant(float(theta_p), "theta_p")
+    dt_c = _named_constant(dt, "dt")
+    theta_u_c = _named_constant(theta_u, "theta_u")
+    theta_p_c = _named_constant(theta_p, "theta_p")
+    one = _named_constant(1.0, "upl_one", preserve=False)
+    minus_one = _named_constant(-1.0, "upl_minus_one", preserve=False)
 
-    velocity_coefficient = Constant(1.0) / (theta_u_c * dt_c)
-    dt_pressure_coefficient = Constant(1.0) / (theta_p_c * dt_c)
-    prev_velocity_factor = (Constant(1.0) - theta_u_c) / theta_u_c
-    prev_p_rate_factor = (Constant(1.0) - theta_p_c) / theta_p_c
+    velocity_coefficient = one / (theta_u_c * dt_c)
+    dt_pressure_coefficient = one / (theta_p_c * dt_c)
+    prev_velocity_factor = (one - theta_u_c) / theta_u_c
+    prev_p_rate_factor = (one - theta_p_c) / theta_p_c
 
     stiffness_lhs = inner(effective_stress_linear_2d(u_trial, material), epsilon_2d(u_test)) * dx_measure
-    coupling_lhs = -alpha * p_trial * div(u_test) * dx_measure
+    coupling_lhs = minus_one * alpha * p_trial * div(u_test) * dx_measure
     rate_coupling_lhs = velocity_coefficient * alpha * div(u_trial) * p_test * dx_measure
     storage_lhs = dt_pressure_coefficient * invM * p_trial * p_test * dx_measure
     permeability_lhs = hydraulic_conductivity_form_2d(p_trial, p_test, material) * dx_measure
@@ -229,12 +262,16 @@ def build_kratos_quasistatic_upl_system_2d(
     rhs_form = rate_coupling_rhs + storage_rhs
 
     if body_acceleration is not None:
-        body = body_acceleration if hasattr(body_acceleration, "__dict__") else Constant(body_acceleration)
+        body = _named_constant(body_acceleration, "body_acceleration", preserve=False)
         rho = _named_constant(material.mixture_density, "mixture_density")
         rho_l = _named_constant(material.liquid_density, "liquid_density")
         mu_l = _named_constant(material.dynamic_viscosity_liquid, "dynamic_viscosity_liquid")
-        K_intrinsic = Constant(material.permeability_matrix, dim=2)
-        K_intrinsic._jit_name = "intrinsic_permeability"
+        K_intrinsic = _named_constant(
+            material.permeability_matrix,
+            "intrinsic_permeability",
+            dim=2,
+            preserve=False,
+        )
         rhs_form += inner(rho * body, u_test) * dx_measure
         rhs_form += dot(
             dot(K_intrinsic, grad(p_test)),
@@ -254,6 +291,237 @@ def build_kratos_quasistatic_upl_system_2d(
     )
 
 
+def plane_stress_internal_work_2d(u, v, material: UPlMaterial2D, *, damage=None):
+    """Return plane-stress ``sigma(u):epsilon(v)`` with optional scalar damage.
+
+    ``damage`` is treated as a frozen coefficient. This is the correct
+    Kratos-parity tangent for the Modified Mises nonlocal damage law, where the
+    Poromechanics implementation intentionally uses the secant constitutive
+    tensor in the nonlocal branch.
+    """
+
+    E = _named_constant(material.young_modulus, "plane_stress_young_modulus")
+    nu = _named_constant(material.poisson_ratio, "plane_stress_poisson_ratio")
+    thickness = _named_constant(material.thickness, "plane_stress_thickness")
+    one = _named_constant(1.0, "plane_stress_one", preserve=False)
+    half = _named_constant(0.5, "plane_stress_half", preserve=False)
+    c = E / (one - nu * nu)
+    shear = half * c * (one - nu)
+
+    eps_xx = grad(u)[0, 0]
+    eps_yy = grad(u)[1, 1]
+    gamma_xy = grad(u)[0, 1] + grad(u)[1, 0]
+    test_xx = grad(v)[0, 0]
+    test_yy = grad(v)[1, 1]
+    test_gamma_xy = grad(v)[0, 1] + grad(v)[1, 0]
+
+    sigma_xx = c * (eps_xx + nu * eps_yy)
+    sigma_yy = c * (nu * eps_xx + eps_yy)
+    sigma_xy = shear * gamma_xy
+    work = sigma_xx * test_xx + sigma_yy * test_yy + sigma_xy * test_gamma_xy
+    if damage is None:
+        return thickness * work
+    return thickness * (one - damage) * work
+
+
+def plane_strain_internal_work_2d(u, v, material: UPlMaterial2D, *, damage=None):
+    """Return 2D plane-strain ``sigma(u):epsilon(v)`` with optional damage.
+
+    Kratos' fluid-pumping fracture case uses
+    ``ModifiedMisesNonlocalDamagePlaneStrain2DLaw`` for the bulk.  The damage
+    law is updated outside UFL and the tangent consumes a frozen scalar damage
+    coefficient, so this helper keeps the elastic operator generic and simply
+    scales the plane-strain effective stress by ``(1-d)``.
+    """
+
+    thickness = _named_constant(material.thickness, "plane_strain_thickness")
+    one = _named_constant(1.0, "plane_strain_one", preserve=False)
+    work = inner(effective_stress_linear_2d(u, material), epsilon_2d(v))
+    if damage is None:
+        return thickness * work
+    return thickness * (one - damage) * work
+
+
+def build_kratos_quasistatic_damage_upl_system_2d(
+    *,
+    u_trial,
+    p_trial,
+    u_test,
+    p_test,
+    u_prev,
+    p_prev,
+    material: UPlMaterial2D,
+    damage,
+    dt,
+    theta_u,
+    theta_p,
+    dx_measure,
+    velocity_prev=None,
+    p_rate_prev=None,
+    body_acceleration=None,
+) -> UPlKratosDamageQuasistaticSystem2D:
+    """Build a 2D plane-stress U-Pl system with frozen nonlocal damage.
+
+    This is intended for nonlocal-damage continuation solves. The constitutive
+    state update is performed outside UFL and exposed as a quadrature-state
+    coefficient through ``damage``.
+    """
+
+    alpha = _named_constant(material.biot_coefficient, "biot_coef")
+    invM = _named_constant(material.biot_modulus_inverse, "inv_biot_modulus")
+    dt_c = _named_constant(dt, "dt")
+    theta_u_c = _named_constant(theta_u, "theta_u")
+    theta_p_c = _named_constant(theta_p, "theta_p")
+    one = _named_constant(1.0, "upl_one", preserve=False)
+    minus_one = _named_constant(-1.0, "upl_minus_one", preserve=False)
+
+    velocity_coefficient = one / (theta_u_c * dt_c)
+    dt_pressure_coefficient = one / (theta_p_c * dt_c)
+    prev_velocity_factor = (one - theta_u_c) / theta_u_c
+    prev_p_rate_factor = (one - theta_p_c) / theta_p_c
+
+    stiffness_lhs = plane_stress_internal_work_2d(u_trial, u_test, material, damage=damage) * dx_measure
+    coupling_lhs = minus_one * alpha * p_trial * div(u_test) * dx_measure
+    rate_coupling_lhs = velocity_coefficient * alpha * div(u_trial) * p_test * dx_measure
+    storage_lhs = dt_pressure_coefficient * invM * p_trial * p_test * dx_measure
+    permeability_lhs = hydraulic_conductivity_form_2d(p_trial, p_test, material) * dx_measure
+
+    rate_coupling_rhs = velocity_coefficient * alpha * div(u_prev) * p_test * dx_measure
+    storage_rhs = dt_pressure_coefficient * invM * p_prev * p_test * dx_measure
+    if velocity_prev is not None:
+        rate_coupling_rhs += prev_velocity_factor * alpha * div(velocity_prev) * p_test * dx_measure
+    if p_rate_prev is not None:
+        storage_rhs += prev_p_rate_factor * invM * p_rate_prev * p_test * dx_measure
+    rhs_form = rate_coupling_rhs + storage_rhs
+
+    if body_acceleration is not None:
+        body = _named_constant(body_acceleration, "body_acceleration", preserve=False)
+        rho = _named_constant(material.mixture_density, "mixture_density")
+        rhs_form += inner(rho * body, u_test) * dx_measure
+
+    return UPlKratosDamageQuasistaticSystem2D(
+        lhs_form=stiffness_lhs + coupling_lhs + rate_coupling_lhs + storage_lhs + permeability_lhs,
+        rhs_form=rhs_form,
+        stiffness_lhs=stiffness_lhs,
+        coupling_lhs=coupling_lhs,
+        rate_coupling_lhs=rate_coupling_lhs,
+        storage_lhs=storage_lhs,
+        permeability_lhs=permeability_lhs,
+        rate_coupling_rhs=rate_coupling_rhs,
+        storage_rhs=storage_rhs,
+    )
+
+
+def build_kratos_fic_triangle_damage_upl_system_2d(
+    *,
+    u_trial,
+    p_trial,
+    u_test,
+    p_test,
+    u_prev,
+    p_prev,
+    material: UPlMaterial2D,
+    damage,
+    dt,
+    theta_u,
+    theta_p,
+    dx_measure,
+    element_length_squared,
+    velocity_prev=None,
+    p_rate_prev=None,
+    body_acceleration=None,
+) -> UPlKratosFICQuasistaticSystem2D:
+    """Build Kratos' triangular FIC U-Pl bulk form with frozen bulk damage.
+
+    This is the damage-aware counterpart of
+    :func:`build_kratos_fic_triangle_upl_system_2d`.  It preserves the FIC
+    pressure-gradient stabilization and replaces only the elastic skeleton
+    stiffness by the plane-strain damaged secant stiffness used by the
+    fluid-pumping fracture body law.
+    """
+
+    alpha = _named_constant(material.biot_coefficient, "biot_coef")
+    invM = _named_constant(material.biot_modulus_inverse, "inv_biot_modulus")
+    dt_c = _named_constant(dt, "dt")
+    theta_u_c = _named_constant(theta_u, "theta_u")
+    theta_p_c = _named_constant(theta_p, "theta_p")
+    one = _named_constant(1.0, "upl_one", preserve=False)
+    two = _named_constant(2.0, "fic_two", preserve=False)
+    three = _named_constant(3.0, "fic_three", preserve=False)
+    eight = _named_constant(8.0, "fic_eight", preserve=False)
+    minus_one = _named_constant(-1.0, "upl_minus_one", preserve=False)
+
+    velocity_coefficient = one / (theta_u_c * dt_c)
+    dt_pressure_coefficient = one / (theta_p_c * dt_c)
+    prev_velocity_factor = (one - theta_u_c) / theta_u_c
+    prev_p_rate_factor = (one - theta_p_c) / theta_p_c
+
+    stiffness_lhs = plane_strain_internal_work_2d(u_trial, u_test, material, damage=damage) * dx_measure
+    coupling_lhs = minus_one * alpha * p_trial * div(u_test) * dx_measure
+    rate_coupling_lhs = velocity_coefficient * alpha * div(u_trial) * p_test * dx_measure
+    storage_lhs = dt_pressure_coefficient * invM * p_trial * p_test * dx_measure
+    permeability_lhs = hydraulic_conductivity_form_2d(p_trial, p_test, material) * dx_measure
+
+    rate_coupling_rhs = velocity_coefficient * alpha * div(u_prev) * p_test * dx_measure
+    storage_rhs = dt_pressure_coefficient * invM * p_prev * p_test * dx_measure
+    if velocity_prev is not None:
+        rate_coupling_rhs += prev_velocity_factor * alpha * div(velocity_prev) * p_test * dx_measure
+    if p_rate_prev is not None:
+        storage_rhs += prev_p_rate_factor * invM * p_rate_prev * p_test * dx_measure
+
+    rhs_form = rate_coupling_rhs + storage_rhs
+    if body_acceleration is not None:
+        body = _named_constant(body_acceleration, "body_acceleration", preserve=False)
+        rho = _named_constant(material.mixture_density, "mixture_density")
+        rho_l = _named_constant(material.liquid_density, "liquid_density")
+        mu_l = _named_constant(material.dynamic_viscosity_liquid, "dynamic_viscosity_liquid")
+        K_intrinsic = _named_constant(
+            material.permeability_matrix,
+            "intrinsic_permeability",
+            dim=2,
+            preserve=False,
+        )
+        rhs_form += inner(rho * body, u_test) * dx_measure
+        rhs_form += dot(
+            dot(K_intrinsic, grad(p_test)),
+            (rho_l / mu_l) * body,
+        ) * dx_measure
+
+    base = UPlKratosQuasistaticSystem2D(
+        lhs_form=stiffness_lhs + coupling_lhs + rate_coupling_lhs + storage_lhs + permeability_lhs,
+        rhs_form=rhs_form,
+        stiffness_lhs=stiffness_lhs,
+        coupling_lhs=coupling_lhs,
+        rate_coupling_lhs=rate_coupling_lhs,
+        storage_lhs=storage_lhs,
+        permeability_lhs=permeability_lhs,
+        rate_coupling_rhs=rate_coupling_rhs,
+        storage_rhs=storage_rhs,
+    )
+
+    mu = _named_constant(material.mu, "fic_shear_modulus")
+    h2 = _as_elementwise_or_constant(element_length_squared, name="fic_element_length_squared")
+    tau_pressure = (h2 * alpha / (eight * mu)) * (
+        alpha - (two * mu * invM) / (three * alpha)
+    )
+    pressure_gradient_lhs = (
+        dt_pressure_coefficient * tau_pressure * inner(grad(p_trial), grad(p_test)) * dx_measure
+    )
+    pressure_gradient_rhs = (
+        dt_pressure_coefficient * tau_pressure * inner(grad(p_prev), grad(p_test)) * dx_measure
+    )
+    if p_rate_prev is not None:
+        pressure_gradient_rhs += prev_p_rate_factor * tau_pressure * inner(grad(p_rate_prev), grad(p_test)) * dx_measure
+
+    return UPlKratosFICQuasistaticSystem2D(
+        lhs_form=base.lhs_form + pressure_gradient_lhs,
+        rhs_form=base.rhs_form + pressure_gradient_rhs,
+        base_system=base,
+        pressure_gradient_lhs=pressure_gradient_lhs,
+        pressure_gradient_rhs=pressure_gradient_rhs,
+    )
+
+
 def kratos_fic_triangle_element_length_squared(mesh) -> np.ndarray:
     """Return Kratos' 2D triangular FIC ``ElementLength^2 = 4A/pi`` per cell."""
 
@@ -268,6 +536,8 @@ def kratos_fic_triangle_element_length_squared(mesh) -> np.ndarray:
 
 
 def _as_elementwise_or_constant(value, *, name: str | None = None):
+    if isinstance(value, (Constant, ElementWiseConstant)):
+        return _named_constant(value, name)
     if hasattr(value, "__dict__"):
         return value
     arr = np.asarray(value, dtype=float)
@@ -328,13 +598,17 @@ def build_kratos_fic_triangle_upl_system_2d(
     invM = _named_constant(material.biot_modulus_inverse, "fic_inv_biot_modulus")
     mu = _named_constant(material.mu, "fic_shear_modulus")
     h2 = _as_elementwise_or_constant(element_length_squared, name="fic_element_length_squared")
-    dt_c = dt if hasattr(dt, "__dict__") else _named_constant(float(dt), "fic_dt")
-    theta_p_c = theta_p if hasattr(theta_p, "__dict__") else _named_constant(float(theta_p), "fic_theta_p")
-    dt_pressure_coefficient = Constant(1.0) / (theta_p_c * dt_c)
-    prev_p_rate_factor = (Constant(1.0) - theta_p_c) / theta_p_c
+    dt_c = _named_constant(dt, "fic_dt")
+    theta_p_c = _named_constant(theta_p, "fic_theta_p")
+    one = _named_constant(1.0, "fic_one", preserve=False)
+    two = _named_constant(2.0, "fic_two", preserve=False)
+    three = _named_constant(3.0, "fic_three", preserve=False)
+    eight = _named_constant(8.0, "fic_eight", preserve=False)
+    dt_pressure_coefficient = one / (theta_p_c * dt_c)
+    prev_p_rate_factor = (one - theta_p_c) / theta_p_c
 
-    tau_pressure = (h2 * alpha / (Constant(8.0) * mu)) * (
-        alpha - (Constant(2.0) * mu * invM) / (Constant(3.0) * alpha)
+    tau_pressure = (h2 * alpha / (eight * mu)) * (
+        alpha - (two * mu * invM) / (three * alpha)
     )
 
     pressure_gradient_lhs = (
@@ -364,11 +638,11 @@ def normal_liquid_flux_rhs_2d(p_test, normal_flux, boundary_measure, *, scale=No
     ``+ int_Gamma normal_flux q``.
     """
 
-    flux = normal_flux if hasattr(normal_flux, "__dict__") else Constant(float(normal_flux))
+    flux = _named_constant(normal_flux, "normal_liquid_flux")
     if scale is None:
-        scale_expr = Constant(1.0)
+        scale_expr = _named_constant(1.0, "normal_liquid_flux_scale", preserve=False)
     else:
-        scale_expr = scale if hasattr(scale, "__dict__") else Constant(float(scale))
+        scale_expr = _named_constant(scale, "normal_liquid_flux_scale")
     return scale_expr * flux * p_test * boundary_measure
 
 
@@ -376,7 +650,8 @@ def displacement_neumann_rhs(u_test, traction, boundary_measure, *, scale=None):
     """Boundary work helper matching the consolidation pressure-load sign."""
 
     if scale is None:
-        scale = Constant(1.0)
-    elif not hasattr(scale, "__dict__"):
-        scale = Constant(float(scale))
-    return -scale * dot(traction, u_test) * boundary_measure
+        scale = _named_constant(1.0, "displacement_neumann_scale", preserve=False)
+    else:
+        scale = _named_constant(scale, "displacement_neumann_scale")
+    minus_one = _named_constant(-1.0, "displacement_neumann_minus_one", preserve=False)
+    return minus_one * scale * dot(traction, u_test) * boundary_measure

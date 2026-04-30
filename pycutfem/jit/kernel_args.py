@@ -1204,9 +1204,10 @@ def _build_jit_kernel_args(       # ← signature unchanged
     base_allow = {
         # geometry / meta (unsided)
         "gdofs_map", "node_coords", "element_nodes",
-        "qp_phys", "qref", "qp_ref", "qw", "detJ", "J_inv", "normals", "phis",
-        "eids", "entity_kind",
+        "qp_phys", "qref", "qp_ref", "qw", "qw_ref", "detJ", "J_inv", "normals", "phis",
+        "eids", "entity_kind", "domain", "domain_type",
         "owner_id", "owner_pos_id", "owner_neg_id", "pos_eids", "neg_eids",
+        "qstate_owner_id", "qstate_entity_id",
         "pos_map", "neg_map",
 
         # Hessian-of-inverse-map tensors (volume / boundary / interface)
@@ -1456,13 +1457,23 @@ def _build_jit_kernel_args(       # ← signature unchanged
     def _validate_qstate_layout(qstate: QuadratureStateCoefficient, name: str) -> None:
         if pre_built is None:
             raise ValueError(
-                f"QuadratureStateCoefficient '{name}' requires standard volume precomputed quadrature data."
+                f"QuadratureStateCoefficient '{name}' requires precomputed quadrature data."
             )
         entity_kind = str(pre_built.get("entity_kind", "") or "")
-        if entity_kind and entity_kind != "element":
+        domain = str(pre_built.get("domain") or pre_built.get("domain_type") or "")
+        if domain in {"nonmatching_interface", "trace_link"}:
+            expected_layout = domain
+        elif entity_kind in {"", "element"}:
+            expected_layout = "volume_cell"
+        else:
             raise NotImplementedError(
-                f"QuadratureStateCoefficient '{name}' is only supported on standard volume elements in phase 1; "
-                f"got entity_kind={entity_kind!r}."
+                f"QuadratureStateCoefficient '{name}' is only supported on volume elements "
+                f"nonmatching interfaces, and trace-link domains; got entity_kind={entity_kind!r}, domain={domain!r}."
+            )
+        if str(qstate.layout.entity_kind) != expected_layout:
+            raise ValueError(
+                f"QuadratureStateCoefficient '{name}' layout entity_kind={qstate.layout.entity_kind!r} "
+                f"does not match active quadrature domain {expected_layout!r}."
             )
         qref_raw = _first_present(pre_built, "qp_ref", "qref")
         if qref_raw is None:
@@ -1474,7 +1485,14 @@ def _build_jit_kernel_args(       # ← signature unchanged
             raise NotImplementedError(
                 f"QuadratureStateCoefficient '{name}' is not yet supported with per-element/ragged quadrature."
             )
-        _, ref_weights = volume(mixed_element.mesh.element_type, q_order)
+        ref_weights = _first_present(pre_built, "qw_ref", "reference_weights")
+        if ref_weights is None:
+            if expected_layout != "volume_cell":
+                raise ValueError(
+                    f"QuadratureStateCoefficient '{name}' on {expected_layout!r} requires "
+                    "'qw_ref' or 'reference_weights' in pre_built."
+                )
+            _, ref_weights = volume(mixed_element.mesh.element_type, q_order)
         qstate.layout.validate_against(
             reference_points=ref_points,
             reference_weights=np.asarray(ref_weights, dtype=np.float64),
@@ -1491,25 +1509,37 @@ def _build_jit_kernel_args(       # ← signature unchanged
     total_dofs = dof_handler.total_dofs
 
     for name in sorted(required):
+        if name == "qstate_owner_id":
+            owners = _first_present(args, "qstate_owner_id", "qstate_entity_id", "owner_id", "eids")
+            if owners is None:
+                owners = np.arange(int(n_elem), dtype=np.int32)
+            args["qstate_owner_id"] = np.asarray(owners, dtype=np.int32).reshape(-1)
+            continue
+
         # Always supply global element-length h_arr for CellDiameter
         if name == "h_arr":
             # Kernels index CellDiameter / ElementWiseConstant as h_arr[owner_id[e]].
             #
             # Contract:
             # - By default `h_arr` is a global per-element size array for `mixed_element.mesh`.
-            # - For multi-mesh nonmatching interfaces, assemblers may inject a *custom*
-            #   `owner_id` + `h_arr` pair (with `domain == "nonmatching_interface"`).
+            # - For multi-mesh nonmatching/trace-link interfaces, assemblers may
+            #   inject a *custom* `owner_id` + `h_arr` pair.
             dom = str(args.get("domain") or args.get("domain_type") or "")
-            if dom == "nonmatching_interface" and args.get("h_arr") is not None:
+            if dom in {"nonmatching_interface", "trace_link"} and args.get("h_arr") is not None:
                 harr = np.asarray(args["h_arr"], dtype=np.float64)
                 owners = args.get("owner_id", None)
                 if owners is None:
-                    raise KeyError("nonmatching_interface requires 'owner_id' when requesting 'h_arr'.")
+                    raise KeyError(f"{dom} requires 'owner_id' when requesting 'h_arr'.")
                 owners = np.asarray(owners, dtype=np.int64).ravel()
+                if np.any(owners < 0):
+                    raise ValueError(
+                        f"{dom} cannot evaluate CellDiameter/MeshSize with negative owner ids. "
+                        "Provide valid owner_id values or remove owner-dependent expressions from the trace-link form."
+                    )
                 valid = owners >= 0
                 if np.any(valid) and int(np.max(owners[valid])) >= int(harr.shape[0]):
                     raise ValueError(
-                        "Invalid nonmatching_interface h_arr/owner_id: "
+                        f"Invalid {dom} h_arr/owner_id: "
                         f"max(owner_id)={int(np.max(owners[valid]))} >= len(h_arr)={int(harr.shape[0])}."
                     )
                 args["h_arr"] = harr
@@ -1534,7 +1564,7 @@ def _build_jit_kernel_args(       # ← signature unchanged
                 # tables are already in the expected local layout. Do not treat it as
                 # "ghost" for the owner->union pre-padding path.
                 dom = str(pb.get("domain") or pb.get("domain_type") or "")
-                if dom == "nonmatching_interface":
+                if dom in {"nonmatching_interface", "trace_link"}:
                     return False
                 return any(
                     k == "pos_map"
@@ -1835,10 +1865,22 @@ def _build_jit_kernel_args(       # ← signature unchanged
         elif name in qstate_arrays:
             qstate = qstate_arrays[name]
             _validate_qstate_layout(qstate, name)
-            arr = _expand_subset_to_full(
-                np.asarray(qstate.values, dtype=np.float64),
-                what=f"QuadratureState {name}",
-            )
+            raw = np.asarray(qstate.values, dtype=np.float64)
+            domain = str(args.get("domain") or args.get("domain_type") or "")
+            if domain in {"nonmatching_interface", "trace_link"}:
+                owners = np.asarray(args.get("qstate_owner_id", args.get("qstate_entity_id", [])), dtype=np.int64).ravel()
+                valid = owners >= 0
+                if np.any(valid) and int(np.max(owners[valid])) >= int(raw.shape[0]):
+                    raise ValueError(
+                        f"QuadratureState {name}: max(qstate_owner_id)={int(np.max(owners[valid]))} "
+                        f">= state length {int(raw.shape[0])}."
+                    )
+                arr = raw
+            else:
+                arr = _expand_subset_to_full(
+                    raw,
+                    what=f"QuadratureState {name}",
+                )
             args[name] = np.ascontiguousarray(arr)
 
         # ---- analytic expressions ----------------------------------------

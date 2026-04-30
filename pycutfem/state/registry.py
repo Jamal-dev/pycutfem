@@ -29,11 +29,22 @@ class QuadratureLayout:
         self.cell_type = str(self.cell_type).strip().lower()
         self.quadrature_order = int(self.quadrature_order)
         self.reference_points = np.asarray(self.reference_points, dtype=float)
+        if self.reference_points.ndim == 1:
+            self.reference_points = self.reference_points.reshape(-1, 1)
         self.reference_weights = np.asarray(self.reference_weights, dtype=float).reshape(-1)
-        if self.entity_kind != "volume_cell":
-            raise ValueError(f"Unsupported quadrature entity_kind {self.entity_kind!r}.")
-        if self.reference_points.ndim != 2 or self.reference_points.shape[1] != 2:
-            raise ValueError("reference_points must have shape (n_qp, 2).")
+        if self.entity_kind not in {"volume_cell", "nonmatching_interface", "trace_link"}:
+            raise ValueError(
+                f"Unsupported quadrature entity_kind {self.entity_kind!r}; "
+                "use 'volume_cell', 'nonmatching_interface', or 'trace_link'."
+            )
+        if self.reference_points.ndim != 2:
+            raise ValueError("reference_points must have shape (n_qp, dim).")
+        expected_dim = 2 if self.entity_kind == "volume_cell" else 1
+        if int(self.reference_points.shape[1]) != expected_dim:
+            raise ValueError(
+                f"{self.entity_kind!r} quadrature reference_points must have shape "
+                f"(n_qp, {expected_dim}), got {self.reference_points.shape}."
+            )
         if self.reference_points.shape[0] != self.reference_weights.shape[0]:
             raise ValueError(
                 "reference_points/reference_weights length mismatch: "
