@@ -1,0 +1,20 @@
+name: pycutfem
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - c-compiler
+  - cxx-compiler
+  - eigen
+  - numpy
+  - scipy
+  - sympy
+  - matplotlib
+  - numba
+  - meshio
+  - pybind11
+  - pytest
+  - pip:
+      - legacy-quadpy
+      - -e .

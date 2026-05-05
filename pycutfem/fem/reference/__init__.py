@@ -6,6 +6,8 @@ from functools import lru_cache
 from importlib import import_module
 import numpy as np
 
+from .rt import get_rt_reference
+
 class Ref:
     def __init__(self, shape_lambda, deriv_lambdas):
         self.shape_lambda = shape_lambda
@@ -86,3 +88,12 @@ def get_reference(element_type: str, poly_order: int = 1, max_deriv_order: int =
                 
     return Ref(shape_l, deriv_lambdas)
 
+
+@lru_cache(maxsize=None)
+def get_hdiv_reference(element_type: str, poly_order: int):
+    """
+    Factory for H(div) reference elements.
+
+    Currently supports Raviart–Thomas RT_k on triangles and quads.
+    """
+    return get_rt_reference(str(element_type), int(poly_order))

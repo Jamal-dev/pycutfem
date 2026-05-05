@@ -9,7 +9,7 @@ from pycutfem.fem.mixedelement import MixedElement
 from pycutfem.core.dofhandler import DofHandler
 from pycutfem.ufl.expressions import (
     TrialFunction, TestFunction, grad, dot,
-    Neg, Pos, CellDiameter, Function, VectorFunction
+    Neg, Pos, CellDiameter, Function, VectorFunction, inner
 )
 from pycutfem.ufl.analytic import Analytic
 from pycutfem.ufl.measures import dx
@@ -93,8 +93,8 @@ def solve_cut_volume_only(p: int, nx=16, ny=16):
 
     # bilinear (volume only)
     a = (
-        k_minus*dot(grad(Neg(u_neg)), grad(Neg(v_neg))) * dx_neg +
-        k_plus *dot(grad(Pos(u_pos)), grad(Pos(v_pos))) * dx_pos
+        k_minus*inner(grad(Neg(u_neg)), grad(Neg(v_neg))) * dx_neg +
+        k_plus *inner(grad(Pos(u_pos)), grad(Pos(v_pos))) * dx_pos
     )
 
     # RHS (manufactured loads)

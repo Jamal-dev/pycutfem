@@ -20,7 +20,7 @@ def test_cut_volume_basis_matches_python(monkeypatch, tmp_path):
     from pycutfem.ufl.compilers import FormCompiler
     from pycutfem.ufl.helpers import required_multi_indices
     from pycutfem.jit import compile_backend
-    from pycutfem.ufl.helpers_jit import _build_jit_kernel_args
+    from pycutfem.jit.kernel_args import _build_jit_kernel_args
 
     problem = diag.build_stokes_problem(with_deformation=True)
     dh = problem.dh

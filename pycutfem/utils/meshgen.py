@@ -5,10 +5,23 @@ import numpy as np
 from scipy.spatial import Delaunay
 from pycutfem.io.visualization import visualize_mesh_node_order
 from pycutfem.core.topology import Node
-from typing import List, Tuple, Dict, Optional
-import numba
-from numba.core import types
-from numba.typed import Dict
+from typing import List, Tuple, Optional
+
+# Numba is an optional dependency. In some environments it may be present but
+# unusable (e.g. binary wheels built against an older NumPy). Treat *any* import
+# failure as "numba unavailable" and transparently fall back to pure-Python
+# implementations.
+try:  # pragma: no cover - depends on environment
+    import numba  # type: ignore
+    from numba.core import types  # type: ignore
+    from numba.typed import Dict as NumbaTypedDict  # type: ignore
+
+    HAS_NUMBA = True
+except Exception:  # noqa: PERF203  # pragma: no cover - optional dependency
+    numba = None  # type: ignore[assignment]
+    types = None  # type: ignore[assignment]
+    NumbaTypedDict = None  # type: ignore[assignment]
+    HAS_NUMBA = False
 
 __all__ = ["delaunay_rectangle", "structured_quad", "structured_triangles"]
 
@@ -44,12 +57,46 @@ def _translate_nodes(nodes: List[Node], offset: Tuple[float, float]):
         node.x = coords[i, 0]
         node.y = coords[i, 1]
 
-@numba.jit(nopython=True, cache=True)
-def _translate_coords(coords: np.ndarray, offset: np.ndarray):
-    """Translates all node coordinates by a given offset vector."""
-    coords[:, 0] += offset[0]
-    coords[:, 1] += offset[1]
+
+def _rotate_coords(coords: np.ndarray, *, angle: float, center: Tuple[float, float]):
+    """Rotate coordinates in-place around `center` by `angle` (radians)."""
+    ang = float(angle)
+    if coords.size == 0 or abs(ang) <= 0.0:
+        return coords
+    cx, cy = float(center[0]), float(center[1])
+    c = float(np.cos(ang))
+    s = float(np.sin(ang))
+    x = coords[:, 0] - cx
+    y = coords[:, 1] - cy
+    coords[:, 0] = cx + c * x - s * y
+    coords[:, 1] = cy + s * x + c * y
     return coords
+
+
+def _rotate_nodes(nodes: List[Node], *, angle: float, center: Tuple[float, float]):
+    """Rotate Node objects in-place around `center` by `angle` (radians)."""
+    if not nodes or abs(float(angle)) <= 0.0:
+        return
+    coords = np.array([[node.x, node.y] for node in nodes], dtype=float)
+    _rotate_coords(coords, angle=float(angle), center=center)
+    for i, node in enumerate(nodes):
+        node.x = float(coords[i, 0])
+        node.y = float(coords[i, 1])
+
+if HAS_NUMBA:
+    @numba.jit(nopython=True, cache=True)  # type: ignore[misc]
+    def _translate_coords(coords: np.ndarray, offset: np.ndarray):
+        """Translates all node coordinates by a given offset vector."""
+        coords[:, 0] += offset[0]
+        coords[:, 1] += offset[1]
+        return coords
+else:
+    def _translate_coords(coords: np.ndarray, offset: np.ndarray):
+        coords = np.asarray(coords, dtype=float)
+        off = np.asarray(offset, dtype=float).reshape((2,))
+        coords[:, 0] += off[0]
+        coords[:, 1] += off[1]
+        return coords
 
 # Python implementations for fallback
 def py_unique_rows(a):
@@ -65,42 +112,53 @@ def py_unique_rows(a):
             unique_list.append(a[i])
     return np.array(unique_list, dtype=a.dtype)
 
-unituple_int64_2 = types.UniTuple(types.int64, 2)
+if HAS_NUMBA:
+    unituple_int64_2 = types.UniTuple(types.int64, 2)  # type: ignore[union-attr]
 
-@numba.jit(nopython=True, cache=True)
-def unique_rows_int64_impl(a):
-    if a.shape[0] == 0:
-        return np.empty((0, 2), dtype=np.int64)
-    
-    seen_dict = Dict.empty(
-        key_type=unituple_int64_2,
-        value_type=types.boolean
-    )
-    
-    unique_list = []
-    for i in range(a.shape[0]):
-        row_tuple = (a[i, 0], a[i, 1])
-        if row_tuple not in seen_dict:
-            seen_dict[row_tuple] = True
-            unique_list.append(row_tuple)
-            
-    res = np.empty((len(unique_list), 2), dtype=np.int64)
-    for i in range(len(unique_list)):
-        res[i, 0] = unique_list[i][0]
-        res[i, 1] = unique_list[i][1]
-    return res
+    @numba.jit(nopython=True, cache=True)  # type: ignore[misc]
+    def unique_rows_int64_impl(a):
+        if a.shape[0] == 0:
+            return np.empty((0, 2), dtype=np.int64)
 
-unique_rows_int64 = unique_rows_int64_impl
+        seen_dict = NumbaTypedDict.empty(  # type: ignore[union-attr]
+            key_type=unituple_int64_2,
+            value_type=types.boolean,  # type: ignore[union-attr]
+        )
+
+        unique_list = []
+        for i in range(a.shape[0]):
+            row_tuple = (a[i, 0], a[i, 1])
+            if row_tuple not in seen_dict:
+                seen_dict[row_tuple] = True
+                unique_list.append(row_tuple)
+
+        res = np.empty((len(unique_list), 2), dtype=np.int64)
+        for i in range(len(unique_list)):
+            res[i, 0] = unique_list[i][0]
+            res[i, 1] = unique_list[i][1]
+        return res
+
+    unique_rows_int64 = unique_rows_int64_impl
+else:
+    unique_rows_int64 = py_unique_rows
 
 def structured_quad(Lx: float, Ly: float, *, nx: int, ny: int, poly_order: int, 
-                    offset: Optional[Tuple[float, float]] = None,numba_path=True, parallel: bool = True):
+                    offset: Optional[Tuple[float, float]] = None,
+                    rotation: Optional[float] = None,
+                    rotation_center: Optional[Tuple[float, float]] = None,
+                    numba_path=True, parallel: bool = True):
     """
     Main wrapper for generating structured quadrilateral meshes.
     Returns raw data: node objects, element connectivity, edge connectivity,
     and corner node connectivity for each element.
     """
-    if not numba_path:
-        return _structured_qn(Lx, Ly, nx, ny, poly_order, offset)
+    use_numba = bool(numba_path) and bool(HAS_NUMBA)
+    if not use_numba:
+        nodes, elements, edges, elements_corner_nodes = _structured_qn(Lx, Ly, nx, ny, poly_order, offset)
+        if rotation is not None:
+            center = rotation_center if rotation_center is not None else (0.0, 0.0)
+            _rotate_nodes(nodes, angle=float(rotation), center=center)
+        return nodes, elements, edges, elements_corner_nodes
     else:
         # 1. Call the fast Numba core to get raw NumPy arrays
         nodes_coords, elements, edges, elements_corner_nodes = _structured_qn_numba(
@@ -108,6 +166,9 @@ def structured_quad(Lx: float, Ly: float, *, nx: int, ny: int, poly_order: int,
         )
         if offset is not None:
             nodes_coords = _translate_coords(nodes_coords, np.array(offset, dtype=np.float64))
+        if rotation is not None:
+            center = rotation_center if rotation_center is not None else (0.0, 0.0)
+            nodes_coords = _rotate_coords(nodes_coords, angle=float(rotation), center=center)
 
         # 2. Convert the raw coordinate array back to a list of Node objects
         # This loop is fast and runs in standard Python.
@@ -119,80 +180,84 @@ def structured_quad(Lx: float, Ly: float, *, nx: int, ny: int, poly_order: int,
         # 3. Return the Node objects and other connectivity data
         return node_objects, elements, edges, elements_corner_nodes
 
-@numba.jit(nopython=True, parallel=True, cache=True)
-def _structured_qn_numba(
-    Lx: float, Ly: float, nx: int, ny: int, order: int, parallel: bool
-):
-    """
-    Generates raw data for a structured Qn quadrilateral mesh using Numba.
-    """
-    if order < 1:
-        # Numba doesn't support raising ValueError with strings, so error is minimal.
-        raise ValueError("Polynomial order must be a positive integer.")
+if HAS_NUMBA:
+    @numba.jit(nopython=True, parallel=True, cache=True)  # type: ignore[misc]
+    def _structured_qn_numba(
+        Lx: float, Ly: float, nx: int, ny: int, order: int, parallel: bool
+    ):
+        """
+        Generates raw data for a structured Qn quadrilateral mesh using Numba.
+        """
+        if order < 1:
+            # Numba doesn't support raising ValueError with strings, so error is minimal.
+            raise ValueError("Polynomial order must be a positive integer.")
 
-    # --- 1. Generate Node Coordinates ---
-    num_global_nodes_x = order * nx + 1
-    num_global_nodes_y = order * ny + 1
-    num_total_nodes = num_global_nodes_x * num_global_nodes_y
-    nodes_coords = np.zeros((num_total_nodes, 2), dtype=np.float64)
-    
-    x_coords = np.linspace(0, Lx, num_global_nodes_x)
-    y_coords = np.linspace(0, Ly, num_global_nodes_y)
+        # --- 1. Generate Node Coordinates ---
+        num_global_nodes_x = order * nx + 1
+        num_global_nodes_y = order * ny + 1
+        num_total_nodes = num_global_nodes_x * num_global_nodes_y
+        nodes_coords = np.zeros((num_total_nodes, 2), dtype=np.float64)
 
-    # Numba can parallelize this loop efficiently
-    for j_glob in numba.prange(num_global_nodes_y) if parallel else range(num_global_nodes_y):
-        for i_glob in range(num_global_nodes_x):
-            node_id = j_glob * num_global_nodes_x + i_glob
-            nodes_coords[node_id, 0] = x_coords[i_glob]
-            nodes_coords[node_id, 1] = y_coords[j_glob]
+        x_coords = np.linspace(0, Lx, num_global_nodes_x)
+        y_coords = np.linspace(0, Ly, num_global_nodes_y)
 
-    # --- 2. Generate Element and Edge Connectivity ---
-    num_elements = nx * ny
-    nodes_per_edge_1d = order + 1
-    elements = np.empty((num_elements, nodes_per_edge_1d**2), dtype=np.int64)
-    elements_corner_nodes = np.empty((num_elements, 4), dtype=np.int64)
-    # A set() is not supported in nopython mode, so we collect all edges
-    # and find the unique ones later using numpy.
-    all_edges = np.empty((num_elements * 4, 2), dtype=np.int64)
+        # Numba can parallelize this loop efficiently
+        for j_glob in numba.prange(num_global_nodes_y) if parallel else range(num_global_nodes_y):
+            for i_glob in range(num_global_nodes_x):
+                node_id = j_glob * num_global_nodes_x + i_glob
+                nodes_coords[node_id, 0] = x_coords[i_glob]
+                nodes_coords[node_id, 1] = y_coords[j_glob]
 
-    # This loop is also safe to parallelize
-    for el_idx in numba.prange(num_elements) if parallel else range(num_elements):
-        el_j = el_idx // nx
-        el_i = el_idx % nx
-        
-        start_ix, start_iy = order * el_i, order * el_j
-        
-        # A. Build Full Element Connectivity
-        local_node_idx = 0
-        for local_ny in range(nodes_per_edge_1d):
-            for local_nx in range(nodes_per_edge_1d):
-                gid = (start_iy + local_ny) * num_global_nodes_x + (start_ix + local_nx)
-                elements[el_idx, local_node_idx] = gid
-                local_node_idx += 1
-        
-        # B. Identify and store corners for this element (CCW order)
-        bl_gid = start_iy * num_global_nodes_x + start_ix
-        br_gid = start_iy * num_global_nodes_x + (start_ix + order)
-        tl_gid = (start_iy + order) * num_global_nodes_x + start_ix
-        tr_gid = (start_iy + order) * num_global_nodes_x + (start_ix + order)
-        corners = np.array([bl_gid, br_gid, tr_gid, tl_gid])
-        elements_corner_nodes[el_idx, :] = corners
-        
-        # C. Store all geometric edges for later unique filtering
-        edge_offset = el_idx * 4
-        all_edges[edge_offset, :] = np.sort(np.array([corners[0], corners[1]]))
-        all_edges[edge_offset + 1, :] = np.sort(np.array([corners[1], corners[2]]))
-        all_edges[edge_offset + 2, :] = np.sort(np.array([corners[2], corners[3]]))
-        all_edges[edge_offset + 3, :] = np.sort(np.array([corners[3], corners[0]]))
+        # --- 2. Generate Element and Edge Connectivity ---
+        num_elements = nx * ny
+        nodes_per_edge_1d = order + 1
+        elements = np.empty((num_elements, nodes_per_edge_1d**2), dtype=np.int64)
+        elements_corner_nodes = np.empty((num_elements, 4), dtype=np.int64)
+        # A set() is not supported in nopython mode, so we collect all edges
+        # and find the unique ones later using numpy.
+        all_edges = np.empty((num_elements * 4, 2), dtype=np.int64)
 
-    # --- 3. Filter for Unique Edges (serial operation) ---
-    # This is a standard method to find unique rows in a NumPy array.
-    if num_elements > 0:
-        edges = unique_rows_int64(all_edges)
-    else:
-        edges = np.empty((0, 2), dtype=np.int64)
+        # This loop is also safe to parallelize
+        for el_idx in numba.prange(num_elements) if parallel else range(num_elements):
+            el_j = el_idx // nx
+            el_i = el_idx % nx
 
-    return nodes_coords, elements, edges, elements_corner_nodes
+            start_ix, start_iy = order * el_i, order * el_j
+
+            # A. Build Full Element Connectivity
+            local_node_idx = 0
+            for local_ny in range(nodes_per_edge_1d):
+                for local_nx in range(nodes_per_edge_1d):
+                    gid = (start_iy + local_ny) * num_global_nodes_x + (start_ix + local_nx)
+                    elements[el_idx, local_node_idx] = gid
+                    local_node_idx += 1
+
+            # B. Identify and store corners for this element (CCW order)
+            bl_gid = start_iy * num_global_nodes_x + start_ix
+            br_gid = start_iy * num_global_nodes_x + (start_ix + order)
+            tl_gid = (start_iy + order) * num_global_nodes_x + start_ix
+            tr_gid = (start_iy + order) * num_global_nodes_x + (start_ix + order)
+            corners = np.array([bl_gid, br_gid, tr_gid, tl_gid])
+            elements_corner_nodes[el_idx, :] = corners
+
+            # C. Store all geometric edges for later unique filtering
+            edge_offset = el_idx * 4
+            all_edges[edge_offset, :] = np.sort(np.array([corners[0], corners[1]]))
+            all_edges[edge_offset + 1, :] = np.sort(np.array([corners[1], corners[2]]))
+            all_edges[edge_offset + 2, :] = np.sort(np.array([corners[2], corners[3]]))
+            all_edges[edge_offset + 3, :] = np.sort(np.array([corners[3], corners[0]]))
+
+        # --- 3. Filter for Unique Edges (serial operation) ---
+        # This is a standard method to find unique rows in a NumPy array.
+        if num_elements > 0:
+            edges = unique_rows_int64(all_edges)
+        else:
+            edges = np.empty((0, 2), dtype=np.int64)
+
+        return nodes_coords, elements, edges, elements_corner_nodes
+else:
+    def _structured_qn_numba(*args, **kwargs):  # pragma: no cover
+        raise RuntimeError("Numba is not available; call structured_quad(numba_path=False) or install a working numba.")
 
 def _structured_qn(Lx: float, Ly: float, nx: int, ny: int, order: int, 
                    offset: Optional[Tuple[float, float]] = None) -> Tuple[List[Node], np.ndarray, np.ndarray, np.ndarray]:

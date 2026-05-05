@@ -13,7 +13,6 @@ import re
 
 
 
-from matplotlib.pylab import f
 import numpy as np
 import scipy.sparse as sp
 from typing import Dict, List, Any, Tuple, Iterable, Mapping, Union
@@ -42,32 +41,50 @@ from pycutfem.integration.cut_integration import CutIntegration
 from pycutfem.ufl.expressions import (
     Constant,    TestFunction,   TrialFunction,
     VectorTestFunction, VectorTrialFunction,
+    HdivTestFunction, HdivTrialFunction,
+    HdivFunction,
+    HdivFunctionComponent, HdivTrialFunctionComponent, HdivTestFunctionComponent,
     Function,    VectorFunction,
-    Grad, DivOperation, Inner, Dot,
+    Grad, DivOperation, Inner, Dot, Outer,
     Sum, Sub, Prod, Pos, Neg,Div, Jump, FacetNormal,
+    Avg,
     ElementWiseConstant, Derivative, Transpose,
-    CellDiameter, NormalComponent,
-    Restriction, Power, Trace, Hessian, Laplacian
+    CellDiameter, MeshSize, NormalComponent,
+    Restriction, Power, Trace, Determinant, Inverse, Hessian, Laplacian,
+    Identity, Cofactor, PositivePart, Heaviside, Log, Exp, Tanh,
+    Sin, Cos, Tan, Asin, Acos, Atan, Sinh, Cosh, Asinh, Acosh, Atanh
 )
-from pycutfem.ufl.forms import Equation
+from pycutfem.ufl.forms import CondensedQuadratureLocalSystem, Equation
 from pycutfem.ufl.measures import Integral
 from pycutfem.ufl.quadrature import PolynomialDegreeEstimator
-from pycutfem.ufl.helpers import (VecOpInfo, GradOpInfo, HessOpInfo, 
+from pycutfem.ufl.helpers import (VecOpInfo, GradOpInfo, HessOpInfo, _collapsed_function, _collapsed_grad, lhs_num,
                                   required_multi_indices,
                                   _all_fields,_find_all,
                                   _trial_test, 
                                   phys_scalar_third_row, 
                                   phys_scalar_fourth_row,
                                   _as_indices,
+                                  _apply_storage_transform_opinfo,
                                   HelpersFieldAware as _hfa,
                                   HelpersAlignCoefficents as _hac,
                                   normalize_edge_ids,
                                   normalize_elem_ids)
 from pycutfem.ufl.analytic import Analytic
-from pycutfem.ufl.helpers_jit import  _build_jit_kernel_args, _scatter_element_contribs, _stack_ragged
+from pycutfem.jit.kernel_args import  _build_jit_kernel_args, _scatter_element_contribs, _stack_ragged
+from pycutfem.jit import (
+    _FusedIntegralGroup,
+    _active_field_order,
+    _active_columns,
+    _compress_static_for_active,
+    _plan_equation_assembly,
+    _plan_integral_execution_units,
+)
+from pycutfem.state.coefficient import QuadratureStateCoefficient
+from pycutfem.ufl.condensed_backend import condense_local_system
 from pycutfem.ufl.helpers_geom import (
     phi_eval, clip_triangle_to_side, fan_triangulate, map_ref_tri_to_phys, corner_tris
 )
+from pycutfem.ufl.tensor_algebra import DotKernelCase, OperationKind, TensorRuleEngine
 from contextlib import contextmanager
 from pycutfem.core.sideconvention import SIDE
 import os
@@ -78,6 +95,38 @@ import os
 
 logger = logging.getLogger(__name__)
 _INTERFACE_TOL = SIDE.tol
+
+
+@dataclass(frozen=True)
+class LocalAssemblyBatch:
+    K_elem: np.ndarray | None
+    F_elem: np.ndarray | None
+    element_ids: np.ndarray
+    gdofs_map: np.ndarray
+    entity_kind: str = "element"
+
+
+LocalVolumeAssemblyBatch = LocalAssemblyBatch
+
+
+@dataclass(frozen=True)
+class LocalQuadratureExpressionBatch:
+    values: np.ndarray
+    element_ids: np.ndarray
+    gdofs_map: np.ndarray | None
+    mode: str
+
+
+def _is_scalar_zero_constant(expr) -> bool:
+    """Return True only for exact scalar Constant(0.0)-style literals."""
+    if not isinstance(expr, Constant):
+        return False
+    if int(getattr(expr, "dim", 0)) != 0:
+        return False
+    try:
+        return float(expr.value) == 0.0
+    except Exception:
+        return False
 
 def interface_normal_for_edge(mesh, e, level_set):
     # mid-point on the physical edge
@@ -133,37 +182,82 @@ class FormCompiler:
         self._coeff_cache: Dict[tuple, np.ndarray] = {}
         self._collapsed_cache: Dict[tuple, np.ndarray] = {}
         self._basis_cache: Dict[str, Dict[str, np.ndarray]] = {}
+        self._volume_jit_kernel_cache: Dict[tuple, tuple[Any, dict[str, Any], dict[str, Any], np.ndarray]] = {}
         self.degree_estimator = PolynomialDegreeEstimator(dh)
         self.backend = backend
-        if self.backend == "jit":
-            from pycutfem.jit import compile_backend
-            self._compile_backend = compile_backend
+        self._jit_backend = None
+        if self.backend == "python":
+            self._compile_backend = None
+        elif self.backend in {"jit", "cpp", "c++"}:
+            if self.backend in {"cpp", "c++"}:
+                from pycutfem.jit.cpp_backend import compile_backend_cpp
+                self._compile_backend = compile_backend_cpp
+                self._jit_backend = "cpp"
+            else:
+                from pycutfem.jit import compile_backend
+                self._compile_backend = compile_backend
+                self._jit_backend = "jit"
+        else:
+            raise ValueError(f"Unsupported backend: {self.backend}. Use 'python', 'jit', or 'cpp'.")
+        # Cache: which level set the mesh is currently classified against.
+        # Some CutFEM assemblers (interface/ghost) rely on mesh tags and interface segments.
+        self._mesh_ls_key = None
+        self._mesh_ls_has_segments = False
         self._dispatch = {
             Constant: self._visit_Constant, 
             TestFunction: self._visit_TestFunction,
             TrialFunction: self._visit_TrialFunction, 
             VectorTestFunction: self._visit_VectorTestFunction,
             VectorTrialFunction: self._visit_VectorTrialFunction, 
+            HdivTestFunction: self._visit_HdivTestFunction,
+            HdivTrialFunction: self._visit_HdivTrialFunction,
+            HdivFunction: self._visit_HdivFunction,
+            HdivTestFunctionComponent: self._visit_HdivTestFunctionComponent,
+            HdivTrialFunctionComponent: self._visit_HdivTrialFunctionComponent,
+            HdivFunctionComponent: self._visit_HdivFunctionComponent,
             Function: self._visit_Function,
             VectorFunction: self._visit_VectorFunction, 
             Grad: self._visit_Grad,
             DivOperation: self._visit_DivOperation, Sum: self._visit_Sum,
             Sub: self._visit_Sub, Prod: self._visit_Prod, Dot: self._visit_Dot,
-            Inner: self._visit_Inner, Pos: self._visit_Pos, Neg: self._visit_Neg,
+            Inner: self._visit_Inner, Outer: self._visit_Outer, Pos: self._visit_Pos, Neg: self._visit_Neg,
+            Avg: self._visit_Avg,
             Div: self._visit_Div,
             Analytic: self._visit_Analytic,
             FacetNormal: self._visit_FacetNormal,
             ElementWiseConstant: self._visit_EWC,
+            QuadratureStateCoefficient: self._visit_QSC,
             Jump: self._visit_Jump,
             Derivative        : self._visit_Derivative,
             Transpose: self._visit_Transpose,
             CellDiameter: self._visit_CellDiameter,
+            MeshSize: self._visit_MeshSize,
             NormalComponent: self._visit_NormalComponent,
             Restriction: self._visit_Restriction,
             Power: self._visit_Power,
             Trace: self._visit_Trace,
+            Determinant: self._visit_Determinant,
+            Inverse: self._visit_Inverse,
+            Cofactor: self._visit_Cofactor,
             Hessian: self._visit_Hessian,
-            Laplacian: self._visit_Laplacian
+            Laplacian: self._visit_Laplacian,
+            Identity: self._visit_Identity,
+            PositivePart: self._visit_PositivePart,
+            Heaviside: self._visit_Heaviside,
+            Log: self._visit_Log,
+            Exp: self._visit_Exp,
+            Tanh: self._visit_Tanh,
+            Sin: self._visit_Sin,
+            Cos: self._visit_Cos,
+            Tan: self._visit_Tan,
+            Asin: self._visit_Asin,
+            Acos: self._visit_Acos,
+            Atan: self._visit_Atan,
+            Sinh: self._visit_Sinh,
+            Cosh: self._visit_Cosh,
+            Asinh: self._visit_Asinh,
+            Acosh: self._visit_Acosh,
+            Atanh: self._visit_Atanh,
         }
     
     @contextmanager
@@ -177,6 +271,39 @@ class FormCompiler:
                 self.ctx.pop(key, None)
             else:
                 self.ctx[key] = old
+
+    def _is_jit_backend(self) -> bool:
+        return self.backend in {"jit", "cpp", "c++"}
+
+    def _ensure_mesh_classified(self, level_set, *, need_interface_segments: bool) -> None:
+        """
+        Ensure the mesh is classified against `level_set`.
+
+        Notes
+        -----
+        - Cut-volume assemblers classify on-the-fly, but interface/ghost assemblers
+          require `mesh.elements_list[*].tag`, edge tags/bitsets, and (for dInterface)
+          `element.interface_segments` to match the current level set.
+        - Boundary edge tags are preserved by `mesh.classify_edges(...)`.
+        """
+        if level_set is None:
+            return
+        mesh = self.me.mesh
+        tol = float(getattr(SIDE, "tol", 0.0))
+        tok = getattr(level_set, "cache_token", None)
+        key = ("token", tok, tol) if tok is not None else ("objid", int(id(level_set)), tol)
+
+        # Volume cut assemblers can re-classify the mesh without going through this
+        # helper. Use mesh-owned markers (when available) to avoid stale caching.
+        if getattr(mesh, "_ls_elements_key", None) != key:
+            mesh.classify_elements(level_set, tol=tol)
+        if getattr(mesh, "_ls_edges_key", None) != key:
+            mesh.classify_edges(level_set, tol=tol)
+        if need_interface_segments and getattr(mesh, "_ls_segments_key", None) != key:
+            mesh.build_interface_segments(level_set, tol=tol)
+
+        self._mesh_ls_key = key
+        self._mesh_ls_has_segments = bool(need_interface_segments)
     # --------------------- OpInfo meta helpers ---------------------
     def _op_meta_from_ctx(self, node, field_names):
         """Build consistent metadata for VecOpInfo/GradOpInfo from ctx + node."""
@@ -220,31 +347,2313 @@ class FormCompiler:
 
 
     # ============================ PUBLIC API ===============================
-    def assemble(self, eq: Equation, bcs: Union[Mapping, Iterable, None] = None):
+    def assemble(
+        self,
+        eq: Equation,
+        bcs: Union[Mapping, Iterable, None] = None,
+        *,
+        need_matrix: bool = True,
+        need_vector: bool = True,
+    ):
+        # Coefficients may change between assembly calls (e.g., FD checks); reset caches.
+        self._basis_cache.clear()
+        self._coeff_cache.clear()
+        self._collapsed_cache.clear()
         ndofs = self.dh.total_dofs
-        K = sp.lil_matrix((ndofs, ndofs))
+        p_geo = int(getattr(self.me.mesh, "poly_order", 1))
+        plan = _plan_equation_assembly(
+            eq,
+            compiler=self,
+            p_geo=p_geo,
+            backend=self.backend,
+            need_matrix=bool(need_matrix),
+            need_vector=bool(need_vector),
+            vector_first=True,
+        )
+        K = sp.lil_matrix((ndofs, ndofs)) if bool(need_matrix) else None
         F = np.zeros(ndofs)
 
-        # Assemble LHS if it is provided.
-        if eq.a is not None and not (isinstance(eq.a, (int, float)) or eq.a != 0.0):
-            logger.info("Assembling LHS...")
-            self.ctx["rhs"] = False
-            self._assemble_form(eq.a, K)
+        for stage in plan.stages:
+            if stage.target == "vector":
+                logger.info("Assembling RHS vector F...")
+                self._assemble_integral_units(stage.units, F, rhs=True)
+                continue
+            if stage.target == "matrix":
+                if K is None:
+                    raise RuntimeError("Equation assembly plan requested a matrix stage without a matrix target.")
+                logger.info("Assembling LHS...")
+                self._assemble_integral_units(stage.units, K, rhs=False)
+                continue
+            raise RuntimeError(f"Unknown equation assembly stage target {stage.target!r}.")
 
-        # Assemble RHS if it is provided.
-        if eq.L is not None and not (isinstance(eq.L, (int, float)) or eq.L != 0.0):
-            logger.info("Assembling RHS vector F...")
-            self.ctx["rhs"] = True
-            self._assemble_form(eq.L, F)
-        
-        # --- THE FIX ---
-        # Apply boundary conditions AFTER both LHS and RHS have been assembled.
-        # This block is now outside of the `if eq.L` check.
-        logger.info("Applying Dirichlet boundary conditions...")
-        self._apply_bcs(K, F, bcs)
+        if bcs:
+            if K is None:
+                raise ValueError(
+                    "Dirichlet BC application in FormCompiler.assemble requires need_matrix=True."
+                )
+            logger.info("Applying Dirichlet boundary conditions...")
+            K = self._apply_bcs(K, F, bcs)
 
         logger.info("Assembly complete.")
-        return K.tocsr(), F
+        if K is None:
+            return None, F
+        try:
+            K_csr = K.tocsr()
+        except ValueError:
+            if not sp.isspmatrix_lil(K):
+                raise
+            rows: list[int] = []
+            cols: list[int] = []
+            data: list[float] = []
+            for row_id, (row_cols_raw, row_vals_raw) in enumerate(zip(K.rows, K.data)):
+                row_cols = np.atleast_1d(np.asarray(row_cols_raw, dtype=int)).reshape(-1)
+                row_vals = np.atleast_1d(np.asarray(row_vals_raw, dtype=float)).reshape(-1)
+                if row_cols.size == 0:
+                    continue
+                if row_vals.size == 1 and row_cols.size > 1:
+                    row_vals = np.full(int(row_cols.size), float(row_vals[0]), dtype=float)
+                if row_cols.size != row_vals.size:
+                    raise ValueError(
+                        f"Malformed LIL row {row_id}: column/value size mismatch "
+                        f"({row_cols.size} vs {row_vals.size})."
+                    )
+                rows.extend([int(row_id)] * int(row_cols.size))
+                cols.extend(int(col_id) for col_id in row_cols.tolist())
+                data.extend(float(val) for val in row_vals.tolist())
+            K_csr = sp.csr_matrix(
+                (
+                    np.asarray(data, dtype=float),
+                    (np.asarray(rows, dtype=int), np.asarray(cols, dtype=int)),
+                ),
+                shape=K.shape,
+            )
+        return K_csr, F
+
+    def _populate_volume_basis_cache(
+        self,
+        *,
+        fields: list[str],
+        eid: int,
+        xi: float,
+        eta: float,
+        J_inv: np.ndarray,
+    ) -> None:
+        """Populate standard volume basis/gradient caches for one element quadrature point."""
+        self._basis_cache.clear()
+        for f in fields:
+            fam = getattr(self.me, "_field_families", {}).get(f, "Lagrange")
+            if fam == "RT":
+                # H(div): vector basis values + divergence basis (both union-sized).
+                V = np.asarray(
+                    self.me.tabulate_value(f, float(xi), float(eta), element_id=int(eid)),
+                    dtype=float,
+                )
+                G = np.asarray(
+                    self.me.tabulate_grad(f, float(xi), float(eta), element_id=int(eid)),
+                    dtype=float,
+                )
+                H = np.asarray(
+                    self.me.tabulate_hessian(f, float(xi), float(eta), element_id=int(eid)),
+                    dtype=float,
+                )
+                divV = np.asarray(
+                    self.me.tabulate_div(f, float(xi), float(eta), element_id=int(eid)),
+                    dtype=float,
+                ).ravel()
+                sgn = np.asarray(self.dh.element_signs[f][int(eid)], dtype=float).ravel()
+                if sgn.shape[0] != V.shape[0]:
+                    raise RuntimeError(
+                        f"element_signs length mismatch for RT field '{f}' on element {eid}."
+                    )
+                V = sgn[:, None] * V
+                G = sgn[:, None, None] * G
+                H = sgn[:, None, None, None] * H
+                divV = sgn * divV
+
+                n_union = int(self.me.n_dofs_local)
+                sl = self.me.component_dof_slices[f]
+                hdiv_val = np.zeros((2, n_union), dtype=float)
+                hdiv_grad = np.zeros((2, n_union, 2), dtype=float)
+                hdiv_hess = np.zeros((2, n_union, 2, 2), dtype=float)
+                hdiv_val[:, sl] = V.T
+                hdiv_grad[:, sl, :] = np.transpose(G, (1, 0, 2))
+                hdiv_hess[:, sl, :, :] = np.transpose(H, (1, 0, 2, 3))
+                hdiv_div = np.zeros((n_union,), dtype=float)
+                hdiv_div[sl] = divV
+                self._basis_cache[f] = {
+                    "hdiv_val": hdiv_val,
+                    "hdiv_grad": hdiv_grad,
+                    "hdiv_hess": hdiv_hess,
+                    "hdiv_div": hdiv_div,
+                }
+                continue
+
+            self._basis_cache[f] = {
+                "val": self.me.basis(f, xi, eta),
+                "grad": self.me.grad_basis(f, xi, eta) @ J_inv,
+            }
+
+    @staticmethod
+    def _normalize_quadrature_expression_value(value, *, expected_shape: tuple[int, ...], expr_name: str):
+        data = getattr(value, "data", value)
+        arr = np.asarray(data, dtype=float)
+        if expected_shape == ():
+            flat = arr.reshape(-1)
+            if flat.size != 1:
+                raise ValueError(
+                    f"Quadrature evaluation for '{expr_name}' expected a scalar, got shape {arr.shape}."
+                )
+            return float(flat[0])
+        try:
+            return np.asarray(arr, dtype=float).reshape(expected_shape)
+        except ValueError as exc:
+            raise ValueError(
+                f"Quadrature evaluation for '{expr_name}' expected shape {expected_shape}, got {arr.shape}."
+            ) from exc
+
+    @staticmethod
+    def _normalize_compiled_scalar_quadrature_values(values, *, n_elem: int, expr_name: str) -> np.ndarray:
+        arr = np.asarray(values, dtype=float)
+        if arr.shape == (int(n_elem),):
+            return np.ascontiguousarray(arr)
+        if arr.shape == (int(n_elem), 1):
+            return np.ascontiguousarray(arr[:, 0])
+        if arr.ndim == 0 and int(n_elem) == 1:
+            return np.asarray([float(arr)], dtype=float)
+        try:
+            flat = np.asarray(arr, dtype=float).reshape(int(n_elem), -1)
+        except ValueError as exc:
+            raise ValueError(
+                f"Compiled quadrature evaluation for '{expr_name}' returned shape {arr.shape}, "
+                f"expected ({int(n_elem)},) or ({int(n_elem)}, 1)."
+            ) from exc
+        if flat.shape[1] == 1:
+            return np.ascontiguousarray(flat[:, 0])
+        raise ValueError(
+            f"Compiled quadrature evaluation for '{expr_name}' returned shape {arr.shape}, "
+            f"expected a scalar functional per element."
+        )
+
+    @staticmethod
+    def _normalize_local_quadrature_expression_value(value, *, expr_name: str) -> tuple[np.ndarray, str]:
+        data = getattr(value, "data", value)
+        arr = np.asarray(data, dtype=float)
+        if arr.ndim == 0:
+            return np.asarray(float(arr), dtype=float), "scalar"
+        if arr.ndim == 1:
+            return np.asarray(arr, dtype=float), "vector"
+        if arr.ndim == 2:
+            if 1 in arr.shape:
+                return np.asarray(arr.reshape(max(arr.shape)), dtype=float), "vector"
+            return np.asarray(arr, dtype=float), "matrix"
+        raise ValueError(
+            f"Local quadrature evaluation for '{expr_name}' produced unsupported rank-{arr.ndim} data with shape {arr.shape}."
+        )
+
+    def _volume_physical_quadrature_weights(self, *, layout, element_ids: np.ndarray) -> np.ndarray:
+        ref_points = np.asarray(layout.reference_points, dtype=float)
+        ref_weights = np.asarray(layout.reference_weights, dtype=float).reshape(-1)
+        elem_ids = np.asarray(element_ids, dtype=np.int32).reshape(-1)
+        out = np.zeros((int(elem_ids.shape[0]), int(ref_points.shape[0])), dtype=float)
+        for out_eid, eid in enumerate(elem_ids.tolist()):
+            eid_i = int(eid)
+            for q, (qp_ref, w_ref) in enumerate(zip(ref_points, ref_weights)):
+                xi = float(qp_ref[0])
+                eta = float(qp_ref[1])
+                J = np.asarray(transform.jacobian(self.me.mesh, eid_i, (xi, eta)), dtype=float)
+                out[out_eid, q] = float(abs(np.linalg.det(J))) * float(w_ref)
+        return out
+
+    def _collect_expression_data_functions(self, expr) -> dict[str, Any]:
+        coeffs = (Function, VectorFunction)
+        current = {
+            f.name: f
+            for f in _find_all(expr, coeffs)
+            if not getattr(f, "is_test", False) and not getattr(f, "is_trial", False)
+        }
+        for f in list(current.values()):
+            pv = getattr(f, "_parent_vector", None)
+            if pv is not None and hasattr(pv, "name"):
+                current.setdefault(pv.name, pv)
+        return current
+
+    def _scalarize_quadrature_expression(self, expr):
+        from pycutfem.ufl.expressions import _expr_shape
+
+        shape = tuple(int(v) for v in _expr_shape(expr))
+        if shape == ():
+            return [((), expr)]
+        return [(tuple(idx), expr[idx]) for idx in np.ndindex(shape)]
+
+    def _layout_matches_standard_volume_rule(self, *, layout, q_order: int | None) -> bool:
+        if q_order is None:
+            return False
+        try:
+            qp_ref, qw_ref = volume(self.me.mesh.element_type, int(q_order))
+        except Exception:
+            return False
+        qp_ref = np.asarray(qp_ref, dtype=float)
+        qw_ref = np.asarray(qw_ref, dtype=float).reshape(-1)
+        return (
+            qp_ref.shape == tuple(np.asarray(layout.reference_points, dtype=float).shape)
+            and qw_ref.shape == tuple(np.asarray(layout.reference_weights, dtype=float).reshape(-1).shape)
+            and np.allclose(qp_ref, np.asarray(layout.reference_points, dtype=float), atol=1.0e-13, rtol=1.0e-13)
+            and np.allclose(qw_ref, np.asarray(layout.reference_weights, dtype=float).reshape(-1), atol=1.0e-13, rtol=1.0e-13)
+        )
+
+    def _build_compiled_volume_quadrature_prebuilt(
+        self,
+        *,
+        layout,
+        element_ids: np.ndarray,
+        need_hess: bool,
+        need_o3: bool,
+        need_o4: bool,
+    ) -> tuple[dict[str, Any], int]:
+        ref_points = np.asarray(layout.reference_points, dtype=float)
+        elem_ids = np.asarray(element_ids, dtype=np.int32).ravel()
+        n_elem = int(elem_ids.shape[0])
+        n_q = int(ref_points.shape[0])
+        q_order = int(self.qorder) if self.qorder is not None else None
+
+        if self._layout_matches_standard_volume_rule(layout=layout, q_order=q_order):
+            geo_all = self.dh.precompute_geometric_factors(
+                int(q_order),
+                need_hess=need_hess,
+                need_o3=need_o3,
+                need_o4=need_o4,
+            )
+            n_total = int(np.asarray(geo_all["qp_phys"]).shape[0])
+            pre_built: dict[str, Any] = {}
+            for key, val in geo_all.items():
+                if isinstance(val, np.ndarray) and val.ndim >= 1 and int(val.shape[0]) == n_total:
+                    pre_built[key] = np.ascontiguousarray(val[elem_ids])
+                else:
+                    pre_built[key] = val
+            pre_built["qp_ref"] = np.ascontiguousarray(np.asarray(pre_built.get("qp_ref", ref_points), dtype=float))
+            pre_built["qref"] = np.ascontiguousarray(np.asarray(pre_built["qp_ref"], dtype=float))
+            pre_built["qw"] = np.zeros((n_elem, n_q), dtype=float)
+            pre_built["eids"] = np.ascontiguousarray(elem_ids)
+            pre_built["owner_id"] = np.ascontiguousarray(elem_ids)
+            pre_built["qstate_owner_id"] = np.ascontiguousarray(elem_ids)
+            pre_built["qstate_entity_id"] = np.ascontiguousarray(elem_ids)
+            pre_built["entity_kind"] = "element"
+            pre_built["is_interface"] = False
+            pre_built["normals"] = np.zeros_like(np.asarray(pre_built["qp_phys"], dtype=float))
+            pre_built.setdefault("J_inv_pos", pre_built["J_inv"])
+            pre_built.setdefault("J_inv_neg", pre_built["J_inv"])
+            return pre_built, int(q_order)
+
+        if need_o3 or need_o4:
+            raise NotImplementedError(
+                "Compiled quadrature evaluation for custom layouts currently supports only first- and "
+                "second-order inverse geometry data. Use a standard volume rule or the python backend."
+            )
+
+        qp_phys = np.empty((n_elem, n_q, 2), dtype=float)
+        qw = np.zeros((n_elem, n_q), dtype=float)
+        J_inv = np.empty((n_elem, n_q, 2, 2), dtype=float)
+        detJ = np.empty((n_elem, n_q), dtype=float)
+        Hxi0 = np.empty((n_elem, n_q, 2, 2), dtype=float) if need_hess else None
+        Hxi1 = np.empty((n_elem, n_q, 2, 2), dtype=float) if need_hess else None
+
+        for out_eid, eid in enumerate(elem_ids.tolist()):
+            eid_i = int(eid)
+            for q, qp_ref in enumerate(ref_points):
+                xi = float(qp_ref[0])
+                eta = float(qp_ref[1])
+                J = np.asarray(transform.jacobian(self.me.mesh, eid_i, (xi, eta)), dtype=float)
+                det_j = float(np.linalg.det(J))
+                if abs(det_j) <= 1.0e-20:
+                    raise RuntimeError(f"Singular mapping encountered during compiled quadrature evaluation on element {eid_i}.")
+                qp_phys[out_eid, q] = np.asarray(transform.x_mapping(self.me.mesh, eid_i, (xi, eta)), dtype=float)
+                J_inv[out_eid, q] = np.linalg.inv(J)
+                detJ[out_eid, q] = det_j
+                if need_hess:
+                    _, _, H0, H1 = transform.element_Hxi(self.me.mesh, eid_i, (xi, eta))
+                    Hxi0[out_eid, q] = np.asarray(H0, dtype=float)
+                    Hxi1[out_eid, q] = np.asarray(H1, dtype=float)
+
+        pre_built = {
+            "qp_phys": np.ascontiguousarray(qp_phys),
+            "qp_ref": np.ascontiguousarray(ref_points),
+            "qref": np.ascontiguousarray(ref_points),
+            "qw": np.ascontiguousarray(qw),
+            "J_inv": np.ascontiguousarray(J_inv),
+            "detJ": np.ascontiguousarray(detJ),
+            "normals": np.zeros_like(qp_phys),
+            "eids": np.ascontiguousarray(elem_ids),
+            "owner_id": np.ascontiguousarray(elem_ids),
+            "qstate_owner_id": np.ascontiguousarray(elem_ids),
+            "qstate_entity_id": np.ascontiguousarray(elem_ids),
+            "entity_kind": "element",
+            "is_interface": False,
+            "J_inv_pos": np.ascontiguousarray(J_inv),
+            "J_inv_neg": np.ascontiguousarray(J_inv),
+        }
+        if need_hess:
+            pre_built["Hxi0"] = np.ascontiguousarray(Hxi0)
+            pre_built["Hxi1"] = np.ascontiguousarray(Hxi1)
+        return pre_built, int(q_order if q_order is not None else max(n_q, 1))
+
+    def _evaluate_volume_expressions_on_quadrature_compiled(
+        self,
+        expr_items,
+        *,
+        expr_shapes,
+        layout,
+        element_ids,
+    ):
+        results = {
+            name: np.empty((len(element_ids), int(layout.reference_points.shape[0]), *expr_shapes[name]), dtype=float)
+            if expr_shapes[name]
+            else np.empty((len(element_ids), int(layout.reference_points.shape[0])), dtype=float)
+            for name, _ in expr_items
+        }
+
+        for name, expr in expr_items:
+            scalar_components = self._scalarize_quadrature_expression(expr)
+            for idx, scalar_expr in scalar_components:
+                runner, ir = self._compile_backend(scalar_expr, self.dh, self.me, on_facet=False)
+                active_fields = _active_field_order(ir, self.me)
+                runner_active = getattr(runner, "active_fields", None)
+                if runner_active:
+                    active_set = set(runner_active)
+                    me_order = getattr(self.me, "field_names", ())
+                    active_fields = tuple([f for f in me_order if f in active_set]) if me_order else tuple(runner_active)
+                active_cols = _active_columns(self.me, active_fields)
+
+                req = set(list(getattr(runner, "param_order", [])))
+                need_hess = any(
+                    k in req for k in ("Hxi0", "Hxi1", "pos_Hxi0", "pos_Hxi1", "neg_Hxi0", "neg_Hxi1")
+                ) or self._expr_requires_hess(scalar_expr)
+                need_o3 = any(
+                    k in req for k in ("Txi0", "Txi1", "pos_Txi0", "pos_Txi1", "neg_Txi0", "neg_Txi1")
+                )
+                need_o4 = any(
+                    k in req for k in ("Qxi0", "Qxi1", "pos_Qxi0", "pos_Qxi1", "neg_Qxi0", "neg_Qxi1")
+                )
+
+                pre_built, q_order = self._build_compiled_volume_quadrature_prebuilt(
+                    layout=layout,
+                    element_ids=element_ids,
+                    need_hess=need_hess,
+                    need_o3=need_o3,
+                    need_o4=need_o4,
+                )
+                gdofs_map = np.vstack(
+                    [self.dh.get_elemental_dofs(int(eid))[active_cols] for eid in np.asarray(element_ids, dtype=np.int32)]
+                ).astype(np.int32)
+                basis_args = _build_jit_kernel_args(
+                    ir,
+                    scalar_expr,
+                    self.me,
+                    int(q_order),
+                    dof_handler=self.dh,
+                    gdofs_map=gdofs_map,
+                    active_cols=active_cols,
+                    param_order=runner.param_order,
+                    pre_built=pre_built,
+                )
+                static_args = {
+                    "gdofs_map": gdofs_map,
+                    "node_coords": self.dh.get_all_dof_coords(),
+                    **pre_built,
+                    **basis_args,
+                }
+                static_args = _compress_static_for_active(static_args, self.me, active_cols)
+                qw = np.asarray(static_args["qw"], dtype=float)
+                current_funcs = self._collect_expression_data_functions(scalar_expr)
+
+                scalar_values = np.empty((len(element_ids), int(layout.reference_points.shape[0])), dtype=float)
+                for q in range(int(layout.reference_points.shape[0])):
+                    qw[...] = 0.0
+                    qw[:, q] = 1.0
+                    _, _, J_loc = runner(current_funcs, static_args)
+                    scalar_values[:, q] = self._normalize_compiled_scalar_quadrature_values(
+                        J_loc,
+                        n_elem=len(element_ids),
+                        expr_name=name if not idx else f"{name}{idx}",
+                    )
+                qw[...] = 0.0
+
+                if idx == ():
+                    results[name][...] = scalar_values
+                else:
+                    results[name][(slice(None), slice(None)) + idx] = scalar_values
+        return results
+
+    def evaluate_volume_expressions_on_quadrature(
+        self,
+        expressions,
+        *,
+        layout,
+        element_ids=None,
+    ):
+        """
+        Evaluate coefficient-only UFL expressions at volume quadrature points.
+
+        This is the runtime bridge for discrete operators that want to reuse the
+        same symbolic UFL definitions as the assembled residual/Jacobian while
+        updating quadrature-state fields before assembly.
+        """
+        from pycutfem.ufl.expressions import (
+            Expression,
+            HdivTestFunction as _HdivTestFunctionExpr,
+            HdivTrialFunction as _HdivTrialFunctionExpr,
+            TestFunction as _TestFunctionExpr,
+            TrialFunction as _TrialFunctionExpr,
+            VectorTestFunction as _VectorTestFunctionExpr,
+            VectorTrialFunction as _VectorTrialFunctionExpr,
+            _expr_shape,
+        )
+
+        if isinstance(expressions, Mapping):
+            expr_items = [(str(name), expr) for name, expr in expressions.items()]
+            return_mapping = True
+        else:
+            expr_items = [(str(i), expr) for i, expr in enumerate(list(expressions))]
+            return_mapping = False
+
+        if not expr_items:
+            return {} if return_mapping else []
+
+        for name, expr in expr_items:
+            if not isinstance(expr, Expression):
+                raise TypeError(
+                    f"Quadrature evaluation input '{name}' must be a UFL Expression, got {type(expr).__name__}."
+                )
+            trial = _find_all(
+                expr,
+                (
+                    _TestFunctionExpr,
+                    _VectorTestFunctionExpr,
+                    _HdivTestFunctionExpr,
+                    _TrialFunctionExpr,
+                    _VectorTrialFunctionExpr,
+                    _HdivTrialFunctionExpr,
+                ),
+            )
+            if trial:
+                raise ValueError(
+                    f"Quadrature evaluation input '{name}' contains trial/test basis functions. "
+                    "Only coefficient/value expressions are supported."
+                )
+
+        ref_points = np.asarray(layout.reference_points, dtype=float)
+        ref_weights = np.asarray(layout.reference_weights, dtype=float).reshape(-1)
+        if str(getattr(self.me.mesh, "element_type", "")).strip().lower() != str(layout.cell_type).strip().lower():
+            raise ValueError(
+                "Quadrature evaluation layout cell_type does not match the active mesh: "
+                f"{layout.cell_type!r} vs {getattr(self.me.mesh, 'element_type', None)!r}."
+            )
+
+        expr_shapes = {name: tuple(int(v) for v in _expr_shape(expr)) for name, expr in expr_items}
+        fields = sorted({fld for _, expr in expr_items for fld in _all_fields(expr)})
+        elem_ids = normalize_elem_ids(self.me.mesh, element_ids)
+        if elem_ids is None:
+            elem_ids = list(range(int(self.me.mesh.n_elements)))
+
+        for name, expr in expr_items:
+            self._validate_quadrature_state_usage(
+                expr,
+                reference_points=ref_points,
+                reference_weights=ref_weights,
+                context=f"quadrature evaluation for '{name}'",
+            )
+
+        results = {
+            name: np.empty((len(elem_ids), int(ref_points.shape[0]), *expr_shapes[name]), dtype=float)
+            if expr_shapes[name]
+            else np.empty((len(elem_ids), int(ref_points.shape[0])), dtype=float)
+            for name, _ in expr_items
+        }
+
+        if self._is_jit_backend():
+            results = self._evaluate_volume_expressions_on_quadrature_compiled(
+                expr_items,
+                expr_shapes=expr_shapes,
+                layout=layout,
+                element_ids=np.asarray(elem_ids, dtype=np.int32),
+            )
+            if return_mapping:
+                return results
+            return [results[str(i)] for i in range(len(expr_items))]
+
+        self._coeff_cache.clear()
+        self._collapsed_cache.clear()
+        old_rhs = self.ctx.get("rhs", None)
+        self.ctx["rhs"] = True
+        try:
+            for out_eid, eid in enumerate(elem_ids):
+                eid_i = int(eid)
+                for q, (qp_ref, _) in enumerate(zip(ref_points, ref_weights)):
+                    xi = float(qp_ref[0])
+                    eta = float(qp_ref[1])
+                    J = transform.jacobian(self.me.mesh, eid_i, (xi, eta))
+                    detJ = float(np.linalg.det(J))
+                    J_inv = np.linalg.inv(J)
+
+                    self._coeff_cache.clear()
+                    self._collapsed_cache.clear()
+                    self._populate_volume_basis_cache(
+                        fields=fields,
+                        eid=eid_i,
+                        xi=xi,
+                        eta=eta,
+                        J_inv=J_inv,
+                    )
+
+                    self.ctx["eid"] = eid_i
+                    self.ctx["q"] = int(q)
+                    self.ctx["qstate_owner_id"] = eid_i
+                    self.ctx["x_phys"] = transform.x_mapping(self.me.mesh, eid_i, (xi, eta))
+                    self.ctx["_xi_eta"] = (xi, eta)
+                    self.ctx["detJ"] = detJ
+
+                    for name, expr in expr_items:
+                        value = self._visit(expr)
+                        results[name][out_eid, q] = self._normalize_quadrature_expression_value(
+                            value,
+                            expected_shape=expr_shapes[name],
+                            expr_name=name,
+                        )
+        finally:
+            if old_rhs is None:
+                self.ctx.pop("rhs", None)
+            else:
+                self.ctx["rhs"] = old_rhs
+            for k in ("eid", "x_phys", "q", "qstate_owner_id", "_xi_eta", "detJ"):
+                self.ctx.pop(k, None)
+
+        if return_mapping:
+            return results
+        return [results[str(i)] for i in range(len(expr_items))]
+
+    def _nonmatching_python_entity_context(self, geo: dict, fields: list[str], ei: int) -> dict:
+        if str(geo.get("trace_kind", "")) in {"paired_station", "fracture_station"}:
+            global_dofs = np.asarray(geo["gdofs_map"][ei], dtype=int)
+            pos_map_by_field = {}
+            neg_map_by_field = {}
+            pos_union_mask_by_field = {}
+            neg_union_mask_by_field = {}
+            for fld in fields:
+                pos_key = f"pos_map_{fld}"
+                neg_key = f"neg_map_{fld}"
+                if pos_key not in geo or neg_key not in geo:
+                    raise KeyError(
+                        f"Precomputed station trace-link interface is missing '{pos_key}'/'{neg_key}'."
+                    )
+                pos_map_by_field[fld] = np.asarray(geo[pos_key][ei], dtype=int)
+                neg_map_by_field[fld] = np.asarray(geo[neg_key][ei], dtype=int)
+                pos_mask_key = f"restrict_mask_{fld}_pos"
+                neg_mask_key = f"restrict_mask_{fld}_neg"
+                if pos_mask_key in geo:
+                    pos_union_mask_by_field[fld] = np.asarray(geo[pos_mask_key][ei], dtype=float)
+                if neg_mask_key in geo:
+                    neg_union_mask_by_field[fld] = np.asarray(geo[neg_mask_key][ei], dtype=float)
+            return {
+                "eid": int(np.asarray(geo.get("owner_id", geo.get("owner_pos_id")), dtype=np.int32)[ei]),
+                "pos_eid": int(np.asarray(geo["owner_pos_id"], dtype=np.int32)[ei]),
+                "neg_eid": int(np.asarray(geo["owner_neg_id"], dtype=np.int32)[ei]),
+                "global_dofs": global_dofs,
+                "pos_map": np.asarray(geo.get("pos_map", np.empty((0, 0), dtype=int))[ei], dtype=int),
+                "neg_map": np.asarray(geo.get("neg_map", np.empty((0, 0), dtype=int))[ei], dtype=int),
+                "pos_map_by_field": pos_map_by_field,
+                "neg_map_by_field": neg_map_by_field,
+                "pos_union_mask_by_field": pos_union_mask_by_field,
+                "neg_union_mask_by_field": neg_union_mask_by_field,
+            }
+
+        pos_eid = int(np.asarray(geo["owner_pos_id"], dtype=np.int32)[ei])
+        neg_eid = int(np.asarray(geo["owner_neg_id"], dtype=np.int32)[ei])
+        pos_dofs = np.asarray(self.dh.get_elemental_dofs(pos_eid), dtype=int)
+        neg_dofs = np.asarray(self.dh.get_elemental_dofs(neg_eid), dtype=int)
+        global_dofs = np.unique(np.concatenate([pos_dofs, neg_dofs]))
+        pos_map = np.searchsorted(global_dofs, pos_dofs)
+        neg_map = np.searchsorted(global_dofs, neg_dofs)
+        pos_map_by_field, neg_map_by_field = _hfa.build_field_union_maps(
+            self.dh, fields, pos_eid, neg_eid, global_dofs
+        )
+        pos_union_mask_by_field = {}
+        neg_union_mask_by_field = {}
+        for fld, idxs in pos_map_by_field.items():
+            m = np.zeros(len(global_dofs), dtype=float)
+            m[np.asarray(idxs, dtype=int)] = 1.0
+            pos_union_mask_by_field[fld] = m
+        for fld, idxs in neg_map_by_field.items():
+            m = np.zeros(len(global_dofs), dtype=float)
+            m[np.asarray(idxs, dtype=int)] = 1.0
+            neg_union_mask_by_field[fld] = m
+        return {
+            "eid": int(np.asarray(geo.get("owner_id", geo.get("owner_pos_id")), dtype=np.int32)[ei]),
+            "pos_eid": pos_eid,
+            "neg_eid": neg_eid,
+            "global_dofs": global_dofs,
+            "pos_map": pos_map,
+            "neg_map": neg_map,
+            "pos_map_by_field": pos_map_by_field,
+            "neg_map_by_field": neg_map_by_field,
+            "pos_union_mask_by_field": pos_union_mask_by_field,
+            "neg_union_mask_by_field": neg_union_mask_by_field,
+        }
+
+    def _nonmatching_python_basis_values(self, geo: dict, fields: list[str], ei: int, q: int) -> dict:
+        if str(geo.get("trace_kind", "")) not in {"paired_station", "fracture_station"}:
+            return {"+": {}, "-": {}}
+        out = {"+": {}, "-": {}}
+        for side, suffix in (("+", "pos"), ("-", "neg")):
+            for fld in fields:
+                rows = {}
+                for alpha, prefix in (((0, 0), "r00"), ((1, 0), "r10"), ((0, 1), "r01")):
+                    key = f"{prefix}_{fld}_{suffix}"
+                    if key in geo:
+                        rows[alpha] = np.asarray(geo[key][ei, q], dtype=float)
+                out[side][fld] = rows
+        return out
+
+    def _evaluate_nonmatching_interface_expressions_on_quadrature_compiled(
+        self,
+        expr_items,
+        *,
+        expr_shapes,
+        interface,
+        layout,
+        quadrature: str,
+        domain_type: str = "nonmatching_interface",
+    ):
+        from pycutfem.ufl.measures import dNonmatchingInterface, dTraceLink
+
+        domain_type = str(domain_type).strip().lower()
+        measure_template = dTraceLink if domain_type == "trace_link" else dNonmatchingInterface
+        entity_count = interface.n_entities() if hasattr(interface, "n_entities") else interface.n_segments()
+        results = {
+            name: np.empty((entity_count, int(layout.n_qp), *expr_shapes[name]), dtype=float)
+            if expr_shapes[name]
+            else np.empty((entity_count, int(layout.n_qp)), dtype=float)
+            for name, _ in expr_items
+        }
+
+        for name, expr in expr_items:
+            scalar_components = self._scalarize_quadrature_expression(expr)
+            for idx, scalar_expr in scalar_components:
+                md_key = "trace" if domain_type == "trace_link" else "interface"
+                measure = measure_template(
+                    metadata={
+                        "q": int(layout.quadrature_order),
+                        md_key: interface,
+                        "quadrature": str(quadrature),
+                    }
+                )
+                integral = scalar_expr * measure
+                runner, ir = self._compile_backend(scalar_expr, self.dh, self.me, on_facet=True)
+                derivs, need_hess, need_o3, need_o4 = self._find_req_derivs(integral, runner)
+                geo = self._precompute_trace_domain_factors(
+                    integral,
+                    interface,
+                    qdeg=int(layout.quadrature_order),
+                    derivs=derivs,
+                    reuse=True,
+                    need_hess=need_hess,
+                    need_o3=need_o3,
+                    need_o4=need_o4,
+                    quadrature=str(quadrature),
+                )
+                layout.validate_against(
+                    reference_points=np.asarray(geo["qref"], dtype=float),
+                    reference_weights=np.asarray(geo["qw_ref"], dtype=float),
+                    context=f"{domain_type} quadrature evaluation for '{name}'",
+                )
+
+                valid_eids = np.asarray(geo.get("eids", []), dtype=np.int32)
+                if valid_eids.size == 0:
+                    continue
+                kernel_args = _build_jit_kernel_args(
+                    ir=ir,
+                    expression=scalar_expr,
+                    mixed_element=self.me,
+                    q_order=int(layout.quadrature_order),
+                    dof_handler=self.dh,
+                    gdofs_map=geo["gdofs_map"],
+                    param_order=runner.param_order,
+                    pre_built=geo,
+                )
+                if ("node_coords" in runner.param_order) and ("node_coords" not in kernel_args):
+                    kernel_args["node_coords"] = np.asarray(self.me.mesh.nodes_x_y_pos, dtype=float)
+                if ("element_nodes" in runner.param_order) and ("element_nodes" not in kernel_args):
+                    kernel_args["element_nodes"] = np.asarray(self.me.mesh.elements_connectivity, dtype=np.int64)
+                missing = [p for p in runner.param_order if p not in kernel_args]
+                missing = [p for p in missing if not (p.startswith("u_") and p.endswith("_loc"))]
+                if missing:
+                    raise KeyError(f"{domain_type} quadrature evaluation missing static args: {missing}")
+
+                # Pointwise quadrature evaluation reuses the integration kernel by
+                # selecting one quadrature point at a time with one-hot weights.
+                # ``kernel_args["qw"]`` often aliases the cached interface/trace
+                # precompute table when ``reuse=True``.  Mutating it in-place would
+                # corrupt later assemblies on the same trace domain, most visibly
+                # by zeroing the weights before the next Newton iteration.
+                qw = np.zeros_like(np.asarray(kernel_args["qw"], dtype=float))
+                kernel_args["qw"] = qw
+                current_funcs = self._collect_expression_data_functions(scalar_expr)
+                scalar_values = np.empty((int(valid_eids.shape[0]), int(layout.n_qp)), dtype=float)
+                for q in range(int(layout.n_qp)):
+                    qw[...] = 0.0
+                    qw[:, q] = 1.0
+                    _, _, J_loc = runner(current_funcs, kernel_args)
+                    scalar_values[:, q] = self._normalize_compiled_scalar_quadrature_values(
+                        J_loc,
+                        n_elem=int(valid_eids.shape[0]),
+                        expr_name=name if not idx else f"{name}{idx}",
+                    )
+                if idx == ():
+                    results[name][...] = scalar_values
+                else:
+                    results[name][(slice(None), slice(None)) + idx] = scalar_values
+        return results
+
+    def evaluate_nonmatching_interface_expressions_on_quadrature(
+        self,
+        expressions,
+        *,
+        layout,
+        interface,
+        quadrature: str = "gauss",
+        _domain_type: str = "nonmatching_interface",
+    ):
+        """
+        Evaluate coefficient-only UFL expressions at nonmatching-interface
+        quadrature points.
+
+        Interface quadrature state is indexed by the common-refinement segment
+        id, not by either adjacent volume element id. This keeps contact/damage
+        state distinct even when several interface segments share one owner
+        element.
+        """
+        from pycutfem.ufl.expressions import (
+            Expression,
+            HdivTestFunction as _HdivTestFunctionExpr,
+            HdivTrialFunction as _HdivTrialFunctionExpr,
+            TestFunction as _TestFunctionExpr,
+            TrialFunction as _TrialFunctionExpr,
+            VectorTestFunction as _VectorTestFunctionExpr,
+            VectorTrialFunction as _VectorTrialFunctionExpr,
+            _expr_shape,
+        )
+
+        domain_type = str(_domain_type).strip().lower()
+        label = "trace-link" if domain_type == "trace_link" else "nonmatching-interface"
+        if str(getattr(layout, "entity_kind", "")).strip().lower() != domain_type:
+            raise ValueError(
+                f"evaluate_{domain_type}_expressions_on_quadrature requires "
+                f"layout.entity_kind == {domain_type!r}."
+            )
+        if interface is None:
+            raise ValueError(f"A {label} object is required for quadrature evaluation.")
+
+        quadrature_rule = str(quadrature or "gauss").strip().lower().replace("-", "_")
+        if quadrature_rule in {"gll", "lobatto"}:
+            quadrature_rule = "gauss_lobatto"
+
+        if isinstance(expressions, Mapping):
+            expr_items = [(str(name), expr) for name, expr in expressions.items()]
+            return_mapping = True
+        else:
+            expr_items = [(str(i), expr) for i, expr in enumerate(list(expressions))]
+            return_mapping = False
+        if not expr_items:
+            return {} if return_mapping else []
+
+        basis_nodes = (
+            _TestFunctionExpr,
+            _VectorTestFunctionExpr,
+            _HdivTestFunctionExpr,
+            _TrialFunctionExpr,
+            _VectorTrialFunctionExpr,
+            _HdivTrialFunctionExpr,
+        )
+        for name, expr in expr_items:
+            if not isinstance(expr, Expression):
+                raise TypeError(
+                    f"Interface quadrature evaluation input '{name}' must be a UFL Expression, got {type(expr).__name__}."
+                )
+            if _find_all(expr, basis_nodes):
+                raise ValueError(
+                    f"Interface quadrature evaluation input '{name}' contains trial/test basis functions. "
+                    "Only coefficient/value expressions are supported."
+                )
+
+        expr_shapes = {name: tuple(int(v) for v in _expr_shape(expr)) for name, expr in expr_items}
+        for name, expr in expr_items:
+            self._validate_quadrature_state_usage(
+                expr,
+                reference_points=np.asarray(layout.reference_points, dtype=float),
+                reference_weights=np.asarray(layout.reference_weights, dtype=float),
+                context=f"interface quadrature evaluation for '{name}'",
+            )
+
+        if self._is_jit_backend():
+            results = self._evaluate_nonmatching_interface_expressions_on_quadrature_compiled(
+                expr_items,
+                expr_shapes=expr_shapes,
+                interface=interface,
+                layout=layout,
+                quadrature=quadrature_rule,
+                domain_type=domain_type,
+            )
+            if return_mapping:
+                return results
+            return [results[str(i)] for i in range(len(expr_items))]
+
+        derivs = {(0, 0), (1, 0), (0, 1)}
+        for _, expr in expr_items:
+            derivs |= set(required_multi_indices(expr))
+        from pycutfem.ufl.measures import dNonmatchingInterface, dTraceLink
+
+        md_key = "trace" if domain_type == "trace_link" else "interface"
+        measure = (dTraceLink if domain_type == "trace_link" else dNonmatchingInterface)(
+            metadata={
+                "q": int(layout.quadrature_order),
+                md_key: interface,
+                "quadrature": quadrature_rule,
+            }
+        )
+        integral_for_precompute = expr_items[0][1] * measure
+        geo = self._precompute_trace_domain_factors(
+            integral_for_precompute,
+            interface,
+            qdeg=int(layout.quadrature_order),
+            derivs=derivs,
+            reuse=True,
+            quadrature=quadrature_rule,
+        )
+        layout.validate_against(
+            reference_points=np.asarray(geo["qref"], dtype=float),
+            reference_weights=np.asarray(geo["qw_ref"], dtype=float),
+            context=f"{label} quadrature evaluation",
+        )
+
+        eids = np.asarray(geo.get("eids", np.empty((0,), dtype=np.int32)), dtype=np.int32)
+        results = {
+            name: np.empty((int(eids.size), int(layout.n_qp), *expr_shapes[name]), dtype=float)
+            if expr_shapes[name]
+            else np.empty((int(eids.size), int(layout.n_qp)), dtype=float)
+            for name, _ in expr_items
+        }
+        if eids.size == 0:
+            return results if return_mapping else [results[str(i)] for i in range(len(expr_items))]
+
+        fields = sorted({fld for _, expr in expr_items for fld in _all_fields(expr)})
+        if not fields:
+            fields = list(getattr(self.dh, "field_names", []))
+
+        old_rhs = self.ctx.get("rhs", None)
+        self.ctx["rhs"] = True
+        self.ctx["is_interface"] = True
+        self.ctx["is_ghost"] = False
+        self.ctx["measure_side"] = None
+        try:
+            for ei in range(int(eids.size)):
+                entity_ctx = self._nonmatching_python_entity_context(geo, fields, int(ei))
+
+                for q in range(int(layout.n_qp)):
+                    self._coeff_cache.clear()
+                    self._collapsed_cache.clear()
+                    self.ctx.update(
+                        {
+                            **entity_ctx,
+                            "qstate_owner_id": int(np.asarray(geo.get("qstate_owner_id", eids), dtype=np.int32)[ei]),
+                            "q": int(q),
+                            "normal": np.asarray(geo["normals"][ei, q], float),
+                            "x_phys": np.asarray(geo["qp_phys"][ei, q], float),
+                            "phi_val": 0.0,
+                            "use_union_local_dofs": True,
+                            "basis_values": self._nonmatching_python_basis_values(geo, fields, int(ei), int(q)),
+                            "_xi_eta_cache": {
+                                "+": (float(geo["xi_pos"][ei, q]), float(geo["eta_pos"][ei, q])),
+                                "-": (float(geo["xi_neg"][ei, q]), float(geo["eta_neg"][ei, q])),
+                            },
+                        }
+                    )
+                    for name, expr in expr_items:
+                        value = self._visit(expr)
+                        results[name][ei, q] = self._normalize_quadrature_expression_value(
+                            value,
+                            expected_shape=expr_shapes[name],
+                            expr_name=name,
+                        )
+        finally:
+            if old_rhs is None:
+                self.ctx.pop("rhs", None)
+            else:
+                self.ctx["rhs"] = old_rhs
+            for k in (
+                "basis_values",
+                "global_dofs",
+                "pos_map",
+                "neg_map",
+                "pos_map_by_field",
+                "neg_map_by_field",
+                "pos_union_mask_by_field",
+                "neg_union_mask_by_field",
+                "_xi_eta_cache",
+                "use_union_local_dofs",
+                "mask_basis",
+                "pos_eid",
+                "neg_eid",
+                "eid",
+                "qstate_owner_id",
+                "q",
+                "x_phys",
+                "phi_val",
+                "normal",
+                "is_interface",
+                "measure_side",
+            ):
+                self.ctx.pop(k, None)
+            self.ctx.pop("is_ghost", None)
+
+        if return_mapping:
+            return results
+        return [results[str(i)] for i in range(len(expr_items))]
+
+    def evaluate_trace_link_expressions_on_quadrature(
+        self,
+        expressions,
+        *,
+        layout,
+        trace,
+        quadrature: str = "gauss",
+    ):
+        """Evaluate coefficient-only UFL expressions on a ``dTraceLink`` domain."""
+
+        return self.evaluate_nonmatching_interface_expressions_on_quadrature(
+            expressions,
+            layout=layout,
+            interface=trace,
+            quadrature=quadrature,
+            _domain_type="trace_link",
+        )
+
+    def _evaluate_volume_local_expression_compiled(
+        self,
+        expr,
+        *,
+        layout,
+        element_ids: np.ndarray,
+        expr_name: str,
+    ) -> LocalQuadratureExpressionBatch:
+        from pycutfem.ufl.expressions import (
+            HdivTestFunction as _HdivTestFunctionExpr,
+            HdivTrialFunction as _HdivTrialFunctionExpr,
+            TestFunction as _TestFunctionExpr,
+            TrialFunction as _TrialFunctionExpr,
+            VectorTestFunction as _VectorTestFunctionExpr,
+            VectorTrialFunction as _VectorTrialFunctionExpr,
+        )
+        from pycutfem.ufl.measures import dx
+
+        basis_nodes = (
+            _TestFunctionExpr,
+            _VectorTestFunctionExpr,
+            _HdivTestFunctionExpr,
+            _TrialFunctionExpr,
+            _VectorTrialFunctionExpr,
+            _HdivTrialFunctionExpr,
+        )
+        has_basis = bool(_find_all(expr, basis_nodes))
+        if has_basis:
+            integral = expr * dx(metadata={"q": int(layout.quadrature_order)})
+            runner, ir = self._compile_backend(integral.integrand, self.dh, self.me, on_facet=False)
+            _, need_hess, need_o3, need_o4 = self._find_req_derivs(integral, runner)
+            active_cols = np.arange(int(self.me.n_dofs_local), dtype=np.int32)
+            pre_built, q_order = self._build_compiled_volume_quadrature_prebuilt(
+                layout=layout,
+                element_ids=np.asarray(element_ids, dtype=np.int32),
+                need_hess=need_hess,
+                need_o3=need_o3,
+                need_o4=need_o4,
+            )
+            gdofs_map = np.vstack(
+                [self._elemental_gdofs_row(int(e), n_loc_expected=int(active_cols.size))[active_cols] for e in np.asarray(element_ids, dtype=np.int32)]
+            ).astype(np.int32)
+            basis_args = _build_jit_kernel_args(
+                ir,
+                integral.integrand,
+                self.me,
+                int(q_order),
+                dof_handler=self.dh,
+                gdofs_map=gdofs_map,
+                active_cols=active_cols,
+                param_order=runner.param_order,
+                pre_built=pre_built,
+            )
+            static_args = {
+                "gdofs_map": gdofs_map,
+                "node_coords": self.dh.get_all_dof_coords(),
+                **pre_built,
+                **basis_args,
+            }
+            current_funcs = self._get_data_functions_objs(integral)
+        else:
+            runner, ir = self._compile_backend(expr, self.dh, self.me, on_facet=False)
+            active_fields = _active_field_order(ir, self.me)
+            runner_active = getattr(runner, "active_fields", None)
+            if runner_active:
+                active_set = set(runner_active)
+                me_order = getattr(self.me, "field_names", ())
+                active_fields = tuple([f for f in me_order if f in active_set]) if me_order else tuple(runner_active)
+            active_cols = _active_columns(self.me, active_fields)
+            req = set(list(getattr(runner, "param_order", [])))
+            need_hess = any(
+                k in req for k in ("Hxi0", "Hxi1", "pos_Hxi0", "pos_Hxi1", "neg_Hxi0", "neg_Hxi1")
+            ) or self._expr_requires_hess(expr)
+            need_o3 = any(k in req for k in ("Txi0", "Txi1", "pos_Txi0", "pos_Txi1", "neg_Txi0", "neg_Txi1"))
+            need_o4 = any(k in req for k in ("Qxi0", "Qxi1", "pos_Qxi0", "pos_Qxi1", "neg_Qxi0", "neg_Qxi1"))
+            pre_built, q_order = self._build_compiled_volume_quadrature_prebuilt(
+                layout=layout,
+                element_ids=np.asarray(element_ids, dtype=np.int32),
+                need_hess=need_hess,
+                need_o3=need_o3,
+                need_o4=need_o4,
+            )
+            gdofs_map = np.vstack(
+                [self.dh.get_elemental_dofs(int(eid))[active_cols] for eid in np.asarray(element_ids, dtype=np.int32)]
+            ).astype(np.int32)
+            basis_args = _build_jit_kernel_args(
+                ir,
+                expr,
+                self.me,
+                int(q_order),
+                dof_handler=self.dh,
+                gdofs_map=gdofs_map,
+                active_cols=active_cols,
+                param_order=runner.param_order,
+                pre_built=pre_built,
+            )
+            static_args = {
+                "gdofs_map": gdofs_map,
+                "node_coords": self.dh.get_all_dof_coords(),
+                **pre_built,
+                **basis_args,
+            }
+            static_args = _compress_static_for_active(static_args, self.me, active_cols)
+            current_funcs = self._collect_expression_data_functions(expr)
+        qw = np.asarray(static_args["qw"], dtype=float)
+        batch = None
+        mode = None
+        for q in range(int(layout.reference_points.shape[0])):
+            qw[...] = 0.0
+            qw[:, q] = 1.0
+            K_loc, F_loc, J_loc = runner(current_funcs, static_args)
+            if has_basis and F_loc is not None:
+                values_q = np.asarray(F_loc, dtype=float)
+                mode_q = "vector"
+            elif has_basis and K_loc is not None:
+                values_q = np.asarray(K_loc, dtype=float)
+                mode_q = "matrix"
+            elif K_loc is not None:
+                values_q = np.asarray(K_loc, dtype=float)
+                mode_q = "matrix"
+            elif F_loc is not None:
+                values_q = np.asarray(F_loc, dtype=float)
+                mode_q = "vector"
+            else:
+                values_q = self._normalize_compiled_scalar_quadrature_values(
+                    J_loc,
+                    n_elem=int(element_ids.shape[0]),
+                    expr_name=expr_name,
+                )
+                mode_q = "scalar"
+            if mode is None:
+                mode = mode_q
+                if mode == "scalar":
+                    batch = np.zeros((int(element_ids.shape[0]), int(layout.reference_points.shape[0])), dtype=float)
+                elif mode == "vector":
+                    batch = np.zeros(
+                        (int(element_ids.shape[0]), int(layout.reference_points.shape[0]), int(values_q.shape[1])),
+                        dtype=float,
+                    )
+                else:
+                    batch = np.zeros(
+                        (
+                            int(element_ids.shape[0]),
+                            int(layout.reference_points.shape[0]),
+                            int(values_q.shape[1]),
+                            int(values_q.shape[2]),
+                        ),
+                        dtype=float,
+                    )
+            if mode_q != mode:
+                raise ValueError(
+                    f"Local quadrature expression '{expr_name}' changed mode across quadrature points: {mode} vs {mode_q}."
+                )
+            batch[:, q, ...] = np.asarray(values_q, dtype=float)
+        qw[...] = 0.0
+        return LocalQuadratureExpressionBatch(
+            values=np.asarray(batch, dtype=float),
+            element_ids=np.asarray(element_ids, dtype=np.int32),
+            gdofs_map=None if mode == "scalar" else np.asarray(static_args.get("gdofs_map", gdofs_map), dtype=int),
+            mode=str(mode or "scalar"),
+        )
+
+    def evaluate_volume_local_expressions_on_quadrature(
+        self,
+        expressions,
+        *,
+        layout,
+        element_ids=None,
+    ):
+        """
+        Evaluate scalar UFL expressions at volume quadrature points and preserve
+        local FE basis dimensions when the expression contains test/trial data.
+
+        Supported result modes are:
+        - `scalar`: shape `(n_elem, n_qp)`
+        - `vector`: shape `(n_elem, n_qp, n_local)`
+        - `matrix`: shape `(n_elem, n_qp, n_local, n_local)`
+        """
+
+        from pycutfem.ufl.expressions import Expression, _expr_shape
+
+        if isinstance(expressions, Mapping):
+            expr_items = [(str(name), expr) for name, expr in expressions.items()]
+            return_mapping = True
+        else:
+            expr_items = [(str(i), expr) for i, expr in enumerate(list(expressions))]
+            return_mapping = False
+        if not expr_items:
+            return {} if return_mapping else []
+        ref_points = np.asarray(layout.reference_points, dtype=float)
+        elem_ids = self._resolve_volume_local_element_ids(element_ids)
+        if self._is_jit_backend():
+            results = {}
+            for name, expr in expr_items:
+                if not isinstance(expr, Expression):
+                    raise TypeError(
+                        f"Local quadrature evaluation input '{name}' must be a UFL Expression, got {type(expr).__name__}."
+                    )
+                expr_shape = tuple(int(v) for v in _expr_shape(expr))
+                if expr_shape != ():
+                    raise NotImplementedError(
+                        f"Local quadrature evaluation currently expects scalar expressions, got shape {expr_shape} for '{name}'."
+                    )
+                results[name] = self._evaluate_volume_local_expression_compiled(
+                    expr,
+                    layout=layout,
+                    element_ids=elem_ids,
+                    expr_name=name,
+                )
+            if return_mapping:
+                return results
+            return [results[str(i)] for i in range(len(expr_items))]
+
+        results = {}
+        fields = sorted({fld for _, expr in expr_items for fld in _all_fields(expr)})
+        old_rhs = self.ctx.get("rhs", None)
+        self.ctx["rhs"] = True
+        try:
+            for name, expr in expr_items:
+                if not isinstance(expr, Expression):
+                    raise TypeError(
+                        f"Local quadrature evaluation input '{name}' must be a UFL Expression, got {type(expr).__name__}."
+                    )
+                expr_shape = tuple(int(v) for v in _expr_shape(expr))
+                if expr_shape != ():
+                    raise NotImplementedError(
+                        f"Local quadrature evaluation currently expects scalar expressions, got shape {expr_shape} for '{name}'."
+                    )
+                mode = None
+                values = None
+                gdofs_map = None
+                for out_eid, eid in enumerate(elem_ids.tolist()):
+                    eid_i = int(eid)
+                    local_gdofs = None
+                    for q, qp_ref in enumerate(ref_points):
+                        xi = float(qp_ref[0])
+                        eta = float(qp_ref[1])
+                        J = transform.jacobian(self.me.mesh, eid_i, (xi, eta))
+                        detJ = float(np.linalg.det(J))
+                        J_inv = np.linalg.inv(J)
+                        self._coeff_cache.clear()
+                        self._collapsed_cache.clear()
+                        self._populate_volume_basis_cache(
+                            fields=fields,
+                            eid=eid_i,
+                            xi=xi,
+                            eta=eta,
+                            J_inv=J_inv,
+                        )
+                        self.ctx["eid"] = eid_i
+                        self.ctx["q"] = int(q)
+                        self.ctx["qstate_owner_id"] = eid_i
+                        self.ctx["x_phys"] = transform.x_mapping(self.me.mesh, eid_i, (xi, eta))
+                        self.ctx["_xi_eta"] = (xi, eta)
+                        self.ctx["detJ"] = detJ
+                        raw_value = self._visit(expr)
+                        arr_q, mode_q = self._normalize_local_quadrature_expression_value(raw_value, expr_name=name)
+                        if mode is None:
+                            mode = mode_q
+                            if mode == "scalar":
+                                values = np.zeros((int(elem_ids.shape[0]), int(ref_points.shape[0])), dtype=float)
+                            elif mode == "vector":
+                                values = np.zeros((int(elem_ids.shape[0]), int(ref_points.shape[0]), int(arr_q.shape[0])), dtype=float)
+                            else:
+                                values = np.zeros(
+                                    (
+                                        int(elem_ids.shape[0]),
+                                        int(ref_points.shape[0]),
+                                        int(arr_q.shape[0]),
+                                        int(arr_q.shape[1]),
+                                    ),
+                                    dtype=float,
+                                )
+                        if mode_q != mode:
+                            raise ValueError(
+                                f"Local quadrature expression '{name}' changed mode across quadrature points: {mode} vs {mode_q}."
+                            )
+                        if mode == "scalar":
+                            values[out_eid, q] = float(arr_q)
+                        else:
+                            values[out_eid, q, ...] = np.asarray(arr_q, dtype=float)
+                            if local_gdofs is None:
+                                local_gdofs = self._elemental_gdofs_row(
+                                    eid_i,
+                                    n_loc_expected=int(np.asarray(arr_q).shape[0]),
+                                )
+                    if gdofs_map is None and mode != "scalar":
+                        n_loc = int(np.asarray(local_gdofs, dtype=int).shape[0])
+                        gdofs_map = np.zeros((int(elem_ids.shape[0]), n_loc), dtype=int)
+                    if gdofs_map is not None and local_gdofs is not None:
+                        gdofs_map[out_eid, :] = np.asarray(local_gdofs, dtype=int)
+                results[name] = LocalQuadratureExpressionBatch(
+                    values=np.asarray(values, dtype=float),
+                    element_ids=np.asarray(elem_ids, dtype=np.int32),
+                    gdofs_map=None if gdofs_map is None else np.asarray(gdofs_map, dtype=int),
+                    mode=str(mode or "scalar"),
+                )
+        finally:
+            if old_rhs is None:
+                self.ctx.pop("rhs", None)
+            else:
+                self.ctx["rhs"] = old_rhs
+            for k in ("eid", "x_phys", "q", "qstate_owner_id", "_xi_eta", "detJ"):
+                self.ctx.pop(k, None)
+        if return_mapping:
+            return results
+        return [results[str(i)] for i in range(len(expr_items))]
+
+    def _elemental_gdofs_row(self, eid: int, *, n_loc_expected: int | None = None) -> np.ndarray:
+        gdofs = np.asarray(self.dh.get_elemental_dofs(int(eid)), dtype=int)
+        if n_loc_expected is not None and int(gdofs.shape[0]) != int(n_loc_expected):
+            xfem_getter = getattr(self.dh, "get_elemental_dofs_xfem", None)
+            if callable(xfem_getter):
+                try:
+                    gdofs = np.asarray(xfem_getter(int(eid)), dtype=int)
+                except Exception:
+                    pass
+        return gdofs
+
+    def _resolve_volume_local_element_ids(self, element_ids) -> np.ndarray:
+        elem_ids = normalize_elem_ids(self.me.mesh, element_ids)
+        if elem_ids is None:
+            elem_ids = list(range(int(self.me.mesh.n_elements)))
+        return np.asarray(elem_ids, dtype=np.int32).ravel()
+
+    def _integral_volume_element_ids(self, integral: Integral, *, base_element_ids: np.ndarray) -> np.ndarray:
+        defined = normalize_elem_ids(self.me.mesh, getattr(integral.measure, "defined_on", None))
+        if defined is None:
+            return np.asarray(base_element_ids, dtype=np.int32).ravel()
+        allowed = set(int(e) for e in np.asarray(defined, dtype=np.int32).ravel().tolist())
+        return np.asarray([int(e) for e in np.asarray(base_element_ids, dtype=np.int32).ravel().tolist() if int(e) in allowed], dtype=np.int32)
+
+    def _empty_local_batch(self, *, entity_kind: str = "element", n_loc: int | None = None) -> LocalAssemblyBatch:
+        width = int(self.me.n_dofs_local if n_loc is None else n_loc)
+        return LocalAssemblyBatch(
+            K_elem=None,
+            F_elem=None,
+            element_ids=np.empty((0,), dtype=np.int32),
+            gdofs_map=np.empty((0, width), dtype=int),
+            entity_kind=str(entity_kind),
+        )
+
+    def _resolve_boundary_local_edge_ids(self, edge_ids) -> np.ndarray:
+        eids = normalize_edge_ids(self.me.mesh, edge_ids)
+        if eids is None:
+            eids = [int(edge.gid) for edge in self.me.mesh.edges_list if edge.right is None]
+        return np.asarray(eids, dtype=np.int32).ravel()
+
+    def _integral_boundary_edge_ids(self, integral: Integral, *, base_edge_ids: np.ndarray) -> np.ndarray:
+        measure = getattr(integral, "measure", None)
+        mesh = self.me.mesh
+        if getattr(measure, "defined_on", None) is not None:
+            defined = normalize_edge_ids(mesh, measure.defined_on)
+        elif getattr(measure, "tag", None) is not None:
+            try:
+                defined = normalize_edge_ids(mesh, mesh.get_domain_bitset(str(measure.tag), entity="edge"))
+            except Exception:
+                defined = None
+        else:
+            defined = None
+        if defined is None:
+            return np.asarray(base_edge_ids, dtype=np.int32).ravel()
+        allowed = set(int(e) for e in np.asarray(defined, dtype=np.int32).ravel().tolist())
+        return np.asarray([int(e) for e in np.asarray(base_edge_ids, dtype=np.int32).ravel().tolist() if int(e) in allowed], dtype=np.int32)
+
+    def _restrict_local_integral_entities(self, integral: Integral, entity_ids):
+        if entity_ids is None:
+            return integral
+        from pycutfem.utils.bitset import BitSet
+
+        mesh = self.me.mesh
+        measure = getattr(integral, "measure", None)
+        domain_type = str(getattr(measure, "domain_type", "")).strip().lower()
+        if domain_type in {"volume", "interface"}:
+            ids = normalize_elem_ids(mesh, entity_ids)
+            mask = np.zeros(int(mesh.n_elements), dtype=bool)
+        elif domain_type == "exterior_facet":
+            ids = normalize_edge_ids(mesh, entity_ids)
+            mask = np.zeros(len(getattr(mesh, "edges_list", ())), dtype=bool)
+        else:
+            raise NotImplementedError(
+                f"Entity filtering for local discrete assembly is not yet supported for measure type {domain_type!r}."
+            )
+        if ids is None:
+            return integral
+        mask[np.asarray(ids, dtype=int).ravel()] = True
+        return Integral(integral.integrand, measure(defined_on=BitSet(mask)))
+
+    def _batch_from_variable_local_rows(
+        self,
+        *,
+        entity_ids: list[int],
+        gdofs_rows: list[np.ndarray],
+        K_rows: list[np.ndarray] | None = None,
+        F_rows: list[np.ndarray] | None = None,
+        entity_kind: str = "element",
+    ) -> LocalAssemblyBatch:
+        if not entity_ids:
+            return self._empty_local_batch(entity_kind=entity_kind)
+        widths = [int(np.asarray(row, dtype=int).size) for row in gdofs_rows]
+        n_loc = max(widths, default=int(self.me.n_dofs_local))
+        n_ent = len(entity_ids)
+        gdofs_map = np.empty((n_ent, n_loc), dtype=int)
+        K_elem = None if K_rows is None else np.zeros((n_ent, n_loc, n_loc), dtype=float)
+        F_elem = None if F_rows is None else np.zeros((n_ent, n_loc), dtype=float)
+        for i, (entity_id, gdofs_row) in enumerate(zip(entity_ids, gdofs_rows)):
+            gdofs = np.asarray(gdofs_row, dtype=int).reshape(-1)
+            pad_val = int(gdofs[-1]) if gdofs.size else 0
+            gdofs_map[i, :] = pad_val
+            if gdofs.size:
+                gdofs_map[i, : gdofs.size] = gdofs
+            if K_elem is not None:
+                loc = np.asarray(K_rows[i], dtype=float)
+                K_elem[i, : loc.shape[0], : loc.shape[1]] = loc
+            if F_elem is not None:
+                loc = np.asarray(F_rows[i], dtype=float).reshape(-1)
+                F_elem[i, : loc.shape[0]] = loc
+        return LocalAssemblyBatch(
+            K_elem=K_elem,
+            F_elem=F_elem,
+            element_ids=np.asarray(entity_ids, dtype=np.int32),
+            gdofs_map=gdofs_map,
+            entity_kind=str(entity_kind),
+        )
+
+    def _pad_local_batch_width(self, batch: LocalAssemblyBatch, width: int) -> LocalAssemblyBatch:
+        target_width = int(width)
+        current_width = int(np.asarray(batch.gdofs_map, dtype=int).shape[1]) if np.asarray(batch.gdofs_map).ndim == 2 else 0
+        if current_width == target_width:
+            return batch
+        if current_width > target_width:
+            raise ValueError(f"Cannot pad local batch from width {current_width} down to {target_width}.")
+        n_ent = int(np.asarray(batch.element_ids, dtype=np.int32).size)
+        gdofs_map = np.empty((n_ent, target_width), dtype=int)
+        src = np.asarray(batch.gdofs_map, dtype=int)
+        if current_width > 0:
+            gdofs_map[:, :current_width] = src
+            gdofs_map[:, current_width:] = src[:, current_width - 1 : current_width]
+        else:
+            gdofs_map.fill(0)
+        K_elem = None
+        F_elem = None
+        if batch.K_elem is not None:
+            K_elem = np.zeros((n_ent, target_width, target_width), dtype=float)
+            K_elem[:, :current_width, :current_width] = np.asarray(batch.K_elem, dtype=float)
+        if batch.F_elem is not None:
+            F_elem = np.zeros((n_ent, target_width), dtype=float)
+            F_elem[:, :current_width] = np.asarray(batch.F_elem, dtype=float)
+        return LocalAssemblyBatch(
+            K_elem=K_elem,
+            F_elem=F_elem,
+            element_ids=np.asarray(batch.element_ids, dtype=np.int32),
+            gdofs_map=gdofs_map,
+            entity_kind=str(batch.entity_kind),
+        )
+
+    def _concat_local_batches(self, batches: list[LocalAssemblyBatch], *, entity_kind: str | None = None) -> LocalAssemblyBatch:
+        nonempty = [batch for batch in batches if int(np.asarray(batch.element_ids, dtype=np.int32).size) > 0]
+        if not nonempty:
+            return self._empty_local_batch(entity_kind="element" if entity_kind is None else str(entity_kind))
+        width = max(int(np.asarray(batch.gdofs_map, dtype=int).shape[1]) for batch in nonempty)
+        padded = [self._pad_local_batch_width(batch, width) for batch in nonempty]
+        kind = str(entity_kind) if entity_kind is not None else (
+            str(padded[0].entity_kind) if len({str(batch.entity_kind) for batch in padded}) == 1 else "mixed"
+        )
+        K_blocks = [np.asarray(batch.K_elem, dtype=float) for batch in padded if batch.K_elem is not None]
+        F_blocks = [np.asarray(batch.F_elem, dtype=float) for batch in padded if batch.F_elem is not None]
+        return LocalAssemblyBatch(
+            K_elem=None if not K_blocks else np.concatenate(K_blocks, axis=0),
+            F_elem=None if not F_blocks else np.concatenate(F_blocks, axis=0),
+            element_ids=np.concatenate([np.asarray(batch.element_ids, dtype=np.int32) for batch in padded], axis=0),
+            gdofs_map=np.concatenate([np.asarray(batch.gdofs_map, dtype=int) for batch in padded], axis=0),
+            entity_kind=kind,
+        )
+
+    def _accumulate_local_batches(self, batches: list[LocalAssemblyBatch], *, default_entity_kind: str = "element") -> LocalAssemblyBatch:
+        nonempty = [batch for batch in batches if int(np.asarray(batch.element_ids, dtype=np.int32).size) > 0]
+        if not nonempty:
+            return self._empty_local_batch(entity_kind=default_entity_kind)
+        width = max(int(np.asarray(batch.gdofs_map, dtype=int).shape[1]) for batch in nonempty)
+        padded = [self._pad_local_batch_width(batch, width) for batch in nonempty]
+        seed = padded[0]
+        element_ids = np.asarray(seed.element_ids, dtype=np.int32)
+        gdofs_map = np.asarray(seed.gdofs_map, dtype=int)
+        K_elem = None if seed.K_elem is None else np.asarray(seed.K_elem, dtype=float).copy()
+        F_elem = None if seed.F_elem is None else np.asarray(seed.F_elem, dtype=float).copy()
+        entity_kind = str(seed.entity_kind)
+        for batch in padded[1:]:
+            if str(batch.entity_kind) != entity_kind:
+                raise NotImplementedError(
+                    "Local discrete assembly cannot positionally accumulate batches with differing entity kinds. "
+                    "Split the form by measure/domain before requesting local contributions."
+                )
+            if not np.array_equal(np.asarray(batch.element_ids, dtype=np.int32), element_ids):
+                raise NotImplementedError(
+                    "Local discrete assembly requires identical entity ordering across integrals of the same form."
+                )
+            if not np.array_equal(np.asarray(batch.gdofs_map, dtype=int), gdofs_map):
+                raise NotImplementedError(
+                    "Local discrete assembly requires identical local DOF maps across integrals of the same form."
+                )
+            if batch.K_elem is not None:
+                if K_elem is None:
+                    K_elem = np.zeros_like(np.asarray(batch.K_elem, dtype=float))
+                K_elem += np.asarray(batch.K_elem, dtype=float)
+            if batch.F_elem is not None:
+                if F_elem is None:
+                    F_elem = np.zeros_like(np.asarray(batch.F_elem, dtype=float))
+                F_elem += np.asarray(batch.F_elem, dtype=float)
+        return LocalAssemblyBatch(
+            K_elem=K_elem,
+            F_elem=F_elem,
+            element_ids=element_ids,
+            gdofs_map=gdofs_map,
+            entity_kind=entity_kind,
+        )
+
+    def _volume_jit_kernel_cache_key(
+        self,
+        integral,
+        *,
+        element_ids: np.ndarray,
+        full_local_layout: bool,
+    ) -> tuple:
+        element_ids_arr = np.asarray(element_ids, dtype=np.int32).ravel()
+        if isinstance(integral, _FusedIntegralGroup):
+            integral_key = ("group", tuple(int(id(item)) for item in integral.integrals))
+        else:
+            integral_key = ("single", int(id(integral)))
+        return (
+            integral_key,
+            bool(full_local_layout),
+            int(element_ids_arr.size),
+            bytes(element_ids_arr.tobytes()),
+        )
+
+    def _prepare_volume_jit_kernel(
+        self,
+        integral,
+        *,
+        element_ids: np.ndarray,
+        full_local_layout: bool,
+    ):
+        cache_key = self._volume_jit_kernel_cache_key(
+            integral,
+            element_ids=np.asarray(element_ids, dtype=np.int32),
+            full_local_layout=bool(full_local_layout),
+        )
+        cached = self._volume_jit_kernel_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        mesh = self.me.mesh
+        on_facet = integral.measure.on_facet
+        current_funcs = self._get_data_functions_objs(integral)
+        if isinstance(integral, _FusedIntegralGroup) and self.backend in {"cpp", "c++"}:
+            from pycutfem.jit.cpp_backend import compile_backend_cpp_group
+
+            runner, ir = compile_backend_cpp_group(
+                [item.integrand for item in integral.integrals],
+                self.dh,
+                self.me,
+                on_facet=on_facet,
+            )
+        else:
+            runner, ir = self._compile_backend(integral.integrand, self.dh, self.me, on_facet=on_facet)
+        _, need_hess, need_o3, need_o4 = self._find_req_derivs(integral, runner)
+
+        if full_local_layout:
+            active_cols = np.arange(int(self.me.n_dofs_local), dtype=np.int32)
+        else:
+            active_fields = _active_field_order(ir, self.me)
+            runner_active = getattr(runner, "active_fields", None)
+            if runner_active:
+                active_set = set(runner_active)
+                me_order = getattr(self.me, "field_names", ())
+                active_fields = tuple([f for f in me_order if f in active_set]) if me_order else tuple(runner_active)
+            active_cols = _active_columns(self.me, active_fields)
+
+        q_base = int(self._find_q_order(integral))
+        p_geo = int(getattr(mesh, "poly_order", 1))
+        q_infl = 2 * max(0, p_geo - 1)
+        q_order = q_base + q_infl
+        deformation = getattr(integral.measure, "deformation", None)
+
+        geo_args_all = self.dh.precompute_geometric_factors(
+            q_order,
+            need_hess=need_hess,
+            need_o3=need_o3,
+            need_o4=need_o4,
+            deformation=deformation,
+        )
+        qp_ref_all = geo_args_all.get("qp_ref", None)
+        if qp_ref_all is None:
+            raise RuntimeError("Volume JIT assembly requires qp_ref geometric data.")
+        ref_points = np.asarray(qp_ref_all, dtype=float)
+        if ref_points.ndim == 3:
+            raise NotImplementedError(
+                "QuadratureStateCoefficient is currently supported only for standard volume quadrature."
+            )
+        _, ref_weights = volume(mesh.element_type, q_order)
+        self._validate_quadrature_state_usage(
+            integral.integrand,
+            reference_points=ref_points,
+            reference_weights=np.asarray(ref_weights, dtype=float),
+            context=f"jit volume integral q={int(q_order)}",
+        )
+
+        pre_built = {}
+        n_total = int(np.asarray(geo_args_all["qp_phys"]).shape[0])
+        for key, val in geo_args_all.items():
+            if isinstance(val, np.ndarray) and val.ndim >= 1 and int(val.shape[0]) == n_total:
+                pre_built[key] = np.ascontiguousarray(val[np.asarray(element_ids, dtype=np.int32)])
+            else:
+                pre_built[key] = val
+        pre_built["entity_kind"] = "element"
+        pre_built["is_interface"] = False
+        pre_built["owner_id"] = np.ascontiguousarray(
+            np.asarray(geo_args_all.get("owner_id", geo_args_all.get("eids"))[np.asarray(element_ids, dtype=np.int32)], dtype=np.int32)
+        )
+
+        gdofs_map = np.vstack(
+            [self._elemental_gdofs_row(int(e), n_loc_expected=int(active_cols.size))[active_cols] for e in np.asarray(element_ids, dtype=np.int32)]
+        ).astype(np.int32)
+
+        basis_args = _build_jit_kernel_args(
+            ir,
+            integral.integrand,
+            self.me,
+            q_order,
+            dof_handler=self.dh,
+            gdofs_map=gdofs_map,
+            active_cols=active_cols,
+            param_order=runner.param_order,
+            pre_built=pre_built,
+        )
+        static_args = {
+            "gdofs_map": gdofs_map,
+            "node_coords": self.dh.get_all_dof_coords(),
+            **pre_built,
+            **basis_args,
+        }
+        if not full_local_layout:
+            static_args = _compress_static_for_active(static_args, self.me, active_cols)
+            gdofs_map = np.asarray(static_args.get("gdofs_map", gdofs_map), dtype=np.int32)
+
+        cached_value = (runner, current_funcs, static_args, gdofs_map)
+        self._volume_jit_kernel_cache[cache_key] = cached_value
+        return cached_value
+
+    def _assemble_volume_jit_local_batch(self, integral: Integral, *, element_ids: np.ndarray) -> LocalVolumeAssemblyBatch:
+        runner, current_funcs, static_args, gdofs_map = self._prepare_volume_jit_kernel(
+            integral,
+            element_ids=np.asarray(element_ids, dtype=np.int32),
+            full_local_layout=True,
+        )
+        K_loc, F_loc, _ = runner(current_funcs, static_args)
+        return LocalVolumeAssemblyBatch(
+            K_elem=None if K_loc is None else np.asarray(K_loc, dtype=float),
+            F_elem=None if F_loc is None else np.asarray(F_loc, dtype=float),
+            element_ids=np.asarray(element_ids, dtype=np.int32),
+            gdofs_map=np.asarray(gdofs_map, dtype=int),
+        )
+
+    def _assemble_volume_python_local_batch(self, integral: Integral, *, element_ids: np.ndarray) -> LocalVolumeAssemblyBatch:
+        mesh = self.me.mesh
+        trial, test = _trial_test(integral.integrand)
+        is_rhs = trial is None and test is not None
+        if trial is None and test is None:
+            raise NotImplementedError(
+                "assemble_volume_local_contributions does not yet support pure scalar functionals. "
+                "Use evaluate_volume_expressions_on_quadrature for quadrature data or a linear/bilinear form for local blocks."
+            )
+
+        fields = self._fields_for(integral.integrand)
+        q_base = int(self._find_q_order(integral))
+        p_geo = int(getattr(mesh, "poly_order", 1))
+        q_infl = 2 * max(0, p_geo - 1)
+        q_order = q_base + q_infl
+        qp, qw = volume(mesh.element_type, q_order)
+        self._validate_quadrature_state_usage(
+            integral.integrand,
+            reference_points=np.asarray(qp, dtype=float),
+            reference_weights=np.asarray(qw, dtype=float),
+            context=f"volume local batch q={int(q_order)}",
+        )
+
+        n_loc = int(self.me.n_dofs_local)
+        n_elem = int(np.asarray(element_ids, dtype=np.int32).shape[0])
+        K_elem = None if is_rhs else np.zeros((n_elem, n_loc, n_loc), dtype=float)
+        F_elem = np.zeros((n_elem, n_loc), dtype=float) if is_rhs else None
+        gdofs_map = np.vstack([self._elemental_gdofs_row(int(eid), n_loc_expected=n_loc) for eid in np.asarray(element_ids, dtype=np.int32)]).astype(int)
+
+        old_rhs = self.ctx.get("rhs", None)
+        old_is_interface = self.ctx.get("is_interface", None)
+        old_is_ghost = self.ctx.get("is_ghost", None)
+        old_measure_side = self.ctx.get("measure_side", None)
+        self.ctx["rhs"] = is_rhs
+        self.ctx["is_interface"] = False
+        self.ctx["is_ghost"] = False
+        self.ctx["measure_side"] = None
+        try:
+            for out_eid, eid in enumerate(np.asarray(element_ids, dtype=np.int32).tolist()):
+                loc = np.zeros((n_loc,), dtype=float) if is_rhs else np.zeros((n_loc, n_loc), dtype=float)
+                for q, ((xi, eta), w) in enumerate(zip(qp, qw)):
+                    J = transform.jacobian(mesh, int(eid), (float(xi), float(eta)))
+                    detJ = abs(np.linalg.det(J))
+                    Ji = np.linalg.inv(J)
+
+                    self._basis_cache.clear()
+                    self._coeff_cache.clear()
+                    self._collapsed_cache.clear()
+                    for f in fields:
+                        fam = getattr(self.me, "_field_families", {}).get(f, "Lagrange")
+                        if fam == "RT":
+                            V = np.asarray(self.me.tabulate_value(f, float(xi), float(eta), element_id=int(eid)), dtype=float)
+                            G = np.asarray(self.me.tabulate_grad(f, float(xi), float(eta), element_id=int(eid)), dtype=float)
+                            H = np.asarray(self.me.tabulate_hessian(f, float(xi), float(eta), element_id=int(eid)), dtype=float)
+                            divV = np.asarray(self.me.tabulate_div(f, float(xi), float(eta), element_id=int(eid)), dtype=float).ravel()
+                            sgn = np.asarray(self.dh.element_signs[f][int(eid)], dtype=float).ravel()
+                            if sgn.shape[0] != V.shape[0]:
+                                raise RuntimeError(f"element_signs length mismatch for RT field '{f}' on element {eid}.")
+                            V = sgn[:, None] * V
+                            G = sgn[:, None, None] * G
+                            H = sgn[:, None, None, None] * H
+                            divV = sgn * divV
+
+                            sl = self.me.component_dof_slices[f]
+                            hdiv_val = np.zeros((2, n_loc), dtype=float)
+                            hdiv_grad = np.zeros((2, n_loc, 2), dtype=float)
+                            hdiv_hess = np.zeros((2, n_loc, 2, 2), dtype=float)
+                            hdiv_val[:, sl] = V.T
+                            hdiv_grad[:, sl, :] = np.transpose(G, (1, 0, 2))
+                            hdiv_hess[:, sl, :, :] = np.transpose(H, (1, 0, 2, 3))
+                            hdiv_div = np.zeros((n_loc,), dtype=float)
+                            hdiv_div[sl] = divV
+                            self._basis_cache[f] = {
+                                "hdiv_val": hdiv_val,
+                                "hdiv_grad": hdiv_grad,
+                                "hdiv_hess": hdiv_hess,
+                                "hdiv_div": hdiv_div,
+                            }
+                            continue
+                        self._basis_cache[f] = {
+                            "val": self.me.basis(f, xi, eta),
+                            "grad": self.me.grad_basis(f, xi, eta) @ Ji,
+                        }
+
+                    self.ctx["eid"] = int(eid)
+                    self.ctx["q"] = int(q)
+                    self.ctx["qstate_owner_id"] = int(eid)
+                    self.ctx["x_phys"] = transform.x_mapping(mesh, int(eid), (float(xi), float(eta)))
+                    loc += float(w * detJ) * self._visit(integral.integrand)
+
+                if is_rhs:
+                    F_elem[out_eid, :] += np.asarray(loc, dtype=float)
+                else:
+                    K_elem[out_eid, :, :] += np.asarray(loc, dtype=float)
+        finally:
+            if old_rhs is None:
+                self.ctx.pop("rhs", None)
+            else:
+                self.ctx["rhs"] = old_rhs
+            if old_is_interface is None:
+                self.ctx.pop("is_interface", None)
+            else:
+                self.ctx["is_interface"] = old_is_interface
+            if old_is_ghost is None:
+                self.ctx.pop("is_ghost", None)
+            else:
+                self.ctx["is_ghost"] = old_is_ghost
+            if old_measure_side is None:
+                self.ctx.pop("measure_side", None)
+            else:
+                self.ctx["measure_side"] = old_measure_side
+            for key in ("eid", "x_phys", "q", "qstate_owner_id"):
+                self.ctx.pop(key, None)
+
+        return LocalVolumeAssemblyBatch(
+            K_elem=K_elem,
+            F_elem=F_elem,
+            element_ids=np.asarray(element_ids, dtype=np.int32),
+            gdofs_map=gdofs_map,
+        )
+
+    def assemble_volume_local_contributions(
+        self,
+        form_or_equation,
+        *,
+        element_ids=None,
+        need_matrix: bool = True,
+        need_vector: bool = True,
+    ) -> LocalVolumeAssemblyBatch:
+        """
+        Assemble explicit element-local volume contributions without scattering.
+
+        This is the backend-neutral bridge for discrete operators that want
+        Kratos-style local matrix/vector blocks but still define those blocks
+        through the existing UFL form setup.
+        """
+        from pycutfem.ufl.forms import Equation, Form
+
+        p_geo = int(getattr(self.me.mesh, "poly_order", 1))
+        if isinstance(form_or_equation, Equation):
+            plan = _plan_equation_assembly(
+                form_or_equation,
+                compiler=self,
+                p_geo=p_geo,
+                backend=self.backend,
+                need_matrix=bool(need_matrix),
+                need_vector=bool(need_vector),
+                vector_first=True,
+            )
+            planned_units = [unit for stage in plan.stages for unit in stage.units]
+        elif isinstance(form_or_equation, Form):
+            planned_units = list(getattr(form_or_equation, "integrals", []))
+        elif isinstance(form_or_equation, Integral):
+            planned_units = [form_or_equation]
+        else:
+            raise TypeError(
+                "assemble_volume_local_contributions expects an Equation, Form, or volume Integral."
+            )
+
+        def _unit_enabled(unit) -> bool:
+            trial, test = _trial_test(unit.integrand)
+            if trial is not None and test is not None:
+                return bool(need_matrix)
+            if trial is None and test is not None:
+                return bool(need_vector)
+            return False
+
+        planned_units = [unit for unit in planned_units if _unit_enabled(unit)]
+
+        base_element_ids = self._resolve_volume_local_element_ids(element_ids)
+        if base_element_ids.size == 0:
+            return LocalVolumeAssemblyBatch(
+                K_elem=None,
+                F_elem=None,
+                element_ids=base_element_ids,
+                gdofs_map=np.empty((0, int(self.me.n_dofs_local)), dtype=int),
+            )
+
+        gdofs_map = np.vstack(
+            [self._elemental_gdofs_row(int(eid), n_loc_expected=int(self.me.n_dofs_local)) for eid in base_element_ids]
+        ).astype(int)
+        row_by_eid = {int(eid): idx for idx, eid in enumerate(base_element_ids.tolist())}
+        K_elem = None
+        F_elem = None
+
+        def _accumulate_batch(batch: LocalVolumeAssemblyBatch) -> None:
+            nonlocal K_elem, F_elem
+            if batch.element_ids.size == 0:
+                return
+            rows = np.asarray([row_by_eid[int(eid)] for eid in np.asarray(batch.element_ids, dtype=np.int32)], dtype=int)
+            if batch.K_elem is not None:
+                if K_elem is None:
+                    K_elem = np.zeros((base_element_ids.size, batch.K_elem.shape[1], batch.K_elem.shape[2]), dtype=float)
+                K_elem[rows, :, :] += np.asarray(batch.K_elem, dtype=float)
+            if batch.F_elem is not None:
+                if F_elem is None:
+                    F_elem = np.zeros((base_element_ids.size, batch.F_elem.shape[1]), dtype=float)
+                F_elem[rows, :] += np.asarray(batch.F_elem, dtype=float)
+
+        if self.backend in {"cpp", "c++"} and not isinstance(form_or_equation, Equation):
+            planned_units = _plan_integral_execution_units(
+                [integral for integral in planned_units if isinstance(integral, Integral)],
+                compiler=self,
+                p_geo=p_geo,
+                backend=self.backend,
+            )
+
+        for integral in planned_units:
+            if str(getattr(integral.measure, "domain_type", "")).strip().lower() != "volume":
+                raise NotImplementedError(
+                    "assemble_volume_local_contributions currently supports only standard volume integrals."
+                )
+            if getattr(integral.measure, "level_set", None) is not None:
+                raise NotImplementedError(
+                    "assemble_volume_local_contributions does not yet support cut-volume integrals."
+                )
+            subset_eids = self._integral_volume_element_ids(integral, base_element_ids=base_element_ids)
+            if subset_eids.size == 0:
+                continue
+            if self._is_jit_backend():
+                batch = self._assemble_volume_jit_local_batch(integral, element_ids=subset_eids)
+            else:
+                batch = self._assemble_volume_python_local_batch(integral, element_ids=subset_eids)
+            _accumulate_batch(batch)
+
+        return LocalVolumeAssemblyBatch(
+            K_elem=K_elem,
+            F_elem=F_elem,
+            element_ids=base_element_ids,
+            gdofs_map=gdofs_map,
+            entity_kind="element",
+        )
+
+    def _local_forms_from_input(self, form_or_equation):
+        from pycutfem.ufl.forms import Equation, Form
+
+        if isinstance(form_or_equation, Equation):
+            return [frm for frm in (form_or_equation.a, form_or_equation.L) if frm is not None]
+        if isinstance(form_or_equation, Form):
+            return [form_or_equation]
+        if isinstance(form_or_equation, Integral):
+            return [form_or_equation]
+        raise TypeError(
+            "Local discrete assembly expects an Equation, Form, or Integral."
+        )
+
+    def assemble_exterior_facet_local_contributions(
+        self,
+        form_or_equation,
+        *,
+        edge_ids=None,
+    ) -> LocalAssemblyBatch:
+        forms = self._local_forms_from_input(form_or_equation)
+        batches: list[LocalAssemblyBatch] = []
+        for form in forms:
+            integrals = [form] if isinstance(form, Integral) else list(getattr(form, "integrals", []))
+            for integral in integrals:
+                if not isinstance(integral, Integral):
+                    continue
+                if str(getattr(integral.measure, "domain_type", "")).strip().lower() != "exterior_facet":
+                    raise NotImplementedError(
+                        "assemble_exterior_facet_local_contributions only supports dS/exterior_facet integrals."
+                    )
+                integral_loc = self._restrict_local_integral_entities(integral, edge_ids)
+                if self._is_jit_backend():
+                    batches.append(self._assemble_boundary_edge_jit_local_batch(integral_loc))
+                else:
+                    batches.append(self._assemble_boundary_edge_python_local_batch(integral_loc))
+        return self._accumulate_local_batches(batches, default_entity_kind="edge")
+
+    def assemble_interface_local_contributions(
+        self,
+        form_or_equation,
+        *,
+        element_ids=None,
+    ) -> LocalAssemblyBatch:
+        forms = self._local_forms_from_input(form_or_equation)
+        batches: list[LocalAssemblyBatch] = []
+        for form in forms:
+            integrals = [form] if isinstance(form, Integral) else list(getattr(form, "integrals", []))
+            for integral in integrals:
+                if not isinstance(integral, Integral):
+                    continue
+                if str(getattr(integral.measure, "domain_type", "")).strip().lower() != "interface":
+                    raise NotImplementedError(
+                        "assemble_interface_local_contributions only supports dInterface/interface integrals."
+                    )
+                integral_loc = self._restrict_local_integral_entities(integral, element_ids)
+                level_set = getattr(integral_loc.measure, "level_set", None)
+                self._ensure_mesh_classified(level_set, need_interface_segments=True)
+                mesh = self.me.mesh
+                aligned_edges = None
+                try:
+                    aligned_edges = mesh.edge_bitset("interface")
+                except Exception:
+                    aligned_edges = None
+                sub_batches: list[LocalAssemblyBatch] = []
+                has_aligned = False
+                if aligned_edges is not None:
+                    try:
+                        has_aligned = aligned_edges.cardinality() > 0
+                    except Exception:
+                        has_aligned = bool(aligned_edges)
+                if has_aligned:
+                    if self.backend == "python":
+                        sub_batches.append(self._assemble_aligned_interface_python_local_batch(integral_loc, aligned_edges))
+                    else:
+                        sub_batches.append(self._assemble_aligned_interface_jit_local_batch(integral_loc, aligned_edges))
+                if self.backend == "python":
+                    sub_batches.append(self._assemble_interface_python_local_batch(integral_loc))
+                else:
+                    sub_batches.append(self._assemble_interface_jit_local_batch(integral_loc))
+                batches.append(self._concat_local_batches(sub_batches))
+        return self._accumulate_local_batches(batches, default_entity_kind="mixed")
+
+    def assemble_nonmatching_interface_local_contributions(
+        self,
+        form_or_equation,
+    ) -> LocalAssemblyBatch:
+        forms = self._local_forms_from_input(form_or_equation)
+        batches: list[LocalAssemblyBatch] = []
+        for form in forms:
+            integrals = [form] if isinstance(form, Integral) else list(getattr(form, "integrals", []))
+            for integral in integrals:
+                if not isinstance(integral, Integral):
+                    continue
+                if str(getattr(integral.measure, "domain_type", "")).strip().lower() != "nonmatching_interface":
+                    raise NotImplementedError(
+                        "assemble_nonmatching_interface_local_contributions only supports dNonmatchingInterface integrals."
+                    )
+                if self._is_jit_backend():
+                    batches.append(self._assemble_nonmatching_interface_jit_local_batch(integral))
+                else:
+                    batches.append(self._assemble_nonmatching_interface_python_local_batch(integral))
+        return self._accumulate_local_batches(batches, default_entity_kind="edge")
+
+    def assemble_trace_link_local_contributions(
+        self,
+        form_or_equation,
+    ) -> LocalAssemblyBatch:
+        forms = self._local_forms_from_input(form_or_equation)
+        batches: list[LocalAssemblyBatch] = []
+        for form in forms:
+            integrals = [form] if isinstance(form, Integral) else list(getattr(form, "integrals", []))
+            for integral in integrals:
+                if not isinstance(integral, Integral):
+                    continue
+                if str(getattr(integral.measure, "domain_type", "")).strip().lower() != "trace_link":
+                    raise NotImplementedError(
+                        "assemble_trace_link_local_contributions only supports dTraceLink integrals."
+                    )
+                if self._is_jit_backend():
+                    batches.append(self._assemble_nonmatching_interface_jit_local_batch(integral))
+                else:
+                    batches.append(self._assemble_nonmatching_interface_python_local_batch(integral))
+        return self._accumulate_local_batches(batches, default_entity_kind="edge")
+
+    def assemble_local_contributions(
+        self,
+        form_or_equation,
+        *,
+        entity_ids=None,
+        need_matrix: bool = True,
+        need_vector: bool = True,
+    ) -> LocalAssemblyBatch:
+        if isinstance(form_or_equation, CondensedQuadratureLocalSystem):
+            return self.assemble_condensed_local_contributions(form_or_equation, element_ids=entity_ids)
+        forms = self._local_forms_from_input(form_or_equation)
+        domain_types = {
+            str(getattr(integral.measure, "domain_type", "")).strip().lower()
+            for form in forms
+            for integral in ([form] if isinstance(form, Integral) else list(getattr(form, "integrals", [])))
+            if isinstance(integral, Integral)
+        }
+        if not domain_types:
+            raise ValueError("No integrals found for local discrete assembly.")
+        if len(domain_types) != 1:
+            raise NotImplementedError(
+                "assemble_local_contributions currently expects all integrals to use the same measure/domain type."
+            )
+        domain_type = next(iter(domain_types))
+        if domain_type == "volume":
+            return self.assemble_volume_local_contributions(
+                form_or_equation,
+                element_ids=entity_ids,
+                need_matrix=bool(need_matrix),
+                need_vector=bool(need_vector),
+            )
+        if domain_type == "exterior_facet":
+            return self.assemble_exterior_facet_local_contributions(form_or_equation, edge_ids=entity_ids)
+        if domain_type == "interface":
+            return self.assemble_interface_local_contributions(form_or_equation, element_ids=entity_ids)
+        if domain_type == "nonmatching_interface":
+            if entity_ids is not None:
+                raise NotImplementedError(
+                    "assemble_local_contributions does not yet support explicit entity_ids filtering for nonmatching interfaces."
+                )
+            return self.assemble_nonmatching_interface_local_contributions(form_or_equation)
+        if domain_type == "trace_link":
+            if entity_ids is not None:
+                raise NotImplementedError(
+                    "assemble_local_contributions does not yet support explicit entity_ids filtering for trace-link domains."
+                )
+            return self.assemble_trace_link_local_contributions(form_or_equation)
+        raise NotImplementedError(
+            f"assemble_local_contributions does not yet support measure/domain type {domain_type!r}."
+        )
+
+    def assemble_condensed_local_contributions(
+        self,
+        condensed: CondensedQuadratureLocalSystem,
+        *,
+        element_ids=None,
+    ) -> LocalAssemblyBatch:
+        elem_ids = self._resolve_volume_local_element_ids(element_ids)
+        base_batch = self.assemble_volume_local_contributions(
+            condensed.base_form_or_equation,
+            element_ids=elem_ids,
+        )
+        left_batches = self.evaluate_volume_local_expressions_on_quadrature(
+            {f"left_{i}": expr for i, expr in enumerate(tuple(condensed.coupling_left))},
+            layout=condensed.quadrature_layout,
+            element_ids=elem_ids,
+        )
+        right_batches = self.evaluate_volume_local_expressions_on_quadrature(
+            {f"right_{i}": expr for i, expr in enumerate(tuple(condensed.coupling_right))},
+            layout=condensed.quadrature_layout,
+            element_ids=elem_ids,
+        )
+        hidden_residual = self.evaluate_volume_expressions_on_quadrature(
+            {f"r_{i}": expr for i, expr in enumerate(tuple(condensed.hidden_residual))},
+            layout=condensed.quadrature_layout,
+            element_ids=elem_ids,
+        )
+        hidden_jacobian = self.evaluate_volume_expressions_on_quadrature(
+            {
+                f"A_{i}_{j}": expr
+                for i, row in enumerate(tuple(tuple(r) for r in condensed.hidden_jacobian))
+                for j, expr in enumerate(row)
+            },
+            layout=condensed.quadrature_layout,
+            element_ids=elem_ids,
+        )
+
+        left_first = next(iter(left_batches.values()))
+        right_first = next(iter(right_batches.values()))
+        if left_first.mode != "vector" or right_first.mode != "vector":
+            raise ValueError("Condensed local systems require vector-valued coupling expressions.")
+        if left_first.gdofs_map is None or right_first.gdofs_map is None:
+            raise ValueError("Condensed local systems require local DOF maps for coupling expressions.")
+        if not np.array_equal(np.asarray(left_first.gdofs_map, dtype=int), np.asarray(right_first.gdofs_map, dtype=int)):
+            raise ValueError("Left/right condensed coupling expressions must share the same local DOF map.")
+        if not np.array_equal(np.asarray(base_batch.gdofs_map, dtype=int), np.asarray(left_first.gdofs_map, dtype=int)):
+            raise ValueError("Condensed local system base form and coupling expressions must share the same local DOF map.")
+
+        n_hidden = int(len(tuple(condensed.hidden_residual)))
+        left = np.stack(
+            [np.asarray(left_batches[f"left_{i}"].values, dtype=float) for i in range(n_hidden)],
+            axis=2,
+        )
+        right = np.stack(
+            [np.asarray(right_batches[f"right_{i}"].values, dtype=float) for i in range(n_hidden)],
+            axis=2,
+        )
+        residual = np.stack(
+            [np.asarray(hidden_residual[f"r_{i}"], dtype=float) for i in range(n_hidden)],
+            axis=2,
+        )
+        jacobian = np.zeros(
+            (
+                int(elem_ids.shape[0]),
+                int(condensed.quadrature_layout.n_qp),
+                n_hidden,
+                n_hidden,
+            ),
+            dtype=float,
+        )
+        for i in range(n_hidden):
+            for j in range(n_hidden):
+                jacobian[:, :, i, j] = np.asarray(hidden_jacobian[f"A_{i}_{j}"], dtype=float)
+
+        weights = self._volume_physical_quadrature_weights(
+            layout=condensed.quadrature_layout,
+            element_ids=elem_ids,
+        )
+        K_corr, F_corr = condense_local_system(
+            left,
+            right,
+            jacobian,
+            residual,
+            weights,
+            backend=str(self.backend),
+            sign=float(condensed.sign),
+        )
+        K_base = None if base_batch.K_elem is None else np.asarray(base_batch.K_elem, dtype=float)
+        F_base = None if base_batch.F_elem is None else np.asarray(base_batch.F_elem, dtype=float)
+        K_total = np.asarray(K_corr, dtype=float) if K_base is None else np.asarray(K_base + K_corr, dtype=float)
+        F_total = np.asarray(F_corr, dtype=float) if F_base is None else np.asarray(F_base + F_corr, dtype=float)
+        return LocalAssemblyBatch(
+            K_elem=K_total,
+            F_elem=F_total,
+            element_ids=np.asarray(base_batch.element_ids, dtype=np.int32),
+            gdofs_map=np.asarray(base_batch.gdofs_map, dtype=int),
+            entity_kind=str(base_batch.entity_kind),
+        )
+
+    def assemble_and_scatter_local_contributions_reduced(
+        self,
+        form_or_equation,
+        *,
+        solver,
+        A_red,
+        R_red,
+        need_matrix: bool,
+        entity_ids=None,
+    ):
+        """
+        Assemble local contributions and inject them directly into a solver-owned
+        reduced system.
+
+        This keeps symbolic local assembly inside the compiler/solver boundary
+        and avoids a second runtime post-processing merge step in operator code.
+        """
+        if isinstance(form_or_equation, CondensedQuadratureLocalSystem):
+            return self.assemble_and_scatter_condensed_local_contributions_reduced(
+                form_or_equation,
+                solver=solver,
+                A_red=A_red,
+                R_red=R_red,
+                need_matrix=bool(need_matrix),
+                element_ids=entity_ids,
+            )
+        batch = self.assemble_local_contributions(
+            form_or_equation,
+            entity_ids=entity_ids,
+            need_matrix=bool(need_matrix),
+            need_vector=True,
+        )
+        return solver.scatter_element_contribs_reduced(
+            K_elem=batch.K_elem if bool(need_matrix) else None,
+            F_elem=batch.F_elem,
+            element_ids=batch.element_ids,
+            gdofs_map=batch.gdofs_map,
+            A_red=A_red,
+            R_red=R_red,
+        )
+
+    def assemble_and_scatter_condensed_local_contributions_reduced(
+        self,
+        condensed: CondensedQuadratureLocalSystem,
+        *,
+        solver,
+        A_red,
+        R_red,
+        need_matrix: bool,
+        element_ids=None,
+    ):
+        elem_ids = self._resolve_volume_local_element_ids(element_ids)
+        base_batch = self.assemble_volume_local_contributions(
+            condensed.base_form_or_equation,
+            element_ids=elem_ids,
+            need_matrix=bool(need_matrix),
+        )
+        A_red, R_red = solver.scatter_element_contribs_reduced(
+            K_elem=base_batch.K_elem if bool(need_matrix) else None,
+            F_elem=base_batch.F_elem,
+            element_ids=base_batch.element_ids,
+            gdofs_map=base_batch.gdofs_map,
+            A_red=A_red,
+            R_red=R_red,
+        )
+
+        left_batches = self.evaluate_volume_local_expressions_on_quadrature(
+            {f"left_{i}": expr for i, expr in enumerate(tuple(condensed.coupling_left))},
+            layout=condensed.quadrature_layout,
+            element_ids=elem_ids,
+        )
+        right_batches = self.evaluate_volume_local_expressions_on_quadrature(
+            {f"right_{i}": expr for i, expr in enumerate(tuple(condensed.coupling_right))},
+            layout=condensed.quadrature_layout,
+            element_ids=elem_ids,
+        )
+        hidden_residual = self.evaluate_volume_expressions_on_quadrature(
+            {f"r_{i}": expr for i, expr in enumerate(tuple(condensed.hidden_residual))},
+            layout=condensed.quadrature_layout,
+            element_ids=elem_ids,
+        )
+        hidden_jacobian = self.evaluate_volume_expressions_on_quadrature(
+            {
+                f"A_{i}_{j}": expr
+                for i, row in enumerate(tuple(tuple(r) for r in condensed.hidden_jacobian))
+                for j, expr in enumerate(row)
+            },
+            layout=condensed.quadrature_layout,
+            element_ids=elem_ids,
+        )
+
+        left_first = next(iter(left_batches.values()))
+        right_first = next(iter(right_batches.values()))
+        if left_first.mode != "vector" or right_first.mode != "vector":
+            raise ValueError("Condensed local systems require vector-valued coupling expressions.")
+        if left_first.gdofs_map is None or right_first.gdofs_map is None:
+            raise ValueError("Condensed local systems require local DOF maps for coupling expressions.")
+        if not np.array_equal(np.asarray(left_first.gdofs_map, dtype=int), np.asarray(right_first.gdofs_map, dtype=int)):
+            raise ValueError("Left/right condensed coupling expressions must share the same local DOF map.")
+        if not np.array_equal(np.asarray(base_batch.gdofs_map, dtype=int), np.asarray(left_first.gdofs_map, dtype=int)):
+            raise ValueError("Condensed local system base form and coupling expressions must share the same local DOF map.")
+
+        n_hidden = int(len(tuple(condensed.hidden_residual)))
+        left = np.stack(
+            [np.asarray(left_batches[f"left_{i}"].values, dtype=float) for i in range(n_hidden)],
+            axis=2,
+        )
+        right = np.stack(
+            [np.asarray(right_batches[f"right_{i}"].values, dtype=float) for i in range(n_hidden)],
+            axis=2,
+        )
+        residual = np.stack(
+            [np.asarray(hidden_residual[f"r_{i}"], dtype=float) for i in range(n_hidden)],
+            axis=2,
+        )
+        jacobian = np.zeros(
+            (
+                int(elem_ids.shape[0]),
+                int(condensed.quadrature_layout.n_qp),
+                n_hidden,
+                n_hidden,
+            ),
+            dtype=float,
+        )
+        for i in range(n_hidden):
+            for j in range(n_hidden):
+                jacobian[:, :, i, j] = np.asarray(hidden_jacobian[f"A_{i}_{j}"], dtype=float)
+
+        weights = self._volume_physical_quadrature_weights(
+            layout=condensed.quadrature_layout,
+            element_ids=elem_ids,
+        )
+        K_corr, F_corr = condense_local_system(
+            left,
+            right,
+            jacobian,
+            residual,
+            weights,
+            backend=str(self.backend),
+            sign=float(condensed.sign),
+        )
+        return solver.scatter_element_contribs_reduced(
+            K_elem=np.asarray(K_corr, dtype=float) if bool(need_matrix) else None,
+            F_elem=np.asarray(F_corr, dtype=float),
+            element_ids=np.asarray(base_batch.element_ids, dtype=np.int32),
+            gdofs_map=np.asarray(base_batch.gdofs_map, dtype=int),
+            A_red=A_red,
+            R_red=R_red,
+        )
     
     def _active_side(self, default: str | None = None) -> str:
         """
@@ -365,6 +2774,18 @@ class FormCompiler:
                     m_local = mask_dict.get(field)
                     if m_local is not None and len(row_field) == len(m_local):
                         row_field = row_field * m_local  # apply while still field-local
+            use_mortar = bool(self.ctx.get("use_mortar_projectors", False))
+            if use_mortar:
+                proj_dict = self.ctx.get("pos_P_by_field" if side == '+' else "neg_P_by_field", {})
+                P = proj_dict.get(field)
+                if P is not None and P.size:
+                    if self.ctx.get("debug_mortar", False):
+                        print(f"[mortar] projecting field {field} on side {side}: row len {len(row_field)}, P shape {P.shape}")
+                    row_field = row_field @ P
+                    maps_red = self.ctx.get("pos_map_by_field_reduced" if side == '+' else "neg_map_by_field_reduced", {})
+                    amap_reduced = maps_red.get(field)
+                    if amap_reduced is not None:
+                        amap = amap_reduced
 
             # Pad to union layout only if assembling a mat/vec
             if g is not None:
@@ -428,7 +2849,17 @@ class FormCompiler:
         x_phys = self.ctx.get("x_phys")
         if eid is None or x_phys is None:
             raise KeyError("Derivative requested outside element context (missing 'eid'/'x_phys').")
-        xi, eta = transform.inverse_mapping(self.me.mesh, int(eid), np.asarray(x_phys))
+        # Prefer reference coordinates when the assembler provides them.
+        # This avoids an inverse-mapping fallback that becomes invalid under
+        # isoparametric deformations (x_phys lives on the deformed geometry).
+        xi_eta = self.ctx.get("_xi_eta")
+        if xi_eta is not None:
+            try:
+                xi, eta = float(xi_eta[0]), float(xi_eta[1])
+            except Exception:
+                xi, eta = transform.inverse_mapping(self.me.mesh, int(eid), np.asarray(x_phys))
+        else:
+            xi, eta = transform.inverse_mapping(self.me.mesh, int(eid), np.asarray(x_phys))
         row = self._phys_scalar_deriv_row(field, float(xi), float(eta), ox, oy, int(eid))
 
         # If we just computed one Hessian entry and none cached yet, compute all and store
@@ -498,7 +2929,17 @@ class FormCompiler:
             if g is not None:
                 return g
         if 'eid' in self.ctx:           # matrix/vector path
-            return self.dh.get_elemental_dofs(self.ctx["eid"])
+            eid = int(self.ctx["eid"])
+            gdofs = self.dh.get_elemental_dofs(eid)
+            # XFEM: when the current element-local layout is expanded, gather the
+            # enriched DOFs too so coefficient evaluation sees the full space.
+            try:
+                n_expect = int(getattr(self.me, "n_dofs_local", len(gdofs)))
+            except Exception:
+                n_expect = int(len(gdofs))
+            if hasattr(self.dh, "get_elemental_dofs_xfem") and int(len(gdofs)) != n_expect:
+                return self.dh.get_elemental_dofs_xfem(eid)
+            return gdofs
         return self.ctx.get('global_dofs')
     
     def _visit_Restriction(self, n: Restriction):
@@ -513,8 +2954,38 @@ class FormCompiler:
             # No element context (e.g., early scalar eval) → do nothing.
             in_domain = True
         else:
-            in_domain = (n.domain[eid] if hasattr(n.domain, "__getitem__")
-                         else (eid in n.domain))
+            # For edge-based assembly (ghost facets / aligned interface), ctx["eid"] is an
+            # *edge id*, while Restriction domains are typically *element* BitSets.
+            # Map the check to the owner element on the active side whenever possible.
+            dom = n.domain
+            if hasattr(dom, "__getitem__"):
+                dom_len = len(dom)
+                mesh = getattr(self.me, "mesh", None)
+                n_elem = len(mesh.elements_list) if mesh is not None else None
+                n_edge = len(mesh.edges_list) if mesh is not None else None
+
+                pos_eid = self.ctx.get("pos_eid", None)
+                neg_eid = self.ctx.get("neg_eid", None)
+
+                if n_elem is not None and dom_len == n_elem and (pos_eid is not None or neg_eid is not None):
+                    side = getattr(n.operand, "side", None)
+                    if side == "+" and pos_eid is not None:
+                        in_domain = bool(dom[int(pos_eid)])
+                    elif side == "-" and neg_eid is not None:
+                        in_domain = bool(dom[int(neg_eid)])
+                    elif pos_eid is not None and neg_eid is not None:
+                        in_domain = bool(dom[int(pos_eid)]) or bool(dom[int(neg_eid)])
+                    elif pos_eid is not None:
+                        in_domain = bool(dom[int(pos_eid)])
+                    else:
+                        in_domain = bool(dom[int(neg_eid)])
+                elif n_edge is not None and dom_len == n_edge:
+                    in_domain = bool(dom[int(eid)])
+                else:
+                    # Default: treat ctx["eid"] as the domain index (volume / element-interface paths).
+                    in_domain = bool(dom[int(eid)])
+            else:
+                in_domain = (eid in dom)
 
         # 2. Check if the element is in the active domain.
         if in_domain:
@@ -537,20 +3008,35 @@ class FormCompiler:
             result = self._visit(n.operand)
             
             if isinstance(result, (VecOpInfo, GradOpInfo)):
-                # Use the overloaded multiplication to create a zeroed-out copy.
                 return result * 0.0
             elif isinstance(result, np.ndarray):
-                # For raw numpy arrays, just return a zero-filled array of the same shape.
                 return np.zeros_like(result)
-            else: # for scalars
+            elif result is None:
+                return 0.0
+            else:
                 return 0.0
 
     def _apply_restriction_mask(self, value, node):
         """Apply per-side union masks after evaluating a Restriction operand."""
         if value is None:
-            return value
+            return 0.0
 
-        side = self._get_side()
+        def _resolve_side():
+            # Prefer the side captured on the evaluated value; fall back to node hints.
+            s = getattr(value, "side", None)
+            if s in ("+", "-"):
+                return s
+            op = getattr(node, "operand", None)
+            if isinstance(op, Pos):
+                return "+"
+            if isinstance(op, Neg):
+                return "-"
+            side_attr = getattr(op, "side", None)
+            if side_attr in ("+", "-"):
+                return side_attr
+            return self._get_side()
+
+        side = _resolve_side()
         restriction_store = self.ctx.get('_restriction_masks')
 
         def _mask_array(arr: np.ndarray, mask: np.ndarray) -> np.ndarray:
@@ -744,6 +3230,40 @@ class FormCompiler:
     
     def _visit_NormalComponent(self, n:NormalComponent):
         return self._visit_FacetNormal(FacetNormal())[n.idx]
+
+    def _materialize_matrix_value(self, tensor_value, node, op_name: str) -> np.ndarray:
+        """
+        Collapse a tensor expression result to a numeric 2×2 matrix.
+        Only function-valued gradients (or plain numpy arrays) are supported.
+        """
+        a_shape = getattr(tensor_value, "shape", None)
+        a_role = getattr(tensor_value, "role", None)
+        if isinstance(tensor_value, np.ndarray):
+            mat = np.asarray(tensor_value, dtype=float)
+        elif isinstance(tensor_value, GradOpInfo):
+            if tensor_value.role != "function":
+                raise TypeError(
+                    f"{op_name} is only defined for function-valued tensors at a quadrature point; "
+                    f"got role '{tensor_value.role}'."
+                )
+            data = tensor_value.data
+            if data.ndim == 3:
+                if tensor_value.coeffs is None:
+                    raise ValueError(
+                        f"{op_name} requires coefficient weights to collapse a function gradient."
+                    )
+                mat = np.einsum("knd,kn->kd", data, tensor_value.coeffs, optimize=True)
+            else:
+                mat = np.asarray(data, dtype=float)
+        else:
+            raise TypeError(
+                f"{op_name} expects a numeric tensor; got {type(tensor_value).__name__}."
+                f" Role: '{a_role}', shape: {a_shape}."
+            )
+
+        if mat.shape != (2, 2):
+            raise ValueError(f"{op_name} expects a 2×2 matrix, got shape {mat.shape}.")
+        return np.asarray(mat, dtype=float)
     
     def _visit_Trace(self, node: Trace):
         """trace(A): sum of diagonal on the *first* and *last* axes for GradOpInfo.
@@ -771,16 +3291,33 @@ class FormCompiler:
                 return self._vecinfo(np.array([tr_val]), role="function", node=node, field_names=A.field_names)
 
             # Test/Trial: sum diagonal across first/last axes → (n,)
-            if A.data.ndim != 3:
-                raise ValueError(f"Trace expects a rank-3 GradOpInfo for test/trial, got {A.data.shape}.")
-            k_dim, n_loc, d_dim = A.data.shape
-            m = min(k_dim, d_dim)
-            # sum_i A[i, :, i]  — works for either (k,n,d) or (d,n,k) because we always use axes (0,2)
-            tr_vec = np.zeros((n_loc,), dtype=A.data.dtype)
-            for i in range(m):
-                tr_vec += A.data[i, :, i]
-            # Return as a 1-component vector basis block: (1, n_loc)
-            return self._vecinfo(np.stack([tr_vec]), role=A.role, node=node, field_names=A.field_names)
+            if A.role in ("test", "trial") and A.ndim == 3:
+                k_dim, n_loc, d_dim = A.data.shape
+                if k_dim != d_dim:
+                    raise ValueError(f"Cannot take trace of non-square GradOpInfo with shape {A.data.shape}.")
+                # m = min(k_dim, d_dim)
+                m = k_dim
+                # sum_i A[i, :, i]  — works for either (k,n,d) or (d,n,k) because we always use axes (0,2)
+                tr_vec = np.zeros((n_loc,), dtype=A.data.dtype)
+                for i in range(m):
+                    tr_vec += A.data[i, :, i]
+                # Return as a 1-component vector basis block: (1, n_loc)
+                return self._vecinfo(np.stack([tr_vec]), role=A.role, node=node, field_names=A.field_names)
+            elif A.role in {"mixed"} and A.ndim == 4:
+                k,m,n,d = A.data.shape
+                k_dim, n_test, n_trial, d_dim = A.data.shape
+                if k_dim != d_dim:
+                    raise ValueError(f"Cannot take trace of non-square GradOpInfo with shape {A.data.shape}.")
+                # m = min(k_dim, d_dim)
+                m = k_dim
+                M = np.zeros((n_test, n_trial), dtype=A.data.dtype)
+                # sum over the diagonal of the outermost and innermost axes
+                for i in range(m):
+                    M += A.data[i, :, :, i]
+                M = M[np.newaxis, ...]  # (1, n_test, n_trial)
+                return self._vecinfo(M, role=A.role, node=node, field_names=A.field_names)
+            else:
+                raise ValueError(f"Trace not defined for GradOpInfo with role '{A.role}' and shape {A.data.shape}.")
 
         # Hessian-like object
         if isinstance(A, HessOpInfo):
@@ -796,11 +3333,84 @@ class FormCompiler:
             else:
                 # test/trial: return (k,n) table of Laplacians
                 tr = A.data[..., 0, 0] + A.data[..., 1, 1]
-                return self._vecinfo(tr, role=A.role, node=node, field_names=A.field_names)
+            return self._vecinfo(tr, role=A.role, node=node, field_names=A.field_names)
 
         # VecOpInfo or other types are not meaningful for trace
         raise TypeError(f"Trace not implemented for {type(A)}"
                         f" for role '{A.role}' with shape {A.data.shape}.")
+
+    def _visit_Determinant(self, node: Determinant):
+        A = self._visit(node.A)
+        mat = self._materialize_matrix_value(A, node, "determinant")
+        det = mat[0, 0] * mat[1, 1] - mat[0, 1] * mat[1, 0]
+        return float(det)
+
+    def _visit_Cofactor(self, node: Cofactor):
+        A = self._visit(node.A)
+        # The cofactor map is linear only in 2x2 case
+        # we can calculate it for grad of basis functions
+        if isinstance(A, GradOpInfo):
+            if A.role in ("test", "trial") and A.ndim == 3 and A.shape[0] == A.shape[2] == 2:
+                cofactor_data = np.empty_like(A.data)
+                cofactor_data[0, :, 0] = A.data[1, :, 1]  #
+                cofactor_data[0, :, 1] = -A.data[1, :, 0]
+                cofactor_data[1, :, 0] = -A.data[0, :, 1]
+                cofactor_data[1, :, 1] = A.data[0, :, 0]
+                return self._gradinfo(
+                    cofactor_data,
+                    role=A.role,
+                    node=node,
+                    field_names=A.field_names,
+                    coeffs=None,
+                )
+        mat = self._materialize_matrix_value(A, node, "cofactor")
+        cof_mat = np.array(
+            [
+                [mat[1, 1], -mat[1, 0]],
+                [-mat[0, 1], mat[0, 0]],
+            ],
+            dtype=float,
+        )
+        if isinstance(A, GradOpInfo):
+            if np.shape(cof_mat) == np.shape(A.data):
+                return self._gradinfo(
+                    cof_mat,
+                    role=A.role,
+                    node=node,
+                    field_names=A.field_names,
+                    coeffs=None,
+                )
+            raise ValueError(
+                f"Cofactor result shape {cof_mat.shape} is not square GradOpInfo shape {A.data.shape}."
+            )
+        return cof_mat
+
+    def _visit_Inverse(self, node: Inverse):
+        A = self._visit(node.A)
+        mat = self._materialize_matrix_value(A, node, "inverse")
+        det = mat[0, 0] * mat[1, 1] - mat[0, 1] * mat[1, 0]
+        inv_det = 1.0 / (det )
+        inv_mat = np.array(
+            [
+                [mat[1, 1], -mat[0, 1]],
+                [-mat[1, 0], mat[0, 0]],
+            ],
+            dtype=float,
+        ) * inv_det
+        if isinstance(A, GradOpInfo):
+            if np.shape(inv_mat) == np.shape(A.data):
+                return self._gradinfo(
+                    inv_mat,
+                    role=A.role,
+                    node=node,
+                    field_names=A.field_names,
+                    coeffs=None,
+                )
+            else:
+                raise ValueError(
+                    f"Inverse result shape {inv_mat.shape} is not square GradOpInfo shape {A.data.shape}."
+                )
+        return inv_mat
     
     def _visit_Power(self, n: Power):
         """
@@ -811,12 +3421,16 @@ class FormCompiler:
         base = self._visit(n.a)
         exponent = self._visit(n.b)
 
-        # Handle custom VecOpInfo and GradOpInfo types explicitly
-        if isinstance(base, (VecOpInfo, GradOpInfo)):
+        # Handle custom VecOpInfo and GradOpInfo types explicitly.
+        #
+        # NOTE: VecOpInfo and GradOpInfo have different constructor signatures;
+        # use the `_with` helpers to preserve metadata safely.
+        if isinstance(base, VecOpInfo):
             new_data = base.data ** exponent
-            # Return a new instance of the same class with the new data
-            # This uses getattr for robustness, as VecOpInfo lacks 'coeffs'
-            return type(base)(data=new_data, role=base.role, coeffs=getattr(base, 'coeffs', None))
+            return base._with(new_data, role=base.role)
+        if isinstance(base, GradOpInfo):
+            new_data = base.data ** exponent
+            return base._with(new_data, role=base.role)
 
         # Ensure the exponent is a scalar (constant).
         if not np.isscalar(exponent):
@@ -827,6 +3441,247 @@ class FormCompiler:
 
 
     def _visit_Derivative(self, op: Derivative):
+        def _is_scalar_leaf(expr):
+            return isinstance(
+                expr,
+                (
+                    Function,
+                    TrialFunction,
+                    TestFunction,
+                    VectorFunction,
+                    VectorTrialFunction,
+                    VectorTestFunction,
+                    HdivFunction,
+                    HdivTrialFunction,
+                    HdivTestFunction,
+                ),
+            )
+
+        def _scale_derivative_value(darg, factor):
+            if isinstance(darg, (VecOpInfo, GradOpInfo, HessOpInfo)):
+                return darg._with(factor * darg.data, role=darg.role)
+            return factor * darg
+
+        def _derivative_of_scalar_expr(expr, order):
+            ox, oy = order
+            if (ox + oy) > 1 and not _is_scalar_leaf(expr):
+                res = expr
+                for _ in range(int(ox)):
+                    res = Derivative(res, 1, 0)
+                for _ in range(int(oy)):
+                    res = Derivative(res, 0, 1)
+                return self._visit(res)
+
+            if isinstance(expr, Constant):
+                return 0.0
+            if isinstance(expr, Derivative):
+                ex, ey = expr.order
+                if isinstance(expr.f, Pos):
+                    return self._visit(Pos(Derivative(expr.f.operand, ex + ox, ey + oy)))
+                if isinstance(expr.f, Neg):
+                    return self._visit(Neg(Derivative(expr.f.operand, ex + ox, ey + oy)))
+                if isinstance(expr.f, Restriction):
+                    return self._visit(Restriction(Derivative(expr.f.operand, ex + ox, ey + oy), expr.f.domain))
+                return self._visit(Derivative(expr.f, ex + ox, ey + oy))
+            if isinstance(expr, Pos):
+                return self._visit(Pos(Derivative(expr.operand, *order)))
+            if isinstance(expr, Neg):
+                return self._visit(Neg(Derivative(expr.operand, *order)))
+            if isinstance(expr, Sum):
+                return self._visit(Derivative(expr.a, *order)) + self._visit(Derivative(expr.b, *order))
+            if isinstance(expr, Sub):
+                return self._visit(Derivative(expr.a, *order)) - self._visit(Derivative(expr.b, *order))
+            if isinstance(expr, Prod):
+                da = self._visit(Derivative(expr.a, *order))
+                db = self._visit(Derivative(expr.b, *order))
+                a = self._visit(expr.a)
+                b = self._visit(expr.b)
+                return da * b + a * db
+            if isinstance(expr, Dot):
+                return (
+                    self._visit(Dot(Derivative(expr.a, *order), expr.b))
+                    + self._visit(Dot(expr.a, Derivative(expr.b, *order)))
+                )
+            if isinstance(expr, Inner):
+                return (
+                    self._visit(Inner(Derivative(expr.a, *order), expr.b))
+                    + self._visit(Inner(expr.a, Derivative(expr.b, *order)))
+                )
+            if isinstance(expr, Div):
+                da = self._visit(Derivative(expr.a, *order))
+                db = self._visit(Derivative(expr.b, *order))
+                a = self._visit(expr.a)
+                b = self._visit(expr.b)
+                return (da * b - a * db) / (b * b)
+            if isinstance(expr, Power):
+                base = expr.a
+                expo = expr.b
+                dbase = self._visit(Derivative(base, *order))
+                dexp = self._visit(Derivative(expo, *order))
+                base_val = self._visit(base)
+                expo_val = self._visit(expo)
+                if isinstance(expo, Constant):
+                    p = float(expo.value)
+                    if isinstance(base_val, VecOpInfo):
+                        base_pow = base_val._with(base_val.data ** (p - 1.0), role=base_val.role)
+                    elif isinstance(base_val, GradOpInfo):
+                        base_pow = base_val._with(base_val.data ** (p - 1.0), role=base_val.role)
+                    elif isinstance(base_val, HessOpInfo):
+                        base_pow = base_val._with(base_val.data ** (p - 1.0), role=base_val.role)
+                    else:
+                        base_pow = base_val ** (p - 1.0)
+                    return p * base_pow * dbase
+                return (base_val ** expo_val) * (dexp * self._visit(Log(base)) + expo_val * dbase / base_val)
+            if isinstance(expr, Log):
+                darg = self._visit(Derivative(expr.operand, *order))
+                arg = self._visit(expr.operand)
+                return darg / arg
+            if isinstance(expr, Exp):
+                darg = self._visit(Derivative(expr.operand, *order))
+                arg = self._visit(expr.operand)
+                if isinstance(arg, (VecOpInfo, GradOpInfo, HessOpInfo)):
+                    factor = np.exp(arg.data)
+                elif isinstance(arg, np.ndarray):
+                    factor = np.exp(arg)
+                else:
+                    factor = math.exp(float(arg))
+                return _scale_derivative_value(darg, factor)
+            if isinstance(expr, Tanh):
+                darg = self._visit(Derivative(expr.operand, *order))
+                arg = self._visit(expr.operand)
+                if isinstance(arg, (VecOpInfo, GradOpInfo, HessOpInfo)):
+                    sech_sq = 1.0 - np.square(np.tanh(arg.data))
+                elif isinstance(arg, np.ndarray):
+                    sech_sq = 1.0 - np.square(np.tanh(arg))
+                else:
+                    tanh_arg = math.tanh(float(arg))
+                    sech_sq = 1.0 - tanh_arg * tanh_arg
+                return _scale_derivative_value(darg, sech_sq)
+            if isinstance(expr, Sin):
+                darg = self._visit(Derivative(expr.operand, *order))
+                arg = self._visit(expr.operand)
+                if isinstance(arg, (VecOpInfo, GradOpInfo, HessOpInfo)):
+                    factor = np.cos(arg.data)
+                elif isinstance(arg, np.ndarray):
+                    factor = np.cos(arg)
+                else:
+                    factor = math.cos(float(arg))
+                return _scale_derivative_value(darg, factor)
+            if isinstance(expr, Cos):
+                darg = self._visit(Derivative(expr.operand, *order))
+                arg = self._visit(expr.operand)
+                if isinstance(arg, (VecOpInfo, GradOpInfo, HessOpInfo)):
+                    factor = -np.sin(arg.data)
+                elif isinstance(arg, np.ndarray):
+                    factor = -np.sin(arg)
+                else:
+                    factor = -math.sin(float(arg))
+                return _scale_derivative_value(darg, factor)
+            if isinstance(expr, Tan):
+                darg = self._visit(Derivative(expr.operand, *order))
+                arg = self._visit(expr.operand)
+                if isinstance(arg, (VecOpInfo, GradOpInfo, HessOpInfo)):
+                    tan_arg = np.tan(arg.data)
+                    factor = 1.0 + np.square(tan_arg)
+                elif isinstance(arg, np.ndarray):
+                    tan_arg = np.tan(arg)
+                    factor = 1.0 + np.square(tan_arg)
+                else:
+                    tan_arg = math.tan(float(arg))
+                    factor = 1.0 + tan_arg * tan_arg
+                return _scale_derivative_value(darg, factor)
+            if isinstance(expr, Asin):
+                darg = self._visit(Derivative(expr.operand, *order))
+                arg = self._visit(expr.operand)
+                if isinstance(arg, (VecOpInfo, GradOpInfo, HessOpInfo)):
+                    factor = 1.0 / np.sqrt(1.0 - np.square(arg.data))
+                elif isinstance(arg, np.ndarray):
+                    factor = 1.0 / np.sqrt(1.0 - np.square(arg))
+                else:
+                    arg_f = float(arg)
+                    factor = 1.0 / math.sqrt(1.0 - arg_f * arg_f)
+                return _scale_derivative_value(darg, factor)
+            if isinstance(expr, Acos):
+                darg = self._visit(Derivative(expr.operand, *order))
+                arg = self._visit(expr.operand)
+                if isinstance(arg, (VecOpInfo, GradOpInfo, HessOpInfo)):
+                    factor = -1.0 / np.sqrt(1.0 - np.square(arg.data))
+                elif isinstance(arg, np.ndarray):
+                    factor = -1.0 / np.sqrt(1.0 - np.square(arg))
+                else:
+                    arg_f = float(arg)
+                    factor = -1.0 / math.sqrt(1.0 - arg_f * arg_f)
+                return _scale_derivative_value(darg, factor)
+            if isinstance(expr, Atan):
+                darg = self._visit(Derivative(expr.operand, *order))
+                arg = self._visit(expr.operand)
+                if isinstance(arg, (VecOpInfo, GradOpInfo, HessOpInfo)):
+                    factor = 1.0 / (1.0 + np.square(arg.data))
+                elif isinstance(arg, np.ndarray):
+                    factor = 1.0 / (1.0 + np.square(arg))
+                else:
+                    arg_f = float(arg)
+                    factor = 1.0 / (1.0 + arg_f * arg_f)
+                return _scale_derivative_value(darg, factor)
+            if isinstance(expr, Sinh):
+                darg = self._visit(Derivative(expr.operand, *order))
+                arg = self._visit(expr.operand)
+                if isinstance(arg, (VecOpInfo, GradOpInfo, HessOpInfo)):
+                    factor = np.cosh(arg.data)
+                elif isinstance(arg, np.ndarray):
+                    factor = np.cosh(arg)
+                else:
+                    factor = math.cosh(float(arg))
+                return _scale_derivative_value(darg, factor)
+            if isinstance(expr, Cosh):
+                darg = self._visit(Derivative(expr.operand, *order))
+                arg = self._visit(expr.operand)
+                if isinstance(arg, (VecOpInfo, GradOpInfo, HessOpInfo)):
+                    factor = np.sinh(arg.data)
+                elif isinstance(arg, np.ndarray):
+                    factor = np.sinh(arg)
+                else:
+                    factor = math.sinh(float(arg))
+                return _scale_derivative_value(darg, factor)
+            if isinstance(expr, Asinh):
+                darg = self._visit(Derivative(expr.operand, *order))
+                arg = self._visit(expr.operand)
+                if isinstance(arg, (VecOpInfo, GradOpInfo, HessOpInfo)):
+                    factor = 1.0 / np.sqrt(1.0 + np.square(arg.data))
+                elif isinstance(arg, np.ndarray):
+                    factor = 1.0 / np.sqrt(1.0 + np.square(arg))
+                else:
+                    arg_f = float(arg)
+                    factor = 1.0 / math.sqrt(1.0 + arg_f * arg_f)
+                return _scale_derivative_value(darg, factor)
+            if isinstance(expr, Acosh):
+                darg = self._visit(Derivative(expr.operand, *order))
+                arg = self._visit(expr.operand)
+                if isinstance(arg, (VecOpInfo, GradOpInfo, HessOpInfo)):
+                    factor = 1.0 / (np.sqrt(arg.data - 1.0) * np.sqrt(arg.data + 1.0))
+                elif isinstance(arg, np.ndarray):
+                    factor = 1.0 / (np.sqrt(arg - 1.0) * np.sqrt(arg + 1.0))
+                else:
+                    arg_f = float(arg)
+                    factor = 1.0 / (math.sqrt(arg_f - 1.0) * math.sqrt(arg_f + 1.0))
+                return _scale_derivative_value(darg, factor)
+            if isinstance(expr, Atanh):
+                darg = self._visit(Derivative(expr.operand, *order))
+                arg = self._visit(expr.operand)
+                if isinstance(arg, (VecOpInfo, GradOpInfo, HessOpInfo)):
+                    factor = 1.0 / (1.0 - np.square(arg.data))
+                elif isinstance(arg, np.ndarray):
+                    factor = 1.0 / (1.0 - np.square(arg))
+                else:
+                    arg_f = float(arg)
+                    factor = 1.0 / (1.0 - arg_f * arg_f)
+                return _scale_derivative_value(darg, factor)
+            if isinstance(expr, (PositivePart, Heaviside)):
+                raise NotImplementedError("Derivative of PositivePart/Heaviside is not supported in the Python backend.")
+            if not _is_scalar_leaf(expr):
+                raise NotImplementedError(f"Derivative() not implemented for composite operand {type(expr)}.")
+            return None
+
         # --------------------------------------------------------------
         # 1) Operand is a Jump  →  Jump of derivatives
         # --------------------------------------------------------------
@@ -889,6 +3744,84 @@ class FormCompiler:
                 return np.zeros_like(result)
             return 0.0
 
+        if isinstance(op.f, (HdivFunctionComponent, HdivTrialFunctionComponent, HdivTestFunctionComponent)):
+            fld = str(op.f.field_name)
+            comp = int(op.f.component_index)
+            ox, oy = map(int, op.order)
+            if (ox, oy) not in {(1, 0), (0, 1), (2, 0), (1, 1), (0, 2)}:
+                raise NotImplementedError(f"H(div) component derivative order {(ox, oy)} not implemented.")
+            basis_entry = self._get_hdiv_basis_entry(fld)
+            if (ox, oy) in {(1, 0), (0, 1)}:
+                grad_tbl = basis_entry.get("hdiv_grad")
+                if grad_tbl is None:
+                    raise RuntimeError(f"Missing H(div) gradient cache for field '{fld}'.")
+                deriv_row = np.asarray(grad_tbl, dtype=float)[comp, :, 0 if (ox, oy) == (1, 0) else 1]
+            else:
+                hess_tbl = basis_entry.get("hdiv_hess")
+                if hess_tbl is None:
+                    raise RuntimeError(f"Missing H(div) Hessian cache for field '{fld}'.")
+                if (ox, oy) == (2, 0):
+                    deriv_row = np.asarray(hess_tbl, dtype=float)[comp, :, 0, 0]
+                elif (ox, oy) == (1, 1):
+                    deriv_row = np.asarray(hess_tbl, dtype=float)[comp, :, 0, 1]
+                else:
+                    deriv_row = np.asarray(hess_tbl, dtype=float)[comp, :, 1, 1]
+
+            if getattr(op.f, "is_function", False):
+                coeffs = np.asarray(op.f.get_nodal_values(self._local_dofs()), dtype=float)
+                side = self._get_side() if self._on_sided_path() else ""
+                gd = self.ctx.get("global_dofs", None)
+                if gd is not None:
+                    deriv_row, coeffs = _hac._align_phi_and_coeffs_to_global(
+                        self.ctx, side or "+", fld, deriv_row, coeffs
+                    )
+                val = float(np.asarray(deriv_row, dtype=float) @ np.asarray(coeffs, dtype=float))
+                return self._vecinfo(np.asarray([val], dtype=float), role="function", node=op, field_names=[fld])
+
+            role = "trial" if getattr(op.f, "is_trial", False) else "test"
+            row = np.asarray(deriv_row, dtype=float)[np.newaxis, :]
+            return self._vecinfo(row, role=role, node=op, field_names=[fld])
+
+        composite_val = _derivative_of_scalar_expr(op.f, op.order)
+        if composite_val is not None:
+            return composite_val
+
+        if isinstance(op.f, (VectorFunction, VectorTrialFunction, VectorTestFunction)):
+            fields = list(getattr(op.f, "field_names", []) or [])
+            alpha = op.order
+            if not fields:
+                raise RuntimeError("Vector derivative requested without component field names.")
+            if getattr(op.f, "is_function", False):
+                values = []
+                for fld in fields:
+                    row = self._lookup_basis(fld, alpha)[np.newaxis, :]
+                    coeffs = op.f.components[fields.index(fld)].get_nodal_values(self._local_dofs())[np.newaxis, :]
+                    gd = self.ctx.get("global_dofs")
+                    if gd is not None:
+                        side = self._get_side()
+                        phi_aligned, coeffs_aligned = _hac._align_phi_and_coeffs_to_global(
+                            self.ctx, side, fld, row[0], coeffs[0]
+                        )
+                        row = phi_aligned[np.newaxis, :]
+                        coeffs = coeffs_aligned[np.newaxis, :]
+                    if self.ctx.get('is_ghost', False):
+                        side = self._get_side()
+                        if side == '+':
+                            gmask = self.ctx.get('coeff_mask_pos_global')
+                        elif side == '-':
+                            gmask = self.ctx.get('coeff_mask_neg_global')
+                        else:
+                            gmask = None
+                        if gmask is not None:
+                            mask_arr = np.asarray(gmask, dtype=coeffs.dtype)
+                            coeffs = coeffs * mask_arr[np.newaxis, :]
+                    values.append(float(np.asarray(coeffs * row).sum()))
+                return self._vecinfo(np.asarray(values, dtype=float), role="function", node=op, field_names=fields)
+
+            data = np.vstack([self._lookup_basis(fld, alpha) for fld in fields]).astype(float, copy=False)
+            role = "trial" if getattr(op.f, "is_trial", False) else "test"
+            return self._vecinfo(data, role=role, node=op, field_names=fields)
+
         fld, alpha = op.f.field_name, op.order
         row = self._lookup_basis(fld, alpha)[np.newaxis, :]      # (1,n)
 
@@ -913,7 +3846,13 @@ class FormCompiler:
                 if gmask is not None:
                     mask_arr = np.asarray(gmask, dtype=coeffs.dtype)
                     coeffs = coeffs * mask_arr[np.newaxis, :]
-            data, role = coeffs * row, "function"
+            # IMPORTANT: Derivative of a *coefficient* function must collapse
+            # the basis-weighted DOF contributions to a scalar value at the QP,
+            # just like `_visit_Function` does for function values.
+            data = np.asarray(coeffs * row)
+            if data.ndim == 2:
+                data = data.sum(axis=1)
+            role = "function"
         elif op.f.is_trial:
             data, role = row, "trial"
         else:
@@ -926,12 +3865,42 @@ class FormCompiler:
         if n.dim ==0:
             return float(n.value)
         return np.asarray(n.value)
+
+    def _visit_Identity(self, n: Identity):
+        data = np.eye(n.size, dtype=float)
+
+        return self._gradinfo(data, role="identity", node=n, field_names=[])
     
     def _visit_FacetNormal(self, n: FacetNormal): 
-        """Returns the normal vector from the context.""" 
-        if 'normal' not in self.ctx: 
-            raise RuntimeError("FacetNormal accessed outside of a facet or interface integral context.") 
-        return self.ctx['normal'] 
+        """Return the facet/interface normal from the context.
+
+        Conventions
+        -----------
+        Assemblers set ``ctx['normal']`` to a *single* oriented unit normal `n₀`
+        for the current facet/interface quadrature point.
+
+        - For two-sided measures (ghost/cut-skeleton/interior facets), `n₀` is
+          oriented from the (–) side element to the (+) side element.
+        - For interface measures, `n₀` is oriented from Ω⁻ (φ<0) to Ω⁺ (φ>0),
+          i.e. `n₀ = ∇φ/||∇φ||` in the reference (undeformed) configuration.
+
+        UFL semantics require side-dependent outward normals:
+          n(+) = outward normal of the (+) side element/domain
+          n(-) = outward normal of the (–) side element/domain
+        with n(-) = -n(+).
+
+        With our stored orientation `n₀` (from – to +), the outward normals are:
+          n(+) = -n₀,   n(-) = +n₀.
+        """
+        if "normal" not in self.ctx:
+            raise RuntimeError("FacetNormal accessed outside of a facet or interface integral context.")
+        n0 = np.asarray(self.ctx["normal"], dtype=float)
+        side = self.ctx.get("side")
+        if side == "+":
+            return -n0
+        if side == "-":
+            return n0
+        return n0
     
     # -- Element-wise constants ----------------------------------------
     def _visit_EWC(self, n:ElementWiseConstant):
@@ -943,6 +3912,31 @@ class FormCompiler:
         if eid is None:
             raise RuntimeError("ElementWiseConstant evaluated outside an element loop.")
         return n.value_on_element(int(eid))
+
+    def _visit_QSC(self, n: QuadratureStateCoefficient):
+        owner_id = self.ctx.get("qstate_owner_id")
+        q = self.ctx.get("q")
+        if owner_id is None or q is None:
+            raise RuntimeError(
+                "QuadratureStateCoefficient evaluated outside a supported quadrature loop."
+            )
+        return n.value_on_entity_qp(int(owner_id), int(q))
+
+    def _validate_quadrature_state_usage(
+        self,
+        expr,
+        *,
+        reference_points: np.ndarray,
+        reference_weights: np.ndarray,
+        context: str,
+    ) -> None:
+        qstates = _find_all(expr, QuadratureStateCoefficient)
+        for qstate in qstates:
+            qstate.layout.validate_against(
+                reference_points=np.asarray(reference_points, dtype=float),
+                reference_weights=np.asarray(reference_weights, dtype=float),
+                context=context,
+            )
     
     
     def _on_sided_path(self) -> bool:
@@ -993,6 +3987,86 @@ class FormCompiler:
         pv = float(self.ctx.get('phi_val', 0.0))
         return (val * 0.0) if SIDE.is_pos(pv) else val
 
+    def _visit_PositivePart(self, node: PositivePart):
+        val = self._visit(node.operand)
+        if val is None:
+            return None
+        if isinstance(val, (VecOpInfo, GradOpInfo, HessOpInfo)):
+            if getattr(val, "role", None) in {"trial", "test", "mixed"}:
+                raise NotImplementedError("PositivePart is only supported for coefficient/value expressions.")
+            return val._with(np.maximum(val.data, 0.0))
+        if isinstance(val, np.ndarray):
+            return np.maximum(val, 0.0)
+        x = float(val)
+        return x if x > 0.0 else 0.0
+
+    def _visit_Heaviside(self, node: Heaviside):
+        val = self._visit(node.operand)
+        if val is None:
+            return None
+        if isinstance(val, (VecOpInfo, GradOpInfo, HessOpInfo)):
+            if getattr(val, "role", None) in {"trial", "test", "mixed"}:
+                raise NotImplementedError("Heaviside is only supported for coefficient/value expressions.")
+            return val._with(np.where(val.data > 0.0, 1.0, 0.0))
+        if isinstance(val, np.ndarray):
+            return np.where(val > 0.0, 1.0, 0.0)
+        x = float(val)
+        return 1.0 if x > 0.0 else 0.0
+
+    def _visit_smooth_unary_numpy(self, operand, *, name: str, np_func, scalar_func):
+        val = self._visit(operand)
+        if val is None:
+            return None
+        if isinstance(val, (VecOpInfo, GradOpInfo, HessOpInfo)):
+            if getattr(val, "role", None) in {"trial", "test", "mixed"}:
+                raise NotImplementedError(f"{name} is only supported for coefficient/value expressions.")
+            return val._with(np_func(val.data))
+        if isinstance(val, np.ndarray):
+            return np_func(val)
+        return scalar_func(float(val))
+
+    def _visit_Log(self, node: Log):
+        return self._visit_smooth_unary_numpy(node.operand, name="Log", np_func=np.log, scalar_func=math.log)
+
+    def _visit_Exp(self, node: Exp):
+        return self._visit_smooth_unary_numpy(node.operand, name="Exp", np_func=np.exp, scalar_func=math.exp)
+
+    def _visit_Tanh(self, node: Tanh):
+        return self._visit_smooth_unary_numpy(node.operand, name="Tanh", np_func=np.tanh, scalar_func=math.tanh)
+
+    def _visit_Sin(self, node: Sin):
+        return self._visit_smooth_unary_numpy(node.operand, name="Sin", np_func=np.sin, scalar_func=math.sin)
+
+    def _visit_Cos(self, node: Cos):
+        return self._visit_smooth_unary_numpy(node.operand, name="Cos", np_func=np.cos, scalar_func=math.cos)
+
+    def _visit_Tan(self, node: Tan):
+        return self._visit_smooth_unary_numpy(node.operand, name="Tan", np_func=np.tan, scalar_func=math.tan)
+
+    def _visit_Asin(self, node: Asin):
+        return self._visit_smooth_unary_numpy(node.operand, name="Asin", np_func=np.arcsin, scalar_func=math.asin)
+
+    def _visit_Acos(self, node: Acos):
+        return self._visit_smooth_unary_numpy(node.operand, name="Acos", np_func=np.arccos, scalar_func=math.acos)
+
+    def _visit_Atan(self, node: Atan):
+        return self._visit_smooth_unary_numpy(node.operand, name="Atan", np_func=np.arctan, scalar_func=math.atan)
+
+    def _visit_Sinh(self, node: Sinh):
+        return self._visit_smooth_unary_numpy(node.operand, name="Sinh", np_func=np.sinh, scalar_func=math.sinh)
+
+    def _visit_Cosh(self, node: Cosh):
+        return self._visit_smooth_unary_numpy(node.operand, name="Cosh", np_func=np.cosh, scalar_func=math.cosh)
+
+    def _visit_Asinh(self, node: Asinh):
+        return self._visit_smooth_unary_numpy(node.operand, name="Asinh", np_func=np.arcsinh, scalar_func=math.asinh)
+
+    def _visit_Acosh(self, node: Acosh):
+        return self._visit_smooth_unary_numpy(node.operand, name="Acosh", np_func=np.arccosh, scalar_func=math.acosh)
+
+    def _visit_Atanh(self, node: Atanh):
+        return self._visit_smooth_unary_numpy(node.operand, name="Atanh", np_func=np.arctanh, scalar_func=math.atanh)
+
     def _visit_Jump(self, n: Jump):
         phi_old  = self.ctx.get('phi_val', None)
         eid_old  = self.ctx.get('eid')
@@ -1041,6 +4115,13 @@ class FormCompiler:
 
         return u_pos - u_neg
 
+    def _visit_Avg(self, n: Avg):
+        if not self._on_sided_path():
+            raise RuntimeError("Avg(...) is only supported on facet integrals (ds/dGhost/dInterface).")
+        v_pos = self._with_side("+", "pos_eid", n.v)
+        v_neg = self._with_side("-", "neg_eid", n.v)
+        return 0.5 * (v_pos + v_neg)
+
 ###########################################################################################3
 ########### --- Functions and VectorFunctions (evaluated to numerical values) ---
 ###########################################################################################
@@ -1071,8 +4152,8 @@ class FormCompiler:
             side = self._get_side()  # '+' or '-'
             union_key = 'pos_union_mask_by_field' if side == '+' else 'neg_union_mask_by_field'
             union_backup = None
-            if not self.ctx.get('_restriction_mask_active', 0):
-                masks = self.ctx.get(union_key)
+            masks = self.ctx.get(union_key)
+            if self.ctx.get('_restriction_mask_active', 0):
                 if isinstance(masks, dict) and masks:
                     union_backup = masks
                     self.ctx[union_key] = {f: np.ones_like(np.asarray(m, dtype=float)) for f, m in masks.items()}
@@ -1086,7 +4167,121 @@ class FormCompiler:
 
         # Elementwise product: returns a single block (keep legacy shape: list of 1 vector)
         data = [u_loc * basis_00]
-        return self._vecinfo(data, role="function", node=n, field_names=[n.field_name])
+        arr = np.asarray(data)
+        # Collapse basis-weighted coefficients immediately: (k,n) -> (k,)
+        if arr.ndim == 2 and arr.shape[0] != arr.shape[1]:
+            arr = arr.sum(axis=1)
+        return self._vecinfo(arr, role="function", node=n, field_names=[n.field_name])
+
+    def _visit_HdivFunction(self, n: HdivFunction):
+        # H(div) coefficient function evaluates to a 2D vector via the RT basis.
+        if "mask_basis" not in self.ctx:
+            self.ctx["mask_basis"] = False
+        local_dofs = self._local_dofs()
+        coeffs = np.asarray(n.get_nodal_values(local_dofs), dtype=float)  # (n_loc,)
+
+        entry = self._basis_cache.get(n.field_name, {})
+        side = self._get_side() if self._on_sided_path() else None
+        if side == "+":
+            hdiv_val = entry.get("hdiv_val_pos", None)
+        elif side == "-":
+            hdiv_val = entry.get("hdiv_val_neg", None)
+        else:
+            hdiv_val = None
+        if hdiv_val is None:
+            hdiv_val = entry.get("hdiv_val")  # (2, n_loc)
+        if hdiv_val is None:
+            raise RuntimeError(f"Missing H(div) basis cache for field '{n.field_name}'.")
+
+        # On ghost/interface paths, align BOTH basis and coeffs to the same global layout.
+        gd = self.ctx.get("global_dofs", None)
+        if gd is not None:
+            union_key = "pos_union_mask_by_field" if side == "+" else "neg_union_mask_by_field"
+            union_backup = None
+            masks = self.ctx.get(union_key)
+            if self.ctx.get("_restriction_mask_active", 0):
+                if isinstance(masks, dict) and masks:
+                    union_backup = masks
+                    self.ctx[union_key] = {f: np.ones_like(np.asarray(m, dtype=float)) for f, m in masks.items()}
+            try:
+                hdiv_val, coeffs = _hac._align_phi_and_coeffs_to_global(
+                    self.ctx, side or "+", n.field_name, np.asarray(hdiv_val, dtype=float), coeffs
+                )
+            finally:
+                if union_backup is not None:
+                    self.ctx[union_key] = union_backup
+
+        val = np.asarray(hdiv_val, dtype=float) @ np.asarray(coeffs, dtype=float)  # (2,)
+        # Repeat field metadata per vector component so restriction masks apply to both.
+        return self._vecinfo(np.asarray(val, dtype=float), role="function", node=n, field_names=[n.field_name] * 2)
+
+    def _get_hdiv_basis_entry(self, field_name: str):
+        fld = str(field_name)
+        entry = self._basis_cache.get(fld, {})
+        side = self._get_side() if self._on_sided_path() else None
+        if side == "+":
+            side_entry = {
+                "hdiv_val": entry.get("hdiv_val_pos", None),
+                "hdiv_grad": entry.get("hdiv_grad_pos", None),
+                "hdiv_div": entry.get("hdiv_div_pos", None),
+                "hdiv_hess": entry.get("hdiv_hess_pos", None),
+            }
+        elif side == "-":
+            side_entry = {
+                "hdiv_val": entry.get("hdiv_val_neg", None),
+                "hdiv_grad": entry.get("hdiv_grad_neg", None),
+                "hdiv_div": entry.get("hdiv_div_neg", None),
+                "hdiv_hess": entry.get("hdiv_hess_neg", None),
+            }
+        else:
+            side_entry = {"hdiv_val": None, "hdiv_grad": None, "hdiv_div": None, "hdiv_hess": None}
+
+        for key in ("hdiv_val", "hdiv_grad", "hdiv_div", "hdiv_hess"):
+            if side_entry[key] is None:
+                side_entry[key] = entry.get(key)
+        return side_entry
+
+    def _visit_hdiv_component_leaf(self, n, *, role: str):
+        fld = str(n.field_name)
+        comp = int(n.component_index)
+        basis_entry = self._get_hdiv_basis_entry(fld)
+        hdiv_val = basis_entry.get("hdiv_val")
+        if hdiv_val is None:
+            raise RuntimeError(f"Missing H(div) basis cache for field '{fld}'.")
+
+        row = np.asarray(hdiv_val, dtype=float)[comp, :]
+        if role == "function":
+            coeffs = np.asarray(n.get_nodal_values(self._local_dofs()), dtype=float)
+            side = self._get_side() if self._on_sided_path() else ""
+            gd = self.ctx.get("global_dofs", None)
+            if gd is not None:
+                union_key = "pos_union_mask_by_field" if side == "+" else "neg_union_mask_by_field"
+                union_backup = None
+                masks = self.ctx.get(union_key)
+                if self.ctx.get("_restriction_mask_active", 0):
+                    if isinstance(masks, dict) and masks:
+                        union_backup = masks
+                        self.ctx[union_key] = {f: np.ones_like(np.asarray(m, dtype=float)) for f, m in masks.items()}
+                try:
+                    row, coeffs = _hac._align_phi_and_coeffs_to_global(
+                        self.ctx, side or "+", fld, row, coeffs
+                    )
+                finally:
+                    if union_backup is not None:
+                        self.ctx[union_key] = union_backup
+            val = float(np.asarray(row, dtype=float) @ np.asarray(coeffs, dtype=float))
+            return self._vecinfo(np.asarray([val], dtype=float), role="function", node=n, field_names=[fld])
+
+        return self._vecinfo(np.asarray(row, dtype=float)[np.newaxis, :], role=role, node=n, field_names=[fld])
+
+    def _visit_HdivFunctionComponent(self, n: HdivFunctionComponent):
+        return self._visit_hdiv_component_leaf(n, role="function")
+
+    def _visit_HdivTrialFunctionComponent(self, n: HdivTrialFunctionComponent):
+        return self._visit_hdiv_component_leaf(n, role="trial")
+
+    def _visit_HdivTestFunctionComponent(self, n: HdivTestFunctionComponent):
+        return self._visit_hdiv_component_leaf(n, role="test")
 
     def _visit_VectorFunction(self, n: VectorFunction):
         logger.debug(f"Visiting VectorFunction: {n.field_names}")
@@ -1111,8 +4306,8 @@ class FormCompiler:
                 side = self._get_side()
                 union_key = 'pos_union_mask_by_field' if side == '+' else 'neg_union_mask_by_field'
                 union_backup = None
-                if not self.ctx.get('_restriction_mask_active', 0):
-                    masks = self.ctx.get(union_key)
+                masks = self.ctx.get(union_key)
+                if self.ctx.get('_restriction_mask_active', 0):
                     if isinstance(masks, dict) and masks:
                         union_backup = masks
                         self.ctx[union_key] = {f: np.ones_like(np.asarray(m, dtype=float)) for f, m in masks.items()}
@@ -1135,6 +4330,10 @@ class FormCompiler:
             width = len(self.ctx["global_dofs"]) if self.ctx.get("global_dofs") is not None else len(local_dofs)
             data = np.zeros((0, width))
 
+        # Collapse basis-weighted coefficients immediately: (k,n) -> (k,)
+        if data.ndim == 2 and data.shape[0] != data.shape[1]:
+            data = data.sum(axis=1)
+
         return self._vecinfo(data, role="function", node=n, field_names=names)
 
 
@@ -1143,23 +4342,26 @@ class FormCompiler:
     # --- Unknowns (represented by basis functions) ---
     def _visit_TestFunction(self, n):
         logger.debug(f"Visiting TestFunction: {n.field_name}")
-        # gatting with the mask
-        self.ctx["mask_basis"] = False
+        # Respect caller's sided masking intent (ghost/interface); default to no masking.
+        if "mask_basis" not in self.ctx:
+            self.ctx["mask_basis"] = False
         row = self._lookup_basis(n.field_name, (0, 0))[np.newaxis, :]
         return self._vecinfo(row, role="test", node=n, field_names=[n.field_name])
 
     def _visit_TrialFunction(self, n):
         logger.debug(f"Visiting TrialFunction: {n.field_name}")
-        # gatting with the mask
-        self.ctx["mask_basis"] = False
+        # Respect caller's sided masking intent (ghost/interface); default to no masking.
+        if "mask_basis" not in self.ctx:
+            self.ctx["mask_basis"] = False
         row = self._lookup_basis(n.field_name, (0, 0))[np.newaxis, :]
         return self._vecinfo(row, role="trial", node=n, field_names=[n.field_name])
 
 
     def _visit_VectorTestFunction(self, n):
         logger.debug(f"Visiting VectorTestFunction: {n.field_names}")
-        # gatting with the mask
-        self.ctx["mask_basis"] = False
+        # Respect caller's sided masking intent (ghost/interface); default to no masking.
+        if "mask_basis" not in self.ctx:
+            self.ctx["mask_basis"] = False
         names = _hfa._filter_fields_for_side(self, n, list(n.field_names))
         rows = [self._lookup_basis(f, (0, 0)) for f in names]
         data  = np.stack(rows) if rows else np.zeros((len(n.field_names), self._zero_width()))
@@ -1167,18 +4369,99 @@ class FormCompiler:
 
     def _visit_VectorTrialFunction(self, n):
         logger.debug(f"Visiting VectorTrialFunction: {n.field_names}")
-        # gatting with the mask
-        self.ctx["mask_basis"] = False
+        # Respect caller's sided masking intent (ghost/interface); default to no masking.
+        if "mask_basis" not in self.ctx:
+            self.ctx["mask_basis"] = False
         names = _hfa._filter_fields_for_side(self, n, list(n.field_names))
         rows = [self._lookup_basis(f, (0, 0)) for f in names]
         data  = np.stack(rows) if rows else np.zeros((len(n.field_names), self._zero_width()))
         return self._vecinfo(data, role="trial", node=n, field_names=names)
+
+
+    def _visit_HdivTestFunction(self, n: HdivTestFunction):
+        if "mask_basis" not in self.ctx:
+            self.ctx["mask_basis"] = False
+        fld = str(n.field_name)
+        entry = self._basis_cache.get(fld, {})
+        side = self._get_side() if self._on_sided_path() else None
+        if side == "+":
+            val = entry.get("hdiv_val_pos", None)
+        elif side == "-":
+            val = entry.get("hdiv_val_neg", None)
+        else:
+            val = None
+        if val is None:
+            val = entry.get("hdiv_val")
+        if val is None:
+            raise RuntimeError(f"Missing H(div) basis cache for field '{fld}'.")
+        return self._vecinfo(np.asarray(val, dtype=float), role="test", node=n, field_names=[fld] * 2)
+
+    def _visit_HdivTrialFunction(self, n: HdivTrialFunction):
+        if "mask_basis" not in self.ctx:
+            self.ctx["mask_basis"] = False
+        fld = str(n.field_name)
+        entry = self._basis_cache.get(fld, {})
+        side = self._get_side() if self._on_sided_path() else None
+        if side == "+":
+            val = entry.get("hdiv_val_pos", None)
+        elif side == "-":
+            val = entry.get("hdiv_val_neg", None)
+        else:
+            val = None
+        if val is None:
+            val = entry.get("hdiv_val")
+        if val is None:
+            raise RuntimeError(f"Missing H(div) basis cache for field '{fld}'.")
+        return self._vecinfo(np.asarray(val, dtype=float), role="trial", node=n, field_names=[fld] * 2)
 
     # ================== VISITORS: OPERATORS ========================
     def _visit_Grad(self, n: Grad):
         """Return GradOpInfo with shape (k, n_dofs_local, d) for test/trial, or (k,d) for function (collapsed)."""
         op = n.operand
         logger.debug(f"Entering _visit_Grad for operand type {type(op)}")
+
+        def _grad_from_scalar_derivatives(node, dx_part, dy_part):
+            parts = [dx_part, dy_part]
+            template = next((p for p in parts if isinstance(p, VecOpInfo)), None)
+            if template is not None:
+                def _coerce_part(part):
+                    if isinstance(part, VecOpInfo):
+                        return np.asarray(part.data)
+                    arr = np.asarray(part, dtype=float)
+                    tmpl = np.asarray(template.data)
+                    if arr.ndim == 0:
+                        return np.full_like(tmpl, float(arr), dtype=float)
+                    if arr.shape == tmpl.shape:
+                        return arr
+                    if tmpl.ndim == 2 and arr.ndim == 1 and tmpl.shape[0] == 1 and arr.shape[0] == tmpl.shape[1]:
+                        return arr[np.newaxis, :]
+                    raise ValueError(
+                        f"Cannot coerce derivative part shape {arr.shape} to gradient template shape {tmpl.shape}."
+                    )
+
+                dx_arr = _coerce_part(dx_part)
+                dy_arr = _coerce_part(dy_part)
+                tmpl = np.asarray(template.data)
+                if template.role in {"trial", "test"} and (tmpl.ndim == 1 or (tmpl.ndim == 2 and tmpl.shape[0] == 1)):
+                    if dx_arr.ndim == 2:
+                        dx_arr = dx_arr[0]
+                    if dy_arr.ndim == 2:
+                        dy_arr = dy_arr[0]
+                    grad_data = np.ascontiguousarray(np.stack([dx_arr, dy_arr], axis=0))
+                else:
+                    grad_data = np.stack([dx_arr, dy_arr], axis=-1)
+                return GradOpInfo(grad_data, role=template.role, coeffs=None, **template.update_meta(template.meta()))
+
+            dx_arr = np.asarray(dx_part, dtype=float)
+            dy_arr = np.asarray(dy_part, dtype=float)
+            if dx_arr.ndim == 0 and dy_arr.ndim == 0:
+                grad_data = np.asarray([[float(dx_arr), float(dy_arr)]], dtype=float)
+            else:
+                grad_data = np.stack([dx_arr, dy_arr], axis=-1)
+                if grad_data.ndim == 1:
+                    grad_data = grad_data[np.newaxis, :]
+            return self._gradinfo(grad_data, role="function", node=node, field_names=[])
+
         # Distribute grad over sided restrictions so Pos/Neg work with grad()
         #   grad(Pos(u)) = Pos(grad(u))
         #   grad(Neg(u)) = Neg(grad(u))
@@ -1188,26 +4471,144 @@ class FormCompiler:
             return self._visit(Neg(Grad(op.operand)))
         if isinstance(op, Jump):
             return self._visit(Jump(Grad(op.u_pos), Grad(op.u_neg)))
+        if isinstance(op, Restriction):
+            depth = int(self.ctx.get('_restriction_mask_active', 0))
+            self.ctx['_restriction_mask_active'] = depth + 1
+            try:
+                result = self._visit(Grad(op.operand))
+            finally:
+                if depth == 0:
+                    self.ctx.pop('_restriction_mask_active', None)
+                else:
+                    self.ctx['_restriction_mask_active'] = depth
+            return self._apply_restriction_mask(result, op)
+        if isinstance(op, DivOperation):
+            return self._visit_GradOfDiv(op)
+        if not isinstance(
+            op,
+            (
+                TestFunction,
+                VectorTestFunction,
+                HdivTestFunction,
+                TrialFunction,
+                VectorTrialFunction,
+                HdivTrialFunction,
+                Function,
+                VectorFunction,
+                HdivFunction,
+            ),
+        ):
+            dx_part = self._visit(Derivative(op, 1, 0))
+            dy_part = self._visit(Derivative(op, 0, 1))
+            return _grad_from_scalar_derivatives(n, dx_part, dy_part)
 
         # 1) role
-        if isinstance(op, (TestFunction, VectorTestFunction)):
+        if isinstance(op, (TestFunction, VectorTestFunction, HdivTestFunction)):
             role = "test"
-        elif isinstance(op, (TrialFunction, VectorTrialFunction)):
+        elif isinstance(op, (TrialFunction, VectorTrialFunction, HdivTrialFunction)):
             role = "trial"
-        elif isinstance(op, (Function, VectorFunction)):
+        elif isinstance(op, (Function, VectorFunction, HdivFunction)):
             role = "function"
         else:
             raise NotImplementedError(f"grad() not implemented for {type(op)}")
 
         # 2) fields
         fields = op.field_names if hasattr(op, "field_names") else [op.field_name]
+        if fields is None:
+            fields = []
+        elif isinstance(fields, tuple):
+            fields = list(fields)
+        elif not isinstance(fields, list):
+            fields = [fields]
         fields = _hfa._filter_fields_for_side(self, op, list(fields))
+        if not fields:
+            fld = getattr(op, "field_name", None)
+            if fld is not None:
+                fields = [fld]
+
+        is_hdiv_rt = (
+            len(fields) == 1
+            and getattr(self.me, "_field_families", {}).get(str(fields[0]), None) == "RT"
+            and isinstance(op, (HdivTestFunction, HdivTrialFunction, HdivFunction))
+        )
+        if is_hdiv_rt:
+            fld = str(fields[0])
+            entry = self._basis_cache.get(fld, {})
+            side = self._get_side() if self._on_sided_path() else None
+            if side == "+":
+                grad_tbl = entry.get("hdiv_grad_pos", None)
+            elif side == "-":
+                grad_tbl = entry.get("hdiv_grad_neg", None)
+            else:
+                grad_tbl = None
+            if grad_tbl is None:
+                grad_tbl = entry.get("hdiv_grad")
+            if grad_tbl is None:
+                raise RuntimeError(f"Missing H(div) gradient cache for field '{fld}'.")
+
+            grad_fields = [fld, fld]
+            if role == "function":
+                coeffs = np.asarray(op.get_nodal_values(self._local_dofs()), dtype=float)
+                grad_val = np.einsum("ind,n->id", np.asarray(grad_tbl, dtype=float), coeffs, optimize=True)
+                return self._gradinfo(np.asarray(grad_val, dtype=float), role=role, node=op, field_names=grad_fields)
+            return self._gradinfo(np.asarray(grad_tbl, dtype=float), role=role, node=op, field_names=grad_fields)
 
         k_blocks = []
         if role == "function":
-            # collapse once per component and cache
+            # collapse once per component and cache (unless restriction masks need DOF layout)
             local_dofs = self._local_dofs()
-            
+            mask_active = bool(self.ctx.get("_restriction_mask_active", 0))
+
+            if mask_active:
+                grad_blocks = []
+                coeff_blocks = []
+                for i, fld in enumerate(fields):
+                    g = self._g(fld)  # (n,2)
+                    # coefficients padded once per component
+                    key_c = (id(op), i, tuple(local_dofs))
+                    coeffs = self._coeff_cache.get(key_c)
+                    if coeffs is None:
+                        if hasattr(op, "components"):
+                            coeffs = op.components[i].padded_values(local_dofs)
+                        else:
+                            coeffs = op.padded_values(local_dofs)
+                        self._coeff_cache[key_c] = coeffs
+                    coeffs_use = coeffs
+                    if self.ctx.get("global_dofs") is not None:
+                        side = self._get_side()
+                        coeffs_use = _hac._pad_coeffs_to_global(self.ctx, side, fld, coeffs)
+                        mask_dict = self.ctx.get("pos_union_mask_by_field" if side == "+" else "neg_union_mask_by_field")
+                        if isinstance(mask_dict, dict):
+                            mask = mask_dict.get(fld)
+                            if mask is not None:
+                                mask_arr = np.asarray(mask, dtype=coeffs_use.dtype).ravel()
+                                if mask_arr.shape[0] != coeffs_use.shape[0]:
+                                    try:
+                                        mask_arr = _hac._pad_coeffs_to_global(self.ctx, side, fld, mask_arr)
+                                    except Exception:
+                                        mask_arr = mask_arr
+                                if mask_arr.shape[0] == coeffs_use.shape[0]:
+                                    coeffs_use = coeffs_use * mask_arr
+                        if self.ctx.get("is_ghost", False):
+                            if side == "+":
+                                gmask = self.ctx.get("coeff_mask_pos_global")
+                            elif side == "-":
+                                gmask = self.ctx.get("coeff_mask_neg_global")
+                            else:
+                                gmask = None
+                            if gmask is not None:
+                                mask_arr = np.asarray(gmask, dtype=coeffs_use.dtype)
+                                coeffs_use = coeffs_use * mask_arr
+                    grad_blocks.append(g)
+                    coeff_blocks.append(coeffs_use)
+                return self._gradinfo(
+                    np.stack(grad_blocks),
+                    role=role,
+                    node=op,
+                    field_names=fields,
+                    coeffs=np.stack(coeff_blocks),
+                )
+
             for i, fld in enumerate(fields):
                 key_coll = (id(op), "grad", i, self.ctx.get("eid"), self.ctx.get("side"), self.ctx.get("phi_val"))
                 gval = self._collapsed_cache.get(key_coll)
@@ -1226,6 +4627,18 @@ class FormCompiler:
                     if self.ctx.get("global_dofs") is not None:
                         side = self._get_side()
                         coeffs_use = _hac._pad_coeffs_to_global(self.ctx, side, fld, coeffs)
+                        mask_dict = self.ctx.get('pos_union_mask_by_field' if side == '+' else 'neg_union_mask_by_field')
+                        if isinstance(mask_dict, dict):
+                            mask = mask_dict.get(fld)
+                            if mask is not None:
+                                mask_arr = np.asarray(mask, dtype=coeffs_use.dtype).ravel()
+                                if mask_arr.shape[0] != coeffs_use.shape[0]:
+                                    try:
+                                        mask_arr = _hac._pad_coeffs_to_global(self.ctx, side, fld, mask_arr)
+                                    except Exception:
+                                        mask_arr = mask_arr
+                                if mask_arr.shape[0] == coeffs_use.shape[0]:
+                                    coeffs_use = coeffs_use * mask_arr
                         if self.ctx.get('is_ghost', False):
                             if side == '+':
                                 gmask = self.ctx.get('coeff_mask_pos_global')
@@ -1239,13 +4652,47 @@ class FormCompiler:
                     gval = np.einsum("nd,n->d", g, coeffs_use, optimize=True)  # (2,)
                     self._collapsed_cache[key_coll] = gval
                 k_blocks.append(gval)
-            return self._gradinfo(np.stack(k_blocks), role=role, node=op, field_names=fields)
-
         else:
             for fld in fields:
-                g = self._g(fld)
-                k_blocks.append(g)
-            return self._gradinfo(np.stack(k_blocks), role=role, node=op, field_names=fields)
+                k_blocks.append(self._g(fld))
+        if not k_blocks:
+            raise RuntimeError(
+                f"Grad assembly produced no component blocks for operand type {type(op).__name__} "
+                f"with role={role}, fields={fields}, repr={op!r}."
+            )
+        if role in {"trial", "test"} and len(k_blocks) == 1:
+            return self._gradinfo(np.ascontiguousarray(k_blocks[0].T), role=role, node=op, field_names=fields)
+        return self._gradinfo(np.stack(k_blocks), role=role, node=op, field_names=fields)
+
+    def _visit_GradOfDiv(self, n: DivOperation):
+        """
+        grad(div(v)) for vector-valued v, assembled from the component Hessians.
+
+        In 2D/3D, [grad(div(v))]_j = sum_i d_j d_i v_i = sum_i Hess(v_i)[j, i].
+        We return a VecOpInfo because the result is a vector field, not a matrix.
+        """
+        H = self._visit_Hessian(Hessian(n.operand))
+        d = int(self.me.mesh.spatial_dim)
+        num_comps = int(H.data.shape[0])
+        if num_comps < d:
+            raise ValueError(f"grad(div(v)) expects at least {d} components, got {num_comps}.")
+
+        fields = getattr(n.operand, "field_names", None)
+        if fields is None:
+            fld = getattr(n.operand, "field_name", None)
+            fields = [fld] if fld is not None else []
+        fields = list(fields)[:d] if fields else [f"gdiv_{i}" for i in range(d)]
+
+        if H.role == "function":
+            out = np.zeros((d,), dtype=H.data.dtype)
+            for j in range(d):
+                out[j] = np.sum([H.data[i, j, i] for i in range(d)], axis=0)
+            return self._vecinfo(out, role="function", node=n, field_names=fields)
+
+        out = np.zeros((d, H.data.shape[1]), dtype=H.data.dtype)
+        for j in range(d):
+            out[j, :] = np.sum([H.data[i, :, j, i] for i in range(d)], axis=0)
+        return self._vecinfo(out, role=H.role, node=n, field_names=fields)
     
     def _visit_Hessian(self, n: Hessian):
         """
@@ -1263,44 +4710,56 @@ class FormCompiler:
         if isinstance(op, Neg):
             return self._visit(Neg(Hessian(op.operand)))
         if isinstance(op, Restriction):
-            # Evaluate the operand with a coefficient mask so the collapse respects the restriction
-            side = self._active_side()
-            eid  = self.ctx.get('pos_eid' if side == '+' else 'neg_eid', None)
-            gd   = self.ctx.get('global_dofs', None)
-            side = self._active_side()
-            if gd is None:
-                return self._apply_restriction_mask(self._visit(Hessian(op.operand)), op)
-
-            if self.ctx.get('is_ghost', False):
-                idx = self.ctx.get('pos_map' if side == '+' else 'neg_map', None)
-                gmask = np.zeros(len(gd), dtype=float)
-                if idx is not None:
-                    gmask[np.asarray(idx, dtype=int)] = 1.0
+            # `Hessian(restrict(u, domain))` must respect the element-membership gate
+            # (zero on elements not in `domain`) and apply union masks so trial/test
+            # tables are properly restricted on ghost/interface assemblers.
+            eid = self.ctx.get("eid")
+            if eid is None:
+                side = self._active_side()
+                eid = self.ctx.get("pos_eid" if side == "+" else "neg_eid", None)
+            if eid is None:
+                in_domain = True
             else:
-                # (interface path) keep existing φ‑side logic
-                level_set = self.ctx.get('_ghost_level_set', None)
-                pos_masks, neg_masks = _hfa.build_side_masks_by_field(self.dh, fields, int(eid), level_set, tol=SIDE.tol)
-                maps_by_field = self.ctx.get('pos_map_by_field' if side == '+' else 'neg_map_by_field', {})
-                gmask = np.zeros(len(gd), dtype=float)
-                for fld in fields:
-                    local = (pos_masks if side == '+' else neg_masks).get(fld)
-                    fmap  = maps_by_field.get(fld)
-                    if local is not None and fmap is not None and len(local) == len(fmap):
-                        gmask[np.asarray(fmap, dtype=int)] = np.asarray(local, dtype=float)
+                in_domain = (op.domain[int(eid)] if hasattr(op.domain, "__getitem__") else (int(eid) in op.domain))
 
+            if not in_domain:
+                result = self._visit(Hessian(op.operand))
+                if isinstance(result, (VecOpInfo, GradOpInfo, HessOpInfo)):
+                    return result * 0.0
+                if isinstance(result, np.ndarray):
+                    return np.zeros_like(result)
+                return 0.0
 
-            key = 'coeff_mask_pos_global' if side == '+' else 'coeff_mask_neg_global'
-            old_mask   = self.ctx.get(key, None)
-            old_ghost  = self.ctx.get('is_ghost', False)
-            self.ctx[key]   = gmask
-            self.ctx['is_ghost'] = True   # make Hessian path apply the coeff mask
+            depth = int(self.ctx.get("_restriction_mask_active", 0))
+            self.ctx["_restriction_mask_active"] = depth + 1
             try:
-                # Evaluate on the active side so eid/x_phys are consistent
-                return self._with_side(side, 'pos_eid' if side == '+' else 'neg_eid', Hessian(op.operand))
+                result = self._visit(Hessian(op.operand))
             finally:
-                if old_mask is None: self.ctx.pop(key, None)
-                else:                 self.ctx[key] = old_mask
-                self.ctx['is_ghost'] = old_ghost
+                if depth == 0:
+                    self.ctx.pop("_restriction_mask_active", None)
+                else:
+                    self.ctx["_restriction_mask_active"] = depth
+            return self._apply_restriction_mask(result, op)
+
+        if isinstance(op, (HdivFunctionComponent, HdivTrialFunctionComponent, HdivTestFunctionComponent)):
+            fld = str(op.field_name)
+            comp = int(op.component_index)
+            hess_tbl = self._get_hdiv_basis_entry(fld).get("hdiv_hess")
+            if hess_tbl is None:
+                raise RuntimeError(f"Missing H(div) Hessian cache for field '{fld}'.")
+            hess_tbl = np.asarray(hess_tbl, dtype=float)[comp, :, :, :]
+            if getattr(op, "is_function", False):
+                coeffs = np.asarray(op.get_nodal_values(self._local_dofs()), dtype=float)
+                side = self._get_side() if self._on_sided_path() else ""
+                gd = self.ctx.get("global_dofs", None)
+                if gd is not None:
+                    hess_tbl, coeffs = _hac._align_phi_and_coeffs_to_global(
+                        self.ctx, side or "+", fld, hess_tbl, coeffs
+                    )
+                Hval = np.einsum("nij,n->ij", hess_tbl, coeffs, optimize=True)
+                return self._hessinfo(Hval[np.newaxis, :, :], role="function", node=op, field_names=[fld])
+            role = "trial" if getattr(op, "is_trial", False) else "test"
+            return self._hessinfo(hess_tbl[np.newaxis, :, :, :], role=role, node=op, field_names=[fld])
 
         # Role + component names
         if isinstance(op, (TestFunction, VectorTestFunction)):
@@ -1340,6 +4799,18 @@ class FormCompiler:
                     if self.ctx.get("global_dofs") is not None:
                         side = self._get_side()
                         coeffs_use = _hac._pad_coeffs_to_global(self.ctx, side, fld, coeffs)
+                        mask_dict = self.ctx.get('pos_union_mask_by_field' if side == '+' else 'neg_union_mask_by_field')
+                        if isinstance(mask_dict, dict):
+                            mask = mask_dict.get(fld)
+                            if mask is not None:
+                                mask_arr = np.asarray(mask, dtype=coeffs_use.dtype).ravel()
+                                if mask_arr.shape[0] != coeffs_use.shape[0]:
+                                    try:
+                                        mask_arr = _hac._pad_coeffs_to_global(self.ctx, side, fld, mask_arr)
+                                    except Exception:
+                                        mask_arr = mask_arr
+                                if mask_arr.shape[0] == coeffs_use.shape[0]:
+                                    coeffs_use = coeffs_use * mask_arr
                         if self.ctx.get('is_ghost', False):
                             if side == '+':
                                 gmask = self.ctx.get('coeff_mask_pos_global')
@@ -1380,6 +4851,51 @@ class FormCompiler:
         return tr
 
     def _visit_DivOperation(self, n: DivOperation):
+        op0 = n.operand
+        base_op = op0.operand if isinstance(op0, Restriction) else op0
+        # Canonical composite lowering: div(grad(u)) == Laplacian(u).
+        # Route through the shared Laplacian path so scalar and vector operands
+        # do not fall back to derivative-on-Grad special cases.
+        if isinstance(base_op, Grad):
+            result = self._visit_Laplacian(Laplacian(base_op.operand))
+            if isinstance(op0, Restriction):
+                return self._apply_restriction_mask(result, op0)
+            return result
+        # Handle div on H(div) fields directly (no grad/trace).
+        if isinstance(base_op, (HdivTestFunction, HdivTrialFunction)):
+            fld = str(base_op.field_name)
+            entry = self._basis_cache.get(fld, {})
+            side = self._get_side() if self._on_sided_path() else None
+            if side == "+":
+                div_row = entry.get("hdiv_div_pos", None)
+            elif side == "-":
+                div_row = entry.get("hdiv_div_neg", None)
+            else:
+                div_row = None
+            if div_row is None:
+                div_row = entry.get("hdiv_div")
+            if div_row is None:
+                raise RuntimeError(f"Missing H(div) divergence cache for field '{fld}'.")
+            role = "test" if isinstance(base_op, HdivTestFunction) else "trial"
+            return self._vecinfo(np.stack([np.asarray(div_row, dtype=float)]), role=role, node=op0, field_names=[fld])
+        if isinstance(base_op, HdivFunction):
+            fld = str(base_op.field_name)
+            entry = self._basis_cache.get(fld, {})
+            side = self._get_side() if self._on_sided_path() else None
+            if side == "+":
+                div_row = entry.get("hdiv_div_pos", None)
+            elif side == "-":
+                div_row = entry.get("hdiv_div_neg", None)
+            else:
+                div_row = None
+            if div_row is None:
+                div_row = entry.get("hdiv_div")
+            if div_row is None:
+                raise RuntimeError(f"Missing H(div) divergence cache for field '{fld}'.")
+            coeffs = np.asarray(base_op.get_nodal_values(self._local_dofs()), dtype=float)
+            div_val = float(coeffs @ np.asarray(div_row, dtype=float))
+            return self._vecinfo(np.asarray([div_val], dtype=float), role="function", node=op0, field_names=[fld])
+
         grad_op = self._visit(Grad(n.operand))           # (k, n_loc, d)
         logger.debug(f"Visiting DivOperation for operand of type {type(n.operand)}, grad_op shape: {grad_op.data.shape}")
         d = self.me.mesh.spatial_dim
@@ -1407,15 +4923,28 @@ class FormCompiler:
 
         # Decide which side of the bilinear form this lives on
         op = n.operand
-        fields = op.field_names if hasattr(op, "field_names") else [op.field_name]
-        if isinstance(op, (TestFunction, VectorTestFunction)):
-            role = "test"
-        elif isinstance(op, (TrialFunction, VectorTrialFunction)):
-            role = "trial"
-        elif isinstance(op, (Function, VectorFunction)):
-            role = "function"
-        else:
-            role = "none"
+        base_op = op.operand if isinstance(op, Restriction) else op
+
+        def _field_names(expr):
+            if hasattr(expr, "field_names"):
+                names = getattr(expr, "field_names", [])
+                return list(names) if names is not None else []
+            if hasattr(expr, "field_name"):
+                return [getattr(expr, "field_name")]
+            return []
+
+        fields = _field_names(base_op) or _field_names(op)
+
+        role = grad_op.role
+        if role == "none":
+            if isinstance(base_op, (TestFunction, VectorTestFunction)):
+                role = "test"
+            elif isinstance(base_op, (TrialFunction, VectorTrialFunction)):
+                role = "trial"
+            elif isinstance(base_op, (Function, VectorFunction)):
+                role = "function"
+            else:
+                role = "none"
 
         # Wrap as VecOpInfo with a single component so that _visit_Prod
         # can use the role information to orient the outer product.
@@ -1429,6 +4958,15 @@ class FormCompiler:
         #     raise KeyError("CellDiameter() requires 'eid' in context; set it in the element loop.")
         # h = self.me.mesh.element_char_length(eid)
         if self.ctx.get('is_interface'):
+            # Multi-mesh nonmatching interfaces (and some custom assemblers) can
+            # inject a per-quadrature (or per-entity) face size directly.
+            h_override = self.ctx.get("h_val", None)
+            if h_override is None:
+                h_override = self.ctx.get("h_face", None)
+            if h_override is None:
+                h_override = self.ctx.get("h_interface", None)
+            if h_override is not None:
+                return float(h_override)
             # use min(h_left, h_right) on the face (robust even on aligned Γ)
             h = self.me.mesh.face_char_length(self.ctx.get('pos_eid'), self.ctx.get('neg_eid'))
         else:
@@ -1436,13 +4974,62 @@ class FormCompiler:
         # print(f"CellDiameter on eid={eid}: CellDiameter={h}")
         return float(h)
 
+    def _visit_MeshSize(self, node: MeshSize):
+        """Pointwise NGSolve-like `specialcf.mesh_size`.
+
+        JIT backends lower this symbolically to `factor*sqrt(|detJ|)` at the QP.
+        For the Python backend we evaluate the same formula when the assembler
+        provides `ctx['detJ']` for the current QP, otherwise we fall back to an
+        element-wise `CellDiameter`.
+        """
+        if self._is_jit_backend():
+            # JIT compilers lower MeshSize directly; return a harmless scalar here.
+            return 1.0
+
+        detJ = self.ctx.get("detJ")
+        if detJ is not None:
+            try:
+                det = float(detJ)
+            except Exception:
+                det = float(np.asarray(detJ).reshape(()))
+            factor = 2.0 if getattr(self.me.mesh, "element_type", "tri") == "quad" else 1.0
+            return factor * float(np.sqrt(abs(det)))
+
+        # Python backend fallback: element-wise diameter.
+        return self._visit_CellDiameter(CellDiameter())
+
 
     
     # ================= VISITORS: ALGEBRAIC ==========================
-    def _visit_Sum(self, n): return self._visit(n.a) + self._visit(n.b)
+    def _visit_Sum(self, n):
+        a = self._visit(n.a)
+        b = self._visit(n.b)
+        if a is None:
+            return b
+        if b is None:
+            return a
+        try:
+            sum_lowering = TensorRuleEngine.plan_sum_lowering(a, b)
+        except Exception:
+            sum_lowering = None
+        if sum_lowering is not None:
+            a = _apply_storage_transform_opinfo(a, sum_lowering.lhs_transform)
+            b = _apply_storage_transform_opinfo(b, sum_lowering.rhs_transform)
+        return a + b
     def _visit_Sub(self, n):
         a = self._visit(n.a)
         b = self._visit(n.b)
+        if b is None:
+            logger.error(f"Sub encountered None operand: a={type(a)} {getattr(a,'role',None)}; sub expr={n}; rhs operand={n.b!r}")
+        if a is None:
+            logger.error(f"Sub encountered None left operand: b={type(b)} {getattr(b,'role',None)}; expression={n}")
+        try:
+            sum_lowering = TensorRuleEngine.plan_sum_lowering(a, b)
+        except Exception:
+            sum_lowering = None
+        if sum_lowering is not None:
+            a = _apply_storage_transform_opinfo(a, sum_lowering.lhs_transform)
+            b = _apply_storage_transform_opinfo(b, sum_lowering.rhs_transform)
         return a - b
     
     def _visit_Transpose(self, node: Transpose):
@@ -1450,6 +5037,8 @@ class FormCompiler:
 
         # Plain numpy: use .T
         if isinstance(A, np.ndarray):
+            if A.ndim != 2:
+                raise TypeError(f"Transpose is only defined for rank-2 tensors, got ndarray shape {A.shape!r}.")
             return A.T
 
         # Grad basis/operators
@@ -1464,12 +5053,19 @@ class FormCompiler:
         #     # VecOpInfo stores (k, n) -> transpose to (n, k)
         #     return VecOpInfo(A.data.T, role=A.role)
 
+        if isinstance(A, VecOpInfo):
+            raise TypeError(
+                f"Transpose is only defined for rank-2 tensors; VecOpInfo with shape {A.data.shape!r} "
+                "must be lowered via the tensor rule engine instead."
+            )
+
         raise TypeError(f"Transpose not implemented for {type(A)}")
 
     def _visit_Div(self, n):
         """Handles scalar, vector, or tensor division by a scalar."""
         numerator = self._visit(n.a)
         denominator = self._visit(n.b)
+        TensorRuleEngine.plan_division(numerator, denominator)
 
         # NumPy correctly handles element-wise division of an array by a scalar.
         return numerator / denominator
@@ -1477,6 +5073,8 @@ class FormCompiler:
     def _visit_Prod(self, n: Prod):
         a = self._visit(n.a)
         b = self._visit(n.b)
+        if a is None or b is None:
+            logger.error(f"Prod operands contain None: a={a} ({type(a)}), b={b} ({type(b)}); expr={n}")
         a_data = a.data if isinstance(a, (VecOpInfo, GradOpInfo, HessOpInfo)) else a
         b_data = b.data if isinstance(b, (VecOpInfo, GradOpInfo, HessOpInfo)) else b
         shape_a = getattr(a_data,"shape", None)
@@ -1485,11 +5083,20 @@ class FormCompiler:
         # b_vec = np.squeeze(b_data)
         # role_a = getattr(a, 'role', None)
         # role_b = getattr(b, 'role', None)
-        logger.debug(f"Entering _visit_Prod for  ('{n.a!r}' * '{n.b!r}') on {'RHS' if self.ctx['rhs'] else 'LHS'}") #, a.info={getattr(a, 'info', None)}, b.info={getattr(b, 'info', None)}
+        logger.debug(
+            "Entering _visit_Prod for types %s * %s on %s",
+            type(n.a).__name__,
+            type(n.b).__name__,
+            "RHS" if self.ctx["rhs"] else "LHS",
+        )
         # print(f" Product: a type={type(a)}, shape={shape_a}, b type={type(b)}, shape={shape_b}, side: {'RHS' if self.ctx['rhs'] else 'LHS'}"
         #       f" roles: a={getattr(a, 'role', None)}, b={getattr(b, 'role', None)}")
 
-        result = a * b
+        try:
+            result = a * b
+        except TypeError as exc:
+            logger.error(f"Prod multiplication failed: a={type(a)} role={getattr(a,'role',None)} shape={getattr(a,'shape',None)}; b={type(b)} role={getattr(b,'role',None)} shape={getattr(b,'shape',None)}; error={exc}; expr={n}")
+            raise
         # print(f" Product result: {getattr(result, 'shape', None)}"
         #       f" roles: result={getattr(result, 'role', None)}"
         #       f" types: result={type(result)}")
@@ -1507,10 +5114,149 @@ class FormCompiler:
         role_b = getattr(b, 'role', None)
         shape_a = getattr(a_data,"shape", None)
         shape_b = getattr(b_data,"shape", None)
+        is_a_scalar = np.isscalar(a_data) or (isinstance(a_data, np.ndarray) and a_data.ndim == 0)
+        is_b_scalar = np.isscalar(b_data) or (isinstance(b_data, np.ndarray) and b_data.ndim == 0)
+        
         # print(f"visit dot: role_a={role_a}, role_b={role_b}, side: {'RHS' if self.ctx['rhs'] else 'LHS'}"
         #       f" type_a={type(a)}, type_b={type(b)}"
         #       f" shape_a={shape_a}, shape_b={shape_b}")
         logger.debug(f"Entering _visit_Dot for types {type(a)} . {type(b)}")
+
+        # ------------------------------------------------------------------
+        # Coefficient (vector) · coefficient (vector)
+        # ------------------------------------------------------------------
+        # Needed e.g. for |v| in SUPG parameters and energy functionals.
+        # This should be valid regardless of whether we are assembling the
+        # Jacobian (LHS) or residual (RHS), since it evaluates to a scalar
+        # coefficient value at the current quadrature point.
+        if isinstance(a, VecOpInfo) and isinstance(b, VecOpInfo) and a.role == b.role == "function":
+            return a.dot_vec(b)
+
+        # ------------------------------------------------------------------
+        # Matrix fast-paths
+        # ------------------------------------------------------------------
+        # Identity matrix: dot(I, X) = X, dot(X, I) = X.
+        #
+        # Note: Identity is represented as GradOpInfo(role="identity") in the
+        # python backend. Many porous/FPI expressions rely on matrix products
+        # like (I - grad(u)) and J * F^{-T} K^{-1} F^{-1}. Historically this
+        # failed when K^{-1}=I or when multiplying by constant 2D tensors.
+        if isinstance(a, GradOpInfo) and role_a == "identity":
+            return b
+        if isinstance(b, GradOpInfo) and role_b == "identity":
+            return a
+
+        # Constant matrix × semantic rank-1 carrier -> semantic rank-1 carrier.
+        if (
+            isinstance(a, np.ndarray)
+            and a.ndim == 2
+            and isinstance(b, VecOpInfo)
+            and role_b in {"function", "vector", "trial", "test", "trial_n", "test_n", "mixed"}
+        ):
+            return b.__rmul__(a)
+
+        # Semantic rank-1 carrier × constant matrix -> semantic rank-1 carrier.
+        if (
+            isinstance(b, np.ndarray)
+            and b.ndim == 2
+            and isinstance(a, VecOpInfo)
+            and role_a in {"function", "vector", "trial", "test", "trial_n", "test_n", "mixed"}
+        ):
+            return a.__mul__(b)
+
+        # Constant 2D tensor × GradOpInfo:
+        # - If b is already collapsed to a 2D matrix (function path), keep the
+        #   result as GradOpInfo to enable further matrix products.
+        # - If b is a gradient table (trial/test/mixed), delegate to left_dot
+        #   which returns a GradOpInfo with the correct shape.
+        if isinstance(a, np.ndarray) and a.ndim == 2 and isinstance(b, GradOpInfo) and isinstance(b_data, np.ndarray):
+            if b_data.ndim in {2, 3, 4}:
+                return b.__rmul__(a)
+
+        # GradOpInfo × constant 2D tensor:
+        # - If a is collapsed to a 2D matrix (function path), keep the result
+        #   as GradOpInfo for subsequent matrix products.
+        # - If a is a gradient table (trial/test/mixed), dot_vec already
+        #   produces a GradOpInfo with the correct shape.
+        if isinstance(b, np.ndarray) and b.ndim == 2 and isinstance(a, GradOpInfo) and isinstance(a_data, np.ndarray):
+            if a_data.ndim in {2, 3, 4}:
+                return a.__mul__(b)
+
+        # Some older code paths produce intermediate matrices as VecOpInfo with
+        # role="vector" and a 2D data array. Treat those as matrices here.
+        if (
+            isinstance(a, GradOpInfo)
+            and isinstance(b, VecOpInfo)
+            and role_b == "vector"
+            and isinstance(a_data, np.ndarray)
+            and isinstance(b_data, np.ndarray)
+            and a_data.ndim == b_data.ndim == 2
+        ):
+            return a._with(a_data @ b_data, role=a.role, coeffs=None)
+        if (
+            isinstance(a, VecOpInfo)
+            and role_a == "vector"
+            and isinstance(b, GradOpInfo)
+            and isinstance(a_data, np.ndarray)
+            and isinstance(b_data, np.ndarray)
+            and a_data.ndim == b_data.ndim == 2
+        ):
+            return b._with(a_data @ b_data, role=b.role, coeffs=None)
+
+        dot_kernel = None
+        dot_plan = None
+        try:
+            dot_kernel = TensorRuleEngine.plan_dot_kernel(a, b)
+        except Exception:
+            dot_kernel = None
+
+        if dot_kernel is not None:
+            dot_plan = dot_kernel.lowering.algebra
+            dot_case = dot_kernel.case
+        else:
+            dot_case = None
+            try:
+                dot_plan = TensorRuleEngine.plan_dot(a, b)
+            except Exception:
+                dot_plan = None
+
+        if dot_plan is not None:
+            if dot_case == DotKernelCase.BASIS_BASIS_MASS and isinstance(a, VecOpInfo) and isinstance(b, VecOpInfo):
+                return a.dot_vec(b)
+            if dot_case == DotKernelCase.BASIS_GRAD_DOT_VALUE_VECTOR and isinstance(a, GradOpInfo) and isinstance(b, VecOpInfo):
+                return a.dot_vec(b)
+            if dot_case == DotKernelCase.VALUE_VECTOR_DOT_BASIS_GRAD and isinstance(a, VecOpInfo) and isinstance(b, GradOpInfo):
+                return a.dot_grad(b)
+            if dot_case == DotKernelCase.VALUE_GRAD_DOT_BASIS_VECTOR and isinstance(a, GradOpInfo) and isinstance(b, VecOpInfo):
+                return a.dot_vec(b)
+            if dot_case == DotKernelCase.BASIS_VECTOR_DOT_VALUE_GRAD and isinstance(a, VecOpInfo) and isinstance(b, GradOpInfo):
+                return a.dot_grad(b)
+            if dot_case == DotKernelCase.BASIS_GRAD_DOT_BASIS_VECTOR and isinstance(a, GradOpInfo) and isinstance(b, VecOpInfo):
+                return a.dot_vec(b)
+            if dot_case == DotKernelCase.BASIS_VECTOR_DOT_BASIS_GRAD and isinstance(a, VecOpInfo) and isinstance(b, GradOpInfo):
+                return b.left_dot(a)
+            if dot_plan.kind == OperationKind.DOT_HESSIAN_VECTOR and isinstance(a, HessOpInfo):
+                return a.dot_right(b)
+            if dot_plan.kind == OperationKind.DOT_VECTOR_HESSIAN and isinstance(b, HessOpInfo):
+                return b.dot_left(a)
+            if dot_plan.kind == OperationKind.DOT_VECTOR_VECTOR:
+                if isinstance(a, VecOpInfo) and isinstance(b, VecOpInfo):
+                    return a.dot_vec(b)
+                if isinstance(a, GradOpInfo) and isinstance(b, VecOpInfo):
+                    return a.dot_vec(b)
+                if isinstance(a, VecOpInfo) and isinstance(b, GradOpInfo):
+                    if b.role == "function":
+                        return a.dot_grad(b)
+                    return b.left_dot(a)
+                if isinstance(a, np.ndarray) and a.ndim == 1 and isinstance(b, VecOpInfo):
+                    return b.dot_const(a)
+                if isinstance(b, np.ndarray) and b.ndim == 1 and isinstance(a, VecOpInfo):
+                    return a.dot_const(b)
+                if isinstance(a, np.ndarray) and isinstance(b, np.ndarray):
+                    return np.dot(a, b)
+            if dot_plan.kind == OperationKind.DOT_TENSOR_TENSOR:
+                if isinstance(a, GradOpInfo) and isinstance(b, GradOpInfo):
+                    return a.dot(b)
 
         def rhs():
             # ------------------------------------------------------------------
@@ -1558,21 +5304,22 @@ class FormCompiler:
                (isinstance(b, VecOpInfo) and role_b == "vector")) and \
              isinstance(a, (VecOpInfo)) and a.role in {"trial", "function"}:
                 # return a.dot_const(b) if a.ndim==2 else a.dot_vec(b)
-                return a.dot_const_vec(b)
+                return a.dot_const(b) 
             if isinstance(a, VecOpInfo) and role_a == "vector" and role_b == None:
                 return a.dot_const(b)
             elif isinstance(b, VecOpInfo) and role_b == "vector" and role_a == None:
                 return b.dot_const(a)
-            elif isinstance(a, np.ndarray) and isinstance(b, GradOpInfo):
+            if isinstance(a, np.ndarray) and isinstance(b, GradOpInfo):
                 return b.left_dot(a)  # np.ndarray · ∇u
-            elif isinstance(b, np.ndarray) and isinstance(a, GradOpInfo):
+            if isinstance(b, np.ndarray) and isinstance(a, GradOpInfo):
                 return a.dot_vec(b)
             # ------------------------------------------------------------------
-            # Case:  Grad(Trial) · Grad(Function)       ∇u_trial · ∇u_k 
+            # Case:  Grad(Function/Test) · Grad(Function/Test)       ∇function/Test · ∇u_k/w_test 
             # ------------------------------------------------------------------
-            if isinstance(a, GradOpInfo) and  (a.role == "function") \
-            and isinstance(b, GradOpInfo) and (b.role == "function"):
+            if isinstance(a, GradOpInfo) and  (a.role in {"function", "test"}) \
+            and isinstance(b, GradOpInfo) and (b.role in {"function", "test"}):
                 return a.dot(b)
+        
             if isinstance(b, np.ndarray) and  (role_b == None) \
             and isinstance(a, np.ndarray) and (role_a == None):
                 return np.dot(a, b)  # plain numpy dot product
@@ -1592,10 +5339,13 @@ class FormCompiler:
             result = rhs()
             if result is not None:
                 return result
-            else:
-                raise TypeError(f"Unsupported dot product for RHS: '{n.a} . {n.b}'"
-                                f" (roles: {role_a}, {role_b})"
-                                f" (shapes: {getattr(a_data, 'shape', None)}, {getattr(b_data, 'shape', None)})")
+
+        if role_a is None and is_a_scalar and role_b is not None:
+            return b * a
+        elif role_b is None and is_b_scalar and role_a is not None:
+            return a * b
+        elif role_a is None and role_b is None and is_a_scalar and is_b_scalar:
+            return a * b
 
         if role_a == None and role_b == "test":
             # Special case like dot( Constat(np.array([u1,u2])), TestFunction('v') )
@@ -1621,37 +5371,36 @@ class FormCompiler:
         # mass matrix case: VecOpInfo . VecOpInfo
         if isinstance(a, VecOpInfo) and isinstance(b, VecOpInfo):
             logger.debug(f"visit dot: Both operands are VecOpInfo: {a.role} . {b.role}")
-            if a.role == "test" and b.role in {"trial", "function"}:
+            if a.role == "test" and b.role in {"trial", "function", "mixed", "vector"}:
                 # return np.dot(a_data.T, b_data)  # test . trial
                 return b.dot_vec(a)  # test . trial
-            elif b.role == "test" and a.role in {"trial", "function"}:
+            elif b.role == "test" and a.role in {"trial", "function", "mixed", "vector"}:
                 # return np.dot(b_data.T, a_data)  # tiral . test
                 return a.dot_vec(b)  # trial . test
+            elif a.role == "mixed" and b.role in {"function"}:
+                return a.dot_vec(b)
         
         # ------------------------------------------------------------------
         # Case:  VectorFunction · Grad(⋅)      u_k · ∇w_test
         # ------------------------------------------------------------------
         if isinstance(a, VecOpInfo) and isinstance(b, GradOpInfo) \
-        and a.role == "function" and b.role == "test":
+        and a.role in {"function", "trial"} and b.role == "test":
             return b.left_dot(a)  # u_k · ∇w
         
         # ------------------------------------------------------------------
         # case grad(u_trial) . u_k
         if isinstance(a, GradOpInfo) and ((isinstance(b, VecOpInfo) \
-            and (b.role == "function" )) and a.role == "trial" 
+            and (b.role in {"function","test","vector"} )) and a.role in {"trial", "test", "function"}
             ):
 
             return a.dot_vec(b)  # ∇u_trial · u_k
         # ------------------------------------------------------------------
-        # case u_trial . grad(u_k)
+        # case u_trial/u_test . grad(u_k)
         if isinstance(b, GradOpInfo) and ((isinstance(a, VecOpInfo) \
-            and (a.role == "trial" )) and b.role == "function"
+            and (a.role in {"trial", "test"} )) and b.role == "function"
             ):
             return b.left_dot(a)  # u_trial · ∇u_k
-        
- 
-        
-        
+
         # ------------------------------------------------------------------
         # Case:  Grad(Function) · Vec(Trial)      (∇u_k) · u
         # ------------------------------------------------------------------
@@ -1659,7 +5408,10 @@ class FormCompiler:
         and isinstance(b, VecOpInfo)  and b.role == "trial":
 
             return a.dot_vec(b)  # ∇u_k · u_trial
-        
+        if isinstance(a, GradOpInfo) and a.role == "test" \
+        and isinstance(b, VecOpInfo) and b.role == "trial":
+            return a.dot_vec(b)  # ∇v · u_trial
+       
         # ------------------------------------------------------------------
         # Case:  Vec(Function) · Grad(Trial)      u_k · ∇u_trial
         # ------------------------------------------------------------------
@@ -1670,8 +5422,8 @@ class FormCompiler:
         # ------------------------------------------------------------------
         # Case:  Grad(Trial) · Grad(Function)       ∇u_trial · ∇u_k 
         # ------------------------------------------------------------------
-        if isinstance(a, GradOpInfo) and (a.role in {"trial", "function", "test"}) \
-        and isinstance(b, GradOpInfo) and (b.role in {"trial", "function", "test"}):
+        if isinstance(a, GradOpInfo) and (a.role in {"trial", "function", "test", "mixed"}) \
+        and isinstance(b, GradOpInfo) and (b.role in {"trial", "function", "test", "mixed"}):
             return a.dot(b)
         
         # --- Hessian · vector (right) and vector · Hessian (left) -------------
@@ -1689,9 +5441,120 @@ class FormCompiler:
         # Both are numerical vectors (RHS)
         if isinstance(a, np.ndarray) and isinstance(b, np.ndarray): return np.dot(a,b)
 
-        raise TypeError(f"Unsupported dot product LHS '{n.a} . {n.b}'"
+        raise TypeError(f"Unsupported dot product LHS '{type(a)} . {type(b)}'"
                         f" for roles a={getattr(a, 'role', None)}, b={getattr(b, 'role', None)}"
                         f" and data shapes a={getattr(a_data, 'shape', None)}, b={getattr(b_data, 'shape', None)}")
+
+    def _visit_Outer(self, n: Outer):
+        """
+        Outer product / dyad: ``Outer(a, b) := a ⊗ b``.
+
+        The symbolic layer promotes non-scalar vector products such as
+        ``u_k * du`` and ``v * du`` to ``Outer``.  Lower them through the
+        tensor-rule engine so later ``dot(...)`` closures see the same carried
+        storage/layout as the JIT/C++ backends.
+        """
+        a = self._visit(n.a)
+        b = self._visit(n.b)
+
+        a_data = a.data if isinstance(a, (VecOpInfo, GradOpInfo, HessOpInfo)) else a
+        b_data = b.data if isinstance(b, (VecOpInfo, GradOpInfo, HessOpInfo)) else b
+
+        try:
+            product_value_spec = TensorRuleEngine.plan_product_value_spec(a, b)
+        except Exception:
+            product_value_spec = None
+
+        is_a_scalar = np.isscalar(a_data) or (isinstance(a_data, np.ndarray) and a_data.ndim == 0)
+        is_b_scalar = np.isscalar(b_data) or (isinstance(b_data, np.ndarray) and b_data.ndim == 0)
+        if is_a_scalar or is_b_scalar:
+            return a * b
+
+        def _as_rank1_vec(obj: Any):
+            if isinstance(obj, VecOpInfo):
+                return obj
+            arr = np.asarray(obj, dtype=float)
+            if arr.ndim == 1:
+                return VecOpInfo(arr, role="vector", is_rhs=bool(self.ctx.get("rhs")))
+            return None
+
+        def _value_components(obj: Any) -> np.ndarray:
+            if isinstance(obj, VecOpInfo):
+                vals = _collapsed_function(obj) if obj.role in {"function", "scalar"} else np.asarray(obj.data, dtype=float)
+            else:
+                vals = np.asarray(obj, dtype=float)
+            vals = np.asarray(vals, dtype=float)
+            if vals.ndim != 1:
+                raise NotImplementedError(
+                    f"Outer expects a semantic rank-1 value vector, got shape {vals.shape}."
+                )
+            return vals
+
+        def _outer_meta(lhs_obj: Any, rhs_obj: Any) -> dict:
+            preferred: list[VecOpInfo] = []
+            for role in ("test", "trial", "mixed"):
+                for candidate in (lhs_obj, rhs_obj):
+                    if isinstance(candidate, VecOpInfo) and candidate.role == role:
+                        preferred.append(candidate)
+            for candidate in (lhs_obj, rhs_obj):
+                if isinstance(candidate, VecOpInfo):
+                    preferred.append(candidate)
+            if preferred:
+                return preferred[0].meta()
+            return {
+                "field_names": [],
+                "parent_name": "",
+                "side": "",
+                "field_sides": [],
+                "is_rhs": bool(self.ctx.get("rhs")),
+            }
+
+        lhs_vec = _as_rank1_vec(a)
+        rhs_vec = _as_rank1_vec(b)
+        if lhs_vec is not None and rhs_vec is not None:
+            if product_value_spec is not None and product_value_spec.kind == "mat":
+                return np.ascontiguousarray(
+                    _value_components(lhs_vec)[:, None] * _value_components(rhs_vec)[None, :]
+                )
+
+            if product_value_spec is not None and product_value_spec.kind == "grad":
+                if lhs_vec.role in {"trial", "test", "mixed"}:
+                    data = np.ascontiguousarray(
+                        np.asarray(lhs_vec.data, dtype=float)[:, :, None]
+                        * _value_components(rhs_vec)[None, None, :]
+                    )
+                elif rhs_vec.role in {"trial", "test", "mixed"}:
+                    data = np.ascontiguousarray(
+                        _value_components(lhs_vec)[:, None, None]
+                        * np.asarray(rhs_vec.data, dtype=float).T[None, :, :]
+                    )
+                else:
+                    raise NotImplementedError(
+                        f"Outer grad lowering expected exactly one basis operand, got roles {lhs_vec.role}/{rhs_vec.role}."
+                    )
+                return GradOpInfo(data, role=product_value_spec.role, **_outer_meta(lhs_vec, rhs_vec))
+
+            if product_value_spec is not None and product_value_spec.kind == "mixed":
+                lhs_basis = np.asarray(lhs_vec.data, dtype=float)
+                rhs_basis = np.asarray(rhs_vec.data, dtype=float)
+                if lhs_vec.role == "test" and rhs_vec.role == "trial":
+                    data = np.ascontiguousarray(
+                        lhs_basis[:, :, None, None] * rhs_basis.T[None, None, :, :]
+                    )
+                elif lhs_vec.role == "trial" and rhs_vec.role == "test":
+                    data = np.ascontiguousarray(
+                        lhs_basis[:, None, :, None] * rhs_basis.T[None, :, None, :]
+                    )
+                else:
+                    raise NotImplementedError(
+                        f"Outer mixed lowering requires test/trial basis operands, got roles {lhs_vec.role}/{rhs_vec.role}."
+                    )
+                return GradOpInfo(data, role=product_value_spec.role, **_outer_meta(lhs_vec, rhs_vec))
+
+        raise NotImplementedError(
+            f"Outer product not implemented for types {type(a_data)} (shape {getattr(a_data,'shape',None)}) "
+            f"and {type(b_data)} (shape {getattr(b_data,'shape',None)})."
+        )
 
     # ================ VISITORS: INNER PRODUCTS =========================
     def _visit_Inner(self, n: Inner):
@@ -1705,11 +5568,34 @@ class FormCompiler:
 
         rhs = bool(self.ctx.get("rhs"))
 
+        def _grad_const_inner(grad_info: GradOpInfo, const_arr: np.ndarray, *, node, role_hint: str | None = None):
+            carr = np.asarray(const_arr, dtype=float)
+            if carr.ndim == 1:
+                carr = carr[np.newaxis, :]
+            elif carr.ndim != 2:
+                raise TypeError(f"Grad-constant inner expects a rank-2 constant, got shape {carr.shape}.")
+            const_role = "scalar" if carr.shape[0] == 1 else "function"
+            const_grad = self._gradinfo(carr, role=const_role, node=node, field_names=[])
+            result = grad_info.inner(const_grad)
+            if grad_info.role in {"trial", "test"}:
+                data = np.asarray(result, dtype=float)
+                if data.ndim == 1:
+                    data = data[np.newaxis, :]
+                role = role_hint or grad_info.role
+                return self._vecinfo(data, role=role, node=node, field_names=grad_info.field_names)
+            if grad_info.role == "mixed":
+                return self._vecinfo(np.asarray(result, dtype=float), role="mixed", node=node, field_names=grad_info.field_names)
+            return result
+
         # ============================= RHS =============================
         if rhs:
             # ---- Hessian(Function) · Hessian(Test/Trial)  → (n,) ----
             if isinstance(a, (HessOpInfo, VecOpInfo, GradOpInfo)) and isinstance(b, (HessOpInfo, VecOpInfo, GradOpInfo)):
                 return a.inner(b)  # returns (n,) vector
+            if isinstance(a, GradOpInfo) and isinstance(b, np.ndarray):
+                return _grad_const_inner(a, b, node=n)
+            if isinstance(b, GradOpInfo) and isinstance(a, np.ndarray):
+                return _grad_const_inner(b, a, node=n)
             # ---- Numeric tensor with Grad basis on RHS ----
             if isinstance(a, ( VecOpInfo)) and isinstance(b, (np.ndarray, VecOpInfo)):
                 return a.inner(b)  # returns (n,) vector
@@ -1741,7 +5627,37 @@ class FormCompiler:
                 return a.inner(b)
             if a.role == "trial" and b.role == "test":
                 return b.inner(a)
-            raise ValueError(f"Grad LHS expects test vs trial; got {a.role} vs {b.role}.")
+            elif a.role == "function" and b.role in {"trial", "test", "mixed", "identity", "function"}:
+                result = a.inner(b)
+                if b.role in {"trial", "test"}:
+                    role = b.role
+                    if result.ndim ==1:
+                        # expand to (1, n) 
+                        result = result[np.newaxis, :]
+                        return self._vecinfo(result, role=role, node=n, field_names=b.field_names)
+                    else:
+                        return self._vecinfo(result, role=role, node=n, field_names=b.field_names)
+                return result
+            elif a.role in {"trial", "test"} and b.role in {"function", "identity"}:
+                result = a.inner(b)
+                if a.role in {"trial", "test"}:
+                    role = a.role
+                    if result.ndim ==1:
+                        # expand to (1, n)
+                        result = result[np.newaxis, :]
+                        return self._vecinfo(result, role=role, node=n, field_names=a.field_names)
+                    else:
+                        return self._vecinfo(result, role=role, node=n, field_names=a.field_names)
+                return result
+            
+            elif a.role in {"mixed"} and b.role in {"function", "identity"}:
+                return a.inner(b)
+            raise ValueError(f"Grad LHS expects test vs trial; got {a.role} vs {b.role}."
+                             f" shapes a={getattr(a.data,'shape',None)}, b={getattr(b.data,'shape',None)}")
+        if isinstance(a, GradOpInfo) and isinstance(b, np.ndarray):
+            return _grad_const_inner(a, b, node=n)
+        if isinstance(b, GradOpInfo) and isinstance(a, np.ndarray):
+            return _grad_const_inner(b, a, node=n)
 
         # ---- Vec LHS (e.g., Laplacian(LHS) yields VecOpInfo) ----
         if isinstance(a, VecOpInfo) and isinstance(b, VecOpInfo):
@@ -1749,6 +5665,14 @@ class FormCompiler:
                 return a.inner(b)
             if a.role == "trial" and b.role == "test":
                 return b.inner(a)
+            # Allow coefficient-only vector inner products on the LHS, e.g.
+            # `sqrt(inner(v_prev, v_prev) + eps)` used in stabilization weights.
+            # These do not contribute to the bilinear structure directly, but they are
+            # valid scalar coefficients. Collapse (k,n)->(k,) and compute a scalar dot.
+            if a.role == "function" and b.role == "function":
+                a_vec = _collapsed_function(a)
+                b_vec = _collapsed_function(b)
+                return float(np.einsum("k,k->", a_vec, b_vec, optimize=True))
             raise ValueError(f"Vec LHS expects test vs trial; got {a.role} vs {b.role}.")
 
         # ---- Numerical fallbacks ----
@@ -1757,56 +5681,101 @@ class FormCompiler:
             return float(np.einsum("..., ...->", a, b, optimize=True)) if a.ndim == b.ndim == 1 else np.tensordot(a, b, axes=([0], [0]))
 
 
-        raise TypeError(f"Unsupported inner product '{n.a} : {n.b}' "
+        raise TypeError(f"Unsupported inner product '{type(n.a)} : {type(n.b)}' "
                         f"for roles a={getattr(a, 'role', None)}, b={getattr(b, 'role', None)} "
+                        f"for shapes a={getattr(a, 'shape', None)}, b={getattr(b, 'shape', None)} "
                         f"and data shapes a={getattr(a, 'data', None)}, b={getattr(b, 'data', None)}")
 
     
         
     # Visitor dispatch
-    def _visit(self, node): return self._dispatch[type(node)](node)
+    def _visit(self, node):
+        handler = self._dispatch.get(type(node))
+        if handler is None:
+            for cls, candidate in self._dispatch.items():
+                if isinstance(node, cls):
+                    handler = candidate
+                    break
+        if handler is None:
+            raise KeyError(f"No visitor registered for node type {type(node).__name__}.")
+        result = handler(node)
+        if result is None:
+            raise RuntimeError(f"Visitor returned None for node={node!r} type={type(node).__name__}")
+        return result
 
     def _visit_Analytic(self, node): return node.eval(self.ctx['x_phys'])
 
     # ======================= ASSEMBLY CORE ============================
+    def _assemble_integral(self, integral, target):
+        """Assemble one integral-like unit into the provided target."""
+        if not isinstance(integral, (Integral, _FusedIntegralGroup)):
+            return
+
+        # --- The rest of the dispatching logic remains the same ---
+        if integral.measure.domain_type == "interface":
+            # Handle interface integrals with a level set
+            logger.info(f"Assembling interface integral: {integral} with backend {self.backend}")
+            self._assemble_interface(integral, target)
+            return
+        if integral.measure.domain_type == "nonmatching_interface":
+            logger.info(f"Assembling nonmatching-interface integral: {integral} with backend {self.backend}")
+            self._assemble_nonmatching_interface(integral, target)
+            return
+        if integral.measure.domain_type == "trace_link":
+            logger.info(f"Assembling trace-link integral: {integral} with backend {self.backend}")
+            self._assemble_trace_link(integral, target)
+            return
+        if integral.measure.domain_type == "volume":
+            # Handle volume integrals
+            logger.info(f"Assembling volume integral: {integral} with backend {self.backend}")
+            self._assemble_volume(integral, target)
+            return
+        if integral.measure.domain_type == "ghost_edge":
+            logger.info(f"Assembling ghost edge integral: {integral} with backend {self.backend}")
+            self._assemble_ghost_edge(integral, target)
+            return
+        if integral.measure.domain_type == "facet_patch":
+            logger.info(f"Assembling facet-patch integral: {integral} with backend {self.backend}")
+            self._assemble_facet_patch(integral, target)
+            return
+        if integral.measure.domain_type == "interior_facet":
+            logger.info(f"Assembling interior-facet integral: {integral} with backend {self.backend}")
+            self._assemble_interior_edge(integral, target)
+            return
+        if integral.measure.domain_type == "cut_interior_facet":
+            logger.info(f"Assembling cut interior-facet integral: {integral} with backend {self.backend}")
+            self._assemble_cut_interior_edge(integral, target)
+            return
+        if integral.measure.domain_type == "exterior_facet":
+            logger.info(f"Assembling exterior-facet integral: {integral} with backend {self.backend}")
+            self._assemble_boundary_edge(integral, target)
+            return
+
+    def _assemble_integral_units(self, integrals, target, *, rhs: bool) -> None:
+        old_rhs = self.ctx.get("rhs", None)
+        try:
+            self.ctx["rhs"] = bool(rhs)
+            for integral in list(integrals or []):
+                self._assemble_integral(integral, target)
+        finally:
+            if old_rhs is None:
+                self.ctx.pop("rhs", None)
+            else:
+                self.ctx["rhs"] = old_rhs
+
     def _assemble_form(self, form, target):
         """Accept a Form object and iterate through its integrals."""
         from pycutfem.ufl.forms import Form
-        # from pycutfem.ufl.measures import Integral
 
         # This guard clause correctly handles one-sided equations (e.g., L=None or a=None)
         if form is None or not isinstance(form, Form):
             return
 
-        for integral in form.integrals:
-            if not isinstance(integral, Integral):
-                continue
-            
-            # --- The rest of the dispatching logic remains the same ---
-            if integral.measure.domain_type == "interface":
-                # Handle interface integrals with a level set
-                logger.info(f"Assembling interface integral: {integral} with backend {self.backend}")
-                # print(f"Assembling interface integral with backend {self.backend}")
-                self._assemble_interface(integral, target)
-                continue
-            if integral.measure.domain_type == "volume":
-                # Handle volume integrals
-                logger.info(f"Assembling volume integral: {integral} with backend {self.backend}")
-                # print(f"Assembling volume integral with backend {self.backend}")
-                self._assemble_volume(integral, target)
-                continue
-            if integral.measure.domain_type == "ghost_edge":
-                logger.info(f"Assembling ghost edge integral: {integral} with backend {self.backend}")
-                # print(f"Assembling ghost edge integral with backend {self.backend}")
-                self._assemble_ghost_edge(integral, target)
-                continue
-            if integral.measure.domain_type == "exterior_facet":
-                logger.info(f"Assembling exterior-facet integral: {integral} with backend {self.backend}")
-                # print(f"Assembling exterior-facet integral with backend {self.backend}")
-                self._assemble_boundary_edge(integral, target)
-                continue
-
-            logger.warning(f"Skipping unsupported integral type: {integral.measure.domain_type}")
+        self._assemble_integral_units(
+            [integral for integral in form.integrals if isinstance(integral, Integral)],
+            target,
+            rhs=bool(self.ctx.get("rhs", True)),
+        )
 
 
     def _find_q_order(self, integral: Integral) -> int:
@@ -1854,26 +5823,62 @@ class FormCompiler:
     
     # ====================== BC handling ===============================
     def _apply_bcs(self, K, F, bcs):
-        # This method remains unchanged from your provided file
-        if not bcs: return
+        if not bcs:
+            return K
         data = self.dh.get_dirichlet_data(bcs)
-        if not data: return
+        if not data:
+            return K
         rows = np.fromiter(data.keys(), dtype=int)
         vals = np.fromiter(data.values(), dtype=float)
         
         # Apply to RHS vector F
         F -= K @ np.bincount(rows, weights=vals, minlength=F.size)
         
-        # Zero out rows and columns in the matrix
-        K_lil = K.tolil()
-        K_lil[rows, :] = 0
-        K_lil[:, rows] = 0
-        K_lil[rows, rows] = 1.0
-        # copy the edited data back
-        K[:] = K_lil  # Convert back to CSR format
-        
+        # Zero out rows and columns in CSR/CSC space to avoid slow LIL fancy sets.
+        K_csc = K.tocsc(copy=True) if hasattr(K, "tocsc") else sp.csc_matrix(K)
+        n_rows, n_cols = K_csc.shape
+        keep = (rows >= 0) & (rows < min(n_rows, n_cols))
+        rows = rows[keep]
+        vals = vals[keep]
+        c_indptr = K_csc.indptr
+        c_data = K_csc.data
+        for rr in rows.tolist():
+            start = int(c_indptr[rr])
+            end = int(c_indptr[rr + 1])
+            if end > start:
+                c_data[start:end] = 0.0
+
+        K_csr = K_csc.tocsr()
+        indptr = K_csr.indptr
+        indices = K_csr.indices
+        values = K_csr.data
+        missing_diag: list[int] = []
+        for rr in rows.tolist():
+            start = int(indptr[rr])
+            end = int(indptr[rr + 1])
+            if end <= start:
+                missing_diag.append(rr)
+                continue
+            values[start:end] = 0.0
+            hit = np.nonzero(indices[start:end] == rr)[0]
+            if hit.size:
+                values[start + int(hit[0])] = 1.0
+            else:
+                missing_diag.append(rr)
+        if missing_diag:
+            diag_rows = np.asarray(missing_diag, dtype=int)
+            K_csr = (
+                K_csr
+                + sp.csr_matrix(
+                    (np.ones(diag_rows.size, dtype=float), (diag_rows, diag_rows)),
+                    shape=K_csr.shape,
+                )
+            ).tocsr()
+        K_csr.eliminate_zeros()
+
         # Set values in the RHS vector
         F[rows] = vals
+        return K_csr
     
     def _union_element_dofs(self, eid: int, fields: list[str]) -> np.ndarray:
         """
@@ -1913,6 +5918,13 @@ class FormCompiler:
 
         if fields is None:
             gdofs = np.asarray(self.dh.get_elemental_dofs(eid), dtype=int)
+            # XFEM: allow a larger local block on cut/enriched elements
+            try:
+                n_loc = int(loc.shape[0]) if hasattr(loc, "shape") else int(len(loc))
+            except Exception:
+                n_loc = int(len(gdofs))
+            if n_loc != int(len(gdofs)) and hasattr(self.dh, "get_elemental_dofs_xfem"):
+                gdofs = np.asarray(self.dh.get_elemental_dofs_xfem(eid), dtype=int)
         else:
             gdofs = np.concatenate(
                 [np.asarray(self.dh.element_dofs(f, eid), dtype=int) for f in fields],
@@ -1954,7 +5966,7 @@ class FormCompiler:
         # if a level-set was attached to dx → do cut-cell assembly in Python path
         if getattr(integral.measure, "level_set", None) is not None:
             # CUT-VOLUME integral
-            if self.backend == "jit":
+            if self._is_jit_backend():
                 self._assemble_volume_cut_jit(integral, matvec)
             else:
                 self._clear_sided_ctx()
@@ -1963,10 +5975,12 @@ class FormCompiler:
         # … otherwise the existing back-end selection …
         if self.backend == "python":
             self._assemble_volume_python(integral, matvec)
-        elif self.backend == "jit":
+        elif self._is_jit_backend():
             self._assemble_volume_jit(integral, matvec)
         else:
-            raise ValueError("Unsupported backend.")
+            raise ValueError(
+                f"Unsupported backend: {self.backend}. Use 'python', 'jit', or 'cpp'."
+            )
     
     # ----------------------------------------------------------------------
     def _expr_requires_hess(self, node):
@@ -2047,16 +6061,47 @@ class FormCompiler:
         )
         derivs, need_hess, need_o3, need_o4 = self._find_req_derivs(integral, runner)
 
+        # Active subset/permutation used by the kernel (needed for static arg layout)
+        active_fields = _active_field_order(ir, self.me)
+        runner_active = getattr(runner, "active_fields", None)
+        if runner_active:
+            # Normalize to MixedElement ordering: cached kernels may not expose active_fields.
+            active_set = set(runner_active)
+            me_order = getattr(self.me, "field_names", ())
+            active_fields = tuple([f for f in me_order if f in active_set]) if me_order else tuple(runner_active)
+        active_cols = _active_columns(self.me, active_fields)
+
 
         # 4. Build the static arguments required by this specific kernel.
         # We build these fresh every time to avoid caching collisions.
-        q_order = self._find_q_order(integral)
+        # Match the python backend's geometry-aware quadrature inflation for
+        # curved/isoparametric mappings (poly_order>1). Without this, non-polynomial
+        # integrands (e.g. detachment sqrt terms) can differ between backends.
+        q_base = int(self._find_q_order(integral))
+        p_geo = int(getattr(mesh, "poly_order", 1))
+        q_infl = 2 * max(0, p_geo - 1)
+        q_order = q_base + q_infl
         deformation = getattr(integral.measure, "deformation", None)
 
         # (A) Get full-mesh geometric factors and then SLICE them for the subset.
         geo_args_all = self.dh.precompute_geometric_factors(q_order, 
                                                             need_hess=need_hess, need_o3=need_o3, need_o4=need_o4,
                                                             deformation=deformation)
+        qp_ref_all = geo_args_all.get("qp_ref", None)
+        if qp_ref_all is None:
+            raise RuntimeError("Volume JIT assembly requires qp_ref geometric data.")
+        ref_points = np.asarray(qp_ref_all, dtype=float)
+        if ref_points.ndim == 3:
+            raise NotImplementedError(
+                "QuadratureStateCoefficient is currently supported only for standard volume quadrature."
+            )
+        _, ref_weights = volume(mesh.element_type, q_order)
+        self._validate_quadrature_state_usage(
+            integral.integrand,
+            reference_points=ref_points,
+            reference_weights=np.asarray(ref_weights, dtype=float),
+            context=f"jit volume integral q={int(q_order)}",
+        )
         # Slice only tensors that are organised per-element along axis 0. Scalars or
         # global tables (e.g. qp_ref with shape (n_q, 2)) must be reused as-is.
         pre_built = {}
@@ -2073,7 +6118,7 @@ class FormCompiler:
 
         # (B) Build the DOF map for the subset.
         gdofs_map = np.vstack([
-            self.dh.get_elemental_dofs(e) for e in element_ids
+            self.dh.get_elemental_dofs(e)[active_cols] for e in element_ids
         ]).astype(np.int32)
 
         # (C) Build all other required tables (basis, etc.) based on the correct param_order.
@@ -2081,6 +6126,7 @@ class FormCompiler:
             ir, integral.integrand, self.me, q_order,
             dof_handler=self.dh,
             gdofs_map=gdofs_map,
+            active_cols=active_cols,
             param_order=runner.param_order, # Use the param_order from the CURRENT runner
             pre_built=pre_built
         )
@@ -2092,6 +6138,8 @@ class FormCompiler:
             **pre_built,
             **basis_args,
         }
+        static_args = _compress_static_for_active(static_args, self.me, active_cols)
+        gdofs_map = static_args.get("gdofs_map", gdofs_map)
 
         # 5. Execute the kernel via the runner.
         K_loc, F_loc, J_loc = runner(current_funcs, static_args)
@@ -2126,8 +6174,7 @@ class FormCompiler:
         - curved geometry     : quadrature order inflated by mesh.poly_order
         """
         import numpy as np
-        from pycutfem.fem import transform
-        from pycutfem.ufl.helpers import normalize_elem_ids
+        from pycutfem.ufl.helpers import normalize_elem_ids, _trial_test
 
         mesh   = self.me.mesh
         rhs    = self.ctx.get("rhs", False)
@@ -2137,6 +6184,21 @@ class FormCompiler:
         self.ctx["measure_side"] = None          # no LS side here
 
         logger.info(f"Assembling volume integral: {integral}")
+
+        # --- functional detection (structure-based) ---
+        trial, test = _trial_test(integral.integrand)
+        hook = self._hook_for(integral.integrand)
+        is_pure_functional = (trial is None) and (test is None)
+        accumulate_scalar = is_pure_functional and (hook is not None)
+        if is_pure_functional and hook is None:
+            if _is_scalar_zero_constant(integral.integrand):
+                return
+            raise ValueError(
+                "Pure functionals on the python backend require an assembler hook "
+                "(e.g. assemble_form(..., assembler_hooks={integrand:{'name':'I'}}))."
+            )
+        if accumulate_scalar:
+            self.ctx.setdefault("scalar_results", {}).setdefault(hook["name"], 0.0)
 
         # --- element restriction via 'defined_on' (BitSet / mask / ids / tag / int)
         allowed = normalize_elem_ids(mesh, getattr(integral.measure, "defined_on", None))
@@ -2152,14 +6214,23 @@ class FormCompiler:
         q_order = q_base + q_infl
 
         qp, qw = volume(mesh.element_type, q_order)
+        self._validate_quadrature_state_usage(
+            integral.integrand,
+            reference_points=np.asarray(qp, dtype=float),
+            reference_weights=np.asarray(qw, dtype=float),
+            context=f"volume integral q={int(q_order)}",
+        )
 
-        # local block shape == full mixed-element local size (matches visitor output)
-        loc_shape = (self.me.n_dofs_local,) if rhs else (self.me.n_dofs_local, self.me.n_dofs_local)
+        loc_shape = None
+        if not accumulate_scalar:
+            loc_shape = (self.me.n_dofs_local,) if rhs else (self.me.n_dofs_local, self.me.n_dofs_local)
 
         for eid in elem_ids:
-            loc = np.zeros(loc_shape, dtype=float)
+            loc = None
+            if not accumulate_scalar:
+                loc = np.zeros(loc_shape, dtype=float)
 
-            for (xi, eta), w in zip(qp, qw):
+            for q, ((xi, eta), w) in enumerate(zip(qp, qw)):
                 J     = transform.jacobian(mesh, eid, (xi, eta))
                 detJ  = abs(np.linalg.det(J))
                 Ji    = np.linalg.inv(J)
@@ -2167,28 +6238,78 @@ class FormCompiler:
                 # cache basis/grad for exactly the fields used by the integrand
                 self._basis_cache.clear(); self._coeff_cache.clear(); self._collapsed_cache.clear()
                 for f in fields:
+                    fam = getattr(self.me, "_field_families", {}).get(f, "Lagrange")
+                    if fam == "RT":
+                        # H(div): vector basis values + divergence basis (both union-sized).
+                        V = np.asarray(self.me.tabulate_value(f, float(xi), float(eta), element_id=int(eid)), dtype=float)  # (n_loc_f,2)
+                        G = np.asarray(self.me.tabulate_grad(f, float(xi), float(eta), element_id=int(eid)), dtype=float)  # (n_loc_f,2,2)
+                        H = np.asarray(self.me.tabulate_hessian(f, float(xi), float(eta), element_id=int(eid)), dtype=float)  # (n_loc_f,2,2,2)
+                        divV = np.asarray(self.me.tabulate_div(f, float(xi), float(eta), element_id=int(eid)), dtype=float).ravel()  # (n_loc_f,)
+                        sgn = np.asarray(self.dh.element_signs[f][int(eid)], dtype=float).ravel()
+                        if sgn.shape[0] != V.shape[0]:
+                            raise RuntimeError(f"element_signs length mismatch for RT field '{f}' on element {eid}.")
+                        V = sgn[:, None] * V
+                        G = sgn[:, None, None] * G
+                        H = sgn[:, None, None, None] * H
+                        divV = sgn * divV
+
+                        n_union = int(self.me.n_dofs_local)
+                        sl = self.me.component_dof_slices[f]
+                        hdiv_val = np.zeros((2, n_union), dtype=float)
+                        hdiv_grad = np.zeros((2, n_union, 2), dtype=float)
+                        hdiv_hess = np.zeros((2, n_union, 2, 2), dtype=float)
+                        hdiv_val[:, sl] = V.T
+                        hdiv_grad[:, sl, :] = np.transpose(G, (1, 0, 2))
+                        hdiv_hess[:, sl, :, :] = np.transpose(H, (1, 0, 2, 3))
+                        hdiv_div = np.zeros((n_union,), dtype=float)
+                        hdiv_div[sl] = divV
+                        self._basis_cache[f] = {
+                            "hdiv_val": hdiv_val,
+                            "hdiv_grad": hdiv_grad,
+                            "hdiv_hess": hdiv_hess,
+                            "hdiv_div": hdiv_div,
+                        }
+                        continue
+
                     self._basis_cache[f] = {
-                        "val" : self.me.basis(f, xi, eta),
-                        "grad": self.me.grad_basis(f, xi, eta) @ Ji
+                        "val": self.me.basis(f, xi, eta),
+                        "grad": self.me.grad_basis(f, xi, eta) @ Ji,
                     }
 
                 self.ctx["eid"]    = eid
+                self.ctx["q"] = int(q)
+                self.ctx["qstate_owner_id"] = int(eid)
+                self.ctx["detJ"] = float(detJ)
                 self.ctx["x_phys"] = transform.x_mapping(mesh, eid, (xi, eta))
 
                 integrand_val = self._visit(integral.integrand)
-                loc += (w * detJ) * integrand_val
-
-            # full-size local block → scatter against ALL element DOFs
-            self._scatter_local(eid, loc, fields=None, matvec=matvec, rhs=rhs)
+                if accumulate_scalar:
+                    val_data = getattr(integrand_val, "data", integrand_val)
+                    val_arr = np.asarray(val_data, dtype=float)
+                    if val_arr.ndim == 0:
+                        val = float(val_arr)
+                    else:
+                        val_arr = val_arr.reshape(-1)
+                        if val_arr.size != 1:
+                            raise ValueError(
+                                f"Pure functional integrand must be scalar; got shape {val_arr.shape}."
+                            )
+                        val = float(val_arr[0])
+                    self.ctx["scalar_results"][hook["name"]] += float(w * detJ) * val
+                else:
+                    loc += (w * detJ) * integrand_val
+            if not accumulate_scalar:
+                # full-size local block → scatter against ALL element DOFs
+                self._scatter_local(eid, loc, fields=None, matvec=matvec, rhs=rhs)
 
         # cleanup
-        for k in ("eid", "x_phys", "is_interface"):
+        for k in ("eid", "x_phys", "is_interface", "q", "qstate_owner_id", "detJ"):
             self.ctx.pop(k, None)
 
     
     
-    def _assemble_interface_python(self, intg: Integral, matvec):
-        from pycutfem.integration.quadrature import  curved_line_quadrature_batch
+    def _assemble_interface_python(self, intg: Integral, matvec, *, _collector=None):
+        from pycutfem.integration.quadrature import curved_line_quadrature_batch
         try:
             from pycutfem.integration.quadrature import isoparam_interface_line_quadrature_batch as _iso_ifc
         except Exception:
@@ -2199,223 +6320,820 @@ class FormCompiler:
 
         rhs = bool(self.ctx.get('rhs', False))
         log.info(f"Assembling interface integral: {intg}, is_rhs={rhs}")
-        level_set = intg.measure.level_set
+        level_set = getattr(intg.measure, "level_set", None)
         if level_set is None:
             raise ValueError("dInterface measure requires a level_set.")
 
         deformation = getattr(intg.measure, "deformation", None)
-        mesh, me, dh = self.me.mesh, self.me, self.dh
+        dh = self.dh
 
-        # context: we are on Γ
-        self.ctx['is_interface'] = True
-        self.ctx['is_ghost']     = False
-        md = intg.measure.metadata or {}
-        side_md = md.get('side', None)
-        if side_md in ('+', '-'):
-            self.ctx['measure_side'] = side_md
-
-        qdeg   = self._find_q_order(intg)
-        p_geo  = int(getattr(mesh, "poly_order", 1))
-        qdeg  += 2 * max(0, p_geo - 1)
-        fields = self._fields_for(intg.integrand)
-        nseg   = int(md.get("nseg", max(3, p_geo + qdeg//2)))
-        ref_geom = transform.get_reference(mesh.element_type, p_geo)
-
-        # scalar‑functional?
-        trial, test = _trial_test(intg.integrand)
-        hook = self._hook_for(intg.integrand)
-        is_functional = (hook is not None) and not (trial or test)
-        if is_functional:
-            self.ctx.setdefault('scalar_results', {}).setdefault(hook['name'], 0.0)
-
-        def _is_valid(elem):
-            return getattr(elem, 'tag', None) == 'cut' and len(getattr(elem, 'interface_pts', ())) == 2
-
-        # gather interface elements
-        eids, P0, P1 = [], [], []
-        for elem in mesh.elements_list:
-            if _is_valid(elem):
-                eids.append(int(elem.id))
-                p0, p1 = elem.interface_pts
-                P0.append(np.asarray(p0, float)); P1.append(np.asarray(p1, float))
-        if not eids:
-            return
-
-        eids  = np.asarray(eids, dtype=int)
-        P0    = np.asarray(P0, float)
-        P1    = np.asarray(P1, float)
-
-        # per‑element global dofs & maps
-        gdofs_per_e = [np.asarray(dh.get_elemental_dofs(e), dtype=int) for e in eids]
-        maps_by_field = [_hfa.build_field_union_maps(dh, fields, int(e), int(e), gdofs_per_e[i])
-                        for i, e in enumerate(eids)]
-        masks_by_field = []
-        for i, eid in enumerate(eids):
-            try:
-                masks_by_field.append(_hfa.build_side_masks_by_field(dh, fields, int(eid), level_set, tol=SIDE.tol))
-            except Exception:
-                masks_by_field.append(({}, {}))
-
-        # one iso call for all Γ segments: return reference coords + tangents
-        t0 = _time.perf_counter()
-        if _iso_ifc is not None:
-            qb, wb, tb, rb = _iso_ifc(level_set, P0, P1,
-                                    p=p_geo, order=qdeg, project_steps=3, tol=SIDE.tol,
-                                    mesh=mesh, eids=eids,
-                                    return_tangent=True, return_qref=True)
-            qpts_all, qwts_all, that_all, qref_all = qb, wb, tb, rb
-        else:
-            # fallback: polyline rule (no qref/tangent); will use inverse map — slower
-            qpts, qwts = curved_line_quadrature_batch(level_set, P0, P1, order=qdeg, nseg=nseg, project_steps=3, tol=SIDE.tol)
-            qpts_all, qwts_all, that_all, qref_all = qpts, qwts, None, None
-        t_iso = _time.perf_counter() - t0
-
-        # micro helpers (avoid np.linalg.inv per QP)
-        def _solve2x2(A, b):
-            # solves A v = b (both 2d); returns v
-            a, b0 = float(A[0,0]), float(A[0,1])
-            c, d  = float(A[1,0]), float(A[1,1])
-            det   = a*d - b0*c
-            invd  = 1.0/(det + 1e-300)
-            return np.array([( d*b[0] - b0*b[1]) * invd,
-                            (-c*b[0] +  a*b[1]) * invd], float)
-
-        # main per‑element loop
-        t_qploop = 0.0
+        # XFEM: when enrichment is active, evaluate basis against the expanded local layout.
+        me_prev = self.me
         try:
-            t1 = _time.perf_counter()
-            for ei, eid in enumerate(eids):
-                self.ctx['eid']     = int(eid)
-                self.ctx['pos_eid'] = int(eid)
-                self.ctx['neg_eid'] = int(eid)
-
-                global_dofs = gdofs_per_e[ei]
-                pos_map_by_field, neg_map_by_field = maps_by_field[ei]
+            if (
+                hasattr(dh, "xfem_mixed_element")
+                and callable(getattr(dh, "xfem_mixed_element"))
+                and getattr(dh, "n_enriched", lambda: 0)() > 0
+            ):
                 try:
-                    pos_mask_by_field, neg_mask_by_field = masks_by_field[ei]
+                    self.me = dh.xfem_mixed_element()
                 except Exception:
-                    pos_mask_by_field, neg_mask_by_field = {}, {}
+                    self.me = me_prev
 
-                # deformation locals (avoid repeat lookups)
-                if deformation is not None:
-                    conn = np.asarray(mesh.elements_connectivity[int(eid)], dtype=int)
-                    Uloc = np.asarray(deformation.node_displacements[conn], float)
-                ref_shape = ref_geom.shape
-                ref_grad  = ref_geom.grad
-                x_map     = transform.x_mapping
-                jac_fun   = transform.jacobian
+            mesh, me = self.me.mesh, self.me
 
-                # local accumulator
-                if is_functional:
-                    acc = 0.0
+            # context: we are on Γ
+            self.ctx['is_interface'] = True
+            self.ctx['is_ghost']     = False
+            md = intg.measure.metadata or {}
+            side_md = md.get('side', None)
+            if side_md in ('+', '-'):
+                self.ctx['measure_side'] = side_md
+
+            qdeg   = int(self._find_q_order(intg))
+            p_geo  = int(getattr(mesh, "poly_order", 1))
+            qdeg  += 2 * max(0, p_geo - 1)
+            fields = self._fields_for(intg.integrand)
+            nseg   = int(md.get("nseg", max(3, p_geo + qdeg//2)))
+            linear_interface = bool(md.get("linear_interface", False))
+            ref_geom = transform.get_reference(mesh.element_type, p_geo)
+
+            # scalar-functional?
+            trial, test = _trial_test(intg.integrand)
+            hook = self._hook_for(intg.integrand)
+            is_functional = (hook is not None) and not (trial or test)
+            if _collector is not None and is_functional:
+                raise NotImplementedError(
+                    "Local interface batches do not yet support pure scalar functionals."
+                )
+            if is_functional:
+                self.ctx.setdefault('scalar_results', {}).setdefault(hook['name'], None)
+
+            allowed = normalize_elem_ids(mesh, getattr(intg.measure, "defined_on", None))
+            if allowed is None:
+                try:
+                    elem_ids = mesh.element_bitset("cut").to_indices()
+                except Exception:
+                    elem_ids = [int(el.id) for el in mesh.elements_list if getattr(el, "tag", None) == "cut"]
+            else:
+                elem_ids = [int(e) for e in allowed]
+
+            segments: list[tuple[int, np.ndarray, np.ndarray]] = []
+            for eid in elem_ids:
+                if eid < 0 or eid >= len(mesh.elements_list):
+                    continue
+                elem = mesh.elements_list[int(eid)]
+                if getattr(elem, "tag", None) != "cut":
+                    continue
+                segs = getattr(elem, "interface_segments", None)
+                if segs:
+                    for seg in segs:
+                        if seg and len(seg) == 2:
+                            p0, p1 = seg
+                            segments.append((int(elem.id), np.asarray(p0, float), np.asarray(p1, float)))
+                elif len(getattr(elem, "interface_pts", ())) == 2:
+                    p0, p1 = elem.interface_pts
+                    segments.append((int(elem.id), np.asarray(p0, float), np.asarray(p1, float)))
+            if not segments:
+                return
+
+            eids = np.asarray([s[0] for s in segments], dtype=int)
+            P0   = np.asarray([s[1] for s in segments], float)
+            P1   = np.asarray([s[2] for s in segments], float)
+
+            def _gdofs_for_eid(eid: int) -> np.ndarray:
+                gd = np.asarray(dh.get_elemental_dofs(int(eid)), dtype=int)
+                try:
+                    n_loc = int(me.n_dofs_local)
+                except Exception:
+                    n_loc = int(len(gd))
+                if hasattr(dh, "get_elemental_dofs_xfem") and int(len(gd)) != n_loc:
+                    try:
+                        gd = np.asarray(dh.get_elemental_dofs_xfem(int(eid)), dtype=int)
+                    except Exception:
+                        pass
+                return gd
+
+            # per-element global dofs & maps
+            gdofs_per_e = [_gdofs_for_eid(int(e)) for e in eids]
+            maps_by_field = [
+                _hfa.build_field_union_maps(dh, fields, int(e), int(e), gdofs_per_e[i])
+                for i, e in enumerate(eids)
+            ]
+            masks_by_field = []
+            for i, eid in enumerate(eids):
+                try:
+                    masks_by_field.append(_hfa.build_side_masks_by_field(dh, fields, int(eid), level_set, tol=SIDE.tol))
+                except Exception:
+                    masks_by_field.append(({}, {}))
+
+            # Quadrature on Γ (physical points + physical weights)
+            t0 = _time.perf_counter()
+            qpts_all = qwts_all = that_all = qref_all = None
+
+            # Optional: straight chord rule between the interface endpoints.
+            if linear_interface:
+                from pycutfem.integration.quadrature import gauss_legendre
+
+                order = max(1, int(qdeg))
+                xi_1d, w_1d = gauss_legendre(int(order))
+                s = 0.5 * (np.asarray(xi_1d, dtype=float) + 1.0)
+                ws = 0.5 * np.asarray(w_1d, dtype=float)
+                d = P1 - P0
+                L = np.linalg.norm(d, axis=1)
+                L_safe = np.maximum(L, 1e-30)
+                tau = d / L_safe[:, None]
+                qpts_all = P0[:, None, :] + s[None, :, None] * d[:, None, :]
+                qwts_all = ws[None, :] * L[:, None]
+                that_all = np.broadcast_to(tau[:, None, :], qpts_all.shape).copy()
+                qref_all = None
+
+            # Special-case: QUAD + Q1 level set -> exact reference iso-curve rule.
+            elif (
+                mesh.element_type == "quad"
+                and hasattr(level_set, "value_on_element_ref")
+                and hasattr(level_set, "value_on_element")
+            ):
+                try:
+                    from pycutfem.integration.cut_integration import CutIntegration
+
+                    order = max(1, int(qdeg))
+                    nQ = int(order)
+                    nE = int(eids.shape[0])
+                    qpts_all = np.empty((nE, nQ, 2), dtype=float)
+                    qwts_all = np.empty((nE, nQ), dtype=float)
+                    that_all = np.empty((nE, nQ, 2), dtype=float)
+                    qref_all = np.empty((nE, nQ, 2), dtype=float)
+
+                    ok = True
+                    for ei, eid in enumerate(eids):
+                        qref_e, wref_e, coeffs, _ = CutIntegration.iso_interface_rule_ref(
+                            mesh, int(eid), level_set, order=order, tol=SIDE.tol
+                        )
+                        if qref_e.shape[0] != nQ:
+                            ok = False
+                            break
+
+                        a00, a10, a01, a11 = (float(coeffs[0]), float(coeffs[1]), float(coeffs[2]), float(coeffs[3]))
+                        for iq in range(nQ):
+                            xi = float(qref_e[iq, 0])
+                            eta = float(qref_e[iq, 1])
+                            qref_all[ei, iq, 0] = xi
+                            qref_all[ei, iq, 1] = eta
+
+                            xq = transform.x_mapping(mesh, int(eid), (xi, eta))
+                            qpts_all[ei, iq, :] = np.asarray(xq, float)
+
+                            gx = a10 + a11 * eta  # ∂φ/∂ξ
+                            gy = a01 + a11 * xi   # ∂φ/∂η
+                            gn = float(np.hypot(gx, gy)) + 1e-30
+                            tref = np.array([gy / gn, -gx / gn], dtype=float)
+
+                            Jg = transform.jacobian(mesh, int(eid), (xi, eta))
+                            tphys = Jg @ tref
+                            tn = float(np.linalg.norm(tphys)) + 1e-30
+                            that_all[ei, iq, :] = tphys / tn
+                            qwts_all[ei, iq] = float(wref_e[iq]) * tn
+
+                    if not ok:
+                        qpts_all = qwts_all = that_all = qref_all = None
+                except Exception:
+                    qpts_all = qwts_all = that_all = qref_all = None
+
+            if qpts_all is None:
+                if _iso_ifc is not None:
+                    # With deformation active, the interface curve becomes higher order.
+                    p_curve = max(2, p_geo) if deformation is not None else p_geo
+                    qb, wb, tb, rb = _iso_ifc(
+                        level_set, P0, P1,
+                        p=int(p_curve), order=max(1, int(qdeg)), project_steps=3, tol=SIDE.tol,
+                        mesh=mesh, eids=eids,
+                        return_tangent=True, return_qref=True)
+                    qpts_all, qwts_all, that_all, qref_all = qb, wb, tb, rb
                 else:
-                    n = len(global_dofs)
-                    acc = np.zeros(n, float) if rhs else np.zeros((n, n), float)
+                    # fallback: polyline rule (no qref/tangent); will use inverse map — slower
+                    qpts, qwts = curved_line_quadrature_batch(
+                        level_set, P0, P1, order=max(1, int(qdeg)), nseg=nseg, project_steps=3, tol=SIDE.tol
+                    )
+                    qpts_all, qwts_all, that_all, qref_all = qpts, qwts, None, None
 
-                nQ = qpts_all.shape[1]
-                for iq in range(nQ):
-                    xq = qpts_all[ei, iq, :]
-                    w  = float(qwts_all[ei, iq])
+            t_iso = _time.perf_counter() - t0
 
-                    if isinstance(qref_all, np.ndarray):
-                        xi = float(qref_all[ei, iq, 0]); eta = float(qref_all[ei, iq, 1])
-                    else:
-                        xi, eta = transform.inverse_mapping(mesh, int(eid), np.asarray(xq, float))  # slow fallback
+            # micro helpers (avoid np.linalg.inv per QP)
+            def _solve2x2(A, b):
+                # solves A v = b (both 2d); returns v
+                a, b0 = float(A[0,0]), float(A[0,1])
+                c, d  = float(A[1,0]), float(A[1,1])
+                det   = a*d - b0*c
+                invd  = 1.0/(det + 1e-300)
+                return np.array([( d*b[0] - b0*b[1]) * invd,
+                                (-c*b[0] +  a*b[1]) * invd], float)
 
-                    # geometric Jacobian
-                    Jg = jac_fun(mesh, int(eid), (xi, eta))
+            # main per-element loop
+            t_qploop = 0.0
+            try:
+                t1 = _time.perf_counter()
+                for ei, eid in enumerate(eids):
+                    self.ctx['eid']     = int(eid)
+                    self.ctx['pos_eid'] = int(eid)
+                    self.ctx['neg_eid'] = int(eid)
 
-                    # weight stretch & total Jacobian for basis mapping
+                    global_dofs = gdofs_per_e[ei]
+                    pos_map_by_field, neg_map_by_field = maps_by_field[ei]
+                    try:
+                        pos_mask_by_field, neg_mask_by_field = masks_by_field[ei]
+                    except Exception:
+                        pos_mask_by_field, neg_mask_by_field = {}, {}
+
+                    # deformation locals (avoid repeat lookups)
                     if deformation is not None:
-                        dN   = np.asarray(ref_grad(xi, eta), float)           # (nloc,2)
-                        Jd   = Uloc.T @ dN                                    # (2,2)
-                        Jt   = Jg + Jd
+                        conn = np.asarray(mesh.elements_connectivity[int(eid)], dtype=int)
+                        Uloc = np.asarray(deformation.node_displacements[conn], float)
+                    ref_shape = ref_geom.shape
+                    ref_grad  = ref_geom.grad
+                    x_map     = transform.x_mapping
+                    jac_fun   = transform.jacobian
 
-                        # stretch factor = || (I + G_ref Jg^{-1}) tau_hat ||
-                        tau  = that_all[ei, iq, :] if isinstance(that_all, np.ndarray) else np.array([1.0, 0.0], float)
-                        v    = _solve2x2(Jg, tau)                             # v = Jg^{-1} tau
-                        Ftau = tau + (Uloc.T @ dN) @ v                        # Uloc.T@dN == G_ref
-                        w_eff = w * float(np.linalg.norm(Ftau))
-
-                        # inverse for gradient mapping (Jt^{-1})
-                        a, b0 = float(Jt[0,0]), float(Jt[0,1])
-                        c, d  = float(Jt[1,0]), float(Jt[1,1])
-                        det_t = a*d - b0*c
-                        invd  = 1.0/(det_t + 1e-300)
-                        Ji    = np.array([[ d, -b0], [-c, a]], float) * invd
-                        # deformed point
-                        y = x_map(mesh, int(eid), (xi, eta)) + (np.asarray(ref_shape(xi, eta), float) @ Uloc)
-                    else:
-                        Ji    = np.array(np.linalg.inv(Jg), float)            # tiny cost w/o deformation
-                        w_eff = w
-                        y     = np.asarray(xq, float)
-
-                    # normal at Γ (from φ)
-                    if hasattr(level_set, 'gradient_on_element'):
-                        g_here = np.asarray(level_set.gradient_on_element(int(eid), (xi, eta)), float)
-                    else:
-                        g_here = np.asarray(level_set.gradient(np.asarray(y, float)), float)
-                    nrm = float(np.linalg.norm(g_here)) + 1e-30
-                    self.ctx['normal'] = g_here / nrm
-
-                    # basis cache at (xi,eta)
-                    self.ctx['basis_values'] = {"+": {}, "-": {}}
-                    if fields:
-                        for f in fields:
-                            vrow = me.basis(f, xi, eta)
-                            Gtab = me.grad_basis(f, xi, eta) @ Ji
-                            slotp = self.ctx['basis_values']['+'].setdefault(f, {})
-                            slotn = self.ctx['basis_values']['-'].setdefault(f, {})
-                            slotp[(0,0)] = vrow; slotn[(0,0)] = vrow
-                            slotp[(1,0)] = Gtab[:, 0]; slotn[(1,0)] = Gtab[:, 0]
-                            slotp[(0,1)] = Gtab[:, 1]; slotn[(0,1)] = Gtab[:, 1]
-
-                    # context maps/masks
-                    self.ctx['x_phys']           = np.asarray(y, float)
-                    self.ctx['phi_val']          = 0.0
-                    self.ctx['global_dofs']      = global_dofs
-                    self.ctx['pos_map']          = np.arange(len(global_dofs), dtype=int)
-                    self.ctx['neg_map']          = self.ctx['pos_map']
-                    self.ctx['pos_map_by_field'] = pos_map_by_field
-                    self.ctx['neg_map_by_field'] = neg_map_by_field
-                    self.ctx['pos_mask_by_field']= pos_mask_by_field
-                    self.ctx['neg_mask_by_field']= neg_mask_by_field
-
-                    # evaluate & accumulate
-                    val = self._visit(intg.integrand)
+                    # local accumulator
                     if is_functional:
-                        arr = np.asarray(val)
-                        acc += w_eff * float(arr if arr.ndim == 0 else arr.sum())
+                        acc = None
                     else:
-                        arr = np.asarray(getattr(val, 'data', val))
-                        if rhs and arr.ndim == 2 and 1 in arr.shape:
-                            arr = arr.reshape(-1)
-                        acc += w_eff * arr
+                        n = len(global_dofs)
+                        acc = np.zeros(n, float) if rhs else np.zeros((n, n), float)
 
-                # scatter
-                if is_functional:
-                    self.ctx['scalar_results'][hook['name']] += float(acc)
-                else:
-                    if rhs:
-                        np.add.at(matvec, global_dofs, acc)
+                    nQ = qpts_all.shape[1]
+                    for iq in range(nQ):
+                        xq = qpts_all[ei, iq, :]
+                        w  = float(qwts_all[ei, iq])
+
+                        if isinstance(qref_all, np.ndarray):
+                            xi = float(qref_all[ei, iq, 0]); eta = float(qref_all[ei, iq, 1])
+                        else:
+                            xi, eta = transform.inverse_mapping(mesh, int(eid), np.asarray(xq, float))  # slow fallback
+
+                        # geometric Jacobian + base point
+                        Jg = jac_fun(mesh, int(eid), (float(xi), float(eta)))
+                        x_base = x_map(mesh, int(eid), (float(xi), float(eta)))
+
+                        # normal at Γ (from φ) in the undeformed configuration
+                        if hasattr(level_set, 'gradient_on_element'):
+                            g_here = np.asarray(level_set.gradient_on_element(int(eid), (float(xi), float(eta))), float)
+                        else:
+                            g_here = np.asarray(level_set.gradient(np.asarray(x_base, float)), float)
+                        nrm = float(np.linalg.norm(g_here)) + 1e-30
+                        normal_base = g_here / nrm
+
+                        # weight stretch & total Jacobian for basis mapping
+                        if deformation is not None:
+                            dN   = np.asarray(ref_grad(float(xi), float(eta)), float)           # (nloc,2)
+                            Jd   = Uloc.T @ dN                                                  # (2,2)
+                            Jt   = Jg + Jd
+
+                            # stretch factor = || (I + ∇u) tau_hat ||
+                            if isinstance(that_all, np.ndarray):
+                                tau  = np.asarray(that_all[ei, iq, :], float)
+                            else:
+                                tau = np.array([-normal_base[1], normal_base[0]], float)
+                            v    = _solve2x2(Jg, tau)                                          # v = Jg^{-1} tau
+                            Ftau = tau + Jd @ v                                                # Jd == ∂u/∂(ξ,η)
+                            w_eff = w * float(np.linalg.norm(Ftau))
+
+                            # inverse for gradient mapping (Jt^{-1})
+                            a, b0 = float(Jt[0,0]), float(Jt[0,1])
+                            c, d  = float(Jt[1,0]), float(Jt[1,1])
+                            det_t = a*d - b0*c
+                            invd  = 1.0/(det_t + 1e-300)
+                            Ji    = np.array([[ d, -b0], [-c, a]], float) * invd
+
+                            # deformed point
+                            y = np.asarray(x_base, float) + (np.asarray(ref_shape(float(xi), float(eta)), float) @ Uloc)
+
+                            # Transform normal to the deformed configuration: n_y ∝ F^{-T} n_x
+                            ag, bg = float(Jg[0, 0]), float(Jg[0, 1])
+                            cg, dg = float(Jg[1, 0]), float(Jg[1, 1])
+                            det_g = ag * dg - bg * cg
+                            inv_det_g = 1.0 / (det_g + 1e-300)
+                            invJg = np.array([[dg, -bg], [-cg, ag]], float) * inv_det_g
+                            Gphy = Jd @ invJg
+                            F00 = 1.0 + float(Gphy[0, 0])
+                            F01 = float(Gphy[0, 1])
+                            F10 = float(Gphy[1, 0])
+                            F11 = 1.0 + float(Gphy[1, 1])
+                            detF = F00 * F11 - F01 * F10
+                            inv_detF = 1.0 / (detF + 1e-300)
+                            n0x = float(normal_base[0])
+                            n0y = float(normal_base[1])
+                            nx = (F11 * n0x - F10 * n0y) * inv_detF
+                            ny = (-F01 * n0x + F00 * n0y) * inv_detF
+                            nn = float(np.hypot(nx, ny)) + 1e-30
+                            self.ctx['normal'] = np.array([nx / nn, ny / nn], float)
+                        else:
+                            Ji    = np.array(np.linalg.inv(Jg), float)                         # tiny cost w/o deformation
+                            w_eff = w
+                            y     = np.asarray(xq, float)
+                            self.ctx['normal'] = np.asarray(normal_base, float)
+
+                        # basis cache at (xi,eta)
+                        self._basis_cache.clear()
+                        self._coeff_cache.clear()
+                        self._collapsed_cache.clear()
+                        self.ctx['basis_values'] = {"+": {}, "-": {}}
+                        if fields:
+                            for f in fields:
+                                fam = getattr(me, "_field_families", {}).get(f, "Lagrange")
+                                if fam == "RT":
+                                    # H(div): store vector basis + divergence in the basis cache.
+                                    Vhat = np.asarray(me.tabulate_value(f, float(xi), float(eta)), dtype=float)  # (n_loc,2)
+                                    A = np.asarray(Ji, dtype=float)  # J^{-1} at this QP (total, incl. deformation)
+                                    adj = np.array([[A[1, 1], -A[0, 1]], [-A[1, 0], A[0, 0]]], dtype=float)
+                                    Vphys = (adj @ Vhat.T).T  # (n_loc,2)
+                                    detJinv = float(np.linalg.det(A))
+                                    div_hat = np.asarray(me.tabulate_div(f, float(xi), float(eta)), dtype=float).ravel()
+                                    div_phys = div_hat * detJinv
+
+                                    sgn = np.asarray(dh.element_signs[f][int(eid)], dtype=float).ravel()
+                                    if sgn.shape[0] != Vphys.shape[0]:
+                                        raise RuntimeError(f"element_signs length mismatch for RT field '{f}' on element {eid}.")
+                                    Vphys = sgn[:, None] * Vphys
+                                    div_phys = sgn * div_phys
+
+                                    n_union = int(len(global_dofs))
+                                    hdiv_val = np.zeros((2, n_union), dtype=float)
+                                    hdiv_div = np.zeros((n_union,), dtype=float)
+                                    fmap = pos_map_by_field.get(f)
+                                    if fmap is None:
+                                        sl = me.component_dof_slices[f]
+                                        fmap = np.arange(int(sl.start), int(sl.stop), dtype=int)
+                                    fmap = np.asarray(fmap, dtype=int).ravel()
+                                    hdiv_val[:, fmap] = Vphys.T
+                                    hdiv_div[fmap] = div_phys
+
+                                    self._basis_cache[f] = {
+                                        "hdiv_val_pos": hdiv_val,
+                                        "hdiv_val_neg": hdiv_val,
+                                        "hdiv_div_pos": hdiv_div,
+                                        "hdiv_div_neg": hdiv_div,
+                                    }
+                                    continue
+
+                                vrow = me.basis(f, float(xi), float(eta))
+                                Gtab = me.grad_basis(f, float(xi), float(eta)) @ Ji
+                                slotp = self.ctx['basis_values']['+'].setdefault(f, {})
+                                slotn = self.ctx['basis_values']['-'].setdefault(f, {})
+                                slotp[(0,0)] = vrow; slotn[(0,0)] = vrow
+                                slotp[(1,0)] = Gtab[:, 0]; slotn[(1,0)] = Gtab[:, 0]
+                                slotp[(0,1)] = Gtab[:, 1]; slotn[(0,1)] = Gtab[:, 1]
+
+                        # context maps/masks
+                        self.ctx['x_phys']           = np.asarray(y, float)
+                        self.ctx['phi_val']          = 0.0
+                        self.ctx['global_dofs']      = global_dofs
+                        self.ctx['pos_map']          = np.arange(len(global_dofs), dtype=int)
+                        self.ctx['neg_map']          = self.ctx['pos_map']
+                        self.ctx['pos_map_by_field'] = pos_map_by_field
+                        self.ctx['neg_map_by_field'] = neg_map_by_field
+                        self.ctx['pos_mask_by_field']= pos_mask_by_field
+                        self.ctx['neg_mask_by_field']= neg_mask_by_field
+
+                        # evaluate & accumulate
+                        val = self._visit(intg.integrand)
+                        if is_functional:
+                            data = val.data if isinstance(val, VecOpInfo) else val
+                            arr = np.asarray(data, dtype=float)
+                            if acc is None:
+                                acc = np.zeros_like(arr, dtype=float)
+                            acc += w_eff * arr
+                        else:
+                            arr = lhs_num(val)
+                            arr = np.asarray(arr)
+                            if rhs and arr.ndim == 2 and 1 in arr.shape:
+                                arr = arr.reshape(-1)
+                            acc += w_eff * arr
+
+                    # scatter
+                    if is_functional:
+                        results = self.ctx.setdefault('scalar_results', {})
+                        if results.get(hook['name']) is None or (
+                            isinstance(results.get(hook['name']), (int, float)) and isinstance(acc, np.ndarray)
+                        ):
+                            results[hook['name']] = np.zeros_like(acc, dtype=float)
+                        results[hook['name']] += acc
+                    elif _collector is not None:
+                        _collector(int(eid), np.asarray(global_dofs, dtype=int), np.asarray(acc, dtype=float))
                     else:
-                        rr, cc = np.meshgrid(global_dofs, global_dofs, indexing='ij')
-                        matvec[rr, cc] += acc
-            t_qploop = _time.perf_counter() - t1
-        finally:
-            for k in ("basis_values", "global_dofs", "pos_map", "neg_map", "pos_map_by_field",
+                        unique_dofs, union_to_unique = np.unique(global_dofs, return_inverse=True)
+                        if rhs:
+                            agg = np.zeros((unique_dofs.shape[0],), dtype=float)
+                            np.add.at(agg, union_to_unique, acc)
+                            np.add.at(matvec, unique_dofs, agg)
+                        else:
+                            agg = np.zeros((unique_dofs.shape[0], unique_dofs.shape[0]), dtype=float)
+                            np.add.at(agg, (union_to_unique[:, None], union_to_unique[None, :]), acc)
+                            r, c = np.meshgrid(unique_dofs, unique_dofs, indexing="ij")
+                            matvec[r, c] += agg
+                t_qploop = _time.perf_counter() - t1
+            finally:
+                for k in (
+                    "basis_values", "global_dofs", "pos_map", "neg_map", "pos_map_by_field",
                     "neg_map_by_field", "pos_mask_by_field", "neg_mask_by_field",
-                    "eid", "pos_eid", "neg_eid", "is_interface", "x_phys", "phi_val", "normal"):
-                self.ctx.pop(k, None)
+                    "eid", "pos_eid", "neg_eid", "is_interface", "is_ghost",
+                    "x_phys", "phi_val", "normal", "measure_side",
+                ):
+                    self.ctx.pop(k, None)
 
-        if bool((intg.measure.metadata or {}).get('profile', False)) or os.getenv('PYCUTFEM_PROFILE_INTERFACE', '').lower() in {'1','true','yes'}:
-            log.info(f"[PC] interface profile: total={(t_iso+t_qploop):.4f}s, iso_setup={t_iso:.4f}s, qp_loop={t_qploop:.4f}s, elems={len(eids)}, q={qdeg}")
+            if bool((intg.measure.metadata or {}).get('profile', False)) or os.getenv('PYCUTFEM_PROFILE_INTERFACE', '').lower() in {'1','true','yes'}:
+                log.info(f"[PC] interface profile: total={(t_iso+t_qploop):.4f}s, iso_setup={t_iso:.4f}s, qp_loop={t_qploop:.4f}s, elems={len(eids)}, q={qdeg}")
+        finally:
+            self.me = me_prev
+
+    def _assemble_interface_python_local_batch(self, intg: Integral) -> LocalAssemblyBatch:
+        entity_ids: list[int] = []
+        gdofs_rows: list[np.ndarray] = []
+        trial, test = _trial_test(intg.integrand)
+        is_rhs = trial is None and test is not None
+        if trial is None and test is None:
+            raise NotImplementedError(
+                "Local interface batches do not yet support pure scalar functionals."
+            )
+        K_rows: list[np.ndarray] | None = [] if not is_rhs else None
+        F_rows: list[np.ndarray] | None = [] if is_rhs else None
+
+        def _collector(entity_id: int, gdofs_row: np.ndarray, loc) -> None:
+            entity_ids.append(int(entity_id))
+            gdofs_rows.append(np.asarray(gdofs_row, dtype=int).reshape(-1))
+            if is_rhs:
+                assert F_rows is not None
+                F_rows.append(np.asarray(loc, dtype=float).reshape(-1))
+            else:
+                assert K_rows is not None
+                K_rows.append(np.asarray(loc, dtype=float))
+
+        old_rhs = self.ctx.get("rhs", None)
+        self.ctx["rhs"] = is_rhs
+        try:
+            self._assemble_interface_python(intg, None, _collector=_collector)
+        finally:
+            if old_rhs is None:
+                self.ctx.pop("rhs", None)
+            else:
+                self.ctx["rhs"] = old_rhs
+        return self._batch_from_variable_local_rows(
+            entity_ids=entity_ids,
+            gdofs_rows=gdofs_rows,
+            K_rows=K_rows,
+            F_rows=F_rows,
+            entity_kind="element",
+        )
 
   
 
     
+    def _assemble_aligned_interface_python(self, intg: Integral, matvec, aligned_edges, *, _collector=None):
+        """
+        Assemble integrals over edges tagged as 'interface' (aligned φ≈0) using the Python backend.
+        Geometry and orientation come from precompute_ghost_factors with allow_interface=True.
+        """
+        import numpy as np
+        from pycutfem.fem import transform
+
+        rhs = bool(self.ctx.get("rhs", False))
+        mesh, dh, me = self.me.mesh, self.dh, self.me
+        level_set = getattr(intg.measure, "level_set", None)
+        if level_set is None:
+            raise ValueError("Aligned interface assembly requires a level_set.")
+
+        md = intg.measure.metadata or {}
+        derivs = set(md.get("derivs", set())) | set(required_multi_indices(intg.integrand))
+        derivs |= {(0, 0), (1, 0), (0, 1)}
+        max_total = max((ox + oy for (ox, oy) in derivs), default=0)
+        for p in range(max_total + 1):
+            for ox in range(p + 1):
+                derivs.add((ox, p - ox))
+        need_hess = any((dx + dy) >= 2 for (dx, dy) in derivs)
+        need_o3 = any((dx + dy) >= 3 for (dx, dy) in derivs)
+        need_o4 = any((dx + dy) >= 4 for (dx, dy) in derivs)
+
+        qdeg_base = max(self._find_q_order(intg), 2 * max_total + 4)
+        p_geo_mesh = int(getattr(mesh, "poly_order", 1))
+        qdeg = qdeg_base + max(0, p_geo_mesh - 1)
+
+        # Geometry mode for facet patches (mirrors DofHandler.precompute_facet_patch_factors):
+        # For curved/isoparametric meshes, polynomial extension far outside the reference
+        # cell can make the inverse map ill-conditioned and lead to huge basis/gradient
+        # values. Since facet-patch terms are stabilizations (not consistency-critical),
+        # we default to an affine, corner-based geometry map when p_geo>1.
+        _geo_mode = os.getenv("PYCUTFEM_FACET_PATCH_GEO_MODE", "").strip().lower()
+        use_affine_geo = bool(p_geo_mesh > 1)
+        if _geo_mode:
+            if _geo_mode in {"iso", "isoparametric", "curved"}:
+                use_affine_geo = False
+            elif _geo_mode in {"affine", "linear"}:
+                use_affine_geo = True
+        if use_affine_geo and (
+            getattr(mesh, "corner_connectivity", None) is None or getattr(mesh, "element_type", "") not in {"quad", "tri"}
+        ):
+            use_affine_geo = False
+        p_geo_eval = 1 if use_affine_geo else p_geo_mesh
+
+        fields = set(self._fields_for(intg.integrand))
+        trial, test = _trial_test(intg.integrand)
+        for tt in (trial, test):
+            if tt is None:
+                continue
+            if hasattr(tt, "field_names"):
+                fields.update(tt.field_names)
+            elif hasattr(tt, "field_name"):
+                fields.add(tt.field_name)
+        fields = sorted(fields)
+
+        hook = self._hook_for(intg.integrand)
+        is_functional = hook is not None and trial is None and test is None
+        if _collector is not None and is_functional:
+            raise NotImplementedError(
+                "Local aligned-interface batches do not yet support pure scalar functionals."
+            )
+        if is_functional:
+            self.ctx.setdefault("scalar_results", {})[hook["name"]] = None
+
+        geo = dh.precompute_ghost_factors(
+            ghost_edge_ids=aligned_edges,
+            qdeg=qdeg,
+            level_set=level_set,
+            derivs=derivs,
+            allow_interface=True,
+            reuse=True,
+            need_hess=need_hess,
+            need_o3=need_o3,
+            need_o4=need_o4,
+            deformation=getattr(intg.measure, "deformation", None),
+        )
+        edge_ids = geo.get("eids")
+        if edge_ids is None or len(edge_ids) == 0:
+            return
+
+        nE = len(edge_ids)
+        nQ = geo["qw"].shape[1]
+        phis_arr = geo.get("phis", None)
+
+        self.ctx["is_interface"] = True
+        self.ctx["is_ghost"] = False
+
+        xi_pos_all = geo["xi_pos"]; eta_pos_all = geo["eta_pos"]
+        xi_neg_all = geo["xi_neg"]; eta_neg_all = geo["eta_neg"]
+        normals_all = geo["normals"]
+        qp_phys_all = geo["qp_phys"]
+        Jinv_pos_all = geo["J_inv_pos"]
+        Jinv_neg_all = geo["J_inv_neg"]
+        qw_all = geo["qw"]
+        pos_ids = geo["owner_pos_id"]
+        neg_ids = geo["owner_neg_id"]
+
+        for ei in range(nE):
+            pos_eid = int(pos_ids[ei])
+            neg_eid = int(neg_ids[ei])
+
+            pos_dofs = dh.get_elemental_dofs(pos_eid)
+            neg_dofs = dh.get_elemental_dofs(neg_eid)
+            global_dofs = np.unique(np.concatenate([pos_dofs, neg_dofs]))
+
+            pos_map = np.searchsorted(global_dofs, pos_dofs)
+            neg_map = np.searchsorted(global_dofs, neg_dofs)
+
+            pos_map_by_field_full, neg_map_by_field_full = _hfa.build_field_union_maps(
+                dh, fields, pos_eid, neg_eid, global_dofs
+            )
+
+            try:
+                pos_masks_elem, _ = _hfa.build_side_masks_by_field(dh, fields, pos_eid, level_set, tol=SIDE.tol)
+            except Exception:
+                pos_masks_elem = {}
+            try:
+                _, neg_masks_elem = _hfa.build_side_masks_by_field(dh, fields, neg_eid, level_set, tol=SIDE.tol)
+            except Exception:
+                neg_masks_elem = {}
+
+            restriction_masks_phi = {"+": {}, "-": {}}
+            for fld in fields:
+                mask_pos = pos_masks_elem.get(fld)
+                mask_neg = neg_masks_elem.get(fld)
+                if mask_pos is not None:
+                    full_idx = pos_map_by_field_full.get(fld)
+                    if full_idx is not None and len(mask_pos) == len(full_idx):
+                        arr = np.zeros(len(global_dofs), dtype=float)
+                        arr[np.asarray(full_idx, dtype=int)] = np.asarray(mask_pos, dtype=float)
+                        restriction_masks_phi["+"][fld] = arr
+                if mask_neg is not None:
+                    full_idx = neg_map_by_field_full.get(fld)
+                    if full_idx is not None and len(mask_neg) == len(full_idx):
+                        arr = np.zeros(len(global_dofs), dtype=float)
+                        arr[np.asarray(full_idx, dtype=int)] = np.asarray(mask_neg, dtype=float)
+                        restriction_masks_phi["-"][fld] = arr
+
+            mask_pos_global = np.zeros(len(global_dofs), dtype=float)
+            mask_neg_global = np.zeros(len(global_dofs), dtype=float)
+            mask_pos_global[pos_map] = 1.0
+            mask_neg_global[neg_map] = 1.0
+
+            pos_map_by_field_reduced = {}
+            neg_map_by_field_reduced = {}
+            pos_P_by_field = {}
+            neg_P_by_field = {}
+            pos_union_mask_by_field = {}
+            neg_union_mask_by_field = {}
+            for fld in fields:
+                pos_full = np.asarray(pos_map_by_field_full.get(fld, []), dtype=int)
+                neg_full = np.asarray(neg_map_by_field_full.get(fld, []), dtype=int)
+                if pos_full.size:
+                    pos_map_by_field_reduced[fld] = pos_full
+                    pos_P_by_field[fld] = np.eye(len(global_dofs))[pos_full]
+                    pos_union_mask_by_field[fld] = np.zeros(len(global_dofs), dtype=float)
+                    pos_union_mask_by_field[fld][pos_full] = 1.0
+                if neg_full.size:
+                    neg_map_by_field_reduced[fld] = neg_full
+                    neg_P_by_field[fld] = np.eye(len(global_dofs))[neg_full]
+                    neg_union_mask_by_field[fld] = np.zeros(len(global_dofs), dtype=float)
+                    neg_union_mask_by_field[fld][neg_full] = 1.0
+
+            if is_functional:
+                acc = None
+            else:
+                n = len(global_dofs)
+                acc = np.zeros(n, float) if rhs else np.zeros((n, n), float)
+
+            for q in range(nQ):
+                xi_p = float(xi_pos_all[ei, q]); eta_p = float(eta_pos_all[ei, q])
+                xi_n = float(xi_neg_all[ei, q]); eta_n = float(eta_neg_all[ei, q])
+                Ji_pos = np.asarray(Jinv_pos_all[ei, q], float)
+                Ji_neg = np.asarray(Jinv_neg_all[ei, q], float)
+
+                self.ctx["basis_values"] = {"+": {}, "-": {}}
+                for f in fields:
+                    fam = getattr(me, "_field_families", {}).get(f, "Lagrange")
+                    if fam == "RT":
+                        Vhat_p = np.asarray(me.tabulate_value(f, float(xi_p), float(eta_p)), dtype=float)  # (n_loc,2)
+                        Vhat_n = np.asarray(me.tabulate_value(f, float(xi_n), float(eta_n)), dtype=float)
+                        Apos = np.asarray(Ji_pos, dtype=float)
+                        Aneg = np.asarray(Ji_neg, dtype=float)
+                        adj_p = np.array([[Apos[1, 1], -Apos[0, 1]], [-Apos[1, 0], Apos[0, 0]]], dtype=float)
+                        adj_n = np.array([[Aneg[1, 1], -Aneg[0, 1]], [-Aneg[1, 0], Aneg[0, 0]]], dtype=float)
+                        Vphys_p = (adj_p @ Vhat_p.T).T
+                        Vphys_n = (adj_n @ Vhat_n.T).T
+                        det_inv_p = float(np.linalg.det(Apos))
+                        det_inv_n = float(np.linalg.det(Aneg))
+                        div_hat_p = np.asarray(me.tabulate_div(f, float(xi_p), float(eta_p)), dtype=float).ravel()
+                        div_hat_n = np.asarray(me.tabulate_div(f, float(xi_n), float(eta_n)), dtype=float).ravel()
+                        div_phys_p = div_hat_p * det_inv_p
+                        div_phys_n = div_hat_n * det_inv_n
+
+                        sgn_p = np.asarray(dh.element_signs[f][int(pos_eid)], dtype=float).ravel()
+                        sgn_n = np.asarray(dh.element_signs[f][int(neg_eid)], dtype=float).ravel()
+                        Vphys_p = sgn_p[:, None] * Vphys_p
+                        Vphys_n = sgn_n[:, None] * Vphys_n
+                        div_phys_p = sgn_p * div_phys_p
+                        div_phys_n = sgn_n * div_phys_n
+
+                        n_union = int(len(global_dofs))
+                        hdiv_val_pos = np.zeros((2, n_union), dtype=float)
+                        hdiv_val_neg = np.zeros((2, n_union), dtype=float)
+                        hdiv_div_pos = np.zeros((n_union,), dtype=float)
+                        hdiv_div_neg = np.zeros((n_union,), dtype=float)
+                        idx_p = pos_map_by_field_full.get(f)
+                        idx_n = neg_map_by_field_full.get(f)
+                        if idx_p is not None:
+                            idx_p = np.asarray(idx_p, dtype=int).ravel()
+                            hdiv_val_pos[:, idx_p] = Vphys_p.T
+                            hdiv_div_pos[idx_p] = div_phys_p
+                        if idx_n is not None:
+                            idx_n = np.asarray(idx_n, dtype=int).ravel()
+                            hdiv_val_neg[:, idx_n] = Vphys_n.T
+                            hdiv_div_neg[idx_n] = div_phys_n
+                        self._basis_cache[f] = {
+                            "hdiv_val_pos": hdiv_val_pos,
+                            "hdiv_val_neg": hdiv_val_neg,
+                            "hdiv_div_pos": hdiv_div_pos,
+                            "hdiv_div_neg": hdiv_div_neg,
+                        }
+                        continue
+
+                    v_pos = me.basis(f, xi_p, eta_p)
+                    g_pos = me.grad_basis(f, xi_p, eta_p) @ Ji_pos
+                    v_neg = me.basis(f, xi_n, eta_n)
+                    g_neg = me.grad_basis(f, xi_n, eta_n) @ Ji_neg
+                    slotp = self.ctx["basis_values"]["+"].setdefault(f, {})
+                    slotn = self.ctx["basis_values"]["-"].setdefault(f, {})
+                    slotp[(0, 0)] = v_pos; slotn[(0, 0)] = v_neg
+                    slotp[(1, 0)] = g_pos[:, 0]; slotn[(1, 0)] = g_neg[:, 0]
+                    slotp[(0, 1)] = g_pos[:, 1]; slotn[(0, 1)] = g_neg[:, 1]
+
+                self.ctx.update({
+                    "eid": int(edge_ids[ei]),
+                    "pos_eid": pos_eid,
+                    "neg_eid": neg_eid,
+                    "normal": np.asarray(normals_all[ei, q], float),
+                    "x_phys": np.asarray(qp_phys_all[ei, q], float),
+                    "phi_val": float(phis_arr[ei, q]) if phis_arr is not None else 0.0,
+                    "global_dofs": global_dofs,
+                    "pos_map": pos_map,
+                    "neg_map": neg_map,
+                    "pos_map_by_field": pos_map_by_field_full,
+                    "neg_map_by_field": neg_map_by_field_full,
+                    "pos_map_by_field_reduced": pos_map_by_field_reduced,
+                    "neg_map_by_field_reduced": neg_map_by_field_reduced,
+                    "pos_P_by_field": pos_P_by_field,
+                    "neg_P_by_field": neg_P_by_field,
+                    "pos_union_mask_by_field": pos_union_mask_by_field,
+                    "neg_union_mask_by_field": neg_union_mask_by_field,
+                    "_restriction_masks": restriction_masks_phi,
+                    "use_union_local_dofs": True,
+                })
+
+                val = self._visit(intg.integrand)
+                w = float(qw_all[ei, q])
+                if is_functional:
+                    data = val.data if isinstance(val, VecOpInfo) else val
+                    arr = np.asarray(data, dtype=float)
+                    if acc is None:
+                        acc = np.zeros_like(arr, dtype=float)
+                    acc += w * arr
+                else:
+                    arr = lhs_num(val)
+                    arr = np.asarray(arr)
+                    if rhs and arr.ndim == 2 and 1 in arr.shape:
+                        arr = arr.reshape(-1)
+                    acc += w * arr
+
+            if is_functional:
+                results = self.ctx.setdefault("scalar_results", {})
+                if results.get(hook["name"]) is None or (
+                    isinstance(results.get(hook["name"]), (int, float)) and isinstance(acc, np.ndarray)
+                ):
+                    results[hook["name"]] = np.zeros_like(acc, dtype=float)
+                results[hook["name"]] += acc
+            elif _collector is not None:
+                _collector(int(edge_ids[ei]), np.asarray(global_dofs, dtype=int), np.asarray(acc, dtype=float))
+            else:
+                if rhs:
+                    np.add.at(matvec, global_dofs, acc)
+                else:
+                    rr, cc = np.meshgrid(global_dofs, global_dofs, indexing="ij")
+                    matvec[rr, cc] += acc
+
+        for k in (
+            "basis_values", "global_dofs", "pos_map", "neg_map",
+            "pos_map_by_field", "neg_map_by_field",
+            "pos_map_by_field_reduced", "neg_map_by_field_reduced",
+            "pos_P_by_field", "neg_P_by_field",
+            "pos_union_mask_by_field", "neg_union_mask_by_field",
+            "_restriction_masks", "use_union_local_dofs",
+            "mask_basis", "is_interface",
+            "pos_eid", "neg_eid", "eid", "x_phys", "phi_val", "normal"
+        ):
+            self.ctx.pop(k, None)
+        self.ctx.pop("is_ghost", None)
+
+    def _assemble_aligned_interface_python_local_batch(self, intg: Integral, aligned_edges) -> LocalAssemblyBatch:
+        entity_ids: list[int] = []
+        gdofs_rows: list[np.ndarray] = []
+        trial, test = _trial_test(intg.integrand)
+        is_rhs = trial is None and test is not None
+        if trial is None and test is None:
+            raise NotImplementedError(
+                "Local aligned-interface batches do not yet support pure scalar functionals."
+            )
+        K_rows: list[np.ndarray] | None = [] if not is_rhs else None
+        F_rows: list[np.ndarray] | None = [] if is_rhs else None
+
+        def _collector(entity_id: int, gdofs_row: np.ndarray, loc) -> None:
+            entity_ids.append(int(entity_id))
+            gdofs_rows.append(np.asarray(gdofs_row, dtype=int).reshape(-1))
+            if is_rhs:
+                assert F_rows is not None
+                F_rows.append(np.asarray(loc, dtype=float).reshape(-1))
+            else:
+                assert K_rows is not None
+                K_rows.append(np.asarray(loc, dtype=float))
+
+        old_rhs = self.ctx.get("rhs", None)
+        self.ctx["rhs"] = is_rhs
+        try:
+            self._assemble_aligned_interface_python(intg, None, aligned_edges, _collector=_collector)
+        finally:
+            if old_rhs is None:
+                self.ctx.pop("rhs", None)
+            else:
+                self.ctx["rhs"] = old_rhs
+        return self._batch_from_variable_local_rows(
+            entity_ids=entity_ids,
+            gdofs_rows=gdofs_rows,
+            K_rows=K_rows,
+            F_rows=F_rows,
+            entity_kind="edge",
+        )
+
+    
+    
     def _phys_scalar_deriv_row(self, fld: str, xi: float, eta: float,
-                           ox: int, oy: int, eid: int) -> np.ndarray:
+                            ox: int, oy: int, eid: int) -> np.ndarray:
         """
         Return a length-(nloc_elem) row for D^{(ox,oy)} of scalar field 'fld' in physical coords.
         Exact for orders 0, 1, 2 (includes inverse-map curvature). Uses cached exact formulas for
@@ -2440,9 +7158,18 @@ class FormCompiler:
                 xi = float(geom_entry.get("xi", xi))
                 eta = float(geom_entry.get("eta", eta))
             except Exception:
-                xi, eta = float(xi), float(eta)
+                pass
         else:
-            xi, eta = float(xi), float(eta)
+            # Element-local deformation jets (e.g. cut-volume integrals).
+            deform_elem = self.ctx.get("_deformation_current_elem")
+            if isinstance(deform_elem, dict):
+                geom_jets = deform_elem.get("jets")
+                try:
+                    xi = float(deform_elem.get("xi", xi))
+                    eta = float(deform_elem.get("eta", eta))
+                except Exception:
+                    pass
+        xi, eta = float(xi), float(eta)
 
         # order 0: just values in reference
         if ox == 0 and oy == 0:
@@ -2678,7 +7405,7 @@ class FormCompiler:
         hook = self._hook_for(intg.integrand)
         is_functional = (hook is not None and trial is None and test is None)
         if is_functional:
-            self.ctx.setdefault("scalar_results", {}).setdefault(hook["name"], 0.0)
+            self.ctx.setdefault("scalar_results", {}).setdefault(hook["name"], None)
 
         # ------------------------ main loop over ghost edges ------------------------
         self.ctx['_ghost_level_set'] = level_set
@@ -2695,18 +7422,21 @@ class FormCompiler:
                         return float(level_set.value_on_element(int(eid), (float(xi), float(eta))))
                     return float(level_set(point))
 
+                tag_left = getattr(mesh.elements_list[e.left], "tag", "")
+                tag_right = getattr(mesh.elements_list[e.right], "tag", "")
+
                 def choose_pos_neg_ids():
                     tag = str(getattr(e, "tag", ""))
                     if tag == "ghost_pos":
-                        return e.right, e.left
+                        if tag_left == "outside" and tag_right == "cut":
+                            return e.left, e.right
+                        if tag_right == "outside" and tag_left == "cut":
+                            return e.right, e.left
                     if tag == "ghost_neg":
-                        return e.left, e.right
-                    tag_left  = getattr(mesh.elements_list[e.left],  "tag", "")
-                    tag_right = getattr(mesh.elements_list[e.right], "tag", "")
-                    if tag_left == "cut" and tag_right != "cut":
-                        return e.left, e.right
-                    if tag_right == "cut" and tag_left != "cut":
-                        return e.right, e.left
+                        if tag_left == "inside" and tag_right == "cut":
+                            return e.right, e.left
+                        if tag_right == "inside" and tag_left == "cut":
+                            return e.left, e.right
                     cL = np.asarray(mesh.elements_list[e.left ].centroid())
                     cR = np.asarray(mesh.elements_list[e.right].centroid())
                     phiL = _eval_ls(e.left, cL)
@@ -2728,84 +7458,78 @@ class FormCompiler:
 
 
                 # Local union DOFs / accumulator
-                 # Always compute union layout & maps; accumulator depends on functional vs mat/vec
+                # Always compute union layout & maps; accumulator depends on functional vs mat/vec
                 pos_dofs = self.dh.get_elemental_dofs(pos_eid)
                 neg_dofs = self.dh.get_elemental_dofs(neg_eid)
                 global_dofs = np.unique(np.concatenate([pos_dofs, neg_dofs]))
 
                 pos_map = np.searchsorted(global_dofs, pos_dofs)
                 neg_map = np.searchsorted(global_dofs, neg_dofs)
-                pos_map_by_field: Dict[str, np.ndarray] = {}
-                neg_map_by_field: Dict[str, np.ndarray] = {}
-                for fld in fields:
-                    try:
-                        pos_field_dofs = _hfa.elemental_field_dofs(self.dh, int(pos_eid), fld)
-                        pos_map_by_field[fld] = np.asarray(
-                            np.searchsorted(global_dofs, pos_field_dofs), dtype=int
-                        )
-                    except Exception:
-                        pass
-                    try:
-                        neg_field_dofs = _hfa.elemental_field_dofs(self.dh, int(neg_eid), fld)
-                        neg_map_by_field[fld] = np.asarray(
-                            np.searchsorted(global_dofs, neg_field_dofs), dtype=int
-                        )
-                    except Exception:
-                        pass
 
-                restriction_masks_phi = {'+': {}, '-': {}}
+                pos_map_by_field_full, neg_map_by_field_full = _hfa.build_field_union_maps(
+                    self.dh, fields, int(pos_eid), int(neg_eid), global_dofs
+                )
+
                 try:
-                    pos_masks_pos, _ = _hfa.build_side_masks_by_field(
+                    pos_masks_elem, _ = _hfa.build_side_masks_by_field(
                         self.dh, fields, int(pos_eid), level_set, tol=SIDE.tol
                     )
                 except Exception:
-                    pos_masks_pos = {}
+                    pos_masks_elem = {}
                 try:
-                    _, neg_masks_neg = _hfa.build_side_masks_by_field(
+                    _, neg_masks_elem = _hfa.build_side_masks_by_field(
                         self.dh, fields, int(neg_eid), level_set, tol=SIDE.tol
                     )
                 except Exception:
-                    neg_masks_neg = {}
+                    neg_masks_elem = {}
 
+                restriction_masks_phi = {'+': {}, '-': {}}
                 for fld in fields:
-                    mask = pos_masks_pos.get(fld)
-                    if mask is not None and fld in pos_map_by_field and len(mask) == len(pos_map_by_field[fld]):
-                        arr = np.zeros(len(global_dofs), dtype=float)
-                        arr[pos_map_by_field[fld]] = np.asarray(mask, dtype=float)
-                        restriction_masks_phi['+'][fld] = arr
-                    mask = neg_masks_neg.get(fld)
-                    if mask is not None and fld in neg_map_by_field and len(mask) == len(neg_map_by_field[fld]):
-                        arr = np.zeros(len(global_dofs), dtype=float)
-                        arr[neg_map_by_field[fld]] = np.asarray(mask, dtype=float)
-                        restriction_masks_phi['-'][fld] = arr
+                    mask_pos = pos_masks_elem.get(fld)
+                    mask_neg = neg_masks_elem.get(fld)
+                    if mask_pos is not None:
+                        full_idx = pos_map_by_field_full.get(fld)
+                        if full_idx is not None and len(mask_pos) == len(full_idx):
+                            arr = np.zeros(len(global_dofs), dtype=float)
+                            arr[np.asarray(full_idx, dtype=int)] = np.asarray(mask_pos, dtype=float)
+                            restriction_masks_phi['+'][fld] = arr
+                    if mask_neg is not None:
+                        full_idx = neg_map_by_field_full.get(fld)
+                        if full_idx is not None and len(mask_neg) == len(full_idx):
+                            arr = np.zeros(len(global_dofs), dtype=float)
+                            arr[np.asarray(full_idx, dtype=int)] = np.asarray(mask_neg, dtype=float)
+                            restriction_masks_phi['-'][fld] = arr
 
-                # mask_pos_global = np.ones(len(global_dofs), dtype=float)
-                # mask_neg_global = np.ones(len(global_dofs), dtype=float)
-                # After you have pos_map, neg_map, pos_map_by_field, neg_map_by_field and global_dofs:
-
-                # Element‑membership masks on the union (1 on this element’s dofs; 0 otherwise)
+                # Element‑membership masks on the union (1 on this element’s DOFs; 0 otherwise)
                 mask_pos_global = np.zeros(len(global_dofs), dtype=float)
                 mask_pos_global[np.asarray(pos_map, dtype=int)] = 1.0
 
                 mask_neg_global = np.zeros(len(global_dofs), dtype=float)
                 mask_neg_global[np.asarray(neg_map, dtype=int)] = 1.0
 
-                # Per‑field union masks for Restriction() (again, element membership)
+                # Per-field union masks for Restriction() (again, element membership)
                 pos_union_mask_by_field = {}
                 neg_union_mask_by_field = {}
-                for fld, idxs in pos_map_by_field.items():
+                for fld, idxs in pos_map_by_field_full.items():
                     m = np.zeros(len(global_dofs), dtype=float)
                     m[np.asarray(idxs, dtype=int)] = 1.0
                     pos_union_mask_by_field[fld] = m
 
-                for fld, idxs in neg_map_by_field.items():
+                for fld, idxs in neg_map_by_field_full.items():
                     m = np.zeros(len(global_dofs), dtype=float)
                     m[np.asarray(idxs, dtype=int)] = 1.0
                     neg_union_mask_by_field[fld] = m
 
+                # For dGhost, (+)/(-) are the two owner elements of the facet. Restriction(...)
+                # must therefore act as an *element-membership* mask on the union layout.
                 restriction_masks_union = {'+': pos_union_mask_by_field, '-': neg_union_mask_by_field}
 
-                loc_acc = 0.0 if is_functional else (
+                pos_map_by_field_red: Dict[str, np.ndarray] = {}
+                neg_map_by_field_red: Dict[str, np.ndarray] = {}
+                P_pos_by_field: Dict[str, np.ndarray] = {}
+                P_neg_by_field: Dict[str, np.ndarray] = {}
+
+                loc_acc = None if is_functional else (
                     np.zeros(len(global_dofs)) if rhs
                     else np.zeros((len(global_dofs), len(global_dofs)))
                 )
@@ -2831,7 +7555,14 @@ class FormCompiler:
                 normal_base = np.array([tangent_unit[1], -tangent_unit[0]], float)
                 cpos = np.asarray(mesh.elements_list[pos_eid].centroid())
                 cneg = np.asarray(mesh.elements_list[neg_eid].centroid())
-                if np.dot(normal_base, cpos - cneg) < 0.0:
+                orient_vec = None
+                try:
+                    orient_vec = np.asarray(level_set.gradient(0.5 * (p0 + p1)), float)
+                except Exception:
+                    orient_vec = None
+                if orient_vec is None or not np.isfinite(orient_vec).all() or np.linalg.norm(orient_vec) < 1e-15:
+                    orient_vec = cpos - cneg
+                if np.dot(normal_base, orient_vec) < 0.0:
                     normal_base = -normal_base
 
                 # ---------------- QP loop ----------------
@@ -2870,7 +7601,7 @@ class FormCompiler:
                             tau_eff = Ftau_pos
                         tangent_def = tau_eff / (np.linalg.norm(tau_eff) + 1e-30)
                         normal_here = np.array([tangent_def[1], -tangent_def[0]], float)
-                        if np.dot(normal_here, cpos - cneg) < 0.0:
+                        if np.dot(normal_here, orient_vec) < 0.0:
                             normal_here = -normal_here
 
                         shape_pos = np.asarray(ref_geom.shape(xi_pos, eta_pos), float)
@@ -2895,6 +7626,58 @@ class FormCompiler:
                         deform_ctx_entry = None
 
                     for fld in fields:
+                        fam = getattr(self.me, "_field_families", {}).get(fld, "Lagrange")
+                        if fam == "RT":
+                            # H(div): build side-specific vector basis + divergence in union layout.
+                            Vhat_p = np.asarray(self.me.tabulate_value(fld, float(xi_pos), float(eta_pos)), dtype=float)  # (n_loc,2)
+                            Vhat_n = np.asarray(self.me.tabulate_value(fld, float(xi_neg), float(eta_neg)), dtype=float)
+                            Apos = np.asarray(Ji_pos, dtype=float)
+                            Aneg = np.asarray(Ji_neg, dtype=float)
+                            adj_p = np.array([[Apos[1, 1], -Apos[0, 1]], [-Apos[1, 0], Apos[0, 0]]], dtype=float)
+                            adj_n = np.array([[Aneg[1, 1], -Aneg[0, 1]], [-Aneg[1, 0], Aneg[0, 0]]], dtype=float)
+                            Vphys_p = (adj_p @ Vhat_p.T).T
+                            Vphys_n = (adj_n @ Vhat_n.T).T
+                            det_inv_p = float(np.linalg.det(Apos))
+                            det_inv_n = float(np.linalg.det(Aneg))
+                            div_hat_p = np.asarray(self.me.tabulate_div(fld, float(xi_pos), float(eta_pos)), dtype=float).ravel()
+                            div_hat_n = np.asarray(self.me.tabulate_div(fld, float(xi_neg), float(eta_neg)), dtype=float).ravel()
+                            div_phys_p = div_hat_p * det_inv_p
+                            div_phys_n = div_hat_n * det_inv_n
+
+                            sgn_p = np.asarray(self.dh.element_signs[fld][int(pos_eid)], dtype=float).ravel()
+                            sgn_n = np.asarray(self.dh.element_signs[fld][int(neg_eid)], dtype=float).ravel()
+                            if sgn_p.shape[0] != Vphys_p.shape[0] or sgn_n.shape[0] != Vphys_n.shape[0]:
+                                raise RuntimeError("element_signs length mismatch for RT field on ghost facet.")
+                            Vphys_p = sgn_p[:, None] * Vphys_p
+                            Vphys_n = sgn_n[:, None] * Vphys_n
+                            div_phys_p = sgn_p * div_phys_p
+                            div_phys_n = sgn_n * div_phys_n
+
+                            n_union = int(len(global_dofs))
+                            hdiv_val_pos = np.zeros((2, n_union), dtype=float)
+                            hdiv_val_neg = np.zeros((2, n_union), dtype=float)
+                            hdiv_div_pos = np.zeros((n_union,), dtype=float)
+                            hdiv_div_neg = np.zeros((n_union,), dtype=float)
+
+                            idx_p = pos_map_by_field_full.get(fld)
+                            idx_n = neg_map_by_field_full.get(fld)
+                            if idx_p is not None:
+                                idx_p = np.asarray(idx_p, dtype=int).ravel()
+                                hdiv_val_pos[:, idx_p] = Vphys_p.T
+                                hdiv_div_pos[idx_p] = div_phys_p
+                            if idx_n is not None:
+                                idx_n = np.asarray(idx_n, dtype=int).ravel()
+                                hdiv_val_neg[:, idx_n] = Vphys_n.T
+                                hdiv_div_neg[idx_n] = div_phys_n
+
+                            self._basis_cache[fld] = {
+                                "hdiv_val_pos": hdiv_val_pos,
+                                "hdiv_val_neg": hdiv_val_neg,
+                                "hdiv_div_pos": hdiv_div_pos,
+                                "hdiv_div_neg": hdiv_div_neg,
+                            }
+                            continue
+
                         try:
                             vrow_pos = self.me.basis(fld, float(xi_pos), float(eta_pos))
                             grad_pos = self.me.grad_basis(fld, float(xi_pos), float(eta_pos)) @ Ji_pos
@@ -2927,17 +7710,22 @@ class FormCompiler:
                         "global_dofs": global_dofs,
                         "pos_map": pos_map,
                         "neg_map": neg_map,
-                        "pos_map_by_field": pos_map_by_field,
-                        "neg_map_by_field": neg_map_by_field,
+                        "pos_map_by_field": pos_map_by_field_full,
+                        "neg_map_by_field": neg_map_by_field_full,
+                        "pos_map_by_field_reduced": pos_map_by_field_red,
+                        "neg_map_by_field_reduced": neg_map_by_field_red,
+                        "pos_P_by_field": P_pos_by_field,
+                        "neg_P_by_field": P_neg_by_field,
+                        "use_mortar_projectors": False,
                         "pos_union_mask_by_field": pos_union_mask_by_field,
                         "neg_union_mask_by_field": neg_union_mask_by_field,
                         "coeff_mask_pos_global": mask_pos_global,
                         "coeff_mask_neg_global": mask_neg_global,
-                        "_restriction_masks": restriction_masks_phi,
+                        "_restriction_masks": restriction_masks_union,
                         "mask_basis": False,
                         "pos_eid": pos_eid,
                         "neg_eid": neg_eid,
-                        "use_union_local_dofs": is_functional,
+                        "use_union_local_dofs": False,
                         "_ghost_level_set": level_set,
                         "_xi_eta_cache": xi_eta_cache,
                     }
@@ -2946,23 +7734,32 @@ class FormCompiler:
 
                     self.ctx.update(ctx_updates)
 
+                    # Collapsed coefficient evaluations (e.g. ∇u_k, Hessian(u_k)) depend on the
+                    # current quadrature point. Clear per-QP caches so values are not reused
+                    # across different points on ghost facets.
+                    self._collapsed_cache.clear()
+
                     val = self._visit(intg.integrand)
                     if is_functional:
-                        if isinstance(val, VecOpInfo):
-                            v = float(np.sum(val.data))
-                        else:
-                            arr = np.asarray(val)
-                            v = float(arr if arr.ndim == 0 else arr.sum())
-                        loc_acc += w_eff * v
+                        data = val.data if isinstance(val, VecOpInfo) else val
+                        arr = np.asarray(data, dtype=float)
+                        if arr.ndim > 0:
+                            arr = np.array(arr.sum(), dtype=float)
+                        if loc_acc is None:
+                            loc_acc = np.zeros_like(arr, dtype=float)
+                        loc_acc += w_eff * arr
                     else:
                         loc_acc += w_eff * np.asarray(val)
 
                 # Scatter
                 if is_functional:
-                    self.ctx["scalar_results"][hook["name"]] += loc_acc
+                    results = self.ctx.setdefault("scalar_results", {})
+                    if results.get(hook["name"]) is None or (
+                        isinstance(results.get(hook["name"]), (int, float)) and isinstance(loc_acc, np.ndarray)
+                    ):
+                        results[hook["name"]] = np.zeros_like(loc_acc, dtype=float)
+                    results[hook["name"]] += loc_acc
                 else:
-                    if not rhs and loc_acc.ndim == 2:
-                        loc_acc = 0.5 * (loc_acc + loc_acc.T)
                     unique_dofs, union_to_unique = np.unique(global_dofs, return_inverse=True)
                     if rhs:
                         agg = np.zeros(len(unique_dofs), dtype=loc_acc.dtype)
@@ -2980,22 +7777,488 @@ class FormCompiler:
                     "x_phys_pos", "x_phys_neg",
                     "global_dofs", "pos_map", "neg_map", "pos_eid", "neg_eid",
                     "pos_map_by_field", "neg_map_by_field",
+                    "pos_map_by_field_reduced", "neg_map_by_field_reduced",
+                    "pos_P_by_field", "neg_P_by_field",
                     "pos_union_mask_by_field", "neg_union_mask_by_field",
                     "coeff_mask_pos_global", "coeff_mask_neg_global",
                     "_restriction_masks",
                     "use_union_local_dofs",
                     "mask_basis",
                     "is_interface",
+                    "use_mortar_projectors",
+                    "mortar_owner_side",
+                    "mortar_project_trial",
+                    "mortar_pairs",
+                    "debug_mortar",
                     "_xi_eta_cache"):
                 self.ctx.pop(k, None)
             self.ctx.pop('_ghost_level_set', None)
             self.ctx.pop('_deformation_current', None)
             self.ctx.pop("is_ghost", None)
 
+    def _assemble_facet_patch_python(self, intg: "Integral", matvec):
+        """
+        Assemble facet-patch (two-element) integrals (pure Python path).
 
-    
+        The patch quadrature is built by taking a volume rule on each of the
+        two facet-adjacent elements and mapping each point to the neighbor
+        element such that the *physical* coordinates match. The mapped
+        reference coordinates are generally outside the reference cell; when
+        basis functions are evaluated there, this is a *polynomial extension*
+        of the element shape functions across the shared facet.
 
-    def _assemble_interface_jit(self, intg, matvec):
+        Mathematical motivation
+        -----------------------
+        Patch/extension-based facet integrals are a standard stabilization tool
+        in unfitted FEM: they couple small cut cells to their neighbors and
+        provide uniform control of jumps/penalties without depending on the
+        possibly tiny physical intersection K∩Ω.
+        """
+        import numpy as np
+        from collections import defaultdict
+
+        from pycutfem.integration.quadrature import volume as vol_rule
+        from pycutfem.fem import transform
+        from pycutfem.ufl.helpers import HelpersFieldAware as _hfa
+
+        rhs = bool(self.ctx.get("rhs", False))
+        mesh = self.me.mesh
+        md = intg.measure.metadata or {}
+        deformation = getattr(intg.measure, "deformation", None)
+
+        self.ctx["is_interface"] = False
+        self.ctx["is_ghost"] = True
+
+        level_set = getattr(intg.measure, "level_set", None)
+        if level_set is None:
+            raise ValueError("dFacetPatch measure requires a 'level_set' callable.")
+
+        # Quadrature degree: interpret 'q' as a volume quadrature order.
+        derivs = set(md.get("derivs", set())) | set(required_multi_indices(intg.integrand))
+        derivs |= {(0, 0), (1, 0), (0, 1)}
+        max_total = max((ox + oy for (ox, oy) in derivs), default=0)
+        qdeg_base = max(self._find_q_order(intg), 2 * max_total + 4)
+        p_geo_mesh = int(getattr(mesh, "poly_order", 1))
+        qdeg = qdeg_base + max(0, p_geo_mesh - 1)
+
+        # Geometry mode for facet patches (mirrors DofHandler.precompute_facet_patch_factors):
+        # For curved/isoparametric meshes, polynomial extension far outside the reference
+        # cell can make the inverse map ill-conditioned and lead to huge basis/gradient
+        # values. Since facet-patch terms are stabilizations (not consistency-critical),
+        # we default to an affine, corner-based geometry map when p_geo>1.
+        _geo_mode = os.getenv("PYCUTFEM_FACET_PATCH_GEO_MODE", "").strip().lower()
+        use_affine_geo = bool(p_geo_mesh > 1)
+        if _geo_mode:
+            if _geo_mode in {"iso", "isoparametric", "curved"}:
+                use_affine_geo = False
+            elif _geo_mode in {"affine", "linear"}:
+                use_affine_geo = True
+        if use_affine_geo and (
+            getattr(mesh, "corner_connectivity", None) is None or getattr(mesh, "element_type", "") not in {"quad", "tri"}
+        ):
+            use_affine_geo = False
+        p_geo_eval = 1 if use_affine_geo else p_geo_mesh
+
+        # Which facets form patches?
+        edge_ids = normalize_edge_ids(mesh, intg.measure.defined_on)
+        if edge_ids is None:
+            bs = mesh.edge_bitset("ghost")
+            edge_ids = bs.to_indices() if hasattr(bs, "to_indices") else list(bs)
+        edge_ids = [int(e) for e in edge_ids]
+
+        # Fields needed for basis tabulation
+        fields = set(self._fields_for(intg.integrand))
+        trial, test = _trial_test(intg.integrand)
+        for tt in (trial, test):
+            if tt is None:
+                continue
+            if hasattr(tt, "field_names"):
+                fields.update(tt.field_names)
+            elif hasattr(tt, "field_name"):
+                fields.add(tt.field_name)
+        if not fields:
+            fields = set(getattr(self.dh, "field_names", []))
+        fields = sorted(fields)
+
+        hook = self._hook_for(intg.integrand)
+        is_functional = hook is not None and trial is None and test is None
+        if is_functional:
+            self.ctx.setdefault("scalar_results", {}).setdefault(hook["name"], None)
+
+        qref, wref = vol_rule(mesh.element_type, int(qdeg))
+        qref = np.asarray(qref, dtype=float)
+        wref = np.asarray(wref, dtype=float).ravel()
+
+        ref_geom = transform.get_reference(mesh.element_type, p_geo_eval)
+
+        def _invmap_coords(coords_def: np.ndarray, x_target: np.ndarray, xi0: np.ndarray) -> np.ndarray:
+            """
+            Robust Newton inverse map for deformed element geometry (coords_def).
+
+            For facet-patch quadrature we intentionally allow (ξ,η) outside [-1,1]^2
+            (polynomial extension). Under deformation, a plain Newton update can
+            occasionally diverge and produce huge reference coordinates, which in
+            turn yields astronomically large basis/gradient values and breaks the
+            facet-patch Jacobian.
+            """
+            xi_eta = np.asarray(xi0, dtype=float).reshape(2,).copy()
+            x_target = np.asarray(x_target, dtype=float).reshape(2,)
+            if not np.isfinite(xi_eta).all() or not np.isfinite(x_target).all():
+                return xi_eta
+
+            # Allow moderate extension outside the reference cell, but avoid blow-up.
+            max_abs = float(os.getenv("PYCUTFEM_FACET_PATCH_INV_MAXABS", "20.0"))
+            max_step = float(os.getenv("PYCUTFEM_FACET_PATCH_INV_MAXSTEP", "2.0"))
+            tol = 1e-12
+
+            best = xi_eta.copy()
+            best_r = np.inf
+            for _ in range(40):
+                xi, eta = float(xi_eta[0]), float(xi_eta[1])
+                N = np.asarray(ref_geom.shape(xi, eta), dtype=float).ravel()
+                dN = np.asarray(ref_geom.grad(xi, eta), dtype=float)
+                X = N @ coords_def
+                rhs = x_target - np.asarray(X, dtype=float).reshape(2,)
+                rnorm = float(np.linalg.norm(rhs))
+                if rnorm < best_r:
+                    best_r = rnorm
+                    best[:] = xi_eta
+                if rnorm < tol:
+                    break
+
+                J = coords_def.T @ dN
+                try:
+                    delta = np.linalg.solve(J, rhs)
+                except np.linalg.LinAlgError:
+                    delta = np.linalg.lstsq(J, rhs, rcond=None)[0]
+                delta = np.asarray(delta, dtype=float).reshape(2,)
+
+                dnorm = float(np.linalg.norm(delta))
+                if not np.isfinite(dnorm):
+                    break
+                if dnorm > max_step and dnorm > 0.0:
+                    delta *= max_step / dnorm
+
+                xi_eta_next = xi_eta + delta
+                if not np.isfinite(xi_eta_next).all():
+                    break
+                if max_abs > 0.0:
+                    xi_eta_next = np.clip(xi_eta_next, -max_abs, max_abs)
+
+                if float(np.linalg.norm(xi_eta_next - xi_eta)) < tol:
+                    xi_eta = xi_eta_next
+                    break
+                xi_eta = xi_eta_next
+
+            return best
+
+        def _affine_data(coords: np.ndarray):
+            coords = np.asarray(coords, dtype=float)
+            if mesh.element_type == "quad":
+                if coords.shape[0] < 4:
+                    raise ValueError("quad affine geometry requires 4 corner coordinates.")
+                x0 = coords[0]
+                e1 = coords[1] - x0
+                e2 = coords[3] - x0
+            else:
+                if coords.shape[0] < 3:
+                    raise ValueError("tri affine geometry requires 3 corner coordinates.")
+                x0 = coords[0]
+                e1 = coords[1] - x0
+                e2 = coords[2] - x0
+
+            B = np.stack((e1, e2), axis=1)
+            detB = float(np.linalg.det(B))
+            try:
+                Binv = np.linalg.inv(B)
+            except np.linalg.LinAlgError:
+                Binv = np.linalg.pinv(B)
+
+            if mesh.element_type == "quad":
+                detJ_aff = 0.25 * detB
+                Jinv_aff = 2.0 * Binv
+            else:
+                detJ_aff = detB
+                Jinv_aff = Binv
+            return x0, e1, e2, detJ_aff, Jinv_aff, Binv
+
+        if mesh.element_type == "quad":
+            def _map_aff(x0: np.ndarray, e1: np.ndarray, e2: np.ndarray, xi: float, eta: float) -> np.ndarray:
+                return x0 + 0.5 * (float(xi) + 1.0) * e1 + 0.5 * (float(eta) + 1.0) * e2
+        else:
+            def _map_aff(x0: np.ndarray, e1: np.ndarray, e2: np.ndarray, xi: float, eta: float) -> np.ndarray:
+                return x0 + float(xi) * e1 + float(eta) * e2
+
+        if mesh.element_type == "quad":
+            def _invmap_aff(x0: np.ndarray, Binv: np.ndarray, x: np.ndarray) -> np.ndarray:
+                tu = Binv @ (np.asarray(x, dtype=float).reshape(2,) - x0)
+                return np.array([2.0 * float(tu[0]) - 1.0, 2.0 * float(tu[1]) - 1.0], dtype=float)
+        else:
+            def _invmap_aff(x0: np.ndarray, Binv: np.ndarray, x: np.ndarray) -> np.ndarray:
+                st = Binv @ (np.asarray(x, dtype=float).reshape(2,) - x0)
+                return np.array([float(st[0]), float(st[1])], dtype=float)
+
+        try:
+            for gid in edge_ids:
+                e = mesh.edge(int(gid))
+                if e.right is None:
+                    continue
+
+                # POS/NEG in patch integrals are the two neighboring elements (no level-set orientation).
+                pos_eid = int(e.left)
+                neg_eid = int(e.right)
+
+                # union DOFs (element pair)
+                pos_dofs = self.dh.get_elemental_dofs(pos_eid)
+                neg_dofs = self.dh.get_elemental_dofs(neg_eid)
+                global_dofs = np.unique(np.concatenate([pos_dofs, neg_dofs]))
+                pos_map = np.searchsorted(global_dofs, pos_dofs)
+                neg_map = np.searchsorted(global_dofs, neg_dofs)
+
+                pos_map_by_field_full, neg_map_by_field_full = _hfa.build_field_union_maps(
+                    self.dh, fields, int(pos_eid), int(neg_eid), global_dofs
+                )
+
+                # Restriction masks for facet-patch integrals:
+                # (+)/(-) are the two owner elements (no level-set orientation), so use
+                # element-membership masks on the union layout.
+                restriction_masks_union = {"+": {}, "-": {}}
+                for fld in fields:
+                    mp = pos_map_by_field_full.get(fld)
+                    if mp is not None:
+                        arr = np.zeros(len(global_dofs), dtype=float)
+                        arr[np.asarray(mp, dtype=int)] = 1.0
+                        restriction_masks_union["+"][fld] = arr
+                    mn = neg_map_by_field_full.get(fld)
+                    if mn is not None:
+                        arr = np.zeros(len(global_dofs), dtype=float)
+                        arr[np.asarray(mn, dtype=int)] = 1.0
+                        restriction_masks_union["-"][fld] = arr
+
+                # Constant facet normal (if requested by the integrand)
+                p0, p1 = mesh.nodes_x_y_pos[list(e.nodes)]
+                t = np.asarray(p1 - p0, dtype=float)
+                tn = float(np.linalg.norm(t))
+                if tn < 1e-30:
+                    normal_base = np.array([1.0, 0.0], dtype=float)
+                else:
+                    t /= tn
+                    normal_base = np.array([t[1], -t[0]], dtype=float)
+
+                # Geometry nodes and (optional) deformation
+                if use_affine_geo:
+                    pos_conn = np.asarray(mesh.corner_connectivity[pos_eid], dtype=int)
+                    neg_conn = np.asarray(mesh.corner_connectivity[neg_eid], dtype=int)
+                else:
+                    pos_conn = np.asarray(mesh.elements_connectivity[pos_eid], dtype=int)
+                    neg_conn = np.asarray(mesh.elements_connectivity[neg_eid], dtype=int)
+                coords_pos_geom = np.asarray(mesh.nodes_x_y_pos[pos_conn], dtype=float)
+                coords_neg_geom = np.asarray(mesh.nodes_x_y_pos[neg_conn], dtype=float)
+                if deformation is not None:
+                    Uloc_pos = np.asarray(deformation.node_displacements[pos_conn], dtype=float)
+                    Uloc_neg = np.asarray(deformation.node_displacements[neg_conn], dtype=float)
+                    coords_pos_def = coords_pos_geom + Uloc_pos
+                    coords_neg_def = coords_neg_geom + Uloc_neg
+                else:
+                    Uloc_pos = None
+                    Uloc_neg = None
+                    coords_pos_def = coords_pos_geom
+                    coords_neg_def = coords_neg_geom
+
+                loc_acc = None if is_functional else (
+                    np.zeros(len(global_dofs)) if rhs else np.zeros((len(global_dofs), len(global_dofs)))
+                )
+
+                # Precompute affine inverse Jacobians for the stabilization geometry path.
+                if use_affine_geo:
+                    x0_pos, e1_pos, e2_pos, detJ_pos, Jinv_pos, Binv_pos = _affine_data(coords_pos_def)
+                    x0_neg, e1_neg, e2_neg, detJ_neg, Jinv_neg, Binv_neg = _affine_data(coords_neg_def)
+
+                # Build the facet patch: points from pos + points from neg.
+                for origin_side in ("+", "-"):
+                    origin_eid = pos_eid if origin_side == "+" else neg_eid
+                    other_eid = neg_eid if origin_side == "+" else pos_eid
+                    coords_origin_def = coords_pos_def if origin_side == "+" else coords_neg_def
+                    coords_other_def = coords_neg_def if origin_side == "+" else coords_pos_def
+                    coords_origin_geom = coords_pos_geom if origin_side == "+" else coords_neg_geom
+
+                    for (xi0, eta0), w in zip(qref, wref):
+                        xi0 = float(xi0); eta0 = float(eta0)
+                        if use_affine_geo:
+                            if origin_side == "+":
+                                x_origin = _map_aff(x0_pos, e1_pos, e2_pos, xi0, eta0)
+                                w_eff = float(w) * abs(float(detJ_pos))
+                                x0o, Binvo = (x0_neg, Binv_neg)
+                            else:
+                                x_origin = _map_aff(x0_neg, e1_neg, e2_neg, xi0, eta0)
+                                w_eff = float(w) * abs(float(detJ_neg))
+                                x0o, Binvo = (x0_pos, Binv_pos)
+                            xi_eta_other = _invmap_aff(x0o, Binvo, np.asarray(x_origin, dtype=float))
+                        else:
+                            N = np.asarray(ref_geom.shape(xi0, eta0), dtype=float).ravel()
+                            dN = np.asarray(ref_geom.grad(xi0, eta0), dtype=float)
+                            x_origin = N @ coords_origin_def
+
+                            # detJ on origin element provides physical weight
+                            J0 = coords_origin_def.T @ dN
+                            det0 = float(np.linalg.det(J0))
+                            w_eff = float(w) * abs(det0)
+
+                            if deformation is None:
+                                xi_eta_other = transform.inverse_mapping(mesh, int(other_eid), np.asarray(x_origin, dtype=float))
+                            else:
+                                x_base = N @ coords_origin_geom
+                                xi_guess = transform.inverse_mapping(mesh, int(other_eid), np.asarray(x_base, dtype=float))
+                                xi_eta_other = _invmap_coords(coords_other_def, np.asarray(x_origin, dtype=float), np.asarray(xi_guess, dtype=float))
+
+                        # Assign (xi,eta) per side in the compiler's (+)/(-) convention
+                        if origin_side == "+":
+                            xi_pos = float(xi0); eta_pos = float(eta0)
+                            xi_neg = float(xi_eta_other[0]); eta_neg = float(xi_eta_other[1])
+                        else:
+                            xi_neg = float(xi0); eta_neg = float(eta0)
+                            xi_pos = float(xi_eta_other[0]); eta_pos = float(xi_eta_other[1])
+
+                        # Geometry jets / inverse Jacobians for derivative mapping
+                        if use_affine_geo:
+                            Ji_pos = np.asarray(Jinv_pos, dtype=float)
+                            Ji_neg = np.asarray(Jinv_neg, dtype=float)
+                            # Even under isoparametric deformation we intentionally use an
+                            # affine (corner-based) geometry map for facet-patch stabilizations.
+                            #
+                            # For Hessians we must also ensure the Python backend uses the
+                            # same chain rule as the JIT backends: provide inverse-map jets
+                            # with zero curvature (A2 = 0) instead of falling back to the
+                            # undeformed mesh JET cache.
+                            A2_zero = np.zeros((2, 2, 2), dtype=float)
+                            deform_ctx_entry = {
+                                "+": {"xi": float(xi_pos), "eta": float(eta_pos), "jets": {"A": Ji_pos, "A2": A2_zero}},
+                                "-": {"xi": float(xi_neg), "eta": float(eta_neg), "jets": {"A": Ji_neg, "A2": A2_zero}},
+                            }
+                            x_pos = np.asarray(x_origin, dtype=float)
+                            x_neg = np.asarray(x_origin, dtype=float)
+                        elif deformation is not None:
+                            jets_pos = self._build_inverse_jets(ref_geom, coords_pos_def, xi_pos, eta_pos, upto=max_total)
+                            jets_neg = self._build_inverse_jets(ref_geom, coords_neg_def, xi_neg, eta_neg, upto=max_total)
+                            Ji_pos = jets_pos["A"]
+                            Ji_neg = jets_neg["A"]
+                            deform_ctx_entry = {
+                                "+": {"xi": float(xi_pos), "eta": float(eta_pos), "jets": jets_pos},
+                                "-": {"xi": float(xi_neg), "eta": float(eta_neg), "jets": jets_neg},
+                            }
+                            x_pos = np.asarray(ref_geom.shape(xi_pos, eta_pos), dtype=float).ravel() @ coords_pos_def
+                            x_neg = np.asarray(ref_geom.shape(xi_neg, eta_neg), dtype=float).ravel() @ coords_neg_def
+                        else:
+                            Jg_pos = transform.jacobian(mesh, int(pos_eid), (xi_pos, eta_pos))
+                            Jg_neg = transform.jacobian(mesh, int(neg_eid), (xi_neg, eta_neg))
+                            Ji_pos = np.linalg.inv(Jg_pos)
+                            Ji_neg = np.linalg.inv(Jg_neg)
+                            deform_ctx_entry = None
+                            x_pos = np.asarray(x_origin, dtype=float)
+                            x_neg = np.asarray(x_origin, dtype=float)
+
+                        x_mean = 0.5 * (np.asarray(x_pos, dtype=float) + np.asarray(x_neg, dtype=float))
+
+                        # basis cache for this QP
+                        bv = {"+": defaultdict(dict), "-": defaultdict(dict)}
+                        for fld in fields:
+                            vrow_pos = self.me.basis(fld, xi_pos, eta_pos)
+                            grad_pos = self.me.grad_basis(fld, xi_pos, eta_pos) @ Ji_pos
+                            slot_pos = bv["+"].setdefault(fld, {})
+                            slot_pos[(0, 0)] = vrow_pos
+                            slot_pos[(1, 0)] = grad_pos[:, 0]
+                            slot_pos[(0, 1)] = grad_pos[:, 1]
+
+                            vrow_neg = self.me.basis(fld, xi_neg, eta_neg)
+                            grad_neg = self.me.grad_basis(fld, xi_neg, eta_neg) @ Ji_neg
+                            slot_neg = bv["-"].setdefault(fld, {})
+                            slot_neg[(0, 0)] = vrow_neg
+                            slot_neg[(1, 0)] = grad_neg[:, 0]
+                            slot_neg[(0, 1)] = grad_neg[:, 1]
+
+                        ctx_updates = {
+                            "basis_values": bv,
+                            "normal": normal_base,
+                            # On facet-patch integrals, (+)/(-) refer to the two owner elements.
+                            # Do not evaluate the level set at deformed coordinates here; it is
+                            # unused on sided paths and can fail the owner search under deformation.
+                            "phi_val": 0.0,
+                            "x_phys_pos": np.asarray(x_pos, dtype=float),
+                            "x_phys_neg": np.asarray(x_neg, dtype=float),
+                            "x_phys": np.asarray(x_mean, dtype=float),
+                            "global_dofs": global_dofs,
+                            "pos_map": pos_map,
+                            "neg_map": neg_map,
+                            "pos_map_by_field": pos_map_by_field_full,
+                            "neg_map_by_field": neg_map_by_field_full,
+                            "_restriction_masks": restriction_masks_union,
+                            "pos_eid": pos_eid,
+                            "neg_eid": neg_eid,
+                            "_xi_eta_cache": {"+": (xi_pos, eta_pos), "-": (xi_neg, eta_neg)},
+                        }
+                        if deform_ctx_entry is not None:
+                            ctx_updates["_deformation_current"] = deform_ctx_entry
+                        self.ctx.update(ctx_updates)
+
+                        # Per-QP cache invalidation (same rationale as in _assemble_ghost_edge_python).
+                        self._collapsed_cache.clear()
+
+                        val = self._visit(intg.integrand)
+                        if is_functional:
+                            data = val.data if isinstance(val, VecOpInfo) else val
+                            arr = np.asarray(data, dtype=float)
+                            if arr.ndim > 0:
+                                arr = np.array(arr.sum(), dtype=float)
+                            if loc_acc is None:
+                                loc_acc = np.zeros_like(arr, dtype=float)
+                            loc_acc += w_eff * arr
+                        else:
+                            loc_acc += w_eff * np.asarray(val)
+
+                # Scatter once per patch
+                if is_functional:
+                    results = self.ctx.setdefault("scalar_results", {})
+                    if results.get(hook["name"]) is None or (
+                        isinstance(results.get(hook["name"]), (int, float)) and isinstance(loc_acc, np.ndarray)
+                    ):
+                        results[hook["name"]] = np.zeros_like(loc_acc, dtype=float)
+                    results[hook["name"]] += loc_acc
+                else:
+                    unique_dofs, union_to_unique = np.unique(global_dofs, return_inverse=True)
+                    if rhs:
+                        agg = np.zeros(len(unique_dofs), dtype=loc_acc.dtype)
+                        np.add.at(agg, union_to_unique, loc_acc)
+                        np.add.at(matvec, unique_dofs, agg)
+                    else:
+                        agg = np.zeros((len(unique_dofs), len(unique_dofs)), dtype=loc_acc.dtype)
+                        np.add.at(agg, (union_to_unique[:, None], union_to_unique[None, :]), loc_acc)
+                        r, c = np.meshgrid(unique_dofs, unique_dofs, indexing="ij")
+                        matvec[r, c] += agg
+        finally:
+            for k in (
+                "basis_values",
+                "normal",
+                "phi_val",
+                "x_phys",
+                "x_phys_pos",
+                "x_phys_neg",
+                "global_dofs",
+                "pos_map",
+                "neg_map",
+                "pos_eid",
+                "neg_eid",
+                "pos_map_by_field",
+                "neg_map_by_field",
+                "_restriction_masks",
+                "_xi_eta_cache",
+                "_deformation_current",
+                "is_interface",
+            ):
+                self.ctx.pop(k, None)
+            self.ctx.pop("is_ghost", None)
+
+
+    def _execute_interface_jit_batch(self, intg):
         """
         Assemble interface terms (∫_Γ …) with the JIT back‑end **using
         cut‑only tables**.
@@ -3009,19 +8272,33 @@ class FormCompiler:
         2. feed those aligned arrays to the kernel, and
         3. scatter the kernel output with the matching global‑id list.
         """
-        dh, me  = self.dh, self.me
-        mesh    = me.mesh
+        dh, me = self.dh, self.me
+        mesh = me.mesh
+        trial, test = _trial_test(intg.integrand)
+        if trial is None and test is None:
+            raise NotImplementedError(
+                "Local interface batches do not yet support pure scalar functionals."
+            )
+
+        # XFEM: compile interface kernel against expanded cut-element layout when enrichment is active.
+        me_used = me
+        if (
+            hasattr(dh, "xfem_mixed_element")
+            and callable(getattr(dh, "xfem_mixed_element"))
+            and getattr(dh, "n_enriched", lambda: 0)() > 0
+        ):
+            try:
+                me_used = dh.xfem_mixed_element()
+            except Exception:
+                me_used = me
 
         # ------------------------------------------------------------------
         # 1. Which elements carry an interface?  (BitSet → array of ids)
         # ------------------------------------------------------------------
-        cut_bs = (intg.measure.defined_on
-                if intg.measure.defined_on is not None
-                else mesh.element_bitset("cut"))
+        cut_bs = intg.measure.defined_on if intg.measure.defined_on is not None else mesh.element_bitset("cut")
         on_facet = intg.measure.on_facet
-
-        if cut_bs.cardinality() == 0:          # nothing to do
-            return
+        if cut_bs.cardinality() == 0:
+            return None, None, None, np.empty((0,), dtype=np.int32), np.empty((0, 0), dtype=np.int32), "element"
 
         # ------------------------------------------------------------------
         # 2. Pre‑compute geometry for the interface elements only
@@ -3034,19 +8311,21 @@ class FormCompiler:
         if level_set is None:
             raise ValueError("dInterface measure requires a level_set.")
 
+        runner, ir = self._compile_backend(intg.integrand, dh, me_used, on_facet=on_facet)
+        _, need_hess, need_o3, need_o4 = self._find_req_derivs(intg, runner)
 
-        runner, ir = self._compile_backend(intg.integrand, dh, me, on_facet=on_facet)
-        derivs, need_hess, need_o3, need_o4 = self._find_req_derivs(intg, runner)
         nseg_hint = md.get("nseg")
         if nseg_hint is not None:
             try:
                 nseg_hint = int(nseg_hint)
             except Exception:
                 nseg_hint = None
+        linear_interface = bool(md.get("linear_interface", False))
         geo = dh.precompute_interface_factors(
             cut_bs,
             qdeg,
             level_set,
+            linear_interface=linear_interface,
             nseg=nseg_hint,
             need_hess=need_hess,
             need_o3=need_o3,
@@ -3054,35 +8333,16 @@ class FormCompiler:
             deformation=getattr(intg.measure, "deformation", None),
         )
         geo["is_interface"] = True
-        cut_eids = geo["eids"].astype(np.int32)      # 1‑D array, len = n_cut
-
-        # # 2a) ALIAS: for interface, both sides are the same element.
-        # #    Provide r**_*_{pos|neg} by aliasing to existing d**_* tables.
-        # fields = dh.mixed_element.field_names
-        # for fld in fields:
-        #     gkey = f"g_{fld}"
-        #     if gkey not in geo:
-        #         continue
-        #     g = geo[gkey]                         # (nE, nQ, n_union, 2) = [d/dξ, d/dη]
-        #     r10 = np.ascontiguousarray(g[..., 0]) # (nE, nQ, n_union)
-        #     r01 = np.ascontiguousarray(g[..., 1]) # (nE, nQ, n_union)
-        #     # Only set if absent
-        #     geo.setdefault(f"r10_{fld}_pos", r10)
-        #     geo.setdefault(f"r01_{fld}_pos", r01)
-        #     geo.setdefault(f"r10_{fld}_neg", r10)
-        #     geo.setdefault(f"r01_{fld}_neg", r01)
-        #     b = geo.get(f"b_{fld}")  # (nE, nQ, n_union) value table on interface
-        #     if b is not None:
-        #         geo.setdefault(f"r00_{fld}_pos", b)
-        #         geo.setdefault(f"r00_{fld}_neg", b)
+        cut_eids = geo["eids"].astype(np.int32)
 
         # ------------------------------------------------------------------
         # 3. Element‑to‑DOF map  (shape = n_cut × n_loc)
         # ------------------------------------------------------------------
-        gdofs_map = np.vstack(
-            [dh.get_elemental_dofs(eid) for eid in cut_eids]
-        ).astype(np.int32)
-        geo["gdofs_map"] = gdofs_map
+        if "gdofs_map" in geo:
+            gdofs_map = np.asarray(geo["gdofs_map"], dtype=np.int32)
+        else:
+            gdofs_map = np.vstack([dh.get_elemental_dofs(eid) for eid in cut_eids]).astype(np.int32)
+            geo["gdofs_map"] = gdofs_map
         geo["entity_kind"] = "element"
 
         # ------------------------------------------------------------------
@@ -3091,49 +8351,708 @@ class FormCompiler:
         current_funcs = self._get_data_functions_objs(intg)
 
         # ------------------------------------------------------------------
-        # 5. Compile kernel & build static argument dict
+        # 5. Build static argument dict
         # ------------------------------------------------------------------
-
-        
-
         basis_args = _build_jit_kernel_args(
-            ir, intg.integrand, me, qdeg,
-            dof_handler = dh,
-            gdofs_map   = gdofs_map,
-            param_order = runner.param_order,
-            pre_built   = geo
+            ir,
+            intg.integrand,
+            me_used,
+            qdeg,
+            dof_handler=dh,
+            gdofs_map=gdofs_map,
+            param_order=runner.param_order,
+            pre_built=geo,
         )
 
         static_args = {k: v for k, v in geo.items() if k != "eids"}
         static_args.update(basis_args)
 
+        active_fields = _active_field_order(ir, me_used)
+        runner_active = getattr(runner, "active_fields", None)
+        if runner_active:
+            active_set = set(runner_active)
+            me_order = getattr(me_used, "field_names", ())
+            active_fields = tuple([f for f in me_order if f in active_set]) if me_order else tuple(runner_active)
+        active_cols = _active_columns(me_used, active_fields)
+        static_args = _compress_static_for_active(static_args, me_used, active_cols)
+        gdofs_map = static_args.get("gdofs_map", gdofs_map)
+
         # ------------------------------------------------------------------
         # 6. Execute kernel  → element buffers K/F/J
         # ------------------------------------------------------------------
         K_cut, F_cut, J_cut = runner(current_funcs, static_args)
+        return K_cut, F_cut, J_cut, cut_eids, gdofs_map, str(geo.get("entity_kind", "element"))
+
+    def _assemble_interface_jit(self, intg, matvec):
+        K_cut, F_cut, J_cut, cut_eids, gdofs_map, _ = self._execute_interface_jit_batch(intg)
 
         # ------------------------------------------------------------------
         # 7. Scatter the contributions from the cut elements
         # ------------------------------------------------------------------
         hook = self._hook_for(intg.integrand)
-        if self._functional_calculate(intg, J_cut, hook): return
+        if self._functional_calculate(intg, J_cut, hook):
+            return
 
         _scatter_element_contribs(
-            K_cut, F_cut, J_cut,
-            cut_eids, gdofs_map,
-            matvec, self.ctx, intg.integrand,
-            hook = hook,          # scalar‑functional hook, if any
+            K_cut,
+            F_cut,
+            J_cut,
+            cut_eids,
+            gdofs_map,
+            matvec,
+            self.ctx,
+            intg.integrand,
+            hook=hook,
+        )
+
+    def _assemble_interface_jit_local_batch(self, intg: Integral) -> LocalAssemblyBatch:
+        K_cut, F_cut, J_cut, cut_eids, gdofs_map, entity_kind = self._execute_interface_jit_batch(intg)
+        return LocalAssemblyBatch(
+            K_elem=None if K_cut is None else np.asarray(K_cut, dtype=float),
+            F_elem=None if F_cut is None else np.asarray(F_cut, dtype=float),
+            element_ids=np.asarray(cut_eids, dtype=np.int32),
+            gdofs_map=np.asarray(gdofs_map, dtype=int),
+            entity_kind=str(entity_kind),
+        )
+
+    def _execute_aligned_interface_jit_batch(self, intg, aligned_edges):
+        """Assemble aligned interface edges (φ≈0 along an edge) with the JIT backend."""
+        mesh = self.me.mesh
+        dh, me = self.dh, self.me
+        trial, test = _trial_test(intg.integrand)
+        if trial is None and test is None:
+            raise NotImplementedError(
+                "Local aligned-interface batches do not yet support pure scalar functionals."
+            )
+
+        # XFEM: compile against expanded layout when enrichment is active.
+        me_used = me
+        if (
+            hasattr(dh, "xfem_mixed_element")
+            and callable(getattr(dh, "xfem_mixed_element"))
+            and getattr(dh, "n_enriched", lambda: 0)() > 0
+        ):
+            try:
+                me_used = dh.xfem_mixed_element()
+            except Exception:
+                me_used = me
+
+        edge_ids = aligned_edges
+        on_facet = intg.measure.on_facet
+        level_set = getattr(intg.measure, "level_set", None)
+        if level_set is None:
+            raise ValueError("Aligned interface assembly requires a level_set.")
+
+        try:
+            if edge_ids.cardinality() == 0:
+                return
+        except Exception:
+            if not edge_ids:
+                return
+
+        runner, ir = self._compile_backend(intg.integrand, dh, me_used, on_facet=on_facet)
+        derivs, need_hess, need_o3, need_o4 = self._find_req_derivs(intg, runner)
+
+        max_total = max((ox + oy for (ox, oy) in derivs), default=0)
+        qdeg = max(self._find_q_order(intg), 2 * max_total + 4)
+
+        geo = self.dh.precompute_ghost_factors(
+            ghost_edge_ids=edge_ids,
+            qdeg=qdeg,
+            level_set=level_set,
+            derivs=derivs,
+            allow_interface=True,
+            need_hess=need_hess,
+            need_o3=need_o3,
+            need_o4=need_o4,
+            reuse=True,
+            deformation=getattr(intg.measure, "deformation", None),
+        )
+        geo["is_interface"] = True
+
+        valid_eids = geo.get("eids")
+        if valid_eids is None or len(valid_eids) == 0:
+            return None, None, None, np.empty((0,), dtype=np.int32), np.empty((0, 0), dtype=np.int32), str(geo.get("entity_kind", "edge"))
+
+        kernel_args = _build_jit_kernel_args(
+            ir=ir,
+            expression=intg.integrand,
+            mixed_element=me_used,
+            q_order=qdeg,
+            dof_handler=dh,
+            gdofs_map=geo["gdofs_map"],
+            param_order=runner.param_order,
+            pre_built=geo,
+        )
+
+        active_fields = _active_field_order(ir, me_used)
+        active_cols = _active_columns(me_used, active_fields)
+        use_full_union = bool(
+            str(geo.get("trace_kind", "")) in {"paired_station", "fracture_station"}
+            or (geo.get("gdofs_map") is not None and geo["gdofs_map"].shape[1] != me_used.n_dofs_local)
+        )
+        if not use_full_union:
+            kernel_args = _compress_static_for_active(kernel_args, me_used, active_cols)
+            geo["gdofs_map"] = kernel_args.get("gdofs_map", geo.get("gdofs_map"))
+
+        if ("node_coords" in runner.param_order) and ("node_coords" not in kernel_args):
+            kernel_args["node_coords"] = np.asarray(mesh.nodes_x_y_pos, dtype=float)
+        if ("element_nodes" in runner.param_order) and ("element_nodes" not in kernel_args):
+            kernel_args["element_nodes"] = np.asarray(mesh.elements_connectivity, dtype=np.int64)
+
+        req_list = list(getattr(runner, "param_order", []))
+        req = set(req_list)
+        for side in ("pos", "neg"):
+            for t in ("Hxi0", "Hxi1", "Txi0", "Txi1", "Qxi0", "Qxi1"):
+                need_key = f"{side}_{t}"
+                if (need_key in req) and (need_key not in kernel_args) and (t in geo):
+                    kernel_args[need_key] = geo[t]
+
+        missing = [p for p in runner.param_order if p not in kernel_args]
+        missing = [p for p in missing if not (p.startswith("u_") and p.endswith("_loc"))]
+        if missing:
+            raise KeyError(f"Aligned interface kernel missing static args: {missing}")
+
+        current_funcs = self._get_data_functions_objs(intg)
+        K_edge, F_edge, J_edge = runner(current_funcs, kernel_args)
+        return K_edge, F_edge, J_edge, np.asarray(valid_eids, dtype=np.int32), np.asarray(geo["gdofs_map"], dtype=int), str(geo.get("entity_kind", "edge"))
+
+    def _assemble_aligned_interface_jit(self, intg, matvec, aligned_edges):
+        K_edge, F_edge, J_edge, valid_eids, gdofs_map, _ = self._execute_aligned_interface_jit_batch(intg, aligned_edges)
+        hook = self._hook_for(intg.integrand)
+        if self._functional_calculate(intg, J_edge, hook):
+            return
+
+        _scatter_element_contribs(
+            K_edge,
+            F_edge,
+            J_edge,
+            valid_eids,
+            gdofs_map,
+            matvec,
+            self.ctx,
+            intg.integrand,
+            hook=hook,
+        )
+
+    def _assemble_aligned_interface_jit_local_batch(self, intg: Integral, aligned_edges) -> LocalAssemblyBatch:
+        K_edge, F_edge, J_edge, valid_eids, gdofs_map, entity_kind = self._execute_aligned_interface_jit_batch(intg, aligned_edges)
+        return LocalAssemblyBatch(
+            K_elem=None if K_edge is None else np.asarray(K_edge, dtype=float),
+            F_elem=None if F_edge is None else np.asarray(F_edge, dtype=float),
+            element_ids=np.asarray(valid_eids, dtype=np.int32),
+            gdofs_map=np.asarray(gdofs_map, dtype=int),
+            entity_kind=str(entity_kind),
         )
 
 
     def _assemble_interface(self, intg: Integral, matvec):
         """Assemble integrals over non-conforming interfaces defined by a level set."""
+        level_set = getattr(intg.measure, "level_set", None)
+        # Interface assembly needs up-to-date cut tags and interface segments.
+        self._ensure_mesh_classified(level_set, need_interface_segments=True)
+
+        trial, test = _trial_test(intg.integrand)
+        if trial is None and test is None and self._is_jit_backend():
+            # Keep scalar dInterface functionals on the Python path for now.
+            # This matches the existing fallback policy used by other edge-based
+            # measures whose JIT local-batch plumbing is matrix/vector oriented.
+            mesh = self.me.mesh
+            aligned_edges = None
+            try:
+                aligned_edges = mesh.edge_bitset("interface")
+            except Exception:
+                aligned_edges = None
+            has_aligned = False
+            if aligned_edges is not None:
+                try:
+                    has_aligned = aligned_edges.cardinality() > 0
+                except Exception:
+                    has_aligned = bool(aligned_edges)
+            if has_aligned:
+                self._assemble_aligned_interface_python(intg, matvec, aligned_edges)
+            self._assemble_interface_python(intg, matvec)
+            return
+
+        mesh = self.me.mesh
+        aligned_edges = None
+        try:
+            aligned_edges = mesh.edge_bitset("interface")
+        except Exception:
+            aligned_edges = None
+        has_aligned = False
+        if aligned_edges is not None:
+            try:
+                has_aligned = aligned_edges.cardinality() > 0
+            except Exception:
+                has_aligned = bool(aligned_edges)
+        if has_aligned:
+            self._assemble_aligned_interface(intg, matvec, aligned_edges)
+
         if self.backend == "python":
             self._assemble_interface_python(intg, matvec)
-        elif self.backend == "jit":
+        elif self._is_jit_backend():
             self._assemble_interface_jit(intg, matvec)
         else:
-            raise ValueError(f"Unsupported backend: {self.backend}. Use 'python' or 'jit'.")
+            raise ValueError(
+                f"Unsupported backend: {self.backend}. Use 'python', 'jit', or 'cpp'."
+            )
+
+    # ------------------------------------------------------------------
+    # Non-matching interface (common-refinement coupling)
+    # ------------------------------------------------------------------
+    def _assemble_nonmatching_interface(self, intg: Integral, matvec):
+        """Assemble integrals over a non-matching interface (common-refinement segments)."""
+        if self.backend == "python":
+            self._assemble_nonmatching_interface_python(intg, matvec)
+        elif self._is_jit_backend():
+            self._assemble_nonmatching_interface_jit(intg, matvec)
+        else:
+            raise ValueError(
+                f"Unsupported backend: {self.backend}. Use 'python', 'jit', or 'cpp'."
+            )
+
+    def _assemble_trace_link(self, intg: Integral, matvec):
+        """Assemble integrals over a discrete trace/link domain."""
+        if self.backend == "python":
+            self._assemble_nonmatching_interface_python(intg, matvec)
+        elif self._is_jit_backend():
+            self._assemble_nonmatching_interface_jit(intg, matvec)
+        else:
+            raise ValueError(
+                f"Unsupported backend: {self.backend}. Use 'python', 'jit', or 'cpp'."
+            )
+
+    def _nonmatching_interface_obj(self, intg: Integral):
+        md = getattr(intg.measure, "metadata", None) or {}
+        iface = md.get("interface", None)
+        if iface is None:
+            iface = getattr(intg.measure, "interface", None)
+        if iface is None:
+            raise ValueError(
+                "dNonmatchingInterface requires metadata={'interface': <NonMatchingInterface>} "
+                "(with element ids in the same mesh numbering as dof_handler.mixed_element.mesh)."
+            )
+        return iface
+
+    def _trace_link_obj(self, intg: Integral):
+        md = getattr(intg.measure, "metadata", None) or {}
+        trace = md.get("trace", None)
+        if trace is None:
+            trace = md.get("interface", None)
+        if trace is None:
+            trace = getattr(intg.measure, "trace", None)
+        if trace is None:
+            raise ValueError(
+                "dTraceLink requires metadata={'trace': <TraceLinkInterface>} "
+                "(with trace.mesh in the same numbering as dof_handler.mixed_element.mesh)."
+            )
+        return trace
+
+    def _trace_domain_obj(self, intg: Integral):
+        domain = str(getattr(intg.measure, "domain_type", "")).strip().lower()
+        if domain == "trace_link":
+            return self._trace_link_obj(intg)
+        if domain == "nonmatching_interface":
+            return self._nonmatching_interface_obj(intg)
+        raise ValueError(f"Unsupported sided trace measure/domain type {domain!r}.")
+
+    def _trace_domain_label(self, intg: Integral) -> str:
+        domain = str(getattr(intg.measure, "domain_type", "")).strip().lower()
+        return "trace-link" if domain == "trace_link" else "nonmatching-interface"
+
+    def _precompute_trace_domain_factors(
+        self,
+        intg: Integral,
+        trace_obj,
+        *,
+        qdeg: int,
+        derivs,
+        reuse: bool = True,
+        need_hess: bool = False,
+        need_o3: bool = False,
+        need_o4: bool = False,
+        quadrature: str = "gauss",
+    ) -> dict:
+        domain = str(getattr(intg.measure, "domain_type", "")).strip().lower()
+        if domain == "trace_link":
+            geo = self.dh.precompute_trace_link_factors(
+                trace=trace_obj,
+                qdeg=int(qdeg),
+                derivs=derivs,
+                reuse=reuse,
+                need_hess=need_hess,
+                need_o3=need_o3,
+                need_o4=need_o4,
+                deformation=getattr(intg.measure, "deformation", None),
+                quadrature=quadrature,
+            )
+        elif domain == "nonmatching_interface":
+            geo = self.dh.precompute_nonmatching_interface_factors(
+                interface=trace_obj,
+                qdeg=int(qdeg),
+                derivs=derivs,
+                reuse=reuse,
+                need_hess=need_hess,
+                need_o3=need_o3,
+                need_o4=need_o4,
+                deformation=getattr(intg.measure, "deformation", None),
+                quadrature=quadrature,
+            )
+        else:
+            raise ValueError(f"Unsupported sided trace measure/domain type {domain!r}.")
+        geo["is_interface"] = True
+        geo["is_ghost"] = False
+        geo["domain"] = domain
+        geo["domain_type"] = domain
+        return geo
+
+    def _assemble_nonmatching_interface_python(self, intg: Integral, matvec, *, _collector=None):
+        import numpy as np
+        import logging
+        from pycutfem.ufl.helpers import _trial_test
+
+        log = logging.getLogger(__name__)
+        rhs = bool(self.ctx.get("rhs", False))
+        label = self._trace_domain_label(intg)
+        log.info(f"Assembling {label} integral: {intg}, is_rhs={rhs}")
+
+        interface = self._trace_domain_obj(intg)
+        dh, me, mesh = self.dh, self.me, self.me.mesh
+
+        # context: we are on Γ_nm
+        self.ctx["is_interface"] = True
+        self.ctx["is_ghost"] = False
+        self.ctx["measure_side"] = None
+
+        md = intg.measure.metadata or {}
+        derivs = set(md.get("derivs", set())) | set(required_multi_indices(intg.integrand))
+        derivs |= {(0, 0), (1, 0), (0, 1)}
+
+        max_total = max((ox + oy for (ox, oy) in derivs), default=0)
+        for p in range(max_total + 1):
+            for ox in range(p + 1):
+                derivs.add((ox, p - ox))
+
+        qdeg = int(self._find_q_order(intg))
+        p_geo = int(getattr(mesh, "poly_order", 1))
+        qdeg += max(0, p_geo - 1)
+
+        geo = self._precompute_trace_domain_factors(
+            intg,
+            interface,
+            qdeg=int(qdeg),
+            derivs=derivs,
+            reuse=True,
+            quadrature=str(md.get("quadrature", md.get("rule", "gauss"))),
+        )
+        eids = np.asarray(geo.get("eids", np.empty((0,), dtype=np.int32)), dtype=np.int32)
+        if eids.size == 0:
+            return
+
+        # scalar-functional hook support
+        trial, test = _trial_test(intg.integrand)
+        hook = self._hook_for(intg.integrand)
+        is_functional = (hook is not None) and (trial is None) and (test is None)
+        if _collector is not None and is_functional:
+            raise NotImplementedError(
+                f"Local {label} batches do not yet support pure scalar functionals."
+            )
+        if is_functional:
+            self.ctx.setdefault("scalar_results", {}).setdefault(hook["name"], None)
+
+        fields = self._fields_for(intg.integrand)
+        if not fields:
+            fields = list(getattr(dh, "field_names", []))
+
+        try:
+            for ei in range(int(eids.size)):
+                entity_ctx = self._nonmatching_python_entity_context(geo, fields, int(ei))
+                global_dofs = np.asarray(entity_ctx["global_dofs"], dtype=int)
+
+                if is_functional:
+                    acc = None
+                else:
+                    n = int(len(global_dofs))
+                    acc = np.zeros(n, float) if rhs else np.zeros((n, n), float)
+
+                qp_phys = np.asarray(geo["qp_phys"], dtype=float)
+                qw = np.asarray(geo["qw"], dtype=float)
+                normals = np.asarray(geo["normals"], dtype=float)
+                xi_pos = np.asarray(geo["xi_pos"], dtype=float)
+                eta_pos = np.asarray(geo["eta_pos"], dtype=float)
+                xi_neg = np.asarray(geo["xi_neg"], dtype=float)
+                eta_neg = np.asarray(geo["eta_neg"], dtype=float)
+
+                owner_id = int(np.asarray(geo.get("owner_id", geo.get("owner_pos_id")), dtype=np.int32)[ei])
+
+                nQ = int(qp_phys.shape[1])
+                for q in range(nQ):
+                    wq = float(qw[ei, q])
+                    if wq == 0.0:
+                        continue
+
+                    self.ctx.update(
+                        {
+                            **entity_ctx,
+                            "eid": owner_id,
+                            "qstate_owner_id": int(np.asarray(geo.get("qstate_owner_id", eids), dtype=np.int32)[ei]),
+                            "q": int(q),
+                            "normal": np.asarray(normals[ei, q], float),
+                            "x_phys": np.asarray(qp_phys[ei, q], float),
+                            "phi_val": 0.0,
+                            "use_union_local_dofs": True,
+                            "basis_values": self._nonmatching_python_basis_values(geo, fields, int(ei), int(q)),
+                            "_xi_eta_cache": {
+                                "+": (float(xi_pos[ei, q]), float(eta_pos[ei, q])),
+                                "-": (float(xi_neg[ei, q]), float(eta_neg[ei, q])),
+                            },
+                        }
+                    )
+
+                    val = self._visit(intg.integrand)
+                    if is_functional:
+                        data = val.data if isinstance(val, VecOpInfo) else val
+                        arr = np.asarray(data, dtype=float)
+                        if acc is None:
+                            acc = np.zeros_like(arr, dtype=float)
+                        acc += wq * arr
+                    else:
+                        arr = lhs_num(val)
+                        arr = np.asarray(arr)
+                        if rhs and arr.ndim == 2 and 1 in arr.shape:
+                            arr = arr.reshape(-1)
+                        acc += wq * arr
+
+                if is_functional:
+                    results = self.ctx.setdefault("scalar_results", {})
+                    if results.get(hook["name"]) is None or (
+                        isinstance(results.get(hook["name"]), (int, float)) and isinstance(acc, np.ndarray)
+                    ):
+                        results[hook["name"]] = np.zeros_like(acc, dtype=float)
+                    results[hook["name"]] += acc
+                elif _collector is not None:
+                    _collector(int(eids[ei]), np.asarray(global_dofs, dtype=int), np.asarray(acc, dtype=float))
+                else:
+                    if rhs:
+                        np.add.at(matvec, global_dofs, acc)
+                    else:
+                        rr, cc = np.meshgrid(global_dofs, global_dofs, indexing="ij")
+                        matvec[rr, cc] += acc
+        finally:
+            for k in (
+                "basis_values",
+                "global_dofs",
+                "pos_map",
+                "neg_map",
+                "pos_map_by_field",
+                "neg_map_by_field",
+                "pos_union_mask_by_field",
+                "neg_union_mask_by_field",
+                "_xi_eta_cache",
+                "use_union_local_dofs",
+                "mask_basis",
+                "pos_eid",
+                "neg_eid",
+                "eid",
+                "qstate_owner_id",
+                "q",
+                "x_phys",
+                "phi_val",
+                "normal",
+                "is_interface",
+                "measure_side",
+            ):
+                self.ctx.pop(k, None)
+            self.ctx.pop("is_ghost", None)
+
+    def _assemble_nonmatching_interface_python_local_batch(self, intg: Integral) -> LocalAssemblyBatch:
+        entity_ids: list[int] = []
+        gdofs_rows: list[np.ndarray] = []
+        trial, test = _trial_test(intg.integrand)
+        is_rhs = trial is None and test is not None
+        if trial is None and test is None:
+            raise NotImplementedError(
+                f"Local {self._trace_domain_label(intg)} batches do not yet support pure scalar functionals."
+            )
+        K_rows: list[np.ndarray] | None = [] if not is_rhs else None
+        F_rows: list[np.ndarray] | None = [] if is_rhs else None
+
+        def _collector(entity_id: int, gdofs_row: np.ndarray, loc) -> None:
+            entity_ids.append(int(entity_id))
+            gdofs_rows.append(np.asarray(gdofs_row, dtype=int).reshape(-1))
+            if is_rhs:
+                assert F_rows is not None
+                F_rows.append(np.asarray(loc, dtype=float).reshape(-1))
+            else:
+                assert K_rows is not None
+                K_rows.append(np.asarray(loc, dtype=float))
+
+        old_rhs = self.ctx.get("rhs", None)
+        self.ctx["rhs"] = is_rhs
+        try:
+            self._assemble_nonmatching_interface_python(intg, None, _collector=_collector)
+        finally:
+            if old_rhs is None:
+                self.ctx.pop("rhs", None)
+            else:
+                self.ctx["rhs"] = old_rhs
+        return self._batch_from_variable_local_rows(
+            entity_ids=entity_ids,
+            gdofs_rows=gdofs_rows,
+            K_rows=K_rows,
+            F_rows=F_rows,
+            entity_kind="edge",
+        )
+
+    def _execute_nonmatching_interface_jit_batch(self, intg: "Integral"):
+        import numpy as np
+
+        dh, me = self.dh, self.me
+        interface = self._trace_domain_obj(intg)
+        trial, test = _trial_test(intg.integrand)
+        if trial is None and test is None:
+            raise NotImplementedError(
+                f"Local {self._trace_domain_label(intg)} batches do not yet support pure scalar functionals."
+            )
+
+        # XFEM: compile facet kernels against the expanded local layout when enrichment is active.
+        me_used = me
+        if (
+            hasattr(dh, "xfem_mixed_element")
+            and callable(getattr(dh, "xfem_mixed_element"))
+            and getattr(dh, "n_enriched", lambda: 0)() > 0
+        ):
+            try:
+                me_used = dh.xfem_mixed_element()
+            except Exception:
+                me_used = me
+
+        runner, ir = self._compile_backend(intg.integrand, dh, me_used, on_facet=True)
+        derivs, need_hess, need_o3, need_o4 = self._find_req_derivs(intg, runner)
+
+        md = getattr(intg.measure, "metadata", None) or {}
+        quadrature_rule = str(md.get("quadrature", md.get("rule", "gauss"))).strip().lower().replace("-", "_")
+        if quadrature_rule in {"gll", "lobatto"}:
+            quadrature_rule = "gauss_lobatto"
+
+        max_total = max((ox + oy for (ox, oy) in derivs), default=0)
+        if quadrature_rule == "gauss_lobatto":
+            qdeg = int(self._find_q_order(intg))
+        else:
+            qdeg = max(self._find_q_order(intg), 2 * max_total + 4)
+        p_geo = int(getattr(me_used.mesh, "poly_order", 1))
+        qdeg += max(0, p_geo - 1)
+
+        geo = self._precompute_trace_domain_factors(
+            intg,
+            interface,
+            qdeg=int(qdeg),
+            derivs=derivs,
+            reuse=True,
+            need_hess=need_hess,
+            need_o3=need_o3,
+            need_o4=need_o4,
+            quadrature=quadrature_rule,
+        )
+
+        valid_eids = np.asarray(geo.get("eids", []), dtype=np.int32)
+        if valid_eids.size == 0:
+            return None, None, None, np.empty((0,), dtype=np.int32), np.empty((0, 0), dtype=np.int32), str(geo.get("entity_kind", "edge"))
+
+        kernel_args = _build_jit_kernel_args(
+            ir=ir,
+            expression=intg.integrand,
+            mixed_element=me_used,
+            q_order=int(qdeg),
+            dof_handler=dh,
+            gdofs_map=geo["gdofs_map"],
+            param_order=runner.param_order,
+            pre_built=geo,
+        )
+
+        active_fields = _active_field_order(ir, me_used)
+        active_cols = _active_columns(me_used, active_fields)
+        use_full_union = bool(
+            str(geo.get("trace_kind", "")) in {"paired_station", "fracture_station"}
+            or (geo.get("gdofs_map") is not None and geo["gdofs_map"].shape[1] != me_used.n_dofs_local)
+        )
+        if not use_full_union:
+            kernel_args = _compress_static_for_active(kernel_args, me_used, active_cols)
+            geo["gdofs_map"] = kernel_args.get("gdofs_map", geo.get("gdofs_map"))
+
+        if ("node_coords" in runner.param_order) and ("node_coords" not in kernel_args):
+            kernel_args["node_coords"] = np.asarray(me_used.mesh.nodes_x_y_pos, dtype=float)
+        if ("element_nodes" in runner.param_order) and ("element_nodes" not in kernel_args):
+            kernel_args["element_nodes"] = np.asarray(me_used.mesh.elements_connectivity, dtype=np.int64)
+
+        req_list = list(getattr(runner, "param_order", []))
+        req = set(req_list)
+        for side in ("pos", "neg"):
+            for t in ("Hxi0", "Hxi1", "Txi0", "Txi1", "Qxi0", "Qxi1"):
+                need_key = f"{side}_{t}"
+                if (need_key in req) and (need_key not in kernel_args) and (need_key in geo):
+                    kernel_args[need_key] = geo[need_key]
+
+        missing = [p for p in runner.param_order if p not in kernel_args]
+        missing = [p for p in missing if not (p.startswith("u_") and p.endswith("_loc"))]
+        if missing:
+            raise KeyError(f"{self._trace_domain_label(intg)} kernel missing static args: {missing}")
+
+        current_funcs = self._get_data_functions_objs(intg)
+        K_ent, F_ent, J_ent = runner(current_funcs, kernel_args)
+        return K_ent, F_ent, J_ent, valid_eids, np.asarray(geo["gdofs_map"], dtype=int), str(geo.get("entity_kind", "edge"))
+
+    def _assemble_nonmatching_interface_jit(self, intg: "Integral", matvec):
+        K_ent, F_ent, J_ent, valid_eids, gdofs_map, _ = self._execute_nonmatching_interface_jit_batch(intg)
+        hook = self._hook_for(intg.integrand)
+        if self._functional_calculate(intg, J_ent, hook):
+            return
+
+        _scatter_element_contribs(
+            K_ent,
+            F_ent,
+            J_ent,
+            valid_eids,
+            gdofs_map,
+            matvec,
+            self.ctx,
+            intg.integrand,
+            hook=hook,
+        )
+
+    def _assemble_nonmatching_interface_jit_local_batch(self, intg: Integral) -> LocalAssemblyBatch:
+        K_ent, F_ent, J_ent, valid_eids, gdofs_map, entity_kind = self._execute_nonmatching_interface_jit_batch(intg)
+        return LocalAssemblyBatch(
+            K_elem=None if K_ent is None else np.asarray(K_ent, dtype=float),
+            F_elem=None if F_ent is None else np.asarray(F_ent, dtype=float),
+            element_ids=np.asarray(valid_eids, dtype=np.int32),
+            gdofs_map=np.asarray(gdofs_map, dtype=int),
+            entity_kind=str(entity_kind),
+        )
+
+    def _assemble_aligned_interface(self, intg: Integral, matvec, aligned_edges=None):
+        """Assemble interface integrals on edges tagged as 'interface'."""
+        if aligned_edges is None:
+            try:
+                aligned_edges = self.me.mesh.edge_bitset("interface")
+            except Exception:
+                aligned_edges = None
+        try:
+            has_edges = aligned_edges is not None and aligned_edges.cardinality() > 0
+        except Exception:
+            has_edges = bool(aligned_edges)
+        if not has_edges:
+            return
+
+        if self.backend == "python":
+            self._assemble_aligned_interface_python(intg, matvec, aligned_edges)
+        elif self._is_jit_backend():
+            self._assemble_aligned_interface_jit(intg, matvec, aligned_edges)
+        else:
+            raise ValueError(
+                f"Unsupported backend: {self.backend}. Use 'python', 'jit', or 'cpp'."
+            )
 
     def _find_req_derivs(self, intg: "Integral", runner):
         """Find all required derivative multi-indices for the given integral."""
@@ -3168,29 +9087,38 @@ class FormCompiler:
 
     def _assemble_ghost_edge_jit(self, intg: "Integral", matvec):
         """Assembles ghost-edge integrals using the JIT backend."""
-
-
         mesh = self.me.mesh
         dh, me = self.dh, self.me
 
+        # XFEM: compile ghost kernels against the expanded local layout when enrichment is active.
+        me_used = me
+        if (
+            hasattr(dh, "xfem_mixed_element")
+            and callable(getattr(dh, "xfem_mixed_element"))
+            and getattr(dh, "n_enriched", lambda: 0)() > 0
+        ):
+            try:
+                me_used = dh.xfem_mixed_element()
+            except Exception:
+                me_used = me
 
-        edge_ids = (intg.measure.defined_on
-                    if intg.measure.defined_on is not None
-                    else mesh.edge_bitset('ghost'))
+        edge_ids = intg.measure.defined_on if intg.measure.defined_on is not None else mesh.edge_bitset("ghost")
         on_facet = intg.measure.on_facet
-        level_set = getattr(intg.measure, 'level_set', None)
+        level_set = getattr(intg.measure, "level_set", None)
         if level_set is None:
             raise ValueError("dGhost measure requires a 'level_set' callable.")
 
         if edge_ids.cardinality() == 0:
-            raise ValueError("No ghost edges found for the integral.")
+            # This is a valid state (e.g. no cut cells / no ghost band). Treat as
+            # a zero contribution rather than raising.
+            return
 
         # 2) Compile kernel FIRST (to know exact static params it will require)
-        runner, ir = self._compile_backend(intg.integrand, dh, me, on_facet=on_facet)
+        runner, ir = self._compile_backend(intg.integrand, dh, me_used, on_facet=on_facet)
         derivs, need_hess, need_o3, need_o4 = self._find_req_derivs(intg, runner)
 
         max_total = max((ox + oy for (ox, oy) in derivs), default=0)
-        qdeg = max(self._find_q_order(intg), 2*max_total + 4)
+        qdeg = max(self._find_q_order(intg), 2 * max_total + 4)
 
         # 3) Precompute sided ghost factors with the exact flags
         geo = self.dh.precompute_ghost_factors(
@@ -3214,7 +9142,7 @@ class FormCompiler:
         kernel_args = _build_jit_kernel_args(
             ir=ir,
             expression=intg.integrand,
-            mixed_element=me,
+            mixed_element=me_used,
             q_order=qdeg,
             dof_handler=dh,
             gdofs_map=geo["gdofs_map"],
@@ -3222,40 +9150,33 @@ class FormCompiler:
             pre_built=geo,
         )
 
+        active_fields = _active_field_order(ir, me_used)
+        active_cols = _active_columns(me_used, active_fields)
+        use_full_union = bool(geo.get("gdofs_map") is not None and geo["gdofs_map"].shape[1] != me_used.n_dofs_local)
+        if not use_full_union:
+            kernel_args = _compress_static_for_active(kernel_args, me_used, active_cols)
+            geo["gdofs_map"] = kernel_args.get("gdofs_map", geo.get("gdofs_map"))
+
         # ---- baseline statics some kernels always expect ----
         if ("node_coords" in runner.param_order) and ("node_coords" not in kernel_args):
             kernel_args["node_coords"] = np.asarray(mesh.nodes_x_y_pos, dtype=float)
         if ("element_nodes" in runner.param_order) and ("element_nodes" not in kernel_args):
             kernel_args["element_nodes"] = np.asarray(mesh.elements_connectivity, dtype=np.int64)
 
-        # 4b) Patch unsided dXY_<fld> if requested but missing: average of sided rXY
-        missing_now = [p for p in runner.param_order if p not in kernel_args]
-        if missing_now:
-            for name in list(missing_now):
-                m = re.match(r"^d(\d)(\d)_([A-Za-z0-9_]+)$", name)
-                if not m:
-                    continue
-                dx, dy, fld = int(m.group(1)), int(m.group(2)), m.group(3)
-                kpos = f"r{dx}{dy}_{fld}_pos"
-                kneg = f"r{dx}{dy}_{fld}_neg"
-                if (kpos in kernel_args) and (kneg in kernel_args):
-                    kernel_args[name] = 0.5*(kernel_args[kpos] + kernel_args[kneg])
-                elif kpos in kernel_args:
-                    kernel_args[name] = kernel_args[kpos]
-                elif kneg in kernel_args:
-                    kernel_args[name] = kernel_args[kneg]
-
         # 4c) Alias sided jets from unsided if necessary (belt-and-suspenders)
         req_list = list(getattr(runner, "param_order", []))
         req = set(req_list)
-        for side in ("pos","neg"):
-            for t in ("Hxi0","Hxi1","Txi0","Txi1","Qxi0","Qxi1"):
+        for side in ("pos", "neg"):
+            for t in ("Hxi0", "Hxi1", "Txi0", "Txi1", "Qxi0", "Qxi1"):
                 need_key = f"{side}_{t}"
                 if (need_key in req) and (need_key not in kernel_args) and (t in geo):
                     kernel_args[need_key] = geo[t]
 
-        # Final sanity: everything the kernel listed must be present now
-        still_missing = [p for p in runner.param_order if p not in kernel_args]
+        still_missing = [
+            p
+            for p in runner.param_order
+            if p not in kernel_args and not (isinstance(p, str) and p.startswith("u_") and p.endswith("_loc"))
+        ]
         if still_missing:
             raise KeyError(
                 "KernelRunner: the following static arrays are still missing after automatic completion: "
@@ -3267,11 +9188,461 @@ class FormCompiler:
         current_funcs = self._get_data_functions_objs(intg)
         K_edge, F_edge, J_edge = runner(current_funcs, kernel_args)
 
+        if (not self.ctx.get("rhs", False)) and (K_edge is not None) and K_edge.ndim == 3:
+            # Keep symmetry for SPD-like facet penalties, but do NOT silently
+            # perturb the diagonal by default: that breaks exact nullspaces
+            # (e.g. constant fields for gradient-jump ghost penalties) and can
+            # cause backend inconsistencies.
+            K_edge = 0.5 * (K_edge + np.swapaxes(K_edge, 1, 2))
+            if os.getenv("PYCUTFEM_JIT_GHOST_DIAG_PERTURB", "").lower() in {"1", "true", "yes"}:
+                max_abs = float(np.max(np.abs(K_edge))) if K_edge.size else 0.0
+                if max_abs > 0.0:
+                    eps = 1e-12 * max_abs
+                    diag = np.arange(K_edge.shape[1])
+                    K_edge[:, diag, diag] += eps
+
         hook = self._hook_for(intg.integrand)
         if self._functional_calculate(intg, J_edge, hook):
             return
 
         # 6) Scatter contributions (per-edge union DOFs)
+        _scatter_element_contribs(
+            K_edge,
+            F_edge,
+            J_edge,
+            valid_eids,
+            geo["gdofs_map"],
+            matvec,
+            self.ctx,
+            intg.integrand,
+            hook=hook,
+        )
+
+    def _assemble_facet_patch_jit(self, intg: "Integral", matvec):
+        """Assemble facet-patch integrals using the JIT backend."""
+        import numpy as np
+
+        mesh = self.me.mesh
+        dh, me = self.dh, self.me
+
+        # XFEM: compile patch kernels against the expanded local layout when enrichment is active.
+        me_used = me
+        if (
+            hasattr(dh, "xfem_mixed_element")
+            and callable(getattr(dh, "xfem_mixed_element"))
+            and getattr(dh, "n_enriched", lambda: 0)() > 0
+        ):
+            try:
+                me_used = dh.xfem_mixed_element()
+            except Exception:
+                me_used = me
+
+        edge_ids = intg.measure.defined_on if intg.measure.defined_on is not None else mesh.edge_bitset("ghost")
+        level_set = getattr(intg.measure, "level_set", None)
+        if level_set is None:
+            raise ValueError("dFacetPatch measure requires a 'level_set' callable.")
+        if hasattr(edge_ids, "cardinality") and edge_ids.cardinality() == 0:
+            return
+
+        runner, ir = self._compile_backend(intg.integrand, dh, me_used, on_facet=True)
+        derivs, need_hess, need_o3, need_o4 = self._find_req_derivs(intg, runner)
+        if need_o3 or need_o4:
+            raise NotImplementedError(
+                "dFacetPatch JIT currently supports up to 2nd-order jets (Hessian/Laplacian). "
+                "Higher-order (3rd/4th) inverse-map jets are not implemented."
+            )
+
+        max_total = max((ox + oy for (ox, oy) in derivs), default=0)
+        qdeg = max(self._find_q_order(intg), 2 * max_total + 4)
+        p_geo = int(getattr(mesh, "poly_order", 1))
+        qdeg += max(0, p_geo - 1)
+
+        geo = dh.precompute_facet_patch_factors(
+            facet_ids=edge_ids,
+            qdeg=int(qdeg),
+            level_set=level_set,
+            derivs=derivs,
+            reuse=True,
+            allow_interface=False,
+            deformation=getattr(intg.measure, "deformation", None),
+        )
+
+        valid_eids = geo.get("eids")
+        if valid_eids is None or len(valid_eids) == 0:
+            return
+
+        kernel_args = _build_jit_kernel_args(
+            ir=ir,
+            expression=intg.integrand,
+            mixed_element=me_used,
+            q_order=int(qdeg),
+            dof_handler=dh,
+            gdofs_map=geo["gdofs_map"],
+            param_order=runner.param_order,
+            pre_built=geo,
+        )
+
+        if ("node_coords" in runner.param_order) and ("node_coords" not in kernel_args):
+            kernel_args["node_coords"] = np.asarray(mesh.nodes_x_y_pos, dtype=float)
+        if ("element_nodes" in runner.param_order) and ("element_nodes" not in kernel_args):
+            kernel_args["element_nodes"] = np.asarray(mesh.elements_connectivity, dtype=np.int64)
+
+        current_funcs = self._get_data_functions_objs(intg)
+        K_edge, F_edge, J_edge = runner(current_funcs, kernel_args)
+
+        hook = self._hook_for(intg.integrand)
+        if self._functional_calculate(intg, J_edge, hook):
+            return
+
+        _scatter_element_contribs(
+            K_edge,
+            F_edge,
+            J_edge,
+            valid_eids,
+            geo["gdofs_map"],
+            matvec,
+            self.ctx,
+            intg.integrand,
+            hook=hook,
+        )
+
+
+    def _assemble_interior_edge_python(self, intg: Integral, matvec):
+        """
+        Assemble integrals over interior facets (ds) using the Python backend.
+        Supports Jump/Pos/Neg terms for DG fluxes by treating the facet as a
+        sided path with a union DOF layout.
+        """
+        rhs = bool(self.ctx.get("rhs", False))
+        mesh, me, dh = self.me.mesh, self.me, self.dh
+        md = intg.measure.metadata or {}
+        deformation = getattr(intg.measure, "deformation", None)
+        ref_geom = transform.get_reference(mesh.element_type, int(getattr(mesh, "poly_order", 1))) if deformation is not None else None
+
+        self.ctx["is_interface"] = False
+        self.ctx["is_ghost"] = True
+        side_md = md.get("side")
+        if side_md in ("+", "-"):
+            self.ctx["measure_side"] = side_md
+
+        # Derivative-aware quadrature order
+        derivs = set(md.get("derivs", set())) | set(required_multi_indices(intg.integrand))
+        derivs |= {(0, 0), (1, 0), (0, 1)}
+        max_total = max((ox + oy for (ox, oy) in derivs), default=0)
+        qdeg_base = max(self._find_q_order(intg), 2 * max_total + 4)
+        p_geo = int(getattr(mesh, "poly_order", 1))
+        qdeg = qdeg_base + max(0, p_geo - 1)
+
+        # Edge selection: all interior edges if none provided
+        edge_ids = normalize_edge_ids(mesh, intg.measure.defined_on)
+        if edge_ids is None:
+            edge_ids = [int(e.gid) for e in mesh.edges_list if e.right is not None]
+        edge_ids = [int(eid) for eid in edge_ids]
+
+        # Fields needed for basis tabulation
+        fields = set(self._fields_for(intg.integrand))
+        trial, test = _trial_test(intg.integrand)
+        for tt in (trial, test):
+            if tt is None:
+                continue
+            if hasattr(tt, "field_names"):
+                fields.update(tt.field_names)
+            elif hasattr(tt, "field_name"):
+                fields.add(tt.field_name)
+        if not fields:
+            fields = set(getattr(dh, "field_names", []))
+        fields = sorted(fields)
+
+        # Scalar functional support
+        hook = self._hook_for(intg.integrand)
+        is_functional = hook is not None and trial is None and test is None
+        if is_functional:
+            self.ctx.setdefault("scalar_results", {}).setdefault(hook["name"], None)
+
+        try:
+            for edge_id in edge_ids:
+                e = mesh.edge(int(edge_id))
+                if e.right is None:
+                    continue
+
+                # Orient: pos = right, neg = left so normal points (neg -> pos)
+                pos_eid = int(e.right)
+                neg_eid = int(e.left)
+
+                p0, p1 = mesh.nodes_x_y_pos[list(e.nodes)]
+                qpts_phys, qwts = line_quadrature(p0, p1, qdeg)
+
+                pos_dofs = dh.get_elemental_dofs(pos_eid)
+                neg_dofs = dh.get_elemental_dofs(neg_eid)
+                global_dofs = np.unique(np.concatenate([pos_dofs, neg_dofs]))
+                pos_map = np.searchsorted(global_dofs, pos_dofs)
+                neg_map = np.searchsorted(global_dofs, neg_dofs)
+
+                pos_map_by_field, neg_map_by_field = _hfa.build_field_union_maps(
+                    dh, fields, pos_eid, neg_eid, global_dofs
+                )
+
+                if is_functional:
+                    acc = None
+                else:
+                    n = len(global_dofs)
+                    acc = np.zeros(n, float) if rhs else np.zeros((n, n), float)
+
+                normal = getattr(e, "normal", None)
+                if normal is None:
+                    tangent = p1 - p0
+                    normal = np.array([tangent[1], -tangent[0]], dtype=float)
+                    nrm = np.linalg.norm(normal)
+                    if nrm > 0.0:
+                        normal /= nrm
+                else:
+                    normal = np.asarray(normal, dtype=float)
+
+                # Base unit tangent and orientation vector (used only when deformation is active).
+                tau = np.asarray(p1, float) - np.asarray(p0, float)
+                tau_unit = tau / (float(np.linalg.norm(tau)) + 1e-30)
+                orient_vec = np.asarray(mesh.elements_list[pos_eid].centroid(), float) - np.asarray(
+                    mesh.elements_list[neg_eid].centroid(), float
+                )
+
+                if deformation is not None:
+                    conn_pos = np.asarray(mesh.elements_connectivity[pos_eid], dtype=int)
+                    conn_neg = np.asarray(mesh.elements_connectivity[neg_eid], dtype=int)
+                    Upos = np.asarray(deformation.node_displacements[conn_pos], dtype=float)
+                    Uneg = np.asarray(deformation.node_displacements[conn_neg], dtype=float)
+
+                for x_phys, w in zip(qpts_phys, qwts):
+                    # Reset caches per quadrature point: function gradients/Hessians
+                    # are not constant on Q1/Q2 elements, so per-element caching
+                    # would incorrectly reuse values across different (xi,eta).
+                    self._basis_cache.clear()
+                    self._coeff_cache.clear()
+                    self._collapsed_cache.clear()
+
+                    xi_pos, eta_pos = transform.inverse_mapping(mesh, pos_eid, np.asarray(x_phys, float))
+                    xi_neg, eta_neg = transform.inverse_mapping(mesh, neg_eid, np.asarray(x_phys, float))
+
+                    J_pos = transform.jacobian(mesh, pos_eid, (float(xi_pos), float(eta_pos)))
+                    J_neg = transform.jacobian(mesh, neg_eid, (float(xi_neg), float(eta_neg)))
+                    # Default: undeformed geometry.
+                    Ji_pos = np.linalg.inv(J_pos)
+                    Ji_neg = np.linalg.inv(J_neg)
+                    w_eff = float(w)
+                    normal_here = normal
+                    x_phys_pos = np.asarray(x_phys, float)
+                    x_phys_neg = np.asarray(x_phys, float)
+                    x_phys_use = np.asarray(x_phys, float)
+
+                    if deformation is not None:
+                        if ref_geom is None:
+                            raise RuntimeError("ref_geom missing for deformed interior facet assembly")
+
+                        invJg_pos = np.linalg.inv(J_pos)
+                        invJg_neg = np.linalg.inv(J_neg)
+
+                        dN_pos = np.asarray(ref_geom.grad(float(xi_pos), float(eta_pos)), float)
+                        dN_neg = np.asarray(ref_geom.grad(float(xi_neg), float(eta_neg)), float)
+                        Jd_pos = Upos.T @ dN_pos
+                        Jd_neg = Uneg.T @ dN_neg
+                        Jt_pos = J_pos + Jd_pos
+                        Jt_neg = J_neg + Jd_neg
+                        Ji_pos = np.linalg.inv(Jt_pos)
+                        Ji_neg = np.linalg.inv(Jt_neg)
+
+                        # Stretch factor for ds on the deformed facet: ‖(I+∇u) τ̂‖
+                        F_pos = Jt_pos @ invJg_pos
+                        F_neg = Jt_neg @ invJg_neg
+                        Ftau_pos = F_pos @ tau_unit
+                        Ftau_neg = F_neg @ tau_unit
+                        stretch = 0.5 * (float(np.linalg.norm(Ftau_pos)) + float(np.linalg.norm(Ftau_neg)))
+                        w_eff = float(w) * max(stretch, 1e-16)
+
+                        tau_eff = 0.5 * (Ftau_pos + Ftau_neg)
+                        nvec = np.array([tau_eff[1], -tau_eff[0]], dtype=float)
+                        nn = float(np.linalg.norm(nvec))
+                        if nn > 1e-30:
+                            nvec /= nn
+                        if float(np.dot(nvec, orient_vec)) < 0.0:
+                            nvec *= -1.0
+                        normal_here = nvec
+
+                        N_pos = np.asarray(ref_geom.shape(float(xi_pos), float(eta_pos)), float).ravel()
+                        N_neg = np.asarray(ref_geom.shape(float(xi_neg), float(eta_neg)), float).ravel()
+                        x_base_pos = np.asarray(transform.x_mapping(mesh, pos_eid, (float(xi_pos), float(eta_pos))), float)
+                        x_base_neg = np.asarray(transform.x_mapping(mesh, neg_eid, (float(xi_neg), float(eta_neg))), float)
+                        x_phys_pos = x_base_pos + N_pos @ Upos
+                        x_phys_neg = x_base_neg + N_neg @ Uneg
+                        x_phys_use = 0.5 * (x_phys_pos + x_phys_neg)
+
+                    self.ctx["basis_values"] = {"+": {}, "-": {}}
+                    for f in fields:
+                        v_pos = me.basis(f, float(xi_pos), float(eta_pos))
+                        g_pos = me.grad_basis(f, float(xi_pos), float(eta_pos)) @ Ji_pos
+                        v_neg = me.basis(f, float(xi_neg), float(eta_neg))
+                        g_neg = me.grad_basis(f, float(xi_neg), float(eta_neg)) @ Ji_neg
+
+                        slotp = self.ctx["basis_values"]["+"].setdefault(f, {})
+                        slotn = self.ctx["basis_values"]["-"].setdefault(f, {})
+                        slotp[(0, 0)] = v_pos
+                        slotp[(1, 0)] = g_pos[:, 0]
+                        slotp[(0, 1)] = g_pos[:, 1]
+                        slotn[(0, 0)] = v_neg
+                        slotn[(1, 0)] = g_neg[:, 0]
+                        slotn[(0, 1)] = g_neg[:, 1]
+
+                    self.ctx.update(
+                        {
+                            "eid": pos_eid,
+                            "pos_eid": pos_eid,
+                            "neg_eid": neg_eid,
+                            "normal": np.asarray(normal_here, float),
+                            "x_phys": np.asarray(x_phys_use, float),
+                            "x_phys_pos": np.asarray(x_phys_pos, float),
+                            "x_phys_neg": np.asarray(x_phys_neg, float),
+                            "phi_val": 0.0,
+                            "global_dofs": global_dofs,
+                            "pos_map": pos_map,
+                            "neg_map": neg_map,
+                            "pos_map_by_field": pos_map_by_field,
+                            "neg_map_by_field": neg_map_by_field,
+                            "use_union_local_dofs": False,
+                            "_xi_eta_cache": {
+                                "+": (float(xi_pos), float(eta_pos)),
+                                "-": (float(xi_neg), float(eta_neg)),
+                            },
+                        }
+                    )
+
+                    val = self._visit(intg.integrand)
+                    w = float(w_eff)
+                    if is_functional:
+                        data = val.data if isinstance(val, VecOpInfo) else val
+                        arr = np.asarray(data, dtype=float)
+                        if acc is None:
+                            acc = np.zeros_like(arr, dtype=float)
+                        acc += w * arr
+                    else:
+                        arr = lhs_num(val)
+                        arr = np.asarray(arr)
+                        if rhs and arr.ndim == 2 and 1 in arr.shape:
+                            arr = arr.reshape(-1)
+                        acc += w * arr
+
+                if is_functional:
+                    results = self.ctx.setdefault("scalar_results", {})
+                    if results.get(hook["name"]) is None or (
+                        isinstance(results.get(hook["name"]), (int, float)) and isinstance(acc, np.ndarray)
+                    ):
+                        results[hook["name"]] = np.zeros_like(acc, dtype=float)
+                    results[hook["name"]] += acc
+                else:
+                    if rhs:
+                        np.add.at(matvec, global_dofs, acc)
+                    else:
+                        rr, cc = np.meshgrid(global_dofs, global_dofs, indexing="ij")
+                        matvec[rr, cc] += acc
+        finally:
+            for k in (
+                "basis_values",
+                "normal",
+                "phi_val",
+                "x_phys",
+                "x_phys_pos",
+                "x_phys_neg",
+                "global_dofs",
+                "pos_map",
+                "neg_map",
+                "pos_eid",
+                "neg_eid",
+                "eid",
+                "pos_map_by_field",
+                "neg_map_by_field",
+                "use_union_local_dofs",
+                "measure_side",
+                "_xi_eta_cache",
+            ):
+                self.ctx.pop(k, None)
+            self.ctx.pop("is_ghost", None)
+            self.ctx.pop("is_interface", None)
+
+    def _assemble_interior_edge_jit(self, intg: Integral, matvec):
+        mesh, dh, me = self.me.mesh, self.dh, self.me
+
+        edge_ids = intg.measure.defined_on
+        if edge_ids is None:
+            edge_ids = [int(e.gid) for e in mesh.edges_list if e.right is not None]
+        elif hasattr(edge_ids, "cardinality") and edge_ids.cardinality() == 0:
+            return
+
+        on_facet = intg.measure.on_facet
+        runner, ir = self._compile_backend(intg.integrand, dh, me, on_facet=on_facet)
+        derivs, need_hess, need_o3, need_o4 = self._find_req_derivs(intg, runner)
+
+        max_total = max((ox + oy for (ox, oy) in derivs), default=0)
+        qdeg = max(self._find_q_order(intg), 2 * max_total + 4)
+
+        geo = dh.precompute_interior_factors(
+            edge_ids=edge_ids,
+            qdeg=qdeg,
+            derivs=derivs,
+            need_hess=need_hess,
+            need_o3=need_o3,
+            need_o4=need_o4,
+            reuse=True,
+            level_set=getattr(intg.measure, "level_set", None),
+            deformation=getattr(intg.measure, "deformation", None),
+        )
+        geo["is_interface"] = False
+        geo["is_ghost"] = False
+
+        valid_eids = geo.get("eids")
+        if valid_eids is None or len(valid_eids) == 0:
+            return
+
+        active_fields = _active_field_order(ir, me)
+        runner_active = getattr(runner, "active_fields", None)
+        if runner_active:
+            active_set = set(runner_active)
+            me_order = getattr(me, "field_names", ())
+            active_fields = tuple([f for f in me_order if f in active_set]) if me_order else tuple(runner_active)
+        active_cols = _active_columns(me, active_fields)
+
+        kernel_args = _build_jit_kernel_args(
+            ir=ir,
+            expression=intg.integrand,
+            mixed_element=me,
+            q_order=qdeg,
+            dof_handler=dh,
+            gdofs_map=geo["gdofs_map"],
+            active_cols=active_cols,
+            param_order=runner.param_order,
+            pre_built=geo,
+        )
+
+        use_full_union = bool(geo.get("gdofs_map") is not None and geo["gdofs_map"].shape[1] != me.n_dofs_local)
+        if not use_full_union:
+            kernel_args = _compress_static_for_active(kernel_args, me, active_cols)
+            geo["gdofs_map"] = kernel_args.get("gdofs_map", geo.get("gdofs_map"))
+
+        if ("node_coords" in runner.param_order) and ("node_coords" not in kernel_args):
+            kernel_args["node_coords"] = np.asarray(mesh.nodes_x_y_pos, dtype=float)
+        if ("element_nodes" in runner.param_order) and ("element_nodes" not in kernel_args):
+            kernel_args["element_nodes"] = np.asarray(mesh.elements_connectivity, dtype=np.int64)
+
+        req = set(getattr(runner, "param_order", []))
+        for side in ("pos", "neg"):
+            for t in ("Hxi0", "Hxi1", "Txi0", "Txi1", "Qxi0", "Qxi1"):
+                need_key = f"{side}_{t}"
+                if (need_key in req) and (need_key not in kernel_args) and (t in geo):
+                    kernel_args[need_key] = geo[t]
+
+        current_funcs = self._get_data_functions_objs(intg)
+        K_edge, F_edge, J_edge = runner(current_funcs, kernel_args)
+
+        hook = self._hook_for(intg.integrand)
+        if self._functional_calculate(intg, J_edge, hook):
+            return
+
         _scatter_element_contribs(
             K_edge, F_edge, J_edge,
             valid_eids,
@@ -3280,43 +9651,516 @@ class FormCompiler:
             hook=hook,
         )
 
+    def _assemble_interior_edge(self, intg: Integral, matvec):
+        trial, test = _trial_test(intg.integrand)
+        if trial is None and test is None and self._is_jit_backend():
+            self._assemble_interior_edge_python(intg, matvec)
+            return
+        if self.backend == "python":
+            self._assemble_interior_edge_python(intg, matvec)
+        elif self._is_jit_backend():
+            self._assemble_interior_edge_jit(intg, matvec)
+        else:
+            raise ValueError(
+                f"Unsupported backend: {self.backend}. Use 'python', 'jit', or 'cpp'."
+            )
+
+    def _assemble_cut_interior_edge_python(self, intg: Integral, matvec):
+        """
+        Assemble integrals over the *cut part* of interior facets (CutFEM skeleton).
+
+        Requires:
+          - measure.level_set
+          - measure.metadata['side'] in {'+','-'}
+
+        This measure represents a facet integral restricted to one side of a
+        level set:
+
+            ∫_{F_h ∩ Ω^±} f ds,
+
+        where F_h is a chosen subset of interior facets and Ω^± = {φ ≶ 0}.
+        Facet-based stabilizations (CIP/ghost penalties) are naturally written
+        in this form because they penalize jumps across mesh facets while
+        remaining consistent with the physical subdomain.
+        """
+        rhs = bool(self.ctx.get("rhs", False))
+        mesh, me, dh = self.me.mesh, self.me, self.dh
+        md = intg.measure.metadata or {}
+        deformation = getattr(intg.measure, "deformation", None)
+        ref_geom = transform.get_reference(mesh.element_type, int(getattr(mesh, "poly_order", 1))) if deformation is not None else None
+
+        level_set = getattr(intg.measure, "level_set", None)
+        if level_set is None:
+            raise ValueError("cut_interior_facet measure requires a 'level_set' callable.")
+        side_md = md.get("side")
+        if side_md not in ("+", "-"):
+            raise ValueError("cut_interior_facet measure requires metadata['side'] in {'+','-'}")
+
+        self.ctx["is_interface"] = False
+        self.ctx["is_ghost"] = True
+        self.ctx["measure_side"] = side_md
+
+        # Derivative-aware quadrature order (do not inflate beyond explicit md['q'])
+        derivs = set(md.get("derivs", set())) | set(required_multi_indices(intg.integrand))
+        derivs |= {(0, 0), (1, 0), (0, 1)}
+        max_total = max((ox + oy for (ox, oy) in derivs), default=0)
+        qdeg = self._find_q_order(intg)
+        # Only apply a safety floor when the user did not explicitly request a quadrature order.
+        if not any(k in md for k in ("quad_degree", "quad_order", "q")):
+            qdeg = max(int(qdeg), 2 * max_total + 4)
+
+        # dCutSkeleton is a *facet* measure clipped by the level set.
+        # Any mesh-dependent scaling (e.g. h^k factors in CIP/ghost-penalty terms)
+        # belongs in the weak form, not in the definition of the measure.
+
+        # Edge selection
+        edge_ids = normalize_edge_ids(mesh, intg.measure.defined_on)
+        if edge_ids is None:
+            edge_ids = [int(e.gid) for e in mesh.edges_list if e.right is not None]
+        edge_ids = [int(eid) for eid in edge_ids]
+
+        fields = set(self._fields_for(intg.integrand))
+        trial, test = _trial_test(intg.integrand)
+        for tt in (trial, test):
+            if tt is None:
+                continue
+            if hasattr(tt, "field_names"):
+                fields.update(tt.field_names)
+            elif hasattr(tt, "field_name"):
+                fields.add(tt.field_name)
+        if not fields:
+            fields = set(getattr(dh, "field_names", []))
+        fields = sorted(fields)
+
+        hook = self._hook_for(intg.integrand)
+        is_functional = hook is not None and trial is None and test is None
+        if is_functional:
+            self.ctx.setdefault("scalar_results", {}).setdefault(hook["name"], None)
+
+        tol = float(SIDE.tol)
+        try:
+            for edge_id in edge_ids:
+                e = mesh.edge(int(edge_id))
+                if e.right is None:
+                    continue
+
+                pos_eid = int(e.right)
+                neg_eid = int(e.left)
+
+                p0, p1 = mesh.nodes_x_y_pos[list(e.nodes)]
+                a0 = np.asarray(p0, float)
+                a1 = np.asarray(p1, float)
+                a0_orig = a0.copy()
+                a1_orig = a1.copy()
+
+                phi0 = phi_eval(level_set, a0, eid=neg_eid, mesh=mesh)
+                phi1 = phi_eval(level_set, a1, eid=neg_eid, mesh=mesh)
+
+                if side_md == "+":
+                    in0 = phi0 >= -tol
+                    in1 = phi1 >= -tol
+                else:
+                    in0 = phi0 <= tol
+                    in1 = phi1 <= tol
+
+                if (not in0) and (not in1):
+                    a1 = a0  # empty
+                elif in0 and in1:
+                    pass
+                elif in0 != in1:
+                    denom = float(phi0 - phi1)
+                    t = 0.5 if abs(denom) <= 1e-30 else float(phi0 / denom)
+                    t = float(min(max(t, 0.0), 1.0))
+                    pc = a0_orig + t * (a1_orig - a0_orig)
+                    if in0 and (not in1):
+                        a1 = pc
+                    elif (not in0) and in1:
+                        a0 = pc
+
+                qpts_phys, qw = line_quadrature(a0, a1, qdeg)
+
+                pos_dofs = dh.get_elemental_dofs(pos_eid)
+                neg_dofs = dh.get_elemental_dofs(neg_eid)
+                global_dofs = np.unique(np.concatenate([pos_dofs, neg_dofs]))
+                pos_map = np.searchsorted(global_dofs, pos_dofs)
+                neg_map = np.searchsorted(global_dofs, neg_dofs)
+
+                pos_map_by_field, neg_map_by_field = _hfa.build_field_union_maps(
+                    dh, fields, pos_eid, neg_eid, global_dofs
+                )
+
+                if is_functional:
+                    acc = None
+                else:
+                    n = len(global_dofs)
+                    acc = np.zeros(n, float) if rhs else np.zeros((n, n), float)
+
+                normal = getattr(e, "normal", None)
+                if normal is None:
+                    tangent = a1 - a0
+                    normal = np.array([tangent[1], -tangent[0]], dtype=float)
+                    nrm = np.linalg.norm(normal)
+                    if nrm > 0.0:
+                        normal /= nrm
+                else:
+                    normal = np.asarray(normal, dtype=float)
+
+                # Base unit tangent (on the cut segment) and orientation vector (used only when deformation is active).
+                tau = np.asarray(a1, float) - np.asarray(a0, float)
+                tau_unit = tau / (float(np.linalg.norm(tau)) + 1e-30)
+                orient_vec = np.asarray(mesh.elements_list[pos_eid].centroid(), float) - np.asarray(
+                    mesh.elements_list[neg_eid].centroid(), float
+                )
+
+                if deformation is not None:
+                    conn_pos = np.asarray(mesh.elements_connectivity[pos_eid], dtype=int)
+                    conn_neg = np.asarray(mesh.elements_connectivity[neg_eid], dtype=int)
+                    Upos = np.asarray(deformation.node_displacements[conn_pos], dtype=float)
+                    Uneg = np.asarray(deformation.node_displacements[conn_neg], dtype=float)
+
+                for x_phys, w_eff in zip(qpts_phys, qw):
+                    # Reset caches per quadrature point: function gradients/Hessians
+                    # are not constant on Q1/Q2 elements, so per-element caching
+                    # would incorrectly reuse values across different (xi,eta).
+                    self._basis_cache.clear()
+                    self._coeff_cache.clear()
+                    self._collapsed_cache.clear()
+
+                    xi_pos, eta_pos = transform.inverse_mapping(mesh, pos_eid, np.asarray(x_phys, float))
+                    xi_neg, eta_neg = transform.inverse_mapping(mesh, neg_eid, np.asarray(x_phys, float))
+
+                    J_pos = transform.jacobian(mesh, pos_eid, (float(xi_pos), float(eta_pos)))
+                    J_neg = transform.jacobian(mesh, neg_eid, (float(xi_neg), float(eta_neg)))
+                    Ji_pos = np.linalg.inv(J_pos)
+                    Ji_neg = np.linalg.inv(J_neg)
+                    normal_here = normal
+                    x_phys_pos = np.asarray(x_phys, float)
+                    x_phys_neg = np.asarray(x_phys, float)
+                    x_phys_use = np.asarray(x_phys, float)
+                    det_pos = abs(float(np.linalg.det(J_pos)))
+                    det_neg = abs(float(np.linalg.det(J_neg)))
+                    w_eff = float(w_eff)
+
+                    if deformation is not None:
+                        if ref_geom is None:
+                            raise RuntimeError("ref_geom missing for deformed cut interior facet assembly")
+
+                        invJg_pos = np.linalg.inv(J_pos)
+                        invJg_neg = np.linalg.inv(J_neg)
+
+                        dN_pos = np.asarray(ref_geom.grad(float(xi_pos), float(eta_pos)), float)
+                        dN_neg = np.asarray(ref_geom.grad(float(xi_neg), float(eta_neg)), float)
+                        Jd_pos = Upos.T @ dN_pos
+                        Jd_neg = Uneg.T @ dN_neg
+                        Jt_pos = J_pos + Jd_pos
+                        Jt_neg = J_neg + Jd_neg
+                        Ji_pos = np.linalg.inv(Jt_pos)
+                        Ji_neg = np.linalg.inv(Jt_neg)
+                        det_pos = abs(float(np.linalg.det(Jt_pos)))
+                        det_neg = abs(float(np.linalg.det(Jt_neg)))
+
+                        F_pos = Jt_pos @ invJg_pos
+                        F_neg = Jt_neg @ invJg_neg
+                        Ftau_pos = F_pos @ tau_unit
+                        Ftau_neg = F_neg @ tau_unit
+
+                        tau_eff = 0.5 * (Ftau_pos + Ftau_neg)
+                        stretch = 0.5 * (float(np.linalg.norm(Ftau_pos)) + float(np.linalg.norm(Ftau_neg)))
+                        w_eff *= max(stretch, 1e-16)
+
+                        nvec = np.array([tau_eff[1], -tau_eff[0]], dtype=float)
+                        nn = float(np.linalg.norm(nvec))
+                        if nn > 1e-30:
+                            nvec /= nn
+                        if float(np.dot(nvec, orient_vec)) < 0.0:
+                            nvec *= -1.0
+                        normal_here = nvec
+
+                        N_pos = np.asarray(ref_geom.shape(float(xi_pos), float(eta_pos)), float).ravel()
+                        N_neg = np.asarray(ref_geom.shape(float(xi_neg), float(eta_neg)), float).ravel()
+                        x_base_pos = np.asarray(transform.x_mapping(mesh, pos_eid, (float(xi_pos), float(eta_pos))), float)
+                        x_base_neg = np.asarray(transform.x_mapping(mesh, neg_eid, (float(xi_neg), float(eta_neg))), float)
+                        x_phys_pos = x_base_pos + N_pos @ Upos
+                        x_phys_neg = x_base_neg + N_neg @ Uneg
+                        x_phys_use = 0.5 * (x_phys_pos + x_phys_neg)
+
+                    det_avg = 0.5 * float(det_pos + det_neg)
+
+                    self.ctx["basis_values"] = {"+": {}, "-": {}}
+                    for f in fields:
+                        v_pos = me.basis(f, float(xi_pos), float(eta_pos))
+                        g_pos = me.grad_basis(f, float(xi_pos), float(eta_pos)) @ Ji_pos
+                        v_neg = me.basis(f, float(xi_neg), float(eta_neg))
+                        g_neg = me.grad_basis(f, float(xi_neg), float(eta_neg)) @ Ji_neg
+
+                        slotp = self.ctx["basis_values"]["+"].setdefault(f, {})
+                        slotn = self.ctx["basis_values"]["-"].setdefault(f, {})
+                        slotp[(0, 0)] = v_pos
+                        slotp[(1, 0)] = g_pos[:, 0]
+                        slotp[(0, 1)] = g_pos[:, 1]
+                        slotn[(0, 0)] = v_neg
+                        slotn[(1, 0)] = g_neg[:, 0]
+                        slotn[(0, 1)] = g_neg[:, 1]
+
+                    self.ctx.update(
+                        {
+                            "eid": pos_eid,
+                            "pos_eid": pos_eid,
+                            "neg_eid": neg_eid,
+                            "normal": np.asarray(normal_here, float),
+                            "x_phys": np.asarray(x_phys_use, float),
+                            "x_phys_pos": np.asarray(x_phys_pos, float),
+                            "x_phys_neg": np.asarray(x_phys_neg, float),
+                            "phi_val": 0.0,
+                            "detJ": float(det_avg),
+                            "global_dofs": global_dofs,
+                            "pos_map": pos_map,
+                            "neg_map": neg_map,
+                            "pos_map_by_field": pos_map_by_field,
+                            "neg_map_by_field": neg_map_by_field,
+                            "use_union_local_dofs": False,
+                            "_xi_eta_cache": {
+                                "+": (float(xi_pos), float(eta_pos)),
+                                "-": (float(xi_neg), float(eta_neg)),
+                            },
+                        }
+                    )
+
+                    val = self._visit(intg.integrand)
+                    if is_functional:
+                        data = val.data if isinstance(val, VecOpInfo) else val
+                        arr = np.asarray(data, dtype=float)
+                        if acc is None:
+                            acc = np.zeros_like(arr, dtype=float)
+                        acc += w_eff * arr
+                    else:
+                        arr = lhs_num(val)
+                        arr = np.asarray(arr)
+                        if rhs and arr.ndim == 2 and 1 in arr.shape:
+                            arr = arr.reshape(-1)
+                        acc += w_eff * arr
+
+                if is_functional:
+                    results = self.ctx.setdefault("scalar_results", {})
+                    if results.get(hook["name"]) is None or (
+                        isinstance(results.get(hook["name"]), (int, float)) and isinstance(acc, np.ndarray)
+                    ):
+                        results[hook["name"]] = np.zeros_like(acc, dtype=float)
+                    results[hook["name"]] += acc
+                else:
+                    if rhs:
+                        np.add.at(matvec, global_dofs, acc)
+                    else:
+                        rr, cc = np.meshgrid(global_dofs, global_dofs, indexing="ij")
+                        matvec[rr, cc] += acc
+        finally:
+            for k in (
+                "basis_values",
+                "normal",
+                "phi_val",
+                "x_phys",
+                "x_phys_pos",
+                "x_phys_neg",
+                "global_dofs",
+                "pos_map",
+                "neg_map",
+                "pos_eid",
+                "neg_eid",
+                "eid",
+                "pos_map_by_field",
+                "neg_map_by_field",
+                "use_union_local_dofs",
+                "measure_side",
+                "detJ",
+                "_xi_eta_cache",
+            ):
+                self.ctx.pop(k, None)
+            self.ctx.pop("is_ghost", None)
+            self.ctx.pop("is_interface", None)
+
+    def _assemble_cut_interior_edge_jit(self, intg: Integral, matvec):
+        mesh, dh, me = self.me.mesh, self.dh, self.me
+
+        md = intg.measure.metadata or {}
+        level_set = getattr(intg.measure, "level_set", None)
+        if level_set is None:
+            raise ValueError("cut_interior_facet measure requires a 'level_set' callable.")
+        side = md.get("side")
+        if side not in ("+", "-"):
+            raise ValueError("cut_interior_facet measure requires metadata['side'] in {'+','-'}")
+
+        edge_ids = intg.measure.defined_on
+        if edge_ids is None:
+            edge_ids = [int(e.gid) for e in mesh.edges_list if e.right is not None]
+        elif hasattr(edge_ids, "cardinality") and edge_ids.cardinality() == 0:
+            return
+
+        on_facet = intg.measure.on_facet
+        runner, ir = self._compile_backend(intg.integrand, dh, me, on_facet=on_facet)
+        derivs, need_hess, need_o3, need_o4 = self._find_req_derivs(intg, runner)
+
+        max_total = max((ox + oy for (ox, oy) in derivs), default=0)
+        qdeg = self._find_q_order(intg)
+        if not any(k in md for k in ("quad_degree", "quad_order", "q")):
+            qdeg = max(int(qdeg), 2 * max_total + 4)
+
+        geo = dh.precompute_interior_factors(
+            edge_ids=edge_ids,
+            qdeg=qdeg,
+            derivs=derivs,
+            need_hess=need_hess,
+            need_o3=need_o3,
+            need_o4=need_o4,
+            reuse=True,
+            deformation=getattr(intg.measure, "deformation", None),
+            level_set=level_set,
+            side=str(side),
+        )
+        geo["is_interface"] = False
+        geo["is_ghost"] = False
+
+        valid_eids = geo.get("eids")
+        if valid_eids is None or len(valid_eids) == 0:
+            return
+
+        active_fields = _active_field_order(ir, me)
+        runner_active = getattr(runner, "active_fields", None)
+        if runner_active:
+            active_set = set(runner_active)
+            me_order = getattr(me, "field_names", ())
+            active_fields = tuple([f for f in me_order if f in active_set]) if me_order else tuple(runner_active)
+        active_cols = _active_columns(me, active_fields)
+
+        kernel_args = _build_jit_kernel_args(
+            ir=ir,
+            expression=intg.integrand,
+            mixed_element=me,
+            q_order=qdeg,
+            dof_handler=dh,
+            gdofs_map=geo["gdofs_map"],
+            active_cols=active_cols,
+            param_order=runner.param_order,
+            pre_built=geo,
+        )
+
+        use_full_union = bool(geo.get("gdofs_map") is not None and geo["gdofs_map"].shape[1] != me.n_dofs_local)
+        if not use_full_union:
+            kernel_args = _compress_static_for_active(kernel_args, me, active_cols)
+            geo["gdofs_map"] = kernel_args.get("gdofs_map", geo.get("gdofs_map"))
+
+        if ("node_coords" in runner.param_order) and ("node_coords" not in kernel_args):
+            kernel_args["node_coords"] = np.asarray(mesh.nodes_x_y_pos, dtype=float)
+        if ("element_nodes" in runner.param_order) and ("element_nodes" not in kernel_args):
+            kernel_args["element_nodes"] = np.asarray(mesh.elements_connectivity, dtype=np.int64)
+
+        req = set(getattr(runner, "param_order", []))
+        for side_key in ("pos", "neg"):
+            for t in ("Hxi0", "Hxi1", "Txi0", "Txi1", "Qxi0", "Qxi1"):
+                need_key = f"{side_key}_{t}"
+                if (need_key in req) and (need_key not in kernel_args) and (t in geo):
+                    kernel_args[need_key] = geo[t]
+
+        current_funcs = self._get_data_functions_objs(intg)
+        K_edge, F_edge, J_edge = runner(current_funcs, kernel_args)
+
+        hook = self._hook_for(intg.integrand)
+        if self._functional_calculate(intg, J_edge, hook):
+            return
+
+        _scatter_element_contribs(
+            K_edge,
+            F_edge,
+            J_edge,
+            valid_eids,
+            geo["gdofs_map"],
+            matvec,
+            self.ctx,
+            intg.integrand,
+            hook=hook,
+        )
+
+    def _assemble_cut_interior_edge(self, intg: Integral, matvec):
+        trial, test = _trial_test(intg.integrand)
+        if trial is None and test is None and self._is_jit_backend():
+            self._assemble_cut_interior_edge_python(intg, matvec)
+            return
+        if self.backend == "python":
+            self._assemble_cut_interior_edge_python(intg, matvec)
+        elif self._is_jit_backend():
+            self._assemble_cut_interior_edge_jit(intg, matvec)
+        else:
+            raise ValueError(
+                f"Unsupported backend: {self.backend}. Use 'python', 'jit', or 'cpp'."
+            )
 
 
     
     def _assemble_ghost_edge(self, intg: "Integral", matvec):
         """Assemble ghost edge integrals."""
+        level_set = getattr(intg.measure, "level_set", None)
+        # Ghost-edge assembly relies on edge/element tags for owner conventions.
+        self._ensure_mesh_classified(level_set, need_interface_segments=False)
+
+        trial, test = _trial_test(intg.integrand)
+        if trial is None and test is None and self._is_jit_backend():
+            # Ghost-edge functionals rely on Python path for correct normal orientation.
+            self._assemble_ghost_edge_python(intg, matvec)
+            return
         if self.backend == "python":
             self._assemble_ghost_edge_python(intg, matvec)
-        elif self.backend == "jit":
-            if any(isinstance(node, Function) for node in _find_all(intg.integrand, Function)):
-                self._assemble_ghost_edge_python(intg, matvec)
-                return
+        elif self._is_jit_backend():
             self._assemble_ghost_edge_jit(intg, matvec)
         else:
-            raise ValueError(f"Unsupported backend: {self.backend}. Use 'python' or 'jit'.")
+            raise ValueError(
+                f"Unsupported backend: {self.backend}. Use 'python', 'jit', or 'cpp'."
+            )
+
+    def _assemble_facet_patch(self, intg: "Integral", matvec):
+        """Assemble facet-patch (two-element volume patch) integrals."""
+        level_set = getattr(intg.measure, "level_set", None)
+        self._ensure_mesh_classified(level_set, need_interface_segments=False)
+
+        trial, test = _trial_test(intg.integrand)
+        if trial is None and test is None and self._is_jit_backend():
+            # Keep functional accumulation in Python for now.
+            self._assemble_facet_patch_python(intg, matvec)
+            return
+        if self.backend == "python":
+            self._assemble_facet_patch_python(intg, matvec)
+        elif self._is_jit_backend():
+            self._assemble_facet_patch_jit(intg, matvec)
+        else:
+            raise ValueError(
+                f"Unsupported backend: {self.backend}. Use 'python', 'jit', or 'cpp'."
+            )
 
 
     # inside FormCompiler -------------------------------------------------
-    def _assemble_boundary_edge_python(self, intg: Integral, matvec):
+    def _assemble_boundary_edge_python(self, intg: Integral, matvec, *, _collector=None):
         """
         Assemble ∫_Γ  f  dS   over a *set* of boundary edges  Γ  (Neumann BC,
         surface traction in elasticity, etc.).  Works for bilinear, linear
         and scalar functional forms – scalar forms can be captured with the
         same “assembler_hooks” mechanism used for interfaces / ghost edges.
         """
-        if self.backend == "jit":
+        trial, test = _trial_test(intg.integrand)
+        if self._is_jit_backend() and not (trial is None and test is None):
             raise NotImplementedError("dS + JIT not wired yet")
 
         rhs   = self.ctx.get("rhs", False)
         mesh  = self.me.mesh
         qdeg  = self._find_q_order(intg)
         hook  = self._hook_for(intg.integrand)
-        trial, test = _trial_test(intg.integrand)
         is_functional = hook and trial is None and test is None
+        if _collector is not None and is_functional:
+            raise NotImplementedError(
+                "Local boundary batches do not yet support pure scalar functionals."
+            )
         self.ctx['is_ghost'] = False
         self.ctx['is_interface'] = False
         if is_functional:
             self.ctx.setdefault("scalar_results", {})[hook["name"]] = 0.0
+        from pycutfem.integration.quadrature import line_quadrature
 
         # decide which edges we visit -------------------------------------
         defined = intg.measure.defined_on
@@ -3331,41 +10175,84 @@ class FormCompiler:
         for gid in edge_ids:
             edge   = mesh.edge(gid)
             eid    = edge.left                      # the unique owner element
-            p0, p1 = mesh.nodes_x_y_pos[list(edge.nodes)]
-            qp, qw = line_quadrature(p0, p1, qdeg)  # *weights already in phys. space*
-
-            # outward normal of the *element*:
-            n = edge.normal.copy()
-            # if np.dot(n, np.asarray(mesh.elements_list[eid].centroid()) - qp[0]) < 0:
-            #     n *= -1.0
-            self.ctx["normal"] = n                  # constant along that edge
-
+            elem = mesh.elements_list[eid]
+            try:
+                local_edge_idx = elem.local_edge_index(int(gid))
+            except ValueError:
+                continue
+            # physical endpoints of this *edge segment*
+            p0 = mesh.nodes_x_y_pos[edge.nodes[0]]
+            p1 = mesh.nodes_x_y_pos[edge.nodes[1]]
+            # Quadrature directly on the physical segment; weights already carry |J|
+            phys_pts, phys_w = line_quadrature(p0, p1, qdeg)
             # precompute element dofs once
             gdofs = self.dh.get_elemental_dofs(eid)
 
             # ------------------------------------------------------------------
             loc = None
-            for x_phys, w in zip(qp, qw):
+            tangent = p1 - p0
+            n_vec = np.array([tangent[1], -tangent[0]], dtype=float)
+            n_norm = np.linalg.norm(n_vec)
+            if n_norm > 0.0:
+                n_vec /= n_norm
+            # align with stored edge normal when available
+            if edge.normal is not None and np.dot(n_vec, edge.normal) < 0.0:
+                n_vec *= -1.0
+
+            for q_phys, w_phys in zip(phys_pts, phys_w):
+                x_phys = np.asarray(q_phys, dtype=float)
                 xi, eta = transform.inverse_mapping(mesh, eid, x_phys)
-                Ji    = np.linalg.inv(transform.jacobian(mesh, eid, (xi, eta)))
+                J = transform.jacobian(mesh, eid, (float(xi), float(eta)))
+                normal = n_vec
+                self.ctx["normal"] = normal
+                Ji    = np.linalg.inv(J)
 
                 # basis cache ---------------------------------------------------
                 self._basis_cache.clear();self._coeff_cache.clear(); self._collapsed_cache.clear();
                 for f in fields:
+                    fam = getattr(self.me, "_field_families", {}).get(f, "Lagrange")
+                    if fam == "RT":
+                        V = np.asarray(self.me.tabulate_value(f, float(xi), float(eta), element_id=int(eid)), dtype=float)
+                        G = np.asarray(self.me.tabulate_grad(f, float(xi), float(eta), element_id=int(eid)), dtype=float)
+                        divV = np.asarray(self.me.tabulate_div(f, float(xi), float(eta), element_id=int(eid)), dtype=float).ravel()
+                        sgn = np.asarray(self.dh.element_signs[f][int(eid)], dtype=float).ravel()
+                        if sgn.shape[0] != V.shape[0]:
+                            raise RuntimeError(f"element_signs length mismatch for RT field '{f}' on element {eid}.")
+                        V = sgn[:, None] * V
+                        G = sgn[:, None, None] * G
+                        divV = sgn * divV
+
+                        n_union = int(self.me.n_dofs_local)
+                        sl = self.me.component_dof_slices[f]
+                        hdiv_val = np.zeros((2, n_union), dtype=float)
+                        hdiv_grad = np.zeros((2, n_union, 2), dtype=float)
+                        hdiv_val[:, sl] = V.T
+                        hdiv_grad[:, sl, :] = np.transpose(G, (1, 0, 2))
+                        hdiv_div = np.zeros((n_union,), dtype=float)
+                        hdiv_div[sl] = divV
+                        self._basis_cache[f] = {
+                            "hdiv_val": hdiv_val,
+                            "hdiv_grad": hdiv_grad,
+                            "hdiv_div": hdiv_div,
+                        }
+                        continue
+
                     self._basis_cache[f] = {
-                        "val" : self.me.basis      (f, xi, eta),
-                        "grad": self.me.grad_basis (f, xi, eta) @ Ji
+                        "val": self.me.basis(f, float(xi), float(eta)),
+                        "grad": self.me.grad_basis(f, float(xi), float(eta)) @ Ji,
                     }
 
                 # context for visitors
                 self.ctx.update({"eid": eid, "x_phys": x_phys})
 
                 val = self._visit(intg.integrand)    # scalar, vec, or matrix
-                loc = (w * np.asarray(val)           # **NO detJ re-multiplication!**
-                    if loc is None else loc + w * np.asarray(val))
+                loc_val = float(w_phys) * np.asarray(val)
+                loc = loc_val if loc is None else loc + loc_val
 
             # ---------------- scatter -----------------------------------------
-            if rhs and test:                   # linear form  (vector assemble)
+            if _collector is not None:
+                _collector(int(gid), np.asarray(gdofs, dtype=int), np.asarray(loc, dtype=float))
+            elif rhs and test:                   # linear form  (vector assemble)
                 np.add.at(matvec, gdofs, loc)
             elif not rhs and trial and test:   # bilinear form (matrix assemble)
                 r, c = np.meshgrid(gdofs, gdofs, indexing="ij")
@@ -3408,36 +10295,88 @@ class FormCompiler:
         if is_functional:
             # J_loc is (n_edges,) or scalar; collapse to plain float
             if J_loc is not None:
-                if J_loc.ndim > 1:
-                    total = np.sum(J_loc, axis=0)  # (n_edges,) → scalar
-                    # print(f"J_loc.shape={J_loc.shape}, total={total}")
-                if J_loc.ndim == 1:
-                    total = J_loc.sum()
-                    # print(f"J_loc.shape={J_loc.shape}, total={total}")
+                total = np.sum(J_loc, axis=0)
             name  = hook["name"]               # retrieved earlier via _hook_for
             scal  = self.ctx.setdefault("scalar_results", {})
-            scal[name] =  total
+            if name not in scal or (
+                isinstance(scal[name], (int, float)) and isinstance(total, np.ndarray)
+            ):
+                scal[name] = np.zeros_like(total, dtype=float)
+            scal[name] += total
             flag = True
         return flag                            # 🔑  skip the scatter stage
 
-    def _assemble_boundary_edge_jit(self, intg: Integral, matvec):
+    def _assemble_boundary_edge_python_local_batch(self, intg: Integral) -> LocalAssemblyBatch:
+        trial, test = _trial_test(intg.integrand)
+        is_rhs = trial is None and test is not None
+        if trial is None and test is None:
+            raise NotImplementedError(
+                "Local boundary batches do not yet support pure scalar functionals."
+            )
+        entity_ids: list[int] = []
+        gdofs_rows: list[np.ndarray] = []
+        K_rows: list[np.ndarray] | None = [] if not is_rhs else None
+        F_rows: list[np.ndarray] | None = [] if is_rhs else None
+
+        def _collector(entity_id: int, gdofs_row: np.ndarray, loc) -> None:
+            entity_ids.append(int(entity_id))
+            gdofs_rows.append(np.asarray(gdofs_row, dtype=int).reshape(-1))
+            if is_rhs:
+                assert F_rows is not None
+                F_rows.append(np.asarray(loc, dtype=float).reshape(-1))
+            else:
+                assert K_rows is not None
+                K_rows.append(np.asarray(loc, dtype=float))
+
+        old_rhs = self.ctx.get("rhs", None)
+        self.ctx["rhs"] = is_rhs
+        try:
+            self._assemble_boundary_edge_python(intg, None, _collector=_collector)
+        finally:
+            if old_rhs is None:
+                self.ctx.pop("rhs", None)
+            else:
+                self.ctx["rhs"] = old_rhs
+        return self._batch_from_variable_local_rows(
+            entity_ids=entity_ids,
+            gdofs_rows=gdofs_rows,
+            K_rows=K_rows,
+            F_rows=F_rows,
+            entity_kind="edge",
+        )
+
+    def _execute_boundary_edge_jit_batch(self, intg: Integral):
         mesh, dh, me = self.me.mesh, self.dh, self.me
+        trial, test = _trial_test(intg.integrand)
+        if trial is None and test is None:
+            raise NotImplementedError(
+                "Local boundary batches do not yet support pure scalar functionals."
+            )
 
         # 1. pick edges -----------------------------------------------
-        edge_set = (intg.measure.defined_on
-                    if intg.measure.defined_on is not None
-                    else mesh.get_domain_bitset(intg.measure.tag, entity="edge"))
+        if intg.measure.defined_on is not None:
+            edge_set = intg.measure.defined_on
+        else:
+            # `dS` without `defined_on`/`tag` should integrate over the full boundary
+            # (mirrors `_assemble_boundary_edge_python` behavior).
+            if intg.measure.tag is None:
+                from pycutfem.utils.bitset import BitSet
+
+                edge_set = BitSet(np.fromiter((e.right is None for e in mesh.edges_list), bool))
+            else:
+                edge_set = mesh.get_domain_bitset(intg.measure.tag, entity="edge")
         on_facet = intg.measure.on_facet
         if edge_set.cardinality() == 0:
-            raise ValueError(f"[Assembler: boundary edge JIT] No edges defined for {intg.measure.tag}.")
-        else:
-            print(f"Found boundary edges: {edge_set.cardinality()}")
-
-            
+            tag = "boundary" if intg.measure.tag is None else str(intg.measure.tag)
+            raise ValueError(f"[Assembler: boundary edge JIT] No edges defined for {tag}.")
+        dbg = os.getenv("PYCUTFEM_JIT_DEBUG", "").lower() in {"1", "true", "yes"}
+        if dbg:
+            logger.debug("[boundary-edge] n_edges=%d tag=%s", int(edge_set.cardinality()), str(intg.measure.tag))
 
         # 2. geometry tables ------------------------------------------
         qdeg = self._find_q_order(intg)
-        print(f"[Assembler: boundary edge JIT] Using quadrature degree: {qdeg}")
+        if dbg:
+            logger.debug("[boundary-edge] qdeg=%d", int(qdeg))
         # 3. kernel compilation ---------------------------------------
         runner, ir = self._compile_backend(intg.integrand, dh, me, on_facet=on_facet)
         derivs, need_hess, need_o3, need_o4 = self._find_req_derivs(intg, runner)
@@ -3447,16 +10386,33 @@ class FormCompiler:
         geo["is_interface"] = False
         valid = geo["eids"]
         if valid.size == 0:
-            return
+            return None, None, None, np.empty((0,), dtype=np.int32), np.empty((0, 0), dtype=np.int32), "edge"
 
+
+        active_fields = _active_field_order(ir, me)
+        runner_active = getattr(runner, "active_fields", None)
+        if runner_active:
+            active_set = set(runner_active)
+            me_order = getattr(me, "field_names", ())
+            active_fields = tuple([f for f in me_order if f in active_set]) if me_order else tuple(runner_active)
+        active_cols = _active_columns(me, active_fields)
 
         args = _build_jit_kernel_args(
             ir, intg.integrand, me, qdeg,
             dof_handler = dh,
             gdofs_map   = geo["gdofs_map"],
+            active_cols = active_cols,
             param_order = runner.param_order,
             pre_built   = geo
         )
+        try:
+            from pycutfem.ufl.jit_parametrization import build_jit_parametrization
+
+            _const_param_names = set(
+                build_jit_parametrization(intg.integrand).const_by_name.keys()
+            )
+        except Exception:
+            _const_param_names = set()
 
         # if anything is not aligned to edges
         n_edges = geo["qp_phys"].shape[0]
@@ -3465,7 +10421,13 @@ class FormCompiler:
 
         for name in runner.param_order:
             arr = args.get(name)
-            if isinstance(arr, np.ndarray) and arr.ndim >= 1 and arr.shape[0] != n_edges:
+            if (
+                isinstance(arr, np.ndarray)
+                and arr.ndim >= 1
+                and arr.shape[0] != n_edges
+                # Constant arrays (e.g., Identity) are not per-edge; skip shape enforcement.
+                and name not in _const_param_names
+            ):
                 if arr.shape[0] == n_elems and owner is not None:
                     # Gather per-edge rows from per-element array
                     args[name] = arr[owner]
@@ -3475,6 +10437,18 @@ class FormCompiler:
                         f"but boundary kernel expects {n_edges} edges."
                     )
 
+        # ------------------------------------------------------------------
+        # Active-field compression / reordering
+        #
+        # Boundary kernels (especially the C++ backend) may encode a field order
+        # that differs from the MixedElement's native union ordering. If we do
+        # not reorder `gdofs_map` (and all union-sized tables) accordingly, the
+        # kernel will read the wrong DOF columns and can silently return zeros.
+        # ------------------------------------------------------------------
+        runner_active = getattr(runner, "active_fields", None)
+        args = _compress_static_for_active(args, me, active_cols)
+        gdofs_map = args.get("gdofs_map", geo.get("gdofs_map"))
+
         # 4. up-to-date coefficient Functions -------------------------
         #    • ignore test/trial symbols
         #    • add parent vectors only if they look like real coefficient vectors
@@ -3482,28 +10456,50 @@ class FormCompiler:
 
         # 5. execute and scatter --------------------------------------
         K_loc, F_loc, J_loc = runner(current, args)
+        return K_loc, F_loc, J_loc, np.asarray(geo["eids"], dtype=np.int32), np.asarray(gdofs_map, dtype=int), str(geo.get("entity_kind", "edge"))
 
+    def _assemble_boundary_edge_jit(self, intg: Integral, matvec):
+        K_loc, F_loc, J_loc, entity_ids, gdofs_map, _ = self._execute_boundary_edge_jit_batch(intg)
 
         hook = self._hook_for(intg.integrand)
         if self._functional_calculate(intg, J_loc, hook): return
             
         _scatter_element_contribs(
             K_loc, F_loc, J_loc,
-            element_ids=geo["eids"],                 # rows ≡ edge ids
-            gdofs_map=geo["gdofs_map"],
+            element_ids=entity_ids,                 # rows ≡ edge ids
+            gdofs_map=gdofs_map,
             matvec=matvec, 
             ctx=self.ctx, 
             integrand=intg.integrand,
             hook=hook,
         )
+
+    def _assemble_boundary_edge_jit_local_batch(self, intg: Integral) -> LocalAssemblyBatch:
+        K_loc, F_loc, J_loc, entity_ids, gdofs_map, entity_kind = self._execute_boundary_edge_jit_batch(intg)
+        return LocalAssemblyBatch(
+            K_elem=None if K_loc is None else np.asarray(K_loc, dtype=float),
+            F_elem=None if F_loc is None else np.asarray(F_loc, dtype=float),
+            element_ids=np.asarray(entity_ids, dtype=np.int32),
+            gdofs_map=np.asarray(gdofs_map, dtype=int),
+            entity_kind=str(entity_kind),
+        )
     def _assemble_boundary_edge(self, intg: Integral, matvec):
         """Assemble integrals over boundary edges."""
+        trial, test = _trial_test(intg.integrand)
+        if trial is None and test is None and self._is_jit_backend():
+            # Keep scalar exterior-facet functionals on the Python path for now.
+            # The JIT helper is also used by local-batch assembly, which is still
+            # matrix/vector oriented for boundary entities.
+            self._assemble_boundary_edge_python(intg, matvec)
+            return
         if self.backend == "python":
             self._assemble_boundary_edge_python(intg, matvec)
-        elif self.backend == "jit":
+        elif self._is_jit_backend():
             self._assemble_boundary_edge_jit(intg, matvec)
         else:
-            raise ValueError(f"Unsupported backend: {self.backend}. Use 'python' or 'jit'.")
+            raise ValueError(
+                f"Unsupported backend: {self.backend}. Use 'python', 'jit', or 'cpp'."
+            )
 
     
     
@@ -3533,6 +10529,7 @@ class FormCompiler:
         mesh      = self.me.mesh
         level_set = integral.measure.level_set
         deformation = getattr(integral.measure, "deformation", None)
+        md = getattr(integral.measure, "metadata", None) or {}
         if level_set is None:
             raise ValueError("Cut-cell volume assembly requires measure.level_set")
 
@@ -3587,11 +10584,21 @@ class FormCompiler:
         # print(f"Volume integral on {len(inside_ids)} inside,"
         #       f" {len(outside_ids)} outside,"
         #       f" {len(cut_ids)} cut elements (after 'defined_on' filter).")
-        # --- quadrature orders (account for geometry order)
-        q_base  = int(self._find_q_order(integral))
-        p_geo   = int(getattr(mesh, "poly_order", 1))
-        q_infl  = 2 * max(0, p_geo - 1)
-        q_order = q_base + q_infl
+        # --- quadrature order (match JIT cut-volume precompute which inflates for geometry order)
+        q_order = int(self._find_q_order(integral))
+        p_geo = int(getattr(mesh, "poly_order", 1))
+        q_order += 2 * max(0, p_geo - 1)
+
+        # Derivatives required by the integrand (used for deformation-aware jets in Python).
+        req_derivs = set(md.get("derivs", set())) | set(required_multi_indices(integral.integrand))
+        max_total = max((ox + oy for (ox, oy) in req_derivs), default=0)
+        need_geom_jets = (deformation is not None) and (max_total >= 2)
+        if max_total <= 2:
+            jets_upto = 2
+        elif max_total == 3:
+            jets_upto = 3
+        else:
+            jets_upto = 4
 
         # reference rule on parent element
         qp_ref, qw_ref = _vol_rule(mesh.element_type, q_order)
@@ -3629,6 +10636,14 @@ class FormCompiler:
             acc = 0.0
         for eid in full_eids:
             loc = np.zeros(loc_shape_full, dtype=float)
+            conn = None
+            Uloc = None
+            coords_def = None
+            if deformation is not None:
+                conn = np.asarray(mesh.elements_connectivity[int(eid)], dtype=int)
+                Uloc = np.asarray(deformation.node_displacements[conn], float)
+                if need_geom_jets:
+                    coords_def = np.asarray(mesh.nodes_x_y_pos[conn], float) + Uloc
             for (xi, eta), w in zip(qp_ref, qw_ref):
                 Jg = transform.jacobian(mesh, int(eid), (float(xi), float(eta)))
                 xg = transform.x_mapping(mesh, int(eid), (float(xi), float(eta)))
@@ -3637,9 +10652,7 @@ class FormCompiler:
                     Ji = np.linalg.inv(Jg)
                     y  = xg
                 else:
-                    conn = np.asarray(mesh.elements_connectivity[int(eid)], dtype=int)
                     dN   = np.asarray(ref_geom.grad(float(xi), float(eta)), float)
-                    Uloc = np.asarray(deformation.node_displacements[conn], float)
                     Jd   = Uloc.T @ dN
                     Jt   = Jg + Jd
                     det_t = abs(float(np.linalg.det(Jt)))
@@ -3656,6 +10669,17 @@ class FormCompiler:
 
                 self.ctx["eid"]    = int(eid)
                 self.ctx["x_phys"] = np.asarray(y, float)
+                self.ctx["detJ"]   = float(det_t)
+                self.ctx["_xi_eta"] = (float(xi), float(eta))
+                if need_geom_jets and coords_def is not None:
+                    jets = self._build_inverse_jets(ref_geom, coords_def, float(xi), float(eta), upto=jets_upto)
+                    self.ctx["_deformation_current_elem"] = {
+                        "xi": float(xi),
+                        "eta": float(eta),
+                        "jets": jets,
+                    }
+                else:
+                    self.ctx.pop("_deformation_current_elem", None)
 
                 val = self._visit(integral.integrand)
                 if is_pure_functional:
@@ -3671,122 +10695,229 @@ class FormCompiler:
         # --- 2) CUT elements: subset-sized loc, scatter fields=fields
         if fld_local_idx.size == 0 or len(fields) == 0:
             # Nothing to assemble for cut cells if no participating fields
-            for key in ("eid", "x_phys", "phi_val", "measure_side", "side"):
+            for key in ("eid", "x_phys", "phi_val", "measure_side", "side", "detJ", "_xi_eta", "_deformation_current_elem"):
                 self.ctx.pop(key, None)
             return
 
-        for eid in cut_ids:
-            loc = np.zeros(loc_shape_full, dtype=float)
+        xfem_active = (
+            hasattr(self.dh, "xfem_mixed_element")
+            and callable(getattr(self.dh, "xfem_mixed_element"))
+            and hasattr(self.dh, "n_enriched")
+            and callable(getattr(self.dh, "n_enriched"))
+            and self.dh.n_enriched() > 0
+        )
+        if xfem_active:
+            from pycutfem.ufl.helpers import HelpersFieldAware as _hfa
+            from pycutfem.xfem.enrichment import alpha_from_side_masks
+            from pycutfem.core.sideconvention import SIDE
 
-            if mesh.element_type == 'quad':
-                order_y = max(2, q_order // 2)
-                order_x = max(2, q_order // 2)
-                qpref, qwref = CutIntegration.straight_cut_rule_quad_ref(mesh, int(eid), level_set,
-                                                                          side=side, order_y=order_y, order_x=order_x,
-                                                                          tol=_INTERFACE_TOL)
-                if qpref.size:
-                    for (xi, eta), w in zip(qpref, qwref):
-                        Jg = transform.jacobian(mesh, int(eid), (float(xi), float(eta)))
-                        xg = transform.x_mapping(mesh, int(eid), (float(xi), float(eta)))
+            base_me = self.me
+            me_cut = self.dh.xfem_mixed_element()
+            base_dh = getattr(self.dh, "base", self.dh)
+            enriched_fields = list(getattr(self.dh, "enriched_fields", lambda: ())())
+            enriched_fields = [f for f in enriched_fields if f in fields]
+            loc_shape_cut = (me_cut.n_dofs_local,) if rhs else (me_cut.n_dofs_local, me_cut.n_dofs_local)
+        else:
+            base_me = None
+            me_cut = None
+            base_dh = None
+            enriched_fields = []
+            loc_shape_cut = loc_shape_full
+
+        for eid in cut_ids:
+            loc = np.zeros(loc_shape_cut, dtype=float)
+            me_prev = self.me
+            alpha_elem: dict[str, np.ndarray] = {}
+            if xfem_active and me_cut is not None:
+                self.me = me_cut
+                if enriched_fields:
+                    pos_masks, neg_masks = _hfa.build_side_masks_by_field(
+                        base_dh, enriched_fields, int(eid), level_set, tol=SIDE.tol
+                    )
+                    for f in enriched_fields:
+                        pm = pos_masks.get(f)
+                        nm = neg_masks.get(f)
+                        if pm is None or nm is None:
+                            continue
+                        alpha_elem[f] = alpha_from_side_masks(pm, nm, side=side)
+            try:
+                conn = None
+                Uloc = None
+                coords_def = None
+                if deformation is not None:
+                    conn = np.asarray(mesh.elements_connectivity[int(eid)], dtype=int)
+                    Uloc = np.asarray(deformation.node_displacements[conn], float)
+                    if need_geom_jets:
+                        coords_def = np.asarray(mesh.nodes_x_y_pos[conn], float) + Uloc
+
+
+                if mesh.element_type == 'quad':
+                    order_y = max(2, q_order // 2)
+                    order_x = max(2, q_order // 2)
+                    qpref, qwref = CutIntegration.straight_cut_rule_quad_ref(mesh, int(eid), level_set,
+                                                                              side=side, order_y=order_y, order_x=order_x,
+                                                                              tol=_INTERFACE_TOL)
+                    if qpref.size:
+                        for (xi, eta), w in zip(qpref, qwref):
+                            Jg = transform.jacobian(mesh, int(eid), (float(xi), float(eta)))
+                            xg = transform.x_mapping(mesh, int(eid), (float(xi), float(eta)))
+                            if deformation is None:
+                                Jt = Jg; det_t = abs(float(np.linalg.det(Jg)))
+                                Ji = np.linalg.inv(Jg)
+                                y  = xg
+                            else:
+                                dN   = np.asarray(ref_geom.grad(float(xi), float(eta)), float)
+                                Jd   = Uloc.T @ dN
+                                Jt   = Jg + Jd
+                                det_t = abs(float(np.linalg.det(Jt)))
+                                Ji = np.linalg.inv(Jt)
+                                y  = xg + deformation.displacement_ref(int(eid), (float(xi), float(eta)))
+
+                            self._basis_cache.clear(); self._coeff_cache.clear(); self._collapsed_cache.clear()
+                            for f in fields:
+                                if xfem_active and me_cut is not None and base_me is not None:
+                                    sl_base = base_me.component_dof_slices[f]
+                                    n0 = int(sl_base.stop - sl_base.start)
+                                    sl_cut = me_cut.component_dof_slices[f]
+                                    Nloc = np.asarray(base_me._eval_scalar_basis(f, float(xi), float(eta)), float)
+                                    Gref = np.asarray(base_me._eval_scalar_grad(f, float(xi), float(eta)), float)
+                                    Gphys = Gref @ Ji
+                                    val_u = np.zeros(int(me_cut.n_dofs_local), dtype=float)
+                                    grad_u = np.zeros((int(me_cut.n_dofs_local), 2), dtype=float)
+                                    val_u[sl_cut.start : sl_cut.start + n0] = Nloc
+                                    grad_u[sl_cut.start : sl_cut.start + n0, :] = Gphys
+                                    a = alpha_elem.get(f)
+                                    if a is not None:
+                                        val_u[sl_cut.start + n0 : sl_cut.start + 2 * n0] = Nloc * a
+                                        grad_u[sl_cut.start + n0 : sl_cut.start + 2 * n0, :] = Gphys * a[:, None]
+                                    self._basis_cache[f] = {"val": val_u, "grad": grad_u}
+                                else:
+                                    self._basis_cache[f] = {
+                                        "val":  self.me.basis(f, float(xi), float(eta)),
+                                        "grad": self.me.grad_basis(f, float(xi), float(eta)) @ Ji,
+                                    }
+                            self.ctx["eid"]    = int(eid)
+                            self.ctx["x_phys"] = np.asarray(y, float)
+                            self.ctx["detJ"]   = float(det_t)
+                            self.ctx["_xi_eta"] = (float(xi), float(eta))
+                            if need_geom_jets and coords_def is not None:
+                                jets = self._build_inverse_jets(ref_geom, coords_def, float(xi), float(eta), upto=jets_upto)
+                                self.ctx["_deformation_current_elem"] = {
+                                    "xi": float(xi),
+                                    "eta": float(eta),
+                                    "jets": jets,
+                                }
+                            else:
+                                self.ctx.pop("_deformation_current_elem", None)
+
+                            val = self._visit(integral.integrand)
+                            if is_pure_functional:
+                                arr = np.asarray(val.data) if hasattr(val, "data") else np.asarray(val)
+                                v   = float(arr if arr.ndim == 0 else arr.sum())
+                                acc += float(w) * float(det_t) * v
+                            elif rhs:
+                                vec = np.asarray(val.data) if hasattr(val, "data") else np.asarray(val)
+                                if 1 in vec.shape: vec = vec.flatten()
+                                loc += float(w) * float(det_t) * vec
+                            else:
+                                mat = np.asarray(val.data) if hasattr(val, "data") else np.asarray(val)
+                                loc += float(w) * float(det_t) * mat
+
+                    if not is_pure_functional:
+                        self._scatter_local(int(eid), loc, fields=None, matvec=matvec, rhs=rhs)
+                    continue
+
+                elem = mesh.elements_list[eid]
+                tri_local, corner_ids = corner_tris(mesh, elem)
+                for loc_tri in tri_local:
+                    qx, qw = curved_subcell_quadrature_for_cut_triangle(
+                        mesh, eid, loc_tri, corner_ids, level_set,
+                        side=side, qvol=q_order, nseg_hint=None, tol=_INTERFACE_TOL
+                    )
+                    for x_phys, w in zip(qx, qw):
+                        xi, eta = transform.inverse_mapping(mesh, eid, x_phys)
+                        Jg  = transform.jacobian(mesh, eid, (xi, eta))
+                        det_g = abs(float(np.linalg.det(Jg)))
                         if deformation is None:
-                            Jt = Jg; det_t = abs(float(np.linalg.det(Jg)))
                             Ji = np.linalg.inv(Jg)
-                            y  = xg
+                            y  = np.asarray(x_phys, float)
+                            w_eff = float(w)
+                            det_t = det_g
                         else:
-                            conn = np.asarray(mesh.elements_connectivity[int(eid)], dtype=int)
                             dN   = np.asarray(ref_geom.grad(float(xi), float(eta)), float)
-                            Uloc = np.asarray(deformation.node_displacements[conn], float)
                             Jd   = Uloc.T @ dN
                             Jt   = Jg + Jd
                             det_t = abs(float(np.linalg.det(Jt)))
+                            det_g = det_g + 1e-300
                             Ji = np.linalg.inv(Jt)
-                            y  = xg + deformation.displacement_ref(int(eid), (float(xi), float(eta)))
+                            y  = transform.x_mapping(mesh, int(eid), (float(xi), float(eta))) \
+                                 + deformation.displacement_ref(int(eid), (float(xi), float(eta)))
+                            w_eff = float(w) * float(det_t / det_g)
 
                         self._basis_cache.clear(); self._coeff_cache.clear(); self._collapsed_cache.clear()
                         for f in fields:
-                            self._basis_cache[f] = {
-                                "val":  self.me.basis(f, float(xi), float(eta)),
-                                "grad": self.me.grad_basis(f, float(xi), float(eta)) @ Ji,
+                            if xfem_active and me_cut is not None and base_me is not None:
+                                sl_base = base_me.component_dof_slices[f]
+                                n0 = int(sl_base.stop - sl_base.start)
+                                sl_cut = me_cut.component_dof_slices[f]
+                                Nloc = np.asarray(base_me._eval_scalar_basis(f, float(xi), float(eta)), float)
+                                Gref = np.asarray(base_me._eval_scalar_grad(f, float(xi), float(eta)), float)
+                                Gphys = Gref @ Ji
+                                val_u = np.zeros(int(me_cut.n_dofs_local), dtype=float)
+                                grad_u = np.zeros((int(me_cut.n_dofs_local), 2), dtype=float)
+                                val_u[sl_cut.start : sl_cut.start + n0] = Nloc
+                                grad_u[sl_cut.start : sl_cut.start + n0, :] = Gphys
+                                a = alpha_elem.get(f)
+                                if a is not None:
+                                    val_u[sl_cut.start + n0 : sl_cut.start + 2 * n0] = Nloc * a
+                                    grad_u[sl_cut.start + n0 : sl_cut.start + 2 * n0, :] = Gphys * a[:, None]
+                                self._basis_cache[f] = {"val": val_u, "grad": grad_u}
+                            else:
+                                self._basis_cache[f] = {
+                                    "val":  self.me.basis(f, float(xi), float(eta)),
+                                    "grad": self.me.grad_basis(f, float(xi), float(eta)) @ Ji,
+                                }
+                        self.ctx["eid"]          = eid
+                        self.ctx["x_phys"]       = np.asarray(y, float)
+                        self.ctx["phi_val"]      = 1.0 if side == '+' else -1.0
+                        self.ctx["measure_side"] = side
+                        self.ctx["detJ"]         = float(det_t)
+                        self.ctx["_xi_eta"] = (float(xi), float(eta))
+                        if need_geom_jets and coords_def is not None:
+                            jets = self._build_inverse_jets(ref_geom, coords_def, float(xi), float(eta), upto=jets_upto)
+                            self.ctx["_deformation_current_elem"] = {
+                                "xi": float(xi),
+                                "eta": float(eta),
+                                "jets": jets,
                             }
-                        self.ctx["eid"]    = int(eid)
-                        self.ctx["x_phys"] = np.asarray(y, float)
+                        else:
+                            self.ctx.pop("_deformation_current_elem", None)
 
                         val = self._visit(integral.integrand)
                         if is_pure_functional:
                             arr = np.asarray(val.data) if hasattr(val, "data") else np.asarray(val)
                             v   = float(arr if arr.ndim == 0 else arr.sum())
-                            acc += float(w) * float(det_t) * v
+                            acc += w_eff * v
                         elif rhs:
                             vec = np.asarray(val.data) if hasattr(val, "data") else np.asarray(val)
-                            if 1 in vec.shape: vec = vec.flatten()
-                            loc += float(w) * float(det_t) * vec
+                            if 1 in vec.shape:
+                                vec = vec.flatten()
+                            loc += w_eff * vec
                         else:
                             mat = np.asarray(val.data) if hasattr(val, "data") else np.asarray(val)
-                            loc += float(w) * float(det_t) * mat
+                            loc += w_eff * mat
 
                 if not is_pure_functional:
-                    self._scatter_local(int(eid), loc, fields=None, matvec=matvec, rhs=rhs)
-                continue
+                    self._scatter_local(eid, loc, fields=None, matvec=matvec, rhs=rhs)
 
-            elem = mesh.elements_list[eid]
-            tri_local, corner_ids = corner_tris(mesh, elem)
-            for loc_tri in tri_local:
-                qx, qw = curved_subcell_quadrature_for_cut_triangle(
-                    mesh, eid, loc_tri, corner_ids, level_set,
-                    side=side, qvol=q_order, nseg_hint=None, tol=_INTERFACE_TOL
-                )
-                for x_phys, w in zip(qx, qw):
-                    xi, eta = transform.inverse_mapping(mesh, eid, x_phys)
-                    Jg  = transform.jacobian(mesh, eid, (xi, eta))
-                    if deformation is None:
-                        Ji = np.linalg.inv(Jg)
-                        y  = np.asarray(x_phys, float)
-                        w_eff = float(w)
-                    else:
-                        conn = np.asarray(mesh.elements_connectivity[int(eid)], dtype=int)
-                        dN   = np.asarray(ref_geom.grad(float(xi), float(eta)), float)
-                        Uloc = np.asarray(deformation.node_displacements[conn], float)
-                        Jd   = Uloc.T @ dN
-                        Jt   = Jg + Jd
-                        det_t = abs(float(np.linalg.det(Jt)))
-                        det_g = abs(float(np.linalg.det(Jg))) + 1e-300
-                        Ji = np.linalg.inv(Jt)
-                        y  = transform.x_mapping(mesh, int(eid), (float(xi), float(eta))) \
-                             + deformation.displacement_ref(int(eid), (float(xi), float(eta)))
-                        w_eff = float(w) * float(det_t / det_g)
-
-                    self._basis_cache.clear(); self._coeff_cache.clear(); self._collapsed_cache.clear()
-                    for f in fields:
-                        self._basis_cache[f] = {
-                            "val":  self.me.basis(f, float(xi), float(eta)),
-                            "grad": self.me.grad_basis(f, float(xi), float(eta)) @ Ji,
-                        }
-                    self.ctx["eid"]          = eid
-                    self.ctx["x_phys"]       = np.asarray(y, float)
-                    self.ctx["phi_val"]      = 1.0 if side == '+' else -1.0
-                    self.ctx["measure_side"] = side
-
-                    val = self._visit(integral.integrand)
-                    if is_pure_functional:
-                        arr = np.asarray(val.data) if hasattr(val, "data") else np.asarray(val)
-                        v   = float(arr if arr.ndim == 0 else arr.sum())
-                        acc += w_eff * v
-                    elif rhs:
-                        vec = np.asarray(val.data) if hasattr(val, "data") else np.asarray(val)
-                        if 1 in vec.shape:
-                            vec = vec.flatten()
-                        loc += w_eff * vec
-                    else:
-                        mat = np.asarray(val.data) if hasattr(val, "data") else np.asarray(val)
-                        loc += w_eff * mat
-
-            if not is_pure_functional:
-                self._scatter_local(eid, loc, fields=None, matvec=matvec, rhs=rhs)
+            finally:
+                if xfem_active and me_cut is not None:
+                    self.me = me_prev
 
         if accumulate_scalar:
             self.ctx['scalar_results'][hook['name']] += acc
         # cleanup
-        for key in ("eid", "x_phys", "phi_val", "measure_side", "side"):
+        for key in ("eid", "x_phys", "phi_val", "measure_side", "side", "detJ", "_xi_eta", "_deformation_current_elem"):
             self.ctx.pop(key, None)
 
 
@@ -3817,33 +10948,73 @@ class FormCompiler:
         # --- 1) classification (must be called; sets element tags & caches)
         inside_ids, outside_ids, cut_ids = mesh.classify_elements(level_set)
 
-        # --- compile kernel once
-        runner, ir = self._compile_backend(intg.integrand, dh, me, on_facet=on_facet)
-        derivs, need_hess, need_o3, need_o4 = self._find_req_derivs(intg, runner)
+        # --- compile kernel for full elements (base layout)
+        runner_full, ir_full = self._compile_backend(intg.integrand, dh, me, on_facet=on_facet)
+        derivs, need_hess, need_o3, need_o4 = self._find_req_derivs(intg, runner_full)
+
+        active_fields_full = _active_field_order(ir_full, me)
+        runner_active = getattr(runner_full, "active_fields", None)
+        if runner_active:
+            active_set = set(runner_active)
+            me_order = getattr(me, "field_names", ())
+            active_fields_full = tuple([f for f in me_order if f in active_set]) if me_order else tuple(runner_active)
+        active_cols_full = _active_columns(me, active_fields_full)
+        if os.getenv("PYCUTFEM_JIT_DEBUG_ACTIVE", "").lower() in {"1", "true", "yes"}:
+            print(f"[jit-cut] full active_fields={active_fields_full}, n_cols={len(active_cols_full)}")
+
+        # Optional: XFEM cut-element layout/kernel
+        me_cut = None
+        runner_cut = None
+        ir_cut = None
+        active_cols_cut = None
+        if hasattr(dh, "xfem_mixed_element") and callable(getattr(dh, "xfem_mixed_element")) and getattr(dh, "n_enriched", lambda: 0)() > 0:
+            try:
+                me_cut = dh.xfem_mixed_element()
+            except Exception:
+                me_cut = None
+        if me_cut is not None:
+            runner_cut, ir_cut = self._compile_backend(intg.integrand, dh, me_cut, on_facet=on_facet)
+            active_fields_cut = _active_field_order(ir_cut, me_cut)
+            runner_active_cut = getattr(runner_cut, "active_fields", None)
+            if runner_active_cut:
+                active_set = set(runner_active_cut)
+                me_order = getattr(me_cut, "field_names", ())
+                active_fields_cut = tuple([f for f in me_order if f in active_set]) if me_order else tuple(runner_active_cut)
+            active_cols_cut = _active_columns(me_cut, active_fields_cut)
+            if os.getenv("PYCUTFEM_JIT_DEBUG_ACTIVE", "").lower() in {"1", "true", "yes"}:
+                print(f"[jit-cut] cut active_fields={active_fields_cut}, n_cols={len(active_cols_cut)}")
 
         # helper to run kernel on a subset of elements with prebuilt geo
-        def _run_subset(eids: np.ndarray, prebuilt: dict):
+        def _run_subset(eids: np.ndarray, prebuilt: dict, *, runner, ir, me_used, active_cols: np.ndarray):
             if eids.size == 0:
                 return
-            gdofs_map = np.vstack([dh.get_elemental_dofs(e) for e in eids]).astype(np.int32)
+            # Prefer a prebuilt gdofs_map (e.g. XFEM cut elements); otherwise build from the handler.
+            gmap0 = prebuilt.get("gdofs_map")
+            if isinstance(gmap0, np.ndarray) and gmap0.ndim == 2 and gmap0.shape[0] == eids.size:
+                gdofs_map = np.asarray(gmap0, dtype=np.int32)
+            else:
+                gdofs_map = np.vstack([dh.get_elemental_dofs(int(e))[active_cols] for e in eids]).astype(np.int32)
             # kernel wants node_coords in the signature, provide it once
             prebuilt = dict(prebuilt)
             prebuilt["gdofs_map"]  = gdofs_map
             prebuilt["node_coords"] = dh.get_all_dof_coords()  # required in param_order
             prebuilt["eids"]      = eids 
             static_args = _build_jit_kernel_args(
-                ir, intg.integrand, me, qdeg,
+                ir, intg.integrand, me_used, qdeg,
                 dof_handler=dh,
                 gdofs_map=gdofs_map,
+                active_cols=active_cols,
                 param_order=runner.param_order,
                 pre_built=prebuilt
             )
+            static_args = _compress_static_for_active(static_args, me_used, active_cols)
+            gdofs_map_scatter = static_args.get("gdofs_map", gdofs_map)
             current_funcs = self._get_data_functions_objs(intg)
             K_loc, F_loc, J_loc = runner(current_funcs, static_args)
 
             hook = self._hook_for(intg.integrand)
             _scatter_element_contribs(
-                K_loc, F_loc, J_loc, eids, gdofs_map,
+                K_loc, F_loc, J_loc, eids, gdofs_map_scatter,
                 matvec, self.ctx, intg.integrand, hook=hook
             )
 
@@ -3888,9 +11059,22 @@ class FormCompiler:
                 "J_inv_pos": geo_all["J_inv"][full_ids],
                 "J_inv_neg": geo_all["J_inv"][full_ids],
             }
+            # Higher-order inverse-map jets (required for Hessian / 3rd / 4th derivatives).
+            if need_hess:
+                if "Hxi0" in geo_all and "Hxi1" in geo_all:
+                    prebuilt_full["Hxi0"] = geo_all["Hxi0"][full_ids]
+                    prebuilt_full["Hxi1"] = geo_all["Hxi1"][full_ids]
+            if need_o3:
+                if "Txi0" in geo_all and "Txi1" in geo_all:
+                    prebuilt_full["Txi0"] = geo_all["Txi0"][full_ids]
+                    prebuilt_full["Txi1"] = geo_all["Txi1"][full_ids]
+            if need_o4:
+                if "Qxi0" in geo_all and "Qxi1" in geo_all:
+                    prebuilt_full["Qxi0"] = geo_all["Qxi0"][full_ids]
+                    prebuilt_full["Qxi1"] = geo_all["Qxi1"][full_ids]
             if qref_slice is not None:
                 prebuilt_full["qref"] = qref_slice
-            _run_subset(full_ids, prebuilt_full)
+            _run_subset(full_ids, prebuilt_full, runner=runner_full, ir=ir_full, me_used=me, active_cols=active_cols_full)
 
         # --- 3) cut elements → clipped triangles (physical weights); detJ := 1
         if len(cut_ids):
@@ -3911,7 +11095,10 @@ class FormCompiler:
                 if "detJ" not in geo_cut:
                     geo_cut["detJ"] = np.ones_like(geo_cut["qw"])
                 geo_cut["is_interface"] = False
-                _run_subset(cut_eids, geo_cut)
+                if runner_cut is not None and me_cut is not None and active_cols_cut is not None:
+                    _run_subset(cut_eids, geo_cut, runner=runner_cut, ir=ir_cut, me_used=me_cut, active_cols=active_cols_cut)
+                else:
+                    _run_subset(cut_eids, geo_cut, runner=runner_full, ir=ir_full, me_used=me, active_cols=active_cols_full)
 
         # cleanup context (if you stored any debug keys)
         for k in ("eid", "x_phys", "phi_val"):

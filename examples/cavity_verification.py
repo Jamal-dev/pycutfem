@@ -10,31 +10,36 @@ import numpy as np
 import time
 import scipy.sparse.linalg as sp_la
 import matplotlib.pyplot as plt
+import argparse
+from pathlib import Path
 import numba
 import os
-
-# Get the number of available CPU cores
-num_cores = os.cpu_count()
-print(f"This machine has {num_cores} cores.")
-
-# Set Numba to use all of them
-numba.set_num_threads(num_cores)
-print(f"Numba is set to use {numba.get_num_threads()} threads.")
 
 # --- Core imports ---
 from pycutfem.core.mesh import Mesh
 from pycutfem.core.dofhandler import DofHandler
 from pycutfem.utils.meshgen import structured_quad
+from pycutfem.utils.gmsh_loader import mesh_from_gmsh
+from pycutfem.utils.mpi import barrier, configure_numba_threads, get_mpi_context
+from examples.gmsh_cavity_mesh import build_caity_quad_mesh
 
 # --- UFL-like imports ---
-from pycutfem.ufl.functionspace import FunctionSpace
+from pycutfem.ufl.spaces import FunctionSpace
 from pycutfem.ufl.expressions import (
     TrialFunction, TestFunction, VectorTrialFunction, VectorTestFunction,
     Function, VectorFunction, Constant, grad, inner, dot, div
 )
 from pycutfem.ufl.measures import dx
-from pycutfem.ufl.forms import BoundaryCondition, assemble_form
+from pycutfem.ufl.forms import BoundaryCondition, Equation, assemble_form
+from pycutfem.ufl import linearize_form
 from pycutfem.fem.mixedelement import MixedElement
+
+mpi_ctx = get_mpi_context()
+num_cores = int(os.cpu_count() or 1)
+numba_threads = configure_numba_threads(numba, ctx=mpi_ctx)
+if mpi_ctx.is_root or not mpi_ctx.enabled:
+    print(f"This machine has {num_cores} cores.")
+    print(f"Numba is set to use {numba_threads} threads per active rank.")
 
 
 
@@ -58,35 +63,195 @@ ghia_data_re100 = {
 }
 
 
+def build_cavity_forms(*, rho, dt, theta, mu, du, dp, v, q, u_k, u_n, p_k):
+    jacobian_form = (
+        rho * dot(du, v) / dt
+        + theta * rho * dot(dot(grad(u_k), du), v)
+        + theta * rho * dot(dot(grad(du), u_k), v)
+        + theta * mu * inner(grad(du), grad(v))
+        - dp * div(v)
+        + q * div(du)
+    ) * dx()
 
-# In[3]:
+    residual_form = (
+        rho * dot(u_k - u_n, v) / dt
+        + theta * rho * dot(dot(grad(u_k), u_k), v)
+        + (1.0 - theta) * rho * dot(dot(grad(u_n), u_n), v)
+        + theta * mu * inner(grad(u_k), grad(v))
+        + (1.0 - theta) * mu * inner(grad(u_n), grad(v))
+        - p_k * div(v)
+        + q * div(u_k)
+    ) * dx()
+    return residual_form, jacobian_form
 
+
+def _sparse_max_abs(matrix):
+    matrix = matrix.tocsr()
+    return float(np.max(np.abs(matrix.data))) if matrix.nnz else 0.0
+
+
+def verify_cavity_autodiff_jacobian(
+    *,
+    dof_handler,
+    residual_form,
+    manual_jacobian_form,
+    coefficients,
+    directions,
+    backend,
+    rtol=1.0e-11,
+    atol=1.0e-11,
+):
+    auto_jacobian_form = linearize_form(residual_form, coefficients, directions)
+    manual_matrix, _ = assemble_form(
+        Equation(manual_jacobian_form, None),
+        dof_handler=dof_handler,
+        bcs=[],
+        backend=backend,
+    )
+    auto_matrix, _ = assemble_form(
+        Equation(auto_jacobian_form, None),
+        dof_handler=dof_handler,
+        bcs=[],
+        backend=backend,
+    )
+
+    manual_matrix = manual_matrix.tocsr()
+    auto_matrix = auto_matrix.tocsr()
+    diff_matrix = (manual_matrix - auto_matrix).tocsr()
+    diff_matrix.eliminate_zeros()
+
+    same_shape = manual_matrix.shape == auto_matrix.shape
+    same_pattern = (
+        same_shape
+        and np.array_equal(manual_matrix.indptr, auto_matrix.indptr)
+        and np.array_equal(manual_matrix.indices, auto_matrix.indices)
+    )
+    manual_max = _sparse_max_abs(manual_matrix)
+    auto_max = _sparse_max_abs(auto_matrix)
+    diff_max = _sparse_max_abs(diff_matrix)
+    ref_scale = max(manual_max, auto_max, 1.0)
+    allowed = float(atol) + float(rtol) * ref_scale
+
+    print(
+        f"[autodiff] backend={backend} manual_nnz={manual_matrix.nnz} "
+        f"auto_nnz={auto_matrix.nnz} max|ΔJ|={diff_max:.3e} tol={allowed:.3e}"
+    )
+    if not same_shape:
+        raise RuntimeError(
+            f"Autodiff Jacobian shape mismatch: manual={manual_matrix.shape}, auto={auto_matrix.shape}."
+        )
+    if not same_pattern:
+        raise RuntimeError("Autodiff Jacobian sparsity pattern mismatch.")
+    if diff_max > allowed:
+        raise RuntimeError(
+            "Autodiff Jacobian mismatch exceeds tolerance: "
+            f"max|ΔJ|={diff_max:.6e}, allowed={allowed:.6e}."
+        )
+    return auto_jacobian_form
+
+
+
+# Parse CLI options to choose mesh source
+parser = argparse.ArgumentParser(description="Lid-driven cavity verification (Re=100)")
+parser.add_argument("--use-gmsh", action="store_true", help="Generate the mesh from a gmsh .msh file.")
+parser.add_argument("--gmsh-file", type=Path, default=Path("examples/meshes/cavity_unit_quad.msh"),
+                    help="Path to the gmsh mesh (used when --use-gmsh is set).")
+parser.add_argument("--rebuild-msh", action="store_true",
+                    help="Rebuild the gmsh mesh if the file is missing or --rebuild-msh is passed.")
+parser.add_argument("--nx", type=int, default=30, help="Number of cells in x for the structured mesh.")
+parser.add_argument("--ny", type=int, default=30, help="Number of cells in y for the structured mesh.")
+parser.add_argument("--backend", type=str, default="jit", choices=("python", "jit", "cpp"),
+                    help="Assembly backend to use.")
+parser.add_argument("--linear-backend", type=str, default="petsc", choices=("scipy", "petsc"),
+                    help="Linear solver backend used inside Newton.")
+parser.add_argument("--petsc-distributed", action=argparse.BooleanOptionalAction, default=True,
+                    help="Use collective PETSc linear solves on COMM_WORLD under mpirun.")
+parser.add_argument("--max-time-steps", type=int, default=200, help="Maximum number of time steps to run.")
+parser.add_argument("--show-plots", action="store_true", help="Show verification plots after the simulation.")
+parser.add_argument("--mpi-mode", type=str, default="replicated", choices=("root", "replicated"),
+                    help="Under mpirun, execute the full case on every rank ('replicated', verified) or run only on rank 0 ('root').")
+parser.add_argument("--check-autodiff-jacobian", action="store_true",
+                    help="Assemble the hand-written and autodiff cavity Jacobians and require parity.")
+parser.add_argument("--jacobian-source", type=str, default="manual", choices=("manual", "autodiff"),
+                    help="Jacobian used inside Newton after optional parity checking.")
+parser.add_argument("--skip-solve", action="store_true",
+                    help="Build the cavity problem and run optional Jacobian checks without solving.")
+parser.add_argument("--jacobian-rtol", type=float, default=1.0e-11,
+                    help="Relative tolerance for manual-vs-autodiff Jacobian parity.")
+parser.add_argument("--jacobian-atol", type=float, default=1.0e-11,
+                    help="Absolute tolerance for manual-vs-autodiff Jacobian parity.")
+args, _ = parser.parse_known_args()
+run_replicated = (not mpi_ctx.enabled) or str(args.mpi_mode).lower() == "replicated"
+if mpi_ctx.enabled and not run_replicated and not mpi_ctx.is_root:
+    barrier(mpi_ctx)
+    raise SystemExit(0)
+if mpi_ctx.enabled and not run_replicated and mpi_ctx.is_root:
+    print(f"[mpi] COMM_WORLD size={mpi_ctx.size}; executing the cavity solve on rank 0 only.")
 
 # 1. ============================================================================
 #    SETUP (Meshes, DofHandler, BCs)
 # ===============================================================================
 L, H = 1.0, 1.0
-# MODIFIED: Increased resolution for better accuracy
-NX, NY = 30, 30
-nodes_q2, elems_q2, _, corners_q2 = structured_quad(L, H, nx=NX, ny=NY, poly_order=2)
-mesh_q2 = Mesh(nodes=nodes_q2, element_connectivity=elems_q2, elements_corner_nodes=corners_q2, element_type="quad", poly_order=2)
+NX, NY = args.nx, args.ny
+mesh_geometric_order = 1
+
+# Summary of chosen options
+print("="*60)
+print("\nLid-driven cavity verification (Re=100)")
+print(f"Mesh source: {'gmsh' if args.use_gmsh else 'structured quad'}")
+print(f"Number of elements: {NX} x {NY}")
+print(f"Element geometric order: {mesh_geometric_order}")
+print("="*60)
+
+if args.use_gmsh:
+    gmsh_path = args.gmsh_file
+    mesh_comm = mpi_ctx.comm if (mpi_ctx.enabled and run_replicated) else None
+    if args.rebuild_msh or not gmsh_path.exists():
+        build_caity_quad_mesh(
+            gmsh_path,
+            L=L,
+            H=H,
+            nx=NX,
+            ny=NY,
+            element_order=mesh_geometric_order,
+            comm=mesh_comm,
+        )
+    mesh_q2 = mesh_from_gmsh(gmsh_path, comm=mesh_comm)
+    if mesh_q2.element_type != "quad":
+        raise RuntimeError("Expected a quadrilateral gmsh mesh for the cavity test.")
+else:
+    nodes_q2, elems_q2, _, corners_q2 = structured_quad(L, H, nx=NX, ny=NY, poly_order=mesh_geometric_order)
+    mesh_q2 = Mesh(nodes=nodes_q2, element_connectivity=elems_q2, 
+                   elements_corner_nodes=corners_q2, element_type="quad", poly_order=mesh_geometric_order)
 mixed_element = MixedElement(mesh_q2, field_specs={'ux': 2, 'uy': 2, 'p': 1})
 
 dof_handler = DofHandler(mixed_element, method='cg')
 
-# Tag boundaries for applying BCs
-bc_tags = {
-    'bottom_wall': lambda x,y: np.isclose(y,0),
-    'left_wall':   lambda x,y: np.isclose(x,0),
-    'right_wall':  lambda x,y: np.isclose(x,L),
-    'top_lid':     lambda x,y: np.isclose(y,H)
+# Tag boundaries for applying BCs. Prefer Gmsh physical names when available.
+geom_tol = 1e-6
+locator_tags = {
+    'bottom_wall': lambda x,y, tol=geom_tol: np.isclose(y,0.0, atol=tol),
+    'left_wall':   lambda x,y, tol=geom_tol: np.isclose(x,0.0, atol=tol),
+    'right_wall':  lambda x,y, tol=geom_tol: np.isclose(x,L, atol=tol),
+    'top_lid':     lambda x,y, tol=geom_tol: np.isclose(y,H, atol=tol)
 }
-mesh_q2.tag_boundary_edges(bc_tags)
+if args.use_gmsh:
+    gmsh_tags = set()
+    for edge in mesh_q2.edges_list:
+        if edge.right is not None or not edge.tag:
+            continue
+        gmsh_tags.update(tag.strip() for tag in edge.tag.split(",") if tag)
+    missing = [tag for tag in locator_tags if tag not in gmsh_tags]
+    if missing:
+        print(f"Warning: gmsh mesh missing tags {missing}. Falling back to locator-based tagging.")
+        mesh_q2.tag_boundary_edges(locator_tags)
+else:
+    mesh_q2.tag_boundary_edges(locator_tags)
 
 # Tag a single node for pressure pinning
 dof_handler.tag_dof_by_locator(
     tag='pressure_pin_point', field='p',
-    locator=lambda x, y: np.isclose(x, 0.0) and np.isclose(y, 0.0),
+    locator=lambda x, y, tol=geom_tol: np.isclose(x, 0.0, atol=tol) and np.isclose(y, 0.0, atol=tol),
     find_first=True
 )
 
@@ -152,22 +317,34 @@ dof_handler.apply_bcs(bcs, u_n, p_n)
 
 # --- NEW: JIT Compile Forms ONCE Before the Loop ---
 print("\nJIT compiling Jacobian and Residual forms...")
-jacobian_form = (
-    rho * dot(du, v) / dt + 
-    theta * rho * dot(dot(grad(u_k), du), v) +
-    theta * rho * dot(dot(grad(du), u_k), v) + 
-    theta * mu * inner(grad(du), grad(v)) 
-    -dp * div(v) + q * div(du)
-) * dx()
+residual_form, jacobian_form = build_cavity_forms(
+    rho=rho,
+    dt=dt,
+    theta=theta,
+    mu=mu,
+    du=du,
+    dp=dp,
+    v=v,
+    q=q,
+    u_k=u_k,
+    u_n=u_n,
+    p_k=p_k,
+)
 
-residual_form = (
-    rho * dot(u_k - u_n, v) / dt 
-    + theta *rho * dot( dot(grad(u_k), u_k), v) +
-    (1.0 - theta) * rho * dot( dot(grad(u_n), u_n), v) +
-    theta * mu * inner(grad(u_k), grad(v)) +
-    (1.0 - theta) * mu * inner(grad(u_n), grad(v)) 
-    -p_k * div(v) + q * div(u_k)
-) * dx()
+autodiff_jacobian_form = None
+if args.check_autodiff_jacobian or args.jacobian_source == "autodiff":
+    autodiff_jacobian_form = verify_cavity_autodiff_jacobian(
+        dof_handler=dof_handler,
+        residual_form=residual_form,
+        manual_jacobian_form=jacobian_form,
+        coefficients=[u_k, p_k],
+        directions=[du, dp],
+        backend=args.backend,
+        rtol=float(args.jacobian_rtol),
+        atol=float(args.jacobian_atol),
+    )
+
+solver_jacobian_form = autodiff_jacobian_form if args.jacobian_source == "autodiff" else jacobian_form
 
 
 # In[6]:
@@ -179,24 +356,40 @@ len(dof_handler.get_dirichlet_data(bcs))
 # In[ ]:
 
 
-from pycutfem.solvers.nonlinear_solver import (NewtonSolver, 
-                                               NewtonParameters, 
-                                               TimeStepperParameters, 
-                                               AdamNewtonSolver, 
-                                               GiantInexactNewtonSolver,
-                                               PetscSnesNewtonSolver)
-from pycutfem.solvers.aainhb_solver import AAINHBSolver
+from pycutfem.solvers.nonlinear_solver import (
+    LinearSolverParameters,
+    NewtonSolver,
+    NewtonParameters,
+    TimeStepperParameters,
+    AdamNewtonSolver,
+    PetscSnesNewtonSolver,
+)
+# Optional solvers (commented out to avoid import errors if unavailable)
+# from pycutfem.solvers.aainhb_solver import AAINHBSolver
 
 # build residual_form, jacobian_form, dof_handler, mixed_element, bcs, bcs_homog …
-time_params = TimeStepperParameters(dt=0.1, stop_on_steady=True, steady_tol=1e-6, theta= 0.49)
+time_params = TimeStepperParameters(dt=0.1, stop_on_steady=True, steady_tol=1e-6, theta= 0.49,
+                                    max_steps=args.max_time_steps)
 
-# solver = NewtonSolver(
-#     residual_form, jacobian_form,
-#     dof_handler=dof_handler,
-#     mixed_element=mixed_element,
-#     bcs=bcs, bcs_homog=bcs_homog,
-#     newton_params=NewtonParameters(newton_tol=1e-6, line_search=True),
-# )
+solver = None
+if not args.skip_solve:
+    solver = NewtonSolver(
+        residual_form, solver_jacobian_form,
+        dof_handler=dof_handler,
+        mixed_element=mixed_element,
+        bcs=bcs, bcs_homog=bcs_homog,
+        backend=args.backend,
+        lin_params=LinearSolverParameters(
+            backend=str(args.linear_backend),
+            distributed=bool(
+                mpi_ctx.enabled
+                and bool(getattr(args, "petsc_distributed", True))
+                and str(args.linear_backend).strip().lower() == "petsc"
+            ),
+        ),
+        newton_params=NewtonParameters(newton_tol=1e-6, line_search=True,
+                                       ),
+    )
 # solver = AdamNewtonSolver(
 #     residual_form, jacobian_form,
 #     dof_handler=dof_handler,
@@ -218,49 +411,50 @@ time_params = TimeStepperParameters(dt=0.1, stop_on_steady=True, steady_tol=1e-6
 #     bcs=bcs, bcs_homog=bcs_homog,
 #     newton_params=NewtonParameters(newton_tol=1e-6, line_search=False),
 # )
-solver = PetscSnesNewtonSolver(
-    residual_form, jacobian_form,
-    dof_handler=dof_handler,
-    mixed_element=mixed_element,
-    bcs=bcs, bcs_homog=bcs_homog,
-    newton_params=NewtonParameters(newton_tol=1e-6, line_search=True),
-    petsc_options={
-        "mat_type": "aij",
-        "ksp_type": "gmres",
-        "ksp_rtol": 1e-8,
-        "pc_type": "fieldsplit",
-        "pc_fieldsplit_type": "schur",
-        "pc_fieldsplit_schur_fact_type": "full",   # FULL Schur factorization
-        "pc_fieldsplit_schur_precondition": "selfp",
-        # (optional) monitoring
-        "snes_monitor": None, 
-        # "ksp_monitor": None,
-    },
-)
+# solver = PetscSnesNewtonSolver(
+#     residual_form, jacobian_form,
+#     dof_handler=dof_handler,
+#     mixed_element=mixed_element,
+#     bcs=bcs, bcs_homog=bcs_homog,
+#     newton_params=NewtonParameters(newton_tol=1e-6, line_search=True),
+#     petsc_options={
+#         "mat_type": "aij",
+#         "ksp_type": "gmres",
+#         "ksp_rtol": 1e-8,
+#         "pc_type": "fieldsplit",
+#         "pc_fieldsplit_type": "schur",
+#         "pc_fieldsplit_schur_fact_type": "full",   # FULL Schur factorization
+#         "pc_fieldsplit_schur_precondition": "selfp",
+#         # (optional) monitoring
+#         "snes_monitor": None, 
+#         # "ksp_monitor": None,
+#     },
+# )
 
-solver.set_schur_fieldsplit(
-    {"u": ["ux", "uy"], "p": ["p"]},
-    schur_fact="full",
-    schur_pre="selfp",
-    sub_pc={"u": "hypre", "p": "jacobi"},   # defaults; tune as needed
-)
+# solver.set_schur_fieldsplit(
+#     {"u": ["ux", "uy"], "p": ["p"]},
+#     schur_fact="full",
+#     schur_pre="selfp",
+#     sub_pc={"u": "hypre", "p": "jacobi"},   # defaults; tune as needed
+# )
 
 # primary unknowns
 functions      = [u_k, p_k]
 prev_functions = [u_n, p_n]
 
-solver.solve_time_interval(functions=functions,prev_functions= prev_functions,
-                           time_params=time_params,)
+if solver is not None:
+    solver.solve_time_interval(functions=functions,prev_functions= prev_functions,
+                               time_params=time_params,)
 
 
 # In[ ]:
 
-
-u_n.plot(kind="streamline",
-         density=4.0,
-         linewidth=0.8,
-         cmap="plasma",
-         title="Lid-driven cavity – stream-lines",background = False)
+if args.show_plots:
+    u_n.plot(kind="streamline",
+            density=4.0,
+            linewidth=0.8,
+            cmap="plasma",
+            title="Lid-driven cavity – stream-lines",background = False)
 
 
 # In[ ]:
@@ -273,6 +467,59 @@ from pycutfem.plotting import _extract_profile_1d
 
 # ---------------------------------------------------------------------------
 
+
+def calculate_ghia_error(y_sol, u_sol, x_sol, v_sol, reference_data):
+    """
+    Calculates error metrics between dense FEM solution and sparse Ghia data.
+    """
+    
+    # --- 1. PREPARE U-VELOCITY DATA (Vertical Centerline) ---
+    y_ref = np.array(reference_data['y_locations'])
+    u_ref = np.array(reference_data['u_velocity_on_vertical_centerline'])
+    
+    # IMPORTANT: np.interp requires the x-coordinate (y_sol here) to be sorted!
+    # FEM node extraction is often unsorted.
+    sort_idx_u = np.argsort(y_sol)
+    y_sol_sorted = y_sol[sort_idx_u]
+    u_sol_sorted = u_sol[sort_idx_u]
+
+    # Interpolate FEM solution onto Reference Y-locations
+    u_fem_at_ref_locs = np.interp(y_ref, y_sol_sorted, u_sol_sorted)
+
+    # --- 2. PREPARE V-VELOCITY DATA (Horizontal Centerline) ---
+    x_ref = np.array(reference_data['x_locations'])
+    v_ref = np.array(reference_data['v_velocity_on_horizontal_centerline'])
+    
+    sort_idx_v = np.argsort(x_sol)
+    x_sol_sorted = x_sol[sort_idx_v]
+    v_sol_sorted = v_sol[sort_idx_v]
+
+    # Interpolate FEM solution onto Reference X-locations
+    v_fem_at_ref_locs = np.interp(x_ref, x_sol_sorted, v_sol_sorted)
+
+    # --- 3. CALCULATE METRICS ---
+    
+    # Calculate differences (residuals)
+    diff_u = u_fem_at_ref_locs - u_ref
+    diff_v = v_fem_at_ref_locs - v_ref
+
+    # Metric 1: Root Mean Square Error (RMSE) - Good for average deviation
+    rmse_u = np.sqrt(np.mean(diff_u**2))
+    rmse_v = np.sqrt(np.mean(diff_v**2))
+
+    # Metric 2: L2 Norm (Euclidean Distance)
+    l2_u = np.linalg.norm(diff_u)
+    l2_v = np.linalg.norm(diff_v)
+
+    # Metric 3: L-Infinity Norm (Max Absolute Error)
+    max_err_u = np.max(np.abs(diff_u))
+    max_err_v = np.max(np.abs(diff_v))
+
+    print(f"--- Verification Results (Re=100) ---")
+    print(f"U-Velocity: RMSE={rmse_u:.5f}, L2={l2_u:.5f}, MaxErr={max_err_u:.5f}")
+    print(f"V-Velocity: RMSE={rmse_v:.5f}, L2={l2_v:.5f}, MaxErr={max_err_v:.5f}")
+
+    return rmse_u, rmse_v
 
 def create_verification_plot(dh, u_vec, reference_data, *,
                              x_center=0.5, y_center=0.5):
@@ -303,10 +550,12 @@ def create_verification_plot(dh, u_vec, reference_data, *,
                                        line_axis='x', line_pos=x_center)
     x_sol, v_sol = _extract_profile_1d('uy', dh, uy_vals,
                                        line_axis='y', line_pos=y_center)
-
+    rmse_u, rmse_v = calculate_ghia_error(y_sol, u_sol, x_sol, v_sol, reference_data)
     # ------------------------------------------------------------------
     # 2. Plot comparison
     # ------------------------------------------------------------------
+    if not args.show_plots:
+        return
     fig, (ax_u, ax_v) = plt.subplots(1, 2, figsize=(14, 6), sharey=False)
     fig.suptitle("Lid-driven cavity – comparison with Ghia et al. (Re = 100)",
                  fontsize=16)
@@ -334,5 +583,7 @@ def create_verification_plot(dh, u_vec, reference_data, *,
     plt.tight_layout()
     plt.show()
 
-create_verification_plot(dof_handler, u_n, ghia_data_re100)
-
+if not args.skip_solve:
+    create_verification_plot(dof_handler, u_n, ghia_data_re100)
+if mpi_ctx.enabled and not run_replicated:
+    barrier(mpi_ctx)

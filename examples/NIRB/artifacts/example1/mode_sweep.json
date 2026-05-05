@@ -1,0 +1,434 @@
+[
+  {
+    "force_modes": 1,
+    "displacement_modes": 1,
+    "validation_error": 0.0016124057130349834,
+    "regression_error": 1.54027674342441e-05
+  },
+  {
+    "force_modes": 1,
+    "displacement_modes": 2,
+    "validation_error": 0.0005022385633181057,
+    "regression_error": 0.00010750288841101816
+  },
+  {
+    "force_modes": 1,
+    "displacement_modes": 3,
+    "validation_error": 0.00031333268856426413,
+    "regression_error": 0.00011122344049582087
+  },
+  {
+    "force_modes": 1,
+    "displacement_modes": 4,
+    "validation_error": 0.00025185505209254864,
+    "regression_error": 0.00011251025582996499
+  },
+  {
+    "force_modes": 1,
+    "displacement_modes": 5,
+    "validation_error": 0.0002189595869399858,
+    "regression_error": 0.00011289187943818767
+  },
+  {
+    "force_modes": 1,
+    "displacement_modes": 6,
+    "validation_error": 0.00020639432508432444,
+    "regression_error": 0.00011340468194070046
+  },
+  {
+    "force_modes": 1,
+    "displacement_modes": 7,
+    "validation_error": 0.00020449587983585878,
+    "regression_error": 0.00011416147442513134
+  },
+  {
+    "force_modes": 1,
+    "displacement_modes": 8,
+    "validation_error": 0.0002001335977437862,
+    "regression_error": 0.00011880503252302324
+  },
+  {
+    "force_modes": 1,
+    "displacement_modes": 9,
+    "validation_error": 0.0001955612776465423,
+    "regression_error": 0.0001191789227935622
+  },
+  {
+    "force_modes": 1,
+    "displacement_modes": 10,
+    "validation_error": 0.00019329849705990935,
+    "regression_error": 0.00011953888813833598
+  },
+  {
+    "force_modes": 1,
+    "displacement_modes": 11,
+    "validation_error": 0.00019202999502622228,
+    "regression_error": 0.00011954013456616181
+  },
+  {
+    "force_modes": 1,
+    "displacement_modes": 12,
+    "validation_error": 0.00019007223582247288,
+    "regression_error": 0.00011954390565760539
+  },
+  {
+    "force_modes": 2,
+    "displacement_modes": 1,
+    "validation_error": 0.001612612588932278,
+    "regression_error": 1.8608771801444075e-09
+  },
+  {
+    "force_modes": 2,
+    "displacement_modes": 2,
+    "validation_error": 0.00045876481736067444,
+    "regression_error": 3.2898743537776264e-09
+  },
+  {
+    "force_modes": 2,
+    "displacement_modes": 3,
+    "validation_error": 0.00025199924043918493,
+    "regression_error": 9.066916039731333e-09
+  },
+  {
+    "force_modes": 2,
+    "displacement_modes": 4,
+    "validation_error": 0.00018067538204004905,
+    "regression_error": 3.651987581286115e-08
+  },
+  {
+    "force_modes": 2,
+    "displacement_modes": 5,
+    "validation_error": 0.00014287900269891092,
+    "regression_error": 9.660320010786743e-08
+  },
+  {
+    "force_modes": 2,
+    "displacement_modes": 6,
+    "validation_error": 0.0001279158249621584,
+    "regression_error": 9.722631520374387e-08
+  },
+  {
+    "force_modes": 2,
+    "displacement_modes": 7,
+    "validation_error": 0.00012375625809886537,
+    "regression_error": 1.0659598432164694e-07
+  },
+  {
+    "force_modes": 2,
+    "displacement_modes": 8,
+    "validation_error": 0.00011227908198054392,
+    "regression_error": 1.210178324465878e-07
+  },
+  {
+    "force_modes": 2,
+    "displacement_modes": 9,
+    "validation_error": 0.00010631223079681881,
+    "regression_error": 1.3900663589758416e-07
+  },
+  {
+    "force_modes": 2,
+    "displacement_modes": 10,
+    "validation_error": 0.0001031218833228868,
+    "regression_error": 1.3970420515474076e-07
+  },
+  {
+    "force_modes": 2,
+    "displacement_modes": 11,
+    "validation_error": 0.00010140537452698182,
+    "regression_error": 1.40577774287624e-07
+  },
+  {
+    "force_modes": 2,
+    "displacement_modes": 12,
+    "validation_error": 9.85248235819893e-05,
+    "regression_error": 1.4067854282172473e-07
+  },
+  {
+    "force_modes": 3,
+    "displacement_modes": 1,
+    "validation_error": 0.001612371783545585,
+    "regression_error": 2.928204074390253e-10
+  },
+  {
+    "force_modes": 3,
+    "displacement_modes": 2,
+    "validation_error": 0.0004583833248908407,
+    "regression_error": 7.518252365785236e-10
+  },
+  {
+    "force_modes": 3,
+    "displacement_modes": 3,
+    "validation_error": 0.00024996187797471814,
+    "regression_error": 1.6480347010567224e-09
+  },
+  {
+    "force_modes": 3,
+    "displacement_modes": 4,
+    "validation_error": 0.00017746727980096698,
+    "regression_error": 5.427826856672094e-09
+  },
+  {
+    "force_modes": 3,
+    "displacement_modes": 5,
+    "validation_error": 0.00013963498391751758,
+    "regression_error": 7.486006192425688e-09
+  },
+  {
+    "force_modes": 3,
+    "displacement_modes": 6,
+    "validation_error": 0.00012428887845495606,
+    "regression_error": 7.502194670349644e-09
+  },
+  {
+    "force_modes": 3,
+    "displacement_modes": 7,
+    "validation_error": 0.00012000906819191289,
+    "regression_error": 8.192838915524247e-09
+  },
+  {
+    "force_modes": 3,
+    "displacement_modes": 8,
+    "validation_error": 0.00010825428172272654,
+    "regression_error": 8.59559480234788e-09
+  },
+  {
+    "force_modes": 3,
+    "displacement_modes": 9,
+    "validation_error": 0.00010191889173172603,
+    "regression_error": 9.522905602688499e-09
+  },
+  {
+    "force_modes": 3,
+    "displacement_modes": 10,
+    "validation_error": 9.860819693671181e-05,
+    "regression_error": 9.54114352421128e-09
+  },
+  {
+    "force_modes": 3,
+    "displacement_modes": 11,
+    "validation_error": 9.685973230737722e-05,
+    "regression_error": 9.575762407111246e-09
+  },
+  {
+    "force_modes": 3,
+    "displacement_modes": 12,
+    "validation_error": 9.395531864085469e-05,
+    "regression_error": 9.579368479714363e-09
+  },
+  {
+    "force_modes": 4,
+    "displacement_modes": 1,
+    "validation_error": 0.001612383394088066,
+    "regression_error": 1.5411827830913014e-09
+  },
+  {
+    "force_modes": 4,
+    "displacement_modes": 2,
+    "validation_error": 0.000458394417599776,
+    "regression_error": 3.6329588091817634e-09
+  },
+  {
+    "force_modes": 4,
+    "displacement_modes": 3,
+    "validation_error": 0.0002498942396432434,
+    "regression_error": 4.629573451035071e-09
+  },
+  {
+    "force_modes": 4,
+    "displacement_modes": 4,
+    "validation_error": 0.00017721130838342454,
+    "regression_error": 5.327390029885797e-09
+  },
+  {
+    "force_modes": 4,
+    "displacement_modes": 5,
+    "validation_error": 0.00013907128146109152,
+    "regression_error": 5.375122027216465e-09
+  },
+  {
+    "force_modes": 4,
+    "displacement_modes": 6,
+    "validation_error": 0.00012380741040425586,
+    "regression_error": 5.471474285584749e-09
+  },
+  {
+    "force_modes": 4,
+    "displacement_modes": 7,
+    "validation_error": 0.00011943783300168392,
+    "regression_error": 5.73414876841552e-09
+  },
+  {
+    "force_modes": 4,
+    "displacement_modes": 8,
+    "validation_error": 0.00010763353286708778,
+    "regression_error": 6.204878698960114e-09
+  },
+  {
+    "force_modes": 4,
+    "displacement_modes": 9,
+    "validation_error": 0.00010127005056783612,
+    "regression_error": 6.745221016806885e-09
+  },
+  {
+    "force_modes": 4,
+    "displacement_modes": 10,
+    "validation_error": 9.792885915035423e-05,
+    "regression_error": 6.8071673812176554e-09
+  },
+  {
+    "force_modes": 4,
+    "displacement_modes": 11,
+    "validation_error": 9.616170815403434e-05,
+    "regression_error": 6.84779747781962e-09
+  },
+  {
+    "force_modes": 4,
+    "displacement_modes": 12,
+    "validation_error": 9.324862259336908e-05,
+    "regression_error": 6.86086603487704e-09
+  },
+  {
+    "force_modes": 5,
+    "displacement_modes": 1,
+    "validation_error": 0.0016123392776812376,
+    "regression_error": 2.3486659176603696e-07
+  },
+  {
+    "force_modes": 5,
+    "displacement_modes": 2,
+    "validation_error": 0.00045839446648783733,
+    "regression_error": 6.068279749040541e-07
+  },
+  {
+    "force_modes": 5,
+    "displacement_modes": 3,
+    "validation_error": 0.0002503980100845792,
+    "regression_error": 1.1597356081954676e-06
+  },
+  {
+    "force_modes": 5,
+    "displacement_modes": 4,
+    "validation_error": 0.00017771832842999272,
+    "regression_error": 1.273413603533635e-06
+  },
+  {
+    "force_modes": 5,
+    "displacement_modes": 5,
+    "validation_error": 0.00013986176986015953,
+    "regression_error": 1.3365003891325823e-06
+  },
+  {
+    "force_modes": 5,
+    "displacement_modes": 6,
+    "validation_error": 0.00012480507800391018,
+    "regression_error": 1.3694561745913114e-06
+  },
+  {
+    "force_modes": 5,
+    "displacement_modes": 7,
+    "validation_error": 0.00012037596159243088,
+    "regression_error": 1.3850949991756431e-06
+  },
+  {
+    "force_modes": 5,
+    "displacement_modes": 8,
+    "validation_error": 0.00010884477399057705,
+    "regression_error": 1.4068819023602287e-06
+  },
+  {
+    "force_modes": 5,
+    "displacement_modes": 9,
+    "validation_error": 0.0001025402652014223,
+    "regression_error": 1.4302989680920163e-06
+  },
+  {
+    "force_modes": 5,
+    "displacement_modes": 10,
+    "validation_error": 9.923838046867535e-05,
+    "regression_error": 1.4423218419550774e-06
+  },
+  {
+    "force_modes": 5,
+    "displacement_modes": 11,
+    "validation_error": 9.751446325455154e-05,
+    "regression_error": 1.4543743155982866e-06
+  },
+  {
+    "force_modes": 5,
+    "displacement_modes": 12,
+    "validation_error": 9.46173843249997e-05,
+    "regression_error": 1.4565034371253611e-06
+  },
+  {
+    "force_modes": 6,
+    "displacement_modes": 1,
+    "validation_error": 0.0016123857319382561,
+    "regression_error": 4.2493989500186034e-08
+  },
+  {
+    "force_modes": 6,
+    "displacement_modes": 2,
+    "validation_error": 0.0004584400571967004,
+    "regression_error": 9.370050811753208e-08
+  },
+  {
+    "force_modes": 6,
+    "displacement_modes": 3,
+    "validation_error": 0.00025055405146961573,
+    "regression_error": 1.9323329928914448e-07
+  },
+  {
+    "force_modes": 6,
+    "displacement_modes": 4,
+    "validation_error": 0.00017770718900913447,
+    "regression_error": 2.1761195951625916e-07
+  },
+  {
+    "force_modes": 6,
+    "displacement_modes": 5,
+    "validation_error": 0.00013995058060159283,
+    "regression_error": 2.2903663832727545e-07
+  },
+  {
+    "force_modes": 6,
+    "displacement_modes": 6,
+    "validation_error": 0.00012501235942750932,
+    "regression_error": 2.53547169227493e-07
+  },
+  {
+    "force_modes": 6,
+    "displacement_modes": 7,
+    "validation_error": 0.00012082888057292727,
+    "regression_error": 2.6607493097838255e-07
+  },
+  {
+    "force_modes": 6,
+    "displacement_modes": 8,
+    "validation_error": 0.00010919821667007037,
+    "regression_error": 2.663433730147359e-07
+  },
+  {
+    "force_modes": 6,
+    "displacement_modes": 9,
+    "validation_error": 0.00010316475309293758,
+    "regression_error": 2.969108438974198e-07
+  },
+  {
+    "force_modes": 6,
+    "displacement_modes": 10,
+    "validation_error": 9.988956606891977e-05,
+    "regression_error": 2.970944534305892e-07
+  },
+  {
+    "force_modes": 6,
+    "displacement_modes": 11,
+    "validation_error": 9.817529222030698e-05,
+    "regression_error": 2.9777120313967544e-07
+  },
+  {
+    "force_modes": 6,
+    "displacement_modes": 12,
+    "validation_error": 9.528302016425757e-05,
+    "regression_error": 2.980363538194214e-07
+  }
+]

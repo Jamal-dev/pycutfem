@@ -42,7 +42,7 @@ def grad_u_pos(x,y):
     return np.array([alpha_plus*e*np.sin(np.pi*y), np.pi*e*np.cos(np.pi*y)])
 
 # --- one run (elem_type in {"quad","tri"}) ------------------------------------
-def run_once_interface(elem_type: str, p: int, nx=14, ny=14):
+def run_once_interface(elem_type: str, p: int, backend, nx=14, ny=14):
     Lx = Ly = 1.0
     if elem_type == "quad":
         nodes, elems, edges, corners = structured_quad(Lx, Ly, nx=nx, ny=ny, poly_order=p)
@@ -118,7 +118,7 @@ def run_once_interface(elem_type: str, p: int, nx=14, ny=14):
         BoundaryCondition('u_neg','dirichlet','inactive_outside', 0.0),
     ]
 
-    K, F = assemble_form(eq, dof_handler=dh, bcs=bcs, quad_order=qvol, backend='python')
+    K, F = assemble_form(eq, dof_handler=dh, bcs=bcs, quad_order=qvol, backend=backend)
     assert np.isfinite(K.data).all(), "NaN/Inf in K from interface path"
     assert np.isfinite(F).all(),      "NaN/Inf in F from interface path"
     sol = spla.spsolve(K, F)
@@ -157,14 +157,14 @@ def run_once_interface(elem_type: str, p: int, nx=14, ny=14):
 
     return (l2m + l2p, h1m + h1p)
 
-def run_suite_interface(elem_type, orders=(1,2,3,4,5), nx=14, ny=14):
+def run_suite_interface(elem_type, orders=(1,2,3,4,5), nx=14, ny=14, backend="jit"):
     print(f"\n== Interface p-refinement ({elem_type}) ==")
     print(f"{'p':>2}  {'L2':>12}  {'H1-semi':>12}")
     prevL2=prevH1=None
     l2_errors = []
     h1_errors = []
     for p in orders:
-        l2, h1 = run_once_interface(elem_type, p, nx=nx, ny=ny)
+        l2, h1 = run_once_interface(elem_type, p, nx=nx, ny=ny, backend=backend)
         print(f"{p:2d}  {l2:12.4e}  {h1:12.4e}")
         # if prevL2 is not None:
         #     assert l2 <= prevL2*1.2 + 1e-14
@@ -180,9 +180,10 @@ def check_monotonicity(errors):
         if prev is not None:
             assert e <= prev * 1.05 + 1e-14, "Error did not decrease with p"
         prev = e
-def test_tri_p_refinement_interface():
+@pytest.mark.parametrize("backend", [ "jit"])
+def test_tri_p_refinement_interface(backend):
     orders = (1,2,3)
-    l2_errors, h1_errors = run_suite_interface("tri",  orders=orders, nx=16, ny=16)
+    l2_errors, h1_errors = run_suite_interface("tri",  orders=orders, nx=16, ny=16, backend=backend)
     plt.figure()
     plt.loglog(orders, l2_errors, 'o-', label='L2 error')
     plt.loglog(orders, h1_errors, 's-', label='H1-semi error')
@@ -193,9 +194,10 @@ def test_tri_p_refinement_interface():
     plt.show()
     check_monotonicity(l2_errors)
     check_monotonicity(h1_errors)
-def test_quad_p_refinement_interface():
+@pytest.mark.parametrize("backend", [ "jit"])
+def test_quad_p_refinement_interface(backend):
     orders = (1,2,3)
-    l2_errors, h1_errors = run_suite_interface("quad", orders=orders, nx=12, ny=12)
+    l2_errors, h1_errors = run_suite_interface("quad", orders=orders, nx=12, ny=12, backend=backend)
     plt.figure()
     plt.loglog(orders, l2_errors, 'o-', label='L2 error')
     plt.loglog(orders, h1_errors, 's-', label='H1-semi error')

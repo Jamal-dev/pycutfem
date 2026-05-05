@@ -124,11 +124,12 @@ def test_q3q1_single_node_bc_with_locator_on_p_center():
     mesh = Mesh(nodes, elems, elements_corner_nodes=corners, element_type="quad", poly_order=3)
     me = MixedElement(mesh, field_specs={'ux': 3, 'uy': 3, 'p': 1})
     dh = DofHandler(me, method='cg')
+    locators = {'pin': lambda x,y: np.isclose(x, 0.5) and np.isclose(y, 0.5)}
+    dh.tag_dof_by_locator("pin", 'p', locators['pin'])
 
     bcs = [BoundaryCondition(field='p', domain_tag='pin', method='dirichlet', value=42.0)]
-    locators = {'pin': lambda x,y: np.isclose(x, 0.5) and np.isclose(y, 0.5)}
 
-    data = dh.get_dirichlet_data(bcs, locators=locators)
+    data = dh.get_dirichlet_data(bcs)
     grouped = analyze_dirichlet_result(dh, data)
 
     # Exactly one constrained DOF, and it belongs to 'p'

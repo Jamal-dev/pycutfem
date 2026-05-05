@@ -66,7 +66,20 @@ def triangulate_field(mesh, dof_handler, field: str, *, strict=False):
     if not tris:
         raise RuntimeError(f"Could not build connectivity for field '{field}'.")
     tris_arr = np.unique(np.sort(np.asarray(tris, dtype=int), axis=1), axis=0)
-    return mtri.Triangulation(x, y, tris_arr)
+    if tris_arr.size == 0:
+        raise RuntimeError(f"Could not build connectivity for field '{field}'.")
+    # Filter out degenerate triangles (colinear DOF triplets) to keep Matplotlib happy.
+    ax = x[tris_arr[:, 1]] - x[tris_arr[:, 0]]
+    ay = y[tris_arr[:, 1]] - y[tris_arr[:, 0]]
+    bx = x[tris_arr[:, 2]] - x[tris_arr[:, 0]]
+    by = y[tris_arr[:, 2]] - y[tris_arr[:, 0]]
+    areas = 0.5 * np.abs(ax * by - ay * bx)
+    span = float(max(np.ptp(x), np.ptp(y)))
+    area_tol = max(1e-18, 1e-12 * span * span)
+    keep = areas > area_tol
+    if not np.any(keep):
+        raise RuntimeError(f"Degenerate triangulation for field '{field}'.")
+    return mtri.Triangulation(x, y, tris_arr[keep])
 
 
 

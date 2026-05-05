@@ -1,0 +1,119 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+    defaults:
+      run:
+        shell: bash -el {0}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Create Conda environment
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          miniforge-version: latest
+          use-mamba: true
+          environment-file: environment.yml
+          activate-environment: pycutfem
+          auto-activate-base: false
+
+      - name: Configure Eigen include directory
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          prefix = Path(os.environ["CONDA_PREFIX"])
+          candidates = [
+              prefix / "include" / "eigen3",
+              prefix / "Library" / "include" / "eigen3",
+              Path("/usr/include/eigen3"),
+          ]
+          for candidate in candidates:
+              if candidate.exists():
+                  with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as handle:
+                      handle.write(f"EIGEN_INCLUDE_DIR={candidate}\n")
+                  print(f"EIGEN_INCLUDE_DIR={candidate}")
+                  break
+          else:
+              raise SystemExit("Eigen include directory was not found.")
+          PY
+
+      - name: Import package and numerical stack
+        run: |
+          python - <<'PY'
+          import numpy
+          import pybind11
+          import pycutfem
+          import scipy
+          import sympy
+
+          print("pycutfem import ok")
+          print("numpy", numpy.__version__)
+          print("scipy", scipy.__version__)
+          print("sympy", sympy.__version__)
+          print("pybind11", pybind11.__version__)
+          PY
+
+      - name: Run core regression tests
+        run: |
+          python -m pytest -q \
+            tests/test_three_constituent_benchmark_suite.py \
+            tests/test_three_constituent_one_domain_cpp.py
+
+      - name: Run three-constituent paper smoke suite
+        if: runner.os == 'Linux'
+        run: |
+          python examples/biofilms/benchmarks/three_constituent/run_paper_benchmarks.py \
+            --suite smoke \
+            --skip-seboldt \
+            --outdir out/ci_three_constituent_smoke \
+            --backend cpp \
+            --linear-backend scipy
+
+  docker:
+    name: Docker image
+    runs-on: ubuntu-latest
+    env:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t pycutfem:ci .
+
+      - name: Test Docker image
+        run: |
+          docker run --rm pycutfem:ci python -m pytest -q \
+            tests/test_three_constituent_benchmark_suite.py
+
+      - name: Push Docker image to Docker Hub
+        if: github.event_name != 'pull_request' && env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != ''
+        run: |
+          set -euo pipefail
+          echo "${DOCKERHUB_TOKEN}" | docker login -u "${DOCKERHUB_USERNAME}" --password-stdin
+          docker tag pycutfem:ci "${DOCKERHUB_USERNAME}/pycutfem:latest"
+          docker tag pycutfem:ci "${DOCKERHUB_USERNAME}/pycutfem:${GITHUB_SHA}"
+          docker push "${DOCKERHUB_USERNAME}/pycutfem:latest"
+          docker push "${DOCKERHUB_USERNAME}/pycutfem:${GITHUB_SHA}"

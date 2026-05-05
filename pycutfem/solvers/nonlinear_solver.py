@@ -15,21 +15,53 @@ control logic.
 from __future__ import annotations
 
 from re import A
+import hashlib
+import json
 import time
 import os
-from dataclasses import dataclass
-from typing import Dict, List, Callable, Optional, Tuple
+import math
+import threading
+import subprocess
+import tempfile
+from dataclasses import dataclass, field
+from typing import Dict, List, Callable, Optional, Tuple, Sequence
 import inspect
+import warnings
+from pathlib import Path
 
 
 import numpy as np
 import scipy.sparse.linalg as spla
 import scipy.sparse as sp
-# from pycutfem.ufl.helpers_jit import _scatter_element_contribs
-from pycutfem.ufl.helpers_jit import _build_jit_kernel_args
+from pycutfem.linalg import (
+    AMGCLSettings,
+    BlockDiagonalPreconditioner,
+    BlockLinearSystem,
+    BlockTriangularPreconditioner,
+    FieldBlockLayout,
+    KrylovOptions,
+    ScipyKrylovSolver,
+    SparseSubsolverSpec,
+    UzawaOptions,
+    UzawaPreconditioner,
+    UzawaSolver,
+    build_subsolver,
+    EigenSparseQRSubsolver,
+    solve_sparse_amgcl,
+    solve_sparse_eigen_sparseqr,
+)
+try:
+    from scipy.sparse.linalg import MatrixRankWarning
+except Exception:
+    MatrixRankWarning = None
+# from pycutfem.jit.kernel_args import _scatter_element_contribs
+from pycutfem.jit.kernel_args import _build_jit_kernel_args
 from pycutfem.jit import compile_multi        
+from pycutfem.operators import OperatorManager, RuntimeOperator
+from pycutfem.ufl.autodiff import GateauxDerivativeError, linearize_form
 from pycutfem.ufl.forms import Equation
 from pycutfem.ufl.helpers import analyze_active_dofs
+from pycutfem.solvers.dt_controller import AdaptiveDtController, DtControllerParams
 try:
     from pycutfem.solvers.giant import giant_solver
     HAS_GIANT = True
@@ -47,7 +79,143 @@ if not _skip_petsc:
 else:
     PETSc = None
     HAS_PETSC = False
+_skip_pypardiso = os.getenv("PYCUTFEM_SKIP_PYPARDISO", "").lower() in {"1", "true", "yes"}
+if not _skip_pypardiso:
+    try:
+        from pypardiso import PyPardisoSolver
+        HAS_PYPARDISO = True
+    except Exception:  # noqa: PERF203
+        PyPardisoSolver = None
+        HAS_PYPARDISO = False
+else:
+    PyPardisoSolver = None
+    HAS_PYPARDISO = False
 import sys
+
+_HAVE_NUMBA_REDUCED_PATTERN = False
+try:
+    from numba import njit  # type: ignore
+
+    _HAVE_NUMBA_REDUCED_PATTERN = True
+except Exception:  # pragma: no cover - optional dependency
+    njit = None  # type: ignore[assignment]
+
+
+if _HAVE_NUMBA_REDUCED_PATTERN:
+    @njit(cache=True)
+    def _csr_find_pos(indices: np.ndarray, start: int, end: int, target: int) -> int:
+        lo = start
+        hi = end
+        while lo < hi:
+            mid = (lo + hi) // 2
+            v = int(indices[mid])
+            if v < target:
+                lo = mid + 1
+            else:
+                hi = mid
+        if lo < end and int(indices[lo]) == target:
+            return lo
+        return -1
+
+    @njit(cache=True)
+    def _build_pos_flat_numba(red: np.ndarray, indptr: np.ndarray, indices: np.ndarray) -> np.ndarray:
+        n_ent = int(red.shape[0])
+        n_loc = int(red.shape[1])
+        out = -np.ones((n_ent, n_loc * n_loc), dtype=np.int32)
+        for e in range(n_ent):
+            for i in range(n_loc):
+                ra = int(red[e, i])
+                if ra < 0:
+                    continue
+                s = int(indptr[ra])
+                epos = int(indptr[ra + 1])
+                base = i * n_loc
+                for j in range(n_loc):
+                    c = int(red[e, j])
+                    if c < 0:
+                        continue
+                    out[e, base + j] = _csr_find_pos(indices, s, epos, c)
+        return out
+
+    @njit(cache=True)
+    def _scatter_csr_pos_flat_numba(data: np.ndarray, pos_flat: np.ndarray, values_flat: np.ndarray) -> None:
+        n_ent = int(pos_flat.shape[0])
+        n_terms = int(pos_flat.shape[1])
+        for e in range(n_ent):
+            for k in range(n_terms):
+                pos = int(pos_flat[e, k])
+                if pos >= 0:
+                    data[pos] += values_flat[e, k]
+
+    @njit(cache=True)
+    def _scatter_vec_red_map_numba(target: np.ndarray, red_map: np.ndarray, values: np.ndarray) -> None:
+        n_ent = int(red_map.shape[0])
+        n_loc = int(red_map.shape[1])
+        for e in range(n_ent):
+            for i in range(n_loc):
+                row = int(red_map[e, i])
+                if row >= 0:
+                    target[row] += values[e, i]
+
+# ---------------------------------------------------------------------------
+# Numba reduced-pattern precompile (hide first-call JIT latency)
+# ---------------------------------------------------------------------------
+_NUMBA_REDUCED_PATTERN_PRECOMPILE_EVENT: threading.Event | None = None
+_NUMBA_REDUCED_PATTERN_PRECOMPILE_ERROR: Exception | None = None
+_NUMBA_REDUCED_PATTERN_PRECOMPILE_LOCK = threading.Lock()
+
+
+def _start_numba_reduced_pattern_precompile() -> None:
+    """
+    Trigger compilation of the reduced-pattern numba kernels in a background
+    thread so the first solver startup does not pay the full JIT cost.
+    """
+    global _NUMBA_REDUCED_PATTERN_PRECOMPILE_EVENT, _NUMBA_REDUCED_PATTERN_PRECOMPILE_ERROR
+    if not _HAVE_NUMBA_REDUCED_PATTERN:
+        return
+    if os.getenv("PYCUTFEM_NUMBA_PRECOMPILE_REDUCED_PATTERN", "1").lower() in {"0", "false", "no"}:
+        return
+    with _NUMBA_REDUCED_PATTERN_PRECOMPILE_LOCK:
+        if _NUMBA_REDUCED_PATTERN_PRECOMPILE_EVENT is not None:
+            return
+        ev = threading.Event()
+        _NUMBA_REDUCED_PATTERN_PRECOMPILE_EVENT = ev
+
+        def _worker() -> None:
+            global _NUMBA_REDUCED_PATTERN_PRECOMPILE_ERROR
+            try:
+                red = np.zeros((1, 1), dtype=np.int32)
+                indptr = np.zeros((2,), dtype=np.int32)
+                indices = np.zeros((0,), dtype=np.int32)
+                _build_pos_flat_numba(red, indptr, indices)
+                data = np.zeros((1,), dtype=np.float64)
+                pos_flat = np.zeros((1, 1), dtype=np.int32)
+                vals = np.zeros((1, 1), dtype=np.float64)
+                _scatter_csr_pos_flat_numba(data, pos_flat, vals)
+                _scatter_vec_red_map_numba(data, red, vals)
+            except Exception as exc:  # pragma: no cover - best effort
+                _NUMBA_REDUCED_PATTERN_PRECOMPILE_ERROR = exc
+            finally:
+                ev.set()
+
+        t = threading.Thread(
+            target=_worker,
+            name="pycutfem-numba-precompile-reduced-pattern",
+            daemon=True,
+        )
+        t.start()
+
+
+def _wait_numba_reduced_pattern_precompile() -> None:
+    global _NUMBA_REDUCED_PATTERN_PRECOMPILE_EVENT, _NUMBA_REDUCED_PATTERN_PRECOMPILE_ERROR
+    ev = _NUMBA_REDUCED_PATTERN_PRECOMPILE_EVENT
+    if ev is None:
+        return
+    ev.wait()
+    if _NUMBA_REDUCED_PATTERN_PRECOMPILE_ERROR is not None:
+        # Disable the numba fast-path for this process; fall back to the pure-numpy plan.
+        global _HAVE_NUMBA_REDUCED_PATTERN
+        _HAVE_NUMBA_REDUCED_PATTERN = False
 
 def _scatter_element_contribs(
     *,
@@ -142,27 +310,40 @@ def _scatter_element_contribs_reduced(
     if A_red is not None and K_elem is not None and K_elem.ndim == 3:
         for i in range(len(element_ids)):
             gdofs = gdofs_map[i]
-            rmap  = full_to_red[gdofs]
+            valid_full = gdofs >= 0
+            rmap = -np.ones_like(gdofs, dtype=int)
+            if np.any(valid_full):
+                rmap[valid_full] = full_to_red[gdofs[valid_full]]
             rmask = rmap >= 0
             if not np.any(rmask):
                 continue
             rows = rmap[rmask]
 
             # columns use the same element gdofs (bilinear form)
-            cmap  = full_to_red[gdofs]
+            cmap = rmap
             cmask = cmap >= 0
             if not np.any(cmask):
                 continue
             cols = cmap[cmask]
 
             Ke = K_elem[i][np.ix_(rmask, cmask)]
-            A_red[np.ix_(rows, cols)] += Ke
+            if sp.issparse(A_red):
+                for row_i, row in enumerate(rows.tolist()):
+                    for col_j, col in enumerate(cols.tolist()):
+                        val = float(Ke[row_i, col_j])
+                        if val != 0.0:
+                            A_red[row, col] = float(A_red[row, col]) + val
+            else:
+                A_red[np.ix_(rows, cols)] += Ke
 
     # --- Vector block: keep only free rows ----------------------------
     if R_red is not None and F_elem is not None:
         for i in range(len(element_ids)):
             gdofs = gdofs_map[i]
-            rmap  = full_to_red[gdofs]
+            valid_full = gdofs >= 0
+            rmap = -np.ones_like(gdofs, dtype=int)
+            if np.any(valid_full):
+                rmap[valid_full] = full_to_red[gdofs[valid_full]]
             rmask = rmap >= 0
             if not np.any(rmask):
                 continue
@@ -184,14 +365,107 @@ def _scatter_element_contribs_reduced(
 class NewtonParameters:
     """Settings that govern a *single* Newton solve."""
 
-    newton_tol: float = 1e-8            # ‖R‖_∞ convergence threshold
+    newton_tol: float = 1e-8            # convergence threshold for the selected residual_norm
+    newton_rtol: float = 0.0           # optional relative tolerance on the selected residual_norm
+    residual_norm: str = "linf"        # linf (default) or kratos_l2_over_ndof
     max_newton_iter: int = 20           # hard cap on inner Newton iterations
+    # PETSc SNES robustness: when SNES returns a best iterate but reports a
+    # non-converged reason (e.g. line-search divergence), optionally accept the
+    # step if the reported ‖F‖ is still "close enough" to the absolute tolerance.
+    #
+    # - 0 disables this behavior (default; preserves strict rejection)
+    # - A value like 2 means accept if ‖F‖ ≤ 2*newton_tol.
+    #
+    # NOTE: SNES uses its own norm for ‖F‖ (typically an L2 norm of the residual
+    # vector), while `newton_tol` is documented as an infinity-norm threshold for
+    # the pure-Python Newton path. For SNES we interpret `newton_tol` as the
+    # absolute tolerance supplied via `snes_atol`.
+    accept_nonconverged_atol_factor: float = 0.0
+    # Logging verbosity:
+    #   0 = quiet (no per-step/iteration prints)
+    #   1 = time-step summary only
+    #   2 = Newton iteration summary (default)
+    #   3 = line-search accept/reject details
+    print_level: int = 2
 
     # Armijo back‑tracking line‑search
     line_search: bool = True
-    ls_max_iter: int = 8
+    # Line-search mode:
+    # - "armijo": backtracking on ½‖R‖² with Armijo sufficient decrease
+    # - "dealii": backtracking that only requires ‖R‖_∞ to decrease (step-fsi.cc style)
+    ls_mode: str = "armijo"
+    # Allow deeper backtracking; some stiff problems only descend for very small α
+    ls_max_iter: int = 12
     ls_reduction: float = 0.5           # α ← β·α after reject
-    ls_c1: float = 0.1#1.0e-4               # sufficient‑decrease parameter
+    # When False, a failed residual-decrease line search returns the smallest
+    # tried step (or zero step in the full-space path) instead of aborting the
+    # nonlinear solve. This is useful for exact local operators whose Newton
+    # path is physically correct but can occasionally defeat the globalization
+    # filter near convergence.
+    ls_fail_hard: bool = True
+    # NOTE: A too-large `ls_c1` makes the Armijo test overly strict and can
+    # stall Newton (tiny accepted steps). Use a standard small value.
+    ls_c1: float = 1.0e-4               # sufficient‑decrease parameter
+    # Step globalization for the unconstrained Newton path.
+    # - "line_search": current Armijo / residual-decrease backtracking only
+    # - "trust_region": dogleg trust region on the Gauss-Newton merit only
+    # - "line_search_then_trust": try the line search first, then fall back to trust-region
+    globalization: str = "line_search"
+    tr_max_iter: int = 8
+    tr_radius_init: float = 1.0
+    tr_radius_max: float = 1.0e3
+    tr_eta_accept: float = 1.0e-4
+    tr_eta_contract: float = 2.5e-1
+    tr_eta_expand: float = 7.5e-1
+    tr_shrink: float = 2.5e-1
+    tr_expand: float = 2.0
+    tr_min_radius: float = 1.0e-10
+    # Optional additional trust-region acceptance filter based on the actual
+    # reduced residual infinity norm. Defaults keep the old behavior.
+    tr_min_abs_decrease_inf: float = 0.0
+    tr_min_rel_decrease_inf: float = 0.0
+    # Optional reduced-space Gauss-Newton / LM fallback for the unconstrained
+    # Newton path. This is mainly useful when the raw reduced Newton direction
+    # stops being productive for the least-squares merit near bounded/logit
+    # coordinate saturation.
+    reduced_gn_fallback: bool = True
+    reduced_gn_lambda0: float = 1.0e-6
+    reduced_gn_lambda_growth: float = 10.0
+    reduced_gn_max_tries: int = 4
+    # Optional early-stall detector for exact Newton solves. When enabled, the
+    # solver aborts once a full residual window fails to deliver a meaningful
+    # |R|_inf decrease, so benchmark-local recovery layers can take over.
+    stall_window: int = 0
+    stall_min_abs_decrease_inf: float = 0.0
+    stall_min_rel_decrease_inf: float = 0.0
+    # Optional Kratos-style mixed solution criteria. Each entry is
+    # ("field_a,field_b,...", relative_tol, absolute_tol) and is evaluated on
+    # the accepted Newton correction using RMS-L2 absolute norm and L2-relative
+    # norm. The nonlinear step is accepted when every listed field/group meets
+    # either its absolute or relative tolerance.
+    mixed_solution_criteria: tuple[tuple[str, float, float], ...] = ()
+    # Optional safeguard for mixed solution acceptance: require the residual to
+    # also satisfy |R|_inf <= factor * residual_tol. When residual_tol is not
+    # provided, newton_tol is used for backward compatibility. A non-positive
+    # factor disables the guard.
+    mixed_solution_max_residual_factor: float = 0.0
+    mixed_solution_residual_tol: float = 0.0
+    # Optional pseudo-transient continuation on a selected reduced block for
+    # plain Newton solves. This is intended for latent / unconstrained
+    # formulations that need additional local damping in weakly coupled
+    # mechanics subspaces without switching to the VI / PDAS path.
+    ptc_recovery: bool = False
+    ptc_fields: tuple[str, ...] = ()
+    ptc_sigma0: float = 1.0e-2
+    ptc_sigma_max: float = 1.0e8
+    ptc_growth: float = 5.0
+    ptc_decay: float = 0.5
+    ptc_freeze_complement: bool = False
+    ptc_operator_mode: str = "row_normalized"
+    ptc_late_fields: tuple[str, ...] = ()
+    ptc_late_switch_residual: float = 0.0
+    ptc_late_operator_mode: str = ""
+    ptc_min_diag: float = 1.0e-12
 
 
 @dataclass
@@ -203,70 +477,708 @@ class TimeStepperParameters:
     steady_tol: float = 1e-6            # ‖ΔU‖_∞ < tol ⇒ steady
     theta: float = 1.0                  # 1.0 = backward Euler, 0.5 = CN
     stop_on_steady: bool = True         # early exit when steady‑state reached
-    final_time: float = max_steps * dt  
+    t0: float = 0.0                     # start time (for restarts)
+    step0: int = 0                      # global step offset (for logs/callbacks)
+    final_time: Optional[float] = None  # default: max_steps * dt (set in __post_init__)
+    allow_dt_reduction: bool = False    # opt-in adaptive dt reduction
+    dt_reduction_factor: float = 0.5    # dt <- factor * dt on rejection
+    dt_reduction_threshold: float = 5.0 # reject if ||ΔU|| grows by this factor
+    dt_min: float = 0.0                 # minimum allowed dt when reducing
+    on_dt_change: Optional[Callable[[float], None]] = None
+    adjust_max_steps_on_dt_change: bool = True  # keep final_time reachable
+
+    # Iteration-count based dt adaptation (used when allow_dt_reduction=True)
+    dt_max: Optional[float] = None
+    dt_increase_factor: float = 1.1
+    dt_decrease_factor_slow: float = 0.9
+    dt_iters_increase_threshold: int = 8
+    dt_iters_decrease_threshold: int = 20
+    dt_easy_steps_before_increase: int = 2
+    dt_slow_steps_before_decrease: int = 1
+    dt_reject_on_slow: bool = False
+
+    # Optional: step-failure handler for debugging/recovery.
+    #
+    # Called when Newton fails or returns non-converged at a step.
+    # The callback may mutate coefficients (e.g. penalty Constants) and request a retry.
+    #
+    # Return values:
+    # - False / None: not handled; solver applies its default failure handling (e.g. dt reduction / raise)
+    # - True or "retry": retry the same step (keeps the default predictor: current <- prev)
+    # - "retry_keep_guess": retry the same step but keep the current iterate (skip predictor reset)
+    on_step_failure: Optional[Callable[..., object]] = None
+
+    # Predictor for the initial guess at each new time step.
+    #
+    # - "prev" (default): U^{n+1,0} <- U^n
+    # - "delta":          U^{n+1,0} <- U^n + (dt/dt_prev) * (U^n - U^{n-1})
+    #                     implemented via the previous accepted step increment.
+    #
+    # NOTE: this only affects the *initial guess* for Newton/SNES and does not
+    # change the converged solution (it can, however, strongly affect robustness
+    # and iteration counts).
+    predictor: str = "prev"
+    predictor_damping: float = 1.0
+    predictor_clip_01: bool = False
+
+    # Optional callback to refine the Newton/SNES initial guess for the current
+    # step after the default predictor and time-dependent BCs have been applied.
+    #
+    # Typical use: run a few segregated / staggered sub-solves to preload the
+    # coupled state before the monolithic solve. The callback may mutate
+    # `functions` in place. It is called with keyword arguments including:
+    #   solver, step, step_no, t, dt, t_bc, functions, prev_functions,
+    #   aux_functions, bcs
+    step_initial_guess_callback: Optional[Callable[..., object]] = None
+    debug_step_preamble: bool = False
+
+    def __post_init__(self) -> None:
+        if self.final_time is None:
+            self.final_time = float(self.t0) + float(self.max_steps) * float(self.dt)
+        if self.dt_max is None:
+            self.dt_max = float(self.dt)
+
+
+def _normalize_mixed_solution_criteria(
+    criteria: object,
+) -> list[tuple[tuple[str, ...], float, float]]:
+    out: list[tuple[tuple[str, ...], float, float]] = []
+    if not criteria:
+        return out
+    try:
+        iterable = list(criteria)
+    except Exception:
+        return out
+    for item in iterable:
+        try:
+            group_spec, rel_tol, abs_tol = item
+        except Exception:
+            continue
+        fields = tuple(
+            token.strip()
+            for token in str(group_spec).split(",")
+            if token.strip()
+        )
+        if not fields:
+            continue
+        out.append((fields, float(rel_tol), float(abs_tol)))
+    return out
+
+
+def _mixed_solution_criteria_report(
+    *,
+    dh,
+    funcs,
+    delta_full: np.ndarray,
+    criteria: object,
+    bcs: object = None,
+    active_dofs: object = None,
+) -> tuple[bool, list[dict[str, object]]]:
+    try:
+        from pycutfem.ufl.expressions import VectorFunction as _VectorFunction
+    except Exception:  # pragma: no cover - defensive import
+        _VectorFunction = tuple()  # type: ignore[assignment]
+    parsed = _normalize_mixed_solution_criteria(criteria)
+    if not parsed:
+        return False, []
+
+    fixed_dofs: set[int] = set()
+    if bcs is not None:
+        try:
+            fixed_dofs = {int(k) for k in dh.get_dirichlet_data(bcs).keys()}
+        except Exception:
+            fixed_dofs = set()
+    active_dof_set: set[int] | None = None
+    if active_dofs is not None:
+        try:
+            active_arr = np.asarray(active_dofs, dtype=int).reshape(-1)
+            active_dof_set = {int(v) for v in active_arr.tolist()}
+        except Exception:
+            active_dof_set = None
+
+    scalar_map: dict[str, np.ndarray] = {}
+    value_map: dict[str, np.ndarray] = {}
+    for function in list(funcs):
+        if isinstance(function, _VectorFunction):
+            pieces = list(function.components)
+        else:
+            pieces = [function]
+        for piece in pieces:
+            field_name = str(getattr(piece, "field_name", ""))
+            if not field_name:
+                continue
+            try:
+                field_slice = np.asarray(dh.get_field_slice(field_name), dtype=int)
+            except Exception:
+                continue
+            if field_slice.size == 0:
+                continue
+            free_mask = np.ones(int(field_slice.size), dtype=bool)
+            if fixed_dofs:
+                free_mask &= np.array([int(idx) not in fixed_dofs for idx in field_slice], dtype=bool)
+            if active_dof_set is not None:
+                free_mask &= np.array([int(idx) in active_dof_set for idx in field_slice], dtype=bool)
+            if not np.any(free_mask):
+                continue
+            scalar_map[field_name] = np.asarray(delta_full[field_slice[free_mask]], dtype=float).reshape(-1)
+            value_map[field_name] = np.asarray(piece.nodal_values, dtype=float).reshape(-1)[free_mask]
+
+    reports: list[dict[str, object]] = []
+    all_ok = True
+    for fields, rel_tol, abs_tol in parsed:
+        parts_du = [scalar_map[fld] for fld in fields if fld in scalar_map]
+        parts_u = [value_map[fld] for fld in fields if fld in value_map]
+        if not parts_du or not parts_u:
+            all_ok = False
+            reports.append(
+                {
+                    "fields": fields,
+                    "rel_tol": float(rel_tol),
+                    "abs_tol": float(abs_tol),
+                    "abs_norm": float("inf"),
+                    "rel_norm": float("inf"),
+                    "ok": False,
+                    "missing": True,
+                }
+            )
+            continue
+        du = np.concatenate(parts_du).reshape(-1)
+        uu = np.concatenate(parts_u).reshape(-1)
+        size = max(int(du.size), 1)
+        increase_sq = float(np.dot(du, du))
+        solution_sq = float(np.dot(uu, uu))
+        if solution_sq < 1.0e-12:
+            solution_sq = 1.0
+        # Match Kratos MixedGenericCriteria exactly: the relative criterion is
+        # sqrt(sum(dx^2) / sum(u^2)), while the absolute criterion is
+        # sqrt(sum(dx^2)) divided by the number of free DOFs for that variable.
+        rel_norm = float(math.sqrt(increase_sq / solution_sq))
+        abs_norm = float(math.sqrt(increase_sq) / float(size))
+        ok = bool((abs_norm <= float(abs_tol)) or (rel_norm <= float(rel_tol)))
+        all_ok = bool(all_ok and ok)
+        reports.append(
+            {
+                "fields": fields,
+                "rel_tol": float(rel_tol),
+                "abs_tol": float(abs_tol),
+                "abs_norm": abs_norm,
+                "rel_norm": rel_norm,
+                "free_dofs": int(size),
+                "ok": ok,
+                "missing": False,
+            }
+        )
+    return all_ok, reports
 
 
 @dataclass
 class LinearSolverParameters:
-    """Sparse linear solver settings (expandable for PETSc/Krylov/etc.)."""
+    """Sparse linear solver settings (expandable for PETSc/Krylov/block solves)."""
 
-    backend: str = "scipy"              # placeholder for future options
+    backend: str = ("petsc" if HAS_PETSC else "scipy")
     tol: float = 1e-12
     maxit: int = 10_000
+    distributed: bool = False
+
+
+@dataclass
+class VIParameters:
+    """
+    Parameters for box-constrained variational inequalities (VI) solved via
+    PDAS / semismooth Newton.
+
+    We support a PDAS / semismooth Newton strategy for box constraints by
+    predicting active sets from a (KKT-style) complementarity indicator.
+
+    For lower/upper bounds we use the standard max-based NCP logic:
+
+      lower-active  if   F(x) - c * (x - lo) > 0
+      upper-active  if   F(x) + c * (hi - x) < 0
+
+    where F(x) is the (reduced) residual vector and c>0 is a scaling parameter
+    with the units of "stiffness" (force/length) for mechanics-like problems.
+    """
+
+    c: float = 1.0
+    c_by_field: dict[str, float] = field(default_factory=dict)
+    active_tol: float = 0.0
+    enter_tol: float | None = None
+    leave_tol: float | None = None
+    active_set_persistence: int = 0
+    project_initial_guess: bool = True
+    project_each_iteration: bool = False
+    inactive_reg_lambda0: float = 0.0
+    inactive_reg_lambda_max: float = 1.0e6
+    inactive_reg_growth: float = 5.0
+    inactive_reg_decay: float = 0.5
+    inactive_reg_min_diag: float = 1.0e-12
+    inactive_reg_delta_active_trigger: int = 0
+    inactive_reg_stall_alpha: float = 0.25
+    inactive_reg_stall_merit_ratio: float = 0.95
+    merit_mode: str = "split"
+    merit_residual_weight: float = 1.0
+    merit_gap_weight: float = 1.0
+    merit_equality_weight: float = 1.0
+    filter_max_ginf_growth: float = 1.0
+    filter_max_residual_growth: float = 1.25
+    filter_max_gap_growth: float = 1.25
+    filter_max_equality_growth: float = 1.25
+    bound_step_limit: bool = False
+    bound_step_tau: float = 1.0
+    bound_blocking_activate: bool = False
+    bound_blocking_trigger_alpha: float = 0.95
+    bound_blocking_max_iter: int = 12
+    relaxed_filter_accept_ginf: float = 0.0
+    relaxed_filter_merit_growth: float = 1.05
+    accept_best_filtered_descent: bool = False
+    line_search_nonmonotone_window: int = 0
+    line_search_nonmonotone_active_stable_iters: int = 0
+    line_search_nonmonotone_ginf_trigger: float = 0.0
+    line_search_nonmonotone_gap_ratio: float = 1.0
+    line_search_nonmonotone_eq_abs: float = 1.0e-10
+    line_search_nonmonotone_disable_filter: bool = False
+    equality_active_step_ginf_threshold: float = 5.0e-2
+    active_step_delta_active_trigger: int = 0
+    active_step_soft_alpha: float = 1.0
+    active_step_strong_factor: float = 5.0
+    filter_max_delta_active: int = 0
+    unconstrained_lm: bool = False
+    unconstrained_lm_lambda0: float = 1.0e-4
+    unconstrained_lm_lambda_max: float = 1.0e6
+    unconstrained_lm_growth: float = 5.0
+    unconstrained_lm_decay: float = 0.5
+    unconstrained_lm_min_diag: float = 1.0e-12
+    unconstrained_lm_accept_ratio: float = 1.0e-3
+    unconstrained_lm_good_ratio: float = 0.75
+    unconstrained_lm_max_tries: int = 6
+    affine_cycle_fallback: bool = False
+    affine_cycle_fallback_max_it: int = 12
+    affine_cycle_fallback_armijo_c1: float = 1.0e-4
+    affine_cycle_fallback_lm_lambda0: float = 1.0e-6
+    affine_cycle_fallback_lm_growth: float = 10.0
+    affine_cycle_fallback_lm_max_tries: int = 8
+    affine_identified_acceleration: bool = False
+    affine_identified_stable_iters: int = 2
+    affine_identified_ginf_trigger: float = 5.0e-2
+    affine_identified_gap_ratio: float = 1.0
+    affine_identified_eq_abs: float = 1.0e-10
+    working_set_guard_after_affine: int = 0
+    equation_row_scaling: bool = False
+    equation_row_scaling_floor: float = 1.0e-12
+    equation_row_scaling_clip_min: float = 1.0e-8
+    equation_row_scaling_clip_max: float = 1.0e8
+    variable_column_scaling: bool = False
+    variable_column_scaling_floor: float = 1.0e-12
+    variable_column_scaling_clip_min: float = 1.0e-2
+    variable_column_scaling_clip_max: float = 1.0e2
+    variable_column_scaling_fields: tuple[str, ...] = ()
+    field_proximal_recovery: bool = False
+    field_proximal_recovery_fields: tuple[str, ...] = ()
+    field_proximal_recovery_lambda0: float = 1.0e-3
+    field_proximal_recovery_lambda_max: float = 1.0e6
+    field_proximal_recovery_growth: float = 10.0
+    field_proximal_recovery_max_tries: int = 6
+    field_proximal_recovery_stable_iters: int = 1
+    field_proximal_recovery_ginf_trigger: float = 5.0e-2
+    field_proximal_recovery_gap_ratio: float = 1.0
+    field_proximal_recovery_eq_abs: float = 1.0e-10
+    field_proximal_recovery_alpha_trigger: float = 0.25
+    field_proximal_recovery_merit_ratio_trigger: float = 0.8
+    field_proximal_recovery_g_ratio_trigger: float = 0.8
+    field_proximal_recovery_identified_window: bool = False
+    field_proximal_recovery_ginf_max: float = 0.0
+    ptc_recovery: bool = False
+    ptc_fields: tuple[str, ...] = ()
+    ptc_sigma0: float = 1.0e-2
+    ptc_sigma_max: float = 1.0e6
+    ptc_growth: float = 5.0
+    ptc_decay: float = 0.5
+    ptc_stable_iters: int = 1
+    ptc_ginf_trigger: float = 5.0e-2
+    ptc_gap_ratio: float = 1.0
+    ptc_eq_abs: float = 1.0e-10
+    ptc_alpha_trigger: float = 0.25
+    ptc_merit_ratio_trigger: float = 0.8
+    ptc_g_ratio_trigger: float = 0.8
+    ptc_identified_window: bool = False
+    ptc_ginf_max: float = 0.0
+    ptc_freeze_complement: bool = True
+    ptc_operator_mode: str = "row_normalized"
+    anderson_acceleration: bool = False
+    anderson_history: int = 3
+    anderson_regularization: float = 1.0e-10
+    anderson_damping: float = 1.0
+    anderson_stable_iters: int = 1
+    anderson_ginf_trigger: float = 5.0e-2
+    anderson_gap_ratio: float = 1.0
+    anderson_eq_abs: float = 1.0e-10
+    anderson_ginf_max: float = 0.0
+    interior_point_mu0: float = 1.0e-2
+    interior_point_mu_min: float = 1.0e-10
+    interior_point_mu_decay: float = 0.2
+    interior_point_max_barrier_steps: int = 12
+    interior_point_fraction_to_boundary: float = 0.995
+    interior_point_armijo_c1: float = 1.0e-4
+    interior_point_step_reduction: float = 0.5
+    interior_point_step_min: float = 1.0e-10
+    interior_point_initial_push: float = 1.0e-8
+    interior_point_stage_tol_factor: float = 0.25
+    interior_point_stage_dual_factor: float = 1.5
+    interior_point_stage_cent_factor: float = 1.5
+    interior_point_stage_gap_factor: float = 1.0
+    interior_point_stage_eq_factor: float = 1.0e-4
+    interior_point_project_each_iteration: bool = False
+    interior_point_filter_margin: float = 1.0e-4
+    interior_point_filter_max_feas_growth: float = 1.25
+    interior_point_filter_max_entries: int = 16
+    interior_point_mehrotra_predictor_corrector: bool = True
+    interior_point_mehrotra_sigma_min: float = 0.0
+    interior_point_mehrotra_sigma_max: float = 1.0
+    interior_point_transition_recenter_ratio_max: float = 2.5
+    interior_point_transition_dual_growth_max: float = 2.0
+    interior_point_second_order_correction: bool = False
+    interior_point_soc_alpha_trigger: float = 0.25
+
+
+@dataclass(frozen=True)
+class LinearEqualityConstraint:
+    """
+    Linear equality constraint on the reduced Newton/PDAS iterate.
+
+    The constraint is defined in physical full-space DOF coordinates:
+
+        weights_full^T x_full = target
+
+    The solver automatically condenses this to the current reduced/master
+    space, subtracts fixed Dirichlet/master contributions, and enforces the
+    remaining equality on the active reduced unknowns.
+    """
+
+    name: str
+    weights_full: np.ndarray | None = None
+    target: float | None = None
+    target_callback: Optional[Callable[..., float]] = None
+    weights_callback: Optional[Callable[..., np.ndarray]] = None
+    field_name: str | None = None
+    project_feasible: bool = True
+
+
+@dataclass(frozen=True)
+class _PreparedLinearEqualities:
+    names: tuple[str, ...]
+    field_names: tuple[str | None, ...]
+    B_red: np.ndarray
+    b_eff: np.ndarray
+    project_feasible: tuple[bool, ...]
+
+
+def _vi_filter_abs_floor(vi_params) -> float:
+    """Absolute floor for VI globalization filters on projected problems."""
+    try:
+        floor = float(getattr(vi_params, "projection_tol", 1.0e-12) or 1.0e-12)
+    except Exception:
+        floor = 1.0e-12
+    return max(floor, 1.0e-12)
+
+
+def _vi_filter_threshold(*, base: float, growth: float, abs_floor: float) -> float:
+    scale = max(float(abs(base)), float(abs_floor))
+    return max(float(growth) * scale, float(abs_floor))
+
+
+def _vi_relaxed_accept_reason(
+    *,
+    norm_G: float,
+    accept_factor: float,
+    atol: float,
+    relaxed_g: float,
+) -> str | None:
+    if accept_factor > 0.0 and atol > 0.0 and np.isfinite(float(norm_G)):
+        accept_tol = float(accept_factor) * float(atol)
+        if float(norm_G) <= accept_tol:
+            return f"{float(accept_factor):g}·atol (atol={float(atol):.3e})"
+    if relaxed_g > 0.0 and np.isfinite(float(norm_G)) and float(norm_G) <= float(relaxed_g):
+        return f"relaxed_filter_accept_ginf={float(relaxed_g):.3e}"
+    return None
+
+
+def _project_box_with_single_linear_equality(
+    x: np.ndarray,
+    weights: np.ndarray,
+    lo: np.ndarray,
+    hi: np.ndarray,
+    target: float,
+    *,
+    tol: float = 1.0e-12,
+    max_iter: int = 80,
+) -> np.ndarray:
+    """
+    Project onto { z : lo <= z <= hi, weights^T z = target } by a scalar shift.
+
+    This is the exact weighted L2 projector for box bounds plus one affine
+    equality when the weights are non-negative. The map
+
+        lambda -> weights^T clip(x + lambda, lo, hi)
+
+    is then monotone, so a scalar bisection finds the unique feasible shift.
+    """
+    x = np.asarray(x, dtype=float).ravel()
+    weights = np.asarray(weights, dtype=float).ravel()
+    lo = np.asarray(lo, dtype=float).ravel()
+    hi = np.asarray(hi, dtype=float).ravel()
+    if not (x.size == weights.size == lo.size == hi.size):
+        raise ValueError("Projection inputs must have the same length.")
+    if x.size == 0:
+        return x.copy()
+    if np.any(~np.isfinite(x)):
+        raise ValueError("Projection input x contains non-finite entries.")
+    if np.any(~np.isfinite(weights)):
+        raise ValueError("Projection weights contain non-finite entries.")
+    if np.any(~np.isfinite(lo)) or np.any(~np.isfinite(hi)):
+        raise ValueError("Projection bounds must be finite for equality-constrained fields.")
+    if np.any(lo > hi):
+        raise ValueError("Projection bounds are inconsistent: lower bound exceeds upper bound.")
+
+    w = np.asarray(weights, dtype=float)
+    if np.any(w < -1.0e-14):
+        raise ValueError("Equality-constrained projection requires non-negative weights.")
+    w = np.where(np.abs(w) > 1.0e-18, w, 0.0)
+    if not np.any(w > 0.0):
+        raise ValueError("Equality-constrained projection received zero total weight.")
+
+    min_mass = float(w @ lo)
+    max_mass = float(w @ hi)
+    scale = max(abs(target), abs(min_mass), abs(max_mass), 1.0)
+    if target < min_mass - tol * scale or target > max_mass + tol * scale:
+        raise RuntimeError(
+            f"Equality target {target:.16e} is infeasible for the current box bounds "
+            f"[{min_mass:.16e}, {max_mass:.16e}]."
+        )
+    if target <= min_mass + tol * scale:
+        return lo.copy()
+    if target >= max_mass - tol * scale:
+        return hi.copy()
+
+    lam_lo = float(np.min(lo - x))
+    lam_hi = float(np.max(hi - x))
+
+    def _mass(lam: float) -> float:
+        return float(w @ np.minimum(np.maximum(x + float(lam), lo), hi))
+
+    f_lo = _mass(lam_lo) - target
+    f_hi = _mass(lam_hi) - target
+    if f_lo > tol * scale or f_hi < -tol * scale:
+        raise RuntimeError("Failed to bracket the equality-constrained box projection.")
+
+    for _ in range(int(max_iter)):
+        lam_mid = 0.5 * (lam_lo + lam_hi)
+        f_mid = _mass(lam_mid) - target
+        if abs(f_mid) <= tol * scale:
+            return np.minimum(np.maximum(x + lam_mid, lo), hi)
+        if f_mid < 0.0:
+            lam_lo = lam_mid
+        else:
+            lam_hi = lam_mid
+    lam_mid = 0.5 * (lam_lo + lam_hi)
+    return np.minimum(np.maximum(x + lam_mid, lo), hi)
+
+
+def _project_affine_linear_equalities(
+    x: np.ndarray,
+    B: np.ndarray,
+    b: np.ndarray,
+) -> np.ndarray:
+    """Euclidean projection onto the affine space { z : B z = b }."""
+    x = np.asarray(x, dtype=float).ravel()
+    B = np.asarray(B, dtype=float)
+    b = np.asarray(b, dtype=float).ravel()
+    if int(B.shape[0]) == 0:
+        return x.copy()
+    if int(B.shape[1]) != int(x.size):
+        raise ValueError("Affine projection matrix width does not match x.")
+    rhs = np.asarray(B @ x, dtype=float).ravel() - b
+    if int(rhs.size) == 0 or float(np.linalg.norm(rhs, ord=np.inf)) <= 0.0:
+        return x.copy()
+    gram = np.asarray(B @ B.T, dtype=float)
+    try:
+        lam = np.linalg.solve(gram, rhs)
+    except np.linalg.LinAlgError:
+        lam = np.linalg.lstsq(gram, rhs, rcond=None)[0]
+    return x - np.asarray(B.T @ lam, dtype=float).ravel()
+
+
+def _project_box_with_linear_equalities(
+    x: np.ndarray,
+    B: np.ndarray,
+    lo: np.ndarray,
+    hi: np.ndarray,
+    b: np.ndarray,
+    *,
+    tol: float = 1.0e-12,
+    max_iter: int = 200,
+) -> np.ndarray:
+    """
+    Euclidean projection onto { z : lo <= z <= hi, B z = b } via Dykstra.
+
+    This supports multiple linear equalities and coupled multi-field constraints.
+    """
+    x = np.asarray(x, dtype=float).ravel()
+    lo = np.asarray(lo, dtype=float).ravel()
+    hi = np.asarray(hi, dtype=float).ravel()
+    B = np.asarray(B, dtype=float)
+    b = np.asarray(b, dtype=float).ravel()
+    if not (x.size == lo.size == hi.size):
+        raise ValueError("Projection inputs must have the same length.")
+    if np.any(lo > hi):
+        raise ValueError("Projection bounds are inconsistent: lower bound exceeds upper bound.")
+    if int(B.shape[0]) == 0:
+        return np.minimum(np.maximum(x, lo), hi)
+    if int(B.shape[1]) != int(x.size):
+        raise ValueError("Equality projection matrix width does not match x.")
+    if int(B.shape[0]) != int(b.size):
+        raise ValueError("Equality projection right-hand side size does not match B.")
+
+    finite_bounds = np.concatenate(
+        [
+            np.asarray(lo[np.isfinite(lo)], dtype=float).ravel(),
+            np.asarray(hi[np.isfinite(hi)], dtype=float).ravel(),
+        ]
+    )
+    scale = max(
+        1.0,
+        float(np.linalg.norm(np.asarray(x, dtype=float), ord=np.inf)) if x.size else 0.0,
+        float(np.linalg.norm(np.asarray(b, dtype=float), ord=np.inf)) if b.size else 0.0,
+        float(np.linalg.norm(finite_bounds, ord=np.inf)) if finite_bounds.size else 0.0,
+    )
+
+    z = x.copy()
+    p_box = np.zeros_like(z, dtype=float)
+    p_aff = np.zeros_like(z, dtype=float)
+
+    for _ in range(int(max_iter)):
+        y = np.minimum(np.maximum(z + p_box, lo), hi)
+        p_box = z + p_box - y
+
+        z_new = _project_affine_linear_equalities(y + p_aff, B, b)
+        p_aff = y + p_aff - z_new
+
+        box_lo = np.maximum(lo - z_new, 0.0)
+        box_hi = np.maximum(z_new - hi, 0.0)
+        box_res = max(
+            float(np.linalg.norm(box_lo, ord=np.inf)) if box_lo.size else 0.0,
+            float(np.linalg.norm(box_hi, ord=np.inf)) if box_hi.size else 0.0,
+        )
+        eq_res = float(np.linalg.norm(np.asarray(B @ z_new, dtype=float).ravel() - b, ord=np.inf))
+        step_res = float(np.linalg.norm(z_new - z, ord=np.inf))
+        z = z_new
+        if step_res <= tol * scale and box_res <= 10.0 * tol * scale and eq_res <= 10.0 * tol * scale:
+            break
+
+    box_lo = np.maximum(lo - z, 0.0)
+    box_hi = np.maximum(z - hi, 0.0)
+    box_res = max(
+        float(np.linalg.norm(box_lo, ord=np.inf)) if box_lo.size else 0.0,
+        float(np.linalg.norm(box_hi, ord=np.inf)) if box_hi.size else 0.0,
+    )
+    eq_res = float(np.linalg.norm(np.asarray(B @ z, dtype=float).ravel() - b, ord=np.inf))
+    if box_res > 100.0 * tol * scale or eq_res > 100.0 * tol * scale:
+        raise RuntimeError(
+            "Failed to project onto the box-plus-equality feasible set "
+            f"(box_res={box_res:.3e}, eq_res={eq_res:.3e})."
+        )
+    return z.copy()
 
 # ----------------------------------------------------------------------------
 #  Restriction helper
 # ----------------------------------------------------------------------------
 # put this in nonlinear_solver.py (top-level) -------------------------
 class _ActiveReducer:
-    def __init__(self, dh, active_dofs):
+    def __init__(self, dh, active_dofs, constraint=None):
         self.dh = dh
+        self.constraint = constraint
         self.active = np.asarray(active_dofs, dtype=int)
-        self.full2red = {i: j for j, i in enumerate(self.active)}
+        self.full_size = constraint.n_master if constraint is not None else dh.total_dofs
+        self.phys_size = dh.total_dofs
+        self.full2red = {int(i): j for j, i in enumerate(self.active)}
 
     # vectors ----------------------------------------------------------
     def restrict_vec(self, v_full):
-        return v_full[self.active]
+        if self.constraint is None:
+            return v_full[self.active]
+        v_master = self.constraint.restrict_full(v_full)
+        return v_master[self.active]
 
     def expand_vec(self, v_red):
-        v_full = np.zeros(self.dh.total_dofs, dtype=v_red.dtype)
-        v_full[self.active] = v_red
-        return v_full
+        if self.constraint is None:
+            v_full = np.zeros(self.dh.total_dofs, dtype=v_red.dtype)
+            v_full[self.active] = v_red
+            return v_full
+        v_master = np.zeros(self.full_size, dtype=v_red.dtype)
+        v_master[self.active] = v_red
+        return self.constraint.prolong(v_master)
 
     # matrices ---------------------------------------------------------
     def restrict_mat(self, A_full):
         aid = self.active
-        return A_full.tocsr()[np.ix_(aid, aid)]
+        if self.constraint is None:
+            return A_full.tocsr()[np.ix_(aid, aid)]
+        A_master = self.constraint.E_T @ (A_full @ self.constraint.E)
+        return A_master.tocsr()[np.ix_(aid, aid)]
 
     # systems (full → reduced with BCs already handled in the full space)
     def reduce_system(self, A_full, R_full, dh, bcs):
-        K_red = self.restrict_mat(A_full)
-        F_red = self.restrict_vec(R_full)
+        if self.constraint is None:
+            F_red = self.restrict_vec(R_full)
+            K_red = None if A_full is None else self.restrict_mat(A_full)
+            bc_data = dh.get_dirichlet_data(bcs)
+            if bc_data:
+                rows_full = np.fromiter(bc_data.keys(), dtype=int)
+                vals_full = np.fromiter(bc_data.values(), dtype=float)
 
-        # Dirichlet on the reduced system (identical to your current code)
-        bc_data = dh.get_dirichlet_data(bcs)
-        if bc_data:
-            rows_full = np.fromiter(bc_data.keys(), dtype=int)
-            vals_full = np.fromiter(bc_data.values(), dtype=float)
+                # keep only rows that are active
+                mask = np.isin(rows_full, self.active)
+                rows_full = rows_full[mask]
+                vals_full = vals_full[mask]
+                if rows_full.size:
+                    rows_red = np.array([self.full2red[i] for i in rows_full])
+                    if K_red is not None:
+                        F_red -= K_red @ np.bincount(
+                            rows_red,
+                            weights=vals_full,
+                            minlength=self.active.size,
+                        )
 
-            # keep only rows that are active
-            mask = np.isin(rows_full, self.active)
-            rows_full = rows_full[mask]
-            vals_full = vals_full[mask]
-            if rows_full.size:
-                rows_red = np.array([self.full2red[i] for i in rows_full])
+                        K_red = _zero_rows_cols(K_red, rows_red)
 
-                F_red -= K_red @ np.bincount(rows_red, weights=vals_full,
-                                             minlength=self.active.size)
+                    # Residual-only line-search evaluations still need the
+                    # active Dirichlet rows overridden to their prescribed
+                    # values, but they do not need the Jacobian row/column
+                    # surgery when no matrix was requested.
+                    F_red[rows_red] = vals_full
+            return K_red, F_red
 
-                K_red = K_red.tolil()
-                K_red[rows_red, :] = 0
-                K_red[:, rows_red] = 0
-                K_red[rows_red, rows_red] = 1.0
-                K_red = K_red.tocsr()
+        # Constraint-aware path: condense first, then apply BCs in master space
+        R_master = self.constraint.E_T @ R_full
+        A_master = None if A_full is None else self.constraint.E_T @ (A_full @ self.constraint.E)
 
-                F_red[rows_red] = vals_full
-        return K_red, F_red
+        bc_data_full = dh.get_dirichlet_data(bcs)
+        bc_master = self.constraint.project_dirichlet(bc_data_full)
+        if bc_master:
+            rows_master = np.fromiter(bc_master.keys(), dtype=int)
+            vals_master = np.fromiter(bc_master.values(), dtype=float)
+            if rows_master.size:
+                if A_master is not None:
+                    R_master -= A_master @ np.bincount(
+                        rows_master, weights=vals_master, minlength=self.constraint.n_master
+                    )
+                    A_master = _zero_rows_cols(A_master, rows_master)
+                R_master[rows_master] = vals_master
+
+        if A_master is None:
+            return None, R_master[self.active]
+        A_red = A_master.tocsr()[np.ix_(self.active, self.active)]
+        R_red = R_master[self.active]
+        return A_red, R_red
 
 
 # ----------------------------------------------------------------------------
@@ -290,6 +1202,7 @@ class NewtonSolver:
         residual_form,
         jacobian_form,
         *,
+        linearization_pairs: Optional[Sequence[Tuple[object, object]]] = None,
         dof_handler,
         mixed_element,
         bcs: List,                       # inhomogeneous BCs  (values added)
@@ -302,10 +1215,18 @@ class NewtonSolver:
         # coefficient dictionary used for assembly. Returning ``None`` skips
         # geometry refresh for that call.
         deformation_update: Optional[Callable[[Dict[str, object]], np.ndarray]] = None,
+        constraints: Optional[object] = None,
+        use_hanging_constraints: bool = True,
         preproc_cb: Optional[Callable[[List], None]] = None,
+        # Optional callback invoked *before every assembly* (Jacobian/residual,
+        # including line-search residual evaluations). This is intended for
+        # updating dependent coefficients (e.g. projected Lagrange multipliers)
+        # so residual evaluations stay consistent with the current iterate.
+        preassemble_cb: Optional[Callable[[Dict[str, object]], None]] = None,
         postproc_cb: Optional[Callable[[List], None]] = None,
         backend: str = "jit",
         postproc_timeloop_cb: Optional[Callable[[List], None]] = None,
+        operators: Optional[Sequence[RuntimeOperator]] = None,
     ) -> None:
         self.dh = dof_handler
         self.me = mixed_element
@@ -314,24 +1235,96 @@ class NewtonSolver:
         self.np = newton_params
         self.lp = lin_params
         self.pre_cb = preproc_cb
+        self.preassemble_cb = preassemble_cb
         self.post_cb = postproc_cb
         self.post_timeloop_cb = postproc_timeloop_cb
+        self.post_accept_cb = None
         self.backend = backend
         self.quad_order = quad_order
         self.deformation = deformation
         self._deformation_update = deformation_update
+        self.operators: tuple[RuntimeOperator, ...] = tuple()
+        self.operator_manager: OperatorManager | None = None
+
+        if jacobian_form is None:
+            pairs = tuple(linearization_pairs or ())
+            if not pairs:
+                raise ValueError(
+                    "NewtonSolver requires either an explicit jacobian_form or "
+                    "linearization_pairs=[(coefficient, direction), ...] for auto-linearization."
+                )
+            coeffs = [pair[0] for pair in pairs]
+            directions = [pair[1] for pair in pairs]
+            try:
+                jacobian_form = linearize_form(
+                    residual_form,
+                    coeffs,
+                    directions,
+                    strict=True,
+                )
+            except GateauxDerivativeError as exc:
+                raise ValueError(
+                    "Failed to auto-linearize the residual form for NewtonSolver."
+                ) from exc
+            if len(getattr(jacobian_form, "integrals", []) or []) == 0:
+                raise ValueError(
+                    "Auto-linearization produced an empty Jacobian form. "
+                    "This usually means the selected coefficients are not active in the residual."
+                )
+        elif linearization_pairs:
+            raise ValueError(
+                "Provide either jacobian_form or linearization_pairs, not both."
+            )
 
         # Keep original forms handy (their .integrand is needed later)
         self._residual_form = residual_form
         self._jacobian_form = jacobian_form
 
         # --- compile one kernel list for K, one for F ----------------------
-        self._compile_all_kernels()
+        _profile_setup = os.getenv("PYCUTFEM_PROFILE_SETUP", "").lower() in {"1", "true", "yes"}
+        _t_setup0 = time.perf_counter() if _profile_setup else 0.0
+        parallel_default = "0" if self.backend == "cpp" else "1"
+        parallel_compile = os.getenv("PYCUTFEM_PARALLEL_COMPILE", parallel_default).lower() not in {"0", "false", "no"}
+        _start_numba_reduced_pattern_precompile()
+        _t_compile0 = time.perf_counter()
+        if self._is_jit_backend():
+            msg = f"[setup] preparing kernels (backend='{self.backend}', quad_order={int(self.quad_order)}, cache-aware)"
+            if parallel_compile:
+                msg += " (residual in background)"
+            print(msg, flush=True)
+        # Overlap residual-kernel compilation with active-DOF analysis + reduced-pattern
+        # building. This cuts time-to-first-Newton on small problems.
+        self._compile_all_kernels(parallel_residual=parallel_compile)
+        if self._is_jit_backend():
+            dt_compile = time.perf_counter() - _t_compile0
+            if parallel_compile and getattr(self, "_kernels_F_future", None) is not None:
+                print(f"[setup] kernels ready (jacobian) in {dt_compile:.3f}s; residual will finish during setup.", flush=True)
+            else:
+                print(f"[setup] kernels ready in {dt_compile:.3f}s", flush=True)
+        if _profile_setup:
+            dt = time.perf_counter() - _t_setup0
+            if getattr(self, "_kernels_F_future", None) is not None:
+                print(f"[setup] prepare kernels (jacobian): {dt:.3f}s  (residual preparing in background)")
+            else:
+                print(f"[setup] prepare kernels: {dt:.3f}s")
         # --- NEW: A PRIORI DOF ANALYSIS ---
         # Analyze the forms once to get the definitive set of active DOFs.
         self.equation = Equation(jacobian_form, residual_form)
         # Which BC list marks the fixed rows? Prefer homogeneous set.
         bcs_for_active = self.bcs_homog if getattr(self, "bcs_homog", None) else self.bcs
+        # Optional linear constraints → master space (AgFEM / hanging nodes)
+        self.constraints = constraints
+        if self.constraints is None and use_hanging_constraints and hasattr(self.dh, "build_hanging_node_constraints"):
+            try:
+                self.constraints = self.dh.build_hanging_node_constraints()
+            except Exception:
+                self.constraints = None
+        ndof_effective = self.constraints.n_master if self.constraints is not None else self.dh.total_dofs
+
+        def _map_to_master(ids):
+            if self.constraints is None:
+                return set(ids)
+            return self.constraints.to_master_set(ids)
         # 1) What DOFs are “touched” by Restriction (if any)?
         active_by_restr, has_restriction = analyze_active_dofs(
             self.equation, self.dh, self.me, bcs_for_active
@@ -340,7 +1333,7 @@ class NewtonSolver:
         bc_dofs = set(self.dh.get_dirichlet_data(bcs_for_active).keys())
 
         # Candidate DOFs that would remain without explicit drops
-        candidate = set(active_by_restr) if has_restriction else set(range(ndof))
+        candidate_master = _map_to_master(active_by_restr) if has_restriction else set(range(ndof_effective))
 
         # Optional DOF tags (e.g. CutFEM inactive regions) are honoured here.
         inactive_dofs: set[int] = set()
@@ -349,26 +1342,28 @@ class NewtonSolver:
             inactive_dofs = set(dh_tags.get("inactive", set()))
         # Remove DOFs tagged inactive but not already fixed by Dirichlet BCs
         inactive_free = inactive_dofs - bc_dofs
-        inactive_removed = len(inactive_free & candidate)
+        inactive_removed = len(inactive_free & set(active_by_restr if has_restriction else range(ndof)))
 
         # 2) Free DOFs = candidate DOFs \ (Dirichlet ∪ inactive)
-        free_set = (candidate - bc_dofs) - inactive_free
+        bc_master = _map_to_master(bc_dofs)
+        inactive_master = _map_to_master(inactive_free)
+        free_set = (candidate_master - bc_master) - inactive_master
         free = sorted(free_set)
 
         self.active_dofs = np.asarray(free, dtype=int)
         nfree = self.active_dofs.size
 
         # 3) Maps full ↔ reduced
-        self.full_to_red = -np.ones(ndof, dtype=int)
+        self.full_to_red = -np.ones(ndof_effective, dtype=int)
         self.full_to_red[self.active_dofs] = np.arange(nfree, dtype=int)
         self.red_to_full = self.active_dofs
 
         # 4) Always run the reduced path when there are any fixed DOFs
-        self.use_reduced = (nfree < ndof)
+        self.use_reduced = (nfree < ndof_effective)
         if not self.use_reduced:
             print("NewtonSolver: Operating on the full, unrestricted system.")
         else:
-            print(f"NewtonSolver: Reduced system with {nfree}/{ndof} DOFs.")
+            print(f"NewtonSolver: Reduced system with {nfree}/{ndof_effective} DOFs.")
 
         # Optional sanity log:
         print(f"  Dirichlet DOFs detected: {len(bc_dofs)}; Free DOFs: {nfree}")
@@ -378,38 +1373,2278 @@ class NewtonSolver:
                 print(f"  Inactive DOFs dropped: {inactive_removed}")
             else:
                 print("  Inactive DOFs already excluded by restriction domains.")
-
+        print(f"NewtonSolver using backend '{self.backend}'.")
+        print(f"NewtonSolver linear solver backend '{str(getattr(self.lp, 'backend', 'scipy') or 'scipy')}'.")
         # Build once: CSR structure & per-element scatter plan for reduced system
+        _t_pat0 = time.perf_counter() if _profile_setup else 0.0
         self._build_reduced_pattern()
+        if _profile_setup:
+            print(f"[setup] reduced pattern: {time.perf_counter() - _t_pat0:.3f}s")
 
-        self.restrictor = _ActiveReducer(self.dh, self.active_dofs)
+        # Residual kernels may still be compiling in the background when
+        # `PYCUTFEM_PARALLEL_COMPILE=1`. Synchronize before leaving __init__
+        # so failures surface early and no background threads linger.
+        _t_wait0 = time.perf_counter() if _profile_setup else 0.0
+        self._finish_residual_kernel_compilation()
+        if _profile_setup:
+            dt_wait = time.perf_counter() - _t_wait0
+            # Only print if we actually waited a noticeable amount.
+            if dt_wait >= 1.0e-3:
+                print(f"[setup] compile kernels (residual wait): {dt_wait:.3f}s")
+        self.restrictor = _ActiveReducer(self.dh, self.active_dofs, constraint=self.constraints)
+        self._solver_coord_logistic_fields: tuple[str, ...] = tuple()
+        self._solver_coord_logistic_eps: float = 1.0e-8
+        self._solver_coord_logistic_master_mask = np.zeros(
+            (int(ndof_effective),), dtype=bool
+        )
+        self._solver_coord_logistic_red_mask = np.zeros((int(nfree),), dtype=bool)
+        self._mean_value_gauge_field: str | None = None
+        self._mean_value_gauge_coeff_name: str | None = None
+        self._mean_value_gauge_strength: float = 0.0
+        self._mean_value_gauge_full_weights = np.zeros((int(self.dh.total_dofs),), dtype=float)
+        self._mean_value_gauge_red_weights = np.zeros((int(nfree),), dtype=float)
+        self._reduced_equation_row_scaling: bool = False
+        self._reduced_variable_column_scaling: bool = False
+        self._reduced_variable_column_scaling_fields: tuple[str, ...] = tuple()
+        self._reduced_system_scaling_mode: str = "field"
+        self._reduced_scaling_ruiz_iters: int = 6
+        self._reduced_row_scale_current = np.ones((int(nfree),), dtype=float)
+        self._reduced_col_scale_current = np.ones((int(nfree),), dtype=float)
+        self._reduced_row_scale_field_current: dict[str, float] = {}
+        self._reduced_col_scale_field_current: dict[str, float] = {}
+        self._manual_reduced_row_field_scales: dict[str, float] = {}
+        self._manual_reduced_col_field_scales: dict[str, float] = {}
+        self._reduced_field_names = np.asarray([], dtype=object)
+        self._active_field_names: tuple[str, ...] = tuple()
+        self._reduced_schur_enabled: bool = False
+        self._reduced_schur_pressure_fields: tuple[str, ...] = ("p", "p_mean")
+        self._reduced_schur_diag_only: bool = False
+        self._reduced_schur_shift_rel: float = 1.0e-12
+        self._reduced_schur_pressure_scale_mode: str = "none"
+        self._reduced_schur_pressure_scale_value: float = 1.0
+        self._reduced_schur_trace: bool = False
+        self._reduced_schur_last_info: dict[str, object] = {}
+        self._block_linear_solver_config: dict[str, object] | None = None
+        self._block_linear_last_report: dict[str, object] = {}
+        self._block_linear_last_fallback_signature: tuple[tuple[str, ...], tuple[str, ...]] | None = None
+        self._newton_ptc_sigma_current: float = 0.0
+        self._refresh_reduced_field_names()
+        self.set_runtime_operators(operators)
+
+    def set_runtime_operators(self, operators: Optional[Sequence[RuntimeOperator]] = None) -> None:
+        self.operators = tuple(operators or ())
+        self.operator_manager = OperatorManager(self.operators) if self.operators else None
+        if self.operator_manager is not None:
+            self.operator_manager.bind(self)
+
+    def _before_reduced_assembly(self, coeffs, *, need_matrix: bool) -> None:
+        if getattr(self, "preassemble_cb", None) is not None:
+            self.preassemble_cb(coeffs)
+        if self.operator_manager is not None:
+            self.operator_manager.before_assembly(
+                solver=self,
+                coeffs=coeffs,
+                need_matrix=bool(need_matrix),
+            )
+
+    def _after_reduced_assembly(self, coeffs, A_red, R_red, *, need_matrix: bool):
+        if self.operator_manager is None:
+            return A_red, R_red
+        return self.operator_manager.after_assembly(
+            solver=self,
+            coeffs=coeffs,
+            A_red=A_red,
+            R_red=R_red,
+            need_matrix=bool(need_matrix),
+        )
+
+    def scatter_element_contribs_reduced(
+        self,
+        *,
+        K_elem: np.ndarray | None,
+        F_elem: np.ndarray | None,
+        element_ids: np.ndarray,
+        gdofs_map: np.ndarray,
+        A_red,
+        R_red,
+        hook=None,
+    ):
+        """
+        Scatter explicit element-local contributions into the reduced system.
+
+        This is the stable solver-facing entry point for runtime operators that
+        own discrete local algebra and want to inject their already-assembled
+        element blocks after the ordinary backend assembly.
+        """
+        def _runtime_reduced_scatter_plan(gdofs_arr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+            if getattr(self, "_pattern_stale", True):
+                self._build_reduced_pattern()
+            cache = getattr(self, "_runtime_reduced_scatter_plan_cache", None)
+            if not isinstance(cache, dict):
+                cache = {}
+                self._runtime_reduced_scatter_plan_cache = cache
+            key = int(id(gdofs_arr))
+            cached = cache.get(key)
+            if cached is not None:
+                return cached
+            full = np.asarray(gdofs_arr, dtype=np.int64)
+            ndof_full = int(getattr(self.full_to_red, "size", 0))
+            red = -np.ones_like(full, dtype=np.int32)
+            valid = (full >= 0) & (full < ndof_full)
+            if np.any(valid):
+                red[valid] = self.full_to_red[full[valid]]
+            if _HAVE_NUMBA_REDUCED_PATTERN:
+                _wait_numba_reduced_pattern_precompile()
+                pos_flat = _build_pos_flat_numba(red, self._csr_indptr, self._csr_indices)
+            else:
+                n_ent, n_loc = int(red.shape[0]), int(red.shape[1])
+                pos_flat = -np.ones((n_ent, int(n_loc * n_loc)), dtype=np.int32)
+                indptr = np.asarray(self._csr_indptr, dtype=np.int32)
+                indices = np.asarray(self._csr_indices, dtype=np.int32)
+                for e in range(n_ent):
+                    row_red = red[e]
+                    col_mask = row_red >= 0
+                    if not np.any(col_mask):
+                        continue
+                    cols_act = row_red[col_mask].astype(np.int32, copy=False)
+                    all_cols_active = bool(np.all(col_mask))
+                    for i in range(n_loc):
+                        ra = int(row_red[i])
+                        if ra < 0:
+                            continue
+                        s = int(indptr[ra])
+                        epos = int(indptr[ra + 1])
+                        row_cols = indices[s:epos]
+                        row_pos = s + np.searchsorted(row_cols, cols_act)
+                        seg = pos_flat[e, int(i * n_loc) : int((i + 1) * n_loc)]
+                        if all_cols_active:
+                            seg[:] = row_pos
+                        else:
+                            seg[col_mask] = row_pos
+            cache[key] = (pos_flat, red)
+            return pos_flat, red
+
+        fast_runtime_scatter = (
+            hasattr(self, "active_dofs")
+            and hasattr(self, "full_to_red")
+            and
+            getattr(self, "constraints", None) is None
+            and isinstance(gdofs_map, np.ndarray)
+            and gdofs_map.ndim == 2
+            and (
+                (A_red is not None and sp.isspmatrix(A_red))
+                or (A_red is None and R_red is not None)
+            )
+        )
+        if fast_runtime_scatter:
+            pos_flat, red_map = _runtime_reduced_scatter_plan(np.asarray(gdofs_map, dtype=int))
+            A_work = A_red
+            if A_red is not None and sp.isspmatrix(A_red) and not sp.isspmatrix_csr(A_red):
+                A_work = A_red.tocsr(copy=True)
+            try:
+                if A_work is not None and K_elem is not None and sp.isspmatrix_csr(A_work):
+                    k_flat = np.asarray(K_elem, dtype=float).reshape(int(K_elem.shape[0]), -1)
+                    data = A_work.data
+                    if _HAVE_NUMBA_REDUCED_PATTERN:
+                        _wait_numba_reduced_pattern_precompile()
+                        _scatter_csr_pos_flat_numba(data, np.asarray(pos_flat, dtype=np.int32), k_flat)
+                    else:
+                        for e in range(int(pos_flat.shape[0])):
+                            pflat = np.asarray(pos_flat[e], dtype=np.int32)
+                            if pflat.size == 0:
+                                continue
+                            mask = pflat >= 0
+                            if not np.any(mask):
+                                continue
+                            data[pflat[mask]] += k_flat[e, mask]
+                if R_red is not None and F_elem is not None:
+                    ff = np.asarray(F_elem, dtype=float)
+                    if ff.shape == tuple(red_map.shape) and ff.size:
+                        if _HAVE_NUMBA_REDUCED_PATTERN:
+                            _wait_numba_reduced_pattern_precompile()
+                            _scatter_vec_red_map_numba(R_red, np.asarray(red_map, dtype=np.int32), ff)
+                        else:
+                            rm = np.asarray(red_map, dtype=np.int32).ravel()
+                            ff_flat = ff.ravel()
+                            mask = rm >= 0
+                            if np.any(mask):
+                                np.add.at(R_red, rm[mask], ff_flat[mask])
+                return A_work, R_red
+            except IndexError:
+                self._pattern_stale = True
+                if hasattr(self, "_runtime_reduced_scatter_plan_cache"):
+                    self._runtime_reduced_scatter_plan_cache = {}
+                self._build_reduced_pattern()
+
+        A_work = A_red
+        if A_red is not None and sp.isspmatrix(A_red) and not sp.isspmatrix_lil(A_red):
+            A_work = A_red.tolil(copy=True)
+        _scatter_element_contribs_reduced(
+            K_elem=K_elem,
+            F_elem=F_elem,
+            J_elem=None,
+            element_ids=np.asarray(element_ids, dtype=int),
+            gdofs_map=np.asarray(gdofs_map, dtype=int),
+            A_red=A_work,
+            R_red=R_red,
+            full_to_red=np.asarray(self.full_to_red, dtype=int),
+            hook=hook,
+        )
+        if A_work is not A_red:
+            A_red = A_work.tocsr()
+        return A_red, R_red
+
+    def record_amgcl_kratos_dirichlet_pattern(
+        self,
+        *,
+        K_elem: np.ndarray | None,
+        gdofs_map: np.ndarray | None,
+    ) -> None:
+        """Record the full Kratos-style constrained pattern for AMGCL solves.
+
+        Kratos applies Dirichlet constraints by keeping the original sparse
+        graph, zeroing constrained rows/columns, and retaining the original
+        diagonal. AMGCL uses that graph while building its hierarchy. The local
+        reduced solver drops constrained DOFs, so the block-AMGCL expansion
+        needs this element graph to reproduce Kratos' iterative path.
+        """
+        backend = str(getattr(getattr(self, "lp", None), "backend", "") or "").strip().lower()
+        if backend != "amgcl" or getattr(self, "constraints", None) is not None:
+            return
+        mode = str(os.getenv("PYCUTFEM_LINEAR_AMGCL_KRATOS_DIRICHLET_PATTERN", "1") or "1").strip().lower()
+        if mode in {"0", "false", "no", "off"}:
+            return
+        if K_elem is None or gdofs_map is None:
+            return
+        try:
+            gdofs = np.asarray(gdofs_map, dtype=int)
+            kel = np.asarray(K_elem, dtype=float)
+        except Exception:
+            return
+        if gdofs.ndim != 2 or kel.ndim != 3 or int(kel.shape[0]) != int(gdofs.shape[0]):
+            return
+        if int(kel.shape[1]) != int(gdofs.shape[1]) or int(kel.shape[2]) != int(gdofs.shape[1]):
+            return
+
+        system_master_ids = self._amgcl_system_master_ids()
+        n_system = int(system_master_ids.size)
+        n_master = int(getattr(self.full_to_red, "size", 0))
+        if n_system <= 0 or n_master <= 0:
+            return
+        master_to_system = -np.ones((n_master,), dtype=int)
+        master_to_system[system_master_ids] = np.arange(n_system, dtype=int)
+        valid_g = (gdofs >= 0) & (gdofs < n_master)
+        sys = -np.ones_like(gdofs, dtype=int)
+        if np.any(valid_g):
+            sys[valid_g] = master_to_system[gdofs[valid_g]]
+        valid = sys >= 0
+        if not np.any(valid):
+            return
+
+        row = np.broadcast_to(sys[:, :, None], kel.shape).reshape(-1)
+        col = np.broadcast_to(sys[:, None, :], kel.shape).reshape(-1)
+        mask = (row >= 0) & (col >= 0)
+        if not np.any(mask):
+            return
+        data = np.zeros((int(np.count_nonzero(mask)),), dtype=float)
+        pattern = sp.coo_matrix(
+            (data, (row[mask], col[mask])),
+            shape=(n_system, n_system),
+        ).tocsr()
+        pattern.sum_duplicates()
+        # Keep explicit zeros: they are the AMGCL graph Kratos uses after
+        # ApplyDirichletConditions zeroes fixed rows and columns.
+        self._last_amgcl_kratos_dirichlet_pattern = pattern
+
+        diag = np.zeros((n_master,), dtype=float)
+        try:
+            diag_loc = np.diagonal(kel, axis1=1, axis2=2)
+            if diag_loc.shape == gdofs.shape and np.any(valid_g):
+                np.add.at(diag, gdofs[valid_g], diag_loc[valid_g])
+            self._last_amgcl_kratos_dirichlet_diag = diag
+        except Exception:
+            pass
+
+    def scatter_element_contribs_full(
+        self,
+        *,
+        K_elem: np.ndarray | None,
+        F_elem: np.ndarray | None,
+        element_ids: np.ndarray,
+        gdofs_map: np.ndarray,
+        A_full=None,
+        R_full=None,
+        add: bool = True,
+        hook=None,
+    ):
+        """
+        Scatter explicit element-local contributions into a full system.
+
+        This mirrors the reduced scatter helper but targets the unreduced
+        matrix/vector containers. It is primarily useful for local operators
+        that want a stable solver-owned scatter utility outside the compiled
+        backend assembly path.
+        """
+        element_ids_arr = np.asarray(element_ids, dtype=int)
+        gdofs_map_arr = np.asarray(gdofs_map, dtype=int)
+        if A_full is not None and K_elem is not None:
+            _scatter_element_contribs(
+                K_elem=np.asarray(K_elem, dtype=float),
+                F_elem=None,
+                J_elem=None,
+                element_ids=element_ids_arr,
+                gdofs_map=gdofs_map_arr,
+                target=A_full,
+                ctx={"rhs": False, "add": bool(add)},
+                integrand=None,
+                hook=hook,
+            )
+        if R_full is not None and F_elem is not None:
+            _scatter_element_contribs(
+                K_elem=None,
+                F_elem=np.asarray(F_elem, dtype=float),
+                J_elem=None,
+                element_ids=element_ids_arr,
+                gdofs_map=gdofs_map_arr,
+                target=R_full,
+                ctx={"rhs": True, "add": bool(add)},
+                integrand=None,
+                hook=hook,
+            )
+        return A_full, R_full
+
+    def _notify_operator_step_begin(
+        self,
+        *,
+        functions,
+        prev_functions,
+        aux_functions,
+        step: int,
+        step_no: int,
+        t: float,
+        dt: float,
+        bcs,
+    ) -> None:
+        if self.operator_manager is None:
+            return
+        self.operator_manager.on_step_begin(
+            solver=self,
+            functions=functions,
+            prev_functions=prev_functions,
+            aux_functions=aux_functions,
+            step=int(step),
+            step_no=int(step_no),
+            t=float(t),
+            dt=float(dt),
+            bcs=bcs,
+        )
+
+    def _notify_operator_step_accept(
+        self,
+        *,
+        functions,
+        prev_functions,
+        aux_functions,
+        step: int,
+        step_no: int,
+        t: float,
+        dt: float,
+        bcs,
+    ) -> None:
+        if self.operator_manager is None:
+            return
+        self.operator_manager.on_step_accept(
+            solver=self,
+            functions=functions,
+            prev_functions=prev_functions,
+            aux_functions=aux_functions,
+            step=int(step),
+            step_no=int(step_no),
+            t=float(t),
+            dt=float(dt),
+            bcs=bcs,
+        )
+
+    def _notify_operator_step_reject(
+        self,
+        *,
+        functions,
+        prev_functions,
+        aux_functions,
+        step: int,
+        step_no: int,
+        t: float,
+        dt: float,
+        bcs,
+        exception,
+        reason: str | None,
+    ) -> None:
+        if self.operator_manager is None:
+            return
+        self.operator_manager.on_step_reject(
+            solver=self,
+            functions=functions,
+            prev_functions=prev_functions,
+            aux_functions=aux_functions,
+            step=int(step),
+            step_no=int(step_no),
+            t=float(t),
+            dt=float(dt),
+            bcs=bcs,
+            exception=exception,
+            reason=None if reason is None else str(reason),
+        )
+
+    def _notify_operator_nonlinear_iteration_begin(
+        self,
+        *,
+        functions,
+        prev_functions,
+        aux_functions,
+        iteration: int,
+        coeffs,
+        bcs,
+        metrics: dict | None = None,
+    ) -> None:
+        if self.operator_manager is None:
+            return
+        self.operator_manager.on_nonlinear_iteration_begin(
+            solver=self,
+            functions=functions,
+            prev_functions=prev_functions,
+            aux_functions=aux_functions,
+            iteration=int(iteration),
+            coeffs=coeffs,
+            bcs=bcs,
+            metrics=dict(metrics or {}),
+        )
+
+    def _notify_operator_nonlinear_update(
+        self,
+        *,
+        functions,
+        prev_functions,
+        aux_functions,
+        iteration: int,
+        coeffs,
+        delta_red=None,
+        delta_full=None,
+        bcs=None,
+        metrics: dict | None = None,
+    ) -> None:
+        if self.operator_manager is None:
+            return
+        self.operator_manager.on_nonlinear_update(
+            solver=self,
+            functions=functions,
+            prev_functions=prev_functions,
+            aux_functions=aux_functions,
+            iteration=int(iteration),
+            coeffs=coeffs,
+            delta_red=delta_red,
+            delta_full=delta_full,
+            bcs=bcs,
+            metrics=dict(metrics or {}),
+        )
+
+    def _notify_operator_nonlinear_iteration_end(
+        self,
+        *,
+        functions,
+        prev_functions,
+        aux_functions,
+        iteration: int,
+        coeffs,
+        converged: bool,
+        bcs,
+        metrics: dict | None = None,
+    ) -> None:
+        if self.operator_manager is None:
+            return
+        self.operator_manager.on_nonlinear_iteration_end(
+            solver=self,
+            functions=functions,
+            prev_functions=prev_functions,
+            aux_functions=aux_functions,
+            iteration=int(iteration),
+            coeffs=coeffs,
+            converged=bool(converged),
+            bcs=bcs,
+            metrics=dict(metrics or {}),
+        )
+
+    @staticmethod
+    def _field_name_scale_vector(field_names, field_scales: dict[str, float] | None) -> tuple[np.ndarray, dict[str, float]]:
+        names = np.asarray(field_names, dtype=object)
+        scale = np.ones(names.shape, dtype=float)
+        used: dict[str, float] = {}
+        for fld, raw_val in dict(field_scales or {}).items():
+            name = str(fld).strip()
+            if not name:
+                continue
+            try:
+                val = float(raw_val)
+            except Exception:
+                continue
+            if not np.isfinite(val) or val <= 0.0:
+                continue
+            mask = names == name
+            if np.any(mask):
+                scale[mask] = val
+                used[name] = val
+        scale = np.where(np.isfinite(scale) & (scale > 0.0), scale, 1.0)
+        return scale, used
+
+    def _refresh_solver_coordinate_transform_masks(self) -> None:
+        ndof_eff = (
+            int(self.constraints.n_master)
+            if getattr(self, "constraints", None) is not None
+            else int(self.dh.total_dofs)
+        )
+        master_mask = np.zeros((ndof_eff,), dtype=bool)
+        names = tuple(str(name) for name in getattr(self, "_solver_coord_logistic_fields", tuple()) if str(name))
+        for field in names:
+            try:
+                field_ids = np.asarray(self.dh.get_field_slice(field), dtype=int).ravel()
+            except Exception as exc:
+                raise ValueError(f"Unknown field '{field}' requested for logistic Newton coordinates.") from exc
+            if field_ids.size == 0:
+                continue
+            if getattr(self, "constraints", None) is None:
+                master_ids = field_ids
+            else:
+                master_ids = np.asarray(
+                    sorted(self.constraints.to_master_set(field_ids.tolist())),
+                    dtype=int,
+                )
+            if master_ids.size:
+                master_mask[master_ids] = True
+        self._solver_coord_logistic_master_mask = master_mask
+        active = np.asarray(getattr(self, "active_dofs", np.asarray([], dtype=int)), dtype=int).ravel()
+        if active.size:
+            self._solver_coord_logistic_red_mask = np.asarray(master_mask[active], dtype=bool)
+        else:
+            self._solver_coord_logistic_red_mask = np.zeros((0,), dtype=bool)
+
+    def set_logistic_transform_fields(self, field_names, *, eps: float = 1.0e-8) -> tuple[str, ...]:
+        if isinstance(field_names, str):
+            names = [str(field_names)]
+        else:
+            names = [str(name) for name in list(field_names or [])]
+        ordered = tuple(dict.fromkeys(name for name in names if name))
+        self._solver_coord_logistic_fields = ordered
+        self._solver_coord_logistic_eps = max(float(eps), 1.0e-15)
+        self._refresh_solver_coordinate_transform_masks()
+        return self._solver_coord_logistic_fields
+
+    def set_mean_value_gauge(
+        self,
+        field_name: str,
+        *,
+        full_weights,
+        coeff_name: str | None = None,
+        strength: float = 1.0,
+    ) -> None:
+        weights = np.asarray(full_weights, dtype=float).ravel()
+        if weights.size != int(self.dh.total_dofs):
+            raise ValueError(
+                f"Mean-value gauge weights for field '{field_name}' have size {int(weights.size)}, "
+                f"expected {int(self.dh.total_dofs)}."
+            )
+        if not np.all(np.isfinite(weights)):
+            raise ValueError(f"Mean-value gauge weights for field '{field_name}' contain non-finite values.")
+        self._mean_value_gauge_field = str(field_name)
+        self._mean_value_gauge_coeff_name = None if coeff_name is None else str(coeff_name)
+        self._mean_value_gauge_strength = float(strength)
+        self._mean_value_gauge_full_weights = weights.copy()
+        if getattr(self, "constraints", None) is not None:
+            master_ids = np.asarray(self.constraints.master_ids, dtype=int)
+            master_weights = np.asarray(weights[master_ids], dtype=float).ravel()
+        else:
+            master_weights = np.asarray(weights, dtype=float).ravel()
+        self._mean_value_gauge_red_weights = np.asarray(master_weights[self.active_dofs], dtype=float).ravel()
+
+    def _refresh_reduced_field_names(self) -> np.ndarray:
+        nred = int(np.asarray(getattr(self, "active_dofs", np.asarray([], dtype=int)), dtype=int).size)
+        names = np.empty((nred,), dtype=object)
+        names[:] = ""
+        if nred == 0:
+            self._reduced_field_names = names
+            return names
+        ndof_eff = int(self.full_to_red.size) if hasattr(self, "full_to_red") else int(self.dh.total_dofs)
+        for fld in getattr(self.dh, "field_names", []):
+            try:
+                field_ids = np.asarray(self.dh.get_field_slice(str(fld)), dtype=int).ravel()
+            except Exception:
+                continue
+            if field_ids.size == 0:
+                continue
+            if getattr(self, "constraints", None) is None:
+                master_ids = field_ids
+            else:
+                master_ids = np.asarray(
+                    sorted(self.constraints.to_master_set(field_ids.tolist())),
+                    dtype=int,
+                )
+            if master_ids.size == 0:
+                continue
+            valid = (master_ids >= 0) & (master_ids < ndof_eff)
+            if not np.any(valid):
+                continue
+            red = np.asarray(self.full_to_red[master_ids[valid]], dtype=int).ravel()
+            red = red[red >= 0]
+            if red.size:
+                names[red] = str(fld)
+        self._reduced_field_names = names
+        return names
+
+    def set_reduced_system_scaling(
+        self,
+        *,
+        equation_row_scaling: bool = False,
+        variable_column_scaling: bool = False,
+        variable_column_scaling_fields=(),
+        mode: str = "field",
+        ruiz_iters: int = 6,
+    ) -> None:
+        self._reduced_equation_row_scaling = bool(equation_row_scaling)
+        self._reduced_variable_column_scaling = bool(variable_column_scaling)
+        mode_key = str(mode or "field").strip().lower().replace("-", "_")
+        if mode_key not in {"field", "ruiz"}:
+            raise ValueError(f"Unsupported reduced-system scaling mode '{mode}'.")
+        self._reduced_system_scaling_mode = mode_key
+        self._reduced_scaling_ruiz_iters = max(int(ruiz_iters), 0)
+        if isinstance(variable_column_scaling_fields, str):
+            names = [str(variable_column_scaling_fields)]
+        else:
+            names = [str(name) for name in list(variable_column_scaling_fields or [])]
+        self._reduced_variable_column_scaling_fields = tuple(
+            dict.fromkeys(name for name in names if name)
+        )
+        self._refresh_reduced_field_names()
+
+    def set_manual_reduced_system_scaling(
+        self,
+        *,
+        equation_row_field_scales: dict[str, float] | None = None,
+        variable_column_field_scales: dict[str, float] | None = None,
+    ) -> None:
+        self._manual_reduced_row_field_scales = {
+            str(k): float(v)
+            for k, v in dict(equation_row_field_scales or {}).items()
+            if str(k)
+        }
+        self._manual_reduced_col_field_scales = {
+            str(k): float(v)
+            for k, v in dict(variable_column_field_scales or {}).items()
+            if str(k)
+        }
+        self._refresh_reduced_field_names()
+
+    def _newton_selected_field_mask(self, fields: tuple[str, ...] | list[str] | None) -> np.ndarray:
+        active = np.asarray(getattr(self, "active_dofs", np.asarray([], dtype=int)), dtype=int).ravel()
+        field_names = np.asarray(getattr(self, "_reduced_field_names", np.asarray([], dtype=object)), dtype=object)
+        if field_names.shape != active.shape:
+            field_names = self._refresh_reduced_field_names()
+        mask = np.zeros(field_names.shape, dtype=bool)
+        if field_names.size == 0:
+            return mask
+        names = tuple(str(fld).strip() for fld in (fields or ()) if str(fld).strip())
+        if not names:
+            mask[:] = True
+            return mask
+        selected = set(names)
+        for fld in selected:
+            mask |= field_names == fld
+        return mask
+
+    def _newton_ptc_late_phase_active(self, *, residual_norm: float | None = None) -> bool:
+        thresh = float(getattr(self.np, "ptc_late_switch_residual", 0.0) or 0.0)
+        if thresh <= 0.0 or residual_norm is None or not np.isfinite(float(residual_norm)):
+            return False
+        return float(residual_norm) <= thresh
+
+    def _newton_ptc_active_fields(self, *, residual_norm: float | None = None) -> tuple[str, ...]:
+        base = tuple(str(fld).strip() for fld in (getattr(self.np, "ptc_fields", tuple()) or ()) if str(fld).strip())
+        late = tuple(
+            str(fld).strip()
+            for fld in (getattr(self.np, "ptc_late_fields", tuple()) or ())
+            if str(fld).strip()
+        )
+        if late and self._newton_ptc_late_phase_active(residual_norm=residual_norm):
+            return late
+        return base
+
+    def _newton_ptc_operator_mode(self, *, residual_norm: float | None = None) -> str:
+        base = str(getattr(self.np, "ptc_operator_mode", "row_normalized") or "row_normalized").strip().lower()
+        late_mode = str(getattr(self.np, "ptc_late_operator_mode", "") or "").strip().lower()
+        if late_mode and self._newton_ptc_late_phase_active(residual_norm=residual_norm):
+            return late_mode
+        return base
+
+    def _newton_field_proximal_diag(
+        self,
+        A_base: sp.csr_matrix,
+        field_mask: np.ndarray,
+    ) -> np.ndarray:
+        field_mask = np.asarray(field_mask, dtype=bool).ravel()
+        n = int(getattr(A_base, "shape", (0, 0))[0])
+        if field_mask.size != n:
+            raise ValueError("Selected-field mask size does not match the reduced Newton system.")
+        if not np.any(field_mask):
+            return np.zeros((n,), dtype=float)
+        if not sp.isspmatrix_csr(A_base):
+            A_base = A_base.tocsr()
+        diag_full = np.abs(np.asarray(A_base.diagonal(), dtype=float))
+        row_abs_full = np.asarray(np.abs(A_base).sum(axis=1)).ravel()
+        floor = float(getattr(self.np, "ptc_min_diag", 1.0e-12) or 1.0e-12)
+        diag = np.where(
+            np.isfinite(diag_full) & (diag_full > floor),
+            diag_full,
+            np.where(np.isfinite(row_abs_full) & (row_abs_full > floor), row_abs_full, floor),
+        )
+        out = np.zeros((n,), dtype=float)
+        out[field_mask] = diag[field_mask]
+        return out
+
+    def _newton_apply_ptc_regularization(
+        self,
+        A_mod: sp.csr_matrix,
+        A_base: sp.csr_matrix,
+        field_mask: np.ndarray,
+        sigma: float,
+        *,
+        mode: str | None = None,
+    ) -> tuple[sp.csr_matrix, np.ndarray]:
+        field_mask = np.asarray(field_mask, dtype=bool).ravel()
+        if sigma <= 0.0 or not np.any(field_mask):
+            return A_mod, np.zeros(field_mask.shape, dtype=float)
+        n = int(getattr(A_base, "shape", (0, 0))[0])
+        if field_mask.size != n:
+            raise ValueError("Selected-field mask size does not match the reduced Newton system.")
+        if not sp.isspmatrix_csr(A_base):
+            A_base = A_base.tocsr()
+        idx = np.flatnonzero(field_mask)
+        if idx.size == 0:
+            return A_mod, np.zeros((n,), dtype=float)
+
+        mode = str(
+            mode if mode is not None else getattr(self.np, "ptc_operator_mode", "row_normalized") or "row_normalized"
+        ).strip().lower()
+        if mode in {"diag", "diagonal", "prox"}:
+            diag = self._newton_field_proximal_diag(A_base, field_mask)
+            add = float(sigma) * np.asarray(diag, dtype=float)
+            if not np.any(add > 0.0):
+                return A_mod, np.zeros(field_mask.shape, dtype=float)
+            return (A_mod + sp.diags(add, format="csr")).tocsr(), add
+
+        A_sel = A_base[idx, :][:, idx].tocoo()
+        if int(A_sel.nnz) == 0:
+            return A_mod, np.zeros((n,), dtype=float)
+
+        floor = float(getattr(self.np, "ptc_min_diag", 1.0e-12) or 1.0e-12)
+        row_abs = np.asarray(np.abs(A_sel).max(axis=1).toarray(), dtype=float).ravel()
+        row_abs = np.where(np.isfinite(row_abs) & (row_abs > floor), row_abs, floor)
+
+        if mode in {"row", "row_normalized", "row-normalized"}:
+            data = np.asarray(A_sel.data, dtype=float) / row_abs[np.asarray(A_sel.row, dtype=int)]
+            diag_local = np.abs(np.asarray(A_sel.diagonal(), dtype=float)) / row_abs
+        elif mode in {"sym", "symmetric", "symmetric_normalized", "symmetric-normalized"}:
+            col_abs = np.asarray(np.abs(A_sel).max(axis=0).toarray(), dtype=float).ravel()
+            col_abs = np.where(np.isfinite(col_abs) & (col_abs > floor), col_abs, floor)
+            scale = np.sqrt(row_abs[np.asarray(A_sel.row, dtype=int)] * col_abs[np.asarray(A_sel.col, dtype=int)])
+            scale = np.where(np.isfinite(scale) & (scale > floor), scale, 1.0)
+            data = np.asarray(A_sel.data, dtype=float) / scale
+            diag_local = np.abs(np.asarray(A_sel.diagonal(), dtype=float)) / np.sqrt(row_abs * col_abs)
+        else:
+            raise ValueError(f"Unsupported Newton PTC operator mode: {mode}")
+
+        op = sp.coo_matrix(
+            (
+                float(sigma) * np.asarray(data, dtype=float),
+                (
+                    idx[np.asarray(A_sel.row, dtype=int)],
+                    idx[np.asarray(A_sel.col, dtype=int)],
+                ),
+            ),
+            shape=A_mod.shape,
+        ).tocsr()
+        add = np.zeros((n,), dtype=float)
+        add[idx] = float(sigma) * np.asarray(diag_local, dtype=float)
+        return (A_mod + op).tocsr(), add
+
+    def _newton_apply_selected_field_freeze(
+        self,
+        A_mod: sp.csr_matrix,
+        rhs: np.ndarray,
+        field_mask: np.ndarray,
+    ) -> tuple[sp.csr_matrix, np.ndarray]:
+        field_mask = np.asarray(field_mask, dtype=bool).ravel()
+        rhs = np.asarray(rhs, dtype=float).copy()
+        n = int(getattr(A_mod, "shape", (0, 0))[0])
+        if field_mask.size != n:
+            raise ValueError("Selected-field freeze mask size does not match the reduced Newton system.")
+        if not np.any(field_mask) or np.all(field_mask):
+            return A_mod, rhs
+        frozen = np.flatnonzero(~field_mask)
+        if frozen.size == 0:
+            return A_mod, rhs
+        rhs[frozen] = 0.0
+        return self._newton_apply_identity_rows(A_mod, frozen), rhs
+
+    def _newton_apply_identity_rows(self, A: sp.csr_matrix, rows: np.ndarray) -> sp.csr_matrix:
+        rows = np.asarray(rows, dtype=int).ravel()
+        if rows.size == 0:
+            return A
+        if not sp.isspmatrix_csr(A):
+            A = A.tocsr()
+        A_mod = A.copy()
+        indptr = A_mod.indptr
+        indices = A_mod.indices
+        data = A_mod.data
+        missing_diag = False
+        for rr in rows.tolist():
+            start = int(indptr[rr])
+            end = int(indptr[rr + 1])
+            if end <= start:
+                missing_diag = True
+                continue
+            data[start:end] = 0.0
+            hit = np.nonzero(indices[start:end] == rr)[0]
+            if hit.size:
+                data[start + int(hit[0])] = 1.0
+            else:
+                missing_diag = True
+        if not missing_diag:
+            return A_mod
+
+        A_lil = A.tolil(copy=True)
+        for rr in rows.tolist():
+            A_lil.rows[rr] = [rr]
+            A_lil.data[rr] = [1.0]
+        return A_lil.tocsr()
+
+    def _newton_try_grow_ptc_sigma(self, *, reason: str | None = None) -> bool:
+        if not bool(getattr(self.np, "ptc_recovery", False)):
+            return False
+        sigma0 = max(float(getattr(self.np, "ptc_sigma0", 1.0e-2) or 1.0e-2), 0.0)
+        sigma_max = max(sigma0, float(getattr(self.np, "ptc_sigma_max", 1.0e8) or 1.0e8))
+        sigma_growth = max(float(getattr(self.np, "ptc_growth", 5.0) or 5.0), 1.0)
+        if sigma0 <= 0.0 or sigma_max <= 0.0:
+            return False
+        cur = float(getattr(self, "_newton_ptc_sigma_current", 0.0) or 0.0)
+        nxt = sigma0 if cur <= 0.0 else min(sigma_max, max(sigma0, cur * sigma_growth))
+        if not np.isfinite(nxt) or nxt <= cur * (1.0 + 1.0e-12):
+            return False
+        self._newton_ptc_sigma_current = float(nxt)
+        if int(getattr(self.np, "print_level", 2) or 0) >= 2:
+            why = f" after {reason}" if reason else ""
+            print(f"        [newton-ptc] sigma->{self._newton_ptc_sigma_current:.2e}{why}")
+        return True
+
+    def _newton_decay_ptc_sigma(self, *, norm_before: float, norm_after: float, tol_eff: float) -> None:
+        cur = float(getattr(self, "_newton_ptc_sigma_current", 0.0) or 0.0)
+        if cur <= 0.0 or not np.isfinite(norm_after):
+            return
+        sigma0 = max(float(getattr(self.np, "ptc_sigma0", 1.0e-2) or 1.0e-2), 0.0)
+        sigma_decay = float(getattr(self.np, "ptc_decay", 0.5) or 0.5)
+        if float(norm_after) <= float(tol_eff):
+            new_sigma = 0.0
+        elif float(norm_after) <= 0.75 * max(float(norm_before), 1.0e-300):
+            new_sigma = cur * sigma_decay if 0.0 < sigma_decay < 1.0 else 0.0
+        else:
+            new_sigma = cur
+        if new_sigma < sigma0:
+            new_sigma = 0.0
+        if abs(new_sigma - cur) <= 1.0e-15:
+            return
+        self._newton_ptc_sigma_current = float(new_sigma)
+        if int(getattr(self.np, "print_level", 2) or 0) >= 2:
+            print(f"        [newton-ptc] sigma->{self._newton_ptc_sigma_current:.2e}")
+
+    def set_reduced_schur_preconditioner(
+        self,
+        *,
+        enabled: bool = False,
+        pressure_fields=("p", "p_mean"),
+        diag_only: bool = False,
+        shift_rel: float = 1.0e-12,
+        pressure_scale_mode: str = "none",
+        pressure_scale_value: float = 1.0,
+        trace: bool = False,
+    ) -> None:
+        if isinstance(pressure_fields, str):
+            names = [str(pressure_fields)]
+        else:
+            names = [str(name) for name in list(pressure_fields or [])]
+        scale_mode_key = str(pressure_scale_mode or "none").strip().lower().replace("-", "_")
+        if scale_mode_key not in {"none", "constant", "drag", "inv_drag"}:
+            raise ValueError(f"Unsupported reduced Schur pressure scale mode '{pressure_scale_mode}'.")
+        self._reduced_schur_enabled = bool(enabled)
+        self._reduced_schur_pressure_fields = tuple(dict.fromkeys(name for name in names if name))
+        self._reduced_schur_diag_only = bool(diag_only)
+        self._reduced_schur_shift_rel = max(float(shift_rel), 0.0)
+        self._reduced_schur_pressure_scale_mode = scale_mode_key
+        self._reduced_schur_pressure_scale_value = max(float(pressure_scale_value), 1.0e-30)
+        self._reduced_schur_trace = bool(trace)
+        self._reduced_schur_last_info = {}
+
+    def _reduced_schur_pressure_scale(self) -> tuple[str, float]:
+        mode = str(getattr(self, "_reduced_schur_pressure_scale_mode", "none") or "none").strip().lower()
+        value = max(float(getattr(self, "_reduced_schur_pressure_scale_value", 1.0) or 1.0), 1.0e-30)
+        if mode == "none":
+            return mode, 1.0
+        if mode == "constant":
+            return mode, value
+        if mode == "drag":
+            return mode, value
+        if mode == "inv_drag":
+            return mode, 1.0 / value
+        return "none", 1.0
+
+    def _reduced_ruiz_scale_vectors(self, A_red: sp.csr_matrix) -> tuple[np.ndarray, np.ndarray]:
+        nrow, ncol = map(int, getattr(A_red, "shape", (0, 0)))
+        row_scale = np.ones((nrow,), dtype=float)
+        col_scale = np.ones((ncol,), dtype=float)
+        if nrow == 0 or ncol == 0:
+            return row_scale, col_scale
+        manual_row = np.ones((nrow,), dtype=float)
+        manual_col = np.ones((ncol,), dtype=float)
+        manual_row_used: dict[str, float] = {}
+        manual_col_used: dict[str, float] = {}
+        field_names = np.asarray(getattr(self, "_reduced_field_names", np.asarray([], dtype=object)), dtype=object)
+        if bool(getattr(self, "_reduced_equation_row_scaling", False)):
+            manual_row_map = dict(getattr(self, "_manual_reduced_row_field_scales", {}) or {})
+            if manual_row_map and field_names.shape == manual_row.shape:
+                manual_row, manual_row_used = self._field_name_scale_vector(field_names, manual_row_map)
+        if bool(getattr(self, "_reduced_variable_column_scaling", False)):
+            manual_col_map = dict(getattr(self, "_manual_reduced_col_field_scales", {}) or {})
+            if manual_col_map and field_names.shape == manual_col.shape:
+                manual_col, manual_col_used = self._field_name_scale_vector(field_names, manual_col_map)
+        A_for_ruiz = A_red
+        if not np.allclose(manual_row, 1.0):
+            A_for_ruiz = A_for_ruiz.multiply(manual_row[:, None]).tocsr()
+        if not np.allclose(manual_col, 1.0):
+            A_for_ruiz = A_for_ruiz.multiply(manual_col[None, :]).tocsr()
+        row_scale_raw, col_scale_raw = self._direct_solve_ruiz_scaling(
+            A_for_ruiz,
+            iters=int(getattr(self, "_reduced_scaling_ruiz_iters", 6) or 6),
+        )
+        if bool(getattr(self, "_reduced_equation_row_scaling", False)):
+            row_scale = manual_row * np.asarray(row_scale_raw, dtype=float).ravel()
+        if bool(getattr(self, "_reduced_variable_column_scaling", False)):
+            col_scale = manual_col * np.asarray(col_scale_raw, dtype=float).ravel()
+        self._reduced_row_scale_current = row_scale.copy()
+        self._reduced_col_scale_current = col_scale.copy()
+        self._reduced_row_scale_field_current = dict(manual_row_used)
+        self._reduced_col_scale_field_current = dict(manual_col_used)
+        return row_scale, col_scale
+
+    def _mean_value_gauge_enabled(self) -> bool:
+        weights = getattr(self, "_mean_value_gauge_red_weights", None)
+        strength = float(getattr(self, "_mean_value_gauge_strength", 0.0) or 0.0)
+        return (
+            isinstance(weights, np.ndarray)
+            and bool(weights.size)
+            and np.isfinite(strength)
+            and strength > 0.0
+            and float(np.linalg.norm(weights, ord=2)) > 0.0
+        )
+
+    def _reduced_row_scale_vector(self, A_red: sp.csr_matrix) -> np.ndarray:
+        n = int(getattr(A_red, "shape", (0, 0))[0])
+        scale = np.ones((n,), dtype=float)
+        self._reduced_row_scale_field_current = {}
+        if not bool(getattr(self, "_reduced_equation_row_scaling", False)) or n == 0:
+            self._reduced_row_scale_current = scale.copy()
+            return scale
+        manual_map = dict(getattr(self, "_manual_reduced_row_field_scales", {}) or {})
+        if manual_map:
+            field_names = np.asarray(getattr(self, "_reduced_field_names", np.asarray([], dtype=object)), dtype=object)
+            if field_names.shape != scale.shape:
+                field_names = self._refresh_reduced_field_names()
+            if field_names.shape == scale.shape:
+                scale, used = self._field_name_scale_vector(field_names, manual_map)
+                self._reduced_row_scale_current = np.asarray(scale, dtype=float).copy()
+                self._reduced_row_scale_field_current = dict(used)
+                return scale
+        if not sp.isspmatrix_csr(A_red):
+            A_red = A_red.tocsr()
+        floor = 1.0e-12
+        clip_min = 1.0e-8
+        clip_max = 1.0e8
+        row_abs = np.asarray(np.abs(A_red).sum(axis=1)).ravel()
+        row_abs = np.where(np.isfinite(row_abs) & (row_abs > floor), row_abs, np.nan)
+        field_names = np.asarray(getattr(self, "_reduced_field_names", np.asarray([], dtype=object)), dtype=object)
+        if field_names.shape != scale.shape:
+            field_names = self._refresh_reduced_field_names()
+        if field_names.shape != scale.shape:
+            self._reduced_row_scale_current = scale.copy()
+            return scale
+        field_medians: dict[str, float] = {}
+        med_list: list[float] = []
+        for fld_obj in np.unique(field_names):
+            fld = str(fld_obj)
+            if not fld:
+                continue
+            mask = field_names == fld
+            vals = np.asarray(row_abs[mask], dtype=float)
+            vals = vals[np.isfinite(vals) & (vals > floor)]
+            if vals.size == 0:
+                continue
+            med = float(np.median(vals))
+            field_medians[fld] = med
+            med_list.append(med)
+        finite_rows = np.asarray(row_abs[np.isfinite(row_abs) & (row_abs > floor)], dtype=float)
+        ref = float(np.median(np.asarray(med_list, dtype=float))) if med_list else (
+            float(np.median(finite_rows)) if finite_rows.size else 1.0
+        )
+        ref = max(ref, floor)
+        assigned = np.zeros(scale.shape, dtype=bool)
+        field_scales: dict[str, float] = {}
+        for fld, med in field_medians.items():
+            s_f = float(np.clip(ref / max(med, floor), clip_min, clip_max))
+            mask = field_names == fld
+            scale[mask] = s_f
+            assigned |= mask
+            field_scales[fld] = s_f
+        leftover = (~assigned) & np.isfinite(row_abs) & (row_abs > floor)
+        if np.any(leftover):
+            scale[leftover] = np.clip(ref / np.maximum(row_abs[leftover], floor), clip_min, clip_max)
+        scale = np.where(np.isfinite(scale) & (scale > 0.0), scale, 1.0)
+        self._reduced_row_scale_current = np.asarray(scale, dtype=float).copy()
+        self._reduced_row_scale_field_current = dict(field_scales)
+        return scale
+
+    def _reduced_col_scale_vector(self, A_red: sp.csr_matrix) -> np.ndarray:
+        n = int(getattr(A_red, "shape", (0, 0))[1])
+        scale = np.ones((n,), dtype=float)
+        self._reduced_col_scale_field_current = {}
+        if not bool(getattr(self, "_reduced_variable_column_scaling", False)) or n == 0:
+            self._reduced_col_scale_current = scale.copy()
+            return scale
+        manual_map = dict(getattr(self, "_manual_reduced_col_field_scales", {}) or {})
+        if manual_map:
+            field_names = np.asarray(getattr(self, "_reduced_field_names", np.asarray([], dtype=object)), dtype=object)
+            if field_names.shape != scale.shape:
+                field_names = self._refresh_reduced_field_names()
+            if field_names.shape == scale.shape:
+                scale, used = self._field_name_scale_vector(field_names, manual_map)
+                self._reduced_col_scale_current = np.asarray(scale, dtype=float).copy()
+                self._reduced_col_scale_field_current = dict(used)
+                return scale
+        if not sp.isspmatrix_csr(A_red):
+            A_red = A_red.tocsr()
+        floor = 1.0e-12
+        clip_min = 1.0e-2
+        clip_max = 1.0e2
+        col_abs = np.asarray(np.abs(A_red).sum(axis=0)).ravel()
+        col_abs = np.where(np.isfinite(col_abs) & (col_abs > floor), col_abs, np.nan)
+        field_names = np.asarray(getattr(self, "_reduced_field_names", np.asarray([], dtype=object)), dtype=object)
+        if field_names.shape != scale.shape:
+            field_names = self._refresh_reduced_field_names()
+        if field_names.shape != scale.shape:
+            self._reduced_col_scale_current = scale.copy()
+            return scale
+        selected_raw = tuple(getattr(self, "_reduced_variable_column_scaling_fields", tuple()) or ())
+        selected = {str(name) for name in selected_raw if str(name)}
+        field_medians: dict[str, float] = {}
+        med_list: list[float] = []
+        for fld_obj in np.unique(field_names):
+            fld = str(fld_obj)
+            if not fld or (selected and fld not in selected):
+                continue
+            mask = field_names == fld
+            vals = np.asarray(col_abs[mask], dtype=float)
+            vals = vals[np.isfinite(vals) & (vals > floor)]
+            if vals.size == 0:
+                continue
+            med = float(np.median(vals))
+            field_medians[fld] = med
+            med_list.append(med)
+        finite_cols = np.asarray(col_abs[np.isfinite(col_abs) & (col_abs > floor)], dtype=float)
+        ref = float(np.median(np.asarray(med_list, dtype=float))) if med_list else (
+            float(np.median(finite_cols)) if finite_cols.size else 1.0
+        )
+        ref = max(ref, floor)
+        assigned = np.zeros(scale.shape, dtype=bool)
+        field_scales: dict[str, float] = {}
+        for fld, med in field_medians.items():
+            s_f = float(np.clip(ref / max(med, floor), clip_min, clip_max))
+            mask = field_names == fld
+            scale[mask] = s_f
+            assigned |= mask
+            field_scales[fld] = s_f
+        if not selected:
+            leftover = (~assigned) & np.isfinite(col_abs) & (col_abs > floor)
+            if np.any(leftover):
+                scale[leftover] = np.clip(ref / np.maximum(col_abs[leftover], floor), clip_min, clip_max)
+        scale = np.where(np.isfinite(scale) & (scale > 0.0), scale, 1.0)
+        self._reduced_col_scale_current = np.asarray(scale, dtype=float).copy()
+        self._reduced_col_scale_field_current = dict(field_scales)
+        return scale
+
+    def _apply_reduced_system_scaling(
+        self,
+        A_red: sp.csr_matrix,
+        R_red: np.ndarray,
+    ) -> tuple[sp.csr_matrix, np.ndarray, np.ndarray, np.ndarray]:
+        mode_key = str(getattr(self, "_reduced_system_scaling_mode", "field") or "field").strip().lower()
+        if mode_key == "ruiz":
+            row_scale, col_scale = self._reduced_ruiz_scale_vectors(A_red)
+            A_work = A_red
+            R_work = np.asarray(R_red, dtype=float).ravel()
+            if row_scale.size:
+                A_work = (sp.diags(row_scale, offsets=0, format="csr") @ A_work).tocsr()
+                R_work = row_scale * R_work
+            if col_scale.size:
+                A_work = (A_work @ sp.diags(col_scale, offsets=0, format="csr")).tocsr()
+            return A_work, R_work, row_scale, col_scale
+        row_scale = self._reduced_row_scale_vector(A_red)
+        A_work = A_red
+        R_work = np.asarray(R_red, dtype=float).ravel()
+        if row_scale.size:
+            A_work = (sp.diags(row_scale, offsets=0, format="csr") @ A_work).tocsr()
+            R_work = row_scale * R_work
+        col_scale = self._reduced_col_scale_vector(A_work)
+        if col_scale.size:
+            A_work = (A_work @ sp.diags(col_scale, offsets=0, format="csr")).tocsr()
+        return A_work, R_work, row_scale, col_scale
+
+    def _reduced_indices_for_fields(self, field_names) -> np.ndarray:
+        if isinstance(field_names, str):
+            names = [str(field_names)]
+        else:
+            names = [str(name) for name in list(field_names or [])]
+        out: list[np.ndarray] = []
+        for field_name in names:
+            red = self._reduced_indices_for_field(str(field_name))
+            if red.size:
+                out.append(np.asarray(red, dtype=int).ravel())
+        if not out:
+            return np.empty((0,), dtype=int)
+        return np.unique(np.concatenate(out))
+
+    def build_reduced_field_block_layout(
+        self,
+        blocks,
+        *,
+        include_remaining: bool = True,
+        remainder_name: str = "remainder",
+    ) -> FieldBlockLayout:
+        field_names = np.asarray(getattr(self, "_reduced_field_names", np.asarray([], dtype=object)), dtype=object)
+        nred = int(np.asarray(getattr(self, "active_dofs", np.asarray([], dtype=int)), dtype=int).size)
+        if field_names.shape != (nred,):
+            field_names = self._refresh_reduced_field_names()
+        return FieldBlockLayout.from_field_names(
+            field_names,
+            blocks,
+            include_remaining=bool(include_remaining),
+            remainder_name=str(remainder_name),
+        )
+
+    def clear_block_linear_solver(self) -> None:
+        self._block_linear_solver_config = None
+        self._block_linear_last_report = {}
+        self._block_linear_last_fallback_signature = None
+
+    def set_block_linear_solver(
+        self,
+        *,
+        blocks,
+        method: str = "gmres",
+        preconditioner: str = "lower_triangular",
+        include_remaining: bool = True,
+        remainder_name: str = "remainder",
+        default_subsolver: SparseSubsolverSpec | str | dict = SparseSubsolverSpec(kind="ilu"),
+        block_subsolvers: dict | None = None,
+        block_approximations: dict | None = None,
+        rtol: float | None = None,
+        atol: float = 0.0,
+        maxiter: int | None = None,
+        restart: int | None = None,
+        inner_m: int = 30,
+        outer_k: int = 3,
+        uzawa_primal_block: int | str = 0,
+        uzawa_multiplier_block: int | str = 1,
+        uzawa_relaxation: float = 1.0,
+        trace: bool = False,
+    ) -> None:
+        self._block_linear_solver_config = {
+            "blocks": tuple(list(blocks or [])),
+            "method": str(method or "gmres").strip().lower(),
+            "preconditioner": str(preconditioner or "lower_triangular").strip().lower(),
+            "include_remaining": bool(include_remaining),
+            "remainder_name": str(remainder_name),
+            "default_subsolver": default_subsolver,
+            "block_subsolvers": dict(block_subsolvers or {}),
+            "block_approximations": dict(block_approximations or {}),
+            "rtol": float(self.lp.tol if rtol is None else rtol),
+            "atol": float(atol),
+            "maxiter": int(self.lp.maxit if maxiter is None else maxiter),
+            "restart": None if restart is None else int(restart),
+            "inner_m": int(inner_m),
+            "outer_k": int(outer_k),
+            "uzawa_primal_block": uzawa_primal_block,
+            "uzawa_multiplier_block": uzawa_multiplier_block,
+            "uzawa_relaxation": float(uzawa_relaxation),
+            "trace": bool(trace),
+        }
+        self._block_linear_last_report = {}
+
+    @staticmethod
+    def _block_linear_map_lookup(mapping: dict | None, block_idx: int, block_name: str):
+        if not mapping:
+            return None
+        if block_name in mapping:
+            return mapping[block_name]
+        if block_idx in mapping:
+            return mapping[block_idx]
+        return None
+
+    @staticmethod
+    def _normalize_block_linear_spec(raw_spec, *, index: int) -> tuple[str, tuple[str, ...]]:
+        if hasattr(raw_spec, "name") and hasattr(raw_spec, "fields"):
+            block_name = str(getattr(raw_spec, "name"))
+            raw_fields = getattr(raw_spec, "fields")
+        elif isinstance(raw_spec, str):
+            block_name = str(raw_spec)
+            raw_fields = (str(raw_spec),)
+        elif isinstance(raw_spec, tuple) and len(raw_spec) == 2 and isinstance(raw_spec[0], str):
+            block_name = str(raw_spec[0])
+            raw_fields = raw_spec[1]
+        else:
+            block_name = f"block_{int(index)}"
+            raw_fields = raw_spec
+
+        if isinstance(raw_fields, str):
+            fields = (str(raw_fields),)
+        else:
+            fields = tuple(dict.fromkeys(str(name) for name in list(raw_fields or []) if str(name)))
+        return block_name, fields
+
+    def _filter_block_linear_blocks_for_current_system(
+        self,
+        blocks,
+        *,
+        field_names: np.ndarray,
+    ) -> tuple[tuple[tuple[str, tuple[str, ...]], ...], tuple[str, ...]]:
+        available = {
+            str(name)
+            for name in np.asarray(field_names, dtype=object).reshape(-1).tolist()
+            if str(name)
+        }
+        filtered: list[tuple[str, tuple[str, ...]]] = []
+        dropped: list[str] = []
+        for idx, raw_spec in enumerate(list(blocks or [])):
+            block_name, fields = self._normalize_block_linear_spec(raw_spec, index=idx)
+            matched = tuple(name for name in fields if name in available)
+            if matched:
+                filtered.append((str(block_name), matched))
+            else:
+                dropped.append(str(block_name))
+        return tuple(filtered), tuple(dropped)
+
+    def _build_block_linear_subsolvers(
+        self,
+        system: BlockLinearSystem,
+        cfg: dict[str, object],
+    ) -> tuple[object, ...]:
+        layout = system.layout
+        default_spec = cfg.get("default_subsolver", SparseSubsolverSpec(kind="ilu"))
+        block_specs = dict(cfg.get("block_subsolvers", {}) or {})
+        block_approximations = dict(cfg.get("block_approximations", {}) or {})
+        out: list[object] = []
+        for block_idx, block_name in enumerate(layout.block_names):
+            solver_spec = self._block_linear_map_lookup(block_specs, block_idx, str(block_name))
+            if solver_spec is None:
+                solver_spec = default_spec
+            approx = self._block_linear_map_lookup(block_approximations, block_idx, str(block_name))
+            if approx is None:
+                matrix = system.diagonal_block(block_idx)
+            elif callable(approx):
+                matrix = approx(system)
+            else:
+                matrix = approx
+            out.append(build_subsolver(matrix, solver_spec))
+        return tuple(out)
+
+    def _build_block_linear_preconditioner(
+        self,
+        system: BlockLinearSystem,
+        cfg: dict[str, object],
+        block_solvers: tuple[object, ...],
+    ):
+        kind = str(cfg.get("preconditioner", "lower_triangular") or "lower_triangular").strip().lower()
+        if kind in {"none", "identity"}:
+            return None
+        if kind in {"diag", "diagonal", "block_diagonal"}:
+            return BlockDiagonalPreconditioner(system, block_solvers)
+        if kind in {"lower", "lower_triangular", "block_lower", "triangular"}:
+            return BlockTriangularPreconditioner(system, block_solvers, lower=True)
+        if kind in {"upper", "upper_triangular", "block_upper"}:
+            return BlockTriangularPreconditioner(system, block_solvers, lower=False)
+        if kind == "uzawa":
+            primal_block = cfg.get("uzawa_primal_block", 0)
+            multiplier_block = cfg.get("uzawa_multiplier_block", 1)
+            primal_idx = system.layout._normalize_key(primal_block)
+            multiplier_idx = system.layout._normalize_key(multiplier_block)
+            return UzawaPreconditioner(
+                system,
+                primal_solver=block_solvers[primal_idx],
+                schur_solver=block_solvers[multiplier_idx],
+                primal_block=primal_idx,
+                multiplier_block=multiplier_idx,
+                relaxation=float(cfg.get("uzawa_relaxation", 1.0) or 1.0),
+            )
+        raise ValueError(f"Unsupported block preconditioner '{cfg.get('preconditioner')}'.")
+
+    def _solve_linear_system_block(self, A: sp.csr_matrix, rhs: np.ndarray) -> np.ndarray:
+        cfg = dict(getattr(self, "_block_linear_solver_config", None) or {})
+        if not cfg:
+            raise RuntimeError(
+                "LinearSolverParameters.backend='block' requires set_block_linear_solver(...) to be called first."
+            )
+        field_names = np.asarray(getattr(self, "_reduced_field_names", np.asarray([], dtype=object)), dtype=object)
+        nred = int(np.asarray(getattr(self, "active_dofs", np.asarray([], dtype=int)), dtype=int).size)
+        if field_names.shape != (nred,):
+            field_names = self._refresh_reduced_field_names()
+        filtered_blocks, dropped_blocks = self._filter_block_linear_blocks_for_current_system(
+            cfg.get("blocks", tuple()),
+            field_names=np.asarray(field_names, dtype=object),
+        )
+        if int(len(filtered_blocks)) < 2:
+            fallback_signature = (
+                tuple(str(name) for name, _fields in filtered_blocks),
+                tuple(str(name) for name in dropped_blocks),
+            )
+            self._block_linear_last_report = {
+                "method": "fallback_scipy",
+                "converged": False,
+                "iterations": 0,
+                "residual_norm": float("nan"),
+                "residual_history": [],
+                "layout_blocks": fallback_signature[0],
+                "dropped_blocks": fallback_signature[1],
+            }
+            if bool(cfg.get("trace", False)) and fallback_signature != getattr(
+                self,
+                "_block_linear_last_fallback_signature",
+                None,
+            ):
+                print(
+                    "        [lin-block] fallback to scipy because the current reduced system no longer "
+                    f"supports the configured block layout; kept={fallback_signature[0]} "
+                    f"dropped={fallback_signature[1]}.",
+                    flush=True,
+                )
+            self._block_linear_last_fallback_signature = fallback_signature
+            return self._solve_linear_system_scipy(A, rhs)
+        self._block_linear_last_fallback_signature = None
+        layout = FieldBlockLayout.from_field_names(
+            np.asarray(field_names, dtype=object),
+            filtered_blocks,
+            include_remaining=bool(cfg.get("include_remaining", True)),
+            remainder_name=str(cfg.get("remainder_name", "remainder")),
+        )
+        system = BlockLinearSystem(A, rhs, layout)
+        block_solvers = self._build_block_linear_subsolvers(system, cfg)
+        method = str(cfg.get("method", "gmres") or "gmres").strip().lower()
+
+        if method == "uzawa":
+            primal_block = cfg.get("uzawa_primal_block", 0)
+            multiplier_block = cfg.get("uzawa_multiplier_block", 1)
+            primal_idx = system.layout._normalize_key(primal_block)
+            multiplier_idx = system.layout._normalize_key(multiplier_block)
+            solver = UzawaSolver(
+                system,
+                primal_solver=block_solvers[primal_idx],
+                schur_solver=block_solvers[multiplier_idx],
+                primal_block=primal_idx,
+                multiplier_block=multiplier_idx,
+                options=UzawaOptions(
+                    rtol=float(cfg.get("rtol", self.lp.tol) or self.lp.tol),
+                    maxiter=int(cfg.get("maxiter", self.lp.maxit) or self.lp.maxit),
+                    relaxation=float(cfg.get("uzawa_relaxation", 1.0) or 1.0),
+                ),
+            )
+            sol, report = solver.solve()
+        else:
+            preconditioner = self._build_block_linear_preconditioner(system, cfg, block_solvers)
+            solver = ScipyKrylovSolver(
+                KrylovOptions(
+                    method=method,
+                    rtol=float(cfg.get("rtol", self.lp.tol) or self.lp.tol),
+                    atol=float(cfg.get("atol", 0.0) or 0.0),
+                    maxiter=int(cfg.get("maxiter", self.lp.maxit) or self.lp.maxit),
+                    restart=cfg.get("restart"),
+                    inner_m=int(cfg.get("inner_m", 30) or 30),
+                    outer_k=int(cfg.get("outer_k", 3) or 3),
+                )
+            )
+            sol, report = solver.solve(system.matrix, system.rhs, preconditioner=preconditioner)
+
+        self._block_linear_last_report = {
+            "method": str(report.method),
+            "converged": bool(report.converged),
+            "iterations": int(report.iterations),
+            "residual_norm": float(report.residual_norm),
+            "residual_history": [float(v) for v in report.residual_history],
+            "layout_blocks": tuple(str(name) for name in layout.block_names),
+        }
+        if bool(cfg.get("trace", False)):
+            print(
+                "        [lin-block] "
+                f"method={report.method} blocks={layout.block_names} "
+                f"its={int(report.iterations)} |Ax-b|_inf={float(report.residual_norm):.3e}",
+                flush=True,
+            )
+        return np.asarray(sol, dtype=float).reshape(-1)
+
+    def _current_field_reduced_iterate(self, coeffs, *, field_name: str, coeff_name: str | None = None) -> np.ndarray | None:
+        from pycutfem.ufl.expressions import Function, VectorFunction, HdivFunction
+
+        target = None
+        if coeff_name is not None:
+            candidate = coeffs.get(str(coeff_name), None)
+            if isinstance(candidate, (Function, VectorFunction, HdivFunction)):
+                target = candidate
+        if target is None:
+            for obj in coeffs.values():
+                if not isinstance(obj, (Function, VectorFunction, HdivFunction)):
+                    continue
+                if str(getattr(obj, "field_name", "") or "") != str(field_name):
+                    continue
+                name = str(getattr(obj, "name", "") or "")
+                if name.endswith("_k"):
+                    target = obj
+                    break
+        if target is None:
+            for obj in coeffs.values():
+                if not isinstance(obj, (Function, VectorFunction, HdivFunction)):
+                    continue
+                if str(getattr(obj, "field_name", "") or "") == str(field_name):
+                    target = obj
+                    break
+        if target is None:
+            return None
+        x_full = np.zeros(int(self.dh.total_dofs), dtype=float)
+        gdofs = np.asarray(getattr(target, "_g_dofs", np.array([], dtype=int)), dtype=int).ravel()
+        vals = np.asarray(getattr(target, "nodal_values", np.array([], dtype=float)), dtype=float).ravel()
+        if gdofs.size != vals.size:
+            raise ValueError(
+                f"Function '{getattr(target, 'name', '<unnamed>')}' has nodal_values size {int(vals.size)} "
+                f"but _g_dofs size {int(gdofs.size)}."
+            )
+        if gdofs.size:
+            x_full[gdofs] = vals
+        if getattr(self, "constraints", None) is not None:
+            master_ids = np.asarray(self.constraints.master_ids, dtype=int)
+            x_master = np.asarray(x_full[master_ids], dtype=float).ravel()
+            return np.asarray(x_master[self.active_dofs], dtype=float).ravel()
+        return np.asarray(x_full[self.active_dofs], dtype=float).ravel()
+
+    def _apply_mean_value_gauge_to_reduced(
+        self,
+        A_red: sp.csr_matrix | None,
+        R_red: np.ndarray,
+        coeffs,
+        *,
+        need_matrix: bool,
+    ) -> tuple[sp.csr_matrix | None, np.ndarray]:
+        if not self._mean_value_gauge_enabled():
+            return A_red, R_red
+        weights = np.asarray(self._mean_value_gauge_red_weights, dtype=float).ravel()
+        if int(weights.size) != int(np.asarray(R_red, dtype=float).size):
+            return A_red, R_red
+        norm_w = float(np.linalg.norm(weights, ord=2))
+        if not np.isfinite(norm_w) or norm_w <= 0.0:
+            return A_red, R_red
+        c_red = weights / norm_w
+        x_red = self._current_field_reduced_iterate(
+            coeffs,
+            field_name=str(getattr(self, "_mean_value_gauge_field", "") or ""),
+            coeff_name=getattr(self, "_mean_value_gauge_coeff_name", None),
+        )
+        if x_red is None or int(x_red.size) != int(c_red.size):
+            return A_red, R_red
+        strength = float(getattr(self, "_mean_value_gauge_strength", 0.0) or 0.0)
+        moment = float(np.dot(c_red, np.asarray(x_red, dtype=float).ravel()))
+        R_mod = np.asarray(R_red, dtype=float).ravel() + (strength * moment) * c_red
+        if not need_matrix or A_red is None:
+            return A_red, R_mod
+        A_mod = self._canonicalize_direct_solve_matrix(
+            A_red + sp.csr_matrix(np.outer(c_red, c_red) * strength)
+        )
+        return A_mod, R_mod
+
+    def _solver_coordinate_transform_enabled(self) -> bool:
+        mask = getattr(self, "_solver_coord_logistic_red_mask", None)
+        return isinstance(mask, np.ndarray) and bool(mask.size) and bool(np.any(mask))
+
+    def _solver_coordinate_clip_open_interval(self, values) -> np.ndarray:
+        eps = float(getattr(self, "_solver_coord_logistic_eps", 1.0e-8))
+        return np.clip(np.asarray(values, dtype=float), eps, 1.0 - eps)
+
+    def _solver_coordinate_logit(self, values) -> np.ndarray:
+        clipped = self._solver_coordinate_clip_open_interval(values)
+        return np.log(clipped) - np.log1p(-clipped)
+
+    def _solver_coordinate_sigmoid(self, values) -> np.ndarray:
+        z = np.asarray(values, dtype=float)
+        out = np.empty_like(z, dtype=float)
+        pos = z >= 0.0
+        if np.any(pos):
+            out[pos] = 1.0 / (1.0 + np.exp(-z[pos]))
+        if np.any(~pos):
+            ez = np.exp(z[~pos])
+            out[~pos] = ez / (1.0 + ez)
+        return self._solver_coordinate_clip_open_interval(out)
+
+    def _current_reduced_iterate(self, funcs: list) -> np.ndarray:
+        x_full = self._gather_full_iterate(funcs)
+        return np.asarray(self.restrictor.restrict_vec(x_full), dtype=float).ravel()
+
+    def _solver_coordinate_physical_step(self, step_red, funcs: list) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        step_arr = np.asarray(step_red, dtype=float).ravel()
+        x_red_current = self._current_reduced_iterate(funcs)
+        if step_arr.shape != x_red_current.shape:
+            raise ValueError(
+                "Reduced solver-coordinate step shape mismatch: "
+                f"step={step_arr.shape}, iterate={x_red_current.shape}."
+            )
+        mask = getattr(self, "_solver_coord_logistic_red_mask", None)
+        if not isinstance(mask, np.ndarray) or int(mask.size) != int(x_red_current.size):
+            self._refresh_solver_coordinate_transform_masks()
+            mask = getattr(self, "_solver_coord_logistic_red_mask", None)
+        if not isinstance(mask, np.ndarray) or not mask.size or not np.any(mask):
+            x_red_new = x_red_current + step_arr
+            return np.asarray(x_red_new - x_red_current, dtype=float), np.asarray(x_red_new, dtype=float), x_red_current
+
+        x_red_base = np.asarray(x_red_current, dtype=float).copy()
+        x_red_base[mask] = self._solver_coordinate_clip_open_interval(x_red_base[mask])
+        x_red_new = x_red_base.copy()
+        if np.any(~mask):
+            x_red_new[~mask] = x_red_base[~mask] + step_arr[~mask]
+        z_red = self._solver_coordinate_logit(x_red_base[mask])
+        x_red_new[mask] = self._solver_coordinate_sigmoid(z_red + step_arr[mask])
+        return np.asarray(x_red_new - x_red_current, dtype=float), np.asarray(x_red_new, dtype=float), x_red_current
+
+    def _prepare_solver_coordinate_iterate(self, funcs: list, bcs_now) -> None:
+        if not self._solver_coordinate_transform_enabled():
+            return
+        zero_step = np.zeros((int(len(self.active_dofs)),), dtype=float)
+        delta_red, _, _ = self._solver_coordinate_physical_step(zero_step, funcs)
+        if not delta_red.size:
+            return
+        if float(np.linalg.norm(delta_red, ord=np.inf)) <= 0.0:
+            return
+        dU_full = self.restrictor.expand_vec(delta_red)
+        self.dh.add_to_functions(dU_full, funcs)
+        self.dh.apply_bcs(bcs_now, *funcs)
+        if getattr(self, "constraints", None) is not None:
+            self._enforce_constraints_on_functions(funcs)
+
+    def _solver_coordinate_linear_system(self, A_red, funcs: list) -> tuple[sp.csr_matrix, np.ndarray]:
+        x_red = self._current_reduced_iterate(funcs)
+        scale = np.ones(x_red.shape, dtype=float)
+        mask = getattr(self, "_solver_coord_logistic_red_mask", None)
+        if isinstance(mask, np.ndarray) and mask.size and np.any(mask):
+            clipped = self._solver_coordinate_clip_open_interval(x_red[mask])
+            scale[mask] = clipped * (1.0 - clipped)
+            A_red = (A_red @ sp.diags(scale, offsets=0, format="csr")).tocsr()
+        return A_red, scale
+
+    def _apply_solver_coordinate_step(self, step_red, funcs: list, bcs_now) -> np.ndarray:
+        delta_red, _, _ = self._solver_coordinate_physical_step(step_red, funcs)
+        dU_full = self.restrictor.expand_vec(delta_red)
+        self.dh.add_to_functions(dU_full, funcs)
+        self.dh.apply_bcs(bcs_now, *funcs)
+        if getattr(self, "constraints", None) is not None:
+            self._enforce_constraints_on_functions(funcs)
+        return np.asarray(delta_red, dtype=float)
+
+
+    def _filter_candidate_active_dofs(self, active_dofs) -> np.ndarray:
+        ndof_phys = int(self.dh.total_dofs)
+        raw = np.asarray(active_dofs, dtype=int).ravel()
+        candidate_phys = {
+            int(idx)
+            for idx in raw.tolist()
+            if 0 <= int(idx) < ndof_phys
+        }
+
+        def _map_to_master(ids) -> set[int]:
+            if getattr(self, "constraints", None) is None:
+                return {int(idx) for idx in ids}
+            return {int(idx) for idx in self.constraints.to_master_set(ids)}
+
+        candidate_master = _map_to_master(candidate_phys)
+        bcs_for_active = self.bcs_homog if getattr(self, "bcs_homog", None) else self.bcs
+        bc_dofs = set(self.dh.get_dirichlet_data(bcs_for_active).keys())
+        inactive_dofs: set[int] = set()
+        dh_tags = getattr(self.dh, "dof_tags", None)
+        if dh_tags:
+            inactive_dofs = set(dh_tags.get("inactive", set()))
+        inactive_free = inactive_dofs - bc_dofs
+
+        bc_master = _map_to_master(bc_dofs)
+        inactive_master = _map_to_master(inactive_free)
+        free_set = (candidate_master - bc_master) - inactive_master
+        return np.asarray(sorted(free_set), dtype=int)
+
+    def _invalidate_amgcl_layout_cache(self) -> None:
+        self._amgcl_system_master_ids_cache = None
+        self._amgcl_master_phys_ids_cache = None
+        self._amgcl_master_field_names_cache = None
+        self._amgcl_node_block_layout_cache = None
+
+    def set_active_dofs(self, active_dofs) -> np.ndarray:
+        ndof_effective = int(self.constraints.n_master) if getattr(self, "constraints", None) is not None else int(self.dh.total_dofs)
+        if not bool(getattr(self, "_setting_active_fields", False)):
+            self._active_field_names = tuple()
+        self._invalidate_amgcl_layout_cache()
+        active_master = self._filter_candidate_active_dofs(active_dofs)
+        if int(active_master.size) == 0:
+            raise ValueError("Requested active DOF set is empty after removing Dirichlet/inactive DOFs.")
+        self.active_dofs = np.asarray(active_master, dtype=int)
+        nfree = int(self.active_dofs.size)
+        self.full_to_red = -np.ones(ndof_effective, dtype=int)
+        self.full_to_red[self.active_dofs] = np.arange(nfree, dtype=int)
+        self.red_to_full = self.active_dofs.copy()
+        self.use_reduced = (nfree < ndof_effective)
+        # Active-field retargeting changes every reduced-space scatter/cache map.
+        # Force a rebuild before the next assembly so residual-only line-search
+        # paths cannot reuse stale reduced indices from the previous active set.
+        self._pattern_stale = True
+        self._build_reduced_pattern()
+        self.restrictor = _ActiveReducer(self.dh, self.active_dofs, constraint=self.constraints)
+        if hasattr(self, "_vi_red_field_names"):
+            self._vi_red_field_names = self._build_vi_reduced_field_names()
+        if hasattr(self, "_vi_eq_current"):
+            self._vi_eq_current = None
+        if hasattr(self, "_vi_prev_state"):
+            self._vi_prev_state = None
+        if hasattr(self, "_vi_pending_state"):
+            self._vi_pending_state = None
+        if hasattr(self, "_vi_pending_count"):
+            self._vi_pending_count = None
+        if hasattr(self, "_vi_forced_state"):
+            self._vi_forced_state = None
+        if hasattr(self, "_vi_working_set_guard_state"):
+            self._vi_working_set_guard_state = None
+        if hasattr(self, "_vi_working_set_guard_remaining"):
+            self._vi_working_set_guard_remaining = 0
+        if hasattr(self, "_vi_working_set_guard_active"):
+            self._vi_working_set_guard_active = None
+        if hasattr(self, "_vi_ptc_sigma_current"):
+            self._vi_ptc_sigma_current = 0.0
+        if hasattr(self, "_vi_anderson_history"):
+            self._vi_anderson_history = []
+        if hasattr(self, "_vi_preserve_state_on_next_solve"):
+            self._vi_preserve_state_on_next_solve = False
+        if hasattr(self, "_vi_last_metrics"):
+            self._vi_last_metrics = None
+        if hasattr(self, "_vi_last_retry_count"):
+            self._vi_last_retry_count = 0
+        if hasattr(self, "_vi_linear_equalities"):
+            n_eq = len(getattr(self, "_vi_linear_equalities", []) or [])
+            self._vi_eq_lambda_accepted = np.zeros((n_eq,), dtype=float)
+            self._vi_eq_lambda_current = self._vi_eq_lambda_accepted.copy()
+        self._refresh_solver_coordinate_transform_masks()
+        self._refresh_reduced_field_names()
+        self._trace_reduced_box_bounds_summary()
+        print(f"NewtonSolver: Active DOFs retargeted to {nfree}/{ndof_effective}.")
+        return self.active_dofs.copy()
+
+    def set_active_fields(self, field_names) -> np.ndarray:
+        if isinstance(field_names, str):
+            names = [str(field_names)]
+        else:
+            names = [str(name) for name in list(field_names or [])]
+        names = [str(name).strip() for name in names if str(name).strip()]
+        if not names:
+            raise ValueError("set_active_fields expects at least one field name.")
+        full_ids: list[int] = []
+        for field in names:
+            full_ids.extend(np.asarray(self.dh.get_field_slice(field), dtype=int).ravel().tolist())
+        self._active_field_names = tuple(names)
+        self._setting_active_fields = True
+        try:
+            return self.set_active_dofs(np.asarray(sorted(set(full_ids)), dtype=int))
+        finally:
+            self._setting_active_fields = False
+
+    def _trace_reduced_box_bounds_summary(self) -> None:
+        if os.getenv("PYCUTFEM_TRACE_BOUNDS_FIELDS", "").lower() not in {"1", "true", "yes"}:
+            return
+        lo_full = getattr(self, "_box_lower_full", None)
+        hi_full = getattr(self, "_box_upper_full", None)
+        if lo_full is None or hi_full is None:
+            print("    [bounds] reduced active system has no box bounds configured.", flush=True)
+            return
+        active = np.asarray(getattr(self, "active_dofs", np.asarray([], dtype=int)), dtype=int).ravel()
+        if active.size == 0:
+            print("    [bounds] reduced active system has no active DOFs.", flush=True)
+            return
+        try:
+            lo_red = np.asarray(lo_full, dtype=float)[active]
+            hi_red = np.asarray(hi_full, dtype=float)[active]
+        except Exception as exc:
+            print(f"    [bounds] failed to build reduced box-bound summary: {exc}", flush=True)
+            return
+        bounded = np.isfinite(lo_red) | np.isfinite(hi_red)
+        n_bounded = int(np.count_nonzero(bounded))
+        if n_bounded <= 0:
+            print("    [bounds] reduced active system has no finite box-bounded DOFs.", flush=True)
+            return
+        field_names = np.asarray(getattr(self, "_reduced_field_names", np.asarray([], dtype=object)), dtype=object)
+        if field_names.shape != active.shape:
+            try:
+                field_names = self._refresh_reduced_field_names()
+            except Exception:
+                field_names = np.asarray([], dtype=object)
+        parts: list[str] = []
+        if field_names.shape == active.shape:
+            used = set()
+            for name in field_names[bounded].tolist():
+                key = str(name).strip()
+                if not key or key in used:
+                    continue
+                used.add(key)
+                mask = bounded & (field_names == key)
+                lo_mask = np.isfinite(lo_red) & mask
+                hi_mask = np.isfinite(hi_red) & mask
+                parts.append(
+                    f"{key}:n={int(np.count_nonzero(mask))}"
+                    f"/lo={int(np.count_nonzero(lo_mask))}"
+                    f"/hi={int(np.count_nonzero(hi_mask))}"
+                )
+        if parts:
+            print(
+                "    [bounds] reduced finite box-bounded DOFs "
+                f"n={n_bounded}: {', '.join(parts)}",
+                flush=True,
+            )
+        else:
+            print(f"    [bounds] reduced finite box-bounded DOFs n={n_bounded}.", flush=True)
+
+    def _is_jit_backend(self) -> bool:
+        return self.backend in {"jit", "cpp", "c++"}
+
+    def _gather_full_iterate(self, funcs: list) -> np.ndarray:
+        """
+        Gather the current iterate into a full global DOF vector (global index order).
+
+        Do not assume `func.nodal_values` is stored in global-DOF order. Always map
+        via each function's `_g_dofs`.
+        """
+        n = int(self.dh.total_dofs)
+        x_full = np.zeros(n, dtype=float)
+        for f in funcs:
+            g = getattr(f, "_g_dofs", None)
+            vals = getattr(f, "nodal_values", None)
+            if g is None or vals is None:
+                continue
+            g_arr = np.asarray(g, dtype=int).ravel()
+            if g_arr.size == 0:
+                continue
+            v_arr = np.asarray(vals, dtype=float).ravel()
+            if v_arr.size != g_arr.size:
+                raise ValueError(
+                    f"Function '{getattr(f, 'name', '<unnamed>')}' has nodal_values size {int(v_arr.size)} "
+                    f"but _g_dofs size {int(g_arr.size)}."
+                )
+            x_full[g_arr] = v_arr
+        return x_full
+
+    def _enforce_constraints_on_functions(self, functions: list) -> None:
+        """
+        Ensure the *stored* Function/VectorFunction values satisfy the active
+        linear constraints (slaves are overwritten from masters).
+
+        This is required because the solver stores solution vectors in the full
+        DOF space even when assembling/solving in the constrained master space.
+        """
+        if getattr(self, "constraints", None) is None:
+            return
+        slave_to_master = getattr(self.constraints, "slave_to_master", None)
+        if not isinstance(slave_to_master, dict) or not slave_to_master:
+            return
+
+        from pycutfem.ufl.expressions import Function, VectorFunction
+
+        ndof = int(self.dh.total_dofs)
+        U = np.zeros(ndof, dtype=float)
+
+        # Gather full vector from the provided function objects.
+        for func in functions:
+            if not isinstance(func, (Function, VectorFunction)):
+                continue
+            g2l = getattr(func, "_g2l", None)
+            vals = getattr(func, "nodal_values", None)
+            if g2l is None or vals is None:
+                continue
+            for gdof, lidx in g2l.items():
+                U[int(gdof)] = float(vals[int(lidx)])
+
+        # Overwrite slave DOFs from masters.
+        for sdof, combo in slave_to_master.items():
+            U[int(sdof)] = sum(float(w) * U[int(mdof)] for (mdof, w) in combo)
+
+        # Scatter back into the function objects.
+        for func in functions:
+            if not isinstance(func, (Function, VectorFunction)):
+                continue
+            g2l = getattr(func, "_g2l", None)
+            vals = getattr(func, "nodal_values", None)
+            if g2l is None or vals is None:
+                continue
+            for gdof, lidx in g2l.items():
+                vals[int(lidx)] = U[int(gdof)]
+
+    def _assert_functions_finite(self, functions: list, *, context: str) -> None:
+        from pycutfem.ufl.expressions import Function, VectorFunction
+
+        for func in functions:
+            if not isinstance(func, (Function, VectorFunction)):
+                continue
+            vals = np.asarray(getattr(func, "nodal_values", np.array([], dtype=float)), dtype=float)
+            if vals.size and not np.all(np.isfinite(vals)):
+                raise RuntimeError(
+                    f"Non-finite iterate detected {context} in field '{getattr(func, 'name', '<unnamed>')}'."
+                )
 
 
 
 
-    def _compile_all_kernels(self) -> None:
+    def _compile_all_kernels(self, *, parallel_residual: bool = False) -> None:
         """(Re)compile residual and Jacobian kernels with current metadata."""
-        self.kernels_K = compile_multi(
-            self._jacobian_form,
-            dof_handler=self.dh,
-            mixed_element=self.me,
-            quad_order=self.quad_order,
-            backend=self.backend,
-        )
+        # Ensure no async compilation is left dangling from a previous call.
+        self._finish_residual_kernel_compilation()
+        if self._is_jit_backend():
+            _compress_cache: dict = {}
+            _gdofs_cache: dict = {}
+            self.kernels_K = compile_multi(
+                self._jacobian_form,
+                dof_handler=self.dh,
+                mixed_element=self.me,
+                quad_order=self.quad_order,
+                backend=self.backend,
+                compress_cache=_compress_cache,
+                gdofs_cache=_gdofs_cache,
+            )
 
-        self.kernels_F = compile_multi(
-            self._residual_form,
-            dof_handler=self.dh,
-            mixed_element=self.me,
-            quad_order=self.quad_order,
-            backend=self.backend,
-        )
+            if parallel_residual:
+                from concurrent.futures import ThreadPoolExecutor
+
+                self.kernels_F = []
+                self._kernels_F_executor = ThreadPoolExecutor(max_workers=1)
+                self._kernels_F_future = self._kernels_F_executor.submit(
+                    compile_multi,
+                    self._residual_form,
+                    dof_handler=self.dh,
+                    mixed_element=self.me,
+                    quad_order=self.quad_order,
+                    backend=self.backend,
+                    compress_cache=_compress_cache,
+                    gdofs_cache=_gdofs_cache,
+                )
+            else:
+                self.kernels_F = compile_multi(
+                    self._residual_form,
+                    dof_handler=self.dh,
+                    mixed_element=self.me,
+                    quad_order=self.quad_order,
+                    backend=self.backend,
+                    compress_cache=_compress_cache,
+                    gdofs_cache=_gdofs_cache,
+                )
+            self._python_fc = None
+        elif self.backend == "python":
+            # Python backend: defer to the pure-Python FormCompiler at assembly time.
+            from pycutfem.ufl.compilers import FormCompiler
+
+            self._python_fc = FormCompiler(
+                self.dh, quadrature_order=self.quad_order, backend="python"
+            )
+            self.kernels_K = []
+            self.kernels_F = []
+        else:
+            raise ValueError(
+                f"Unknown backend '{self.backend}'. Use 'python', 'jit', or 'cpp'."
+            )
 
         self._pattern_stale = True
         self._last_jacobian = None
         for attr in ("_csr_indptr", "_csr_indices", "_elem_pos", "_elem_lidx"):
             if hasattr(self, attr):
                 delattr(self, attr)
+
+    def _finish_residual_kernel_compilation(self) -> None:
+        fut = getattr(self, "_kernels_F_future", None)
+        if fut is None:
+            return
+        ex = getattr(self, "_kernels_F_executor", None)
+        try:
+            self.kernels_F = fut.result()
+        finally:
+            try:
+                if ex is not None:
+                    ex.shutdown(wait=True)
+            finally:
+                self._kernels_F_future = None
+                self._kernels_F_executor = None
+
+    def refresh_levelset_kernels(self, level_set):
+        """
+        Refresh precomputed static arguments for kernels that depend on a moving
+        level set without re-JIT compilation. Marks the scatter pattern as stale
+        so it will be rebuilt on the next assembly **only if** the kernel/entity
+        layout changed (eids/gdofs_map shape). Pure geometry updates (same entity
+        sets, new quadrature/weights) should not force a sparsity rebuild.
+        """
+        if not self._is_jit_backend():
+            return
+        refresh_mode = os.getenv("PYCUTFEM_LEVELSET_KERNEL_REFRESH", "").strip().lower()
+        if refresh_mode in {"recompile", "compile", "full"}:
+            t0 = time.perf_counter()
+            self._compile_all_kernels()
+            print(
+                f"[jit] recompiled kernels for moving level set in {time.perf_counter() - t0:.3f}s"
+            )
+            return
+        debug_refresh = os.getenv("PYCUTFEM_LEVELSET_REFRESH_DEBUG", "").lower() in {"1", "true", "yes"}
+        raise_on_fail = os.getenv("PYCUTFEM_LEVELSET_REFRESH_RAISE", "").lower() in {"1", "true", "yes"}
+        trace_refresh = os.getenv("PYCUTFEM_LEVELSET_REFRESH_TRACE", "").lower() in {"1", "true", "yes"}
+        log_summary = os.getenv("PYCUTFEM_LEVELSET_REFRESH_LOG", "").lower() in {"1", "true", "yes"}
+        assert_full_refresh = os.getenv("PYCUTFEM_LEVELSET_REFRESH_ASSERT_FULL", "").lower() in {"1", "true", "yes"}
+        validate_refresh = os.getenv("PYCUTFEM_LEVELSET_REFRESH_VALIDATE", "").lower() in {"1", "true", "yes"}
+        validate_raise = os.getenv("PYCUTFEM_LEVELSET_REFRESH_VALIDATE_RAISE", "").lower() in {"1", "true", "yes"}
+        profile_refresh = os.getenv("PYCUTFEM_LEVELSET_REFRESH_PROFILE", "").lower() in {"1", "true", "yes"}
+        try:
+            validate_samples = int(os.getenv("PYCUTFEM_LEVELSET_REFRESH_VALIDATE_SAMPLES", "25") or "25")
+        except Exception:
+            validate_samples = 25
+        rebuild_no_reuse = refresh_mode in {"rebuild", "rebuild_static", "no_reuse", "noreuse"}
+
+        kernels_all = list(getattr(self, "kernels_K", [])) + list(getattr(self, "kernels_F", []))
+        kernels_ls = [ker for ker in kernels_all if getattr(ker, "level_set", None) is level_set]
+        kernels_ls_buildable = [ker for ker in kernels_ls if callable(getattr(ker, "builder", None))]
+
+        if trace_refresh:
+            from collections import Counter
+
+            def _kind_of(ker) -> str:
+                try:
+                    if isinstance(getattr(ker, "static_args", None), dict):
+                        k = ker.static_args.get("entity_kind", None)
+                        if k:
+                            return str(k)
+                except Exception:
+                    pass
+                if str(getattr(ker, "domain", "")).lower() in {"ghost_edge"}:
+                    return "edge"
+                return "element"
+
+            key_counts = Counter()
+            for ker in kernels_ls:
+                dom = str(getattr(ker, "domain", "") or "unknown")
+                side = str(getattr(ker, "side", "") or "")
+                kind = _kind_of(ker)
+                key_counts[(dom, side, kind)] += 1
+
+            print(
+                "[jit] level-set refresh: total_kernels={} (K={}, F={}), ls_dependent={}, buildable={}".format(
+                    int(len(kernels_all)),
+                    int(len(getattr(self, "kernels_K", []) or [])),
+                    int(len(getattr(self, "kernels_F", []) or [])),
+                    int(len(kernels_ls)),
+                    int(len(kernels_ls_buildable)),
+                )
+            )
+            if key_counts:
+                pretty = ", ".join(
+                    f"{dom}{('/'+side) if side else ''}/{kind}:{n}"
+                    for (dom, side, kind), n in sorted(key_counts.items())
+                )
+                print(f"[jit] level-set kernels by domain: {pretty}")
+
+        if kernels_ls and not kernels_ls_buildable:
+            msg = "[jit] level-set refresh: found ls-dependent kernels but none are refreshable (missing builder hooks)."
+            print(msg)
+            if assert_full_refresh:
+                raise RuntimeError(msg)
+
+        def _pattern_sig(ker) -> tuple:
+            """
+            Return a lightweight signature of the kernel layout that impacts
+            reduced sparsity/scatter plans. We intentionally ignore quadrature
+            data and other geometry-dependent arrays.
+            """
+            static = getattr(ker, "static_args", None)
+            if not isinstance(static, dict):
+                return (0, b"", 0, 0)
+            eids = static.get("eids", None)
+            if eids is None:
+                try:
+                    eids = getattr(ker, "eids", None)
+                except Exception:
+                    eids = None
+            if eids is None:
+                eids = np.asarray([], dtype=np.int64)
+            else:
+                eids = np.asarray(eids, dtype=np.int64).ravel()
+            if eids.size:
+                eids_u8 = np.ascontiguousarray(eids).view(np.uint8)
+                eids_digest = hashlib.blake2b(eids_u8, digest_size=16).digest()
+            else:
+                eids_digest = b""
+
+            gdofs = static.get("gdofs_map", None)
+            if isinstance(gdofs, np.ndarray):
+                gdofs_shape0 = int(gdofs.shape[0])
+                gdofs_shape1 = int(gdofs.shape[1]) if gdofs.ndim >= 2 else 0
+            else:
+                gdofs_shape0, gdofs_shape1 = 0, 0
+
+            return (int(eids.size), eids_digest, gdofs_shape0, gdofs_shape1)
+
+        # Default: refresh static args in-place (fast).
+        t0 = time.perf_counter()
+        changed = 0
+        pattern_changed = False
+        any_fail = False
+        first_fail: tuple[str, str | None, str | None, Exception] | None = None
+        refreshed_kernels: list = []
+        prof_rows: list[tuple[float, str, str | None, str | None, int]] = []
+        for ker in list(getattr(self, "kernels_K", [])) + list(getattr(self, "kernels_F", [])):
+            if getattr(ker, "level_set", None) is not level_set:
+                continue
+            sig_before = _pattern_sig(ker)
+            t_ker0 = time.perf_counter() if profile_refresh else 0.0
+            try:
+                if rebuild_no_reuse:
+                    if getattr(ker, "builder", None) is None:
+                        updated = False
+                    else:
+                        new_args = ker.builder(level_set)
+                        if new_args is None:
+                            updated = False
+                        else:
+                            old_args = ker.static_args if isinstance(ker.static_args, dict) else None
+                            if old_args is not None and isinstance(new_args, dict):
+                                for key, val in old_args.items():
+                                    if key not in new_args:
+                                        new_args[key] = val
+                            ker.static_args = new_args
+                            ker.eids = np.asarray(new_args.get("eids", []), dtype=np.int32)
+                            updated = True
+                else:
+                    updated = ker.refresh(level_set)
+            except Exception as exc:
+                any_fail = True
+                if first_fail is None:
+                    try:
+                        dom = str(getattr(ker, "domain", "unknown"))
+                        side = getattr(ker, "side", None)
+                        kind = None
+                        try:
+                            kind = ker.static_args.get("entity_kind", None)
+                        except Exception:
+                            kind = None
+                        first_fail = (dom, side, kind, exc)
+                    except Exception:
+                        first_fail = ("unknown", None, None, exc)
+                if debug_refresh:
+                    dom = getattr(ker, "domain", "unknown")
+                    side = getattr(ker, "side", None)
+                    kind = None
+                    try:
+                        kind = ker.static_args.get("entity_kind", None)
+                    except Exception:
+                        kind = None
+                    try:
+                        eids_len = int(np.asarray(ker.static_args.get("eids", [])).shape[0])
+                    except Exception:
+                        eids_len = -1
+                    try:
+                        gdofs_shape = tuple(np.asarray(ker.static_args.get("gdofs_map")).shape)
+                    except Exception:
+                        gdofs_shape = ()
+                    print(f"[jit] refresh failed: dom={dom} side={side} kind={kind} err={exc}")
+                    print(f"[jit]   old static: nEnt={eids_len} gdofs_map={gdofs_shape}")
+                    try:
+                        import traceback as _tb
+                        print(_tb.format_exc().rstrip())
+                    except Exception:
+                        pass
+                if raise_on_fail:
+                    raise
+                updated = False
+            if updated:
+                changed += 1
+                refreshed_kernels.append(ker)
+            sig_after = _pattern_sig(ker)
+            if sig_after != sig_before:
+                pattern_changed = True
+            if profile_refresh:
+                dt_ker = time.perf_counter() - t_ker0
+                dom = str(getattr(ker, "domain", "unknown"))
+                side = getattr(ker, "side", None)
+                kind = None
+                try:
+                    if isinstance(getattr(ker, "static_args", None), dict):
+                        kind = ker.static_args.get("entity_kind", None)
+                except Exception:
+                    kind = None
+                n_ent = 0
+                try:
+                    n_ent = int(np.asarray(getattr(ker, "eids", np.asarray([]))).shape[0])
+                except Exception:
+                    n_ent = 0
+                prof_rows.append((float(dt_ker), dom, side, str(kind) if kind is not None else None, int(n_ent)))
+        if any_fail and not raise_on_fail:
+            # Avoid running with a partially refreshed kernel set (inconsistent
+            # Jacobian/residual). Fall back to a full recompile.
+            t_re = time.perf_counter()
+            self._compile_all_kernels()
+            if first_fail is not None:
+                dom, side, kind, exc = first_fail
+                print(
+                    "[jit] kernel refresh failed (dom={}, side={}, kind={}): {}; recompiled kernels in {:.3f}s".format(
+                        dom,
+                        side,
+                        kind,
+                        exc,
+                        time.perf_counter() - t_re,
+                    )
+                )
+            else:
+                print(f"[jit] kernel refresh failed; recompiled kernels in {time.perf_counter() - t_re:.3f}s")
+            return
+        if kernels_ls_buildable and changed != len(kernels_ls_buildable):
+            msg = "[jit] level-set refresh: refreshed {}/{} refreshable kernels (stale kernels possible).".format(
+                int(changed), int(len(kernels_ls_buildable))
+            )
+            print(msg)
+            if assert_full_refresh:
+                raise RuntimeError(msg)
+
+        if validate_refresh and refreshed_kernels:
+            mesh = getattr(getattr(self, "me", None), "mesh", None) or getattr(self.dh.mixed_element, "mesh", None)
+            if mesh is not None:
+                rng = np.random.default_rng(0)
+
+                def _sample(arr: np.ndarray, k: int) -> np.ndarray:
+                    arr = np.asarray(arr, dtype=int)
+                    if arr.size <= k:
+                        return arr
+                    idx = rng.choice(arr.size, size=int(k), replace=False)
+                    return arr[idx]
+
+                bad: list[str] = []
+                for ker in refreshed_kernels:
+                    static = getattr(ker, "static_args", None)
+                    if not isinstance(static, dict):
+                        continue
+                    eids = np.asarray(static.get("eids", []), dtype=int)
+                    kind = static.get("entity_kind", None)
+                    dom = str(getattr(ker, "domain", "") or "unknown")
+                    side = getattr(ker, "side", None)
+                    if kind not in {"edge", "element"}:
+                        kind = "edge" if dom == "ghost_edge" else "element"
+
+                    gdofs = static.get("gdofs_map", None)
+                    if isinstance(gdofs, np.ndarray):
+                        try:
+                            if int(gdofs.shape[0]) != int(eids.shape[0]):
+                                bad.append(
+                                    f"gdofs_map rows != eids ({dom}, kind={kind}, side={side}): {gdofs.shape[0]} vs {eids.shape[0]}"
+                                )
+                        except Exception:
+                            pass
+
+                    samp = _sample(eids, max(0, int(validate_samples)))
+                    if samp.size == 0:
+                        continue
+                    if kind == "element":
+                        tags = [str(getattr(mesh.elements_list[int(e)], "tag", "")) for e in samp]
+                        tagset = set(tags)
+                        if dom == "interface":
+                            if any(t != "cut" for t in tags):
+                                bad.append(f"interface/element has non-cut tags: {sorted(tagset)}")
+                        elif dom == "volume":
+                            # Full-volume kernels should be pure inside/outside; cut-volume kernels are separate.
+                            if static.get("_full_fixed", False):
+                                # Fixed-size full kernels may include all element ids, with inactive
+                                # elements masked out by zero quadrature weights.
+                                qw = static.get("qw", None)
+                                if (
+                                    isinstance(qw, np.ndarray)
+                                    and qw.ndim >= 2
+                                    and int(qw.shape[0]) >= int(mesh.n_elements)
+                                ):
+                                    wrong = []
+                                    for eid, t in zip(samp, tags):
+                                        if str(side) == "+" and t != "outside":
+                                            wrong.append(int(eid))
+                                        if str(side) == "-" and t != "inside":
+                                            wrong.append(int(eid))
+                                    if wrong:
+                                        if not np.allclose(qw[np.asarray(wrong, dtype=int)], 0.0):
+                                            bad.append(
+                                                f"volume/{side} fixed kernel has nonzero weights on non-{('outside' if str(side)== '+' else 'inside')} ids"
+                                            )
+                            else:
+                                if "cut" in tagset and (len(tagset) > 1):
+                                    bad.append(f"volume kernel mixes 'cut' with {sorted(tagset)} (side={side})")
+                                if "cut" not in tagset:
+                                    if str(side) == "+" and any(t != "outside" for t in tags):
+                                        bad.append(f"volume/+ has non-outside tags: {sorted(tagset)}")
+                                    if str(side) == "-" and any(t != "inside" for t in tags):
+                                        bad.append(f"volume/- has non-inside tags: {sorted(tagset)}")
+                    else:
+                        tags = [str(getattr(mesh.edges_list[int(g)], "tag", "")) for g in samp]
+                        tagset = set(tags)
+                        if dom == "interface":
+                            if any(t != "interface" for t in tags):
+                                bad.append(f"interface/edge has non-interface tags: {sorted(tagset)}")
+                        elif dom == "ghost_edge":
+                            if any((not t.startswith("ghost")) or t == "interface" for t in tags):
+                                bad.append(f"ghost_edge has unexpected tags: {sorted(tagset)}")
+
+                if bad:
+                    msg = "[jit] level-set refresh validation failed: " + " | ".join(bad[:6])
+                    print(msg)
+                    if validate_raise:
+                        raise RuntimeError(msg)
+
+        if changed:
+            if pattern_changed:
+                self._pattern_stale = True
+                if hasattr(self, "_decoupled_full_mask"):
+                    try:
+                        delattr(self, "_decoupled_full_mask")
+                    except Exception:
+                        pass
+            total_dt = time.perf_counter() - t0
+            if profile_refresh and prof_rows:
+                prof_rows.sort(reverse=True, key=lambda t: t[0])
+                print("[jit] level-set refresh slow kernels (dt, domain, side, kind, nEnt):")
+                for dt_ker, dom, side, kind, n_ent in prof_rows[:12]:
+                    print(f"  {dt_ker:7.3f}s  dom={dom}  side={side}  kind={kind}  n={n_ent}")
+            if log_summary or trace_refresh or debug_refresh or profile_refresh:
+                print(f"[jit] refreshed {changed} kernels for moving level set in {total_dt:.3f}s")
+    def _python_form_compiler(self):
+        """Lazily construct the pure-Python FormCompiler."""
+        if getattr(self, "_python_fc", None) is None:
+            from pycutfem.ufl.compilers import FormCompiler
+
+            self._python_fc = FormCompiler(
+                self.dh, quadrature_order=self.quad_order, backend="python"
+            )
+        return self._python_fc
 
     def _maybe_refresh_deformation(self, coeffs: Dict[str, object]) -> None:
         if self.deformation is None or self._deformation_update is None:
@@ -475,63 +3710,582 @@ class NewtonSolver:
         """
 
         dh = self.dh
-        dt = time_params.dt
         delta_U = np.zeros(dh.total_dofs)
 
         t_start = time.perf_counter()
-        for step in range(time_params.max_steps):
-            t_n = step * dt
+        step = 0  # local step counter within this solve call
+        t_n = float(getattr(time_params, "t0", 0.0) or 0.0)
+        step0 = int(getattr(time_params, "step0", 0) or 0)
+        prev_delta_inf: float | None = None
+        last_dt: float | None = None
+        last_success_delta: np.ndarray | None = None
+        last_success_dt: float | None = None
+
+        abort_on_dt_reduction = os.getenv("PYCUTFEM_ABORT_ON_DT_REDUCTION", "").lower() in {"1", "true", "yes"}
+        keep_guess = False  # set by on_step_failure="retry_keep_guess"
+        skip_step_guess_cb = False
+
+        dt_controller: AdaptiveDtController | None = None
+        if bool(getattr(time_params, "allow_dt_reduction", False)):
+            dt_controller = AdaptiveDtController(
+                dt0=float(time_params.dt),
+                params=DtControllerParams(
+                    dt_min=float(getattr(time_params, "dt_min", 0.0)),
+                    dt_max=getattr(time_params, "dt_max", None),
+                    iters_increase_threshold=int(getattr(time_params, "dt_iters_increase_threshold", 8)),
+                    iters_decrease_threshold=int(getattr(time_params, "dt_iters_decrease_threshold", 20)),
+                    easy_steps_before_increase=int(getattr(time_params, "dt_easy_steps_before_increase", 2)),
+                    slow_steps_before_decrease=int(getattr(time_params, "dt_slow_steps_before_decrease", 1)),
+                    increase_factor=float(getattr(time_params, "dt_increase_factor", 1.1)),
+                    decrease_factor_slow=float(getattr(time_params, "dt_decrease_factor_slow", 0.9)),
+                    decrease_factor_fail=float(getattr(time_params, "dt_reduction_factor", 0.5)),
+                    reject_on_slow=bool(getattr(time_params, "dt_reject_on_slow", False)),
+                ),
+            )
+
+        def _adjust_max_steps_for_final_time(*, t_now: float, step_now: int, dt_new: float) -> None:
+            if not bool(getattr(time_params, "adjust_max_steps_on_dt_change", True)):
+                return
+            final_time = getattr(time_params, "final_time", None)
+            try:
+                final_time_val = float(final_time) if final_time is not None else None
+            except Exception:
+                final_time_val = None
+            if final_time_val is None or final_time_val <= t_now:
+                return
+            remaining = float(final_time_val) - float(t_now)
+            needed = int(math.ceil(remaining / max(float(dt_new), 1.0e-16)))
+            time_params.max_steps = max(int(time_params.max_steps), int(step_now + needed))
+
+        def _require_dt_callback() -> Callable[[float], None]:
+            on_dt_change = getattr(time_params, "on_dt_change", None)
+            if not callable(on_dt_change):
+                raise RuntimeError(
+                    "Adaptive dt requires TimeStepperParameters.on_dt_change "
+                    "to keep dt-dependent coefficients in sync."
+                )
+            return on_dt_change
+
+        def _classify_newton_exception(exc: Exception) -> str:
+            msg = str(exc)
+            if isinstance(exc, RuntimeError) and "Line search failed" in msg:
+                return "line_search"
+            if "did not converge" in msg:
+                return "max_iter"
+            return type(exc).__name__
+
+        while step < time_params.max_steps and t_n < time_params.final_time:
+            global_step = int(step0 + step)
+            global_step_no = int(global_step + 1)
+            dt_nominal = float(time_params.dt)
+            dt = float(dt_nominal)
+            # Cap the last time step to hit final_time exactly.
+            # Without this, the time loop can overshoot (e.g. t_n=0.46875, dt=0.125, final_time=0.5).
+            try:
+                final_time_val = float(time_params.final_time)
+            except Exception:
+                final_time_val = None
+            if final_time_val is not None:
+                remaining = float(final_time_val) - float(t_n)
+                # Avoid taking a numerically tiny "last" step due to floating-point
+                # drift (e.g. t_n=0.49999999999999994 < 0.5). Such steps can make
+                # the transient blocks nearly singular (inv_dt -> huge) and break
+                # Newton at the end of an otherwise successful run.
+                tol_final = 1.0e-12 * max(1.0, abs(float(final_time_val)))
+                if remaining <= tol_final:
+                    break
+                if dt > remaining:
+                    dt = float(remaining)
+            dt_min = float(getattr(time_params, "dt_min", 0.0))
+            if dt_min > 0.0 and dt < dt_min:
+                # Allow a shorter *last* step to hit final_time exactly.
+                tol_last = 1.0e-12 * max(1.0, abs(float(final_time_val))) if final_time_val is not None else 0.0
+                is_last_step = bool(
+                    final_time_val is not None
+                    and dt < dt_nominal
+                    and abs((t_n + dt) - final_time_val) <= tol_last
+                )
+                if not is_last_step:
+                    raise RuntimeError(
+                        f"Δt={dt:.3e} dropped below dt_min={dt_min:.3e}; aborting time stepping."
+                    )
+                if int(getattr(self.np, "print_level", 2) or 0) >= 1:
+                    print(
+                        f"    [warn] Last step uses Δt={dt:.3e} < dt_min={dt_min:.3e} to hit final_time={final_time_val:.3e}."
+                    )
+            if last_dt is None or not math.isclose(dt, last_dt, rel_tol=0.0, abs_tol=0.0):
+                on_dt_change = getattr(time_params, "on_dt_change", None)
+                if callable(on_dt_change):
+                    on_dt_change(dt)
+                last_dt = dt
 
             # Predictor: copy previous solution ---------------------
-            for f, f_prev in zip(functions, prev_functions):
-                f.nodal_values[:] = f_prev.nodal_values[:]
+            if not keep_guess:
+                for f, f_prev in zip(functions, prev_functions):
+                    f.nodal_values[:] = f_prev.nodal_values[:]
+                pred_key = str(getattr(time_params, "predictor", "prev")).strip().lower()
+                if pred_key in {"delta", "increment", "extrap", "extrapolate"}:
+                    if (
+                        last_success_delta is not None
+                        and last_success_dt is not None
+                        and float(last_success_dt) > 0.0
+                        and float(getattr(time_params, "predictor_damping", 1.0) or 0.0) != 0.0
+                    ):
+                        scale = float(dt) / float(last_success_dt)
+                        damp = float(getattr(time_params, "predictor_damping", 1.0) or 0.0)
+                        dh.add_to_functions(damp * scale * last_success_delta, functions)
+                        if bool(getattr(time_params, "predictor_clip_01", False)) and not isinstance(self, PdasNewtonSolver):
+                            for f in functions:
+                                fld = getattr(f, "field_name", None)
+                                if fld in {"alpha", "phi"}:
+                                    try:
+                                        f.nodal_values[:] = np.clip(np.asarray(f.nodal_values, dtype=float), 0.0, 1.0)
+                                    except Exception:
+                                        pass
+            else:
+                keep_guess = False
+            run_step_guess_cb = not bool(skip_step_guess_cb)
+            skip_step_guess_cb = False
 
             # Time‑dependent BCs -----------------------------------
-            bcs_now = self._freeze_bcs(self.bcs, t_n)
+            # For theta-schemes, apply time-dependent Dirichlet data at t_{n+θ}
+            # (implicit Euler θ=1 → end-of-step, CN θ=0.5 → midpoint).
+            t_bc = t_n + float(getattr(time_params, "theta", 1.0)) * dt
+            debug_step_preamble = bool(getattr(time_params, "debug_step_preamble", False))
+            preamble_t0 = time.perf_counter() if debug_step_preamble else 0.0
+            freeze_t0 = time.perf_counter() if debug_step_preamble else 0.0
+            bcs_now = self._freeze_bcs(self.bcs, t_bc)
+            if debug_step_preamble:
+                print(
+                    f"    [debug] step {int(global_step_no)} preamble: _freeze_bcs took "
+                    f"{time.perf_counter() - freeze_t0:.3f}s at t_bc={float(t_bc):.6g}."
+                )
+            apply_t0 = time.perf_counter() if debug_step_preamble else 0.0
             dh.apply_bcs(bcs_now, *functions)
+            if debug_step_preamble:
+                print(
+                    f"    [debug] step {int(global_step_no)} preamble: apply_bcs took "
+                    f"{time.perf_counter() - apply_t0:.3f}s."
+                )
+            step_guess_cb = getattr(time_params, "step_initial_guess_callback", None)
+            if callable(step_guess_cb) and run_step_guess_cb:
+                cb_t0 = time.perf_counter() if debug_step_preamble else 0.0
+                if debug_step_preamble:
+                    print(f"    [debug] step {int(global_step_no)} preamble: entering step_initial_guess_callback.")
+                try:
+                    step_guess_cb(
+                        solver=self,
+                        step=int(global_step),
+                        step_no=int(global_step_no),
+                        t=float(t_n),
+                        dt=float(dt),
+                        t_bc=float(t_bc),
+                        functions=functions,
+                        prev_functions=prev_functions,
+                        aux_functions=aux_functions,
+                        bcs=bcs_now,
+                    )
+                except Exception as cb_exc:
+                    print(f"    [warn] step_initial_guess_callback raised: {cb_exc}")
+                if debug_step_preamble:
+                    print(
+                        f"    [debug] step {int(global_step_no)} preamble: step_initial_guess_callback took "
+                        f"{time.perf_counter() - cb_t0:.3f}s."
+                    )
+                # The callback is allowed to modify the iterate; re-apply BCs and
+                # linear constraints so the monolithic solve starts from a
+                # feasible state.
+                apply_cb_t0 = time.perf_counter() if debug_step_preamble else 0.0
+                dh.apply_bcs(bcs_now, *functions)
+                if getattr(self, "constraints", None) is not None:
+                    self._enforce_constraints_on_functions(functions)
+                if debug_step_preamble:
+                    print(
+                        f"    [debug] step {int(global_step_no)} preamble: callback BC/constraint restore took "
+                        f"{time.perf_counter() - apply_cb_t0:.3f}s."
+                    )
+            if debug_step_preamble:
+                print(
+                    f"    [debug] step {int(global_step_no)} preamble: total setup took "
+                    f"{time.perf_counter() - preamble_t0:.3f}s."
+                )
+            self._notify_operator_step_begin(
+                functions=functions,
+                prev_functions=prev_functions,
+                aux_functions=aux_functions,
+                step=int(global_step),
+                step_no=int(global_step_no),
+                t=float(t_n),
+                dt=float(dt),
+                bcs=bcs_now,
+            )
 
             # Newton loop -----------------------------------------
-            delta_U = self._newton_loop(functions, prev_functions, aux_functions, bcs_now)
-            print(f"    Time step {step+1}: ΔU = {np.linalg.norm(delta_U, ord=np.inf):.2e}")
+            # Expose step metadata for debug hooks (e.g. step-scoped FD checks).
+            self._current_step_no = int(global_step_no)
+            self._current_t = float(t_n)
+            self._current_dt = float(dt)
+            # Clear last-step diagnostics (set by backend-specific Newton loops).
+            self._last_nonlinear_norm = None
+            self._last_nonlinear_norm_label = None
+            self._last_nonlinear_reason = None
+            self._last_nonlinear_update_inf = None
+            self._last_nonlinear_update_label = None
+            self._last_nonlinear_accepted = False
+            self._last_nonlinear_iterations = None
+            try:
+                delta_U, converged, n_iters = self._newton_loop(functions, prev_functions, aux_functions, bcs_now)
+            except Exception as e:
+                print(f"    Newton failed at step {global_step_no} with dt={dt:.3e}: {e}")
+                reject_reason = _classify_newton_exception(e)
+                self._notify_operator_step_reject(
+                    functions=functions,
+                    prev_functions=prev_functions,
+                    aux_functions=aux_functions,
+                    step=int(global_step),
+                    step_no=int(global_step_no),
+                    t=float(t_n),
+                    dt=float(dt),
+                    bcs=bcs_now,
+                    exception=e,
+                    reason=reject_reason,
+                )
+                on_fail = getattr(time_params, "on_step_failure", None)
+                if callable(on_fail):
+                    try:
+                        action = on_fail(
+                            step=int(global_step),
+                            step_no=int(global_step_no),
+                            global_step=int(global_step),
+                            global_step_no=int(global_step_no),
+                            local_step=int(step),
+                            local_step_no=int(step + 1),
+                            t=float(t_n),
+                            dt=float(dt),
+                            exception=e,
+                            functions=functions,
+                            prev_functions=prev_functions,
+                            bcs=bcs_now,
+                            aux_functions=aux_functions,
+                        )
+                    except TypeError:
+                        action = on_fail(step, t_n, dt, e)
+                    except Exception as cb_exc:  # noqa: PERF203
+                        print(f"    [warn] on_step_failure callback raised: {cb_exc}")
+                        action = None
+                    if action in (True, "retry"):
+                        continue
+                    if action == "retry_keep_guess":
+                        keep_guess = True
+                        skip_step_guess_cb = True
+                        continue
+                    if action == "abort":
+                        raise
+                if not bool(getattr(time_params, "allow_dt_reduction", False)) or dt_controller is None:
+                    raise
+                _require_dt_callback()
+                decision = dt_controller.on_failure(dt=dt, reason=reject_reason)
+                # Guard against infinite retry loops when dt hits dt_min (or when
+                # a controller misconfiguration yields a non-decreasing dt).
+                new_dt = float(decision.dt)
+                if new_dt >= float(dt) - 0.0:
+                    raise RuntimeError(
+                        f"Newton failed at step {global_step_no} with dt={dt:.3e}, "
+                        f"and Δt cannot be reduced further (proposed dt={new_dt:.3e}, reason={decision.reason})."
+                    ) from e
+                if dt_min > 0.0 and decision.dt < dt_min:
+                    raise RuntimeError(
+                        f"Δt reduction would drop below dt_min={dt_min:.3e} (new_dt={decision.dt:.3e})."
+                    ) from e
+                time_params.dt = new_dt
+                _adjust_max_steps_for_final_time(t_now=t_n, step_now=step, dt_new=float(time_params.dt))
+                print(
+                    f"    Rejecting step {global_step_no}; reducing Δt → {time_params.dt:.3e} ({decision.reason}) and retrying."
+                )
+                # Reset line-search warm-start between attempts: after a failed step the
+                # previous accepted α can be extremely small, which makes retries at a
+                # reduced Δt stagnate unnecessarily.
+                self._ls_alpha_prev = 1.0
+                if abort_on_dt_reduction and float(time_params.dt) < float(dt):
+                    raise RuntimeError(
+                        f"Aborting after Δt reduction request at step {global_step_no}: "
+                        f"{dt:.3e} -> {float(time_params.dt):.3e} ({decision.reason})."
+                    ) from e
+                continue
+
+            if not converged:
+                # Some solver backends (e.g. SNES) may return the best iterate without raising.
+                reject_exc = RuntimeError("Newton did not converge.")
+                self._notify_operator_step_reject(
+                    functions=functions,
+                    prev_functions=prev_functions,
+                    aux_functions=aux_functions,
+                    step=int(global_step),
+                    step_no=int(global_step_no),
+                    t=float(t_n),
+                    dt=float(dt),
+                    bcs=bcs_now,
+                    exception=reject_exc,
+                    reason="not_converged",
+                )
+                on_fail = getattr(time_params, "on_step_failure", None)
+                if callable(on_fail):
+                    try:
+                        action = on_fail(
+                            step=int(global_step),
+                            step_no=int(global_step_no),
+                            global_step=int(global_step),
+                            global_step_no=int(global_step_no),
+                            local_step=int(step),
+                            local_step_no=int(step + 1),
+                            t=float(t_n),
+                            dt=float(dt),
+                            exception=reject_exc,
+                            functions=functions,
+                            prev_functions=prev_functions,
+                            bcs=bcs_now,
+                            aux_functions=aux_functions,
+                        )
+                    except TypeError:
+                        action = on_fail(step, t_n, dt, None)
+                    except Exception as cb_exc:  # noqa: PERF203
+                        print(f"    [warn] on_step_failure callback raised: {cb_exc}")
+                        action = None
+                    if action in (True, "retry"):
+                        continue
+                    if action == "retry_keep_guess":
+                        keep_guess = True
+                        continue
+                    if action == "abort":
+                        raise RuntimeError(
+                            f"Newton did not converge at step {global_step_no} with dt={dt:.3e}."
+                        )
+                if not bool(getattr(time_params, "allow_dt_reduction", False)) or dt_controller is None:
+                    raise RuntimeError(
+                        f"Newton did not converge at step {global_step_no} with dt={dt:.3e}."
+                    )
+                _require_dt_callback()
+                decision = dt_controller.on_failure(dt=dt, reason="not_converged")
+                # Guard against infinite retry loops when dt hits dt_min.
+                new_dt = float(decision.dt)
+                if new_dt >= float(dt) - 0.0:
+                    raise RuntimeError(
+                        f"Newton did not converge at step {global_step_no} with dt={dt:.3e}, "
+                        f"and Δt cannot be reduced further (proposed dt={new_dt:.3e}, reason={decision.reason})."
+                    )
+                if dt_min > 0.0 and decision.dt < dt_min:
+                    raise RuntimeError(
+                        f"Δt reduction would drop below dt_min={dt_min:.3e} (new_dt={decision.dt:.3e})."
+                    )
+                time_params.dt = new_dt
+                _adjust_max_steps_for_final_time(t_now=t_n, step_now=step, dt_new=float(time_params.dt))
+                print(
+                    f"    Rejecting step {global_step_no}; reducing Δt → {time_params.dt:.3e} ({decision.reason}) and retrying."
+                )
+                # Same rationale as in the exception path above.
+                self._ls_alpha_prev = 1.0
+                if abort_on_dt_reduction and float(time_params.dt) < float(dt):
+                    raise RuntimeError(
+                        f"Aborting after Δt reduction request at step {global_step_no}: "
+                        f"{dt:.3e} -> {float(time_params.dt):.3e} ({decision.reason})."
+                    )
+                continue
+
+            # Optional dt adaptation based on Newton iteration count (success path)
+            if bool(getattr(time_params, "allow_dt_reduction", False)) and dt_controller is not None:
+                decision = dt_controller.on_success(dt=dt, n_iters=int(n_iters))
+                if decision.dt != dt:
+                    _require_dt_callback()
+                    dt_min = float(getattr(time_params, "dt_min", 0.0))
+                    if dt_min > 0.0 and decision.dt < dt_min:
+                        raise RuntimeError(
+                            f"Δt update would drop below dt_min={dt_min:.3e} (new_dt={decision.dt:.3e})."
+                        )
+                    time_params.dt = float(decision.dt)
+                    # For reject-on-slow mode, retry the same step at the new dt.
+                    if decision.retry_step:
+                        _adjust_max_steps_for_final_time(t_now=t_n, step_now=step, dt_new=float(time_params.dt))
+                        print(
+                            f"    Rejecting step {global_step_no}; setting Δt → {time_params.dt:.3e} ({decision.reason}) and retrying."
+                        )
+                        self._notify_operator_step_reject(
+                            functions=functions,
+                            prev_functions=prev_functions,
+                            aux_functions=aux_functions,
+                            step=int(global_step),
+                            step_no=int(global_step_no),
+                            t=float(t_n),
+                            dt=float(dt),
+                            bcs=bcs_now,
+                            exception=None,
+                            reason=str(decision.reason),
+                        )
+                        if abort_on_dt_reduction and float(time_params.dt) < float(dt):
+                            raise RuntimeError(
+                                f"Aborting after Δt reduction request at step {global_step_no}: "
+                                f"{dt:.3e} -> {float(time_params.dt):.3e} ({decision.reason})."
+                            )
+                        continue
+                    # Otherwise, apply on next step (after advancing time).
+                    _adjust_max_steps_for_final_time(
+                        t_now=float(t_n + dt), step_now=int(step + 1), dt_new=float(time_params.dt)
+                    )
+                    if abort_on_dt_reduction and float(time_params.dt) < float(dt):
+                        raise RuntimeError(
+                            f"Aborting after Δt reduction request at step {global_step_no}: "
+                            f"{dt:.3e} -> {float(time_params.dt):.3e} ({decision.reason})."
+                        )
+                    if decision.reason == "slow_newton":
+                        print(
+                            f"    Slow Newton convergence ({n_iters} iters); setting next Δt → {time_params.dt:.3e}."
+                        )
+                    elif decision.reason == "fast_newton":
+                        print(
+                            f"    Fast Newton convergence ({n_iters} iters); setting next Δt → {time_params.dt:.3e}."
+                        )
+
+            delta_inf = float(np.linalg.norm(delta_U, ord=np.inf))
+            self._last_accepted_step_delta_inf = float(delta_inf)
+            if int(getattr(self.np, "print_level", 2) or 0) >= 1:
+                dom_name = None
+                try:
+                    dom = []
+                    for f_prev, f in zip(prev_functions, functions):
+                        df = np.asarray(f.nodal_values, dtype=float) - np.asarray(f_prev.nodal_values, dtype=float)
+                        dom.append((getattr(f, "name", type(f).__name__), float(np.linalg.norm(df.ravel(), ord=np.inf))))
+                    if dom:
+                        dom_name, _dom_val = max(dom, key=lambda t: t[1])
+                except Exception:
+                    dom_name = None
+
+                msg = (
+                    f"    Time step {global_step_no}: t={float(t_n + dt):.6e}s, dt={float(dt):.3e}, "
+                    f"nNewton={int(n_iters)}, ΔU_step∞ = {delta_inf:.2e}"
+                )
+                if dom_name:
+                    msg += f" (dom={dom_name})"
+                norm_val = getattr(self, "_last_nonlinear_norm", None)
+                norm_label = getattr(self, "_last_nonlinear_norm_label", None)
+                if norm_label and norm_val is not None:
+                    try:
+                        msg += f", {str(norm_label)} = {float(norm_val):.3e}"
+                    except Exception:
+                        pass
+                upd_val = getattr(self, "_last_nonlinear_update_inf", None)
+                upd_label = getattr(self, "_last_nonlinear_update_label", None)
+                if upd_label and upd_val is not None:
+                    try:
+                        msg += f", {str(upd_label)} = {float(upd_val):.3e}"
+                    except Exception:
+                        pass
+                reason = getattr(self, "_last_nonlinear_reason", None)
+                if reason is not None:
+                    msg += f", reason={reason}"
+                if bool(getattr(self, "_last_nonlinear_accepted", False)):
+                    msg += ", accepted=True"
+                print(msg)
+            self._last_nonlinear_iterations = int(n_iters)
             
             # Post-step refiner (VI clip) **before** promotion so prev matches clipped state
             if post_step_refiner is not None:
                 post_step_refiner(step, bcs_now, functions, prev_functions)
-            
-             # Accept: promote current → previous
+
+            # Store last accepted increment for predictor use on the next step.
+            #
+            # IMPORTANT: Build this in *global DOF order* using `_g_dofs` maps.
+            # Concatenating `f.nodal_values` is not guaranteed to match the global
+            # DOF numbering (mixed/vector fields, cut/xfem splitting, constraints),
+            # and using a mis-ordered delta can catastrophically destabilize the
+            # "delta" predictor.
+            try:
+                last_success_delta = self._gather_full_iterate(functions) - self._gather_full_iterate(prev_functions)
+                last_success_dt = float(dt)
+            except Exception:
+                last_success_delta = None
+                last_success_dt = None
+
+            # # Reject and retry with smaller Δt if the update blows up
+            # if step > 0 and prev_delta_inf is not None and prev_delta_inf > 0.0:
+            #     threshold = float(getattr(time_params, "dt_reduction_threshold", 5.0))
+            #     if delta_inf > threshold * prev_delta_inf:
+            #         if not bool(getattr(time_params, "allow_dt_reduction", False)):
+            #             raise RuntimeError(
+            #                 "Time step reduction requested but disabled. "
+            #                 "Reduce dt manually or enable allow_dt_reduction with on_dt_change."
+            #             )
+            #         on_dt_change = getattr(time_params, "on_dt_change", None)
+            #         if not callable(on_dt_change):
+            #             raise RuntimeError(
+            #                 "Time step reduction requires TimeStepperParameters.on_dt_change "
+            #                 "to keep dt-dependent coefficients in sync."
+            #             )
+            #         factor = float(getattr(time_params, "dt_reduction_factor", 0.5))
+            #         time_params.dt = float(time_params.dt) * factor
+            #         if bool(getattr(time_params, "adjust_max_steps_on_dt_change", True)):
+            #             try:
+            #                 final_time = float(time_params.final_time)
+            #             except Exception:
+            #                 final_time = None
+            #             if final_time is not None and final_time > t_n:
+            #                 remaining = final_time - t_n
+            #                 extra = int(math.ceil(remaining / max(float(time_params.dt), 1.0e-16)))
+            #                 time_params.max_steps = max(int(time_params.max_steps), int(step + extra))
+            #         on_dt_change(float(time_params.dt))
+            #         last_dt = float(time_params.dt)
+            #         print(f"    Rejecting step {step+1}; reducing Δt → {time_params.dt:.3e} and retrying.")
+            #         continue
+
+            post_accept_cb = getattr(self, "post_accept_cb", None)
+            if callable(post_accept_cb):
+                post_accept_cb(functions)
+            self._notify_operator_step_accept(
+                functions=functions,
+                prev_functions=prev_functions,
+                aux_functions=aux_functions,
+                step=int(global_step),
+                step_no=int(global_step_no),
+                t=float(t_n),
+                dt=float(dt),
+                bcs=bcs_now,
+            )
+
+            # Re-impose inhomogeneous Dirichlet values on the accepted iterate
+            # before promotion. The reduced Newton path excludes constrained
+            # rows, but trial globalization / runtime operator hooks can still
+            # leave the stored function arrays slightly inconsistent with the
+            # prescribed boundary data.
+            dh.apply_bcs(bcs_now, *functions)
+            if getattr(self, "constraints", None) is not None:
+                self._enforce_constraints_on_functions(functions)
+
+            # Accept: promote current → previous
             for f_prev, f in zip(prev_functions, functions):
                 f_prev.nodal_values[:] = f.nodal_values[:]
-
-            if step > 0:
-                # Reject and retry with smaller Δt if the update blows up
-                if np.linalg.norm(delta_U, np.inf) > 5.0 * (np.linalg.norm(self.delta_U_prev, np.inf) if step else 1.0):
-                    # restore current to previous and cut dt
-                    for f, fp in zip(functions, prev_functions):
-                        f.nodal_values[:] = fp.nodal_values[:]
-                    time_params.dt *= 0.5
-                    print(f"    Rejecting step {step+1}; reducing Δt → {time_params.dt:.3e} and retrying.")
-                    continue
-            self.delta_U_prev = delta_U.copy()
-            # Steady‑state test -----------------------------------
-            if (
-                time_params.stop_on_steady
-                and step > 0
-                and np.linalg.norm(delta_U, ord=np.inf) < time_params.steady_tol
-            ):
-                break
-
-            # # Accept: promote current → previous ------------------
-            # dh.apply_bcs(bcs_now, *functions)
-            # for f_prev, f in zip(prev_functions, functions):
-            #     f_prev.nodal_values[:] = f.nodal_values[:]
+            prev_delta_inf = delta_inf
             # Post time-loop callback
             if self.post_timeloop_cb is not None:
                 self.post_timeloop_cb(functions)
-            if t_n + dt >= time_params.final_time:
+            t_n += dt
+            step += 1
+
+            # Steady‑state test -----------------------------------
+            # If enabled, still run the post-step callback and advance the
+            # time/step counters before exiting so the final accepted step is
+            # consistently recorded/exported by drivers.
+            if time_params.stop_on_steady and step > 0 and delta_inf < time_params.steady_tol:
+                if int(getattr(self.np, "print_level", 2) or 0) >= 1:
+                    try:
+                        tol = float(getattr(time_params, "steady_tol", 0.0))
+                    except Exception:
+                        tol = float("nan")
+                    print(
+                        f"    Steady-state reached at t={float(t_n):.6e}s (step={int(global_step_no)}): "
+                        f"ΔU_step∞={float(delta_inf):.3e} < steady_tol={tol:.3e}; stopping (--stop-on-steady)."
+                    )
                 break
 
         elapsed = time.perf_counter() - t_start
-        return delta_U, step + 1, elapsed
+        return delta_U, step, elapsed
 
     # ------------------------------------------------------------------
     #  Newton iteration (internal)
@@ -543,28 +4297,113 @@ class NewtonSolver:
         - Inhomogeneous Dirichlet values are NOT re-applied inside the iteration,
         only after an accepted step (BCs were already set before entering the loop).
         """
+        self._current_bcs = bcs_now
         dh = self.dh
-        ndof = dh.total_dofs
+        ndof_eff = getattr(self.restrictor, "full_size", dh.total_dofs)
+        residual_mode = str(getattr(self.np, "residual_norm", "linf") or "linf").strip().lower()
+
+        def _residual_norm_label() -> str:
+            if residual_mode in {"kratos_l2_over_ndof", "l2_over_ndof", "kratos"}:
+                return "|R|_2/N"
+            return "|R|_∞"
+
+        def _residual_norm_from_full(residual_full: np.ndarray) -> float:
+            vec = np.asarray(residual_full, dtype=float).reshape(-1)
+            if residual_mode in {"kratos_l2_over_ndof", "l2_over_ndof", "kratos"}:
+                denom = max(int(nfree), 1)
+                return float(np.linalg.norm(vec, ord=2) / float(denom))
+            return float(np.linalg.norm(vec, ord=np.inf))
+
+        def _residual_norm_from_red(residual_red: np.ndarray) -> float:
+            vec_red = np.asarray(residual_red, dtype=float).reshape(-1)
+            if residual_mode in {"kratos_l2_over_ndof", "l2_over_ndof", "kratos"}:
+                vec_full = np.zeros(int(ndof_eff), dtype=float)
+                vec_full[self.active_dofs] = vec_red
+                return _residual_norm_from_full(vec_full)
+            return float(np.linalg.norm(vec_red, ord=np.inf))
+
+        def _trace_label_text() -> str:
+            raw = getattr(self, "_newton_trace_label", None)
+            if callable(raw):
+                try:
+                    raw = raw(self)
+                except TypeError:
+                    raw = raw()
+                except Exception:
+                    raw = None
+            return str(raw or "").strip()
+
+        def _trace_prefix() -> str:
+            text = _trace_label_text()
+            return f"[{text}] " if text else ""
+
+        def _trace_global_residual() -> tuple[float | None, str | None]:
+            cb = getattr(self, "_newton_trace_global_residual_cb", None)
+            if not callable(cb):
+                return None, None
+            try:
+                value = cb(funcs, prev_funcs, aux_funcs, bcs_now)
+                value = float(value)
+            except Exception:
+                return None, None
+            if not np.isfinite(value):
+                return None, None
+            label = str(
+                getattr(self, "_newton_trace_global_residual_label", "|R_global|_∞")
+                or "|R_global|_∞"
+            ).strip()
+            return value, label
 
         # Quick safety: make sure we actually have a reduced set
         # (This is only for logging; we still run the reduced pipeline.)
         nfree = len(self.active_dofs)
-        if nfree == ndof:
-            print("        [warn] active_dofs == total_dofs — reduced path = full size."
-                " Check that bcs_homog correctly marks Dirichlet nodes.")
+        if nfree == ndof_eff:
+            if int(getattr(self.np, "print_level", 2) or 0) >= 2:
+                print(
+                    "        [warn] active_dofs == total_dofs — reduced path = full size."
+                    " Check that bcs_homog correctly marks Dirichlet nodes."
+                )
 
         self._last_iter_timings = []
         totals = {"assembly": 0.0, "linear_solve": 0.0, "line_search": 0.0}
         temp_t0 = time.perf_counter()
+        converged = False
+        norm_R0: float | None = None
+        norm_hist: list[float] = []
+        if bool(getattr(self.np, "ptc_recovery", False)):
+            self._newton_ptc_sigma_current = max(float(getattr(self.np, "ptc_sigma0", 1.0e-2) or 1.0e-2), 0.0)
+        else:
+            self._newton_ptc_sigma_current = 0.0
         for it in range(self.np.max_newton_iter):
+            self._current_newton_it = int(it + 1)
             if self.pre_cb is not None:
                 self.pre_cb(funcs)
+
+            if getattr(self, "constraints", None) is not None:
+                # Keep stored full vectors consistent with master DOFs.
+                self._enforce_constraints_on_functions(funcs)
+                self._enforce_constraints_on_functions(prev_funcs)
+            self._prepare_solver_coordinate_iterate(funcs, bcs_now)
 
             # Build the coefficients dict expected by kernels
             current: Dict[str, "Function"] = {f.name: f for f in funcs}
             current.update({f.name: f for f in prev_funcs})
             if aux_funcs:
                 current.update(aux_funcs)
+            self._notify_operator_nonlinear_iteration_begin(
+                functions=funcs,
+                prev_functions=prev_funcs,
+                aux_functions=aux_funcs,
+                iteration=it + 1,
+                coeffs=current,
+                bcs=bcs_now,
+                metrics={
+                    "step": int(getattr(self, "_current_step", 0)),
+                    "step_no": int(getattr(self, "_current_step_no", 0)),
+                    "t": float(getattr(self, "_current_time", 0.0)),
+                    "dt": float(getattr(self, "_current_dt", 0.0)),
+                },
+            )
 
             # 1) Assemble reduced system: A_ff δU_f = -R_f
             assembly_time = 0.0
@@ -572,36 +4411,425 @@ class NewtonSolver:
             A_red, R_red = self._assemble_system_reduced(current, need_matrix=True)
             assembly_time += time.perf_counter() - t_asm
 
-            # 1a) PRUNE decoupled rows caused by Restriction (nnz==0)
-            row_nnz = np.diff(A_red.indptr)
-            inactive = np.where(row_nnz == 0)[0]
-            if inactive.size:
-                keep_mask = np.ones(len(self.active_dofs), dtype=bool)
-                keep_mask[inactive] = False
-                # rebuild maps
-                self.active_dofs = self.active_dofs[keep_mask]
-                self.full_to_red = -np.ones(ndof, dtype=int)
-                self.full_to_red[self.active_dofs] = np.arange(self.active_dofs.size, dtype=int)
-                self.red_to_full = self.active_dofs
-                self._pattern_stale = True
-                self.restrictor = _ActiveReducer(self.dh, self.active_dofs)
-                # rebuild reduced CSR scatter pattern
-                self._build_reduced_pattern()
-                # re-assemble on the cleaned support
-                t_asm = time.perf_counter()
-                A_red, R_red = self._assemble_system_reduced(current, need_matrix=True)
-                assembly_time += time.perf_counter() - t_asm
+            # 1a) PRUNE decoupled rows/cols caused by Restriction (nnz==0)
+            A_red, R_red, _pruned, extra_asm = self._prune_decoupled_rows_cols(
+                current, A_red, R_red, ndof_eff
+            )
+            assembly_time += extra_asm
 
             # Log residual with a full-size view (zeros on fixed DOFs) for readability
-            R_full = np.zeros(ndof)
+            R_full = np.zeros(ndof_eff)
             R_full[self.active_dofs] = R_red
-            norm_R = np.linalg.norm(R_full, ord=np.inf)
+            norm_R = _residual_norm_from_full(R_full)
+            norm_hist.append(float(norm_R))
+            # Expose convergence diagnostics to the outer time-stepper.
+            self._last_nonlinear_norm = float(norm_R)
+            self._last_nonlinear_norm_label = _residual_norm_label()
+
+            # Optional matrix diagnostics (expensive; debug-only).
+            if os.getenv("PYCUTFEM_MATRIX_STATS", "").lower() in {"1", "true", "yes"}:
+                step_target_raw = os.getenv("PYCUTFEM_MATRIX_STATS_STEP", "").strip()
+                it_target_raw = os.getenv("PYCUTFEM_MATRIX_STATS_IT", "").strip()
+                try:
+                    step_now = int(getattr(self, "_current_step_no", -1))
+                except Exception:
+                    step_now = -1
+                try:
+                    want_step = int(step_target_raw) if step_target_raw else None
+                except Exception:
+                    want_step = None
+                try:
+                    want_it = int(it_target_raw) if it_target_raw else 1
+                except Exception:
+                    want_it = 1
+                do_stats = (want_step is None or want_step == step_now) and (int(it + 1) == int(want_it))
+                if do_stats and A_red is not None:
+                    try:
+                        A_csr = A_red.tocsr() if hasattr(A_red, "tocsr") else A_red
+                        fro_A = float(np.sqrt(A_csr.multiply(A_csr).sum()))
+                        A_skew = A_csr - A_csr.T
+                        fro_skew = float(np.sqrt(A_skew.multiply(A_skew).sum()))
+                        ratio = fro_skew / max(fro_A, 1.0e-300)
+                        nnz = int(getattr(A_csr, "nnz", 0))
+                        print(f"        [mat] nnz={nnz}  ||A-A^T||_F/||A||_F={ratio:.3e}  ||A||_F={fro_A:.3e}")
+
+                        k_raw = os.getenv("PYCUTFEM_MATRIX_EIGS_K", "").strip()
+                        if k_raw:
+                            k = int(k_raw)
+                        else:
+                            k = 0
+                        if k > 0:
+                            which = os.getenv("PYCUTFEM_MATRIX_EIGS_WHICH", "LM").strip() or "LM"
+                            try:
+                                evals = spla.eigs(A_csr, k=min(k, max(1, A_csr.shape[0] - 2)), which=which, return_eigenvectors=False)
+                                evals = np.asarray(evals, dtype=np.complex128)
+                                order = np.argsort(-np.abs(evals))
+                                evals = evals[order]
+                                e_fmt = ", ".join([f"{z.real:+.3e}{z.imag:+.3e}j" for z in evals[:k]])
+                                print(f"        [mat] eigs(k={k}, which='{which}') ≈ [{e_fmt}]")
+                            except Exception as exc:  # noqa: PERF203
+                                print(f"        [mat] eigs failed: {exc}")
+                    except Exception as exc:  # noqa: PERF203
+                        print(f"        [mat] stats failed: {exc}")
+            if os.getenv("PYCUTFEM_SAVE_MATRIX", "").lower() in {"1", "true", "yes"}:
+                step_target_raw = os.getenv("PYCUTFEM_SAVE_MATRIX_STEP", "").strip()
+                it_target_raw = os.getenv("PYCUTFEM_SAVE_MATRIX_IT", "").strip()
+                outdir = str(os.getenv("PYCUTFEM_SAVE_MATRIX_DIR", "") or "").strip()
+                if not outdir:
+                    outdir = os.path.join(os.getcwd(), "_pycutfem_matrix_dumps")
+                try:
+                    step_now = int(getattr(self, "_current_step_no", -1))
+                except Exception:
+                    step_now = -1
+                try:
+                    want_step = int(step_target_raw) if step_target_raw else None
+                except Exception:
+                    want_step = None
+                try:
+                    want_it = int(it_target_raw) if it_target_raw else 1
+                except Exception:
+                    want_it = 1
+                do_dump = (want_step is None or want_step == step_now) and (int(it + 1) == int(want_it))
+                if do_dump:
+                    dumped = getattr(self, "_saved_matrix_keys", None)
+                    if dumped is None:
+                        dumped = set()
+                        setattr(self, "_saved_matrix_keys", dumped)
+                    key = (step_now, int(it + 1))
+                    if key not in dumped and A_red is not None:
+                        dumped.add(key)
+                        try:
+                            os.makedirs(outdir, exist_ok=True)
+                            stem = f"step{int(step_now):04d}_it{int(it + 1):02d}"
+                            A_csr = A_red.tocsr() if hasattr(A_red, "tocsr") else A_red
+                            sp.save_npz(os.path.join(outdir, f"{stem}_A_red.npz"), A_csr)
+                            np.save(os.path.join(outdir, f"{stem}_R_red.npy"), np.asarray(R_red, dtype=np.float64))
+                            np.save(os.path.join(outdir, f"{stem}_active_dofs.npy"), np.asarray(self.active_dofs, dtype=np.int64))
+                            print(f"        [mat-save] saved reduced matrix/vector to {outdir}/{stem}_*")
+                        except Exception as exc:
+                            print(f"        [mat-save] failed: {exc}")
+            if os.getenv("PYCUTFEM_RESIDUAL_TRACE", "").lower() in {"1", "true", "yes"}:
+                worst_full = int(np.argmax(np.abs(R_full))) if R_full.size else -1
+                worst_val = float(R_full[worst_full]) if worst_full >= 0 else 0.0
+                field = None
+                try:
+                    field = getattr(self.dh, "_dof_to_node_map", {}).get(worst_full, (None, None))[0]
+                except Exception:
+                    field = None
+                fmsg = f", field={field}" if field is not None else ""
+
+                extra = ""
+                if os.getenv("PYCUTFEM_RESIDUAL_TRACE_CLASSIFY", "").lower() in {"1", "true", "yes"}:
+                    try:
+                        constraints = getattr(self, "constraints", None)
+                        bc_full = dh.get_dirichlet_data(bcs_now)
+                        if constraints is not None:
+                            bc_master = constraints.project_dirichlet(bc_full)
+                            is_dirichlet = int(worst_full) in bc_master
+                            inactive_master = constraints.to_master_set(dh.dof_tags.get("inactive", set()))
+                            is_inactive = int(worst_full) in inactive_master
+                        else:
+                            is_dirichlet = int(worst_full) in bc_full
+                            is_inactive = int(worst_full) in set(dh.dof_tags.get("inactive", set()))
+                        extra = f", dirichlet={int(bool(is_dirichlet))}, inactive={int(bool(is_inactive))}"
+                    except Exception:
+                        extra = ""
+
+                coords_msg = ""
+                if os.getenv("PYCUTFEM_RESIDUAL_TRACE_COORDS", "").lower() in {"1", "true", "yes"} and field is not None:
+                    try:
+                        sl = np.asarray(self.dh.get_field_slice(field), dtype=int).ravel()
+                        hit = np.nonzero(sl == int(worst_full))[0]
+                        if hit.size:
+                            coords = np.asarray(self.dh.get_dof_coords(field), dtype=float)[int(hit[0])]
+                            if coords.size >= 2:
+                                coords_msg = f", x={coords[0]:.3e}, y={coords[1]:.3e}"
+                    except Exception:
+                        coords_msg = ""
+
+                print(f"        [res] worst_gdof={worst_full} worst_val={worst_val:.3e}{fmsg}{extra}{coords_msg}")
+                if os.getenv("PYCUTFEM_RESIDUAL_TRACE_FIELDS", "").lower() in {"1", "true", "yes"}:
+                    field_norms = []
+                    for fld in getattr(self.dh, "field_names", []):
+                        try:
+                            sl = self.dh.get_field_slice(fld)
+                        except Exception:
+                            continue
+                        if sl is None or len(sl) == 0:
+                            continue
+                        field_norms.append(f"{fld}:{np.linalg.norm(R_full[sl], ord=np.inf):.2e}")
+                    if field_norms:
+                        print("        [res] per-field |R|_∞: " + ", ".join(field_norms))
+
+                # Optional per-kernel/domain breakdown of the residual at the worst DOF.
+                # Useful to separate volume/interface/ghost contributions in CutFEM.
+                if os.getenv("PYCUTFEM_RESIDUAL_BREAKDOWN", "").lower() in {"1", "true", "yes"}:
+                    it_target = os.getenv("PYCUTFEM_RESIDUAL_BREAKDOWN_IT", "").strip()
+                    if not it_target or int(it_target) == int(it + 1):
+                        try:
+                            worst_red = int(self.full_to_red[worst_full]) if worst_full >= 0 else -1
+                        except Exception:
+                            worst_red = -1
+                        if worst_red >= 0:
+                            def _residual_contrib_at_red(kernel, red_index: int) -> float:
+                                gdofs = kernel.static_args.get("gdofs_map")
+                                if not isinstance(gdofs, np.ndarray) or gdofs.ndim != 2 or gdofs.shape[0] == 0:
+                                    return 0.0
+                                _, Floc, _ = kernel.exec(current)
+                                acc = 0.0
+                                constraints = getattr(self, "constraints", None)
+                                if constraints is None:
+                                    ndof_eff = int(self.full_to_red.size)
+                                    for e in range(gdofs.shape[0]):
+                                        full = np.asarray(gdofs[e], dtype=int)
+                                        valid_full = (full >= 0) & (full < ndof_eff)
+                                        if not np.any(valid_full):
+                                            continue
+                                        rmap = -np.ones_like(full, dtype=int)
+                                        rmap[valid_full] = self.full_to_red[full[valid_full]]
+                                        hit = np.nonzero(rmap == int(red_index))[0]
+                                        if hit.size:
+                                            acc += float(np.sum(Floc[e][hit]))
+                                    return float(acc)
+
+                                full_to_master = getattr(self, "_constr_full_to_master", None)
+                                is_slave = getattr(self, "_constr_is_slave", None)
+                                slave_map = getattr(self, "_constr_slave_map", None)
+                                if (
+                                    not isinstance(full_to_master, np.ndarray)
+                                    or not isinstance(is_slave, np.ndarray)
+                                    or not isinstance(slave_map, dict)
+                                ):
+                                    return 0.0
+
+                                for e in range(gdofs.shape[0]):
+                                    full = np.asarray(gdofs[e], dtype=int)
+                                    valid_full = full >= 0
+                                    if not np.any(valid_full):
+                                        continue
+                                    for loc_i, gd in zip(np.nonzero(valid_full)[0].tolist(), full[valid_full].tolist()):
+                                        gd_i = int(gd)
+                                        if gd_i < 0 or gd_i >= int(full_to_master.size):
+                                            continue
+                                        val = float(Floc[e][int(loc_i)])
+                                        if not np.isfinite(val) or val == 0.0:
+                                            continue
+                                        if bool(is_slave[gd_i]):
+                                            combo = slave_map.get(gd_i)
+                                            if combo is None:
+                                                continue
+                                            mcols, wts = combo
+                                            for mcol, wv in zip(mcols.tolist(), wts.tolist()):
+                                                red = int(self.full_to_red[int(mcol)])
+                                                if red == int(red_index):
+                                                    acc += float(wv) * val
+                                        else:
+                                            mcol = int(full_to_master[gd_i])
+                                            if mcol < 0:
+                                                continue
+                                            red = int(self.full_to_red[mcol])
+                                            if red == int(red_index):
+                                                acc += val
+
+                                return float(acc)
+
+                            entries = []
+                            for k_idx, kerF in enumerate(self.kernels_F):
+                                r0 = _residual_contrib_at_red(kerF, worst_red)
+                                if r0 == 0.0:
+                                    continue
+                                entries.append(
+                                    (
+                                        abs(r0),
+                                        r0,
+                                        k_idx,
+                                        getattr(kerF, "domain", "unknown"),
+                                        getattr(kerF, "side", None),
+                                        getattr(kerF.static_args, "get", lambda _k, _d=None: _d)("entity_kind", None),
+                                        int(getattr(kerF.static_args.get("gdofs_map"), "shape", (0,))[0]),
+                                    )
+                                )
+                            entries.sort(reverse=True, key=lambda t: t[0])
+                            print("        [res] per-kernel contrib at worst DOF (|Rk|, Rk, k, domain, side, kind, nEnt):")
+                            for item in entries[:12]:
+                                _, r0, k_idx, dom_k, side_k, kind_k, n_ent = item
+                                print(
+                                    f"          |{abs(r0):.3e}|  Rk={r0:+.3e}  k={k_idx:03d}  "
+                                    f"dom={dom_k}  side={side_k}  kind={kind_k}  n={n_ent}"
+                                )
+            if norm_R0 is None:
+                norm_R0 = float(norm_R)
+            tol_eff = float(getattr(self.np, "newton_tol", 0.0))
+            rtol = float(getattr(self.np, "newton_rtol", 0.0))
+            if rtol > 0.0 and norm_R0 > 0.0:
+                tol_eff = max(tol_eff, rtol * norm_R0)
             t_current = time.perf_counter()
             t_iteration = t_current - temp_t0
             temp_t0 = t_current
-            print(f"        Newton {it+1}: |R|_∞ = {norm_R:.2e}, time = {t_iteration}s")
-            if norm_R <= self.np.newton_tol:
+            if int(getattr(self.np, "print_level", 2) or 0) >= 2:
+                prefix = _trace_prefix()
+                global_norm, global_label = _trace_global_residual()
+                global_msg = ""
+                if global_label and global_norm is not None:
+                    global_msg = f", {str(global_label)} = {float(global_norm):.2e}"
+                print(
+                    f"        {prefix}Newton {it+1}: {_residual_norm_label()} = {norm_R:.2e}{global_msg}, "
+                    f"time = {t_iteration}s"
+                )
+            self._current_newton_it = int(it + 1)
+            self._current_newton_residual_norm = float(norm_R)
+            if os.getenv("PYCUTFEM_NEWTON_TRACE_RES_FIELDS", "").lower() in {"1", "true", "yes"}:
+                try:
+                    R_full_dbg = self.restrictor.expand_vec(R_red)
+                    field_norms = []
+                    for fld in getattr(self.dh, "field_names", []):
+                        try:
+                            sl = self.dh.get_field_slice(fld)
+                        except Exception:
+                            continue
+                        if sl is None or len(sl) == 0:
+                            continue
+                        sl = np.asarray(sl, dtype=int).ravel()
+                        field_norms.append((float(np.linalg.norm(R_full_dbg[sl], ord=np.inf)), str(fld)))
+                    field_norms.sort(reverse=True, key=lambda t: t[0])
+                    n_show_raw = os.getenv("PYCUTFEM_NEWTON_TRACE_RES_FIELDS_N", "8").strip()
+                    try:
+                        n_show = max(1, int(n_show_raw))
+                    except Exception:
+                        n_show = 8
+                    items = ", ".join(f"{name}:{val:.2e}" for val, name in field_norms[:n_show])
+                    print(f"        [res] {items}")
+                except Exception as exc:
+                    print(f"        [res] trace failed: {exc}")
+            stall_window = max(int(getattr(self.np, "stall_window", 0) or 0), 0)
+            stall_abs_drop = max(0.0, float(getattr(self.np, "stall_min_abs_decrease_inf", 0.0) or 0.0))
+            stall_rel_drop = max(0.0, float(getattr(self.np, "stall_min_rel_decrease_inf", 0.0) or 0.0))
+            if (
+                stall_window >= 2
+                and (stall_abs_drop > 0.0 or stall_rel_drop > 0.0)
+                and len(norm_hist) >= stall_window
+                and np.isfinite(float(norm_R))
+                and float(norm_R) > float(tol_eff)
+            ):
+                recent = [float(v) for v in norm_hist[-stall_window:] if np.isfinite(float(v))]
+                if len(recent) >= stall_window:
+                    r_hi = float(max(recent))
+                    r_lo = float(min(recent))
+                    drop_abs = float(r_hi - r_lo)
+                    drop_req = max(stall_abs_drop, stall_rel_drop * max(abs(r_hi), 0.0))
+                    if drop_abs < drop_req:
+                        raise RuntimeError(
+                            "Newton stalled: |R|_∞ decrease "
+                            f"{drop_abs:.3e} over the last {stall_window} iteration(s) "
+                            f"is below the required {drop_req:.3e}."
+                        )
+            # Stagnation accept (near tolerance) --------------------------------
+            #
+            # In strongly penalty-dominated regimes (e.g. very large Brinkman drag β and/or
+            # inertia terms containing 1/Δt factors), driving the *raw* residual infinity norm
+            # below a very small absolute tolerance can become limited by floating-point noise
+            # and subtractive cancellation. In such cases Newton can stagnate with vanishing
+            # progress while still being effectively "as converged as possible".
+            #
+            # This guard accepts an iterate when:
+            #   (a) the residual is within a modest factor of the requested tolerance, and
+            #   (b) residual improvement over a window is negligible.
+            #
+            # Set the accept factor to 0 to disable.
+            accept_factor_raw = os.getenv("PYCUTFEM_NEWTON_STAGNATION_ACCEPT_FACTOR", "").strip()
+            if accept_factor_raw:
+                try:
+                    stag_accept_factor = float(accept_factor_raw)
+                except Exception:
+                    stag_accept_factor = 0.0
+            else:
+                stag_accept_factor = float(getattr(self.np, "accept_nonconverged_atol_factor", 0.0) or 0.0)
+                if stag_accept_factor <= 0.0:
+                    try:
+                        stag_accept_factor = float(os.getenv("PYCUTFEM_LS_FAIL_ACCEPT_FACTOR", "20.0"))
+                    except Exception:
+                        stag_accept_factor = 0.0
+
+            if stag_accept_factor > 0.0 and tol_eff > 0.0 and norm_R <= stag_accept_factor * tol_eff:
+                win_raw = os.getenv("PYCUTFEM_NEWTON_STAGNATION_WINDOW", "8").strip()
+                try:
+                    win = max(3, int(win_raw))
+                except Exception:
+                    win = 8
+
+                rel_raw = os.getenv("PYCUTFEM_NEWTON_STAGNATION_REL_DROP", "1e-3").strip()
+                abs_raw = os.getenv("PYCUTFEM_NEWTON_STAGNATION_ABS_DROP_TOLFAC", "0.5").strip()
+                try:
+                    rel_drop_tol = float(rel_raw)
+                except Exception:
+                    rel_drop_tol = 1.0e-3
+                try:
+                    abs_drop_tolfac = float(abs_raw)
+                except Exception:
+                    abs_drop_tolfac = 0.5
+
+                if len(norm_hist) >= win:
+                    recent = norm_hist[-win:]
+                    r_max = float(max(recent))
+                    r_min = float(min(recent))
+                    abs_drop = r_max - r_min
+                    rel_drop = abs_drop / max(r_max, 1.0e-300)
+                    if (rel_drop <= rel_drop_tol) or (abs_drop <= abs_drop_tolfac * tol_eff):
+                        if int(getattr(self.np, "print_level", 2) or 0) >= 2:
+                            print(
+                                "        Newton stagnated near tolerance "
+                                f"({_residual_norm_label()}={float(norm_R):.2e}, tol={tol_eff:.2e}, "
+                                f"window={win}, rel_drop={rel_drop:.2e}, abs_drop={abs_drop:.2e}); accepting iterate."
+                            )
+                        converged = True
+                        delta = np.hstack(
+                            [
+                                f.nodal_values - f_prev.nodal_values
+                                for f, f_prev in zip(funcs, prev_funcs)
+                            ]
+                        )
+                        totals["assembly"] += assembly_time
+                        self._last_iter_timings.append(
+                            {
+                                "iteration": it + 1,
+                                "assembly": assembly_time,
+                                "linear_solve": 0.0,
+                                "line_search": 0.0,
+                                "residual_norm": norm_R,
+                                "converged": True,
+                            }
+                        )
+                        self._last_iteration_totals = totals
+                        if int(getattr(self.np, "print_level", 2) or 0) >= 2:
+                            prefix = _trace_prefix()
+                            print(
+                                f"          {prefix}"
+                                + "timings: assembly={:.3e}s, solve={:.3e}s, line-search={:.3e}s".format(
+                                    assembly_time, 0.0, 0.0
+                                )
+                            )
+                        self._notify_operator_nonlinear_iteration_end(
+                            functions=funcs,
+                            prev_functions=prev_funcs,
+                            aux_functions=aux_funcs,
+                            iteration=it + 1,
+                            coeffs=current,
+                            converged=True,
+                            bcs=bcs_now,
+                            metrics={
+                                "residual_norm": float(norm_R),
+                                "residual_label": _residual_norm_label(),
+                                "tol_eff": float(tol_eff),
+                                "reason": "stagnation_near_tolerance",
+                                "assembly_time": float(assembly_time),
+                                "linear_solve_time": 0.0,
+                                "line_search_time": 0.0,
+                            },
+                        )
+                        return delta, converged, it + 1
+            if norm_R <= tol_eff:
                 # Converged — return *time-step* increment for all fields
+                converged = True
                 delta = np.hstack([
                     f.nodal_values - f_prev.nodal_values
                     for f, f_prev in zip(funcs, prev_funcs)
@@ -613,39 +4841,683 @@ class NewtonSolver:
                         "assembly": assembly_time,
                         "linear_solve": 0.0,
                         "line_search": 0.0,
+                        "residual_norm": norm_R,
+                        "converged": True,
                     }
                 )
                 self._last_iteration_totals = totals
-                print(
-                    "          timings: assembly={:.3e}s, solve={:.3e}s, line-search={:.3e}s".format(
-                        assembly_time, 0.0, 0.0
+                if int(getattr(self.np, "print_level", 2) or 0) >= 2:
+                    prefix = _trace_prefix()
+                    print(
+                        f"          {prefix}"
+                        + "timings: assembly={:.3e}s, solve={:.3e}s, line-search={:.3e}s".format(
+                            assembly_time, 0.0, 0.0
+                        )
                     )
+                self._notify_operator_nonlinear_iteration_end(
+                    functions=funcs,
+                    prev_functions=prev_funcs,
+                    aux_functions=aux_funcs,
+                    iteration=it + 1,
+                    coeffs=current,
+                    converged=True,
+                    bcs=bcs_now,
+                    metrics={
+                        "residual_norm": float(norm_R),
+                        "residual_label": _residual_norm_label(),
+                        "tol_eff": float(tol_eff),
+                        "reason": "residual_converged_before_update",
+                        "assembly_time": float(assembly_time),
+                        "linear_solve_time": 0.0,
+                        "line_search_time": 0.0,
+                    },
                 )
-                return delta
+                return delta, converged, it + 1
             linear_time = 0.0
             line_search_time = 0.0
 
             # 2) Compute reduced Newton direction
+            A_step, solver_coord_scale = self._solver_coordinate_linear_system(A_red, funcs)
+            self._last_solver_coordinate_scale = np.asarray(solver_coord_scale, dtype=float)
+            ptc_fields_now = self._newton_ptc_active_fields(residual_norm=norm_R)
+            ptc_mask = self._newton_selected_field_mask(ptc_fields_now)
+            ptc_sigma = float(getattr(self, "_newton_ptc_sigma_current", 0.0) or 0.0)
+            ptc_mode = self._newton_ptc_operator_mode(residual_norm=norm_R)
+            A_model = A_step
+            R_model = np.asarray(R_red, dtype=float)
+            if ptc_sigma > 0.0 and np.any(ptc_mask):
+                rhs_work = -np.asarray(R_red, dtype=float)
+                if bool(getattr(self.np, "ptc_freeze_complement", True)):
+                    A_model, rhs_work = self._newton_apply_selected_field_freeze(A_model, rhs_work, ptc_mask)
+                A_model, _ = self._newton_apply_ptc_regularization(
+                    A_model,
+                    A_step,
+                    ptc_mask,
+                    ptc_sigma,
+                    mode=ptc_mode,
+                )
+                R_model = -np.asarray(rhs_work, dtype=float)
+                if int(getattr(self.np, "print_level", 2) or 0) >= 2:
+                    phase = " late" if self._newton_ptc_late_phase_active(residual_norm=norm_R) else ""
+                    print(
+                        f"        [newton-ptc]{phase} sigma={ptc_sigma:.2e} mode={ptc_mode} "
+                        f"active_dofs={int(np.count_nonzero(ptc_mask))}"
+                    )
+            A_solve, R_solve, row_scale_red, col_scale_red = self._apply_reduced_system_scaling(A_model, R_model)
+            self._last_reduced_row_scale = np.asarray(row_scale_red, dtype=float)
+            self._last_reduced_col_scale = np.asarray(col_scale_red, dtype=float)
             t_lin = time.perf_counter()
-            dU_red = self._solve_linear_system(A_red, -R_red)
+            try:
+                dU_solve = self._solve_linear_system(A_solve, -R_solve)
+            except Exception:
+                if np.any(ptc_mask) and self._newton_try_grow_ptc_sigma(reason="linear solve failure"):
+                    self._notify_operator_nonlinear_iteration_end(
+                        functions=funcs,
+                        prev_functions=prev_funcs,
+                        aux_functions=aux_funcs,
+                        iteration=it + 1,
+                        coeffs=current,
+                        converged=False,
+                        bcs=bcs_now,
+                        metrics={
+                            "residual_norm": float(norm_R),
+                            "residual_label": _residual_norm_label(),
+                            "tol_eff": float(tol_eff),
+                            "reason": "ptc_retry_after_linear_solve_failure",
+                            "assembly_time": float(assembly_time),
+                            "linear_solve_time": float(time.perf_counter() - t_lin),
+                            "line_search_time": 0.0,
+                        },
+                    )
+                    continue
+                raise
+            dU_red = np.asarray(col_scale_red, dtype=float) * np.asarray(dU_solve, dtype=float)
             linear_time = time.perf_counter() - t_lin
+            if os.getenv("PYCUTFEM_NEWTON_TRACE", "").lower() in {"1", "true", "yes"}:
+                lin_inf = float(np.linalg.norm(A_model @ dU_red + R_model, ord=np.inf))
+                du_inf = float(np.linalg.norm(dU_red, ord=np.inf))
+                dU_red_dbg, _, _ = self._solver_coordinate_physical_step(dU_red, funcs)
+                dU_full_dbg = self.restrictor.expand_vec(dU_red_dbg)
+                field_norms = []
+                for fld in getattr(self.dh, "field_names", []):
+                    try:
+                        sl = self.dh.get_field_slice(fld)
+                    except Exception:
+                        continue
+                    if sl is None or len(sl) == 0:
+                        continue
+                    field_norms.append(f"{fld}:{np.linalg.norm(dU_full_dbg[sl], ord=np.inf):.2e}")
+                extra = ("  [" + ", ".join(field_norms) + "]") if field_norms else ""
+                print(f"        [lin] ‖A·δU+R‖∞={lin_inf:.3e}  ‖δU‖∞={du_inf:.3e}{extra}")
+                if os.getenv("PYCUTFEM_NEWTON_TRACE_WORST", "").lower() in {"1", "true", "yes"}:
+                    try:
+                        worst_red = int(np.argmax(np.abs(R_red))) if R_red.size else -1
+                        worst_full = int(self.active_dofs[worst_red]) if worst_red >= 0 else -1
+                        du_w = float(dU_red[worst_red]) if worst_red >= 0 else 0.0
+                        r_w = float(R_model[worst_red]) if worst_red >= 0 else 0.0
+                        start = int(A_model.indptr[worst_red]) if worst_red >= 0 else 0
+                        end = int(A_model.indptr[worst_red + 1]) if worst_red >= 0 else 0
+                        row_nnz = int(end - start) if worst_red >= 0 else 0
+                        row_abs = float(np.sum(np.abs(A_model.data[start:end]))) if row_nnz else 0.0
+                        diag = 0.0
+                        if row_nnz:
+                            cols = A_model.indices[start:end]
+                            hit = np.nonzero(cols == worst_red)[0]
+                            if hit.size:
+                                diag = float(A_model.data[start + int(hit[0])])
+                        col_nnz = 0
+                        col_abs = 0.0
+                        try:
+                            col = A_model.getcol(worst_red) if worst_red >= 0 else None
+                            if col is not None:
+                                col_nnz = int(getattr(col, "nnz", 0))
+                                col_abs = float(np.sum(np.abs(getattr(col, "data", np.asarray([], dtype=float))))) if col_nnz else 0.0
+                        except Exception:
+                            col_nnz = 0
+                            col_abs = 0.0
+                        print(
+                            f"        [lin] worst_red={worst_red} worst_gdof={worst_full} "
+                            f"R={r_w:+.3e} dU={du_w:+.3e} "
+                            f"row_nnz={row_nnz} row_abs={row_abs:.3e} diag={diag:+.3e} "
+                            f"col_nnz={col_nnz} col_abs={col_abs:.3e}"
+                        )
+                    except Exception:
+                        pass
 
-            # 3) Optional Armijo backtracking in reduced space (no BC re-application inside)
-            if getattr(self.np, "line_search", False):
-                t_ls = time.perf_counter()
-                dU_red = self._line_search_reduced(A_red, R_red, dU_red, funcs, current, bcs_now)
-                line_search_time = time.perf_counter() - t_ls
+            dd_enabled = (
+                os.getenv("PYCUTFEM_DIRDERIV_CHECK", "").lower() in {"1", "true", "yes"}
+                or os.getenv("PYCUTFEM_NEWTON_FD_CHECK", "").lower() in {"1", "true", "yes"}
+            )
+            dd_step = os.getenv("PYCUTFEM_DIRDERIV_STEP", "").strip() or os.getenv("PYCUTFEM_NEWTON_FD_STEP", "").strip()
+            if dd_enabled and dd_step:
+                try:
+                    dd_step_i = int(dd_step)
+                except Exception:
+                    dd_step_i = None
+                if dd_step_i is not None and int(getattr(self, "_current_step_no", -1)) != dd_step_i:
+                    dd_enabled = False
+            if dd_enabled:
+                # Directional derivative check: (R(u+ε·δ) - R(u))/ε ≈ J·δ = -R(u)
+                eps = float(os.getenv("PYCUTFEM_DIRDERIV_EPS", os.getenv("PYCUTFEM_NEWTON_FD_EPS", "1e-6")))
+                snap = [f.nodal_values.copy() for f in funcs]
+                self._apply_solver_coordinate_step(eps * dU_red, funcs, bcs_now)
+                _, R_eps = self._assemble_system_reduced(current, need_matrix=False)
+                for f, buf in zip(funcs, snap):
+                    f.nodal_values[:] = buf
+                derr = (R_eps - R_red) / eps + R_red
+                dir_err = float(np.linalg.norm(derr, ord=np.inf))
+                worst_red = int(np.argmax(np.abs(derr))) if derr.size else -1
+                worst_full = int(self.active_dofs[worst_red]) if worst_red >= 0 else -1
+                worst_val = float(derr[worst_red]) if worst_red >= 0 else 0.0
+                field = None
+                try:
+                    field = getattr(self.dh, "_dof_to_node_map", {}).get(worst_full, (None, None))[0]
+                except Exception:
+                    field = None
+                fmsg = f", field={field}" if field is not None else ""
+                print(
+                    f"        [dd] ‖(R(u+ε·δ)-R(u))/ε + R(u)‖∞={dir_err:.3e} "
+                    f"(ε={eps:.1e}, worst_gdof={worst_full}, worst_val={worst_val:.3e}{fmsg})"
+                )
+                dd_breakdown = os.getenv("PYCUTFEM_DIRDERIV_BREAKDOWN", "").lower() in {"1", "true", "yes"}
+                dd_breakdown_tol = float(os.getenv("PYCUTFEM_DIRDERIV_BREAKDOWN_TOL", "0.0") or "0.0")
+                dd_breakdown_once = os.getenv("PYCUTFEM_DIRDERIV_BREAKDOWN_ONCE", "").lower() in {"1", "true", "yes"}
+                if dd_breakdown and worst_red >= 0:
+                    if dd_breakdown_tol > 0.0 and dir_err < dd_breakdown_tol:
+                        dd_breakdown = False
+                    if dd_breakdown_once and getattr(self, "_dd_breakdown_done", False):
+                        dd_breakdown = False
+
+                if dd_breakdown and worst_red >= 0:
+                    # Optional per-kernel breakdown of the DD mismatch at the worst DOF.
+                    # This runs extra kernel evaluations; enable only when debugging.
+                    self._dd_breakdown_done = True
+                    def _residual_contrib_at_red(kernel, red_index: int) -> float:
+                        gdofs = kernel.static_args.get("gdofs_map")
+                        if not isinstance(gdofs, np.ndarray) or gdofs.ndim != 2 or gdofs.shape[0] == 0:
+                            return 0.0
+                        _, Floc, _ = kernel.exec(current)
+                        acc = 0.0
+                        constraints = getattr(self, "constraints", None)
+                        if constraints is None:
+                            ndof_eff = int(self.full_to_red.size)
+                            for e in range(gdofs.shape[0]):
+                                full = np.asarray(gdofs[e], dtype=int)
+                                valid_full = (full >= 0) & (full < ndof_eff)
+                                if not np.any(valid_full):
+                                    continue
+                                rmap = -np.ones_like(full, dtype=int)
+                                rmap[valid_full] = self.full_to_red[full[valid_full]]
+                                hit = np.nonzero(rmap == int(red_index))[0]
+                                if hit.size:
+                                    acc += float(np.sum(Floc[e][hit]))
+                            return float(acc)
+
+                        full_to_master = getattr(self, "_constr_full_to_master", None)
+                        is_slave = getattr(self, "_constr_is_slave", None)
+                        slave_map = getattr(self, "_constr_slave_map", None)
+                        if (
+                            not isinstance(full_to_master, np.ndarray)
+                            or not isinstance(is_slave, np.ndarray)
+                            or not isinstance(slave_map, dict)
+                        ):
+                            return 0.0
+
+                        for e in range(gdofs.shape[0]):
+                            full = np.asarray(gdofs[e], dtype=int)
+                            valid_full = full >= 0
+                            if not np.any(valid_full):
+                                continue
+                            for loc_i, gd in zip(np.nonzero(valid_full)[0].tolist(), full[valid_full].tolist()):
+                                gd_i = int(gd)
+                                if gd_i < 0 or gd_i >= int(full_to_master.size):
+                                    continue
+                                val = float(Floc[e][int(loc_i)])
+                                if not np.isfinite(val) or val == 0.0:
+                                    continue
+                                if bool(is_slave[gd_i]):
+                                    combo = slave_map.get(gd_i)
+                                    if combo is None:
+                                        continue
+                                    mcols, wts = combo
+                                    for mcol, wv in zip(mcols.tolist(), wts.tolist()):
+                                        red = int(self.full_to_red[int(mcol)])
+                                        if red == int(red_index):
+                                            acc += float(wv) * val
+                                else:
+                                    mcol = int(full_to_master[gd_i])
+                                    if mcol < 0:
+                                        continue
+                                    red = int(self.full_to_red[mcol])
+                                    if red == int(red_index):
+                                        acc += val
+
+                        return float(acc)
+
+                    base = []
+                    for k_idx, kerF in enumerate(self.kernels_F):
+                        base.append((k_idx, kerF, _residual_contrib_at_red(kerF, worst_red)))
+
+                    snap2 = [f.nodal_values.copy() for f in funcs]
+                    dh.add_to_functions(dU_full, funcs)  # already scaled by eps above
+                    dh.apply_bcs(bcs_now, *funcs)
+                    pert = []
+                    for k_idx, kerF in enumerate(self.kernels_F):
+                        pert.append((k_idx, kerF, _residual_contrib_at_red(kerF, worst_red)))
+                    for f, buf in zip(funcs, snap2):
+                        f.nodal_values[:] = buf
+
+                    entries = []
+                    for (k_idx, kerF, r0), (_, _, r1) in zip(base, pert):
+                        dd_k = (r1 - r0) / eps + r0
+                        if dd_k == 0.0:
+                            continue
+                        entries.append(
+                            (
+                                abs(dd_k),
+                                dd_k,
+                                r0,
+                                r1,
+                                k_idx,
+                                getattr(kerF, "domain", "unknown"),
+                                getattr(kerF, "side", None),
+                                getattr(kerF.static_args, "get", lambda _k, _d=None: _d)("entity_kind", None),
+                                int(getattr(kerF.static_args.get("gdofs_map"), "shape", (0,))[0]),
+                            )
+                        )
+                    entries.sort(reverse=True, key=lambda t: t[0])
+                    print("        [dd] per-kernel breakdown (|dd_k|, dd_k, R0_k, R1_k, k, domain, side, kind, nEnt):")
+                    for item in entries[:12]:
+                        _, dd_k, r0, r1, k_idx, dom_k, side_k, kind_k, n_ent = item
+                        print(
+                            f"          |{abs(dd_k):.3e}|  dd={dd_k:+.3e}  R0={r0:+.3e}  R1={r1:+.3e}  "
+                            f"k={k_idx:03d}  dom={dom_k}  side={side_k}  kind={kind_k}  n={n_ent}"
+                        )
+
+            globalization_mode = self._newton_globalization_mode(self.np)
+            use_line_search = bool(getattr(self.np, "line_search", False)) and globalization_mode in {
+                "line_search",
+                "line_search_then_trust",
+            }
+            use_trust_region = globalization_mode in {"trust_region", "line_search_then_trust"}
+
+            # 3) Optional step globalization in reduced space (no BC re-application inside)
+            try:
+                newton_step_red = np.asarray(dU_red, dtype=float).copy()
+                if use_line_search:
+                    t_ls = time.perf_counter()
+                    try:
+                        dU_red = self._line_search_reduced(A_model, R_model, newton_step_red, funcs, current, bcs_now)
+                        line_search_time = time.perf_counter() - t_ls
+                        if globalization_mode == "line_search_then_trust" and bool(getattr(self, "_ls_last_best_effort", False)):
+                            ls_step = np.asarray(dU_red, dtype=float).copy()
+                            ls_residual = getattr(self, "_ls_last_residual_red", None)
+                            if isinstance(ls_residual, np.ndarray):
+                                ls_residual = np.asarray(ls_residual, dtype=float).copy()
+                            ls_norm = (
+                                float(np.linalg.norm(ls_residual, ord=np.inf))
+                                if isinstance(ls_residual, np.ndarray) and ls_residual.size > 0
+                                else float("inf")
+                            )
+                            if int(getattr(self.np, "print_level", 2) or 0) >= 2:
+                                print(
+                                    "        Line search found only a best-effort step; "
+                                    "comparing with trust region."
+                                )
+                            try:
+                                dU_red_tr = self._trust_region_reduced(
+                                    A_model, R_model, newton_step_red, funcs, current, bcs_now
+                                )
+                                line_search_time = time.perf_counter() - t_ls
+                                tr_residual = getattr(self, "_ls_last_residual_red", None)
+                                tr_norm = (
+                                    float(np.linalg.norm(tr_residual, ord=np.inf))
+                                    if isinstance(tr_residual, np.ndarray) and tr_residual.size > 0
+                                    else float("inf")
+                                )
+                                use_trust_step = (not np.isfinite(ls_norm)) or (
+                                    np.isfinite(tr_norm) and tr_norm < ls_norm
+                                )
+                                if use_trust_step:
+                                    dU_red = np.asarray(dU_red_tr, dtype=float)
+                                else:
+                                    dU_red = ls_step
+                                    self._ls_last_residual_red = (
+                                        None if ls_residual is None else np.asarray(ls_residual, dtype=float)
+                                    )
+                                    if int(getattr(self.np, "print_level", 2) or 0) >= 2:
+                                        print(
+                                            "        Keeping line-search best-effort step "
+                                            f"(‖R‖∞={ls_norm:.3e}) over trust region (‖R‖∞={tr_norm:.3e})."
+                                        )
+                            except RuntimeError as exc_tr:
+                                line_search_time = time.perf_counter() - t_ls
+                                dU_red = ls_step
+                                self._ls_last_residual_red = (
+                                    None if ls_residual is None else np.asarray(ls_residual, dtype=float)
+                                )
+                                if int(getattr(self.np, "print_level", 2) or 0) >= 2:
+                                    print(
+                                        "        Trust-region comparison failed after line-search best effort; "
+                                        f"keeping the line-search step ({exc_tr})."
+                                    )
+                    except RuntimeError as exc:
+                        msg = str(exc)
+                        if "Line search failed" in msg:
+                            accept_factor = float(getattr(self.np, "accept_nonconverged_atol_factor", 0.0) or 0.0)
+                            if accept_factor <= 0.0:
+                                accept_factor = float(os.getenv("PYCUTFEM_LS_FAIL_ACCEPT_FACTOR", "20.0"))
+                            tol_accept = float(tol_eff) if "tol_eff" in locals() else float(getattr(self.np, "newton_tol", 0.0))
+                            if accept_factor > 0.0 and tol_accept > 0.0 and norm_R <= accept_factor * tol_accept:
+                                line_search_time = time.perf_counter() - t_ls
+                                if int(getattr(self.np, "print_level", 2) or 0) >= 2:
+                                    print(
+                                        "        Line search failed near convergence "
+                                        f"(|R|_∞={norm_R:.2e}, tol={tol_accept:.2e}); accepting iterate."
+                                    )
+                                converged = True
+                                delta = np.hstack(
+                                    [
+                                        f.nodal_values - f_prev.nodal_values
+                                        for f, f_prev in zip(funcs, prev_funcs)
+                                    ]
+                                )
+                                totals["assembly"] += assembly_time
+                                totals["linear_solve"] += linear_time
+                                totals["line_search"] += line_search_time
+                                self._last_iter_timings.append(
+                                    {
+                                        "iteration": it + 1,
+                                        "assembly": assembly_time,
+                                        "linear_solve": linear_time,
+                                        "line_search": line_search_time,
+                                        "residual_norm": norm_R,
+                                        "converged": True,
+                                    }
+                                )
+                                self._last_iteration_totals = totals
+                                if int(getattr(self.np, "print_level", 2) or 0) >= 2:
+                                    prefix = _trace_prefix()
+                                    print(
+                                        f"          {prefix}"
+                                        + "timings: assembly={:.3e}s, solve={:.3e}s, line-search={:.3e}s".format(
+                                            assembly_time, linear_time, line_search_time
+                                        )
+                                    )
+                                self._notify_operator_nonlinear_iteration_end(
+                                    functions=funcs,
+                                    prev_functions=prev_funcs,
+                                    aux_functions=aux_funcs,
+                                    iteration=it + 1,
+                                    coeffs=current,
+                                    converged=True,
+                                    bcs=bcs_now,
+                                    metrics={
+                                        "residual_norm": float(norm_R),
+                                        "residual_label": _residual_norm_label(),
+                                        "tol_eff": float(tol_eff),
+                                        "reason": "line_search_failed_near_convergence",
+                                        "assembly_time": float(assembly_time),
+                                        "linear_solve_time": float(linear_time),
+                                        "line_search_time": float(line_search_time),
+                                    },
+                                )
+                                return delta, converged, it + 1
+
+                        fallback = os.getenv("PYCUTFEM_LS_FALLBACK", "armijo").strip().lower()
+                        if (
+                            fallback in {"1", "true", "yes", "armijo"}
+                            and getattr(self.np, "ls_mode", "armijo") == "dealii"
+                        ):
+                            if int(getattr(self.np, "print_level", 2) or 0) >= 2:
+                                print("        Line search failed in 'dealii' mode; retrying with Armijo.")
+                            self.np.ls_mode = "armijo"
+                            self._ls_alpha_prev = 1.0
+                            try:
+                                dU_red = self._line_search_reduced(A_model, R_model, dU_red, funcs, current, bcs_now)
+                            except Exception as exc_fallback:  # noqa: PERF203
+                                line_search_time = time.perf_counter() - t_ls
+                                if int(getattr(self.np, "print_level", 2) or 0) >= 2:
+                                    print(f"        [ls] Armijo fallback also failed: {exc_fallback}")
+                                raise
+                            line_search_time = time.perf_counter() - t_ls
+                        elif use_trust_region and "Line search failed" in msg:
+                            if int(getattr(self.np, "print_level", 2) or 0) >= 2:
+                                print("        Line search failed; retrying with trust region.")
+                            dU_red = self._trust_region_reduced(A_model, R_model, newton_step_red, funcs, current, bcs_now)
+                            line_search_time = time.perf_counter() - t_ls
+                        else:
+                            line_search_time = time.perf_counter() - t_ls
+                            raise
+                elif use_trust_region:
+                    t_ls = time.perf_counter()
+                    dU_red = self._trust_region_reduced(A_model, R_model, newton_step_red, funcs, current, bcs_now)
+                    line_search_time = time.perf_counter() - t_ls
+                else:
+                    line_search_time = 0.0
+            except RuntimeError as exc:
+                accept_factor = float(getattr(self.np, "accept_nonconverged_atol_factor", 0.0) or 0.0)
+                if accept_factor <= 0.0:
+                    try:
+                        accept_factor = float(os.getenv("PYCUTFEM_LS_FAIL_ACCEPT_FACTOR", "20.0"))
+                    except Exception:
+                        accept_factor = 0.0
+                tol_accept = float(tol_eff) if "tol_eff" in locals() else float(getattr(self.np, "newton_tol", 0.0))
+                if accept_factor > 0.0 and tol_accept > 0.0 and norm_R <= accept_factor * tol_accept:
+                    if int(getattr(self.np, "print_level", 2) or 0) >= 2:
+                        print(
+                            "        Globalization failed near convergence "
+                            f"(|R|_∞={norm_R:.2e}, tol={tol_accept:.2e}, factor={accept_factor:.2g}); "
+                            "accepting iterate."
+                        )
+                    converged = True
+                    delta = np.hstack(
+                        [
+                            f.nodal_values - f_prev.nodal_values
+                            for f, f_prev in zip(funcs, prev_funcs)
+                        ]
+                    )
+                    totals["assembly"] += assembly_time
+                    totals["linear_solve"] += linear_time
+                    totals["line_search"] += line_search_time
+                    self._last_iter_timings.append(
+                        {
+                            "iteration": it + 1,
+                            "assembly": assembly_time,
+                            "linear_solve": linear_time,
+                            "line_search": line_search_time,
+                            "residual_norm": norm_R,
+                            "converged": True,
+                        }
+                    )
+                    self._last_iteration_totals = totals
+                    if int(getattr(self.np, "print_level", 2) or 0) >= 2:
+                        prefix = _trace_prefix()
+                        print(
+                            f"          {prefix}"
+                            + "timings: assembly={:.3e}s, solve={:.3e}s, line-search={:.3e}s".format(
+                                assembly_time, linear_time, line_search_time
+                            )
+                        )
+                    self._notify_operator_nonlinear_iteration_end(
+                        functions=funcs,
+                        prev_functions=prev_funcs,
+                        aux_functions=aux_funcs,
+                        iteration=it + 1,
+                        coeffs=current,
+                        converged=True,
+                        bcs=bcs_now,
+                        metrics={
+                            "residual_norm": float(norm_R),
+                            "residual_label": _residual_norm_label(),
+                            "tol_eff": float(tol_eff),
+                            "reason": "globalization_failed_near_convergence",
+                            "assembly_time": float(assembly_time),
+                            "linear_solve_time": float(linear_time),
+                            "line_search_time": float(line_search_time),
+                        },
+                    )
+                    return delta, converged, it + 1
+                if np.any(ptc_mask) and self._newton_try_grow_ptc_sigma(reason=str(exc)):
+                    self._notify_operator_nonlinear_iteration_end(
+                        functions=funcs,
+                        prev_functions=prev_funcs,
+                        aux_functions=aux_funcs,
+                        iteration=it + 1,
+                        coeffs=current,
+                        converged=False,
+                        bcs=bcs_now,
+                        metrics={
+                            "residual_norm": float(norm_R),
+                            "residual_label": _residual_norm_label(),
+                            "tol_eff": float(tol_eff),
+                            "reason": "ptc_retry_after_globalization_failure",
+                            "assembly_time": float(assembly_time),
+                            "linear_solve_time": float(linear_time),
+                            "line_search_time": float(line_search_time),
+                        },
+                    )
+                    continue
+                raise
 
             # 4) Apply accepted step: expand reduced → full, update fields, then re-impose BCs
-            dU_full = np.zeros(ndof)
-            dU_full[self.active_dofs] = dU_red
-            dh.add_to_functions(dU_full, funcs)
+            dU_red_phys, _, _ = self._solver_coordinate_physical_step(dU_red, funcs)
+            dU_full = self.restrictor.expand_vec(dU_red_phys)
 
-            # Re-impose the (possibly inhomogeneous) Dirichlet values AFTER the update
-            dh.apply_bcs(bcs_now, *funcs)
+            if os.getenv("PYCUTFEM_SAVE_NEWTON_STEP", "").lower() in {"1", "true", "yes"}:
+                outdir = str(os.getenv("PYCUTFEM_SAVE_NEWTON_STEP_DIR", "") or "").strip()
+                if not outdir:
+                    outdir = os.path.join(os.getcwd(), "_pycutfem_newton_step_dumps")
+                try:
+                    os.makedirs(outdir, exist_ok=True)
+                    counter = int(getattr(self, "_saved_newton_step_counter", 0)) + 1
+                    self._saved_newton_step_counter = counter
+                    step_now = int(getattr(self, "_current_step_no", -1))
+                    fields_tag = "_".join(str(v) for v in tuple(getattr(self, "_active_field_names", tuple()) or tuple()))
+                    if not fields_tag:
+                        fields_tag = "all"
+                    stem = (
+                        f"step{step_now:04d}_it{int(it + 1):02d}_"
+                        f"n{int(len(self.active_dofs))}_c{counter:04d}_{fields_tag}"
+                    )
+                    np.savez(
+                        os.path.join(outdir, f"{stem}.npz"),
+                        step=np.asarray(step_now, dtype=int),
+                        iteration=np.asarray(int(it + 1), dtype=int),
+                        active_dofs=np.asarray(self.active_dofs, dtype=np.int64),
+                        dU_red=np.asarray(dU_red, dtype=np.float64),
+                        dU_full=np.asarray(dU_full, dtype=np.float64),
+                        R_red=np.asarray(R_red, dtype=np.float64),
+                    )
+                    print(f"        [newton-save] saved {outdir}/{stem}.npz")
+                except Exception as exc:
+                    print(f"        [newton-save] failed: {exc}")
+
+            if os.getenv("PYCUTFEM_CHECK_DIRICHLET_INCREMENT", "").lower() in {"1", "true", "yes"}:
+                try:
+                    bc_rows = np.fromiter(dh.get_dirichlet_data(bcs_now).keys(), dtype=int)
+                    if bc_rows.size:
+                        max_bc_du = float(np.max(np.abs(dU_full[bc_rows])))
+                        print(f"        [bc] max|δU| on Dirichlet DOFs = {max_bc_du:.3e}")
+                except Exception as exc:
+                    print(f"        [bc] Dirichlet increment check skipped: {exc}")
+            self._apply_solver_coordinate_step(dU_red, funcs, bcs_now)
 
             if self.post_cb is not None:
                 self.post_cb(funcs)
+
+            try:
+                dx_inf = float(np.linalg.norm(np.asarray(dU_full, dtype=float), ord=np.inf))
+            except Exception:
+                dx_inf = float("nan")
+            self._last_nonlinear_update_inf = float(dx_inf)
+            self._last_nonlinear_update_label = "Δx_newton∞"
+            self._last_nonlinear_accepted = True
+            self._notify_operator_nonlinear_update(
+                functions=funcs,
+                prev_functions=prev_funcs,
+                aux_functions=aux_funcs,
+                iteration=it + 1,
+                coeffs=current,
+                delta_red=dU_red,
+                delta_full=dU_full,
+                bcs=bcs_now,
+                metrics={
+                    "residual_norm_before": float(norm_R),
+                    "residual_label": _residual_norm_label(),
+                    "tol_eff": float(tol_eff),
+                    "update_inf": float(dx_inf),
+                    "update_label": "Δx_newton∞",
+                    "assembly_time": float(assembly_time),
+                    "linear_solve_time": float(linear_time),
+                    "line_search_time": float(line_search_time),
+                },
+            )
+
+            mixed_solution_ok, mixed_solution_reports = _mixed_solution_criteria_report(
+                dh=dh,
+                funcs=funcs,
+                delta_full=dU_full,
+                criteria=getattr(self.np, "mixed_solution_criteria", ()),
+                bcs=bcs_now,
+                active_dofs=getattr(self, "active_dofs", None),
+            )
+
+            # Reuse the residual computed during line search to detect convergence
+            # without a second full assembly on the updated iterate.
+            norm_after: float | None = None
+            globalization_mode = self._newton_globalization_mode(self.np)
+            accept_factor_after = float(getattr(self.np, "accept_nonconverged_atol_factor", 0.0) or 0.0)
+            if accept_factor_after <= 0.0:
+                try:
+                    accept_factor_after = float(os.getenv("PYCUTFEM_LS_FAIL_ACCEPT_FACTOR", "20.0"))
+                except Exception:
+                    accept_factor_after = 0.0
+            use_ls_cache = (
+                (
+                    bool(getattr(self.np, "line_search", False))
+                    or globalization_mode in {"trust_region", "line_search_then_trust"}
+                )
+                and getattr(self, "preassemble_cb", None) is None
+                and self.post_cb is None
+            )
+            if use_ls_cache:
+                R_after = getattr(self, "_ls_last_residual_red", None)
+                if isinstance(R_after, np.ndarray):
+                    norm_after = _residual_norm_from_red(R_after)
+                    if not np.isfinite(norm_after):
+                        norm_after = None
+            elif (
+                bool(getattr(self, "_ls_last_best_effort", False))
+                and accept_factor_after > 0.0
+            ):
+                try:
+                    _, R_after = self._assemble_system_reduced(current, need_matrix=False)
+                    norm_after = _residual_norm_from_red(np.asarray(R_after, dtype=float))
+                    if not np.isfinite(norm_after):
+                        norm_after = None
+                except Exception:
+                    norm_after = None
+            if norm_after is not None:
+                self._newton_decay_ptc_sigma(
+                    norm_before=float(norm_R),
+                    norm_after=float(norm_after),
+                    tol_eff=float(tol_eff),
+                )
+            near_accept_after = bool(
+                norm_after is not None
+                and bool(getattr(self, "_ls_last_best_effort", False))
+                and accept_factor_after > 0.0
+                and float(tol_eff) > 0.0
+                and float(norm_after) <= accept_factor_after * float(tol_eff)
+            )
+            converged_after = bool(
+                norm_after is not None
+                and (
+                    float(norm_after) <= float(tol_eff)
+                    or near_accept_after
+                )
+            )
 
             totals["assembly"] += assembly_time
             totals["linear_solve"] += linear_time
@@ -656,20 +5528,491 @@ class NewtonSolver:
                     "assembly": assembly_time,
                     "linear_solve": linear_time,
                     "line_search": line_search_time,
+                    "residual_norm": float(norm_after) if converged_after else norm_R,
+                    "converged": bool(converged_after),
                 }
             )
-            print(
-                "          timings: assembly={:.3e}s, solve={:.3e}s, line-search={:.3e}s".format(
-                    assembly_time, linear_time, line_search_time
+            if int(getattr(self.np, "print_level", 2) or 0) >= 2:
+                prefix = _trace_prefix()
+                print(
+                    f"          {prefix}"
+                    + "timings: assembly={:.3e}s, solve={:.3e}s, line-search={:.3e}s".format(
+                        assembly_time, linear_time, line_search_time
+                    )
                 )
+
+            if converged_after:
+                if near_accept_after and int(getattr(self.np, "print_level", 2) or 0) >= 2:
+                    print(
+                        "        Best-effort globalization step reached the relaxed acceptance band "
+                        f"({_residual_norm_label()}={float(norm_after):.2e}, tol={float(tol_eff):.2e}, factor={accept_factor_after:.2g}); "
+                        "accepting iterate."
+                    )
+                converged = True
+                delta = np.hstack(
+                    [f.nodal_values - f_prev.nodal_values for f, f_prev in zip(funcs, prev_funcs)]
+                )
+                self._last_iteration_totals = totals
+                self._notify_operator_nonlinear_iteration_end(
+                    functions=funcs,
+                    prev_functions=prev_funcs,
+                    aux_functions=aux_funcs,
+                    iteration=it + 1,
+                    coeffs=current,
+                    converged=True,
+                    bcs=bcs_now,
+                    metrics={
+                        "residual_norm": float(norm_after),
+                        "residual_norm_before": float(norm_R),
+                        "residual_label": _residual_norm_label(),
+                        "tol_eff": float(tol_eff),
+                        "update_inf": float(dx_inf),
+                        "reason": "residual_converged_after_update",
+                        "assembly_time": float(assembly_time),
+                        "linear_solve_time": float(linear_time),
+                        "line_search_time": float(line_search_time),
+                    },
+                )
+                return delta, converged, it + 1
+
+            mixed_solution_residual_ok = True
+            mixed_solution_residual_factor = float(
+                getattr(self.np, "mixed_solution_max_residual_factor", 0.0) or 0.0
+            )
+            mixed_solution_residual_limit = None
+            mixed_solution_residual_value = None
+            if mixed_solution_residual_factor > 0.0:
+                mixed_solution_residual_tol = float(
+                    getattr(self.np, "mixed_solution_residual_tol", 0.0) or 0.0
+                )
+                if mixed_solution_residual_tol <= 0.0:
+                    mixed_solution_residual_tol = float(tol_eff)
+                mixed_solution_residual_value = float(norm_after if norm_after is not None else norm_R)
+                mixed_solution_residual_limit = mixed_solution_residual_factor * float(mixed_solution_residual_tol)
+                mixed_solution_residual_ok = bool(
+                    np.isfinite(mixed_solution_residual_value)
+                    and np.isfinite(mixed_solution_residual_limit)
+                    and mixed_solution_residual_limit > 0.0
+                    and mixed_solution_residual_value <= mixed_solution_residual_limit
+                )
+
+            if mixed_solution_ok and mixed_solution_residual_ok:
+                if int(getattr(self.np, "print_level", 2) or 0) >= 2:
+                    parts = []
+                    for report in mixed_solution_reports:
+                        fields = ",".join(str(v) for v in report["fields"])
+                        parts.append(
+                            f"{fields}: abs={float(report['abs_norm']):.3e} "
+                            f"rel={float(report['rel_norm']):.3e}"
+                        )
+                    joined = "; ".join(parts)
+                    print(
+                        "        Mixed solution criteria satisfied; accepting iterate "
+                        f"({joined})."
+                    )
+                converged = True
+                delta = np.hstack(
+                    [f.nodal_values - f_prev.nodal_values for f, f_prev in zip(funcs, prev_funcs)]
+                )
+                self._last_nonlinear_reason = "mixed_solution_criteria"
+                self._last_iteration_totals = totals
+                self._notify_operator_nonlinear_iteration_end(
+                    functions=funcs,
+                    prev_functions=prev_funcs,
+                    aux_functions=aux_funcs,
+                    iteration=it + 1,
+                    coeffs=current,
+                    converged=True,
+                    bcs=bcs_now,
+                    metrics={
+                        "residual_norm": float(norm_after if norm_after is not None else norm_R),
+                        "residual_norm_before": float(norm_R),
+                        "residual_label": _residual_norm_label(),
+                        "tol_eff": float(tol_eff),
+                        "update_inf": float(dx_inf),
+                        "reason": "mixed_solution_criteria",
+                        "assembly_time": float(assembly_time),
+                        "linear_solve_time": float(linear_time),
+                        "line_search_time": float(line_search_time),
+                        "mixed_solution_reports": mixed_solution_reports,
+                    },
+                )
+                return delta, converged, it + 1
+            if mixed_solution_ok and (not mixed_solution_residual_ok):
+                if int(getattr(self.np, "print_level", 2) or 0) >= 2:
+                    print(
+                        "        Mixed solution criteria met, but residual safeguard rejected the iterate "
+                        f"({_residual_norm_label()}={float(mixed_solution_residual_value):.3e} > "
+                        f"{float(mixed_solution_residual_limit):.3e})."
+                    )
+            self._notify_operator_nonlinear_iteration_end(
+                functions=funcs,
+                prev_functions=prev_funcs,
+                aux_functions=aux_funcs,
+                iteration=it + 1,
+                coeffs=current,
+                converged=False,
+                bcs=bcs_now,
+                metrics={
+                    "residual_norm": float(norm_after if norm_after is not None else norm_R),
+                    "residual_norm_before": float(norm_R),
+                    "residual_label": _residual_norm_label(),
+                    "tol_eff": float(tol_eff),
+                    "update_inf": float(dx_inf),
+                    "reason": "continue",
+                    "assembly_time": float(assembly_time),
+                    "linear_solve_time": float(linear_time),
+                    "line_search_time": float(line_search_time),
+                },
             )
 
         # If we get here, Newton did not converge within the iteration budget
+        accept_factor_raw = os.getenv("PYCUTFEM_NEWTON_MAXITER_ACCEPT_FACTOR", "").strip()
+        if accept_factor_raw:
+            try:
+                accept_factor = float(accept_factor_raw)
+            except Exception:
+                accept_factor = 0.0
+        else:
+            accept_factor = float(getattr(self.np, "accept_nonconverged_atol_factor", 0.0) or 0.0)
+            if accept_factor <= 0.0:
+                # Default: mirror the line-search "near convergence" accept factor so stiff, penalty-dominated
+                # problems can make progress even when the raw residual hits a floating-point floor.
+                try:
+                    accept_factor = float(os.getenv("PYCUTFEM_LS_FAIL_ACCEPT_FACTOR", "20.0"))
+                except Exception:
+                    accept_factor = 0.0
+        if accept_factor > 0.0:
+            tol_eff_last = float(tol_eff) if "tol_eff" in locals() else float(getattr(self.np, "newton_tol", 0.0))
+            if tol_eff_last > 0.0 and float(norm_R) <= accept_factor * tol_eff_last:
+                if int(getattr(self.np, "print_level", 2) or 0) >= 2:
+                    print(
+                        "        Newton hit max iterations but is near tolerance "
+                        f"({_residual_norm_label()}={float(norm_R):.2e}, tol={tol_eff_last:.2e}, factor={accept_factor:.2g}); accepting iterate."
+                    )
+                converged = True
+                delta = np.hstack(
+                    [
+                        f.nodal_values - f_prev.nodal_values
+                        for f, f_prev in zip(funcs, prev_funcs)
+                    ]
+                )
+                self._last_iteration_totals = totals
+                return delta, converged, int(self.np.max_newton_iter)
+
         self._last_iteration_totals = totals
         raise RuntimeError("Newton did not converge – adjust Δt or verify Jacobian.")
 
 
    
+    def _prune_decoupled_rows_cols(self, coeffs, A_red, R_red, ndof_eff: int):
+        """
+        Drop decoupled (zero) rows/cols in the reduced system and rebuild the
+        reduced pattern. Returns (A_red, R_red, pruned, extra_asm_time).
+        """
+        if bool(getattr(self, "_skip_prune_decoupled", False)):
+            return A_red, R_red, False, 0.0
+        pruned = False
+        extra_asm = 0.0
+        trace = os.getenv("PYCUTFEM_PRUNE_TRACE", "").lower() in {"1", "true", "yes"}
+        for _ in range(2):
+            row_nnz = np.diff(A_red.indptr)
+            if A_red.indices.size:
+                col_nnz = np.bincount(A_red.indices, minlength=A_red.shape[1])
+            else:
+                col_nnz = np.zeros(A_red.shape[1], dtype=int)
+            inactive_mask = (row_nnz == 0) | (col_nnz == 0)
+            drop_tol = float(os.getenv("PYCUTFEM_DROP_TOL", "1e-12"))
+            if drop_tol > 0.0 and A_red.data.size:
+                abs_data = np.abs(A_red.data)
+                row_abs = np.zeros_like(row_nnz, dtype=abs_data.dtype)
+                starts = A_red.indptr[:-1]
+                ends = A_red.indptr[1:]
+                nonempty = ends > starts
+                if np.any(nonempty):
+                    row_abs[nonempty] = np.add.reduceat(abs_data, starts[nonempty])
+                col_abs = np.bincount(A_red.indices, weights=abs_data, minlength=A_red.shape[1])
+                # Treat PYCUTFEM_DROP_TOL as an *absolute* row/col L1 threshold.
+                # A global relative threshold (scaled by max|A|) is brittle: a single
+                # huge penalty block can cause legitimate physics rows to be dropped.
+                inactive_mask |= (row_abs <= drop_tol) | (col_abs <= drop_tol)
+            inactive = np.where(inactive_mask)[0]
+            if not inactive.size:
+                break
+            if trace:
+                print(f"        [prune] dropping {int(inactive.size)}/{int(A_red.shape[0])} decoupled rows/cols")
+            # Track structurally decoupled full-space DOFs so external active-DOF
+            # recomputation (e.g. on moving interfaces) can avoid re-introducing
+            # them when the entity layout did not change.
+            try:
+                removed_full = np.asarray(self.active_dofs[inactive], dtype=int)
+                if removed_full.size:
+                    mask = getattr(self, "_decoupled_full_mask", None)
+                    if (
+                        not isinstance(mask, np.ndarray)
+                        or mask.dtype != bool
+                        or int(mask.size) != int(ndof_eff)
+                    ):
+                        mask = np.zeros(int(ndof_eff), dtype=bool)
+                        self._decoupled_full_mask = mask
+                    mask[removed_full] = True
+            except Exception:
+                pass
+            keep_mask = np.ones(len(self.active_dofs), dtype=bool)
+            keep_mask[inactive] = False
+            self.active_dofs = self.active_dofs[keep_mask]
+            self.full_to_red = -np.ones(ndof_eff, dtype=int)
+            self.full_to_red[self.active_dofs] = np.arange(self.active_dofs.size, dtype=int)
+            self.red_to_full = self.active_dofs
+            self._pattern_stale = True
+            self.restrictor = _ActiveReducer(
+                self.dh, self.active_dofs, constraint=getattr(self, "constraints", None)
+            )
+            self._refresh_solver_coordinate_transform_masks()
+            self._refresh_reduced_field_names()
+            if hasattr(self, "_build_vi_reduced_field_names"):
+                try:
+                    self._vi_red_field_names = self._build_vi_reduced_field_names()
+                except Exception:
+                    pass
+            self._build_reduced_pattern()
+            t_asm = time.perf_counter()
+            A_red, R_red = self._assemble_system_reduced(coeffs, need_matrix=True)
+            extra_asm += time.perf_counter() - t_asm
+            pruned = True
+        return A_red, R_red, pruned, extra_asm
+
+    @staticmethod
+    def _trust_region_metric_diag(A_red: sp.spmatrix) -> np.ndarray:
+        ncol = int(A_red.shape[1]) if getattr(A_red, "shape", None) else 0
+        if ncol == 0:
+            return np.zeros((0,), dtype=float)
+        try:
+            col_sq = np.bincount(
+                np.asarray(A_red.indices, dtype=np.int64),
+                weights=np.asarray(A_red.data, dtype=np.float64) ** 2,
+                minlength=ncol,
+            )
+        except Exception:
+            col_sq = np.asarray(np.abs(A_red).power(2).sum(axis=0), dtype=np.float64).ravel()
+        metric = np.sqrt(np.maximum(col_sq, 0.0))
+        metric[(~np.isfinite(metric)) | (metric <= 1.0)] = 1.0
+        return metric
+
+    @staticmethod
+    def _trust_region_scaled_norm(step: np.ndarray, metric_diag: np.ndarray) -> float:
+        if step.size == 0:
+            return 0.0
+        if metric_diag.shape != step.shape:
+            return float(np.linalg.norm(step))
+        return float(np.linalg.norm(metric_diag * step))
+
+    def _trust_region_dogleg_step(
+        self,
+        A_red: sp.spmatrix,
+        R_red: np.ndarray,
+        newton_step: np.ndarray,
+        delta: float,
+        metric_diag: np.ndarray,
+    ) -> tuple[np.ndarray, bool]:
+        g = np.asarray(A_red.T @ R_red, dtype=float).ravel()
+        if g.size == 0 or not np.all(np.isfinite(g)):
+            return np.asarray(newton_step, dtype=float).ravel(), False
+
+        Ag = np.asarray(A_red @ g, dtype=float).ravel()
+        gg = float(np.dot(g, g))
+        den = float(np.dot(Ag, Ag))
+        if gg <= 0.0 or (not np.isfinite(den)) or den <= 1.0e-300:
+            p_u = -g
+        else:
+            p_u = -(gg / den) * g
+
+        p_b = np.asarray(newton_step, dtype=float).ravel()
+        norm_b = self._trust_region_scaled_norm(p_b, metric_diag)
+        if norm_b <= delta:
+            return p_b, False
+
+        norm_u = self._trust_region_scaled_norm(p_u, metric_diag)
+        if norm_u <= 0.0 or not np.isfinite(norm_u):
+            return (delta / max(norm_b, 1.0e-16)) * p_b, True
+        if norm_u >= delta:
+            return (delta / norm_u) * p_u, True
+
+        d = p_b - p_u
+        mu = metric_diag * p_u
+        md = metric_diag * d
+        a = float(np.dot(md, md))
+        b = float(2.0 * np.dot(mu, md))
+        c = float(np.dot(mu, mu) - delta * delta)
+        disc = max(b * b - 4.0 * a * c, 0.0)
+        beta = 0.0 if (not np.isfinite(a)) or a <= 0.0 else (-b + np.sqrt(disc)) / (2.0 * a)
+        beta = float(np.clip(beta, 0.0, 1.0))
+        return p_u + beta * d, True
+
+    def _trust_region_predicted_reduction(self, A_red: sp.spmatrix, R_red: np.ndarray, step_red: np.ndarray) -> float:
+        Ap = np.asarray(A_red @ step_red, dtype=float).ravel()
+        linear_term = float(np.dot(R_red, Ap))
+        quad_term = 0.5 * float(np.dot(Ap, Ap))
+        return -(linear_term + quad_term)
+
+    def _reduced_gauss_newton_lm_direction(self, A_red: sp.spmatrix, R_red: np.ndarray) -> np.ndarray | None:
+        np_ = self.np
+        if not bool(getattr(np_, "reduced_gn_fallback", True)):
+            return None
+        if not sp.isspmatrix_csr(A_red):
+            A_red = A_red.tocsr()
+        g = np.asarray(A_red.T @ np.asarray(R_red, dtype=float), dtype=float).ravel()
+        if g.size == 0 or (not np.all(np.isfinite(g))):
+            return None
+        g_inf = float(np.linalg.norm(g, ord=np.inf))
+        if (not np.isfinite(g_inf)) or g_inf <= 0.0:
+            return None
+
+        H = self._canonicalize_direct_solve_matrix((A_red.T @ A_red).tocsr())
+        metric_diag = self._trust_region_metric_diag(A_red)
+        diag = np.asarray(metric_diag, dtype=float).ravel() ** 2
+        diag_floor = 1.0e-12
+        diag = np.where(np.isfinite(diag) & (diag > diag_floor), diag, diag_floor)
+        lam = max(float(getattr(np_, "reduced_gn_lambda0", 1.0e-6) or 1.0e-6), 0.0)
+        growth = max(float(getattr(np_, "reduced_gn_lambda_growth", 10.0) or 10.0), 1.0)
+        max_tries = max(int(getattr(np_, "reduced_gn_max_tries", 4) or 4), 1)
+        trace = int(getattr(np_, "print_level", 2) or 0) >= 3 or os.getenv("PYCUTFEM_LS_TRACE", "").lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+
+        for _ in range(max_tries):
+            H_work = H
+            if lam > 0.0:
+                H_work = self._canonicalize_direct_solve_matrix(H + sp.diags(lam * diag, format="csr"))
+            try:
+                H_solve, g_solve, _, col_scale = self._apply_reduced_system_scaling(H_work, g)
+                step_solve = self._solve_linear_system_with_context(
+                    H_solve,
+                    -g_solve,
+                    context="reduced_gauss_newton_lm",
+                )
+                step_red = np.asarray(col_scale, dtype=float) * np.asarray(step_solve, dtype=float)
+            except Exception:
+                lam = max(lam * growth, 1.0e-16) if lam > 0.0 else 1.0e-16
+                continue
+            if not np.all(np.isfinite(step_red)):
+                lam = max(lam * growth, 1.0e-16) if lam > 0.0 else 1.0e-16
+                continue
+            g_ts = float(np.dot(g, step_red))
+            step_inf = float(np.linalg.norm(step_red, ord=np.inf))
+            if trace:
+                print(
+                    f"        [ls-gn] lambda={lam:.3e}  gTs={g_ts:.3e}  ‖g‖∞={g_inf:.3e}  ‖S‖∞={step_inf:.3e}",
+                    flush=True,
+                )
+            if np.isfinite(g_ts) and g_ts < 0.0 and np.isfinite(step_inf) and step_inf > 0.0:
+                return np.asarray(step_red, dtype=float)
+            lam = max(lam * growth, 1.0e-16) if lam > 0.0 else 1.0e-16
+        return None
+
+    def _trust_region_reduced(self, A_red, R_red, S_red, funcs, coeffs, bcs_now):
+        np_ = self.np
+        phi0 = 0.5 * float(R_red @ R_red)
+        res0_inf = float(np.linalg.norm(np.asarray(R_red, dtype=float), ord=np.inf))
+        metric_diag = self._trust_region_metric_diag(A_red)
+        radius_prev = getattr(self, "_tr_radius_prev", None)
+        radius_init = max(float(getattr(np_, "tr_radius_init", 1.0) or 1.0), 1.0e-16)
+        min_radius = float(getattr(np_, "tr_min_radius", 1.0e-10) or 1.0e-10)
+        newton_norm = self._trust_region_scaled_norm(np.asarray(S_red, dtype=float), metric_diag)
+        delta = float(radius_prev) if radius_prev is not None and np.isfinite(radius_prev) and radius_prev > 0.0 else 0.0
+        if delta <= 0.0:
+            if np.isfinite(newton_norm) and newton_norm > 0.0:
+                delta = min(max(newton_norm, min_radius), radius_init)
+            else:
+                delta = radius_init
+        delta = max(delta, min_radius)
+        delta_max = max(float(getattr(np_, "tr_radius_max", 1.0e3) or 1.0e3), radius_init, delta)
+        eta_accept = float(getattr(np_, "tr_eta_accept", 1.0e-4) or 1.0e-4)
+        eta_contract = float(getattr(np_, "tr_eta_contract", 2.5e-1) or 2.5e-1)
+        eta_expand = float(getattr(np_, "tr_eta_expand", 7.5e-1) or 7.5e-1)
+        shrink = float(getattr(np_, "tr_shrink", 2.5e-1) or 2.5e-1)
+        expand = float(getattr(np_, "tr_expand", 2.0) or 2.0)
+        max_tries = max(int(getattr(np_, "tr_max_iter", 8) or 8), 1)
+        tr_min_abs_drop_inf = max(0.0, float(getattr(np_, "tr_min_abs_decrease_inf", 0.0) or 0.0))
+        tr_min_rel_drop_inf = max(0.0, float(getattr(np_, "tr_min_rel_decrease_inf", 0.0) or 0.0))
+        tr_required_drop_inf = max(tr_min_abs_drop_inf, tr_min_rel_drop_inf * max(abs(res0_inf), 0.0))
+        trace = int(getattr(np_, "print_level", 2) or 0) >= 3 or os.getenv("PYCUTFEM_TRUST_TRACE", "").lower() in {"1", "true", "yes"}
+
+        snap = [f.nodal_values.copy() for f in funcs]
+        best_step = None
+        best_phi = phi0
+        best_R = None
+        best_res_inf = res0_inf
+
+        for k in range(max_tries):
+            step_trial, boundary = self._trust_region_dogleg_step(A_red, R_red, S_red, delta, metric_diag)
+            pred = self._trust_region_predicted_reduction(A_red, R_red, step_trial)
+            if (not np.isfinite(pred)) or pred <= 0.0:
+                delta = max(min_radius, shrink * delta)
+                if delta <= min_radius:
+                    break
+                continue
+
+            for f, buf in zip(funcs, snap):
+                f.nodal_values[:] = buf
+            self._apply_solver_coordinate_step(step_trial, funcs, bcs_now)
+            _, R_try = self._assemble_system_reduced(coeffs, need_matrix=False)
+            phi_try = 0.5 * float(R_try @ R_try)
+            res_try_inf = float(np.linalg.norm(np.asarray(R_try, dtype=float), ord=np.inf))
+            res_drop_inf = res0_inf - res_try_inf
+            res_drop_ok = bool(np.isfinite(res_drop_inf) and (res_drop_inf >= tr_required_drop_inf))
+            ared = phi0 - phi_try
+            rho = ared / pred if pred > 0.0 else -np.inf
+            if trace:
+                print(
+                    f"        [tr] k={k+1} delta={delta:.3e} pred={pred:.3e} ared={ared:.3e} rho={rho:.3e} "
+                    f"phi={phi_try:.3e} res_inf={res_try_inf:.3e} drop_inf={res_drop_inf:.3e} "
+                    f"drop_req={tr_required_drop_inf:.3e}",
+                    flush=True,
+                )
+
+            if phi_try < best_phi:
+                best_phi = phi_try
+                best_step = np.asarray(step_trial, dtype=float).copy()
+                best_R = np.asarray(R_try, dtype=float).copy()
+                best_res_inf = float(res_try_inf)
+
+            if np.isfinite(rho) and rho > 0.0 and rho >= eta_accept and phi_try < phi0 and res_drop_ok:
+                if rho < eta_contract:
+                    delta = max(min_radius, shrink * delta)
+                elif rho > eta_expand and boundary:
+                    delta = min(delta_max, expand * delta)
+                self._tr_radius_prev = delta
+                self._ls_last_residual_red = np.asarray(R_try, dtype=float)
+                for f, buf in zip(funcs, snap):
+                    f.nodal_values[:] = buf
+                if int(getattr(np_, "print_level", 2) or 0) >= 2:
+                    print(
+                        f"        Trust region accepted ‖δU‖={self._trust_region_scaled_norm(step_trial, metric_diag):.2e} "
+                        f"(rho={rho:.2e}, delta={delta:.2e})."
+                    )
+                return np.asarray(step_trial, dtype=float)
+
+            if rho < eta_contract:
+                delta = max(min_radius, shrink * delta)
+            elif rho > eta_expand and boundary:
+                delta = min(delta_max, expand * delta)
+            if delta <= min_radius:
+                break
+
+        for f, buf in zip(funcs, snap):
+            f.nodal_values[:] = buf
+        self._tr_radius_prev = delta
+        if best_step is not None and best_phi < phi0 and (res0_inf - best_res_inf) >= tr_required_drop_inf:
+            if int(getattr(np_, "print_level", 2) or 0) >= 2:
+                print(f"        Trust region fallback using best-effort step (φ={best_phi:.3e}).")
+            if best_R is not None:
+                self._ls_last_residual_red = np.asarray(best_R, dtype=float)
+            return np.asarray(best_step, dtype=float)
+        raise RuntimeError("Trust region failed: no residual decrease.")
+
     def _line_search_reduced(self, A_red, R_red, S_red, funcs, coeffs, bcs_now):
         """
         Backtracking Armijo search performed entirely in the reduced space.
@@ -678,30 +6021,203 @@ class NewtonSolver:
         """
         dh   = self.dh
         np_  = self.np
+        mode = getattr(np_, "ls_mode", "armijo")
         c1   = getattr(np_, "ls_c1", 1.0e-4)
+        # Cache the reduced residual at the *accepted* line-search iterate so the
+        # Newton loop can reuse it (avoid an extra assembly just to detect convergence).
+        self._ls_last_residual_red = None
+        self._ls_last_best_effort = False
+
+        if mode not in {"armijo", "dealii"}:
+            raise ValueError(f"Unknown line-search mode '{mode}'.")
+
+        dealii_switch_raw = str(os.getenv("PYCUTFEM_LS_DEALII_SWITCH_NORM", "1e-4") or "1e-4").strip()
+        try:
+            dealii_switch = float(dealii_switch_raw)
+        except Exception:
+            dealii_switch = 0.0
+        if (
+            mode == "armijo"
+            and not isinstance(self, PdasNewtonSolver)
+            and dealii_switch > 0.0
+            and np.isfinite(float(np.linalg.norm(R_red, ord=np.inf)))
+            and float(np.linalg.norm(R_red, ord=np.inf)) <= dealii_switch
+        ):
+            mode = "dealii"
+
+        # Deal.II style: accept the first step that reduces the infinity norm of the residual.
+        if mode == "dealii":
+            trace = os.getenv("PYCUTFEM_LS_TRACE", "").lower() in {"1", "true", "yes"}
+            norm0 = float(np.linalg.norm(R_red, ord=np.inf))
+            best_trigger_raw = str(os.getenv("PYCUTFEM_LS_DEALII_BEST_TRIGGER", "1e-4") or "1e-4").strip()
+            try:
+                best_trigger = float(best_trigger_raw)
+            except Exception:
+                best_trigger = 0.0
+            prefer_best = (
+                not isinstance(self, PdasNewtonSolver)
+                and best_trigger > 0.0
+                and np.isfinite(norm0)
+                and norm0 <= best_trigger
+            )
+            polish_ls_raw = str(os.getenv("PYCUTFEM_LS_DEALII_BEST_MAX_ITER", "12") or "12").strip()
+            try:
+                polish_ls = max(int(polish_ls_raw), int(np_.ls_max_iter))
+            except Exception:
+                polish_ls = int(np_.ls_max_iter)
+            best_alpha, best_norm = 0.0, norm0
+            best_R = None
+            snap = [f.nodal_values.copy() for f in funcs]
+
+            def _eval(alpha_try: float):
+                for f, buf in zip(funcs, snap):
+                    f.nodal_values[:] = buf
+                self._apply_solver_coordinate_step(alpha_try * S_red, funcs, bcs_now)
+
+                _, R_try = self._assemble_system_reduced(coeffs, need_matrix=False)
+                norm_try = float(np.linalg.norm(R_try, ord=np.inf))
+                if trace:
+                    print(f"        [ls] α={alpha_try:.6e}  ‖R‖∞={norm_try:.6e}  (‖R‖∞0={norm0:.6e})")
+                return norm_try, R_try
+
+            # Always try the full Newton step first.
+            # Warm-starting from a tiny α (from a previous near-stagnation) can otherwise
+            # "lock" the search into microscopic steps and stall progress on the next
+            # Newton iteration / time step.
+            norm_try, R_try = _eval(1.0)
+            if norm_try < best_norm:
+                best_norm, best_alpha, best_R = norm_try, 1.0, R_try
+            if (not prefer_best) and norm_try < norm0:
+                for f, buf in zip(funcs, snap):
+                    f.nodal_values[:] = buf
+                if int(getattr(self.np, "print_level", 2) or 0) >= 3:
+                    print("        Line search accepted α = 1.00e+00 (‖R‖∞ decreased)")
+                self._ls_last_residual_red = np.asarray(R_try, dtype=float)
+                self._ls_alpha_prev = 1.0
+                self._ls_last_best_effort = False
+                return 1.0 * S_red
+
+            # Backtracking sequence after the full-step trial.
+            #
+            # IMPORTANT: do *not* warm-start from the previously accepted α here.
+            # After a near-stagnation, the last accepted α can be microscopic.
+            # Starting from such a value would prevent trying moderate steps
+            # (e.g. 0.5, 0.25, ...) even when they would reduce ‖R‖∞.
+            alpha = float(np_.ls_reduction)
+            if not (0.0 < alpha < 1.0):
+                alpha = 0.5
+
+            for _ in range(polish_ls):
+                norm_try, R_try = _eval(alpha)
+                if norm_try < best_norm:
+                    best_norm, best_alpha, best_R = norm_try, alpha, R_try
+                if (not prefer_best) and norm_try < norm0:
+                    for f, buf in zip(funcs, snap):
+                        f.nodal_values[:] = buf
+                    if int(getattr(self.np, "print_level", 2) or 0) >= 3:
+                        print(f"        Line search accepted α = {alpha:.2e} (‖R‖∞ decreased)")
+                    self._ls_last_residual_red = np.asarray(R_try, dtype=float)
+                    self._ls_alpha_prev = alpha
+                    self._ls_last_best_effort = False
+                    return alpha * S_red
+
+                alpha *= np_.ls_reduction
+
+            for f, buf in zip(funcs, snap):
+                f.nodal_values[:] = buf
+            if best_alpha > 0.0:
+                if int(getattr(self.np, "print_level", 2) or 0) >= 2:
+                    if prefer_best:
+                        print(f"        Line search selected best α = {best_alpha:.2e} (‖R‖∞ decreased).")
+                    else:
+                        print(f"        Line search failed, using best-effort α = {best_alpha:.2e} (‖R‖∞ decreased).")
+                if best_R is not None:
+                    self._ls_last_residual_red = np.asarray(best_R, dtype=float)
+                self._ls_alpha_prev = best_alpha
+                self._ls_last_best_effort = True
+                return best_alpha * S_red
+            min_alpha = alpha
+            if int(getattr(self.np, "print_level", 2) or 0) >= 2:
+                print(f"        Line search failed – taking minimal step α = {min_alpha:.2e}.")
+            if os.getenv("PYCUTFEM_LS_FAIL_HARD", "1").lower() not in {"0", "false", "no"}:
+                raise RuntimeError("Line search failed: no residual decrease.")
+            self._ls_alpha_prev = min_alpha
+            self._ls_last_best_effort = True
+            return min_alpha * S_red
 
         # Gradient g_f = J_ff^T R_f  (reduced variables only)
         g = A_red.T @ R_red
         gTS = float(g @ S_red)
         if gTS >= 0.0:
-            # Not a descent direction – reject and take zero step
-            print("        Warning: Not a descent direction in reduced space.")
-            return np.zeros_like(S_red)
+            # Newton direction is not a descent; fall back to steepest descent.
+            # This keeps the iteration moving instead of taking a zero step.
+            if int(getattr(self.np, "print_level", 2) or 0) >= 2:
+                print("        Warning: Not a descent direction in reduced space; using steepest descent.")
+            S_red = -g
+            gTS = float(g @ S_red)  # = -||g||^2 <= 0
+            if os.getenv("PYCUTFEM_LS_DEBUG", "").lower() in {"1", "true", "yes"}:
+                try:
+                    r_inf = float(np.linalg.norm(R_red, ord=np.inf))
+                    g_inf = float(np.linalg.norm(g, ord=np.inf))
+                    s_inf = float(np.linalg.norm(S_red, ord=np.inf))
+                    print(f"        [ls] ‖R‖∞={r_inf:.3e}  ‖g‖∞={g_inf:.3e}  ‖S‖∞={s_inf:.3e}")
+                except Exception:
+                    pass
 
         phi0 = 0.5 * float(R_red @ R_red)
-        alpha = 1.0
+        # Warm-start: reuse last accepted α (try slightly larger first).
+        alpha = float(getattr(self, "_ls_alpha_prev", 1.0))
+        alpha = min(1.0, alpha / float(np_.ls_reduction))
         best_alpha, best_phi = 0.0, phi0
+        best_R = None
 
         # Snapshot the *full* iterate
         snap = [f.nodal_values.copy() for f in funcs]
 
+        def _best_effort_direction(direction_red: np.ndarray, label: str):
+            direction = np.asarray(direction_red, dtype=float).ravel()
+            if direction.size != int(np.asarray(S_red, dtype=float).size):
+                return None, phi0, 0.0, None
+            if not np.all(np.isfinite(direction)):
+                return None, phi0, 0.0, None
+            dir_inf = float(np.linalg.norm(direction, ord=np.inf))
+            if (not np.isfinite(dir_inf)) or dir_inf <= 0.0:
+                return None, phi0, 0.0, None
+            alpha_dir = float(getattr(self, "_ls_alpha_prev", 1.0))
+            alpha_dir = min(1.0, alpha_dir / float(np_.ls_reduction))
+            best_alpha_dir = 0.0
+            best_phi_dir = phi0
+            best_R_dir = None
+            for _ in range(np_.ls_max_iter):
+                for f, buf in zip(funcs, snap):
+                    f.nodal_values[:] = buf
+                self._apply_solver_coordinate_step(alpha_dir * direction, funcs, bcs_now)
+                _, R_try_dir = self._assemble_system_reduced(coeffs, need_matrix=False)
+                phi_dir = 0.5 * float(R_try_dir @ R_try_dir)
+                if phi_dir < best_phi_dir:
+                    best_phi_dir = phi_dir
+                    best_alpha_dir = alpha_dir
+                    best_R_dir = np.asarray(R_try_dir, dtype=float)
+                if phi_dir < phi0:
+                    for f, buf in zip(funcs, snap):
+                        f.nodal_values[:] = buf
+                    if int(getattr(self.np, "print_level", 2) or 0) >= 3:
+                        print(f"        {label} accepted α = {alpha_dir:.2e}")
+                    return alpha_dir * direction, best_phi_dir, best_alpha_dir, best_R_dir
+                alpha_dir *= np_.ls_reduction
+            for f, buf in zip(funcs, snap):
+                f.nodal_values[:] = buf
+            if best_alpha_dir > 0.0:
+                if int(getattr(self.np, "print_level", 2) or 0) >= 2:
+                    print(f"        {label} best-effort α = {best_alpha_dir:.2e}.")
+                return best_alpha_dir * direction, best_phi_dir, best_alpha_dir, best_R_dir
+            return None, phi0, 0.0, None
+
         for _ in range(np_.ls_max_iter):
             # Trial update: expand to full, apply, and re-impose BCs
-            for f, buf in zip(funcs, snap): f.nodal_values[:] = buf
-            dU_full = np.zeros(dh.total_dofs)
-            dU_full[self.active_dofs] = alpha * S_red
-            dh.add_to_functions(dU_full, funcs)
-            dh.apply_bcs(bcs_now, *funcs)
+            for f, buf in zip(funcs, snap):
+                f.nodal_values[:] = buf
+            self._apply_solver_coordinate_step(alpha * S_red, funcs, bcs_now)
 
             # Evaluate residual in reduced space (matrix not needed)
             _, R_try = self._assemble_system_reduced(coeffs, need_matrix=False)
@@ -709,50 +6225,407 @@ class NewtonSolver:
 
             # Track best effort
             if phi < best_phi:
-                best_phi, best_alpha = phi, alpha
+                best_phi, best_alpha, best_R = phi, alpha, R_try
 
             # Armijo condition with reduced quantities
             if phi <= phi0 + c1 * alpha * gTS:
+                self._ls_last_residual_red = np.asarray(R_try, dtype=float)
                 for f, buf in zip(funcs, snap): f.nodal_values[:] = buf
-                print(f"        Armijo search accepted α = {alpha:.2e}")
+                if int(getattr(self.np, "print_level", 2) or 0) >= 3:
+                    print(f"        Armijo search accepted α = {alpha:.2e}")
+                self._ls_alpha_prev = alpha
+                self._ls_last_best_effort = False
                 return alpha * S_red
 
             alpha *= np_.ls_reduction
 
         # Fallback (best effort seen)
         for f, buf in zip(funcs, snap): f.nodal_values[:] = buf
+        gn_dir = self._reduced_gauss_newton_lm_direction(A_red, R_red)
+        if gn_dir is not None:
+            gn_step, gn_phi, gn_alpha, gn_R = _best_effort_direction(gn_dir, "        Armijo GN/LM")
+            if gn_step is not None:
+                better_than_newton = (best_alpha <= 0.0) or (gn_phi < best_phi)
+                if better_than_newton:
+                    if gn_R is not None:
+                        self._ls_last_residual_red = np.asarray(gn_R, dtype=float)
+                    self._ls_alpha_prev = float(gn_alpha)
+                    self._ls_last_best_effort = True
+                    return np.asarray(gn_step, dtype=float)
         if best_alpha > 0.0:
-            print(f"        Armijo failed, using best-effort α = {best_alpha:.2e}.")
+            if int(getattr(self.np, "print_level", 2) or 0) >= 2:
+                print(f"        Armijo failed, using best-effort α = {best_alpha:.2e}.")
+            if best_R is not None:
+                self._ls_last_residual_red = np.asarray(best_R, dtype=float)
+            self._ls_alpha_prev = best_alpha
+            self._ls_last_best_effort = True
             return best_alpha * S_red
-        print("        Line search failed – no descent.")
-        return np.zeros_like(S_red)
+
+        # As a last resort, try a simple residual-direction backtracking step.
+        # This is useful when the assembled Jacobian is inconsistent enough that
+        # the Gauss-Newton gradient g = JᵀR does not produce an actual decrease.
+        try_alt = os.getenv("PYCUTFEM_LS_ALT_RESIDUAL", "1").lower() in {"1", "true", "yes"}
+        if try_alt:
+            S_alt = -np.asarray(R_red, dtype=float)
+            step_alt, _, alpha_alt, best_R_alt = _best_effort_direction(S_alt, "        Armijo alt (S=-R)")
+            if step_alt is not None:
+                if best_R_alt is not None:
+                    self._ls_last_residual_red = np.asarray(best_R_alt, dtype=float)
+                self._ls_alpha_prev = float(alpha_alt)
+                self._ls_last_best_effort = True
+                return np.asarray(step_alt, dtype=float)
+        # No decrease found; still take the smallest tried step to avoid stagnation.
+        min_alpha = alpha
+        if int(getattr(self.np, "print_level", 2) or 0) >= 2:
+            print(f"        Line search failed – taking minimal step α = {min_alpha:.2e}.")
+        ls_fail_hard = bool(getattr(np_, "ls_fail_hard", True))
+        if os.getenv("PYCUTFEM_LS_FAIL_HARD", "").strip():
+            ls_fail_hard = os.getenv("PYCUTFEM_LS_FAIL_HARD", "1").lower() not in {"0", "false", "no"}
+        if ls_fail_hard:
+            raise RuntimeError("Line search failed: no residual decrease.")
+        self._ls_alpha_prev = min_alpha
+        self._ls_last_best_effort = True
+        return min_alpha * S_red
+
+    def _assemble_residual_reduced_fast(self, coeffs) -> np.ndarray:
+        """Assemble reduced residual only, using precomputed reduced scatter maps when available."""
+        if getattr(self, "_pattern_stale", True):
+            self._build_reduced_pattern()
+        self._finish_residual_kernel_compilation()
+
+        nred = int(len(self.active_dofs))
+        R_red = np.zeros(nred, dtype=float)
+        res_maps = getattr(self, "_res_red_maps", None)
+        has_constraints = getattr(self, "constraints", None) is not None
+
+        for k_idx, ker in enumerate(self.kernels_F):
+            gdofs = ker.static_args.get("gdofs_map")
+            if isinstance(gdofs, np.ndarray) and gdofs.shape[0] == 0:
+                continue
+            _, Floc, _ = ker.exec(coeffs)  # [nEnt, nLoc]
+
+            red_map = None
+            if (
+                not has_constraints
+                and isinstance(res_maps, list)
+                and k_idx < len(res_maps)
+                and isinstance(res_maps[k_idx], np.ndarray)
+            ):
+                cand = res_maps[k_idx]
+                if getattr(cand, "shape", None) == getattr(Floc, "shape", None):
+                    red_map = cand
+
+            if red_map is not None:
+                rm = np.asarray(red_map, dtype=np.int32).ravel()
+                ff = np.asarray(Floc, dtype=float).ravel()
+                mask = rm >= 0
+                if np.any(mask):
+                    np.add.at(R_red, rm[mask], ff[mask])
+                continue
+
+            # Fallback: per-entity scatter (supports constraint-aware mappings).
+            if not isinstance(gdofs, np.ndarray):
+                gdofs = ker.static_args["gdofs_map"]
+            for e in range(int(gdofs.shape[0])):
+                full = gdofs[e]
+                valid_full = full >= 0
+                if not np.any(valid_full):
+                    continue
+                if not has_constraints:
+                    rmap = -np.ones_like(full, dtype=int)
+                    rmap[valid_full] = self.full_to_red[full[valid_full]]
+                    m = rmap >= 0
+                    if np.any(m):
+                        np.add.at(R_red, rmap[m], Floc[e][m])
+                else:
+                    full_to_master = getattr(self, "_constr_full_to_master", None)
+                    is_slave = getattr(self, "_constr_is_slave", None)
+                    slave_map = getattr(self, "_constr_slave_map", None)
+                    if (
+                        not isinstance(full_to_master, np.ndarray)
+                        or not isinstance(is_slave, np.ndarray)
+                        or not isinstance(slave_map, dict)
+                    ):
+                        continue
+                    for loc_i, gd in zip(np.nonzero(valid_full)[0].tolist(), full[valid_full].tolist()):
+                        gd_i = int(gd)
+                        if gd_i < 0 or gd_i >= int(full_to_master.size):
+                            continue
+                        val = float(Floc[e][int(loc_i)])
+                        if not np.isfinite(val) or val == 0.0:
+                            continue
+                        if bool(is_slave[gd_i]):
+                            combo = slave_map.get(gd_i)
+                            if combo is None:
+                                continue
+                            mcols, wts = combo
+                            for mcol, wv in zip(mcols.tolist(), wts.tolist()):
+                                red = int(self.full_to_red[int(mcol)])
+                                if red >= 0:
+                                    R_red[red] += float(wv) * val
+                        else:
+                            mcol = int(full_to_master[gd_i])
+                            if mcol < 0:
+                                continue
+                            red = int(self.full_to_red[mcol])
+                            if red >= 0:
+                                R_red[red] += val
+
+        return R_red
 
     # ------------------------------------------------------------------
     #  Reduced Linear system & BC handling
     # ------------------------------------------------------------------
     def _assemble_system_reduced(self, coeffs, *, need_matrix: bool = True):
+        self._before_reduced_assembly(coeffs, need_matrix=need_matrix)
+        if self.backend == "python":
+            A_red, R_red = self._assemble_system_reduced_python(coeffs, need_matrix=need_matrix)
+            return self._after_reduced_assembly(
+                coeffs,
+                A_red,
+                R_red,
+                need_matrix=need_matrix,
+            )
         self._maybe_refresh_deformation(coeffs)
         nred = len(self.active_dofs)
         if need_matrix:
             A_red, R_red = self._assemble_system_reduced_fast(coeffs)
-            return A_red, R_red
+            A_red, R_red = self._apply_mean_value_gauge_to_reduced(
+                A_red,
+                R_red,
+                coeffs,
+                need_matrix=True,
+            )
+            self._debug_compare_reduced_backend(
+                coeffs,
+                A_red_fast=A_red,
+                R_red_fast=R_red,
+                need_matrix=True,
+            )
+            return self._after_reduced_assembly(
+                coeffs,
+                A_red,
+                R_red,
+                need_matrix=True,
+            )
         else:
-            # residual only: keep a light path that avoids fancy indexing
-            R_red = np.zeros(nred)
-            for ker in self.kernels_F:
-                _, Floc, _ = ker.exec(coeffs)
-                eids = ker.static_args["eids"]; gdofs = ker.static_args["gdofs_map"]
-                for e in range(len(eids)):
-                    rmap = self.full_to_red[gdofs[e]]
-                    m = rmap >= 0
-                    if np.any(m):
-                        np.add.at(R_red, rmap[m], Floc[e][m])
-            return None, R_red
+            R_red = self._assemble_residual_reduced_fast(coeffs)
+            _, R_red = self._apply_mean_value_gauge_to_reduced(
+                None,
+                R_red,
+                coeffs,
+                need_matrix=False,
+            )
+            self._debug_compare_reduced_backend(
+                coeffs,
+                A_red_fast=None,
+                R_red_fast=R_red,
+                need_matrix=False,
+            )
+            return self._after_reduced_assembly(
+                coeffs,
+                None,
+                R_red,
+                need_matrix=False,
+            )
+
+    def _debug_compare_reduced_backend(
+        self,
+        coeffs,
+        *,
+        A_red_fast: sp.csr_matrix | None,
+        R_red_fast: np.ndarray,
+        need_matrix: bool,
+    ) -> None:
+        flag = str(os.getenv("PYCUTFEM_COMPARE_REDUCED_BACKEND", "") or "").strip().lower()
+        if flag not in {"1", "true", "yes"}:
+            return
+        if self.backend == "python":
+            return
+        if bool(getattr(self, "_compare_reduced_backend_busy", False)):
+            return
+        step_raw = str(os.getenv("PYCUTFEM_COMPARE_REDUCED_BACKEND_STEP", "") or "").strip()
+        if step_raw:
+            try:
+                if int(getattr(self, "_current_step_no", -1)) != int(step_raw):
+                    return
+            except Exception:
+                return
+        newton_raw = str(os.getenv("PYCUTFEM_COMPARE_REDUCED_BACKEND_NEWTON", "") or "").strip()
+        if newton_raw:
+            try:
+                if int(getattr(self, "_current_newton_it", -1)) != int(newton_raw):
+                    return
+            except Exception:
+                return
+        max_calls = int(os.getenv("PYCUTFEM_COMPARE_REDUCED_BACKEND_MAX_CALLS", "1") or "1")
+        calls_done = int(getattr(self, "_compare_reduced_backend_calls", 0) or 0)
+        if calls_done >= max_calls:
+            return
+        atol = float(os.getenv("PYCUTFEM_COMPARE_REDUCED_BACKEND_ATOL", "1e-10") or "1e-10")
+        rtol = float(os.getenv("PYCUTFEM_COMPARE_REDUCED_BACKEND_RTOL", "1e-10") or "1e-10")
+        raise_on_mismatch = str(
+            os.getenv("PYCUTFEM_COMPARE_REDUCED_BACKEND_FAIL", "0") or "0"
+        ).strip().lower() in {"1", "true", "yes"}
+        self._compare_reduced_backend_busy = True
+        try:
+            A_ref, R_ref = self._assemble_system_reduced_python(coeffs, need_matrix=need_matrix)
+        finally:
+            self._compare_reduced_backend_busy = False
+        self._compare_reduced_backend_calls = calls_done + 1
+
+        R_fast = np.asarray(R_red_fast, dtype=float).ravel()
+        R_ref = np.asarray(R_ref, dtype=float).ravel()
+        if R_fast.shape != R_ref.shape:
+            raise RuntimeError(
+                f"Reduced residual backend compare shape mismatch: fast={R_fast.shape}, python={R_ref.shape}"
+            )
+        R_diff = R_fast - R_ref
+        R_inf = float(np.linalg.norm(R_diff, ord=np.inf)) if R_diff.size else 0.0
+        R_den = max(float(np.linalg.norm(R_ref, ord=np.inf)) if R_ref.size else 0.0, 1.0)
+        R_rel = R_inf / R_den
+
+        A_inf = 0.0
+        A_rel = 0.0
+        if need_matrix:
+            if A_red_fast is None or A_ref is None:
+                raise RuntimeError("Reduced backend compare requested matrix parity, but one matrix is missing.")
+            A_fast_csr = A_red_fast.tocsr()
+            A_ref_csr = A_ref.tocsr()
+            if A_fast_csr.shape != A_ref_csr.shape:
+                raise RuntimeError(
+                    f"Reduced Jacobian backend compare shape mismatch: fast={A_fast_csr.shape}, python={A_ref_csr.shape}"
+                )
+            A_diff = (A_fast_csr - A_ref_csr).tocsr()
+            A_inf = float(np.max(np.abs(A_diff.data))) if int(A_diff.nnz) > 0 else 0.0
+            A_ref_inf = float(np.max(np.abs(A_ref_csr.data))) if int(A_ref_csr.nnz) > 0 else 0.0
+            A_rel = A_inf / max(A_ref_inf, 1.0)
+
+        step_no = int(getattr(self, "_current_step_no", -1))
+        newton_it = int(getattr(self, "_current_newton_it", -1))
+        label = f"[backend-compare] step={step_no} it={newton_it} matrix={int(bool(need_matrix))}"
+        if need_matrix:
+            print(
+                f"        {label} |dA|_inf={A_inf:.3e} relA={A_rel:.3e} |dR|_inf={R_inf:.3e} relR={R_rel:.3e}",
+                flush=True,
+            )
+        else:
+            print(
+                f"        {label} |dR|_inf={R_inf:.3e} relR={R_rel:.3e}",
+                flush=True,
+            )
+        mismatch = (R_inf > atol and R_rel > rtol) or (need_matrix and A_inf > atol and A_rel > rtol)
+        if mismatch and raise_on_mismatch:
+            raise RuntimeError(
+                "Reduced backend compare mismatch: "
+                + (f"|dA|_inf={A_inf:.3e}, relA={A_rel:.3e}, " if need_matrix else "")
+                + f"|dR|_inf={R_inf:.3e}, relR={R_rel:.3e}"
+            )
+
+    def _assemble_full_system_python(self, apply_bcs=None, *, need_matrix: bool = True):
+        """
+        Assemble the full-space Jacobian and residual using the Python backend.
+        Dirichlet conditions are applied only if *apply_bcs* is provided.
+        """
+        fc = self._python_form_compiler()
+        return fc.assemble(self.equation, bcs=apply_bcs, need_matrix=bool(need_matrix), need_vector=True)
+
+    def _assemble_system_reduced_python(self, coeffs, *, need_matrix: bool = True):
+        """
+        Python-backend assembly: build the full system once and condense to the
+        active DOFs (and optional constraints) via the existing reducer.
+        """
+        self._maybe_refresh_deformation(coeffs)
+        A_full, R_full = self._assemble_full_system_python(apply_bcs=None, need_matrix=need_matrix)
+
+        # Prefer the time-frozen BCs when available
+        bcs_apply = getattr(self, "_current_bcs", None)
+        if bcs_apply is None:
+            bcs_apply = self.bcs_homog if self.bcs_homog else self.bcs
+
+        A_red, R_red = self.restrictor.reduce_system(A_full, R_full, self.dh, bcs_apply)
+        A_red, R_red = self._apply_mean_value_gauge_to_reduced(
+            A_red,
+            R_red,
+            coeffs,
+            need_matrix=need_matrix,
+        )
+        if need_matrix:
+            return A_red, R_red
+        return None, R_red
+
+    def _assemble_system_with_constraints(self, coeffs, *, need_matrix: bool = True):
+        """
+        Assemble in the full space and condense hanging nodes via Eᵀ A E / Eᵀ R.
+        """
+        A_full, R_full = self._assemble_system_raw(coeffs, need_matrix=True)
+        if need_matrix:
+            A_red, R_red = self.restrictor.reduce_system(
+                A_full, R_full, self.dh, self.bcs_homog if self.bcs_homog else self.bcs
+            )
+            return A_red, R_red
+        # Residual-only path: condense and select active entries
+        R_master = self.constraints.restrict_full(R_full)
+        bc_map = self.constraints.project_dirichlet(self.dh.get_dirichlet_data(self.bcs_homog or self.bcs))
+        if bc_map:
+            rows = np.fromiter(bc_map.keys(), dtype=int)
+            vals = np.fromiter(bc_map.values(), dtype=float)
+            R_master[rows] = vals
+        return None, R_master[self.active_dofs]
 
 
     # ------------------------------------------------------------------
     #  Linear system & BC handling        (REF‑ACTORED)
     # ------------------------------------------------------------------
+    def _assemble_system_raw(self, coeffs, *, need_matrix: bool = True):
+        """
+        Assemble full-space Jacobian and residual *without* applying Dirichlet BCs.
+        Used when hanging-node condensation is handled separately.
+        """
+        if self.backend == "python":
+            self._maybe_refresh_deformation(coeffs)
+            A_full, R_full = self._assemble_full_system_python(apply_bcs=None, need_matrix=need_matrix)
+            return (A_full if need_matrix else None), R_full
+
+        self._maybe_refresh_deformation(coeffs)
+        ndof = self.dh.total_dofs
+        A_glob = sp.lil_matrix((ndof, ndof)) if need_matrix else None
+        R_glob = np.zeros(ndof)
+
+        if need_matrix:
+            for ker in self.kernels_K:
+                Kloc, _, _ = ker.exec(coeffs)
+                _scatter_element_contribs(
+                    K_elem=Kloc,
+                    F_elem=None,
+                    J_elem=None,
+                    element_ids=ker.static_args["eids"],
+                    gdofs_map=ker.static_args["gdofs_map"],
+                    target=A_glob,
+                    ctx={"rhs": False, "add": True},
+                    integrand=ker,
+                    hook=None,
+                )
+            self._last_jacobian = A_glob
+
+        for ker in self.kernels_F:
+            _, Floc, _ = ker.exec(coeffs)
+            R_inc = np.zeros_like(R_glob)
+            _scatter_element_contribs(
+                K_elem=None,
+                F_elem=Floc,
+                J_elem=None,
+                element_ids=ker.static_args["eids"],
+                gdofs_map=ker.static_args["gdofs_map"],
+                target=R_inc,
+                ctx={"rhs": True, "add": True},
+                integrand=ker,
+                hook=None,
+            )
+            R_glob += R_inc
+
+        return (A_glob.tocsr() if need_matrix else None), R_glob
+
     def _assemble_system(self, coeffs, *, need_matrix: bool = True):
         """
         Assemble global Jacobian A (optional) and residual R.
@@ -761,6 +6634,28 @@ class NewtonSolver:
           enforces homogeneous Dirichlet rows in *R* so that line‑search
           evaluations are meaningful.
         """
+        if self.backend == "python":
+            self._maybe_refresh_deformation(coeffs)
+            A_glob, R_glob = self._assemble_full_system_python(apply_bcs=None, need_matrix=need_matrix)
+            dh = self.dh
+            ndof = dh.total_dofs
+
+            if self.bcs_homog:
+                bc_data = dh.get_dirichlet_data(self.bcs_homog)
+                if bc_data:
+                    rows = np.fromiter(bc_data.keys(), dtype=int)
+                    vals = np.fromiter(bc_data.values(), dtype=float)
+
+                    if need_matrix and A_glob is not None:
+                        bc_vec = np.zeros(ndof)
+                        bc_vec[rows] = vals
+                        R_glob -= A_glob @ bc_vec
+                        A_glob = _zero_rows_cols(A_glob, rows)
+
+                    R_glob[rows] = vals
+
+            return (A_glob if need_matrix else None), R_glob
+
         self._maybe_refresh_deformation(coeffs)
         dh   = self.dh
         ndof = dh.total_dofs
@@ -787,6 +6682,7 @@ class NewtonSolver:
             self._last_jacobian = A_glob          # keep for line‑search
 
         # 2) Residual ---------------------------------------------------
+        trace_kernel_residuals = os.getenv("PYCUTFEM_TRACE_KERNEL_RESIDUALS", "").lower() in {"1", "true", "yes"}
         for ker in self.kernels_F:
             _, Floc, _ = ker.exec(coeffs)
 
@@ -802,7 +6698,8 @@ class NewtonSolver:
                 integrand   = ker,
                 hook        = None,
             )
-            print(f"{ker.domain:9}: |R|_∞ = {np.linalg.norm(R_inc, np.inf):.3e}")
+            if trace_kernel_residuals:
+                print(f"{ker.domain:9}: |R|_∞ = {np.linalg.norm(R_inc, np.inf):.3e}")
             R_glob += R_inc
 
         # 3) Homogeneous Dirichlet rows  (always) -----------------------
@@ -827,10 +6724,1813 @@ class NewtonSolver:
 
 
     def _solve_linear_system(self, A: sp.csr_matrix, rhs: np.ndarray) -> np.ndarray:
-        if self.lp.backend == "scipy":
-            return spla.spsolve(A, rhs)
+        perm = getattr(self, "_linear_solve_perm", None)
+        if perm is not None and not bool(getattr(self, "_linear_solve_perm_active", False)):
+            perm_arr = np.asarray(perm, dtype=int).reshape(-1)
+            n = int(A.shape[0])
+            if int(A.shape[1]) != n:
+                raise ValueError("Linear solve permutation requires a square reduced system.")
+            if perm_arr.size != n:
+                raise ValueError(
+                    "Linear solve permutation size mismatch: "
+                    f"expected {n}, got {perm_arr.size}."
+                )
+            if np.unique(perm_arr).size != n or np.any(perm_arr < 0) or np.any(perm_arr >= n):
+                raise ValueError("Linear solve permutation must be a valid index permutation.")
+            self._linear_solve_perm_active = True
+            try:
+                A_perm = A[perm_arr, :][:, perm_arr].tocsr()
+                rhs_perm = np.asarray(rhs, dtype=np.float64).reshape(-1)[perm_arr]
+                sol_perm = np.asarray(self._solve_linear_system(A_perm, rhs_perm), dtype=np.float64).reshape(-1)
+            finally:
+                self._linear_solve_perm_active = False
+            sol = np.empty_like(sol_perm)
+            sol[perm_arr] = sol_perm
+            return sol
+
+        backend = str(getattr(self.lp, "backend", "scipy") or "scipy").lower()
+        if backend == "pypardiso":
+            backend = "pardiso"
+        if backend == "block":
+            return self._solve_linear_system_block(A, rhs)
+        if backend == "scipy" and getattr(self, "_block_linear_solver_config", None):
+            return self._solve_linear_system_block(A, rhs)
+        if (
+            bool(getattr(self, "_reduced_schur_enabled", False))
+            and not isinstance(self, PdasNewtonSolver)
+            and backend in {"scipy", "pardiso"}
+        ):
+            try:
+                return self._solve_linear_system_reduced_schur(A, rhs)
+            except Exception as exc:
+                print(f"        [lin] reduced Schur solve fallback failed: {exc}", flush=True)
+        if backend == "scipy":
+            return self._solve_linear_system_scipy(A, rhs)
+        if backend == "sparseqr":
+            return self._solve_linear_system_sparseqr(A, rhs)
+        if backend in {"eigen_sparseqr", "eigen_sparse_qr", "kratos_sparse_qr"}:
+            return self._solve_linear_system_eigen_sparseqr(A, rhs)
+        if backend == "pardiso":
+            if not HAS_PYPARDISO:
+                raise RuntimeError(
+                    "LinearSolverParameters.backend='pardiso' requested but pypardiso is not available."
+                )
+            return self._solve_linear_system_pardiso(A, rhs)
+        if backend == "petsc":
+            if not HAS_PETSC:
+                raise RuntimeError(
+                    "LinearSolverParameters.backend='petsc' requested but petsc4py is not available."
+                )
+            return self._solve_linear_system_petsc(A, rhs)
+        if backend == "amgcl":
+            return self._solve_linear_system_amgcl(A, rhs)
+        raise ValueError(f"Unknown linear solver backend '{self.lp.backend}'.")
+
+    def _invalidate_pardiso_linear_cache(self) -> None:
+        cache = getattr(self, "_pardiso_linear_cache", None)
+        solver = cache.get("solver") if isinstance(cache, dict) else None
+        if solver is not None:
+            try:
+                solver.free_memory()
+            except Exception:
+                pass
+        if hasattr(self, "_pardiso_linear_cache"):
+            delattr(self, "_pardiso_linear_cache")
+
+    @staticmethod
+    def _canonicalize_direct_solve_matrix(A: sp.spmatrix) -> sp.csr_matrix | sp.csc_matrix:
+        if not (sp.isspmatrix_csr(A) or sp.isspmatrix_csc(A)):
+            A = A.tocsr()
         else:
-            raise ValueError(f"Unknown linear solver backend '{self.lp.backend}'.")
+            A = A.copy()
+        try:
+            A.sum_duplicates()
+        except Exception:
+            pass
+        try:
+            A.eliminate_zeros()
+        except Exception:
+            pass
+        try:
+            A.sort_indices()
+        except Exception:
+            pass
+        return A
+
+    def _linear_solution_quality(self, A: sp.spmatrix, rhs: np.ndarray, sol: np.ndarray) -> tuple[float, float]:
+        try:
+            res = np.asarray(A @ sol, dtype=float).ravel() - np.asarray(rhs, dtype=float).ravel()
+        except Exception:
+            return float("inf"), float("inf")
+        if not np.all(np.isfinite(res)):
+            return float("inf"), float("inf")
+        res_inf = float(np.linalg.norm(res, ord=np.inf)) if res.size else 0.0
+        rhs_arr = np.asarray(rhs, dtype=float).ravel()
+        rhs_inf = float(np.linalg.norm(rhs_arr, ord=np.inf)) if rhs_arr.size else 0.0
+        rel_inf = res_inf / max(rhs_inf, 1.0)
+        return res_inf, rel_inf
+
+    @staticmethod
+    def _schur_safe_diagonal(diag: np.ndarray, *, rel_floor: float = 1.0e-12) -> np.ndarray:
+        out = np.asarray(diag, dtype=np.float64).ravel().copy()
+        if out.size == 0:
+            return out
+        scale = float(np.max(np.abs(out))) if out.size else 1.0
+        floor = max(float(rel_floor) * max(scale, 1.0), 1.0e-15)
+        good = np.isfinite(out) & (np.abs(out) >= floor)
+        if np.all(good):
+            return out
+        signs = np.sign(out)
+        signs[~np.isfinite(signs) | (signs == 0.0)] = 1.0
+        out[~good] = signs[~good] * floor
+        return out
+
+    def _solve_linear_system_reduced_schur(self, A: sp.csr_matrix, rhs: np.ndarray) -> np.ndarray:
+        cfg_fields = tuple(getattr(self, "_reduced_schur_pressure_fields", tuple()) or tuple())
+        p_red = self._reduced_indices_for_fields(cfg_fields)
+        n = int(A.shape[0])
+        if p_red.size == 0 or p_red.size >= n:
+            raise RuntimeError("No usable reduced pressure block found for Schur solve.")
+        field_names = np.asarray(getattr(self, "_reduced_field_names", np.asarray([], dtype=object)), dtype=object)
+        if field_names.shape == (n,) and np.any(field_names[p_red] == "pi_s"):
+            raise RuntimeError("Current reduced Schur solve is disabled on the pi_s split branch.")
+
+        A = self._canonicalize_direct_solve_matrix(A)
+        rhs = np.asarray(rhs, dtype=np.float64).ravel()
+        u_red = np.setdiff1d(np.arange(n, dtype=int), p_red, assume_unique=False)
+        if u_red.size == 0:
+            raise RuntimeError("Reduced Schur solve requires a non-empty primal block.")
+
+        perm = np.concatenate([u_red, p_red]).astype(int, copy=False)
+        inv_perm = np.empty((n,), dtype=int)
+        inv_perm[perm] = np.arange(n, dtype=int)
+        A_perm = A[np.ix_(perm, perm)].tocsr()
+        rhs_perm = rhs[perm]
+        nu = int(u_red.size)
+        npres = int(p_red.size)
+
+        Auu_raw = self._canonicalize_direct_solve_matrix(A_perm[:nu, :nu].tocsr())
+        Aup = A_perm[:nu, nu:].tocsr()
+        Apu = A_perm[nu:, :nu].tocsr()
+        App = A_perm[nu:, nu:].tocsr()
+        ruiz_iters = int(os.getenv("PYCUTFEM_SCHUR_RUIZ_ITERS", "4") or "4")
+        row_u, col_u = self._direct_solve_ruiz_scaling(Auu_raw, iters=max(ruiz_iters, 0))
+        Auu = self._canonicalize_direct_solve_matrix(
+            (sp.diags(row_u, format="csr") @ Auu_raw @ sp.diags(col_u, format="csr")).tocsc()
+        )
+        lu = spla.splu(Auu.tocsc())
+
+        def _solve_auu(rhs_u_in: np.ndarray) -> np.ndarray:
+            rhs_u_arr = np.asarray(rhs_u_in, dtype=np.float64)
+            if rhs_u_arr.ndim == 1:
+                y = np.asarray(lu.solve(row_u * rhs_u_arr), dtype=np.float64).ravel()
+                return np.asarray(col_u * y, dtype=np.float64).ravel()
+            y = np.asarray(lu.solve(row_u[:, None] * rhs_u_arr), dtype=np.float64)
+            return np.asarray(col_u[:, None] * y, dtype=np.float64)
+
+        rhs_u = np.asarray(rhs_perm[:nu], dtype=np.float64).ravel()
+        rhs_p = np.asarray(rhs_perm[nu:], dtype=np.float64).ravel()
+        Aup_dense = np.asarray(Aup.toarray(), dtype=np.float64)
+        X = _solve_auu(Aup_dense) if npres else np.zeros((nu, 0), dtype=np.float64)
+        Schur = np.asarray(App.toarray(), dtype=np.float64) - np.asarray(Apu @ X, dtype=np.float64)
+        pressure_scale_mode, pressure_scale = self._reduced_schur_pressure_scale()
+        shift_rel = float(getattr(self, "_reduced_schur_shift_rel", 1.0e-12) or 0.0)
+        schur_scale = float(np.max(np.abs(Schur))) if Schur.size else 1.0
+        if shift_rel > 0.0 and npres:
+            Schur = Schur + np.eye(npres, dtype=np.float64) * (shift_rel * max(schur_scale, 1.0))
+        Schur_eff = pressure_scale * Schur if npres else Schur
+
+        if npres:
+            if bool(getattr(self, "_reduced_schur_diag_only", False)):
+                diag_s = self._schur_safe_diagonal(np.diag(Schur_eff), rel_floor=shift_rel)
+
+                def _solve_s(rhs_p_in: np.ndarray) -> np.ndarray:
+                    rhs_arr = pressure_scale * np.asarray(rhs_p_in, dtype=np.float64).ravel()
+                    return rhs_arr / diag_s
+
+                schur_info = {
+                    "mode": "diag",
+                    "diag_min": float(np.min(np.abs(diag_s))) if diag_s.size else 0.0,
+                    "diag_max": float(np.max(np.abs(diag_s))) if diag_s.size else 0.0,
+                }
+            else:
+                def _solve_s(rhs_p_in: np.ndarray) -> np.ndarray:
+                    rhs_p_arr = pressure_scale * np.asarray(rhs_p_in, dtype=np.float64).ravel()
+                    try:
+                        return np.linalg.solve(Schur_eff, rhs_p_arr)
+                    except np.linalg.LinAlgError:
+                        return np.linalg.lstsq(Schur_eff, rhs_p_arr, rcond=None)[0]
+
+                schur_info = {
+                    "mode": "full",
+                    "schur_norm_inf": float(np.linalg.norm(Schur, ord=np.inf)) if Schur.size else 0.0,
+                    "schur_eff_norm_inf": float(np.linalg.norm(Schur_eff, ord=np.inf)) if Schur_eff.size else 0.0,
+                }
+        else:
+            def _solve_s(rhs_p_in: np.ndarray) -> np.ndarray:
+                return np.zeros((0,), dtype=np.float64)
+
+            schur_info = {"mode": "empty"}
+
+        def _solve_block(rhs_perm_in: np.ndarray) -> np.ndarray:
+            rhs_perm_arr = np.asarray(rhs_perm_in, dtype=np.float64).ravel()
+            rhs_u_loc = rhs_perm_arr[:nu]
+            rhs_p_loc = rhs_perm_arr[nu:]
+            x_u_rhs_loc = _solve_auu(rhs_u_loc)
+            schur_rhs = rhs_p_loc - np.asarray(Apu @ x_u_rhs_loc, dtype=np.float64).ravel()
+            x_p_loc = _solve_s(schur_rhs)
+            x_u_loc = _solve_auu(rhs_u_loc - Aup_dense @ x_p_loc)
+            return np.concatenate([np.asarray(x_u_loc, dtype=np.float64).ravel(), np.asarray(x_p_loc, dtype=np.float64).ravel()])
+
+        sol_perm = _solve_block(rhs_perm)
+        refine_iters = max(int(os.getenv("PYCUTFEM_SCHUR_REFINE_ITERS", "2") or "2"), 0)
+        sol = np.asarray(sol_perm[inv_perm], dtype=np.float64).ravel()
+        res_inf, rel_inf = self._linear_solution_quality(A, rhs, sol)
+        for _ in range(refine_iters):
+            if self._direct_solve_quality_passes(res_inf, rel_inf):
+                break
+            res_full = np.asarray(rhs, dtype=np.float64).ravel() - np.asarray(A @ sol, dtype=np.float64).ravel()
+            corr_perm = _solve_block(res_full[perm])
+            sol_perm = sol_perm + corr_perm
+            sol = np.asarray(sol_perm[inv_perm], dtype=np.float64).ravel()
+            res_inf, rel_inf = self._linear_solution_quality(A, rhs, sol)
+
+        self._reduced_schur_last_info = {
+            "pressure_fields": tuple(cfg_fields),
+            "p_dofs": int(npres),
+            "u_dofs": int(nu),
+            "res_inf": float(res_inf),
+            "rel_inf": float(rel_inf),
+            "ruiz_iters": int(ruiz_iters),
+            "refine_iters": int(refine_iters),
+            "pressure_scale_mode": str(pressure_scale_mode),
+            "pressure_scale": float(pressure_scale),
+            **schur_info,
+        }
+        if bool(getattr(self, "_reduced_schur_trace", False)):
+            print(
+                "        [lin-schur] "
+                f"p_dofs={int(npres)} u_dofs={int(nu)} mode={schur_info.get('mode', 'full')} "
+                f"pscale={pressure_scale:.3e} "
+                f"|Ax-b|_inf={res_inf:.3e} rel={rel_inf:.3e}",
+                flush=True,
+            )
+        if self._direct_solve_quality_passes(res_inf, rel_inf):
+            return sol
+        raise RuntimeError(
+            "Reduced Schur solve returned a low-quality solution "
+            f"(|Ax-b|_inf={res_inf:.3e}, rel={rel_inf:.3e})."
+        )
+
+    def _direct_solve_quality_thresholds(self) -> tuple[float, float, bool, float, float]:
+        linear_context = str(getattr(self, "_linear_solve_context", "") or "").strip().lower()
+        if linear_context == "vi_augmented":
+            atol = float(os.getenv("PYCUTFEM_DIRECT_SOLVE_CHECK_ATOL_VI", "1e-6") or "1e-6")
+            rtol = float(os.getenv("PYCUTFEM_DIRECT_SOLVE_CHECK_RTOL_VI", "1e-4") or "1e-4")
+        else:
+            atol = float(os.getenv("PYCUTFEM_DIRECT_SOLVE_CHECK_ATOL", "1e-10") or "1e-10")
+            rtol = float(os.getenv("PYCUTFEM_DIRECT_SOLVE_CHECK_RTOL", "1e-7") or "1e-7")
+
+        globalization = str(getattr(getattr(self, "np", None), "globalization", "line_search") or "line_search").strip().lower()
+        allow_usable = (
+            not isinstance(self, PdasNewtonSolver)
+            and linear_context != "vi_augmented"
+            and (
+                bool(getattr(getattr(self, "np", None), "line_search", False))
+                or globalization in {"trust_region", "line_search_then_trust"}
+            )
+        )
+        usable_atol = float(os.getenv("PYCUTFEM_DIRECT_SOLVE_USABLE_ATOL", "1e-8") or "1e-8")
+        usable_rtol = float(os.getenv("PYCUTFEM_DIRECT_SOLVE_USABLE_RTOL", "1e-5") or "1e-5")
+        # For the exact Newton path we only need a step that is numerically
+        # usable for globalization, not a near-machine-precision direct solve.
+        # Tie the fallback quality gate to the requested nonlinear tolerance so
+        # Ruiz-scaled, moderately ill-conditioned solves are not rejected even
+        # though their residual quality is already well below the target
+        # Newton tolerance.
+        np_cfg = getattr(self, "np", None)
+        newton_tol = max(float(getattr(np_cfg, "newton_tol", 0.0) or 0.0), 0.0)
+        newton_rtol = max(float(getattr(np_cfg, "newton_rtol", 0.0) or 0.0), 0.0)
+        usable_atol = max(usable_atol, 10.0 * newton_tol)
+        usable_rtol = max(usable_rtol, 100.0 * max(newton_tol, newton_rtol))
+        if linear_context == "vi_augmented":
+            current_vi_res = getattr(self, "_current_newton_residual_norm", None)
+            try:
+                current_vi_res = float(current_vi_res)
+            except Exception:
+                current_vi_res = float("nan")
+            # The augmented PDAS/IPM solve only needs to be accurate relative
+            # to the current semismooth residual. When |G| is still O(1e-1),
+            # rejecting O(1e-3)-O(1e-2) relative solves causes expensive retry
+            # storms without materially changing the nonlinear step, but
+            # late-stage solves should tighten automatically as |G| shrinks.
+            vi_scale_factor = float(os.getenv("PYCUTFEM_DIRECT_SOLVE_USABLE_SCALE_VI", "2e-2") or "2e-2")
+            vi_usable_atol_cap = float(os.getenv("PYCUTFEM_DIRECT_SOLVE_USABLE_ATOL_VI", "5e-2") or "5e-2")
+            vi_usable_rtol_cap = float(os.getenv("PYCUTFEM_DIRECT_SOLVE_USABLE_RTOL_VI", "5e-2") or "5e-2")
+            vi_usable_atol_floor = max(10.0 * newton_tol, 1.0e-8)
+            vi_usable_rtol_floor = max(10.0 * max(newton_tol, newton_rtol), 1.0e-5)
+            if np.isfinite(current_vi_res) and current_vi_res > 0.0:
+                vi_scale = max(1.0e-12, vi_scale_factor * current_vi_res)
+                usable_atol = min(vi_usable_atol_cap, max(vi_usable_atol_floor, vi_scale))
+                usable_rtol = min(vi_usable_rtol_cap, max(vi_usable_rtol_floor, vi_scale))
+            else:
+                usable_atol = vi_usable_atol_cap
+                usable_rtol = vi_usable_rtol_cap
+            allow_usable = True
+        return atol, rtol, allow_usable, usable_atol, usable_rtol
+
+    def _direct_solve_quality_passes(self, res_inf: float, rel_inf: float, *, allow_usable_override: bool | None = None) -> bool:
+        atol, rtol, allow_usable, usable_atol, usable_rtol = self._direct_solve_quality_thresholds()
+        if allow_usable_override is not None:
+            allow_usable = bool(allow_usable_override)
+        strict_ok = bool(np.isfinite(res_inf) and np.isfinite(rel_inf) and (res_inf <= atol or rel_inf <= rtol))
+        if strict_ok:
+            return True
+        usable_ok = bool(
+            allow_usable
+            and np.isfinite(res_inf)
+            and np.isfinite(rel_inf)
+            and (res_inf <= usable_atol or rel_inf <= usable_rtol)
+        )
+        return usable_ok
+
+    def _should_use_direct_solve_polish(self, rhs: np.ndarray | None = None) -> bool:
+        if isinstance(self, PdasNewtonSolver):
+            return False
+        trigger_raw = str(os.getenv("PYCUTFEM_DIRECT_SOLVE_POLISH_TRIGGER", "1e-4") or "1e-4").strip()
+        if trigger_raw.lower() in {"0", "false", "no", "off"}:
+            return False
+        try:
+            trigger = float(trigger_raw)
+        except Exception:
+            trigger = 0.0
+        if trigger <= 0.0:
+            return False
+        nr = getattr(self, "_current_newton_residual_norm", None)
+        if nr is not None:
+            try:
+                nr_val = float(nr)
+            except Exception:
+                nr_val = float("inf")
+            if np.isfinite(nr_val) and nr_val <= trigger:
+                return True
+        if rhs is not None:
+            try:
+                rhs_inf = float(np.linalg.norm(np.asarray(rhs, dtype=float).ravel(), ord=np.inf))
+            except Exception:
+                rhs_inf = float("inf")
+            if np.isfinite(rhs_inf) and rhs_inf <= trigger:
+                return True
+        return False
+
+    def _direct_solve_quality_ok(self, A: sp.spmatrix, rhs: np.ndarray, sol: np.ndarray, *, solver_name: str) -> bool:
+        res_inf, rel_inf = self._linear_solution_quality(A, rhs, sol)
+        linear_context = str(getattr(self, "_linear_solve_context", "") or "").strip().lower()
+        atol, rtol, allow_usable, usable_atol, usable_rtol = self._direct_solve_quality_thresholds()
+        trace = str(os.getenv("PYCUTFEM_TRACE_DIRECT_SOLVE_QUALITY", "") or "").strip().lower() in {"1", "true", "yes"}
+        if trace:
+            print(
+                f"        [lin] {solver_name} residual quality ({linear_context or 'default'}): "
+                f"|Ax-b|_inf={res_inf:.3e}, rel={rel_inf:.3e}",
+                flush=True,
+            )
+        strict_ok = bool(np.isfinite(res_inf) and np.isfinite(rel_inf) and (res_inf <= atol or rel_inf <= rtol))
+        if strict_ok:
+            return True
+
+        usable_ok = bool(
+            allow_usable
+            and np.isfinite(res_inf)
+            and np.isfinite(rel_inf)
+            and (res_inf <= usable_atol or rel_inf <= usable_rtol)
+        )
+        if usable_ok:
+            print(
+                f"        [lin] {solver_name} accepted as usable for globalization "
+                f"({linear_context or 'default'}): |Ax-b|_inf={res_inf:.3e}, rel={rel_inf:.3e}",
+                flush=True,
+            )
+            return True
+
+        print(
+            f"        [lin] {solver_name} residual check failed ({linear_context or 'default'}): "
+            f"|Ax-b|_inf={res_inf:.3e}, rel={rel_inf:.3e}",
+            flush=True,
+        )
+        return False
+
+    @staticmethod
+    def _newton_globalization_mode(np_) -> str:
+        mode = str(getattr(np_, "globalization", "line_search") or "line_search").strip().lower()
+        if mode in {"trust", "trust_region", "tr"}:
+            return "trust_region"
+        if mode in {"line_search_then_trust", "ls_then_trust", "armijo_then_trust", "dealii_then_trust"}:
+            return "line_search_then_trust"
+        return "line_search"
+
+    def _solve_linear_system_with_context(
+        self,
+        A: sp.csr_matrix,
+        rhs: np.ndarray,
+        *,
+        context: str | None = None,
+    ) -> np.ndarray:
+        prev_context = getattr(self, "_linear_solve_context", None)
+        self._linear_solve_context = None if context is None else str(context)
+        try:
+            return self._solve_linear_system(A, rhs)
+        finally:
+            self._linear_solve_context = prev_context
+
+    @staticmethod
+    def _direct_solve_column_scaling(A: sp.spmatrix) -> np.ndarray:
+        try:
+            col_max_obj = np.abs(A).max(axis=0)
+        except Exception:
+            col_max_obj = np.abs(A).tocsc().max(axis=0)
+        if sp.issparse(col_max_obj):
+            col_max = np.asarray(col_max_obj.toarray(), dtype=np.float64).ravel()
+        else:
+            col_max = np.asarray(col_max_obj, dtype=np.float64).ravel()
+        col_max = np.asarray(col_max, dtype=np.float64).ravel()
+        bad = (~np.isfinite(col_max)) | (col_max <= 0.0)
+        col_max[bad] = 1.0
+        return 1.0 / col_max
+
+    @staticmethod
+    def _direct_solve_equilibration_modes() -> tuple[str, ...]:
+        raw = str(os.getenv("PYCUTFEM_DIRECT_SOLVE_EQUILIBRATION", "auto") or "auto").strip().lower()
+        if raw in {"0", "false", "no", "off", "none"}:
+            return tuple()
+        if raw in {"col", "column", "column_only"}:
+            return ("col",)
+        if raw in {"ruiz", "rowcol", "row_col"}:
+            return ("ruiz",)
+        if raw in {"auto", "1", "true", "yes", "on", "col+ruiz", "column+ruiz"}:
+            return ("col", "ruiz")
+        return tuple(mode for mode in ("col", "ruiz") if mode in {part.strip() for part in raw.split(",")})
+
+    @staticmethod
+    def _direct_solve_ruiz_scaling(A: sp.spmatrix, *, iters: int = 4) -> tuple[np.ndarray, np.ndarray]:
+        nrow, ncol = map(int, getattr(A, "shape", (0, 0)))
+        row_scale = np.ones((nrow,), dtype=np.float64)
+        col_scale = np.ones((ncol,), dtype=np.float64)
+        if nrow == 0 or ncol == 0:
+            return row_scale, col_scale
+        clip_min = float(os.getenv("PYCUTFEM_DIRECT_SOLVE_RUIZ_CLIP_MIN", "1e-6") or "1e-6")
+        clip_max = float(os.getenv("PYCUTFEM_DIRECT_SOLVE_RUIZ_CLIP_MAX", "1e6") or "1e6")
+        A_eq = A.tocsr().copy()
+        for _ in range(max(int(iters), 0)):
+            row_max_obj = np.abs(A_eq).max(axis=1)
+            if sp.issparse(row_max_obj):
+                row_max = np.asarray(row_max_obj.toarray(), dtype=np.float64).ravel()
+            else:
+                row_max = np.asarray(row_max_obj, dtype=np.float64).ravel()
+            row_max[(~np.isfinite(row_max)) | (row_max <= 0.0)] = 1.0
+            row_step = np.clip(1.0 / np.sqrt(row_max), clip_min, clip_max)
+            row_scale *= row_step
+            A_eq = sp.diags(row_step, format="csr") @ A_eq
+
+            col_max_obj = np.abs(A_eq).max(axis=0)
+            if sp.issparse(col_max_obj):
+                col_max = np.asarray(col_max_obj.toarray(), dtype=np.float64).ravel()
+            else:
+                col_max = np.asarray(col_max_obj, dtype=np.float64).ravel()
+            col_max[(~np.isfinite(col_max)) | (col_max <= 0.0)] = 1.0
+            col_step = np.clip(1.0 / np.sqrt(col_max), clip_min, clip_max)
+            col_scale *= col_step
+            A_eq = A_eq @ sp.diags(col_step, format="csr")
+        return row_scale, col_scale
+
+    def _direct_solve_equilibration(self, A: sp.spmatrix, mode: str) -> tuple[np.ndarray, np.ndarray]:
+        mode_key = str(mode or "").strip().lower()
+        if mode_key == "col":
+            return np.ones((int(A.shape[0]),), dtype=np.float64), self._direct_solve_column_scaling(A)
+        if mode_key == "ruiz":
+            iters = int(os.getenv("PYCUTFEM_DIRECT_SOLVE_RUIZ_ITERS", "4") or "4")
+            return self._direct_solve_ruiz_scaling(A, iters=iters)
+        raise ValueError(f"Unknown direct-solve equilibration mode '{mode}'.")
+
+    def _solve_linear_system_scipy_equilibrated(
+        self,
+        A: sp.csr_matrix,
+        rhs: np.ndarray,
+        *,
+        mode: str,
+    ) -> np.ndarray:
+        row_scale, col_scale = self._direct_solve_equilibration(A, mode)
+        A_scaled = self._canonicalize_direct_solve_matrix(
+            sp.diags(row_scale, format="csr") @ A @ sp.diags(col_scale, format="csr")
+        )
+        rhs_scaled = np.asarray(row_scale * rhs, dtype=np.float64)
+        refine_iters = max(int(os.getenv("PYCUTFEM_SCIPY_COLSCALE_REFINE_ITERS", "2") or "2"), 0)
+        with warnings.catch_warnings():
+            if MatrixRankWarning is not None:
+                warnings.filterwarnings("error", category=MatrixRankWarning)
+            y = np.asarray(spla.spsolve(A_scaled, rhs_scaled), dtype=np.float64).ravel()
+        if not np.isfinite(y).all():
+            raise np.linalg.LinAlgError(f"{mode} equilibrated spsolve returned non-finite values")
+        sol = col_scale * y
+        if self._direct_solve_quality_ok(A, rhs, sol, solver_name=f"scipy+{mode}"):
+            return sol
+        for _ in range(refine_iters):
+            res = rhs_scaled - np.asarray(A_scaled @ y, dtype=np.float64).ravel()
+            with warnings.catch_warnings():
+                if MatrixRankWarning is not None:
+                    warnings.filterwarnings("error", category=MatrixRankWarning)
+                dy = np.asarray(spla.spsolve(A_scaled, res), dtype=np.float64).ravel()
+            if not np.isfinite(dy).all():
+                break
+            y = y + dy
+            sol = col_scale * y
+            if self._direct_solve_quality_ok(A, rhs, sol, solver_name=f"scipy+{mode}"):
+                return sol
+        raise np.linalg.LinAlgError(f"{mode} equilibrated spsolve returned a low-quality solution")
+
+    def _solve_linear_system_scipy_column_scaled(self, A: sp.csr_matrix, rhs: np.ndarray) -> np.ndarray:
+        return self._solve_linear_system_scipy_equilibrated(A, rhs, mode="col")
+
+    def _solve_linear_system_scipy_polished(self, A: sp.csr_matrix, rhs: np.ndarray) -> np.ndarray:
+        A = self._canonicalize_direct_solve_matrix(A)
+        rhs = np.asarray(rhs, dtype=np.float64)
+        trace = str(os.getenv("PYCUTFEM_TRACE_DIRECT_SOLVE_QUALITY", "") or "").strip().lower() in {"1", "true", "yes"}
+        candidates: list[tuple[tuple[float, float], str, np.ndarray]] = []
+        last_exc: Exception | None = None
+
+        def _record(name: str, sol: np.ndarray) -> None:
+            res_inf, rel_inf = self._linear_solution_quality(A, rhs, sol)
+            if np.isfinite(res_inf) and np.isfinite(rel_inf):
+                candidates.append(((rel_inf, res_inf), name, np.asarray(sol, dtype=np.float64).ravel()))
+                if trace:
+                    print(
+                        f"        [lin] {name} polish candidate: |Ax-b|_inf={res_inf:.3e}, rel={rel_inf:.3e}",
+                        flush=True,
+                    )
+
+        try:
+            with warnings.catch_warnings():
+                if MatrixRankWarning is not None:
+                    warnings.filterwarnings("error", category=MatrixRankWarning)
+                sol = np.asarray(spla.spsolve(A, rhs), dtype=np.float64).ravel()
+            if np.isfinite(sol).all():
+                _record("scipy", sol)
+        except Exception as exc:
+            last_exc = exc
+
+        for mode in self._direct_solve_equilibration_modes():
+            try:
+                row_scale, col_scale = self._direct_solve_equilibration(A, mode)
+                A_scaled = self._canonicalize_direct_solve_matrix(
+                    sp.diags(row_scale, format="csr") @ A @ sp.diags(col_scale, format="csr")
+                )
+                rhs_scaled = np.asarray(row_scale * rhs, dtype=np.float64)
+                refine_iters = max(int(os.getenv("PYCUTFEM_DIRECT_SOLVE_POLISH_REFINE_ITERS", "4") or "4"), 0)
+                with warnings.catch_warnings():
+                    if MatrixRankWarning is not None:
+                        warnings.filterwarnings("error", category=MatrixRankWarning)
+                    y = np.asarray(spla.spsolve(A_scaled, rhs_scaled), dtype=np.float64).ravel()
+                if not np.isfinite(y).all():
+                    raise np.linalg.LinAlgError(f"{mode} equilibrated spsolve returned non-finite values")
+                sol = col_scale * y
+                _record(f"scipy+{mode}", sol)
+                for _ in range(refine_iters):
+                    res = rhs_scaled - np.asarray(A_scaled @ y, dtype=np.float64).ravel()
+                    with warnings.catch_warnings():
+                        if MatrixRankWarning is not None:
+                            warnings.filterwarnings("error", category=MatrixRankWarning)
+                        dy = np.asarray(spla.spsolve(A_scaled, res), dtype=np.float64).ravel()
+                    if not np.isfinite(dy).all():
+                        break
+                    y = y + dy
+                    sol = col_scale * y
+                    _record(f"scipy+{mode}(refined)", sol)
+            except Exception as exc:
+                last_exc = exc
+
+        if not candidates:
+            if last_exc is not None:
+                raise last_exc
+            raise RuntimeError("No direct linear-solve candidate produced a finite solution.")
+
+        candidates.sort(key=lambda item: item[0])
+        _, best_name, best_sol = candidates[0]
+        best_res_inf, best_rel_inf = self._linear_solution_quality(A, rhs, best_sol)
+        print(
+            f"        [lin] direct-solve polish selected {best_name}: "
+            f"|Ax-b|_inf={best_res_inf:.3e}, rel={best_rel_inf:.3e}",
+            flush=True,
+        )
+        if self._direct_solve_quality_passes(best_res_inf, best_rel_inf):
+            return best_sol
+        raise RuntimeError(f"{best_name} direct-solve polish returned a low-quality solution.")
+
+    def _solve_linear_system_scipy(self, A: sp.csr_matrix, rhs: np.ndarray, *, allow_shift: bool = True) -> np.ndarray:
+        A = self._canonicalize_direct_solve_matrix(A)
+        rhs = np.asarray(rhs, dtype=np.float64)
+        if self._should_use_direct_solve_polish(rhs):
+            try:
+                return self._solve_linear_system_scipy_polished(A, rhs)
+            except Exception as exc:
+                print(f"        [lin] direct-solve polish fallback failed: {exc}", flush=True)
+        try:
+            with warnings.catch_warnings():
+                if MatrixRankWarning is not None:
+                    warnings.filterwarnings("error", category=MatrixRankWarning)
+                sol = np.asarray(spla.spsolve(A, rhs), dtype=np.float64).ravel()
+            if not np.isfinite(sol).all():
+                raise np.linalg.LinAlgError("spsolve returned non-finite values")
+            if self._direct_solve_quality_ok(A, rhs, sol, solver_name="scipy"):
+                return sol
+            raise np.linalg.LinAlgError("spsolve returned a low-quality solution")
+        except Exception as exc:
+            for mode in self._direct_solve_equilibration_modes():
+                try:
+                    if mode == "col":
+                        print(f"        [lin] retrying scipy with column equilibration after failure: {exc}")
+                    else:
+                        print(f"        [lin] retrying scipy with {mode} equilibration after failure: {exc}")
+                    return self._solve_linear_system_scipy_equilibrated(A, rhs, mode=mode)
+                except Exception as exc_eq:
+                    exc = exc_eq
+            if (not allow_shift) or (not np.isfinite(A.data).all()) or (not np.isfinite(rhs).all()):
+                raise
+            shift_scale = float(os.getenv("PYCUTFEM_LIN_SHIFT", "1e-8"))
+            diag = A.diagonal()
+            diag_scale = float(np.max(np.abs(diag))) if diag.size else 1.0
+            shift = max(shift_scale * max(1.0, diag_scale), 1.0e-14)
+            A_reg = A + (shift * sp.eye(A.shape[0], format="csr"))
+            A_reg = self._canonicalize_direct_solve_matrix(A_reg)
+            print(f"        [lin] adding diagonal shift {shift:.3e} after scipy failure: {exc}")
+            with warnings.catch_warnings():
+                if MatrixRankWarning is not None:
+                    warnings.filterwarnings("error", category=MatrixRankWarning)
+                sol = np.asarray(spla.spsolve(A_reg, rhs), dtype=np.float64).ravel()
+            if not np.isfinite(sol).all():
+                raise RuntimeError("scipy fallback with diagonal shift returned non-finite values.")
+            if not self._direct_solve_quality_ok(A_reg, rhs, sol, solver_name="scipy+shift"):
+                raise RuntimeError("scipy fallback with diagonal shift returned a low-quality solution.")
+            return sol
+
+    def _solve_linear_system_sparseqr_equilibrated(
+        self,
+        A: sp.csr_matrix,
+        rhs: np.ndarray,
+        *,
+        mode: str,
+    ) -> np.ndarray:
+        import sparseqr
+
+        row_scale, col_scale = self._direct_solve_equilibration(A, mode)
+        A_scaled = self._canonicalize_direct_solve_matrix(
+            sp.diags(row_scale, format="csr") @ A @ sp.diags(col_scale, format="csr")
+        )
+        rhs_scaled = np.asarray(row_scale * rhs, dtype=np.float64)
+        out = np.asarray(sparseqr.solve(A_scaled, rhs_scaled), dtype=np.float64).ravel()
+        if not np.all(np.isfinite(out)):
+            raise RuntimeError(f"sparseqr {mode} equilibration returned non-finite solution values.")
+        sol = col_scale * out
+        if not self._direct_solve_quality_ok(A, rhs, sol, solver_name=f"sparseqr+{mode}"):
+            raise RuntimeError(f"sparseqr {mode} equilibration returned a low-quality solution.")
+        return sol
+
+    def _solve_linear_system_sparseqr(self, A: sp.csr_matrix, rhs: np.ndarray) -> np.ndarray:
+        import sparseqr
+
+        A = self._canonicalize_direct_solve_matrix(A)
+        rhs = np.asarray(rhs, dtype=np.float64)
+        try:
+            sol = np.asarray(sparseqr.solve(A, rhs), dtype=np.float64).ravel()
+            if not np.isfinite(sol).all():
+                raise RuntimeError("sparseqr returned non-finite values")
+            if self._direct_solve_quality_ok(A, rhs, sol, solver_name="sparseqr"):
+                return sol
+            raise RuntimeError("sparseqr returned a low-quality solution")
+        except Exception as exc:
+            for mode in self._direct_solve_equilibration_modes():
+                try:
+                    print(f"        [lin] retrying sparseqr with {mode} equilibration after failure: {exc}")
+                    return self._solve_linear_system_sparseqr_equilibrated(A, rhs, mode=mode)
+                except Exception as exc_eq:
+                    exc = exc_eq
+            raise
+
+    def _solve_linear_system_eigen_sparseqr(self, A: sp.csr_matrix, rhs: np.ndarray) -> np.ndarray:
+        A = self._canonicalize_direct_solve_matrix(A)
+        rhs = np.asarray(rhs, dtype=np.float64)
+        use_cache = str(os.getenv("PYCUTFEM_EIGEN_SPARSEQR_CACHE", "1") or "1").strip().lower() not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+        if use_cache and sp.isspmatrix_csr(A):
+            h = hashlib.blake2b(digest_size=16)
+            h.update(np.asarray(A.shape, dtype=np.int64).tobytes())
+            h.update(np.asarray(A.indptr, dtype=np.int64).tobytes())
+            h.update(np.asarray(A.indices, dtype=np.int64).tobytes())
+            h.update(np.asarray(A.data, dtype=np.float64).tobytes())
+            key = h.hexdigest()
+            cache = getattr(NewtonSolver, "_eigen_sparseqr_global_cache", None)
+            if not isinstance(cache, dict):
+                cache = {}
+                setattr(NewtonSolver, "_eigen_sparseqr_global_cache", cache)
+            solver = cache.get(key)
+            if solver is None:
+                max_entries_raw = str(os.getenv("PYCUTFEM_EIGEN_SPARSEQR_CACHE_MAX", "4") or "4").strip()
+                try:
+                    max_entries = max(1, int(max_entries_raw))
+                except Exception:
+                    max_entries = 4
+                while len(cache) >= max_entries:
+                    cache.pop(next(iter(cache)))
+                solver = EigenSparseQRSubsolver(A)
+                cache[key] = solver
+            sol = solver.solve(rhs)
+            report = getattr(solver, "last_report", None)
+        else:
+            sol, report = solve_sparse_eigen_sparseqr(A, rhs)
+        if not np.isfinite(sol).all():
+            raise RuntimeError("Eigen SparseQR returned non-finite values.")
+        if report is not None and not bool(report.converged):
+            raise RuntimeError("Eigen SparseQR reported failure.")
+        if not self._direct_solve_quality_ok(A, rhs, sol, solver_name="eigen_sparseqr"):
+            raise RuntimeError("Eigen SparseQR returned a low-quality solution.")
+        return np.asarray(sol, dtype=np.float64).ravel()
+
+    def _solve_linear_system_pardiso_equilibrated(
+        self,
+        A: sp.csr_matrix,
+        rhs: np.ndarray,
+        *,
+        mode: str,
+    ) -> np.ndarray:
+        row_scale, col_scale = self._direct_solve_equilibration(A, mode)
+        A_scaled = self._canonicalize_direct_solve_matrix(
+            sp.diags(row_scale, format="csr") @ A @ sp.diags(col_scale, format="csr")
+        )
+        rhs_scaled = np.asarray(row_scale * rhs, dtype=np.float64)
+        solver = PyPardisoSolver()
+        out = np.asarray(solver.solve(A_scaled, rhs_scaled), dtype=np.float64).ravel()
+        if not np.all(np.isfinite(out)):
+            raise RuntimeError(f"PARDISO {mode} equilibration returned non-finite solution values.")
+        sol = col_scale * out
+        if not self._direct_solve_quality_ok(A, rhs, sol, solver_name=f"pardiso+{mode}"):
+            raise RuntimeError(f"PARDISO {mode} equilibration returned a low-quality solution.")
+        return sol
+
+    def _solve_linear_system_pardiso(self, A: sp.csr_matrix, rhs: np.ndarray) -> np.ndarray:
+        A = self._canonicalize_direct_solve_matrix(A)
+
+        n = int(A.shape[0])
+        if int(A.shape[1]) != n:
+            raise ValueError("PARDISO linear solve expects a square matrix.")
+
+        rhs = np.asarray(rhs, dtype=np.float64)
+        if (not np.all(np.isfinite(A.data))) or (not np.all(np.isfinite(rhs))):
+            self._invalidate_pardiso_linear_cache()
+            raise RuntimeError("PARDISO linear solve received non-finite entries in matrix or rhs.")
+
+        cache = getattr(self, "_pardiso_linear_cache", None)
+        if cache is None or int(cache.get("n", -1)) != n:
+            self._invalidate_pardiso_linear_cache()
+            cache = {"n": n, "solver": PyPardisoSolver()}
+            self._pardiso_linear_cache = cache
+
+        solver = cache["solver"]
+        try:
+            out = np.asarray(solver.solve(A, rhs), dtype=np.float64).ravel()
+        except Exception as exc:
+            self._invalidate_pardiso_linear_cache()
+            shift_scale = float(os.getenv("PYCUTFEM_LIN_SHIFT", "1e-8"))
+            diag = A.diagonal()
+            diag_scale = float(np.max(np.abs(diag))) if diag.size else 1.0
+            shift = max(shift_scale * max(1.0, diag_scale), 1.0e-14)
+            A_reg = A + (shift * sp.eye(n, format="csr"))
+            print(f"        [lin] adding diagonal shift {shift:.3e} after PARDISO failure: {exc}")
+            retry_solver = PyPardisoSolver()
+            out = np.asarray(retry_solver.solve(A_reg, rhs), dtype=np.float64).ravel()
+            self._pardiso_linear_cache = {"n": n, "solver": retry_solver}
+
+        if not np.all(np.isfinite(out)):
+            self._invalidate_pardiso_linear_cache()
+            raise RuntimeError("PARDISO linear solve returned non-finite solution values.")
+        if self._should_use_direct_solve_polish(rhs):
+            candidates: list[tuple[tuple[float, float], str, np.ndarray]] = []
+
+            def _record(name: str, sol: np.ndarray) -> None:
+                res_inf, rel_inf = self._linear_solution_quality(A, rhs, sol)
+                if np.isfinite(res_inf) and np.isfinite(rel_inf):
+                    candidates.append(((rel_inf, res_inf), name, np.asarray(sol, dtype=np.float64).ravel()))
+
+            _record("pardiso", out)
+            last_exc: Exception | None = None
+            for mode in self._direct_solve_equilibration_modes():
+                try:
+                    cand = self._solve_linear_system_pardiso_equilibrated(A, rhs, mode=mode)
+                    _record(f"pardiso+{mode}", cand)
+                except Exception as exc:
+                    last_exc = exc
+            if candidates:
+                candidates.sort(key=lambda item: item[0])
+                _, best_name, best_sol = candidates[0]
+                best_res_inf, best_rel_inf = self._linear_solution_quality(A, rhs, best_sol)
+                print(
+                    f"        [lin] direct-solve polish selected {best_name}: "
+                    f"|Ax-b|_inf={best_res_inf:.3e}, rel={best_rel_inf:.3e}",
+                    flush=True,
+                )
+                if self._direct_solve_quality_passes(best_res_inf, best_rel_inf):
+                    return best_sol
+                if last_exc is not None:
+                    print(f"        [lin] PARDISO polish fallback failed: {last_exc}", flush=True)
+
+        if self._direct_solve_quality_ok(A, rhs, out, solver_name="pardiso"):
+            return out
+
+        last_exc: Exception | None = None
+        for mode in self._direct_solve_equilibration_modes():
+            try:
+                print(f"        [lin] retrying PARDISO with {mode} equilibration after low-quality raw solve.", flush=True)
+                return self._solve_linear_system_pardiso_equilibrated(A, rhs, mode=mode)
+            except Exception as exc:
+                last_exc = exc
+
+        # Rebuild the factorization once in case the cached solver drifted onto
+        # a poor numerical path for the current matrix values.
+        self._invalidate_pardiso_linear_cache()
+        fresh_solver = PyPardisoSolver()
+        out_retry = np.asarray(fresh_solver.solve(A, rhs), dtype=np.float64).ravel()
+        if np.all(np.isfinite(out_retry)) and self._direct_solve_quality_ok(A, rhs, out_retry, solver_name="pardiso(refactor)"):
+            self._pardiso_linear_cache = {"n": n, "solver": fresh_solver}
+            return out_retry
+
+        if last_exc is not None:
+            print(f"        [lin] PARDISO equilibration fallback failed: {last_exc}", flush=True)
+        print("        [lin] falling back to scipy after low-quality PARDISO solve.", flush=True)
+        return self._solve_linear_system_scipy(A, rhs)
+
+    def set_linear_schur_fieldsplit(
+        self,
+        *,
+        pressure_field: str | tuple[str, ...] | list[str] = "p",
+        schur_fact: str = "full",
+        schur_pre: str = "selfp",
+        outer_ksp: str | None = None,
+        outer_pc: str | None = None,
+        rest_ksp: str | None = None,
+        rest_pc: str | None = None,
+        rest_factor_solver_type: str | None = None,
+        pressure_ksp: str | None = None,
+        pressure_pc: str | None = None,
+        pressure_factor_solver_type: str | None = None,
+    ) -> None:
+        if isinstance(pressure_field, str):
+            fields = tuple(
+                name for name in (part.strip() for part in pressure_field.split(",")) if name
+            )
+        else:
+            fields = tuple(str(name).strip() for name in list(pressure_field or []) if str(name).strip())
+        if not fields:
+            fields = ("p",)
+        self._linear_schur_cfg = {
+            "pressure_field": str(fields[0]),
+            "pressure_fields": fields,
+            "schur_fact": str(schur_fact).lower(),
+            "schur_pre": str(schur_pre).lower(),
+            "outer_ksp": None if outer_ksp is None else str(outer_ksp).lower(),
+            "outer_pc": None if outer_pc is None else str(outer_pc).lower(),
+            "rest_ksp": None if rest_ksp is None else str(rest_ksp).lower(),
+            "rest_pc": None if rest_pc is None else str(rest_pc).lower(),
+            "rest_factor_solver_type": None if rest_factor_solver_type is None else str(rest_factor_solver_type).lower(),
+            "pressure_ksp": None if pressure_ksp is None else str(pressure_ksp).lower(),
+            "pressure_pc": None if pressure_pc is None else str(pressure_pc).lower(),
+            "pressure_factor_solver_type": None if pressure_factor_solver_type is None else str(pressure_factor_solver_type).lower(),
+        }
+        try:
+            self._petsc_linear_cache = None
+        except Exception:
+            pass
+
+    def _petsc_linear_schur_cfg_from_env(self) -> dict | None:
+        flag = str(os.getenv("PYCUTFEM_LINEAR_SCHUR", "") or "").strip().lower()
+        if flag not in {"1", "true", "yes"}:
+            return None
+        raw_fields = str(
+            os.getenv("PYCUTFEM_LINEAR_SCHUR_PRESSURE_FIELDS", os.getenv("PYCUTFEM_LINEAR_SCHUR_PRESSURE_FIELD", "p"))
+            or "p"
+        ).strip()
+        fields = tuple(name for name in (part.strip() for part in raw_fields.split(",")) if name)
+        if not fields:
+            fields = ("p",)
+        return {
+            "pressure_field": str(fields[0]),
+            "pressure_fields": fields,
+            "schur_fact": str(os.getenv("PYCUTFEM_LINEAR_SCHUR_FACT_TYPE", "full") or "full").strip().lower(),
+            "schur_pre": str(os.getenv("PYCUTFEM_LINEAR_SCHUR_PRECONDITION", "selfp") or "selfp").strip().lower(),
+            "outer_ksp": str(os.getenv("PYCUTFEM_LINEAR_KSP_TYPE", "") or "").strip().lower() or None,
+            "outer_pc": "fieldsplit",
+            "rest_ksp": str(os.getenv("PYCUTFEM_LINEAR_SCHUR_REST_KSP_TYPE", "preonly") or "preonly").strip().lower(),
+            "rest_pc": str(os.getenv("PYCUTFEM_LINEAR_SCHUR_REST_PC_TYPE", "ilu") or "ilu").strip().lower(),
+            "rest_factor_solver_type": str(os.getenv("PYCUTFEM_LINEAR_SCHUR_REST_FACTOR_SOLVER_TYPE", "") or "").strip().lower() or None,
+            "pressure_ksp": str(os.getenv("PYCUTFEM_LINEAR_SCHUR_PRESSURE_KSP_TYPE", "preonly") or "preonly").strip().lower(),
+            "pressure_pc": str(os.getenv("PYCUTFEM_LINEAR_SCHUR_PRESSURE_PC_TYPE", "jacobi") or "jacobi").strip().lower(),
+            "pressure_factor_solver_type": str(os.getenv("PYCUTFEM_LINEAR_SCHUR_PRESSURE_FACTOR_SOLVER_TYPE", "") or "").strip().lower() or None,
+        }
+
+    def _reduced_indices_for_field(self, field_name: str) -> np.ndarray:
+        try:
+            full_idx = np.asarray(self.dh.get_field_slice(field_name), dtype=int).ravel()
+        except Exception:
+            return np.empty((0,), dtype=int)
+        if full_idx.size == 0:
+            return np.empty((0,), dtype=int)
+        if getattr(self, "constraints", None) is not None:
+            red_idx_list: list[int] = []
+            for gd in full_idx.tolist():
+                try:
+                    mcol = self.constraints.master_index_for(int(gd))
+                except Exception:
+                    mcol = None
+                if mcol is None:
+                    continue
+                ridx = int(self.full_to_red[int(mcol)]) if 0 <= int(mcol) < int(self.full_to_red.size) else -1
+                if ridx >= 0:
+                    red_idx_list.append(ridx)
+            if not red_idx_list:
+                return np.empty((0,), dtype=int)
+            return np.asarray(sorted(set(red_idx_list)), dtype=int)
+        red_idx = np.asarray(self.full_to_red[full_idx], dtype=int).ravel()
+        red_idx = red_idx[red_idx >= 0]
+        if red_idx.size == 0:
+            return np.empty((0,), dtype=int)
+        return np.unique(red_idx)
+
+    def _petsc_distributed_enabled(self) -> bool:
+        if not HAS_PETSC:
+            return False
+        requested = bool(getattr(getattr(self, "lp", None), "distributed", False))
+        raw = str(os.getenv("PYCUTFEM_PETSC_DISTRIBUTED", "") or "").strip().lower()
+        if raw:
+            requested = raw not in {"0", "false", "no", "off"}
+        if not requested:
+            return False
+        try:
+            return int(PETSc.COMM_WORLD.getSize()) > 1
+        except Exception:
+            return False
+
+    def _petsc_linear_comm(self):
+        return PETSc.COMM_WORLD if self._petsc_distributed_enabled() else PETSc.COMM_SELF
+
+    @staticmethod
+    def _petsc_local_csr_block(
+        A: sp.csr_matrix,
+        *,
+        row_start: int,
+        row_stop: int,
+        petsc_int_type,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        ia_full = np.asarray(A.indptr, dtype=petsc_int_type)
+        base = int(ia_full[int(row_start)])
+        end = int(ia_full[int(row_stop)])
+        ia_local = np.asarray(ia_full[int(row_start) : int(row_stop) + 1] - base, dtype=petsc_int_type)
+        ja_local = np.asarray(A.indices[base:end], dtype=petsc_int_type)
+        a_local = np.asarray(A.data[base:end], dtype=np.float64)
+        return ia_local, ja_local, a_local
+
+    @staticmethod
+    def _petsc_vec_to_numpy_full(x, *, distributed: bool) -> np.ndarray:
+        x_arr = x.getArray(readonly=True)
+        local = np.asarray(x_arr, dtype=np.float64).copy()
+        del x_arr
+        if not distributed:
+            return local
+        mpi_comm = x.getComm().tompi4py()
+        parts = mpi_comm.allgather(local)
+        if not parts:
+            return np.empty((0,), dtype=np.float64)
+        return np.concatenate(parts).astype(np.float64, copy=False)
+
+    def _apply_linear_schur_fieldsplit(self, ksp, n: int) -> bool:
+        from petsc4py import PETSc  # type: ignore
+
+        cfg = getattr(self, "_linear_schur_cfg", None)
+        if cfg is None:
+            cfg = self._petsc_linear_schur_cfg_from_env()
+        if cfg is None:
+            return False
+
+        split_fields = cfg.get("pressure_fields", cfg.get("pressure_field", "p"))
+        if isinstance(split_fields, str):
+            split_names = tuple(name for name in (part.strip() for part in split_fields.split(",")) if name)
+        else:
+            split_names = tuple(str(name).strip() for name in list(split_fields or []) if str(name).strip())
+        if not split_names:
+            split_names = ("p",)
+        p_red = self._reduced_indices_for_fields(split_names)
+        if p_red.size == 0 or p_red.size >= int(n):
+            return False
+        rest_red = np.setdiff1d(np.arange(int(n), dtype=int), p_red, assume_unique=False)
+        if rest_red.size == 0:
+            return False
+
+        pc = ksp.getPC()
+        if cfg.get("outer_ksp"):
+            ksp.setType(str(cfg["outer_ksp"]))
+        pc.setType(str(cfg.get("outer_pc", "fieldsplit") or "fieldsplit"))
+        pc.setFieldSplitType(PETSc.PC.CompositeType.SCHUR)
+
+        try:
+            comm = ksp.getComm()
+        except Exception:
+            comm = PETSc.COMM_SELF
+        rest_is = PETSc.IS().createGeneral(rest_red.astype(PETSc.IntType), comm=comm)
+        p_is = PETSc.IS().createGeneral(p_red.astype(PETSc.IntType), comm=comm)
+        pc.setFieldSplitIS(("rest", rest_is), ("p", p_is))
+
+        opts = PETSc.Options()
+        opts["pc_fieldsplit_schur_fact_type"] = str(cfg.get("schur_fact", "full") or "full")
+        opts["pc_fieldsplit_schur_precondition"] = str(cfg.get("schur_pre", "selfp") or "selfp")
+        if cfg.get("rest_ksp"):
+            opts["fieldsplit_rest_ksp_type"] = str(cfg["rest_ksp"])
+        if cfg.get("rest_pc"):
+            opts["fieldsplit_rest_pc_type"] = str(cfg["rest_pc"])
+        if cfg.get("rest_factor_solver_type"):
+            opts["fieldsplit_rest_pc_factor_mat_solver_type"] = str(cfg["rest_factor_solver_type"])
+        if cfg.get("pressure_ksp"):
+            opts["fieldsplit_p_ksp_type"] = str(cfg["pressure_ksp"])
+        if cfg.get("pressure_pc"):
+            opts["fieldsplit_p_pc_type"] = str(cfg["pressure_pc"])
+        if cfg.get("pressure_factor_solver_type"):
+            opts["fieldsplit_p_pc_factor_mat_solver_type"] = str(cfg["pressure_factor_solver_type"])
+        self._linear_schur_last_info = {
+            "pressure_field": str(split_names[0]),
+            "pressure_fields": tuple(split_names),
+            "p_dofs": int(p_red.size),
+            "rest_dofs": int(rest_red.size),
+        }
+        return True
+
+    def _solve_linear_system_petsc_core(self, A: sp.csr_matrix, rhs: np.ndarray) -> np.ndarray:
+        """
+        Solve A x = rhs using PETSc KSP while reusing the matrix sparsity
+        pattern across Newton iterations.
+
+        In distributed mode, each rank contributes only its owned row block to
+        a COMM_WORLD AIJ matrix and PETSc performs a collective solve. The
+        assembled SciPy matrix is still available on every rank, but the linear
+        algebra itself is truly MPI collective.
+        """
+        from petsc4py import PETSc  # type: ignore
+
+        if not sp.isspmatrix_csr(A):
+            A = A.tocsr()
+
+        n = int(A.shape[0])
+        if int(A.shape[1]) != n:
+            raise ValueError("PETSc linear solve expects a square matrix.")
+
+        distributed = self._petsc_distributed_enabled()
+        comm = self._petsc_linear_comm()
+        try:
+            comm_size = int(comm.getSize())
+        except Exception:
+            comm_size = 1
+        cache = getattr(self, "_petsc_linear_cache", None)
+        if (
+            cache is None
+            or cache.get("n") != n
+            or bool(cache.get("distributed", False)) != bool(distributed)
+            or int(cache.get("comm_size", 1)) != int(comm_size)
+        ):
+            mat = PETSc.Mat().createAIJ(size=(n, n), comm=comm)
+            if distributed:
+                probe = PETSc.Vec().createMPI(n, comm=comm)
+                row_lo, row_hi = probe.getOwnershipRange()
+                try:
+                    probe.destroy()
+                except Exception:
+                    pass
+                try:
+                    local_nnz = np.diff(np.asarray(A.indptr[int(row_lo) : int(row_hi) + 1], dtype=np.int64))
+                    mat.setPreallocationNNZ(np.asarray(local_nnz, dtype=PETSc.IntType))
+                except Exception:
+                    pass
+            else:
+                ia = np.asarray(A.indptr, dtype=PETSc.IntType)
+                ja = np.asarray(A.indices, dtype=PETSc.IntType)
+                try:
+                    mat.setPreallocationCSR((ia, ja))
+                except Exception:
+                    pass
+            try:
+                # When the interface moves or the active set changes, the CSR
+                # pattern can legitimately change; do not hard-fail on new nonzeros.
+                mat.setOption(PETSc.Mat.Option.NEW_NONZERO_ALLOCATION_ERR, False)
+            except Exception:
+                pass
+            mat.setUp()
+            row_lo, row_hi = mat.getOwnershipRange()
+
+            ksp = PETSc.KSP().create(comm=comm)
+            ksp.setOperators(mat)
+            # Robust defaults: exact Newton step.
+            ksp.setType("preonly")
+            pc = ksp.getPC()
+            pc.setType("lu")
+            # Prefer MUMPS when available; otherwise let PETSc pick.
+            try:
+                pc.setFactorSolverType("mumps")
+            except Exception:
+                pass
+            # Optional env overrides for the internal PETSc linear solve used by
+            # the custom Newton/PDAS path. This keeps the benchmark CLI stable
+            # while allowing direct LU vs Krylov experiments.
+            try:
+                ksp_type = str(os.getenv("PYCUTFEM_LINEAR_KSP_TYPE", "") or "").strip()
+                if ksp_type:
+                    ksp.setType(ksp_type)
+            except Exception:
+                pass
+            try:
+                pc_type = str(os.getenv("PYCUTFEM_LINEAR_PC_TYPE", "") or "").strip()
+                if pc_type:
+                    pc.setType(pc_type)
+            except Exception:
+                pass
+            try:
+                factor_type = str(os.getenv("PYCUTFEM_LINEAR_PC_FACTOR_SOLVER_TYPE", "") or "").strip()
+                if factor_type:
+                    pc.setFactorSolverType(factor_type)
+            except Exception:
+                pass
+            schur_applied = False
+            try:
+                schur_applied = bool(self._apply_linear_schur_fieldsplit(ksp, n))
+            except Exception:
+                schur_applied = False
+            try:
+                rtol_raw = str(os.getenv("PYCUTFEM_LINEAR_KSP_RTOL", "") or "").strip()
+                atol_raw = str(os.getenv("PYCUTFEM_LINEAR_KSP_ATOL", "") or "").strip()
+                dtol_raw = str(os.getenv("PYCUTFEM_LINEAR_KSP_DTOL", "") or "").strip()
+                maxit_raw = str(os.getenv("PYCUTFEM_LINEAR_KSP_MAX_IT", "") or "").strip()
+                rtol = float(rtol_raw) if rtol_raw else None
+                atol = float(atol_raw) if atol_raw else None
+                dtol = float(dtol_raw) if dtol_raw else None
+                max_it = int(maxit_raw) if maxit_raw else None
+                if any(v is not None for v in (rtol, atol, dtol, max_it)):
+                    ksp.setTolerances(
+                        rtol=PETSc.DECIDE if rtol is None else rtol,
+                        atol=PETSc.DECIDE if atol is None else atol,
+                        divtol=PETSc.DECIDE if dtol is None else dtol,
+                        max_it=PETSc.DECIDE if max_it is None else max_it,
+                    )
+            except Exception:
+                pass
+            # Allow users to override via PETSc options (e.g. -pc_factor_mat_solver_type superlu_dist).
+            ksp.setFromOptions()
+            if os.getenv("PYCUTFEM_LINEAR_KSP_TRACE", "").lower() in {"1", "true", "yes"} and schur_applied:
+                try:
+                    info = dict(getattr(self, "_linear_schur_last_info", {}) or {})
+                    split_fields = tuple(info.get("pressure_fields", tuple()) or tuple())
+                    split_label = ",".join(str(name) for name in split_fields) if split_fields else str(info.get("pressure_field", "p"))
+                    print(
+                        "        [ksp-schur] pressure_fields="
+                        + split_label
+                        + f" p_dofs={int(info.get('p_dofs', 0))} rest_dofs={int(info.get('rest_dofs', 0))}"
+                    )
+                except Exception:
+                    pass
+
+            if distributed:
+                b = PETSc.Vec().createMPI(n, comm=comm)
+                x = PETSc.Vec().createMPI(n, comm=comm)
+            else:
+                b = PETSc.Vec().createSeq(n, comm=comm)
+                x = PETSc.Vec().createSeq(n, comm=comm)
+
+            cache = {
+                "n": n,
+                "mat": mat,
+                "ksp": ksp,
+                "b": b,
+                "x": x,
+                "distributed": bool(distributed),
+                "comm_size": int(comm_size),
+                "row_lo": int(row_lo),
+                "row_hi": int(row_hi),
+            }
+            self._petsc_linear_cache = cache
+
+        mat: PETSc.Mat = cache["mat"]
+        ksp: PETSc.KSP = cache["ksp"]
+        b: PETSc.Vec = cache["b"]
+        x: PETSc.Vec = cache["x"]
+        row_lo = int(cache.get("row_lo", 0))
+        row_hi = int(cache.get("row_hi", n))
+
+        # Update numeric values (pattern is the same).
+        mat.zeroEntries()
+        rhs = np.asarray(rhs, dtype=np.float64)
+        if distributed:
+            ia, ja, a = self._petsc_local_csr_block(
+                A,
+                row_start=row_lo,
+                row_stop=row_hi,
+                petsc_int_type=PETSc.IntType,
+            )
+        else:
+            ia = np.asarray(A.indptr, dtype=PETSc.IntType)
+            ja = np.asarray(A.indices, dtype=PETSc.IntType)
+            a = np.asarray(A.data, dtype=np.float64)
+        if (not np.all(np.isfinite(a))) or (not np.all(np.isfinite(rhs))):
+            # Non-finite values can corrupt direct solvers (e.g. MUMPS) and even
+            # leave cached PETSc objects in a bad internal state. Clear the cache
+            # so adaptive dt retries start with a clean KSP/Mat.
+            try:
+                self._petsc_linear_cache = None
+            except Exception:
+                pass
+            raise RuntimeError("PETSc linear solve received non-finite entries in matrix or rhs.")
+        try:
+            mat.setValuesCSR(ia, ja, a)
+        except TypeError:
+            mat.setValuesCSR((ia, ja), a)
+        mat.assemblyBegin()
+        mat.assemblyEnd()
+
+        # Load RHS and solve.
+        #
+        # IMPORTANT: petsc4py's Vec.getArray() returns a NumPy view that can keep
+        # the underlying Vec "locked" for array access while the view exists.
+        # If a PETSc solve throws an exception while such a view is live, the lock
+        # can persist and break subsequent solves (e.g. during adaptive-Δt retries).
+        b_arr = b.getArray()
+        if distributed:
+            b_arr[:] = rhs[row_lo:row_hi]
+        else:
+            b_arr[:] = rhs
+        del b_arr
+
+        x.set(0.0)
+        try:
+            ksp.solve(b, x)
+        except PETSc.Error:
+            # Clear cache so the next attempt rebuilds PETSc objects from scratch.
+            try:
+                self._petsc_linear_cache = None
+            except Exception:
+                pass
+            raise
+
+        try:
+            reason = int(ksp.getConvergedReason())
+        except Exception:
+            reason = 0
+        if os.getenv("PYCUTFEM_LINEAR_KSP_TRACE", "").lower() in {"1", "true", "yes"}:
+            try:
+                its = int(ksp.getIterationNumber())
+            except Exception:
+                its = -1
+            try:
+                rnorm = float(ksp.getResidualNorm())
+            except Exception:
+                rnorm = float("nan")
+            try:
+                rank = int(comm.getRank())
+            except Exception:
+                rank = 0
+            if rank == 0:
+                print(
+                    f"        [ksp] type={ksp.getType()} pc={ksp.getPC().getType()} "
+                    f"reason={reason} its={its} rnorm={rnorm:.3e} distributed={int(bool(distributed))}"
+                )
+        if reason <= 0:
+            try:
+                self._petsc_linear_cache = None
+            except Exception:
+                pass
+            its = None
+            try:
+                its = int(ksp.getIterationNumber())
+            except Exception:
+                pass
+            raise RuntimeError(
+                f"PETSc KSP failed to converge (reason={reason}"
+                + (f", its={its}" if its is not None else "")
+                + ")."
+            )
+
+        out = self._petsc_vec_to_numpy_full(x, distributed=distributed)
+        if not np.all(np.isfinite(out)):
+            try:
+                self._petsc_linear_cache = None
+            except Exception:
+                pass
+            raise RuntimeError("PETSc linear solve returned non-finite solution values.")
+        return out
+
+    def _solve_linear_system_petsc(self, A: sp.csr_matrix, rhs: np.ndarray) -> np.ndarray:
+        out = self._solve_linear_system_petsc_core(A, rhs)
+        if self._direct_solve_quality_ok(A, rhs, out, solver_name="petsc"):
+            return out
+        last_exc: Exception | None = None
+        for mode in self._direct_solve_equilibration_modes():
+            try:
+                print(f"        [lin] retrying PETSc with {mode} equilibration after low-quality raw solve.", flush=True)
+                row_scale, col_scale = self._direct_solve_equilibration(A, mode)
+                A_scaled = self._canonicalize_direct_solve_matrix(
+                    sp.diags(row_scale, format="csr") @ A @ sp.diags(col_scale, format="csr")
+                )
+                rhs_scaled = np.asarray(row_scale * rhs, dtype=np.float64)
+                out_scaled = self._solve_linear_system_petsc_core(A_scaled, rhs_scaled)
+                sol = col_scale * out_scaled
+                if self._direct_solve_quality_ok(A, rhs, sol, solver_name=f"petsc+{mode}"):
+                    return sol
+                last_exc = RuntimeError(f"petsc+{mode} returned a low-quality solution.")
+            except Exception as exc:
+                last_exc = exc
+        if last_exc is not None:
+            raise RuntimeError(str(last_exc))
+        raise RuntimeError("PETSc linear solve returned a low-quality solution.")
+
+    def _amgcl_system_master_ids(self) -> np.ndarray:
+        cache = getattr(self, "_amgcl_system_master_ids_cache", None)
+        if isinstance(cache, np.ndarray) and cache.ndim == 1:
+            return cache
+        n_master = int(self.full_to_red.size)
+        active_fields = tuple(
+            str(name).strip()
+            for name in tuple(getattr(self, "_active_field_names", tuple()) or tuple())
+            if str(name).strip()
+        )
+        if active_fields:
+            ids_acc: list[int] = []
+            for field in active_fields:
+                try:
+                    phys_ids = np.asarray(self.dh.get_field_slice(field), dtype=int).ravel()
+                except Exception:
+                    continue
+                if getattr(self, "constraints", None) is None:
+                    valid = phys_ids[(phys_ids >= 0) & (phys_ids < n_master)]
+                    ids_acc.extend(int(idx) for idx in valid.tolist())
+                else:
+                    ids_acc.extend(int(idx) for idx in self.constraints.to_master_set(phys_ids.tolist()))
+            ids = np.asarray(sorted(set(ids_acc)), dtype=int)
+        else:
+            ids = np.arange(n_master, dtype=int)
+        ids = ids[(ids >= 0) & (ids < n_master)]
+        self._amgcl_system_master_ids_cache = ids
+        return ids
+
+    def _amgcl_master_phys_ids(self) -> np.ndarray:
+        cache = getattr(self, "_amgcl_master_phys_ids_cache", None)
+        if isinstance(cache, np.ndarray) and cache.ndim == 1:
+            return cache
+        system_master_ids = self._amgcl_system_master_ids()
+        if getattr(self, "constraints", None) is None:
+            phys_ids = np.asarray(system_master_ids, dtype=int).copy()
+        else:
+            master_phys = np.asarray(self.constraints.master_ids, dtype=int).ravel()
+            if system_master_ids.size == 0 or int(np.max(system_master_ids)) >= int(master_phys.size):
+                phys_ids = np.asarray([], dtype=int)
+            else:
+                phys_ids = np.asarray(master_phys[system_master_ids], dtype=int)
+        self._amgcl_master_phys_ids_cache = phys_ids
+        return phys_ids
+
+    def _amgcl_master_field_names(self) -> np.ndarray:
+        cache = getattr(self, "_amgcl_master_field_names_cache", None)
+        if isinstance(cache, np.ndarray) and cache.ndim == 1:
+            return cache
+        total_dofs = int(self.dh.total_dofs)
+        phys_names = np.empty((total_dofs,), dtype=object)
+        phys_names[:] = ""
+        for fld in getattr(self.dh, "field_names", []):
+            try:
+                ids = np.asarray(self.dh.get_field_slice(str(fld)), dtype=int).ravel()
+            except Exception:
+                continue
+            if ids.size:
+                phys_names[ids] = str(fld)
+        names = np.asarray(phys_names[self._amgcl_master_phys_ids()], dtype=object)
+        self._amgcl_master_field_names_cache = names
+        return names
+
+    def _amgcl_order_block_fields(self, fields: tuple[str, ...]) -> tuple[str, ...]:
+        raw = str(os.getenv("PYCUTFEM_LINEAR_AMGCL_FIELD_ORDER", "") or "").strip()
+        if raw:
+            requested = tuple(str(part).strip() for part in raw.split(",") if str(part).strip())
+            ordered = tuple(name for name in requested if name in fields)
+            ordered += tuple(name for name in fields if name not in ordered)
+            if len(ordered) == len(fields):
+                return ordered
+        field_set = set(fields)
+        if field_set == {"ux", "uy", "p"}:
+            # Kratos' monolithic fluid systems are numbered per node as
+            # PRESSURE, VELOCITY_X, VELOCITY_Y. AMGCL's block preconditioner
+            # is graph/order sensitive, so keep the same local block layout
+            # when matching Kratos DVMS results.
+            return ("p", "ux", "uy")
+        return fields
+
+    def _amgcl_active_system_indices(self, system_master_ids: np.ndarray | None = None) -> np.ndarray | None:
+        system_ids = (
+            np.asarray(system_master_ids, dtype=int).ravel()
+            if system_master_ids is not None
+            else self._amgcl_system_master_ids()
+        )
+        n_master = int(self.full_to_red.size)
+        master_to_system = -np.ones((n_master,), dtype=int)
+        if system_ids.size:
+            master_to_system[system_ids] = np.arange(int(system_ids.size), dtype=int)
+        active = np.asarray(getattr(self, "active_dofs", np.asarray([], dtype=int)), dtype=int).ravel()
+        if active.size == 0 or np.any(active < 0) or np.any(active >= n_master):
+            return None
+        active_system = master_to_system[active]
+        if np.any(active_system < 0):
+            return None
+        return np.asarray(active_system, dtype=int)
+
+    def _amgcl_node_block_layout(self) -> dict[str, object] | None:
+        cache = getattr(self, "_amgcl_node_block_layout_cache", None)
+        if isinstance(cache, dict):
+            return cache
+        system_master_ids = self._amgcl_system_master_ids()
+        active_system = self._amgcl_active_system_indices(system_master_ids)
+        if active_system is None:
+            self._amgcl_node_block_layout_cache = None
+            return None
+        master_phys_ids = self._amgcl_master_phys_ids()
+        if master_phys_ids.size == 0:
+            self._amgcl_node_block_layout_cache = None
+            return None
+        coords_all = np.asarray(self.dh.get_all_dof_coords(), dtype=float)
+        if coords_all.ndim != 2 or coords_all.shape[0] < int(np.max(master_phys_ids)) + 1:
+            self._amgcl_node_block_layout_cache = None
+            return None
+        coords = np.asarray(coords_all[master_phys_ids], dtype=float)
+        field_names = np.asarray(self._amgcl_master_field_names(), dtype=object)
+        fields: list[str] = []
+        seen_fields: set[str] = set()
+        for name in field_names.tolist():
+            fld = str(name)
+            if not fld or fld in seen_fields:
+                continue
+            seen_fields.add(fld)
+            fields.append(fld)
+        fields = list(self._amgcl_order_block_fields(tuple(fields)))
+        if len(fields) <= 1:
+            self._amgcl_node_block_layout_cache = None
+            return None
+        groups: dict[tuple[float, float], dict[str, int]] = {}
+        group_order: list[tuple[float, float]] = []
+        group_sort_ids: dict[tuple[float, float], int] = {}
+        old_node_ids = None
+        try:
+            mesh = self.dh.mixed_element.mesh
+            old_node_ids_raw = getattr(mesh, "_mdpa_new_to_old_node", None)
+            if old_node_ids_raw is not None:
+                old_node_ids_arr = np.asarray(old_node_ids_raw, dtype=int).reshape(-1)
+                if old_node_ids_arr.size == len(getattr(mesh, "nodes_list", ())):
+                    old_node_ids = old_node_ids_arr
+        except Exception:
+            old_node_ids = None
+
+        dof_to_node = getattr(self.dh, "_dof_to_node_map", {})
+        for master_idx, (phys_id, (x, y), name_obj) in enumerate(
+            zip(master_phys_ids.tolist(), coords.tolist(), field_names.tolist())
+        ):
+            field = str(name_obj)
+            if not field:
+                self._amgcl_node_block_layout_cache = None
+                return None
+            key = (round(float(x), 12), round(float(y), 12))
+            entry = groups.get(key)
+            if entry is None:
+                entry = {}
+                groups[key] = entry
+                group_order.append(key)
+            if field in entry:
+                self._amgcl_node_block_layout_cache = None
+                return None
+            entry[field] = int(master_idx)
+            try:
+                _, node_id = dof_to_node[int(phys_id)]
+                node_id_int = int(node_id)
+                if old_node_ids is not None and 0 <= node_id_int < int(old_node_ids.size):
+                    sort_id = int(old_node_ids[node_id_int])
+                else:
+                    sort_id = node_id_int
+                prev_sort_id = group_sort_ids.get(key)
+                if prev_sort_id is None or sort_id < int(prev_sort_id):
+                    group_sort_ids[key] = int(sort_id)
+            except Exception:
+                pass
+        perm: list[int] = []
+        ordered_group_keys = sorted(
+            group_order,
+            key=lambda key: (
+                int(group_sort_ids.get(key, len(group_order))),
+                group_order.index(key),
+            ),
+        )
+        for key in ordered_group_keys:
+            entry = groups[key]
+            if len(entry) != len(fields):
+                self._amgcl_node_block_layout_cache = None
+                return None
+            if any(field not in entry for field in fields):
+                self._amgcl_node_block_layout_cache = None
+                return None
+            perm.extend(int(entry[field]) for field in fields)
+        perm_arr = np.asarray(perm, dtype=int)
+        if perm_arr.size != master_phys_ids.size:
+            self._amgcl_node_block_layout_cache = None
+            return None
+        inv_perm = np.empty_like(perm_arr)
+        inv_perm[perm_arr] = np.arange(int(perm_arr.size), dtype=int)
+        layout = {
+            "fields": tuple(fields),
+            "block_size": int(len(fields)),
+            "system_master_ids": np.asarray(system_master_ids, dtype=int),
+            "active_system_indices": np.asarray(active_system, dtype=int),
+            "perm": perm_arr,
+            "inv_perm": inv_perm,
+        }
+        self._amgcl_node_block_layout_cache = layout
+        return layout
+
+    def _amgcl_expand_reduced_system(
+        self,
+        A_red: sp.csr_matrix,
+        rhs_red: np.ndarray,
+    ) -> tuple[sp.csr_matrix, np.ndarray, np.ndarray]:
+        n_master = int(self.full_to_red.size)
+        system_master_ids = self._amgcl_system_master_ids()
+        active_system = self._amgcl_active_system_indices(system_master_ids)
+        if active_system is None:
+            raise RuntimeError("AMGCL block layout does not cover all active DOFs.")
+        n_system = int(system_master_ids.size)
+        active = np.asarray(self.active_dofs, dtype=int).ravel()
+        rhs_red = np.asarray(rhs_red, dtype=np.float64).ravel()
+        if int(A_red.shape[0]) != int(active.size) or int(A_red.shape[1]) != int(active.size):
+            raise ValueError(
+                "AMGCL reduced matrix shape does not match the active DOF count: "
+                f"{tuple(A_red.shape)} vs {int(active.size)}."
+            )
+        if (
+            not bool(getattr(self, "use_reduced", False))
+            and active.size == n_system
+            and np.array_equal(active_system, np.arange(n_system, dtype=int))
+        ):
+            return (
+                A_red.tocsr() if not sp.isspmatrix_csr(A_red) else A_red,
+                rhs_red,
+                active_system,
+            )
+        A_red = A_red.tocoo() if not sp.isspmatrix_coo(A_red) else A_red
+        row = np.asarray(active[A_red.row], dtype=int)
+        col = np.asarray(active[A_red.col], dtype=int)
+        master_to_system = -np.ones((n_master,), dtype=int)
+        if system_master_ids.size:
+            master_to_system[system_master_ids] = np.arange(n_system, dtype=int)
+        row = np.asarray(master_to_system[row], dtype=int)
+        col = np.asarray(master_to_system[col], dtype=int)
+        valid = (row >= 0) & (col >= 0)
+        if not np.all(valid):
+            raise RuntimeError("AMGCL reduced matrix contains active DOFs outside the block system.")
+        row = row[valid]
+        col = col[valid]
+        data = np.asarray(A_red.data, dtype=np.float64)
+        data = data[valid]
+        red_for_system = np.asarray(self.full_to_red, dtype=int)[system_master_ids]
+        fixed = np.flatnonzero(red_for_system < 0)
+        pattern = getattr(self, "_last_amgcl_kratos_dirichlet_pattern", None)
+        if (
+            pattern is not None
+            and sp.isspmatrix(pattern)
+            and tuple(pattern.shape) == (n_system, n_system)
+            and str(os.getenv("PYCUTFEM_LINEAR_AMGCL_KRATOS_DIRICHLET_PATTERN", "1") or "1").strip().lower()
+            not in {"0", "false", "no", "off"}
+        ):
+            pattern = pattern.tocoo()
+            row_parts = [np.asarray(pattern.row, dtype=int), row]
+            col_parts = [np.asarray(pattern.col, dtype=int), col]
+            data_parts = [
+                np.zeros((int(pattern.nnz),), dtype=np.float64),
+                np.asarray(data, dtype=np.float64),
+            ]
+            if fixed.size:
+                fixed_diag = np.ones((int(fixed.size),), dtype=np.float64)
+                diag_source = getattr(self, "_last_amgcl_kratos_dirichlet_diag", None)
+                if isinstance(diag_source, np.ndarray) and diag_source.ndim == 1 and int(diag_source.size) == n_master:
+                    diag = np.asarray(diag_source, dtype=np.float64)
+                    finite = np.isfinite(diag)
+                    if np.any(finite):
+                        scale = float(np.max(np.abs(diag[finite])))
+                        if not np.isfinite(scale) or scale <= 0.0:
+                            scale = 1.0
+                    else:
+                        scale = 1.0
+                    fixed_diag = np.asarray(diag[system_master_ids[fixed]], dtype=np.float64)
+                    bad = (~np.isfinite(fixed_diag)) | (np.abs(fixed_diag) <= np.finfo(np.float64).eps)
+                    if np.any(bad):
+                        fixed_diag[bad] = scale
+                row_parts.append(fixed)
+                col_parts.append(fixed)
+                data_parts.append(fixed_diag)
+            A_full = sp.coo_matrix(
+                (
+                    np.concatenate(data_parts),
+                    (np.concatenate(row_parts), np.concatenate(col_parts)),
+                ),
+                shape=(n_system, n_system),
+            ).tocsr()
+            A_full.sum_duplicates()
+            rhs_full = np.zeros((n_system,), dtype=np.float64)
+            rhs_full[active_system] = rhs_red
+            return A_full, rhs_full, active_system
+        if fixed.size:
+            fixed_diag = np.ones((int(fixed.size),), dtype=np.float64)
+            diag_source = getattr(self, "_last_amgcl_kratos_dirichlet_diag", None)
+            if isinstance(diag_source, np.ndarray) and diag_source.ndim == 1 and int(diag_source.size) == n_master:
+                diag = np.asarray(diag_source, dtype=np.float64)
+                finite = np.isfinite(diag)
+                if np.any(finite):
+                    scale = float(np.max(np.abs(diag[finite])))
+                    if not np.isfinite(scale) or scale <= 0.0:
+                        scale = 1.0
+                else:
+                    scale = 1.0
+                fixed_diag = np.asarray(diag[system_master_ids[fixed]], dtype=np.float64)
+                bad = (~np.isfinite(fixed_diag)) | (np.abs(fixed_diag) <= np.finfo(np.float64).eps)
+                if np.any(bad):
+                    fixed_diag[bad] = scale
+            row = np.concatenate([row, fixed])
+            col = np.concatenate([col, fixed])
+            data = np.concatenate([data, fixed_diag])
+        A_full = sp.csr_matrix((data, (row, col)), shape=(n_system, n_system))
+        rhs_full = np.zeros((n_system,), dtype=np.float64)
+        rhs_full[active_system] = rhs_red
+        return A_full, rhs_full, active_system
+
+    def _solve_linear_system_amgcl(self, A: sp.csr_matrix, rhs: np.ndarray) -> np.ndarray:
+        A = A.tocsr() if not sp.isspmatrix_csr(A) else A
+        rhs = np.asarray(rhs, dtype=np.float64).ravel()
+        def _env_str(name: str, default: str) -> str:
+            raw = os.getenv(name, "")
+            if raw is None:
+                return str(default)
+            text = str(raw).strip()
+            return text if text else str(default)
+
+        def _env_float(name: str, default: float) -> float:
+            text = _env_str(name, str(default))
+            try:
+                return float(text)
+            except Exception:
+                return float(default)
+
+        def _env_int(name: str, default: int) -> int:
+            text = _env_str(name, str(default))
+            try:
+                return int(float(text))
+            except Exception:
+                return int(default)
+
+        def _env_bool(name: str, default: bool) -> bool:
+            raw = os.getenv(name, "")
+            if raw is None:
+                return bool(default)
+            text = str(raw).strip().lower()
+            if not text:
+                return bool(default)
+            return text in {"1", "true", "yes", "y", "on"}
+
+        block_size_raw = str(os.getenv("PYCUTFEM_LINEAR_AMGCL_BLOCK_SIZE", "auto") or "auto").strip().lower()
+        block_layout = self._amgcl_node_block_layout()
+        use_block_layout = False
+        block_size = 1
+        if block_layout is not None:
+            if block_size_raw == "auto":
+                use_block_layout = True
+                block_size = int(block_layout["block_size"])
+            else:
+                requested_block_size = max(1, int(float(block_size_raw)))
+                if requested_block_size == int(block_layout["block_size"]):
+                    use_block_layout = requested_block_size > 1
+                    block_size = requested_block_size
+        use_block_matrices = bool(use_block_layout) and block_size > 1
+        tol = _env_float("PYCUTFEM_LINEAR_AMGCL_RTOL", _env_float("PYCUTFEM_LINEAR_AMGCL_TOL", 1.0e-6))
+        max_iteration = _env_int("PYCUTFEM_LINEAR_AMGCL_MAX_IT", 100)
+        coarse_enough = _env_int("PYCUTFEM_LINEAR_AMGCL_COARSE_ENOUGH", 1000)
+        gmres_dim = _env_int("PYCUTFEM_LINEAR_AMGCL_GMRES_DIM", 100)
+        max_levels = _env_int("PYCUTFEM_LINEAR_AMGCL_MAX_LEVELS", -1)
+        pre_sweeps = _env_int("PYCUTFEM_LINEAR_AMGCL_PRE_SWEEPS", 1)
+        post_sweeps = _env_int("PYCUTFEM_LINEAR_AMGCL_POST_SWEEPS", 1)
+        verbosity = _env_int("PYCUTFEM_LINEAR_AMGCL_VERBOSITY", 1)
+        scaling = _env_bool("PYCUTFEM_LINEAR_AMGCL_SCALING", False)
+        kratos_pattern_enabled = (
+            bool(use_block_layout)
+            and getattr(self, "_last_amgcl_kratos_dirichlet_pattern", None) is not None
+            and _env_bool("PYCUTFEM_LINEAR_AMGCL_KRATOS_DIRICHLET_PATTERN", True)
+        )
+        preserve_explicit_zeros = _env_bool(
+            "PYCUTFEM_LINEAR_AMGCL_PRESERVE_EXPLICIT_ZEROS",
+            bool(kratos_pattern_enabled),
+        )
+        work_A = A
+        work_rhs = rhs
+        active_system = None
+        if bool(use_block_layout):
+            work_A, work_rhs, active_system = self._amgcl_expand_reduced_system(A, rhs)
+            perm = np.asarray(block_layout["perm"], dtype=int)
+            if int(perm.size) != int(work_A.shape[0]):
+                raise RuntimeError(
+                    "AMGCL block permutation size does not match the expanded system: "
+                    f"{int(perm.size)} != {int(work_A.shape[0])}."
+                )
+            work_A = work_A[perm, :][:, perm].tocsr()
+            work_rhs = np.asarray(work_rhs[perm], dtype=np.float64)
+        else:
+            perm = None
+        trace_amgcl = _env_bool("PYCUTFEM_LINEAR_AMGCL_TRACE", False)
+        params = AMGCLSettings(
+            preconditioner_type=_env_str("PYCUTFEM_LINEAR_AMGCL_PRECONDITIONER", "amg"),
+            smoother_type=_env_str("PYCUTFEM_LINEAR_AMGCL_SMOOTHER", "ilu0"),
+            krylov_type=_env_str("PYCUTFEM_LINEAR_AMGCL_KRYLOV", "gmres"),
+            coarsening_type=_env_str("PYCUTFEM_LINEAR_AMGCL_COARSENING", "aggregation"),
+            tolerance=float(tol),
+            max_iteration=int(max_iteration),
+            gmres_krylov_space_dimension=gmres_dim,
+            verbosity=int(verbosity),
+            scaling=scaling,
+            block_size=block_size,
+            use_block_matrices_if_possible=use_block_matrices,
+            coarse_enough=coarse_enough,
+            max_levels=max_levels,
+            pre_sweeps=pre_sweeps,
+            post_sweeps=post_sweeps,
+            preserve_explicit_zeros=preserve_explicit_zeros,
+        )
+        if bool(trace_amgcl):
+            fields = tuple(block_layout.get("fields", tuple())) if isinstance(block_layout, dict) else tuple()
+            print(
+                "        [lin-amgcl] "
+                f"shape={tuple(work_A.shape)} block_size={int(block_size)} "
+                f"use_block_matrices={int(bool(use_block_matrices))} "
+                f"preserve_explicit_zeros={int(bool(preserve_explicit_zeros))} "
+                f"fields={fields}",
+                flush=True,
+            )
+        dump_dir_raw = str(os.getenv("PYCUTFEM_LINEAR_AMGCL_DUMP_DIR", "") or "").strip()
+        if dump_dir_raw:
+            try:
+                dump_dir = Path(dump_dir_raw).expanduser().resolve()
+                dump_dir.mkdir(parents=True, exist_ok=True)
+                step_now = int(getattr(self, "_current_step_no", -1))
+                it_now = int(getattr(self, "_current_newton_it", -1))
+                counter = int(getattr(self, "_amgcl_dump_counter", 0)) + 1
+                self._amgcl_dump_counter = counter
+                stem = f"step{step_now:04d}_it{it_now:02d}_solve{counter:04d}"
+                sp.save_npz(dump_dir / f"{stem}_A.npz", work_A.tocsr())
+                np.savez(
+                    dump_dir / f"{stem}_meta.npz",
+                    rhs=np.asarray(work_rhs, dtype=np.float64),
+                    active_system=np.asarray([] if active_system is None else active_system, dtype=np.int64),
+                    perm=np.asarray([] if perm is None else perm, dtype=np.int64),
+                    block_size=np.asarray(int(block_size), dtype=int),
+                    use_block_matrices=np.asarray(bool(use_block_matrices), dtype=bool),
+                    preserve_explicit_zeros=np.asarray(bool(preserve_explicit_zeros), dtype=bool),
+                )
+                print(f"        [lin-amgcl-dump] saved {dump_dir}/{stem}_*", flush=True)
+            except Exception as exc:
+                print(f"        [lin-amgcl-dump] failed: {exc}", flush=True)
+        sol, report = solve_sparse_amgcl(work_A, work_rhs, params=params)
+        if bool(trace_amgcl):
+            print(
+                "        [lin-amgcl] "
+                f"converged={int(bool(report.converged))} "
+                f"iterations={int(report.iterations)} residual={float(report.residual_norm):.3e}",
+                flush=True,
+            )
+        if not bool(report.converged):
+            raise RuntimeError(
+                "AMGCL linear solve did not converge "
+                f"(iterations={int(report.iterations)}, residual={float(report.residual_norm):.3e}, "
+                f"tol={float(params.tolerance):.3e})."
+            )
+        sol = np.asarray(sol, dtype=np.float64).ravel()
+        if not np.all(np.isfinite(sol)):
+            raise RuntimeError("AMGCL linear solve returned non-finite solution values.")
+        if bool(use_block_layout):
+            inv_perm = np.asarray(block_layout["inv_perm"], dtype=int)
+            sol = np.asarray(sol[inv_perm], dtype=np.float64)
+            if active_system is None:
+                active_system = np.asarray(block_layout["active_system_indices"], dtype=int)
+            return np.asarray(sol[np.asarray(active_system, dtype=int)], dtype=np.float64)
+        return sol
 
 
     def _phi(self, vec):                 # ½‖·‖² helper
@@ -844,10 +8544,47 @@ class NewtonSolver:
         """
         dh = self.dh
         np_ = self.np
-        c1 = 1e-4
+        mode = getattr(np_, "ls_mode", "armijo")
+        c1 = getattr(np_, "ls_c1", 1.0e-4)
+
+        if mode not in {"armijo", "dealii"}:
+            raise ValueError(f"Unknown line-search mode '{mode}'.")
 
         snap = [f.nodal_values.copy() for f in funcs]
         phi0 = 0.5 * np.dot(R0_vec, R0_vec)
+        norm0 = float(np.linalg.norm(R0_vec, ord=np.inf))
+
+        if mode == "dealii":
+            alpha = 1.0
+            best_alpha, best_norm = 0.0, norm0
+            for _ in range(np_.ls_max_iter):
+                for f, buf in zip(funcs, snap):
+                    f.nodal_values[:] = buf
+                dh.add_to_functions(alpha * dU, funcs)
+                dh.apply_bcs(bcs_now, *funcs)
+                _, R_trial = self._assemble_system(coeffs, need_matrix=False)
+                norm_trial = float(np.linalg.norm(R_trial, ord=np.inf))
+                if norm_trial < best_norm:
+                    best_norm, best_alpha = norm_trial, alpha
+                if norm_trial < norm0:
+                    for f, buf in zip(funcs, snap):
+                        f.nodal_values[:] = buf
+                    print(f"        Line search accepted α = {alpha:.2e} (‖R‖∞ decreased)")
+                    return alpha * dU
+                alpha *= np_.ls_reduction
+
+            for f, buf in zip(funcs, snap):
+                f.nodal_values[:] = buf
+            if best_alpha > 0.0:
+                print(f"        Line search failed, using best-effort α = {best_alpha:.2e} (‖R‖∞ decreased).")
+                return best_alpha * dU
+            print("        Line search failed – no decreasing step found; taking α = 0.")
+            ls_fail_hard = bool(getattr(np_, "ls_fail_hard", True))
+            if os.getenv("PYCUTFEM_LS_FAIL_HARD", "").strip():
+                ls_fail_hard = os.getenv("PYCUTFEM_LS_FAIL_HARD", "1").lower() not in {"0", "false", "no"}
+            if ls_fail_hard:
+                raise RuntimeError("Line search failed: no residual decrease.")
+            return np.zeros_like(dU)
 
         # Initialize "best-effort" tracking variables
         best_alpha = 1.0
@@ -901,7 +8638,9 @@ class NewtonSolver:
             print(f"        Armijo failed, using best-effort α = {best_alpha:.2e} instead.")
             return best_alpha * dU
         else:
-            print(f"        Line search failed catastrophically. No descent found.")
+            print("        Line search failed catastrophically. No descent found.")
+            if os.getenv("PYCUTFEM_LS_FAIL_HARD", "1").lower() not in {"0", "false", "no"}:
+                raise RuntimeError("Line search failed: no residual decrease.")
             return np.zeros_like(dU)
     
     def _create_reduced_system(self, K_full, F_full, bcs):
@@ -934,11 +8673,7 @@ class NewtonSolver:
             F_red -= K_red @ np.bincount(reduced_rows, weights=reduced_vals, minlength=len(active_dofs))
 
             # Zero out rows and columns in the reduced matrix
-            K_red_lil = K_red.tolil()
-            K_red_lil[reduced_rows, :] = 0
-            K_red_lil[:, reduced_rows] = 0
-            K_red_lil[reduced_rows, reduced_rows] = 1.0
-            K_red = K_red_lil.tocsr()
+            K_red = _zero_rows_cols(K_red, reduced_rows)
 
             # Set values in the RHS vector
             F_red[reduced_rows] = reduced_vals
@@ -958,6 +8693,16 @@ class NewtonSolver:
         - self._elem_lidx : per-kernel list of [ per-element local active idx ]
         """
 
+        if self.backend == "python":
+            # Python backend assembles in the full space; reduced scatter is unused.
+            n = len(getattr(self, "active_dofs", []))
+            self._csr_indptr = np.zeros(n + 1, dtype=np.int32)
+            self._csr_indices = np.zeros(0, dtype=np.int32)
+            self._elem_pos = []
+            self._elem_lidx = []
+            self._pattern_stale = False
+            return
+
         if getattr(self, "_pattern_stale", True) is False and hasattr(self, "_csr_indptr"):
             return
 
@@ -971,18 +8716,326 @@ class NewtonSolver:
             self._pattern_stale = False
             return
 
-        # 1) Collect column sets per reduced row
-        rows_cols = [set() for _ in range(n)]
+        if getattr(self, "constraints", None) is not None:
+            self._build_reduced_pattern_constraints()
+            return
+
+        _profile = os.getenv("PYCUTFEM_PROFILE_SETUP", "").lower() in {"1", "true", "yes"}
+        _t0 = time.perf_counter() if _profile else 0.0
+
+        # 1) Build reduced sparsity as COO pairs then compress to CSR.
+        #    Use an incidence-matrix approach to avoid O(n_elem * n_loc^2) COO expansion:
+        #      - Build sparse B with B[e, i] = 1 if reduced DOF i is present in entity e
+        #      - Pattern is then (B.T @ B) > 0 (boolean adjacency)
+        #    This keeps startup fast even when each entity contributes a dense local block.
+        _t_pat0 = time.perf_counter() if _profile else 0.0
+        ent_row_blocks: list[np.ndarray] = []
+        ent_col_blocks: list[np.ndarray] = []
+        ent_rows = 0
+        seen_gdofs_maps: set[int] = set()
+        ndof_full = int(getattr(self.full_to_red, "size", 0))
+        if _profile:
+            try:
+                print(f"[setup] kernels_K: {int(len(self.kernels_K))}")
+            except Exception:
+                pass
         for ker in self.kernels_K:
-            gdofs = ker.static_args["gdofs_map"]
-            for e in range(gdofs.shape[0]):
-                rmap = self.full_to_red[gdofs[e]]
-                rows = rmap[rmap >= 0]
-                if rows.size == 0:
+            gdofs = ker.static_args.get("gdofs_map")
+            if not isinstance(gdofs, np.ndarray) or gdofs.ndim != 2:
+                continue
+            gid = int(id(gdofs))
+            if gid in seen_gdofs_maps:
+                continue
+            seen_gdofs_maps.add(gid)
+            full = np.asarray(gdofs, dtype=np.int64)
+            if full.size == 0:
+                continue
+            valid = (full >= 0) & (full < ndof_full)
+            if not np.any(valid):
+                continue
+            red = -np.ones_like(full, dtype=np.int32)
+            red[valid] = self.full_to_red[full[valid]]
+            mask = red >= 0
+            if not np.any(mask):
+                continue
+            cnt = np.asarray(mask.sum(axis=1), dtype=np.int32)
+            nonempty = np.nonzero(cnt)[0]
+            if nonempty.size == 0:
+                continue
+            # Flatten reduced DOF indices in row-major order over the selected entity rows.
+            cols = red[nonempty][mask[nonempty]].astype(np.int32, copy=False)
+            # Row indices aligned with the boolean flattening above.
+            rows = np.repeat(
+                np.arange(ent_rows, ent_rows + int(nonempty.size), dtype=np.int32),
+                cnt[nonempty],
+            ).astype(np.int32, copy=False)
+            ent_row_blocks.append(rows)
+            ent_col_blocks.append(cols)
+            ent_rows += int(nonempty.size)
+
+        if ent_row_blocks:
+            row_all = np.concatenate(ent_row_blocks)
+            col_all = np.concatenate(ent_col_blocks)
+            B = sp.coo_matrix(
+                (np.ones(row_all.shape[0], dtype=np.int8), (row_all, col_all)),
+                shape=(int(ent_rows), int(n)),
+            ).tocsr()
+            pat = (B.T @ B).tocsr()
+            # pattern only – drop counts
+            try:
+                pat.data[:] = 1
+            except Exception:
+                pat.data = np.ones_like(pat.data, dtype=np.int8)
+            pat.sort_indices()
+            indptr = np.asarray(pat.indptr, dtype=np.int32)
+            indices = np.asarray(pat.indices, dtype=np.int32)
+        else:
+            indptr = np.zeros(n + 1, dtype=np.int32)
+            indices = np.zeros(0, dtype=np.int32)
+        self._csr_indptr, self._csr_indices = indptr, indices
+        if _profile:
+            print(f"[setup] pattern csr: {time.perf_counter() - _t_pat0:.3f}s  nnz={int(indices.size)} n={int(n)}")
+
+        # PETSc matrix cache: sparsity can change when the interface moves and/or the
+        # active DOF set is recomputed. The cached PETSc.Mat preallocation must be
+        # rebuilt when the CSR pattern changes, otherwise PETSc can raise
+        # "new nonzero" insertion errors.
+        try:
+            if str(getattr(self.lp, "backend", "scipy") or "scipy").lower() in {"petsc", "pardiso", "pypardiso"}:
+                if hasattr(self, "_petsc_linear_cache"):
+                    delattr(self, "_petsc_linear_cache")
+                self._invalidate_pardiso_linear_cache()
+        except Exception:
+            pass
+
+        # CSR positions as a sparse matrix (data = position index).
+        #
+        # NOTE: SciPy CSR fancy indexing can dominate startup for medium-sized
+        # problems (it allocates many temporary submatrices). Default to a
+        # row-wise `searchsorted` path which is usually faster end-to-end for
+        # CutFEM-style kernels. The old sparse-indexing path can be re-enabled
+        # via `PYCUTFEM_PATTERN_POS_CSR=1` for comparison/regressions.
+        pos_csr = None
+        use_pos_csr = os.getenv("PYCUTFEM_PATTERN_POS_CSR", "").lower() in {"1", "true", "yes"}
+        if use_pos_csr:
+            try:
+                if indices.size:
+                    pos_data = np.arange(int(indices.size), dtype=np.int32)
+                    pos_csr = sp.csr_matrix((pos_data, indices, indptr), shape=(int(n), int(n)))
+            except Exception:
+                pos_csr = None
+
+        # 3) Ragged per-element scatter plans (store 1-D position arrays + local idx).
+        #    Compute CSR data positions with row-wise searchsorted to avoid a large
+        #    Python dict of (row,col) -> idx.
+        _t_pl0 = time.perf_counter() if _profile else 0.0
+        self._elem_pos = []   # per-kernel: list of 1-D arrays (len = n_act^2)
+        self._elem_lidx = []  # per-kernel: list of local indices kept (len = n_act)
+        plan_cache: dict[int, tuple[object, object]] = {}
+        cache_hits = 0
+        for ker in self.kernels_K:
+            gdofs = ker.static_args.get("gdofs_map")
+            if isinstance(gdofs, np.ndarray) and gdofs.ndim == 2:
+                cached = plan_cache.get(int(id(gdofs)))
+                if cached is not None:
+                    self._elem_pos.append(cached[0])
+                    self._elem_lidx.append(cached[1])
+                    cache_hits += 1
                     continue
-                cols_set = set(rows.tolist())
-                for r in rows:
-                    rows_cols[r].update(cols_set)
+            if not isinstance(gdofs, np.ndarray) or gdofs.ndim != 2:
+                self._elem_pos.append([])
+                self._elem_lidx.append([])
+                continue
+
+            full = np.asarray(gdofs, dtype=np.int64)
+            n_ent, n_loc = int(full.shape[0]), int(full.shape[1])
+            if n_ent == 0:
+                pos_flat = np.empty((0, int(n_loc * n_loc)), dtype=np.int32)
+                plan_cache[int(id(gdofs))] = (pos_flat, None)
+                self._elem_pos.append(pos_flat)
+                self._elem_lidx.append(None)
+                continue
+
+            # Map full -> reduced once for the entire entity batch.
+            red = -np.ones_like(full, dtype=np.int32)
+            valid = (full >= 0) & (full < ndof_full)
+            if np.any(valid):
+                red[valid] = self.full_to_red[full[valid]]
+
+            # Dense per-entity position plan:
+            # - shape (n_ent, n_loc*n_loc)
+            # - local ordering matches `Kloc[e].ravel()` for the kernel.
+            # - inactive row/col pairs are marked with -1 and skipped at scatter time.
+            if _HAVE_NUMBA_REDUCED_PATTERN:
+                _wait_numba_reduced_pattern_precompile()
+                pos_flat = _build_pos_flat_numba(red, indptr, indices)
+            else:
+                pos_flat = -np.ones((n_ent, int(n_loc * n_loc)), dtype=np.int32)
+                for e in range(n_ent):
+                    row_red = red[e]
+                    col_mask = row_red >= 0
+                    if not np.any(col_mask):
+                        continue
+                    cols_act = row_red[col_mask].astype(np.int32, copy=False)
+                    all_cols_active = bool(np.all(col_mask))
+                    for i in range(n_loc):
+                        ra = int(row_red[i])
+                        if ra < 0:
+                            continue
+                        s = int(indptr[ra])
+                        epos = int(indptr[ra + 1])
+                        row_cols = indices[s:epos]
+                        row_pos = s + np.searchsorted(row_cols, cols_act)
+                        seg = pos_flat[e, int(i * n_loc) : int((i + 1) * n_loc)]
+                        if all_cols_active:
+                            seg[:] = row_pos
+                        else:
+                            seg[col_mask] = row_pos
+
+            plan_cache[int(id(gdofs))] = (pos_flat, None)
+            self._elem_pos.append(pos_flat)
+            self._elem_lidx.append(None)
+
+        # No constraint metadata in this mode.
+        self._elem_extra = None
+
+        # Precompute residual scatter maps (full gdof -> reduced row index) for
+        # each residual kernel. This avoids per-element Python loops and repeated
+        # allocation in _assemble_system_reduced_fast().
+        try:
+            res_maps: list[np.ndarray | None] = []
+            res_cache: dict[int, np.ndarray] = {}
+            ndof_full = int(getattr(self.full_to_red, "size", 0))
+            for kerF in list(getattr(self, "kernels_F", []) or []):
+                gdofs = kerF.static_args.get("gdofs_map")
+                if not isinstance(gdofs, np.ndarray) or gdofs.ndim != 2:
+                    res_maps.append(None)
+                    continue
+                gid = int(id(gdofs))
+                cached = res_cache.get(gid)
+                if cached is None:
+                    full = np.asarray(gdofs, dtype=np.int64)
+                    red_map = -np.ones_like(full, dtype=np.int32)
+                    valid = (full >= 0) & (full < ndof_full)
+                    if np.any(valid):
+                        red_map[valid] = self.full_to_red[full[valid]]
+                    res_cache[gid] = red_map
+                    cached = red_map
+                res_maps.append(cached)
+            self._res_red_maps = res_maps
+        except Exception:
+            self._res_red_maps = None
+
+        self._pattern_stale = False
+        self._runtime_reduced_scatter_plan_cache = {}
+        if _profile:
+            try:
+                print(f"[setup] unique gdofs_maps: {int(len(seen_gdofs_maps))}  plan cache hits: {int(cache_hits)}")
+            except Exception:
+                pass
+            print(f"[setup] scatter plans: {time.perf_counter() - _t_pl0:.3f}s")
+            print(f"[setup] build_reduced_pattern total: {time.perf_counter() - _t0:.3f}s")
+
+
+    def _build_reduced_pattern_constraints(self) -> None:
+        """
+        Build reduced CSR pattern + per-entity scatter plans when hanging-node
+        constraints are present.
+
+        We assemble directly in the master space (u_full = E @ u_master) by
+        distributing slave DOF contributions to their master DOFs using the
+        constraint weights, avoiding the expensive full-space assembly and the
+        subsequent Eᵀ A E condensation.
+        """
+
+        constraints = getattr(self, "constraints", None)
+        if constraints is None:
+            raise RuntimeError("_build_reduced_pattern_constraints called without constraints.")
+
+        n = int(len(self.active_dofs))
+        if n <= 0:
+            self._csr_indptr = np.zeros(1, dtype=np.int32)
+            self._csr_indices = np.zeros(0, dtype=np.int32)
+            self._elem_pos = [[] for _ in self.kernels_K]
+            self._elem_lidx = [[] for _ in self.kernels_K]
+            self._elem_extra = [[] for _ in self.kernels_K]
+            self._pattern_stale = False
+            return
+
+        # Lookup tables:
+        # - full gdof -> master column index (or -1 if slave/unmapped)
+        # - slave full gdof -> (master_cols[], weights[])
+        ndof_full = int(getattr(self.dh, "total_dofs", 0))
+        full_to_master = np.full(ndof_full, -1, dtype=np.int32)
+        master_ids = np.asarray(getattr(constraints, "master_ids", np.array([], dtype=int)), dtype=int)
+        for col, gd in enumerate(master_ids.tolist()):
+            gd_i = int(gd)
+            if 0 <= gd_i < ndof_full:
+                full_to_master[gd_i] = int(col)
+
+        slave_to_master_cols: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+        is_slave = np.zeros(ndof_full, dtype=bool)
+        for sdof, combo in getattr(constraints, "slave_to_master", {}).items():
+            sdof_i = int(sdof)
+            if sdof_i < 0 or sdof_i >= ndof_full:
+                continue
+            is_slave[sdof_i] = True
+            mcols: list[int] = []
+            wts: list[float] = []
+            for mdof, w in combo:
+                mdof_i = int(mdof)
+                if mdof_i < 0 or mdof_i >= ndof_full:
+                    continue
+                mcol = int(full_to_master[mdof_i])
+                if mcol < 0:
+                    continue
+                mcols.append(mcol)
+                wts.append(float(w))
+            if mcols:
+                slave_to_master_cols[sdof_i] = (np.asarray(mcols, dtype=np.int32), np.asarray(wts, dtype=float))
+
+        # Save for residual-only assembly path.
+        self._constr_full_to_master = full_to_master
+        self._constr_is_slave = is_slave
+        self._constr_slave_map = slave_to_master_cols
+
+        full_to_red_master = np.asarray(self.full_to_red, dtype=int)
+
+        def _add_red(red_set: set[int], gd: int) -> None:
+            if gd < 0 or gd >= ndof_full:
+                return
+            if bool(is_slave[gd]):
+                combo = slave_to_master_cols.get(int(gd))
+                if combo is None:
+                    return
+                mcols, _w = combo
+                for mcol in mcols.tolist():
+                    red = int(full_to_red_master[int(mcol)])
+                    if red >= 0:
+                        red_set.add(red)
+                return
+            mcol = int(full_to_master[int(gd)])
+            if mcol < 0:
+                return
+            red = int(full_to_red_master[mcol])
+            if red >= 0:
+                red_set.add(red)
+
+        # 1) Collect column sets per reduced row
+        rows_cols: list[set[int]] = [set() for _ in range(n)]
+        for ker in self.kernels_K:
+            gdofs = ker.static_args.get("gdofs_map")
+            if not isinstance(gdofs, np.ndarray) or gdofs.ndim != 2 or gdofs.shape[0] == 0:
+                continue
+            for e in range(int(gdofs.shape[0])):
+                full = np.asarray(gdofs[e], dtype=int)
+                red_set: set[int] = set()
+                for gd in full.tolist():
+                    _add_red(red_set, int(gd))
+                if not red_set:
+                    continue
+                for r in red_set:
+                    rows_cols[r].update(red_set)
 
         # 2) Build CSR (row-wise sorted for determinism)
         indptr = np.zeros(n + 1, dtype=np.int32)
@@ -991,48 +9044,145 @@ class NewtonSolver:
         indices = np.empty(indptr[-1], dtype=np.int32)
         for i in range(n):
             cols = sorted(rows_cols[i])
-            indices[indptr[i] : indptr[i + 1]] = cols
+            indices[indptr[i] : indptr[i + 1]] = np.asarray(cols, dtype=np.int32)
         self._csr_indptr, self._csr_indices = indptr, indices
 
-        # 3) Map (row, col) → absolute position in CSR "data"
-        pos = {}
-        for i in range(n):
-            s, t = indptr[i], indptr[i + 1]
-            for k, c in enumerate(indices[s:t]):
-                pos[(i, c)] = s + k
+        # Pattern changed → drop PETSc cache
+        try:
+            if str(getattr(self.lp, "backend", "scipy") or "scipy").lower() in {"petsc", "pardiso", "pypardiso"}:
+                if hasattr(self, "_petsc_linear_cache"):
+                    delattr(self, "_petsc_linear_cache")
+                self._invalidate_pardiso_linear_cache()
+        except Exception:
+            pass
 
-        # 4) Ragged per-element scatter plans (store 1-D position arrays + local idx)
-        self._elem_pos = []   # per-kernel: list of 1-D arrays (len = n_act^2)
-        self._elem_lidx = []  # per-kernel: list of local indices kept (len = n_act)
+        # 3) Per-kernel scatter plans
+        self._elem_pos = []
+        self._elem_lidx = []
+        self._elem_extra = []
+
+        def _pflat(rows: np.ndarray) -> np.ndarray:
+            rows = np.asarray(rows, dtype=np.int32)
+            m = int(rows.size)
+            if m <= 0:
+                return np.empty(0, dtype=np.int32)
+            out = np.empty(m * m, dtype=np.int32)
+            for ai, r in enumerate(rows.tolist()):
+                r_i = int(r)
+                s = int(indptr[r_i])
+                t = int(indptr[r_i + 1])
+                cols = indices[s:t]
+                jj = np.searchsorted(cols, rows)
+                out[ai * m : (ai + 1) * m] = s + jj.astype(np.int32, copy=False)
+            return out
+
         for ker in self.kernels_K:
-            gdofs = ker.static_args["gdofs_map"]
-            pos_list = []
-            lidx_list = []
-            for e in range(gdofs.shape[0]):
-                full = gdofs[e]
-                rmap = self.full_to_red[full]
-                mask = rmap >= 0
-                rows = rmap[mask]
-                if rows.size == 0:
+            gdofs = ker.static_args.get("gdofs_map")
+            if not isinstance(gdofs, np.ndarray) or gdofs.ndim != 2:
+                self._elem_pos.append([])
+                self._elem_lidx.append([])
+                self._elem_extra.append([])
+                continue
+            nel = int(gdofs.shape[0])
+            nloc = int(gdofs.shape[1]) if gdofs.ndim == 2 else 0
+            pos_list: list[np.ndarray] = []
+            lidx_list: list[np.ndarray] = []
+            extra_list: list[object | None] = []
+
+            for e in range(nel):
+                full = np.asarray(gdofs[e], dtype=int)
+                valid = full >= 0
+                if not np.any(valid):
                     pos_list.append(np.empty(0, dtype=np.int32))
                     lidx_list.append(np.empty(0, dtype=np.int32))
+                    extra_list.append(None)
                     continue
-                # flattened positions, row-major order matching Ke[np.ix_(lidx,lidx)].ravel()
-                nact = rows.size
-                pflat = np.empty(nact * nact, dtype=np.int32)
-                t = 0
-                for a in range(nact):
-                    ra = rows[a]
-                    for b in range(nact):
-                        cb = rows[b]
-                        pflat[t] = pos[(ra, cb)]
-                        t += 1
-                pos_list.append(pflat)
-                lidx_list.append(np.nonzero(mask)[0].astype(np.int32))
+
+                full_valid = full[valid].astype(int, copy=False)
+                has_slave = bool(np.any(is_slave[full_valid]))
+
+                if not has_slave:
+                    mcols = full_to_master[full_valid]
+                    ok = mcols >= 0
+                    if not np.any(ok):
+                        pos_list.append(np.empty(0, dtype=np.int32))
+                        lidx_list.append(np.empty(0, dtype=np.int32))
+                        extra_list.append(None)
+                        continue
+                    reds = full_to_red_master[mcols[ok]]
+                    keep = reds >= 0
+                    if not np.any(keep):
+                        pos_list.append(np.empty(0, dtype=np.int32))
+                        lidx_list.append(np.empty(0, dtype=np.int32))
+                        extra_list.append(None)
+                        continue
+                    rows = np.asarray(reds[keep], dtype=np.int32)
+                    lidx = np.nonzero(valid)[0][ok][keep].astype(np.int32, copy=False)
+                    pos_list.append(_pflat(rows))
+                    lidx_list.append(lidx)
+                    extra_list.append(None)
+                    continue
+
+                # Constrained entity: local mapping P via ragged rows
+                maps: list[list[tuple[int, float]]] = [[] for _ in range(nloc)]
+                red_set: set[int] = set()
+                for i in range(nloc):
+                    gd = int(full[i])
+                    if gd < 0:
+                        continue
+                    if bool(is_slave[gd]):
+                        combo = slave_to_master_cols.get(gd)
+                        if combo is None:
+                            continue
+                        mcols, wts = combo
+                        for mcol, w in zip(mcols.tolist(), wts.tolist()):
+                            red = int(full_to_red_master[int(mcol)])
+                            if red >= 0:
+                                maps[i].append((red, float(w)))
+                                red_set.add(red)
+                    else:
+                        mcol = int(full_to_master[gd])
+                        if mcol < 0:
+                            continue
+                        red = int(full_to_red_master[mcol])
+                        if red >= 0:
+                            maps[i].append((red, 1.0))
+                            red_set.add(red)
+
+                if not red_set:
+                    pos_list.append(np.empty(0, dtype=np.int32))
+                    lidx_list.append(np.empty(0, dtype=np.int32))
+                    extra_list.append(None)
+                    continue
+
+                rows_unique = np.asarray(sorted(red_set), dtype=np.int32)
+                red_to_local = {int(r): j for j, r in enumerate(rows_unique.tolist())}
+
+                ptr = np.zeros(nloc + 1, dtype=np.int32)
+                j_acc: list[int] = []
+                w_acc: list[float] = []
+                for i in range(nloc):
+                    tmp: dict[int, float] = {}
+                    for red, w in maps[i]:
+                        jj = int(red_to_local[int(red)])
+                        tmp[jj] = tmp.get(jj, 0.0) + float(w)
+                    for jj, w in tmp.items():
+                        j_acc.append(int(jj))
+                        w_acc.append(float(w))
+                    ptr[i + 1] = int(len(j_acc))
+                rep_j = np.asarray(j_acc, dtype=np.int32)
+                rep_w = np.asarray(w_acc, dtype=float)
+
+                pos_list.append(_pflat(rows_unique))
+                lidx_list.append(np.empty(0, dtype=np.int32))
+                extra_list.append((rows_unique, ptr, rep_j, rep_w))
+
             self._elem_pos.append(pos_list)
             self._elem_lidx.append(lidx_list)
+            self._elem_extra.append(extra_list)
 
         self._pattern_stale = False
+        self._runtime_reduced_scatter_plan_cache = {}
 
 
     def _assemble_system_reduced_fast(self, coeffs):
@@ -1045,25 +9195,202 @@ class NewtonSolver:
         if getattr(self, "_pattern_stale", True):
             self._build_reduced_pattern()
 
+        # Residual kernels may be compiling asynchronously (parallel setup).
+        self._finish_residual_kernel_compilation()
+
         indptr, indices = self._csr_indptr, self._csr_indices
         n = indptr.size - 1
         data = np.zeros(indices.size, dtype=float)
         R = np.zeros(n, dtype=float)
+        amgcl_backend = str(getattr(getattr(self, "lp", None), "backend", "") or "").strip().lower()
+        diag_mode = str(os.getenv("PYCUTFEM_LINEAR_AMGCL_KRATOS_DIRICHLET_DIAG", "1") or "1").strip().lower()
+        track_kratos_dirichlet_diag = (
+            amgcl_backend == "amgcl"
+            and getattr(self, "constraints", None) is None
+            and diag_mode not in {"0", "false", "no", "off"}
+        )
+        kratos_full_diag = (
+            np.zeros((int(self.full_to_red.size),), dtype=float)
+            if track_kratos_dirichlet_diag
+            else None
+        )
 
         profile = os.getenv("PYCUTFEM_PROFILE_KERNELS", "").lower() in {"1", "true", "yes"}
         prof_entries = []
+        debug_kernel = os.getenv("PYCUTFEM_DEBUG_KERNELS", "").lower() in {"1", "true", "yes"}
+        debug_kernel_min_elems = int(os.getenv("PYCUTFEM_DEBUG_KERNELS_MIN_ELEMS", "0") or "0")
+        trace_exec = os.getenv("PYCUTFEM_TRACE_KERNEL_EXEC", "").lower() in {"1", "true", "yes"}
+        debug_seen = getattr(self, "_debug_kernel_seen", None)
+        if debug_kernel and debug_seen is None:
+            debug_seen = set()
+            self._debug_kernel_seen = debug_seen
 
         # Matrix (Jacobian) blocks
-        for ker, pos_list, lidx_list in zip(self.kernels_K, self._elem_pos, self._elem_lidx):
+        extra_lists = getattr(self, "_elem_extra", None)
+        if extra_lists is None:
+            extra_lists = [None for _ in self.kernels_K]
+
+        for ker, pos_list, lidx_list, extra_list in zip(self.kernels_K, self._elem_pos, self._elem_lidx, extra_lists):
+            gdofs = ker.static_args.get("gdofs_map")
+            if isinstance(gdofs, np.ndarray) and gdofs.shape[0] == 0:
+                continue
             t_exec = time.perf_counter()
+            if trace_exec:
+                print(
+                    f"        [kern] exec jacobian dom={getattr(ker,'domain','?')} side={getattr(ker,'side',None)}",
+                    flush=True,
+                )
             Kloc, _, _ = ker.exec(coeffs)  # shape [nel, nloc, nloc]
             exec_time = time.perf_counter() - t_exec
+            if not isinstance(Kloc, np.ndarray) or Kloc.size == 0:
+                continue
+            if kratos_full_diag is not None and isinstance(gdofs, np.ndarray):
+                try:
+                    diag_loc = np.diagonal(np.asarray(Kloc, dtype=float), axis1=1, axis2=2)
+                    if diag_loc.shape == gdofs.shape:
+                        valid_diag = (gdofs >= 0) & (gdofs < int(kratos_full_diag.size))
+                        if np.any(valid_diag):
+                            np.add.at(kratos_full_diag, gdofs[valid_diag], diag_loc[valid_diag])
+                except Exception:
+                    kratos_full_diag = None
+            if trace_exec:
+                print(
+                    f"        [kern] done jacobian dom={getattr(ker,'domain','?')} exec={exec_time:.3e}s",
+                    flush=True,
+                )
+            if debug_kernel and isinstance(debug_seen, set) and (id(ker) not in debug_seen):
+                try:
+                    n_ent = int(getattr(Kloc, "shape", (0,))[0])
+                except Exception:
+                    n_ent = 0
+                if n_ent >= debug_kernel_min_elems:
+                    try:
+                        qw = ker.static_args.get("qw")
+                        qw_sum = float(np.nansum(np.abs(qw))) if isinstance(qw, np.ndarray) else float("nan")
+                        qw_min = float(np.nanmin(qw)) if isinstance(qw, np.ndarray) and qw.size else float("nan")
+                        qw_max = float(np.nanmax(qw)) if isinstance(qw, np.ndarray) and qw.size else float("nan")
+                        kmax = float(np.nanmax(np.abs(Kloc))) if isinstance(Kloc, np.ndarray) and Kloc.size else float("nan")
+                        n_valid = n_active = 0
+                        active_frac = float("nan")
+                        if isinstance(gdofs, np.ndarray):
+                            valid = gdofs >= 0
+                            if np.any(valid):
+                                rmap = -np.ones_like(gdofs, dtype=int)
+                                rmap[valid] = self.full_to_red[gdofs[valid]]
+                                active = rmap >= 0
+                                n_valid = int(np.count_nonzero(valid))
+                                n_active = int(np.count_nonzero(active))
+                                active_frac = float(n_active) / float(max(1, n_valid))
+                        side = getattr(ker, "side", None)
+                        print(
+                            f"[kern] jacobian dom={getattr(ker,'domain','?')} side={side} "
+                            f"elems={n_ent} max|K|={kmax:.3e} "
+                            f"qw_sum={qw_sum:.3e} qw=[{qw_min:.3e},{qw_max:.3e}] "
+                            f"active_frac={active_frac:.3e} ({n_active}/{n_valid})"
+                        )
+                    except Exception:
+                        pass
+                debug_seen.add(id(ker))
             t_scatter = time.perf_counter()
-            for e, (pflat, lidx) in enumerate(zip(pos_list, lidx_list)):
-                if pflat.size == 0:
-                    continue
-                Kel = Kloc[e][np.ix_(lidx, lidx)].ravel()
-                data[pflat] += Kel
+            if extra_list is None:
+                if isinstance(pos_list, np.ndarray):
+                    # Dense per-entity plan: pos_list[e] has length n_loc*n_loc and
+                    # matches Kloc[e].ravel(); entries are -1 for inactive pairs.
+                    Kflat = np.asarray(Kloc, dtype=float).reshape(int(Kloc.shape[0]), -1)
+                    try:
+                        if _HAVE_NUMBA_REDUCED_PATTERN:
+                            _wait_numba_reduced_pattern_precompile()
+                            _scatter_csr_pos_flat_numba(data, np.asarray(pos_list, dtype=np.int32), Kflat)
+                        else:
+                            for e in range(int(pos_list.shape[0])):
+                                pflat = np.asarray(pos_list[e], dtype=np.int32)
+                                if pflat.size == 0:
+                                    continue
+                                m = pflat >= 0
+                                if not np.any(m):
+                                    continue
+                                data[pflat[m]] += Kflat[e, m]
+                    except IndexError as exc:
+                        retrying = bool(getattr(self, "_reduced_fast_retrying", False))
+                        if retrying:
+                            raise
+                        self._pattern_stale = True
+                        self._reduced_fast_retrying = True
+                        try:
+                            self._build_reduced_pattern()
+                            return self._assemble_system_reduced_fast(coeffs)
+                        finally:
+                            self._reduced_fast_retrying = False
+                else:
+                    for e, (pflat, lidx) in enumerate(zip(pos_list, lidx_list)):
+                        if pflat.size == 0:
+                            continue
+                        Kel = Kloc[e][np.ix_(lidx, lidx)].ravel()
+                        try:
+                            data[pflat] += Kel
+                        except IndexError as exc:
+                            retrying = bool(getattr(self, "_reduced_fast_retrying", False))
+                            if retrying:
+                                raise
+                            self._pattern_stale = True
+                            self._reduced_fast_retrying = True
+                            try:
+                                self._build_reduced_pattern()
+                                return self._assemble_system_reduced_fast(coeffs)
+                            finally:
+                                self._reduced_fast_retrying = False
+            else:
+                # Constraint-aware scatter for entities with hanging-node slaves.
+                for e, (pflat, lidx, meta) in enumerate(zip(pos_list, lidx_list, extra_list)):
+                    if pflat.size == 0:
+                        continue
+                    if meta is None:
+                        Kel = Kloc[e][np.ix_(lidx, lidx)].ravel()
+                        try:
+                            data[pflat] += Kel
+                        except IndexError as exc:
+                            retrying = bool(getattr(self, "_reduced_fast_retrying", False))
+                            if retrying:
+                                raise
+                            self._pattern_stale = True
+                            self._reduced_fast_retrying = True
+                            try:
+                                self._build_reduced_pattern()
+                                return self._assemble_system_reduced_fast(coeffs)
+                            finally:
+                                self._reduced_fast_retrying = False
+                        continue
+                    rows_unique, ptr, rep_j, rep_w = meta
+                    m = int(rows_unique.size)
+                    if m <= 0:
+                        continue
+                    Ke = Kloc[e]
+                    nloc = int(Ke.shape[0])
+
+                    # B = Ke @ P, where P maps local full dofs to local reduced rows.
+                    B = np.zeros((nloc, m), dtype=float)
+                    for j_loc in range(nloc):
+                        s0 = int(ptr[j_loc])
+                        s1 = int(ptr[j_loc + 1])
+                        if s1 <= s0:
+                            continue
+                        col = Ke[:, j_loc]
+                        for k in range(s0, s1):
+                            a = int(rep_j[k])
+                            wv = float(rep_w[k])
+                            B[:, a] += wv * col
+
+                    # Scatter K_m = Pᵀ B directly into global CSR data.
+                    for i_loc in range(nloc):
+                        s0 = int(ptr[i_loc])
+                        s1 = int(ptr[i_loc + 1])
+                        if s1 <= s0:
+                            continue
+                        brow = B[i_loc, :]
+                        for k in range(s0, s1):
+                            a = int(rep_j[k])
+                            wv = float(rep_w[k])
+                            data[pflat[a * m : (a + 1) * m]] += wv * brow
             scatter_time = time.perf_counter() - t_scatter
             if profile:
                 prof_entries.append(
@@ -1071,26 +9398,158 @@ class NewtonSolver:
                 )
 
         # Residual blocks
-        for ker in self.kernels_F:
+        res_maps = getattr(self, "_res_red_maps", None)
+        has_constraints = getattr(self, "constraints", None) is not None
+        for k_idx, ker in enumerate(self.kernels_F):
+            gdofs = ker.static_args.get("gdofs_map")
+            if isinstance(gdofs, np.ndarray) and gdofs.shape[0] == 0:
+                continue
             t_exec = time.perf_counter()
+            if trace_exec:
+                print(
+                    f"        [kern] exec residual dom={getattr(ker,'domain','?')} side={getattr(ker,'side',None)}",
+                    flush=True,
+                )
             _, Floc, _ = ker.exec(coeffs)  # [nel, nloc]
             exec_time = time.perf_counter() - t_exec
+            if not isinstance(Floc, np.ndarray) or Floc.size == 0:
+                continue
+            if trace_exec:
+                print(
+                    f"        [kern] done residual dom={getattr(ker,'domain','?')} exec={exec_time:.3e}s",
+                    flush=True,
+                )
+            if debug_kernel and isinstance(debug_seen, set) and (id(ker) not in debug_seen):
+                try:
+                    n_ent = int(getattr(Floc, "shape", (0,))[0])
+                except Exception:
+                    n_ent = 0
+                if n_ent >= debug_kernel_min_elems:
+                    try:
+                        qw = ker.static_args.get("qw")
+                        qw_sum = float(np.nansum(np.abs(qw))) if isinstance(qw, np.ndarray) else float("nan")
+                        qw_min = float(np.nanmin(qw)) if isinstance(qw, np.ndarray) and qw.size else float("nan")
+                        qw_max = float(np.nanmax(qw)) if isinstance(qw, np.ndarray) and qw.size else float("nan")
+                        absF = np.abs(Floc) if isinstance(Floc, np.ndarray) else None
+                        fmax = float(np.nanmax(absF)) if isinstance(absF, np.ndarray) and absF.size else float("nan")
+                        n_valid = n_active = 0
+                        active_frac = float("nan")
+                        fmax_active = 0.0
+                        fmax_dropped = 0.0
+                        if isinstance(gdofs, np.ndarray) and isinstance(absF, np.ndarray) and absF.size:
+                            valid = gdofs >= 0
+                            if np.any(valid):
+                                rmap = -np.ones_like(gdofs, dtype=int)
+                                rmap[valid] = self.full_to_red[gdofs[valid]]
+                                active = rmap >= 0
+                                n_valid = int(np.count_nonzero(valid))
+                                n_active = int(np.count_nonzero(active))
+                                active_frac = float(n_active) / float(max(1, n_valid))
+                                if np.any(active):
+                                    fmax_active = float(np.nanmax(absF[active]))
+                                dropped = valid & ~active
+                                if np.any(dropped):
+                                    fmax_dropped = float(np.nanmax(absF[dropped]))
+                        side = getattr(ker, "side", None)
+                        print(
+                            f"[kern] residual dom={getattr(ker,'domain','?')} side={side} "
+                            f"elems={n_ent} max|F|={fmax:.3e} "
+                            f"qw_sum={qw_sum:.3e} qw=[{qw_min:.3e},{qw_max:.3e}] "
+                            f"active_frac={active_frac:.3e} ({n_active}/{n_valid}) "
+                            f"max|F_active|={fmax_active:.3e} max|F_drop|={fmax_dropped:.3e}"
+                        )
+                    except Exception:
+                        pass
+                debug_seen.add(id(ker))
             t_scatter = time.perf_counter()
-            gdofs = ker.static_args["gdofs_map"]
-            for e in range(gdofs.shape[0]):
-                rmap = self.full_to_red[gdofs[e]]
-                mask = rmap >= 0
-                if not np.any(mask):
-                    continue
-                rows = rmap[mask]
-                np.add.at(R, rows, Floc[e][mask])
+            if not has_constraints and isinstance(res_maps, list) and k_idx < len(res_maps) and isinstance(res_maps[k_idx], np.ndarray):
+                red_map = res_maps[k_idx]
+                if red_map.shape == getattr(Floc, "shape", None):
+                    ff = np.asarray(Floc, dtype=float)
+                    if ff.shape != tuple(red_map.shape) or ff.size == 0:
+                        red_map = None
+                    else:
+                        if _HAVE_NUMBA_REDUCED_PATTERN:
+                            _wait_numba_reduced_pattern_precompile()
+                            _scatter_vec_red_map_numba(R, np.asarray(red_map, dtype=np.int32), ff)
+                        else:
+                            rm = np.asarray(red_map, dtype=np.int32).ravel()
+                            ff_flat = ff.ravel()
+                            mask = rm >= 0
+                            if np.any(mask):
+                                np.add.at(R, rm[mask], ff_flat[mask])
+                else:
+                    red_map = None
+            else:
+                red_map = None
+
+            if red_map is None:
+                if not isinstance(gdofs, np.ndarray):
+                    gdofs = ker.static_args["gdofs_map"]
+                for e in range(gdofs.shape[0]):
+                    if e >= int(getattr(Floc, "shape", (0,))[0]):
+                        continue
+                    full = gdofs[e]
+                    valid_full = full >= 0
+                    if not np.any(valid_full):
+                        continue
+                    frow = np.asarray(Floc[e], dtype=float).reshape(-1)
+                    if frow.size != full.size:
+                        continue
+                    if not has_constraints:
+                        rmap = -np.ones_like(full, dtype=int)
+                        rmap[valid_full] = self.full_to_red[full[valid_full]]
+                        mask = rmap >= 0
+                        if not np.any(mask):
+                            continue
+                        rows = rmap[mask]
+                        np.add.at(R, rows, frow[mask])
+                    else:
+                        full_to_master = getattr(self, "_constr_full_to_master", None)
+                        is_slave = getattr(self, "_constr_is_slave", None)
+                        slave_map = getattr(self, "_constr_slave_map", None)
+                        if (
+                            not isinstance(full_to_master, np.ndarray)
+                            or not isinstance(is_slave, np.ndarray)
+                            or not isinstance(slave_map, dict)
+                        ):
+                            continue
+                        for loc_i, gd in zip(np.nonzero(valid_full)[0].tolist(), full[valid_full].tolist()):
+                            gd_i = int(gd)
+                            if gd_i < 0 or gd_i >= int(full_to_master.size):
+                                continue
+                            val = float(frow[int(loc_i)])
+                            if not np.isfinite(val) or val == 0.0:
+                                continue
+                            if bool(is_slave[gd_i]):
+                                combo = slave_map.get(gd_i)
+                                if combo is None:
+                                    continue
+                                mcols, wts = combo
+                                for mcol, wv in zip(mcols.tolist(), wts.tolist()):
+                                    red = int(self.full_to_red[int(mcol)])
+                                    if red >= 0:
+                                        R[red] += float(wv) * val
+                            else:
+                                mcol = int(full_to_master[gd_i])
+                                if mcol < 0:
+                                    continue
+                                red = int(self.full_to_red[mcol])
+                                if red >= 0:
+                                    R[red] += val
             scatter_time = time.perf_counter() - t_scatter
             if profile:
+                try:
+                    n_ent = int(getattr(Floc, "shape", (0,))[0])
+                except Exception:
+                    n_ent = 0
                 prof_entries.append(
-                    ("residual", getattr(ker, "domain", "unknown"), exec_time, scatter_time, gdofs.shape[0])
+                    ("residual", getattr(ker, "domain", "unknown"), exec_time, scatter_time, n_ent)
                 )
 
         A = sp.csr_matrix((data, indices, indptr), shape=(n, n))
+        if kratos_full_diag is not None:
+            self._last_amgcl_kratos_dirichlet_diag = np.asarray(kratos_full_diag, dtype=float)
 
         if profile and prof_entries:
             print("        [profile] kernel timings (type, domain, exec, scatter, n_elem):")
@@ -1124,12 +9583,55 @@ class NewtonSolver:
 # ----------------------------------------------------------------------------
 
 def _zero_rows_cols(A: sp.csr_matrix, rows: np.ndarray) -> sp.csr_matrix:
-    """Zero out rows *and* columns and put 1.0 on the diagonal (in‑place)."""
-    A = A.tolil()
-    A[rows, :] = 0.0
-    A[:, rows] = 0.0
-    A[rows, rows] = 1.0
-    return A.tocsr()
+    """Zero out rows/columns and set diagonal ones without LIL fancy indexing."""
+    rows = np.unique(np.asarray(rows, dtype=int).ravel())
+    if rows.size == 0:
+        return A.tocsr(copy=True) if hasattr(A, "tocsr") else sp.csr_matrix(A)
+
+    A_csc = A.tocsc(copy=True) if hasattr(A, "tocsc") else sp.csc_matrix(A)
+    n_rows, n_cols = A_csc.shape
+    keep = (rows >= 0) & (rows < min(n_rows, n_cols))
+    rows = rows[keep]
+    if rows.size == 0:
+        return A_csc.tocsr()
+
+    c_indptr = A_csc.indptr
+    c_data = A_csc.data
+    for rr in rows.tolist():
+        start = int(c_indptr[rr])
+        end = int(c_indptr[rr + 1])
+        if end > start:
+            c_data[start:end] = 0.0
+
+    A_mod = A_csc.tocsr()
+    indptr = A_mod.indptr
+    indices = A_mod.indices
+    data = A_mod.data
+    missing_diag: list[int] = []
+
+    for rr in rows.tolist():
+        start = int(indptr[rr])
+        end = int(indptr[rr + 1])
+        if end <= start:
+            missing_diag.append(rr)
+            continue
+        data[start:end] = 0.0
+        hit = np.nonzero(indices[start:end] == rr)[0]
+        if hit.size:
+            data[start + int(hit[0])] = 1.0
+        else:
+            missing_diag.append(rr)
+
+    if missing_diag:
+        diag_rows = np.asarray(missing_diag, dtype=int)
+        diag_vals = np.ones(diag_rows.size, dtype=float)
+        A_mod = (
+            A_mod
+            + sp.csr_matrix((diag_vals, (diag_rows, diag_rows)), shape=A_mod.shape)
+        ).tocsr()
+
+    A_mod.eliminate_zeros()
+    return A_mod
 
 
 
@@ -1171,6 +9673,7 @@ class PetscSnesNewtonSolver(NewtonSolver):
         self._box_upper_full = None
         self._XL = None               # PETSc Vec (reduced) for lower bounds
         self._XU = None               # PETSc Vec (reduced) for upper bounds
+        self._trace_monitor_installed = False
 
 
         # Sensible defaults; user options may override via setFromOptions()
@@ -1186,12 +9689,53 @@ class PetscSnesNewtonSolver(NewtonSolver):
     # ------------------------------------------------------------------ #
     # Utilities
     # ------------------------------------------------------------------ #
+    def _gather_full_iterate(self, funcs: list) -> np.ndarray:
+        """
+        Gather the current iterate into a full global DOF vector (global index order).
+
+        Do *not* use `np.hstack([f.nodal_values ...])` here: Function/VectorFunction
+        storage order follows `._g_dofs`, which is not guaranteed to be sorted by
+        global DOF id.
+        """
+        n = int(self.dh.total_dofs)
+        x_full = np.zeros(n, dtype=float)
+        for f in funcs:
+            g = getattr(f, "_g_dofs", None)
+            vals = getattr(f, "nodal_values", None)
+            if g is None or vals is None:
+                continue
+            g_arr = np.asarray(g, dtype=int).ravel()
+            if g_arr.size == 0:
+                continue
+            v_arr = np.asarray(vals, dtype=float).ravel()
+            if v_arr.size != g_arr.size:
+                raise ValueError(
+                    f"Function '{getattr(f, 'name', '<unnamed>')}' has nodal_values size {int(v_arr.size)} "
+                    f"but _g_dofs size {int(g_arr.size)}."
+                )
+            x_full[g_arr] = v_arr
+        return x_full
+
     def _apply_petsc_options(self) -> None:
         """Load self.petsc_options into PETSc.Options so setFromOptions() sees them."""
         opts = PETSc.Options()
         for k, v in self.petsc_options.items():
             key = k if k.startswith("-") else k
             opts[key] = "" if v is None else str(v)
+
+    def _invalidate_petsc_cache(self) -> None:
+        """Drop cached PETSc objects so they are rebuilt with the current pattern."""
+        self._snes = None
+        self._x_red = None
+        self._r_red = None
+        self._J = None
+        self._P = None
+        self._XL = None
+        self._XU = None
+        self._trace_monitor_installed = False
+        self._inf_ls_precheck_installed = False
+        self._inf_ls_x_trial = None
+        self._inf_ls_r_trial = None
     
     def set_box_bounds(self, lower=None, upper=None, by_field: dict | None=None):
         """
@@ -1219,6 +9763,25 @@ class PetscSnesNewtonSolver(NewtonSolver):
         # store; we’ll map to reduced each step/size
         self._box_lower_full = lo_full
         self._box_upper_full = hi_full
+        self._trace_reduced_box_bounds_summary()
+
+        # If we are in a constraint (hanging-node) mode, bounds on slave DOFs do
+        # not map cleanly to box constraints in the reduced/master space.
+        # We apply bounds on master DOFs only.
+        if getattr(self, "constraints", None) is not None:
+            try:
+                slaves = np.asarray(self.constraints.slaves, dtype=int)
+                if slaves.size:
+                    lo_s = lo_full[slaves]
+                    hi_s = hi_full[slaves]
+                    if np.any(np.isfinite(lo_s)) or np.any(np.isfinite(hi_s)):
+                        warnings.warn(
+                            "Box bounds were set on slave/hanging DOFs; these bounds are ignored in the "
+                            "condensed master-space VI solve. Apply bounds to master DOFs instead.",
+                            RuntimeWarning,
+                        )
+            except Exception:
+                pass
 
 
     def _ensure_snes(self, n_free: int, comm) -> None:
@@ -1254,10 +9817,81 @@ class PetscSnesNewtonSolver(NewtonSolver):
         self._snes.setFunction(self._eval_residual_reduced, self._r_red)
         self._snes.setJacobian(self._eval_jacobian_reduced, self._J, self._P)
 
+        # ------------------------------------------------------------------
+        # Convergence norm: use infinity norm by default.
+        #
+        # Rationale:
+        # - Our `NewtonParameters.newton_tol` is documented as an infinity-norm
+        #   threshold (‖R‖_∞) for the pure-Python Newton implementation.
+        # - PETSc SNES defaults to a 2-norm on the residual vector. On large
+        #   systems this can be *much* stricter (scales like √N) and may cause
+        #   unnecessary max-iteration failures even when every field has
+        #   already reached the intended per-DOF tolerance.
+        #
+        # We first try to set the SNES norm type directly (if supported by
+        # petsc4py/PETSc). If not available, we install a custom convergence
+        # test that checks ‖F‖_∞ against (atol, rtol).
+        # ------------------------------------------------------------------
+        self._snes_norm_is_infinity = False
+        try:
+            self._snes.setNormType(PETSc.NormType.NORM_INFINITY)  # type: ignore[attr-defined]
+            self._snes_norm_is_infinity = True
+        except Exception:
+            fnorm0_box: dict[str, float | None] = {"fnorm0": None}
+
+            # NOTE: petsc4py changed the callback signature across versions.
+            # Accept optional args so this works with both:
+            #   (snes, it, xnorm, gnorm, fnorm)  and  (snes, it, xnorm)
+            def _conv_test(snes, it, xnorm=None, gnorm=None, fnorm=None, *args, **kwargs):  # noqa: ANN001
+                try:
+                    f_vec, _ctx = snes.getFunction()
+                    f_inf = float(f_vec.norm(PETSc.NormType.NORM_INFINITY))
+                except Exception:
+                    try:
+                        f_inf = float(self._r_red.norm(PETSc.NormType.NORM_INFINITY))
+                    except Exception:
+                        try:
+                            f_inf = float(fnorm) if fnorm is not None else float("nan")
+                        except Exception:
+                            f_inf = float("nan")
+
+                # Reset the "initial norm" at the start of every SNES solve (it=0),
+                # even when SNES is reused across time steps.
+                if it == 0 and np.isfinite(f_inf):
+                    fnorm0_box["fnorm0"] = float(f_inf)
+
+                atol = float(getattr(self.np, "newton_tol", 0.0) or 0.0)
+                rtol = float(getattr(self.np, "newton_rtol", 0.0) or 0.0)
+                if atol > 0.0 and np.isfinite(f_inf) and f_inf <= atol:
+                    return PETSc.SNES.ConvergedReason.CONVERGED_FNORM_ABS
+                if (
+                    rtol > 0.0
+                    and fnorm0_box["fnorm0"] is not None
+                    and np.isfinite(f_inf)
+                    and f_inf <= rtol * float(fnorm0_box["fnorm0"])
+                ):
+                    rel_reason = getattr(PETSc.SNES.ConvergedReason, "CONVERGED_FNORM_RELATIVE", None)
+                    if rel_reason is None:
+                        rel_reason = getattr(PETSc.SNES.ConvergedReason, "CONVERGED_FNORM_REL", None)
+                    if rel_reason is None:
+                        rel_reason = PETSc.SNES.ConvergedReason.CONVERGED_FNORM_ABS
+                    return rel_reason
+                return PETSc.SNES.ConvergedReason.ITERATING
+
+            self._snes.setConvergenceTest(_conv_test)
+            self._snes_norm_is_infinity = True
+
         # --- Optional VI bounds (reduced) ---
         if (getattr(self, "_box_lower_full", None) is not None) and (getattr(self, "_box_upper_full", None) is not None):
-            lo_red = self._box_lower_full[self.active_dofs].astype(float, copy=True)
-            hi_red = self._box_upper_full[self.active_dofs].astype(float, copy=True)
+            if getattr(self, "constraints", None) is not None:
+                master_ids = np.asarray(self.constraints.master_ids, dtype=int)
+                lo_master = np.asarray(self._box_lower_full, dtype=float)[master_ids]
+                hi_master = np.asarray(self._box_upper_full, dtype=float)[master_ids]
+                lo_red = lo_master[self.active_dofs].astype(float, copy=True)
+                hi_red = hi_master[self.active_dofs].astype(float, copy=True)
+            else:
+                lo_red = self._box_lower_full[self.active_dofs].astype(float, copy=True)
+                hi_red = self._box_upper_full[self.active_dofs].astype(float, copy=True)
 
             self._XL = PETSc.Vec().create(comm=comm)
             self._XL.setSizes(n_free)
@@ -1279,7 +9913,11 @@ class PetscSnesNewtonSolver(NewtonSolver):
 
         # --- Programmatic defaults (robust baseline; options may override) ---
         # Use absolute tolerance to mimic your Python Newton's stopping rule
-        self._snes.setTolerances(rtol=0.0, atol=self.np.newton_tol, max_it=self.np.max_newton_iter)
+        self._snes.setTolerances(
+            rtol=float(getattr(self.np, "newton_rtol", 0.0) or 0.0),
+            atol=float(getattr(self.np, "newton_tol", 0.0) or 0.0),
+            max_it=int(getattr(self.np, "max_newton_iter", 0) or 0),
+        )
         try:
             self._snes.getLineSearch().setType("bt")
         except Exception:
@@ -1301,6 +9939,232 @@ class PetscSnesNewtonSolver(NewtonSolver):
         # --- Apply user options last so they override all defaults ---
         self._apply_petsc_options()
         self._snes.setFromOptions()
+        self._maybe_install_residual_trace_monitor()
+        self._maybe_install_inf_ls_precheck()
+
+    def _maybe_install_residual_trace_monitor(self) -> None:
+        """
+        Install a lightweight SNES monitor to print per-field residual diagnostics.
+
+        This mirrors the env-var based tracing supported by the Python Newton/PDAS
+        implementations:
+          - PYCUTFEM_NEWTON_TRACE_RES_FIELDS=1  (top-N per-field |R|_∞)
+          - PYCUTFEM_RESIDUAL_TRACE=1           (worst DOF residual; optionally coords)
+        """
+        if self._trace_monitor_installed:
+            return
+        snes = getattr(self, "_snes", None)
+        r_red = getattr(self, "_r_red", None)
+        if snes is None or r_red is None:
+            return
+
+        want_fields = os.getenv("PYCUTFEM_NEWTON_TRACE_RES_FIELDS", "").lower() in {"1", "true", "yes"}
+        want_worst = os.getenv("PYCUTFEM_RESIDUAL_TRACE", "").lower() in {"1", "true", "yes"}
+        if not (want_fields or want_worst):
+            return
+
+        def _monitor(_snes, it, _norm) -> None:
+            try:
+                if PETSc.COMM_WORLD.getRank() != 0:
+                    return
+            except Exception:
+                pass
+
+            try:
+                R_red = np.asarray(r_red.getArray(readonly=True), dtype=float).ravel()
+                R_full = np.asarray(self.restrictor.expand_vec(R_red), dtype=float).ravel()
+            except Exception as exc:
+                print(f"        [res] snes trace failed: {exc}")
+                return
+
+            if want_fields:
+                try:
+                    field_norms = []
+                    for fld in getattr(self.dh, "field_names", []):
+                        try:
+                            sl = self.dh.get_field_slice(fld)
+                        except Exception:
+                            continue
+                        if sl is None or len(sl) == 0:
+                            continue
+                        sl = np.asarray(sl, dtype=int).ravel()
+                        field_norms.append((float(np.linalg.norm(R_full[sl], ord=np.inf)), str(fld)))
+                    field_norms.sort(reverse=True, key=lambda t: t[0])
+                    n_show_raw = os.getenv("PYCUTFEM_NEWTON_TRACE_RES_FIELDS_N", "8").strip()
+                    try:
+                        n_show = max(1, int(n_show_raw))
+                    except Exception:
+                        n_show = 8
+                    items = ", ".join(f"{name}:{val:.2e}" for val, name in field_norms[:n_show])
+                    print(f"        [res] it={int(it)} {items}")
+                except Exception as exc:
+                    print(f"        [res] snes per-field trace failed: {exc}")
+
+            if want_worst:
+                try:
+                    if R_full.size == 0:
+                        return
+                    worst_full = int(np.argmax(np.abs(R_full)))
+                    worst_val = float(R_full[worst_full])
+                    field = None
+                    try:
+                        field = getattr(self.dh, "_dof_to_node_map", {}).get(worst_full, (None, None))[0]
+                    except Exception:
+                        field = None
+                    fmsg = f", field={field}" if field is not None else ""
+
+                    coords_msg = ""
+                    if os.getenv("PYCUTFEM_RESIDUAL_TRACE_COORDS", "").lower() in {"1", "true", "yes"} and field is not None:
+                        try:
+                            sl = np.asarray(self.dh.get_field_slice(field), dtype=int).ravel()
+                            hit = np.nonzero(sl == int(worst_full))[0]
+                            if hit.size:
+                                coords = np.asarray(self.dh.get_dof_coords(field), dtype=float)[int(hit[0])]
+                                if coords.size >= 2:
+                                    coords_msg = f", x={coords[0]:.3e}, y={coords[1]:.3e}"
+                        except Exception:
+                            coords_msg = ""
+                    print(f"        [res] it={int(it)} worst_gdof={worst_full} worst_val={worst_val:.3e}{fmsg}{coords_msg}")
+                except Exception as exc:
+                    print(f"        [res] snes worst trace failed: {exc}")
+
+        snes.setMonitor(_monitor)
+        self._trace_monitor_installed = True
+
+    def _maybe_install_inf_ls_precheck(self) -> None:
+        """
+        Install an infinity-norm based line-search *pre-check* to improve robustness.
+
+        Motivation:
+        - PETSc line searches/globalization are typically based on a 2-norm of F.
+          For large mixed systems this can accept steps that reduce the 2-norm
+          while increasing the per-DOF maximum residual (∞-norm), which is the
+          metric we use for our time-step accept/reject diagnostics.
+        - In some cases SNES can then terminate with DIVERGED_LINE_SEARCH (-6)
+          even though an earlier iterate had a small ∞-norm residual.
+
+        This pre-check dampens the Newton direction `y` so that a trial step
+          x_trial = x - α y
+        reduces ‖F‖_∞ whenever possible (or at least avoids catastrophic growth).
+
+        Notes:
+        - petsc4py's callback signature for `setLineSearchPreCheck` varies; in the
+          version used by our fenicsx environment it is `precheck(x: Vec, y: Vec)`.
+        - We keep this lightweight (few trial alphas) and only scale the direction.
+        """
+        if getattr(self, "_inf_ls_precheck_installed", False):
+            return
+        snes = getattr(self, "_snes", None)
+        x_red = getattr(self, "_x_red", None)
+        r_red = getattr(self, "_r_red", None)
+        if snes is None or x_red is None or r_red is None:
+            return
+        if not hasattr(snes, "setLineSearchPreCheck"):
+            return
+
+        # Work vectors for trial residual evaluations.
+        try:
+            self._inf_ls_x_trial = x_red.duplicate()
+            self._inf_ls_r_trial = r_red.duplicate()
+        except Exception:
+            return
+
+        # Pre-check tuning via env vars (keep conservative defaults).
+        try:
+            max_tries = int(os.getenv("PYCUTFEM_SNES_INF_LS_MAX_TRIES", "8"))
+        except Exception:
+            max_tries = 8
+        max_tries = max(1, min(20, int(max_tries)))
+        try:
+            reduction = float(os.getenv("PYCUTFEM_SNES_INF_LS_REDUCTION", "0.5"))
+        except Exception:
+            reduction = 0.5
+        if not (0.0 < reduction < 1.0):
+            reduction = 0.5
+
+        x_trial = self._inf_ls_x_trial
+        r_trial = self._inf_ls_r_trial
+
+        def _precheck(x: PETSc.Vec, y: PETSc.Vec, *args, **kwargs):  # noqa: ANN001
+            # Guard: if direction is zero, nothing to do.
+            try:
+                y_inf = float(y.norm(PETSc.NormType.NORM_INFINITY))
+            except Exception:
+                y_inf = float("nan")
+            if not (np.isfinite(y_inf) and y_inf > 0.0):
+                return False
+
+            # Current infinity norm (try to reuse SNES' stored function vector).
+            try:
+                f_vec, _ctx = snes.getFunction()
+                norm0 = float(f_vec.norm(PETSc.NormType.NORM_INFINITY))
+            except Exception:
+                try:
+                    snes.computeFunction(x, r_red)
+                    norm0 = float(r_red.norm(PETSc.NormType.NORM_INFINITY))
+                except Exception:
+                    norm0 = float("nan")
+            if not np.isfinite(norm0):
+                return False
+
+            # First try the full Newton step (α=1). If it already decreases the
+            # ∞-norm, do not interfere with PETSc's native globalization (keeps
+            # overhead low and avoids overly conservative damping).
+            try:
+                x_trial.waxpy(-1.0, y, x)
+                snes.computeFunction(x_trial, r_trial)
+                n_full = float(r_trial.norm(PETSc.NormType.NORM_INFINITY))
+            except Exception:
+                n_full = float("nan")
+            if np.isfinite(n_full) and n_full <= float(norm0):
+                return False
+
+            alpha = 1.0
+            best_alpha = 0.0
+            best_norm = float(norm0)
+            smallest_tried: float | None = None
+            if np.isfinite(n_full):
+                best_alpha = 1.0
+                best_norm = float(n_full)
+
+            # Try a short backtracking sequence and pick the best trial.
+            # If nothing improves, apply the smallest alpha to avoid blow-ups
+            # that can trigger DIVERGED_LINE_SEARCH.
+            for _ in range(max_tries - 1):
+                try:
+                    alpha *= float(reduction)
+                    smallest_tried = float(alpha)
+                    x_trial.waxpy(-alpha, y, x)  # x_trial = x - α y
+                    snes.computeFunction(x_trial, r_trial)
+                    n_try = float(r_trial.norm(PETSc.NormType.NORM_INFINITY))
+                except Exception:
+                    n_try = float("nan")
+
+                if np.isfinite(n_try) and n_try < best_norm:
+                    best_norm = float(n_try)
+                    best_alpha = float(alpha)
+
+                if alpha <= 0.0:
+                    break
+
+            if best_alpha <= 0.0:
+                best_alpha = float(smallest_tried) if smallest_tried is not None else float(reduction)
+
+            # Only scale if we are actually damping.
+            if best_alpha < 1.0 - 1.0e-14:
+                try:
+                    y.scale(best_alpha)
+                    return True
+                except Exception:
+                    return False
+            return False
+
+        try:
+            snes.setLineSearchPreCheck(_precheck)
+            self._inf_ls_precheck_installed = True
+        except Exception:
+            # If this fails, do not block the solve; proceed with PETSc defaults.
+            self._inf_ls_precheck_installed = False
 
 
     # ------------------------------------------------------------------ #
@@ -1308,16 +10172,47 @@ class PetscSnesNewtonSolver(NewtonSolver):
     # ------------------------------------------------------------------ #
     def _newton_loop(self, funcs, prev_funcs, aux_funcs, bcs_now):
         dh = self.dh
+        self._current_bcs = bcs_now
         comm = PETSc.COMM_WORLD
 
-        # Ensure we have the reduced pattern/active dofs
-        if getattr(self, "_pattern_stale", True) or not hasattr(self, "_csr_indptr"):
-            self._build_reduced_pattern()
+        pattern_was_stale = getattr(self, "_pattern_stale", True) or not hasattr(self, "_csr_indptr")
 
         # Apply BCs to the current iterate and form the reduced initial guess
         dh.apply_bcs(bcs_now, *funcs)
-        x0_full = np.hstack([f.nodal_values for f in funcs]).copy()
-        x0_red = x0_full[self.active_dofs].copy()
+        if getattr(self, "constraints", None) is not None:
+            self._enforce_constraints_on_functions(funcs)
+        x0_full = self._gather_full_iterate(funcs)
+
+        # Assemble once to prune any decoupled rows/cols (matches Python Newton behavior).
+        current: Dict[str, "Function"] = {f.name: f for f in funcs}
+        current.update({f.name: f for f in prev_funcs})
+        if aux_funcs:
+            current.update(aux_funcs)
+        ndof_eff = getattr(self.restrictor, "full_size", dh.total_dofs)
+        A_red, R_red = self._assemble_system_reduced(current, need_matrix=True)
+        A_red, R_red, pruned, _extra_asm = self._prune_decoupled_rows_cols(
+            current, A_red, R_red, ndof_eff
+        )
+        if pattern_was_stale or pruned:
+            self._invalidate_petsc_cache()
+        # Ensure we have a CSR sparsity pattern for PETSc preallocation even on the
+        # Python backend (where we don't build the pattern from kernels).
+        try:
+            if A_red is not None:
+                if not sp.isspmatrix_csr(A_red):
+                    A_red = A_red.tocsr()
+                self._csr_indptr = A_red.indptr.copy()
+                self._csr_indices = A_red.indices.copy()
+                self._pattern_stale = False
+        except Exception:
+            pass
+
+        if getattr(self, "constraints", None) is not None:
+            master_ids = np.asarray(self.constraints.master_ids, dtype=int)
+            x0_master = x0_full[master_ids]
+            x0_red = x0_master[self.active_dofs].copy()
+        else:
+            x0_red = x0_full[self.active_dofs].copy()
 
         # Context for callbacks
         self._petsc_ctx = dict(
@@ -1337,24 +10232,126 @@ class PetscSnesNewtonSolver(NewtonSolver):
             hi = self._XU.getArray(readonly=True)
             x0_red = np.minimum(np.maximum(x0_red, lo), hi)
 
+        x0_red_guess = np.asarray(x0_red, dtype=float).copy()
         self._x_red.setValues(idx, x0_red, addv=PETSc.InsertMode.INSERT_VALUES)
         self._x_red.assemblyBegin(); self._x_red.assemblyEnd()
 
+        # Keep SNES tolerances in sync with `NewtonParameters`. This allows runtime
+        # adjustments (e.g. temporary max-it boosts) via callbacks without needing
+        # to recreate the SNES object.
+        try:
+            self._snes.setTolerances(
+                rtol=float(getattr(self.np, "newton_rtol", 0.0) or 0.0),
+                atol=float(getattr(self.np, "newton_tol", 0.0) or 0.0),
+                max_it=int(getattr(self.np, "max_newton_iter", 0) or 0),
+            )
+        except Exception:
+            pass
 
         # Solve the nonlinear system on the reduced space
         self._snes.solve(None, self._x_red)
+        reason_snes = int(self._snes.getConvergedReason())
+        reason = int(reason_snes)
+        converged = reason_snes > 0
+        accepted = False
+        n_iters = int(self._snes.getIterationNumber())
+        # Re-evaluate the residual at the *returned* iterate. In particular for
+        # DIVERGED_LINE_SEARCH (-6), PETSc can exit with a solution vector that
+        # does not match the last stored function vector.
+        fnorm = float("nan")
+        fnorm_snes = float("nan")
+        try:
+            self._snes.computeFunction(self._x_red, self._r_red)
+            fnorm = float(self._r_red.norm(PETSc.NormType.NORM_INFINITY))
+            fnorm_snes = float(self._r_red.norm(PETSc.NormType.NORM_2))
+        except Exception:
+            try:
+                fnorm_snes = float(self._snes.getFunctionNorm())
+            except Exception:
+                fnorm_snes = float("nan")
+            try:
+                f_vec, _ctx = self._snes.getFunction()
+                fnorm = float(f_vec.norm(PETSc.NormType.NORM_INFINITY))
+            except Exception:
+                fnorm = float(fnorm_snes)
+
+        # PETSc may report a nonconverged reason (e.g. DIVERGED_MAX_IT) even when the
+        # returned iterate already satisfies our intended infinity-norm tolerance.
+        # Treat such cases as converged by our criterion (does not relax tolerances).
+        atol = float(getattr(self.np, "newton_tol", 0.0) or 0.0)
+        rtol = float(getattr(self.np, "newton_rtol", 0.0) or 0.0)
+        tol_met_abs = bool(atol > 0.0 and np.isfinite(fnorm) and float(fnorm) <= float(atol))
+        tol_met_rel = False  # rtol currently handled by SNES convergence tests (if enabled)
+        if not converged and (tol_met_abs or tol_met_rel):
+            try:
+                conv_abs = int(getattr(PETSc.SNES.ConvergedReason, "CONVERGED_FNORM_ABS", 2))
+            except Exception:
+                conv_abs = 2
+            print(
+                f"    [warn] SNES returned reason={reason_snes} after {n_iters} iters, but ‖F‖_inf={fnorm:.3e} ≤ atol={atol:.3e}; "
+                "treating as converged."
+            )
+            converged = True
+            reason = int(conv_abs)
+
+        # Expose convergence diagnostics to the outer time-stepper.
+        self._last_nonlinear_norm = float(fnorm)
+        self._last_nonlinear_norm_label = "‖F‖_inf"
+        self._last_nonlinear_reason = int(reason)
+        if not converged:
+            # Ensure norms correspond to the returned iterate.
+            try:
+                self._snes.computeFunction(self._x_red, self._r_red)
+                fnorm = float(self._r_red.norm(PETSc.NormType.NORM_INFINITY))
+                fnorm_snes = float(self._r_red.norm(PETSc.NormType.NORM_2))
+            except Exception:
+                pass
+            accept_factor = float(getattr(self.np, "accept_nonconverged_atol_factor", 0.0) or 0.0)
+            accept_step = bool(
+                accept_factor > 0.0
+                and atol > 0.0
+                and np.isfinite(fnorm)
+                and fnorm <= accept_factor * atol
+            )
+            print(
+                f"    [warn] SNES did not converge (reason={reason_snes}, iters={n_iters}, ‖F‖_inf={fnorm:.3e}, ‖F‖_2={fnorm_snes:.3e}). "
+                "Continuing with best iterate."
+            )
+            if accept_step:
+                print(
+                    f"    [warn] Accepting SNES best iterate since ‖F‖_inf={fnorm:.3e} ≤ {accept_factor:g}·atol "
+                    f"(atol={atol:.3e})."
+                )
+                converged = True
+                accepted = True
 
         # Write back the absolute solution (not an increment)
         x_fin = self._x_red.getArray(readonly=True)
-        new_full = x0_full.copy()
-        new_full[self.active_dofs] = x_fin
+        try:
+            dx_inf = float(np.linalg.norm(np.asarray(x_fin, dtype=float) - x0_red_guess, ord=np.inf))
+        except Exception:
+            dx_inf = float("nan")
+        self._last_nonlinear_update_inf = float(dx_inf)
+        self._last_nonlinear_update_label = "Δx_snes∞"
+        self._last_nonlinear_accepted = bool(accepted)
+        if getattr(self, "constraints", None) is not None:
+            master_ids = np.asarray(self.constraints.master_ids, dtype=int)
+            new_master = x0_full[master_ids].copy()
+            new_master[self.active_dofs] = np.asarray(x_fin, dtype=float)
+            new_full = self.constraints.prolong(new_master)
+        else:
+            new_full = x0_full.copy()
+            new_full[self.active_dofs] = np.asarray(x_fin, dtype=float)
         for f in funcs:
             g = f._g_dofs
             f.set_nodal_values(g, new_full[g])
         dh.apply_bcs(bcs_now, *funcs)
+        if getattr(self, "constraints", None) is not None:
+            self._enforce_constraints_on_functions(funcs)
 
         prev_vals = np.hstack([f.nodal_values for f in prev_funcs])
-        return np.hstack([f.nodal_values for f in funcs]) - prev_vals
+        delta = np.hstack([f.nodal_values for f in funcs]) - prev_vals
+        return delta, converged, n_iters
 
     # ------------------------------------------------------------------ #
     # SNES callbacks: residual and Jacobian on the reduced space
@@ -1363,14 +10360,27 @@ class PetscSnesNewtonSolver(NewtonSolver):
         ctx = self._petsc_ctx
 
         # Lift reduced iterate to full space on a fresh copy, then apply BCs
-        x_full = ctx["x0_full"].copy()
-        x_full[self.active_dofs] = x_red.getArray(readonly=True)
+        x_fin = np.asarray(x_red.getArray(readonly=True), dtype=float)
+        if getattr(self, "constraints", None) is not None:
+            master_ids = np.asarray(self.constraints.master_ids, dtype=int)
+            master = ctx["x0_full"][master_ids].copy()
+            master[self.active_dofs] = x_fin
+            x_full = self.constraints.prolong(master)
+        else:
+            x_full = ctx["x0_full"].copy()
+            x_full[self.active_dofs] = x_fin
 
-        res_funcs = [f.copy() for f in ctx["funcs"]]
+        # IMPORTANT: the pure-Python backend assembles forms using the Function
+        # objects that were captured when the UFL expression was built. In that
+        # mode, assembling on copies would ignore updated coefficients and
+        # produce a constant residual, which breaks SNES line-search.
+        res_funcs = ctx["funcs"] if self.backend == "python" else [f.copy() for f in ctx["funcs"]]
         for f in res_funcs:
             g = f._g_dofs
             f.set_nodal_values(g, x_full[g])
         self.dh.apply_bcs(ctx["bcs_now"], *res_funcs)
+        if getattr(self, "constraints", None) is not None:
+            self._enforce_constraints_on_functions(res_funcs)
 
         coeffs = {f.name: f for f in res_funcs}
         coeffs.update({f.name: f for f in ctx["prev_funcs"]})
@@ -1389,14 +10399,23 @@ class PetscSnesNewtonSolver(NewtonSolver):
     def _eval_jacobian_reduced(self, snes, x_red: PETSc.Vec, J: PETSc.Mat, P: PETSc.Mat):
         ctx = self._petsc_ctx
 
-        x_full = ctx["x0_full"].copy()
-        x_full[self.active_dofs] = x_red.getArray(readonly=True)
+        x_fin = np.asarray(x_red.getArray(readonly=True), dtype=float)
+        if getattr(self, "constraints", None) is not None:
+            master_ids = np.asarray(self.constraints.master_ids, dtype=int)
+            master = ctx["x0_full"][master_ids].copy()
+            master[self.active_dofs] = x_fin
+            x_full = self.constraints.prolong(master)
+        else:
+            x_full = ctx["x0_full"].copy()
+            x_full[self.active_dofs] = x_fin
 
-        jac_funcs = [f.copy() for f in ctx["funcs"]]
+        jac_funcs = ctx["funcs"] if self.backend == "python" else [f.copy() for f in ctx["funcs"]]
         for f in jac_funcs:
             g = f._g_dofs
             f.set_nodal_values(g, x_full[g])
         self.dh.apply_bcs(ctx["bcs_now"], *jac_funcs)
+        if getattr(self, "constraints", None) is not None:
+            self._enforce_constraints_on_functions(jac_funcs)
 
         coeffs = {f.name: f for f in jac_funcs}
         coeffs.update({f.name: f for f in ctx["prev_funcs"]})
@@ -1462,8 +10481,19 @@ class PetscSnesNewtonSolver(NewtonSolver):
             for fld in fields:
                 full_idx.extend(self.dh.get_field_slice(fld))
             full_idx = np.array(sorted(full_idx), dtype=int)
-            red_idx = self.full_to_red[full_idx]
-            red_idx = red_idx[red_idx >= 0]
+            if getattr(self, "constraints", None) is not None:
+                red_idx_list = []
+                for gd in full_idx:
+                    mcol = self.constraints.master_index_for(int(gd))
+                    if mcol is None:
+                        continue
+                    ridx = self.full_to_red[mcol]
+                    if ridx >= 0:
+                        red_idx_list.append(int(ridx))
+                red_idx = np.array(sorted(set(red_idx_list)), dtype=int)
+            else:
+                red_idx = self.full_to_red[full_idx]
+                red_idx = red_idx[red_idx >= 0]
             iset = PETSc.IS().createGeneral(red_idx.astype(PETSc.IntType))
             blocks.append((name, iset))
 
@@ -1495,7 +10525,7 @@ class PetscSnesNewtonSolver(NewtonSolver):
         mesh = dh.mixed_element.mesh
 
         # 1) Coordinates and level-set at DOFs
-        X = dh.get_all_dof_coords()                  # shape (total_dofs, 2)  :contentReference[oaicite:3]{index=3}
+        X = dh.get_all_dof_coords()                  # shape (total_dofs, 2)
         phi = level_set(X)
 
         # 2) Choose band half-width in physical units
@@ -1541,43 +10571,7269 @@ class PetscSnesNewtonSolver(NewtonSolver):
 
         # Leave pressure (or other fields) unbounded by simply not touching them.
         # Store for SNES setup; they’ll be reduced to the active/free DOFs later.
-        self.set_box_bounds(lower=lo_full, upper=hi_full)     # uses existing API  :contentReference[oaicite:4]{index=4}
+        self.set_box_bounds(lower=lo_full, upper=hi_full)     # uses existing API
+
+
+# --------------------------------------------------------------------------
+#  Internal PDAS / Semismooth Newton solver for box VIs
+# --------------------------------------------------------------------------
+
+class PdasNewtonSolver(NewtonSolver):
+    """
+    Internal Primal-Dual Active Set (PDAS) / semismooth Newton solver for
+    box-constrained variational inequalities:
+
+        find x in [lo, hi] such that 0 in F(x) + N_[lo,hi](x)
+
+    This solver reuses pycutfem's reduced assembly pipeline and PETSc-backed
+    linear solves (via LinearSolverParameters.backend='petsc').
+    """
+
+    def __init__(self, *args, vi_params: VIParameters = VIParameters(), **kwargs):
+        super().__init__(*args, **kwargs)
+        self.vi_params = vi_params
+        self._box_lower_full: np.ndarray | None = None
+        self._box_upper_full: np.ndarray | None = None
+        self._vi_prev_state: np.ndarray | None = None
+        self._vi_pending_state: np.ndarray | None = None
+        self._vi_pending_count: np.ndarray | None = None
+        self._vi_lambda_current: float = float(getattr(self.vi_params, "inactive_reg_lambda0", 0.0) or 0.0)
+        self._vi_lm_lambda_current: float = float(getattr(self.vi_params, "unconstrained_lm_lambda0", 1.0e-4) or 1.0e-4)
+        self._vi_last_metrics: dict[str, float] | None = None
+        self._vi_last_retry_count: int = 0
+        self._vi_red_field_names = self._build_vi_reduced_field_names()
+        self._vi_linear_equalities: list[LinearEqualityConstraint] = []
+        self._vi_eq_lambda_accepted: np.ndarray = np.zeros((0,), dtype=float)
+        self._vi_eq_lambda_current: np.ndarray = np.zeros((0,), dtype=float)
+        self._vi_eq_current: _PreparedLinearEqualities | None = None
+        self._vi_forced_state: np.ndarray | None = None
+        self._vi_preserve_state_on_next_solve: bool = False
+        self._vi_working_set_guard_state: np.ndarray | None = None
+        self._vi_working_set_guard_remaining: int = 0
+        self._vi_working_set_guard_active: np.ndarray | None = None
+        self._vi_ptc_sigma_current: float = 0.0
+        self._vi_anderson_history: list[dict[str, np.ndarray]] = []
+        self._vi_row_scale_current: np.ndarray | None = None
+        self._vi_row_scale_field_current: dict[str, float] = {}
+
+    @staticmethod
+    def _merge_vi_field_names(*groups: Sequence[str] | tuple[str, ...]) -> tuple[str, ...]:
+        merged: list[str] = []
+        seen: set[str] = set()
+        for group in groups:
+            for name in tuple(group or ()):
+                key = str(name).strip()
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                merged.append(key)
+        return tuple(merged)
+
+    def configure_identified_manifold_recovery(
+        self,
+        *,
+        proximal_fields: Sequence[str] = (),
+        ptc_fields: Sequence[str] = (),
+        arm_initial: bool = False,
+    ) -> None:
+        """
+        Enable the semismooth recovery package used by hard bounded monolithic
+        problems once the active set starts to stall or chatter.
+
+        This is intentionally a *preset* over the existing VI knobs rather than
+        a second solver path. It wires together the already-implemented local
+        affine rescue, field-proximal recovery, identified-manifold PTC, and
+        Anderson acceleration with values that are conservative on easy steps
+        and only activate when the semismooth solve stops making useful
+        progress.
+        """
+        self.vi_params.affine_cycle_fallback = True
+        self.vi_params.project_each_iteration = True
+        self.vi_params.accept_best_filtered_descent = True
+        self.vi_params.line_search_nonmonotone_window = max(
+            int(getattr(self.vi_params, "line_search_nonmonotone_window", 0) or 0),
+            5,
+        )
+        self.vi_params.line_search_nonmonotone_active_stable_iters = max(
+            int(getattr(self.vi_params, "line_search_nonmonotone_active_stable_iters", 0) or 0),
+            1,
+        )
+        self.vi_params.line_search_nonmonotone_ginf_trigger = max(
+            float(getattr(self.vi_params, "line_search_nonmonotone_ginf_trigger", 0.0) or 0.0),
+            2.5,
+        )
+        self.vi_params.line_search_nonmonotone_gap_ratio = max(
+            float(getattr(self.vi_params, "line_search_nonmonotone_gap_ratio", 1.0) or 1.0),
+            1.0,
+        )
+        self.vi_params.line_search_nonmonotone_eq_abs = max(
+            float(getattr(self.vi_params, "line_search_nonmonotone_eq_abs", 1.0e-10) or 1.0e-10),
+            1.0e-10,
+        )
+        self.vi_params.line_search_nonmonotone_disable_filter = True
+
+        prox_fields = self._merge_vi_field_names(
+            getattr(self.vi_params, "field_proximal_recovery_fields", ()) or (),
+            proximal_fields,
+        )
+        self.vi_params.field_proximal_recovery = True
+        self.vi_params.field_proximal_recovery_fields = prox_fields
+        self.vi_params.field_proximal_recovery_lambda0 = max(
+            float(getattr(self.vi_params, "field_proximal_recovery_lambda0", 1.0e-3) or 1.0e-3),
+            1.0e-2,
+        )
+        self.vi_params.field_proximal_recovery_lambda_max = max(
+            float(getattr(self.vi_params, "field_proximal_recovery_lambda_max", 1.0e6) or 1.0e6),
+            1.0e8,
+        )
+        self.vi_params.field_proximal_recovery_growth = max(
+            float(getattr(self.vi_params, "field_proximal_recovery_growth", 10.0) or 10.0),
+            5.0,
+        )
+        self.vi_params.field_proximal_recovery_max_tries = max(
+            int(getattr(self.vi_params, "field_proximal_recovery_max_tries", 6) or 6),
+            6,
+        )
+        self.vi_params.field_proximal_recovery_stable_iters = 0
+        self.vi_params.field_proximal_recovery_gap_ratio = max(
+            float(getattr(self.vi_params, "field_proximal_recovery_gap_ratio", 1.0) or 1.0),
+            1.0,
+        )
+        self.vi_params.field_proximal_recovery_eq_abs = max(
+            float(getattr(self.vi_params, "field_proximal_recovery_eq_abs", 1.0e-10) or 1.0e-10),
+            1.0e-10,
+        )
+        self.vi_params.field_proximal_recovery_identified_window = True
+        self.vi_params.field_proximal_recovery_ginf_max = max(
+            float(getattr(self.vi_params, "field_proximal_recovery_ginf_max", 0.0) or 0.0),
+            5.0,
+        )
+
+        ptc_fields_merged = self._merge_vi_field_names(
+            getattr(self.vi_params, "ptc_fields", ()) or (),
+            ptc_fields,
+        )
+        self.vi_params.ptc_recovery = True
+        self.vi_params.ptc_fields = ptc_fields_merged
+        self.vi_params.ptc_sigma0 = max(
+            float(getattr(self.vi_params, "ptc_sigma0", 1.0e-2) or 1.0e-2),
+            5.0e-2,
+        )
+        self.vi_params.ptc_sigma_max = max(
+            float(getattr(self.vi_params, "ptc_sigma_max", 1.0e6) or 1.0e6),
+            1.0e8,
+        )
+        self.vi_params.ptc_growth = max(
+            float(getattr(self.vi_params, "ptc_growth", 5.0) or 5.0),
+            5.0,
+        )
+        self.vi_params.ptc_decay = min(
+            max(float(getattr(self.vi_params, "ptc_decay", 0.5) or 0.5), 0.0),
+            0.5,
+        )
+        self.vi_params.ptc_stable_iters = 0
+        self.vi_params.ptc_gap_ratio = max(
+            float(getattr(self.vi_params, "ptc_gap_ratio", 1.0) or 1.0),
+            1.0,
+        )
+        self.vi_params.ptc_eq_abs = max(
+            float(getattr(self.vi_params, "ptc_eq_abs", 1.0e-10) or 1.0e-10),
+            1.0e-10,
+        )
+        self.vi_params.ptc_identified_window = True
+        self.vi_params.ptc_ginf_max = max(
+            float(getattr(self.vi_params, "ptc_ginf_max", 0.0) or 0.0),
+            5.0,
+        )
+        self.vi_params.ptc_freeze_complement = False
+
+        self.vi_params.anderson_acceleration = True
+        self.vi_params.anderson_history = max(
+            int(getattr(self.vi_params, "anderson_history", 3) or 3),
+            3,
+        )
+        self.vi_params.anderson_regularization = max(
+            float(getattr(self.vi_params, "anderson_regularization", 1.0e-10) or 1.0e-10),
+            1.0e-10,
+        )
+        self.vi_params.anderson_damping = min(
+            max(float(getattr(self.vi_params, "anderson_damping", 1.0) or 1.0), 0.25),
+            0.9,
+        )
+        self.vi_params.anderson_stable_iters = 1
+        self.vi_params.anderson_ginf_trigger = max(
+            float(getattr(self.vi_params, "anderson_ginf_trigger", 0.0) or 0.0),
+            5.0e-2,
+        )
+        self.vi_params.anderson_gap_ratio = max(
+            float(getattr(self.vi_params, "anderson_gap_ratio", 1.0) or 1.0),
+            1.0,
+        )
+        self.vi_params.anderson_eq_abs = max(
+            float(getattr(self.vi_params, "anderson_eq_abs", 1.0e-10) or 1.0e-10),
+            1.0e-10,
+        )
+        self.vi_params.anderson_ginf_max = max(
+            float(getattr(self.vi_params, "anderson_ginf_max", 0.0) or 0.0),
+            5.0,
+        )
+
+        if arm_initial:
+            if prox_fields and self.vi_params.field_proximal_recovery_lambda0 > 0.0:
+                self._vi_force_initial_field_prox_lambda = max(
+                    float(getattr(self, "_vi_force_initial_field_prox_lambda", 0.0) or 0.0),
+                    float(self.vi_params.field_proximal_recovery_lambda0),
+                )
+            if ptc_fields_merged and self.vi_params.ptc_sigma0 > 0.0:
+                self._vi_force_initial_ptc_sigma = max(
+                    float(getattr(self, "_vi_force_initial_ptc_sigma", 0.0) or 0.0),
+                    float(self.vi_params.ptc_sigma0),
+                )
+
+    def set_linear_equalities(self, equalities: list[LinearEqualityConstraint] | None = None) -> None:
+        cleaned: list[LinearEqualityConstraint] = []
+        for eq in list(equalities or []):
+            if not isinstance(eq, LinearEqualityConstraint):
+                raise TypeError("set_linear_equalities expects LinearEqualityConstraint entries.")
+            w = None
+            if eq.weights_full is not None:
+                w = np.asarray(eq.weights_full, dtype=float).ravel()
+                if int(w.size) != int(self.dh.total_dofs):
+                    raise ValueError(
+                        f"Linear equality '{eq.name}' has weights size {int(w.size)}, "
+                        f"expected {int(self.dh.total_dofs)}."
+                    )
+            if w is None and not callable(eq.weights_callback):
+                raise ValueError(
+                    f"Linear equality '{eq.name}' needs either weights_full or weights_callback."
+                )
+            cleaned.append(
+                LinearEqualityConstraint(
+                    name=str(eq.name),
+                    weights_full=(None if w is None else w.copy()),
+                    target=None if eq.target is None else float(eq.target),
+                    target_callback=eq.target_callback,
+                    weights_callback=eq.weights_callback,
+                    field_name=None if eq.field_name is None else str(eq.field_name),
+                    project_feasible=bool(eq.project_feasible),
+                )
+            )
+        self._vi_linear_equalities = cleaned
+        self._vi_eq_lambda_accepted = np.zeros((len(cleaned),), dtype=float)
+        self._vi_eq_lambda_current = self._vi_eq_lambda_accepted.copy()
+        self._vi_eq_current = None
+
+    def export_vi_state(self) -> dict[str, np.ndarray] | None:
+        prev_state = getattr(self, "_vi_prev_state", None)
+        active_dofs = np.asarray(getattr(self, "active_dofs", np.array([], dtype=int)), dtype=int).ravel()
+        if active_dofs.size == 0:
+            return None
+        state: dict[str, np.ndarray] = {
+            "active_dofs": active_dofs.copy(),
+        }
+        exported_any = False
+        if prev_state is not None:
+            state["prev_state"] = np.asarray(prev_state, dtype=np.int8).copy()
+            exported_any = True
+        pending_state = getattr(self, "_vi_pending_state", None)
+        pending_count = getattr(self, "_vi_pending_count", None)
+        forced_state = getattr(self, "_vi_forced_state", None)
+        guard_state = getattr(self, "_vi_working_set_guard_state", None)
+        guard_active = getattr(self, "_vi_working_set_guard_active", None)
+        guard_remaining = int(getattr(self, "_vi_working_set_guard_remaining", 0) or 0)
+        if prev_state is not None and pending_state is not None and np.asarray(pending_state).shape == np.asarray(prev_state).shape:
+            state["pending_state"] = np.asarray(pending_state, dtype=np.int8).copy()
+            exported_any = True
+        if prev_state is not None and pending_count is not None and np.asarray(pending_count).shape == np.asarray(prev_state).shape:
+            state["pending_count"] = np.asarray(pending_count, dtype=np.int16).copy()
+            exported_any = True
+        if prev_state is not None and forced_state is not None and np.asarray(forced_state).shape == np.asarray(prev_state).shape:
+            state["forced_state"] = np.asarray(forced_state, dtype=np.int8).copy()
+            exported_any = True
+        if prev_state is not None and guard_state is None and guard_active is not None and np.asarray(guard_active).shape == np.asarray(prev_state).shape:
+            guard_state = np.asarray(guard_active, dtype=np.int8).copy()
+            guard_remaining = max(guard_remaining, 1)
+        if prev_state is not None and guard_state is not None and np.asarray(guard_state).shape == np.asarray(prev_state).shape:
+            state["guard_state"] = np.asarray(guard_state, dtype=np.int8).copy()
+            state["guard_remaining"] = np.asarray([max(guard_remaining, 0)], dtype=np.int32)
+            exported_any = True
+
+        eq_lambda_accepted = np.asarray(getattr(self, "_vi_eq_lambda_accepted", np.array([], dtype=float)), dtype=float).ravel()
+        if eq_lambda_accepted.size > 0:
+            state["vi_eq_lambda_accepted"] = eq_lambda_accepted.copy()
+            exported_any = True
+
+        ipm_z_lo = getattr(self, "_ipm_z_lo_current", None)
+        ipm_z_hi = getattr(self, "_ipm_z_hi_current", None)
+        if (
+            ipm_z_lo is not None
+            and ipm_z_hi is not None
+            and np.asarray(ipm_z_lo).shape == active_dofs.shape
+            and np.asarray(ipm_z_hi).shape == active_dofs.shape
+        ):
+            state["ipm_z_lo"] = np.asarray(ipm_z_lo, dtype=float).copy()
+            state["ipm_z_hi"] = np.asarray(ipm_z_hi, dtype=float).copy()
+            state["ipm_mu"] = np.asarray(
+                [float(getattr(self, "_ipm_mu_current", 0.0) or 0.0)],
+                dtype=float,
+            )
+            exported_any = True
+
+        return state if exported_any else None
+
+    def import_vi_state(
+        self,
+        state: dict[str, np.ndarray] | None,
+        *,
+        force_once: bool = True,
+    ) -> bool:
+        if not state:
+            return False
+        src_active = np.asarray(state.get("active_dofs", np.array([], dtype=int)), dtype=int).ravel()
+        if src_active.size == 0:
+            return False
+        tgt_active = np.asarray(self.active_dofs, dtype=int).ravel()
+        if tgt_active.size == 0:
+            return False
+        src_prev_raw = state.get("prev_state", None)
+        has_prev_state = src_prev_raw is not None
+        src_prev = np.asarray(
+            src_prev_raw if src_prev_raw is not None else np.array([], dtype=np.int8),
+            dtype=np.int8,
+        ).ravel()
+        if has_prev_state and src_prev.size != src_active.size:
+            return False
+        src_z_lo = np.asarray(state.get("ipm_z_lo", np.array([], dtype=float)), dtype=float).ravel()
+        src_z_hi = np.asarray(state.get("ipm_z_hi", np.array([], dtype=float)), dtype=float).ravel()
+        has_ipm_state = src_z_lo.size == src_active.size and src_z_hi.size == src_active.size
+        src_eq_lambda = np.asarray(state.get("vi_eq_lambda_accepted", np.array([], dtype=float)), dtype=float).ravel()
+        try:
+            src_ipm_mu = float(np.asarray(state.get("ipm_mu", np.array([0.0], dtype=float))).ravel()[0])
+        except Exception:
+            src_ipm_mu = 0.0
+
+        src_pending = np.asarray(state.get("pending_state", src_prev), dtype=np.int8).ravel()
+        if not has_prev_state or src_pending.size != src_active.size:
+            src_pending = src_prev.copy()
+        src_counts = np.asarray(
+            state.get("pending_count", np.zeros(src_active.shape, dtype=np.int16)),
+            dtype=np.int16,
+        ).ravel()
+        if not has_prev_state or src_counts.size != src_active.size:
+            src_counts = np.zeros(src_active.shape, dtype=np.int16)
+        src_forced = np.asarray(state.get("forced_state", src_prev), dtype=np.int8).ravel()
+        if not has_prev_state or src_forced.size != src_active.size:
+            src_forced = src_prev.copy()
+        src_guard = np.asarray(state.get("guard_state", np.zeros(src_active.shape, dtype=np.int8)), dtype=np.int8).ravel()
+        if not has_prev_state or src_guard.size != src_active.size:
+            src_guard = np.zeros(src_active.shape, dtype=np.int8)
+        try:
+            src_guard_remaining = int(np.asarray(state.get("guard_remaining", np.array([0], dtype=np.int32))).ravel()[0])
+        except Exception:
+            src_guard_remaining = 0
+
+        tgt_lookup = {int(gdof): idx for idx, gdof in enumerate(tgt_active.tolist())}
+        imported_prev = np.zeros((tgt_active.size,), dtype=np.int8)
+        imported_pending = np.zeros((tgt_active.size,), dtype=np.int8)
+        imported_counts = np.zeros((tgt_active.size,), dtype=np.int16)
+        imported_forced = np.zeros((tgt_active.size,), dtype=np.int8)
+        imported_guard = np.zeros((tgt_active.size,), dtype=np.int8)
+        imported_z_lo = np.zeros((tgt_active.size,), dtype=float)
+        imported_z_hi = np.zeros((tgt_active.size,), dtype=float)
+
+        matched = 0
+        for src_idx, gdof in enumerate(src_active.tolist()):
+            tgt_idx = tgt_lookup.get(int(gdof))
+            if tgt_idx is None:
+                continue
+            if has_prev_state:
+                imported_prev[tgt_idx] = np.int8(src_prev[src_idx])
+                imported_pending[tgt_idx] = np.int8(src_pending[src_idx])
+                imported_counts[tgt_idx] = np.int16(src_counts[src_idx])
+                imported_forced[tgt_idx] = np.int8(src_forced[src_idx])
+                imported_guard[tgt_idx] = np.int8(src_guard[src_idx])
+            if has_ipm_state:
+                imported_z_lo[tgt_idx] = float(src_z_lo[src_idx])
+                imported_z_hi[tgt_idx] = float(src_z_hi[src_idx])
+            matched += 1
+
+        if matched <= 0:
+            return False
+
+        imported_any = False
+        if has_prev_state:
+            self._vi_prev_state = imported_prev
+            self._vi_pending_state = imported_pending
+            self._vi_pending_count = imported_counts
+            self._vi_forced_state = imported_forced if force_once else None
+            if src_guard_remaining > 0 and np.any(imported_guard != 0):
+                self._vi_working_set_guard_state = imported_guard.copy()
+                self._vi_working_set_guard_remaining = int(src_guard_remaining)
+                self._vi_working_set_guard_active = None
+            else:
+                self._vi_clear_working_set_guard()
+            self._vi_preserve_state_on_next_solve = True
+            imported_any = True
+
+        ipm_payload: dict[str, np.ndarray | float] = {}
+        if has_ipm_state:
+            ipm_payload["z_lo"] = imported_z_lo.copy()
+            ipm_payload["z_hi"] = imported_z_hi.copy()
+            ipm_payload["mu"] = float(src_ipm_mu)
+            imported_any = True
+        if src_eq_lambda.size > 0:
+            ipm_payload["eq_lambda"] = np.asarray(src_eq_lambda, dtype=float).copy()
+            imported_any = True
+        if ipm_payload:
+            if force_once:
+                self._ipm_forced_state = ipm_payload
+            else:
+                z_lo_now = ipm_payload.get("z_lo", None)
+                z_hi_now = ipm_payload.get("z_hi", None)
+                if z_lo_now is not None and z_hi_now is not None:
+                    self._ipm_z_lo_current = np.asarray(z_lo_now, dtype=float).copy()
+                    self._ipm_z_hi_current = np.asarray(z_hi_now, dtype=float).copy()
+                if "mu" in ipm_payload:
+                    self._ipm_mu_current = float(ipm_payload["mu"])
+                eq_now = ipm_payload.get("eq_lambda", None)
+                if eq_now is not None:
+                    eq_arr = np.asarray(eq_now, dtype=float).ravel()
+                    if int(eq_arr.size) == int(getattr(self, "_vi_eq_lambda_accepted", np.array([], dtype=float)).size):
+                        self._vi_eq_lambda_accepted = eq_arr.copy()
+                        self._vi_eq_lambda_current = eq_arr.copy()
+        return imported_any
+
+    def _build_vi_reduced_field_names(self) -> np.ndarray:
+        names: list[str] = []
+        full_to_field = getattr(self.dh, "_dof_to_node_map", {})
+        master_ids = None
+        if getattr(self, "constraints", None) is not None:
+            try:
+                master_ids = np.asarray(self.constraints.master_ids, dtype=int)
+            except Exception:
+                master_ids = None
+        for rid in np.asarray(self.active_dofs, dtype=int).tolist():
+            full_id = int(rid)
+            if master_ids is not None and 0 <= full_id < int(master_ids.size):
+                full_id = int(master_ids[full_id])
+            names.append(str(full_to_field.get(full_id, ("", None))[0] or ""))
+        return np.asarray(names, dtype=object)
+
+    def _vi_prepare_linear_equalities(self, funcs, prev_funcs, aux_funcs, bcs_now) -> _PreparedLinearEqualities:
+        eqs = list(getattr(self, "_vi_linear_equalities", []) or [])
+        n_red = int(np.asarray(self.active_dofs, dtype=int).size)
+        if not eqs:
+            prepared = _PreparedLinearEqualities(
+                names=tuple(),
+                field_names=tuple(),
+                B_red=np.zeros((0, n_red), dtype=float),
+                b_eff=np.zeros((0,), dtype=float),
+                project_feasible=tuple(),
+            )
+            self._vi_eq_current = prepared
+            self._vi_eq_lambda_current = np.zeros((0,), dtype=float)
+            return prepared
+
+        x_full = self._gather_full_iterate(funcs)
+        if getattr(self, "constraints", None) is not None:
+            x_master = np.asarray(self.constraints.restrict_full(x_full), dtype=float).ravel()
+            master_n = int(self.constraints.n_master)
+            active_ids = np.asarray(self.active_dofs, dtype=int).ravel()
+        else:
+            x_master = np.asarray(x_full, dtype=float).ravel()
+            master_n = int(self.dh.total_dofs)
+            active_ids = np.asarray(self.active_dofs, dtype=int).ravel()
+        fixed_mask = np.ones(master_n, dtype=bool)
+        fixed_mask[active_ids] = False
+
+        rows: list[np.ndarray] = []
+        b_eff: list[float] = []
+        names: list[str] = []
+        field_names: list[str | None] = []
+        project_flags: list[bool] = []
+
+        for eq in eqs:
+            if callable(eq.weights_callback):
+                w_full = np.asarray(
+                    eq.weights_callback(
+                        solver=self,
+                        funcs=funcs,
+                        prev_funcs=prev_funcs,
+                        aux_funcs=aux_funcs,
+                        bcs_now=bcs_now,
+                        dt=float(getattr(self, "_current_dt", 0.0) or 0.0),
+                        t=float(getattr(self, "_current_t", 0.0) or 0.0),
+                    ),
+                    dtype=float,
+                ).ravel()
+            elif eq.weights_full is not None:
+                w_full = np.asarray(eq.weights_full, dtype=float).ravel()
+            else:
+                raise ValueError(f"Linear equality '{eq.name}' has neither weights_full nor weights_callback.")
+            if int(w_full.size) != int(self.dh.total_dofs):
+                raise ValueError(
+                    f"Linear equality '{eq.name}' has weights size {int(w_full.size)}, "
+                    f"expected {int(self.dh.total_dofs)}."
+                )
+            if getattr(self, "constraints", None) is not None:
+                w_master = np.asarray(self.constraints.E_T @ w_full, dtype=float).ravel()
+            else:
+                w_master = w_full
+            row = np.asarray(w_master[active_ids], dtype=float).copy()
+            fixed_contrib = float(np.asarray(w_master[fixed_mask], dtype=float) @ np.asarray(x_master[fixed_mask], dtype=float))
+            if callable(eq.target_callback):
+                target_val = float(
+                    eq.target_callback(
+                        solver=self,
+                        funcs=funcs,
+                        prev_funcs=prev_funcs,
+                        aux_funcs=aux_funcs,
+                        bcs_now=bcs_now,
+                        dt=float(getattr(self, "_current_dt", 0.0) or 0.0),
+                        t=float(getattr(self, "_current_t", 0.0) or 0.0),
+                    )
+                )
+            elif eq.target is not None:
+                target_val = float(eq.target)
+            else:
+                raise ValueError(f"Linear equality '{eq.name}' needs either target or target_callback.")
+            row_norm = float(np.linalg.norm(row))
+            if not np.isfinite(row_norm) or row_norm <= 0.0:
+                raise RuntimeError(
+                    f"Linear equality '{eq.name}' reduces to a zero row on the active master space."
+                )
+            scale = 1.0 / row_norm
+            rows.append(scale * row)
+            b_eff.append(float(scale * (target_val - fixed_contrib)))
+            names.append(str(eq.name))
+            field_names.append(None if eq.field_name is None else str(eq.field_name))
+            project_flags.append(bool(eq.project_feasible))
+
+        prepared = _PreparedLinearEqualities(
+            names=tuple(names),
+            field_names=tuple(field_names),
+            B_red=np.vstack(rows) if rows else np.zeros((0, n_red), dtype=float),
+            b_eff=np.asarray(b_eff, dtype=float),
+            project_feasible=tuple(project_flags),
+        )
+        self._vi_eq_current = prepared
+        n_eq = int(prepared.B_red.shape[0])
+        if int(self._vi_eq_lambda_current.size) != n_eq:
+            if int(self._vi_eq_lambda_accepted.size) == n_eq:
+                self._vi_eq_lambda_current = self._vi_eq_lambda_accepted.copy()
+            else:
+                self._vi_eq_lambda_current = np.zeros((n_eq,), dtype=float)
+        return prepared
+
+    def _vi_stationarity_residual(
+        self,
+        R_red: np.ndarray,
+        eq_data: _PreparedLinearEqualities,
+        lambda_eq: np.ndarray,
+        row_scale_red: np.ndarray | None = None,
+    ) -> np.ndarray:
+        R_red = np.asarray(R_red, dtype=float).ravel()
+        if int(eq_data.B_red.shape[0]) == 0:
+            return R_red.copy()
+        lam = np.asarray(lambda_eq, dtype=float).ravel()
+        if int(lam.size) != int(eq_data.B_red.shape[0]):
+            raise ValueError("Equality multiplier size does not match the prepared equality system.")
+        bt_lam = np.asarray(eq_data.B_red.T @ lam, dtype=float).ravel()
+        if row_scale_red is not None:
+            scale = np.asarray(row_scale_red, dtype=float).ravel()
+            if scale.shape != bt_lam.shape:
+                raise ValueError("Row scaling vector size does not match the reduced stationarity residual.")
+            bt_lam = scale * bt_lam
+        return R_red + bt_lam
+
+    def _vi_equality_residual(self, x_red: np.ndarray, eq_data: _PreparedLinearEqualities) -> np.ndarray:
+        x_red = np.asarray(x_red, dtype=float).ravel()
+        if int(eq_data.B_red.shape[0]) == 0:
+            return np.zeros((0,), dtype=float)
+        return np.asarray(eq_data.B_red @ x_red, dtype=float).ravel() - np.asarray(eq_data.b_eff, dtype=float).ravel()
+
+    def _vi_augmented_residual(self, G_red: np.ndarray, eq_res: np.ndarray) -> np.ndarray:
+        G_red = np.asarray(G_red, dtype=float).ravel()
+        eq_res = np.asarray(eq_res, dtype=float).ravel()
+        if eq_res.size == 0:
+            return G_red.copy()
+        return np.concatenate([G_red, eq_res], axis=0)
+
+    def _vi_build_augmented_system(
+        self,
+        A_x: sp.csr_matrix,
+        rhs_x: np.ndarray,
+        active_mask: np.ndarray,
+        eq_data: _PreparedLinearEqualities,
+        eq_res: np.ndarray,
+        row_scale_red: np.ndarray | None = None,
+        col_scale_red: np.ndarray | None = None,
+        x_block_col_scaled: bool = False,
+    ) -> tuple[sp.csr_matrix, np.ndarray]:
+        rhs_x = np.asarray(rhs_x, dtype=float).ravel()
+        eq_res = np.asarray(eq_res, dtype=float).ravel()
+        n_eq = int(eq_data.B_red.shape[0])
+        if not sp.isspmatrix_csr(A_x):
+            A_x = A_x.tocsr()
+        n_x = int(A_x.shape[0])
+        if col_scale_red is not None and not bool(x_block_col_scaled):
+            col_scale = np.asarray(col_scale_red, dtype=float).ravel()
+            if int(col_scale.size) != int(A_x.shape[1]):
+                raise ValueError("Column scaling vector size does not match the reduced Newton system.")
+            A_x = self._vi_scale_matrix_cols(A_x, col_scale)
+        if n_eq == 0:
+            return A_x, rhs_x
+        B = np.asarray(eq_data.B_red, dtype=float)
+        if B.shape != (n_eq, n_x):
+            raise ValueError("Prepared equality matrix shape does not match the reduced Newton system.")
+        active_mask = np.asarray(active_mask, dtype=bool).ravel()
+        if int(active_mask.size) != n_x:
+            raise ValueError("Active mask size does not match the reduced Newton system.")
+        B_x = np.asarray(B, dtype=float).copy()
+        if col_scale_red is not None:
+            B_x *= np.asarray(col_scale_red, dtype=float).ravel()[None, :]
+        BT = np.asarray(B.T, dtype=float).copy()
+        if row_scale_red is not None:
+            scale = np.asarray(row_scale_red, dtype=float).ravel()
+            if int(scale.size) != n_x:
+                raise ValueError("Row scaling vector size does not match the reduced Newton system.")
+            BT *= scale[:, None]
+        BT[active_mask, :] = 0.0
+        A_aug = sp.bmat(
+            [
+                [A_x, sp.csr_matrix(BT)],
+                [sp.csr_matrix(B_x), None],
+            ],
+            format="csr",
+        )
+        rhs_aug = np.concatenate([rhs_x, -eq_res], axis=0)
+        return A_aug, rhs_aug
+
+    def _vi_split_augmented_step(
+        self,
+        step_aug: np.ndarray,
+        eq_data: _PreparedLinearEqualities,
+        col_scale_red: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        step_aug = np.asarray(step_aug, dtype=float).ravel()
+        n_eq = int(eq_data.B_red.shape[0])
+        if n_eq == 0:
+            dy_red = step_aug.copy()
+            if col_scale_red is not None:
+                col_scale = np.asarray(col_scale_red, dtype=float).ravel()
+                if col_scale.shape != dy_red.shape:
+                    raise ValueError("Column scaling vector size does not match the reduced primal step.")
+                dy_red = dy_red * col_scale
+            return dy_red, np.zeros((0,), dtype=float)
+        if step_aug.size < n_eq:
+            raise ValueError("Augmented step is smaller than the equality multiplier block.")
+        n_x = int(step_aug.size - n_eq)
+        dy_red = step_aug[:n_x].copy()
+        if col_scale_red is not None:
+            col_scale = np.asarray(col_scale_red, dtype=float).ravel()
+            if int(col_scale.size) != n_x:
+                raise ValueError("Column scaling vector size does not match the reduced primal step.")
+            dy_red *= col_scale
+        return dy_red, step_aug[n_x:].copy()
+
+    @staticmethod
+    def _vi_write_triplets_text(path: Path, mat: sp.spmatrix) -> None:
+        coo = mat.tocoo()
+        with path.open("w", encoding="utf-8") as fh:
+            fh.write(f"{int(coo.shape[0])} {int(coo.shape[1])} {int(coo.nnz)}\n")
+            for r, c, v in zip(coo.row.tolist(), coo.col.tolist(), coo.data.tolist()):
+                fh.write(f"{int(r)} {int(c)} {float(v):.17e}\n")
+
+    @staticmethod
+    def _vi_write_vector_text(path: Path, vec: np.ndarray) -> None:
+        arr = np.asarray(vec, dtype=float).ravel()
+        with path.open("w", encoding="utf-8") as fh:
+            fh.write(f"{int(arr.size)}\n")
+            for val in arr.tolist():
+                fh.write(f"{float(val):.17e}\n")
+
+    @staticmethod
+    def _vi_read_vector_text(path: Path) -> np.ndarray:
+        with path.open("r", encoding="utf-8") as fh:
+            lines = [ln.strip() for ln in fh if ln.strip()]
+        if not lines:
+            return np.zeros((0,), dtype=float)
+        n = int(lines[0])
+        vals = np.asarray([float(v) for v in lines[1:1 + n]], dtype=float)
+        if int(vals.size) != n:
+            raise RuntimeError(f"Vector file {path} is truncated: expected {n} entries, got {int(vals.size)}.")
+        return vals
+
+    def _solve_vi_linearized_dealii(
+        self,
+        *,
+        A_red: sp.csr_matrix,
+        x_red: np.ndarray,
+        lo_red: np.ndarray,
+        hi_red: np.ndarray,
+        c_red: np.ndarray,
+        stat_red: np.ndarray,
+        eq_data: _PreparedLinearEqualities,
+        lambda_eq: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, dict[str, object]]:
+        bin_path = str(
+            os.getenv(
+                "PYCUTFEM_VI_DEALII_BIN",
+                "/tmp/vi_linearized_dump_dealii_build/vi_linearized_dump_dealii",
+            )
+            or ""
+        ).strip()
+        if not bin_path:
+            raise RuntimeError("PYCUTFEM_VI_DEALII_BIN is empty.")
+        exe = Path(bin_path)
+        if not exe.exists():
+            raise RuntimeError(
+                f"deal.II VI parity executable not found at {exe}. "
+                "Build examples/debug/parity/vi_linearized_dump_dealii.cc first."
+            )
+        timeout_s = float(os.getenv("PYCUTFEM_VI_DEALII_TIMEOUT", "300") or "300")
+        keep_dump = os.getenv("PYCUTFEM_VI_DEALII_KEEP_DUMP", "").lower() in {"1", "true", "yes"}
+
+        def _run_in_dir(work_dir: Path) -> tuple[np.ndarray, np.ndarray, dict[str, object]]:
+            self._vi_write_triplets_text(work_dir / "A_red.triplets", A_red)
+            self._vi_write_triplets_text(work_dir / "B_red.triplets", sp.csr_matrix(np.asarray(eq_data.B_red, dtype=float)))
+            self._vi_write_vector_text(work_dir / "x_red.txt", x_red)
+            self._vi_write_vector_text(work_dir / "lo_red.txt", lo_red)
+            self._vi_write_vector_text(work_dir / "hi_red.txt", hi_red)
+            self._vi_write_vector_text(work_dir / "c_red.txt", c_red)
+            self._vi_write_vector_text(work_dir / "stat_red.txt", stat_red)
+            self._vi_write_vector_text(work_dir / "eq_b_eff.txt", np.asarray(eq_data.b_eff, dtype=float))
+            self._vi_write_vector_text(work_dir / "eq_lambda.txt", lambda_eq)
+
+            summary_path = work_dir / "summary.json"
+            proc = subprocess.run(
+                [str(exe), str(work_dir), str(summary_path)],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=max(timeout_s, 1.0),
+            )
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    "deal.II VI parity solve failed"
+                    + (f" (code={proc.returncode})" if proc.returncode is not None else "")
+                    + (f": {proc.stderr.strip()}" if proc.stderr.strip() else "")
+                )
+            y_red = self._vi_read_vector_text(work_dir / "y_red.txt")
+            lambda_red = self._vi_read_vector_text(work_dir / "lambda_red.txt")
+            info: dict[str, object] = {}
+            if summary_path.exists():
+                try:
+                    info = json.loads(summary_path.read_text(encoding="utf-8"))
+                except Exception:
+                    info = {}
+            history_path = work_dir / "history.json"
+            if history_path.exists():
+                try:
+                    info["history"] = json.loads(history_path.read_text(encoding="utf-8"))
+                except Exception:
+                    pass
+            if proc.stdout.strip():
+                info["stdout"] = proc.stdout.strip()
+            if proc.stderr.strip():
+                info["stderr"] = proc.stderr.strip()
+            return y_red, lambda_red, info
+
+        if keep_dump:
+            root = Path(os.getenv("PYCUTFEM_VI_DEALII_DUMP_DIR", "") or "").expanduser()
+            if not str(root):
+                root = Path.cwd() / "_pycutfem_vi_dealii"
+            root.mkdir(parents=True, exist_ok=True)
+            tag = (
+                f"step{int(getattr(self, '_current_step_no', -1)):04d}_"
+                f"it{int(getattr(self, '_current_newton_it', -1)):02d}_"
+                f"{int(time.time() * 1.0e6)}"
+            )
+            work_dir = root / tag
+            work_dir.mkdir(parents=True, exist_ok=False)
+            return _run_in_dir(work_dir)
+
+        with tempfile.TemporaryDirectory(prefix="pycutfem_vi_dealii_") as tmp:
+            return _run_in_dir(Path(tmp))
+
+    def _vi_c_vector(self, A_red: sp.csr_matrix, lo_red: np.ndarray, hi_red: np.ndarray) -> np.ndarray:
+        bounded = np.isfinite(lo_red) | np.isfinite(hi_red)
+        c_base = float(getattr(self.vi_params, "c", 1.0) or 1.0)
+        c_red = np.full(lo_red.shape, c_base, dtype=float)
+
+        # Auto-scale by field from the current Jacobian diagonal when requested.
+        auto_c = (not np.isfinite(c_base)) or (c_base <= 0.0)
+        diag_full = np.abs(np.asarray(A_red.diagonal(), dtype=float))
+        diag_full = np.where(np.isfinite(diag_full) & (diag_full > 0.0), diag_full, np.nan)
+
+        field_vals: dict[str, float] = {}
+        if auto_c and np.any(bounded):
+            for fld in np.unique(self._vi_red_field_names[bounded]):
+                if not str(fld):
+                    continue
+                mask = bounded & (self._vi_red_field_names == fld)
+                vals = diag_full[mask]
+                vals = vals[np.isfinite(vals)]
+                if vals.size:
+                    field_vals[str(fld)] = float(np.median(vals))
+            if field_vals:
+                finite_vals = np.asarray(list(field_vals.values()), dtype=float)
+                finite_vals = finite_vals[np.isfinite(finite_vals) & (finite_vals > 0.0)]
+                self.vi_params.c = float(np.median(finite_vals)) if finite_vals.size else 1.0
+            else:
+                self.vi_params.c = 1.0
+            c_red[:] = float(getattr(self.vi_params, "c", 1.0) or 1.0)
+
+        # Explicit per-field overrides always win.
+        for fld, c_val in dict(getattr(self.vi_params, "c_by_field", {}) or {}).items():
+            try:
+                c_f = float(c_val)
+            except Exception:
+                continue
+            if np.isfinite(c_f) and c_f > 0.0:
+                field_vals[str(fld)] = c_f
+
+        for fld, c_f in field_vals.items():
+            c_red[self._vi_red_field_names == fld] = float(c_f)
+
+        c_red = np.where(np.isfinite(c_red) & (c_red > 0.0), c_red, 1.0)
+        self._vi_c_field_current = dict(field_vals)
+        return c_red
+
+    def _vi_row_scale_vector(self, A_red: sp.csr_matrix) -> np.ndarray:
+        n = int(getattr(A_red, "shape", (0, 0))[0])
+        scale = np.ones((n,), dtype=float)
+        self._vi_row_scale_field_current = {}
+        if not bool(getattr(self.vi_params, "equation_row_scaling", False)) or n == 0:
+            self._vi_row_scale_current = scale.copy()
+            return scale
+        manual_map = dict(getattr(self, "_manual_reduced_row_field_scales", {}) or {})
+        if manual_map:
+            field_names = np.asarray(self._vi_red_field_names, dtype=object)
+            if field_names.shape == scale.shape:
+                scale, used = self._field_name_scale_vector(field_names, manual_map)
+                self._vi_row_scale_current = np.asarray(scale, dtype=float).copy()
+                self._vi_row_scale_field_current = dict(used)
+                return scale
+        if not sp.isspmatrix_csr(A_red):
+            A_red = A_red.tocsr()
+        floor = max(float(getattr(self.vi_params, "equation_row_scaling_floor", 1.0e-12) or 1.0e-12), 1.0e-30)
+        clip_min = max(float(getattr(self.vi_params, "equation_row_scaling_clip_min", 1.0e-8) or 1.0e-8), 1.0e-30)
+        clip_max = max(float(getattr(self.vi_params, "equation_row_scaling_clip_max", 1.0e8) or 1.0e8), clip_min)
+        row_abs = np.asarray(np.abs(A_red).sum(axis=1)).ravel()
+        row_abs = np.where(np.isfinite(row_abs) & (row_abs > floor), row_abs, np.nan)
+        field_names = np.asarray(self._vi_red_field_names, dtype=object)
+        if field_names.shape != scale.shape:
+            self._vi_row_scale_current = scale.copy()
+            return scale
+
+        field_medians: dict[str, float] = {}
+        med_list: list[float] = []
+        for fld in np.unique(field_names):
+            fld = str(fld)
+            if not fld:
+                continue
+            mask = field_names == fld
+            vals = np.asarray(row_abs[mask], dtype=float)
+            vals = vals[np.isfinite(vals) & (vals > floor)]
+            if vals.size == 0:
+                continue
+            med = float(np.median(vals))
+            field_medians[fld] = med
+            med_list.append(med)
+
+        finite_rows = np.asarray(row_abs[np.isfinite(row_abs) & (row_abs > floor)], dtype=float)
+        ref = float(np.median(np.asarray(med_list, dtype=float))) if med_list else (
+            float(np.median(finite_rows)) if finite_rows.size else 1.0
+        )
+        ref = max(ref, floor)
+
+        field_scales: dict[str, float] = {}
+        assigned = np.zeros(scale.shape, dtype=bool)
+        for fld, med in field_medians.items():
+            s_f = float(np.clip(ref / max(med, floor), clip_min, clip_max))
+            mask = field_names == fld
+            scale[mask] = s_f
+            assigned |= mask
+            field_scales[str(fld)] = s_f
+
+        leftover = (~assigned) & np.isfinite(row_abs) & (row_abs > floor)
+        if np.any(leftover):
+            scale[leftover] = np.clip(ref / np.maximum(row_abs[leftover], floor), clip_min, clip_max)
+
+        scale = np.where(np.isfinite(scale) & (scale > 0.0), scale, 1.0)
+        self._vi_row_scale_current = np.asarray(scale, dtype=float).copy()
+        self._vi_row_scale_field_current = dict(field_scales)
+        return scale
+
+    def _vi_ruiz_scale_vectors(self, A_red: sp.csr_matrix) -> tuple[np.ndarray, np.ndarray]:
+        nrow, ncol = map(int, getattr(A_red, "shape", (0, 0)))
+        row_scale = np.ones((nrow,), dtype=float)
+        col_scale = np.ones((ncol,), dtype=float)
+        if nrow == 0 or ncol == 0:
+            self._vi_row_scale_current = row_scale.copy()
+            self._vi_col_scale_current = col_scale.copy()
+            self._vi_row_scale_field_current = {}
+            self._vi_col_scale_field_current = {}
+            return row_scale, col_scale
+        manual_row = np.ones((nrow,), dtype=float)
+        manual_col = np.ones((ncol,), dtype=float)
+        manual_row_used: dict[str, float] = {}
+        manual_col_used: dict[str, float] = {}
+        field_names = np.asarray(self._vi_red_field_names, dtype=object)
+        if bool(getattr(self.vi_params, "equation_row_scaling", False)):
+            manual_row_map = dict(getattr(self, "_manual_reduced_row_field_scales", {}) or {})
+            if manual_row_map and field_names.shape == manual_row.shape:
+                manual_row, manual_row_used = self._field_name_scale_vector(field_names, manual_row_map)
+        if bool(getattr(self.vi_params, "variable_column_scaling", False)):
+            manual_col_map = dict(getattr(self, "_manual_reduced_col_field_scales", {}) or {})
+            if manual_col_map and field_names.shape == manual_col.shape:
+                manual_col, manual_col_used = self._field_name_scale_vector(field_names, manual_col_map)
+        A_for_ruiz = A_red
+        if not np.allclose(manual_row, 1.0):
+            A_for_ruiz = A_for_ruiz.multiply(manual_row[:, None]).tocsr()
+        if not np.allclose(manual_col, 1.0):
+            A_for_ruiz = A_for_ruiz.multiply(manual_col[None, :]).tocsr()
+        row_scale_raw, col_scale_raw = self._direct_solve_ruiz_scaling(
+            A_for_ruiz,
+            iters=int(getattr(self, "_reduced_scaling_ruiz_iters", 6) or 6),
+        )
+        if bool(getattr(self.vi_params, "equation_row_scaling", False)):
+            row_scale = manual_row * np.asarray(row_scale_raw, dtype=float).ravel()
+        if bool(getattr(self.vi_params, "variable_column_scaling", False)):
+            col_scale = manual_col * np.asarray(col_scale_raw, dtype=float).ravel()
+        self._vi_row_scale_current = row_scale.copy()
+        self._vi_col_scale_current = col_scale.copy()
+        self._vi_row_scale_field_current = dict(manual_row_used)
+        self._vi_col_scale_field_current = dict(manual_col_used)
+        return row_scale, col_scale
+
+    @staticmethod
+    def _vi_scale_matrix_rows(A_red: sp.csr_matrix, row_scale_red: np.ndarray | None) -> sp.csr_matrix:
+        if row_scale_red is None:
+            return A_red
+        scale = np.asarray(row_scale_red, dtype=float).ravel()
+        if int(scale.size) != int(A_red.shape[0]):
+            raise ValueError("Row scaling vector size does not match the reduced Jacobian.")
+        if np.allclose(scale, 1.0):
+            return A_red
+        return A_red.multiply(scale[:, None]).tocsr()
+
+    @staticmethod
+    def _vi_scale_vector_rows(vec: np.ndarray, row_scale_red: np.ndarray | None) -> np.ndarray:
+        arr = np.asarray(vec, dtype=float).ravel()
+        if row_scale_red is None:
+            return arr.copy()
+        scale = np.asarray(row_scale_red, dtype=float).ravel()
+        if scale.shape != arr.shape:
+            raise ValueError("Row scaling vector size does not match the reduced residual.")
+        return scale * arr
+
+    @staticmethod
+    def _vi_scale_c_vector(c_red: np.ndarray, row_scale_red: np.ndarray | None) -> np.ndarray:
+        arr = np.asarray(c_red, dtype=float).ravel()
+        if row_scale_red is None:
+            return arr.copy()
+        scale = np.asarray(row_scale_red, dtype=float).ravel()
+        if scale.shape != arr.shape:
+            raise ValueError("Row scaling vector size does not match the reduced PDAS c-vector.")
+        safe = np.where(np.isfinite(scale) & (scale > 0.0), scale, 1.0)
+        out = arr / safe
+        return np.where(np.isfinite(out) & (out > 0.0), out, 1.0)
+
+    def _vi_col_scale_vector(self, A_red: sp.csr_matrix) -> np.ndarray:
+        n = int(getattr(A_red, "shape", (0, 0))[1])
+        scale = np.ones((n,), dtype=float)
+        self._vi_col_scale_field_current = {}
+        if not bool(getattr(self.vi_params, "variable_column_scaling", False)) or n == 0:
+            self._vi_col_scale_current = scale.copy()
+            return scale
+        manual_map = dict(getattr(self, "_manual_reduced_col_field_scales", {}) or {})
+        if manual_map:
+            field_names = np.asarray(self._vi_red_field_names, dtype=object)
+            if field_names.shape == scale.shape:
+                scale, used = self._field_name_scale_vector(field_names, manual_map)
+                self._vi_col_scale_current = np.asarray(scale, dtype=float).copy()
+                self._vi_col_scale_field_current = dict(used)
+                return scale
+        if not sp.isspmatrix_csr(A_red):
+            A_red = A_red.tocsr()
+        floor = max(float(getattr(self.vi_params, "variable_column_scaling_floor", 1.0e-12) or 1.0e-12), 1.0e-30)
+        clip_min = max(float(getattr(self.vi_params, "variable_column_scaling_clip_min", 1.0e-2) or 1.0e-2), 1.0e-30)
+        clip_max = max(float(getattr(self.vi_params, "variable_column_scaling_clip_max", 1.0e2) or 1.0e2), clip_min)
+        col_abs = np.asarray(np.abs(A_red).sum(axis=0)).ravel()
+        col_abs = np.where(np.isfinite(col_abs) & (col_abs > floor), col_abs, np.nan)
+        field_names = np.asarray(self._vi_red_field_names, dtype=object)
+        if field_names.shape != scale.shape:
+            self._vi_col_scale_current = scale.copy()
+            return scale
+
+        selected_raw = tuple(getattr(self.vi_params, "variable_column_scaling_fields", ()) or ())
+        selected = {str(fld).strip() for fld in selected_raw if str(fld).strip()}
+
+        field_medians: dict[str, float] = {}
+        med_list: list[float] = []
+        for fld_obj in np.unique(field_names):
+            fld = str(fld_obj)
+            if not fld or (selected and fld not in selected):
+                continue
+            mask = field_names == fld
+            vals = np.asarray(col_abs[mask], dtype=float)
+            vals = vals[np.isfinite(vals) & (vals > floor)]
+            if vals.size == 0:
+                continue
+            med = float(np.median(vals))
+            field_medians[fld] = med
+            med_list.append(med)
+
+        finite_cols = np.asarray(col_abs[np.isfinite(col_abs) & (col_abs > floor)], dtype=float)
+        ref = float(np.median(np.asarray(med_list, dtype=float))) if med_list else (
+            float(np.median(finite_cols)) if finite_cols.size else 1.0
+        )
+        ref = max(ref, floor)
+
+        field_scales: dict[str, float] = {}
+        assigned = np.zeros(scale.shape, dtype=bool)
+        for fld, med in field_medians.items():
+            s_f = float(np.clip(ref / max(med, floor), clip_min, clip_max))
+            mask = field_names == fld
+            scale[mask] = s_f
+            assigned |= mask
+            field_scales[str(fld)] = s_f
+
+        if selected:
+            leftover = (~assigned) & np.isfinite(col_abs) & (col_abs > floor)
+            for fld in selected:
+                mask = (field_names == fld) & leftover
+                if np.any(mask):
+                    scale[mask] = np.clip(ref / np.maximum(col_abs[mask], floor), clip_min, clip_max)
+        scale = np.where(np.isfinite(scale) & (scale > 0.0), scale, 1.0)
+        self._vi_col_scale_current = np.asarray(scale, dtype=float).copy()
+        self._vi_col_scale_field_current = dict(field_scales)
+        return scale
+
+    def _vi_system_scale_vectors(self, A_red: sp.csr_matrix) -> tuple[np.ndarray, np.ndarray]:
+        mode_key = str(getattr(self, "_reduced_system_scaling_mode", "field") or "field").strip().lower()
+        if mode_key == "ruiz":
+            return self._vi_ruiz_scale_vectors(A_red)
+        row_scale = np.asarray(self._vi_row_scale_vector(A_red), dtype=float).ravel()
+        A_row = self._vi_scale_matrix_rows(A_red, row_scale)
+        col_scale = np.asarray(self._vi_col_scale_vector(A_row), dtype=float).ravel()
+        return row_scale, col_scale
+
+    @staticmethod
+    def _vi_scale_matrix_cols(A_red: sp.csr_matrix, col_scale_red: np.ndarray | None) -> sp.csr_matrix:
+        if col_scale_red is None:
+            return A_red
+        scale = np.asarray(col_scale_red, dtype=float).ravel()
+        if int(scale.size) != int(A_red.shape[1]):
+            raise ValueError("Column scaling vector size does not match the reduced Jacobian.")
+        if np.allclose(scale, 1.0):
+            return A_red
+        return A_red.multiply(scale[None, :]).tocsr()
+
+    def _vi_selected_field_mask(self, fields: tuple[str, ...] | list[str] | None) -> np.ndarray:
+        names = tuple(str(fld).strip() for fld in (fields or ()) if str(fld).strip())
+        field_names = np.asarray(self._vi_red_field_names, dtype=object)
+        mask = np.zeros(field_names.shape, dtype=bool)
+        if field_names.size == 0 or not names:
+            return mask
+        selected = set(names)
+        for fld in selected:
+            mask |= field_names == fld
+        return mask
+
+    def _vi_field_proximal_diag(
+        self,
+        A_base: sp.csr_matrix,
+        field_mask: np.ndarray,
+    ) -> np.ndarray:
+        field_mask = np.asarray(field_mask, dtype=bool).ravel()
+        n = int(getattr(A_base, "shape", (0, 0))[0])
+        if field_mask.size != n:
+            raise ValueError("Selected-field mask size does not match the reduced Newton system.")
+        if not np.any(field_mask):
+            return np.zeros((n,), dtype=float)
+        if not sp.isspmatrix_csr(A_base):
+            A_base = A_base.tocsr()
+        diag_full = np.abs(np.asarray(A_base.diagonal(), dtype=float))
+        row_abs_full = np.asarray(np.abs(A_base).sum(axis=1)).ravel()
+        floor = float(getattr(self.vi_params, "unconstrained_lm_min_diag", 1.0e-12) or 1.0e-12)
+        diag = np.where(
+            np.isfinite(diag_full) & (diag_full > floor),
+            diag_full,
+            np.where(np.isfinite(row_abs_full) & (row_abs_full > floor), row_abs_full, floor),
+        )
+        out = np.zeros((n,), dtype=float)
+        out[field_mask] = diag[field_mask]
+        return out
+
+    def _vi_apply_field_proximal(
+        self,
+        A_mod: sp.csr_matrix,
+        A_base: sp.csr_matrix,
+        field_mask: np.ndarray,
+        lam: float,
+    ) -> tuple[sp.csr_matrix, np.ndarray]:
+        field_mask = np.asarray(field_mask, dtype=bool).ravel()
+        if lam <= 0.0 or not np.any(field_mask):
+            return A_mod, np.zeros(field_mask.shape, dtype=float)
+        diag = self._vi_field_proximal_diag(A_base, field_mask)
+        add = float(lam) * np.asarray(diag, dtype=float)
+        if not np.any(add > 0.0):
+            return A_mod, np.zeros(field_mask.shape, dtype=float)
+        return (A_mod + sp.diags(add, format="csr")).tocsr(), add
+
+    def _vi_apply_ptc_regularization(
+        self,
+        A_mod: sp.csr_matrix,
+        A_base: sp.csr_matrix,
+        field_mask: np.ndarray,
+        sigma: float,
+    ) -> tuple[sp.csr_matrix, np.ndarray]:
+        field_mask = np.asarray(field_mask, dtype=bool).ravel()
+        if sigma <= 0.0 or not np.any(field_mask):
+            return A_mod, np.zeros(field_mask.shape, dtype=float)
+        n = int(getattr(A_base, "shape", (0, 0))[0])
+        if field_mask.size != n:
+            raise ValueError("Selected-field mask size does not match the reduced Newton system.")
+        if not sp.isspmatrix_csr(A_base):
+            A_base = A_base.tocsr()
+        idx = np.flatnonzero(field_mask)
+        if idx.size == 0:
+            return A_mod, np.zeros((n,), dtype=float)
+
+        mode = str(getattr(self.vi_params, "ptc_operator_mode", "row_normalized") or "row_normalized").strip().lower()
+        if mode in {"diag", "diagonal", "prox"}:
+            diag = self._vi_field_proximal_diag(A_base, field_mask)
+            add = float(sigma) * np.asarray(diag, dtype=float)
+            if not np.any(add > 0.0):
+                return A_mod, np.zeros(field_mask.shape, dtype=float)
+            return (A_mod + sp.diags(add, format="csr")).tocsr(), add
+
+        A_sel = A_base[idx, :][:, idx].tocoo()
+        if int(A_sel.nnz) == 0:
+            return A_mod, np.zeros((n,), dtype=float)
+
+        floor = float(getattr(self.vi_params, "unconstrained_lm_min_diag", 1.0e-12) or 1.0e-12)
+        row_abs = np.asarray(np.abs(A_sel).max(axis=1).toarray(), dtype=float).ravel()
+        row_abs = np.where(np.isfinite(row_abs) & (row_abs > floor), row_abs, floor)
+
+        if mode in {"row", "row_normalized", "row-normalized"}:
+            data = np.asarray(A_sel.data, dtype=float) / row_abs[np.asarray(A_sel.row, dtype=int)]
+            diag_local = np.abs(np.asarray(A_sel.diagonal(), dtype=float)) / row_abs
+        elif mode in {"sym", "symmetric", "symmetric_normalized", "symmetric-normalized"}:
+            col_abs = np.asarray(np.abs(A_sel).max(axis=0).toarray(), dtype=float).ravel()
+            col_abs = np.where(np.isfinite(col_abs) & (col_abs > floor), col_abs, floor)
+            scale = np.sqrt(row_abs[np.asarray(A_sel.row, dtype=int)] * col_abs[np.asarray(A_sel.col, dtype=int)])
+            scale = np.where(np.isfinite(scale) & (scale > floor), scale, 1.0)
+            data = np.asarray(A_sel.data, dtype=float) / scale
+            diag_local = np.abs(np.asarray(A_sel.diagonal(), dtype=float)) / np.sqrt(row_abs * col_abs)
+        else:
+            raise ValueError(f"Unsupported PTC operator mode: {mode}")
+
+        op = sp.coo_matrix(
+            (
+                float(sigma) * np.asarray(data, dtype=float),
+                (
+                    idx[np.asarray(A_sel.row, dtype=int)],
+                    idx[np.asarray(A_sel.col, dtype=int)],
+                ),
+            ),
+            shape=A_mod.shape,
+        ).tocsr()
+        add = np.zeros((n,), dtype=float)
+        add[idx] = float(sigma) * np.asarray(diag_local, dtype=float)
+        return (A_mod + op).tocsr(), add
+
+    def _vi_apply_selected_field_freeze(
+        self,
+        A_mod: sp.csr_matrix,
+        rhs: np.ndarray,
+        field_mask: np.ndarray,
+    ) -> tuple[sp.csr_matrix, np.ndarray]:
+        field_mask = np.asarray(field_mask, dtype=bool).ravel()
+        rhs = np.asarray(rhs, dtype=float).copy()
+        n = int(getattr(A_mod, "shape", (0, 0))[0])
+        if field_mask.size != n:
+            raise ValueError("Selected-field freeze mask size does not match the reduced Newton system.")
+        if not np.any(field_mask) or np.all(field_mask):
+            return A_mod, rhs
+        frozen = np.flatnonzero(~field_mask)
+        if frozen.size == 0:
+            return A_mod, rhs
+        rhs[frozen] = 0.0
+        return self._apply_identity_rows(A_mod, frozen), rhs
+
+    def _vi_should_try_field_proximal_recovery(
+        self,
+        *,
+        metrics: dict[str, float],
+        active_stable_count: int,
+    ) -> bool:
+        if not bool(getattr(self.vi_params, "field_proximal_recovery", False)):
+            return False
+        stable_req = max(0, int(getattr(self.vi_params, "field_proximal_recovery_stable_iters", 1) or 1))
+        if int(active_stable_count) < stable_req:
+            return False
+        ginf_trigger = float(getattr(self.vi_params, "field_proximal_recovery_ginf_trigger", 5.0e-2) or 0.0)
+        if ginf_trigger > 0.0 and float(metrics.get("G_inf", 0.0) or 0.0) < ginf_trigger:
+            return False
+        gap_ratio = float(getattr(self.vi_params, "field_proximal_recovery_gap_ratio", 1.0) or 1.0)
+        eq_abs = float(getattr(self.vi_params, "field_proximal_recovery_eq_abs", 1.0e-10) or 1.0e-10)
+        inactive_res = float(metrics.get("inactive_res_inf", 0.0) or 0.0)
+        active_gap = float(metrics.get("active_gap_inf", 0.0) or 0.0)
+        equality = float(metrics.get("equality_inf", 0.0) or 0.0)
+        if active_gap > max(eq_abs, gap_ratio * max(inactive_res, 1.0e-30)):
+            return False
+        if equality > max(eq_abs, 1.0e-2 * max(inactive_res, 1.0e-30)):
+            return False
+        return True
+
+    def _vi_should_arm_field_proximal_after_accept(
+        self,
+        *,
+        accepted_alpha: float,
+        merit_ratio: float,
+        accepted_g_ratio: float,
+    ) -> bool:
+        alpha_trigger = float(getattr(self.vi_params, "field_proximal_recovery_alpha_trigger", 0.25) or 0.25)
+        merit_trigger = float(
+            getattr(self.vi_params, "field_proximal_recovery_merit_ratio_trigger", 0.8) or 0.8
+        )
+        g_ratio_trigger = float(getattr(self.vi_params, "field_proximal_recovery_g_ratio_trigger", 0.8) or 0.8)
+        return (
+            float(accepted_alpha) < alpha_trigger
+            or float(merit_ratio) > merit_trigger
+            or float(accepted_g_ratio) > g_ratio_trigger
+        )
+
+    def _vi_should_force_field_proximal_on_identified_window(
+        self,
+        *,
+        metrics: dict[str, float],
+        active_stable_count: int,
+        changed: int,
+    ) -> bool:
+        if not bool(getattr(self.vi_params, "field_proximal_recovery_identified_window", False)):
+            return False
+        if int(changed) != 0:
+            return False
+        if not bool(getattr(self.vi_params, "field_proximal_recovery", False)):
+            return False
+        ginf = float(metrics.get("G_inf", 0.0) or 0.0)
+        ginf_trigger = float(getattr(self.vi_params, "field_proximal_recovery_ginf_trigger", 5.0e-2) or 0.0)
+        if ginf_trigger > 0.0 and ginf < ginf_trigger:
+            return False
+        gap_ratio = float(getattr(self.vi_params, "field_proximal_recovery_gap_ratio", 1.0) or 1.0)
+        eq_abs = float(getattr(self.vi_params, "field_proximal_recovery_eq_abs", 1.0e-10) or 1.0e-10)
+        inactive_res = float(metrics.get("inactive_res_inf", 0.0) or 0.0)
+        active_gap = float(metrics.get("active_gap_inf", 0.0) or 0.0)
+        equality = float(metrics.get("equality_inf", 0.0) or 0.0)
+        if active_gap > max(eq_abs, gap_ratio * max(inactive_res, 1.0e-30)):
+            return False
+        if equality > max(eq_abs, 1.0e-2 * max(inactive_res, 1.0e-30)):
+            return False
+        ginf_max = float(getattr(self.vi_params, "field_proximal_recovery_ginf_max", 0.0) or 0.0)
+        if ginf_max > 0.0 and ginf > ginf_max:
+            return False
+        return True
+
+    def _vi_should_try_ptc_recovery(
+        self,
+        *,
+        metrics: dict[str, float],
+        active_stable_count: int,
+    ) -> bool:
+        if not bool(getattr(self.vi_params, "ptc_recovery", False)):
+            return False
+        stable_req = max(0, int(getattr(self.vi_params, "ptc_stable_iters", 1) or 1))
+        if int(active_stable_count) < stable_req:
+            return False
+        ginf_trigger = float(getattr(self.vi_params, "ptc_ginf_trigger", 5.0e-2) or 0.0)
+        if ginf_trigger > 0.0 and float(metrics.get("G_inf", 0.0) or 0.0) < ginf_trigger:
+            return False
+        gap_ratio = float(getattr(self.vi_params, "ptc_gap_ratio", 1.0) or 1.0)
+        eq_abs = float(getattr(self.vi_params, "ptc_eq_abs", 1.0e-10) or 1.0e-10)
+        inactive_res = float(metrics.get("inactive_res_inf", 0.0) or 0.0)
+        active_gap = float(metrics.get("active_gap_inf", 0.0) or 0.0)
+        equality = float(metrics.get("equality_inf", 0.0) or 0.0)
+        if active_gap > max(eq_abs, gap_ratio * max(inactive_res, 1.0e-30)):
+            return False
+        if equality > max(eq_abs, 1.0e-2 * max(inactive_res, 1.0e-30)):
+            return False
+        return True
+
+    def _vi_should_arm_ptc_after_accept(
+        self,
+        *,
+        accepted_alpha: float,
+        merit_ratio: float,
+        accepted_g_ratio: float,
+    ) -> bool:
+        alpha_trigger = float(getattr(self.vi_params, "ptc_alpha_trigger", 0.25) or 0.25)
+        merit_trigger = float(getattr(self.vi_params, "ptc_merit_ratio_trigger", 0.8) or 0.8)
+        g_ratio_trigger = float(getattr(self.vi_params, "ptc_g_ratio_trigger", 0.8) or 0.8)
+        return (
+            float(accepted_alpha) < alpha_trigger
+            or float(merit_ratio) > merit_trigger
+            or float(accepted_g_ratio) > g_ratio_trigger
+        )
+
+    def _vi_should_force_ptc_on_identified_window(
+        self,
+        *,
+        metrics: dict[str, float],
+        active_stable_count: int,
+        changed: int,
+    ) -> bool:
+        if not bool(getattr(self.vi_params, "ptc_identified_window", False)):
+            return False
+        if int(changed) != 0:
+            return False
+        if not self._vi_should_try_ptc_recovery(
+            metrics=metrics,
+            active_stable_count=int(active_stable_count),
+        ):
+            return False
+        ginf = float(metrics.get("G_inf", 0.0) or 0.0)
+        ginf_max = float(getattr(self.vi_params, "ptc_ginf_max", 0.0) or 0.0)
+        if ginf_max > 0.0 and ginf > ginf_max:
+            return False
+        return True
+
+    def _vi_should_prefer_field_proximal_phase(
+        self,
+        *,
+        prox_mask: np.ndarray,
+    ) -> bool:
+        if not bool(getattr(self.vi_params, "field_proximal_recovery", False)):
+            return False
+        if not np.any(np.asarray(prox_mask, dtype=bool)):
+            return False
+        return float(getattr(self, "_vi_field_prox_lambda_current", 0.0) or 0.0) > 0.0
+
+    def _vi_should_prefer_ptc_phase(
+        self,
+        *,
+        ptc_mask: np.ndarray,
+    ) -> bool:
+        if not bool(getattr(self.vi_params, "ptc_recovery", False)):
+            return False
+        if not np.any(np.asarray(ptc_mask, dtype=bool)):
+            return False
+        return float(getattr(self, "_vi_ptc_sigma_current", 0.0) or 0.0) > 0.0
+
+    def _vi_should_freeze_local_trial_model(self) -> bool:
+        guard_state = getattr(self, "_vi_working_set_guard_active", None)
+        if guard_state is not None:
+            return True
+        if float(getattr(self, "_vi_field_prox_lambda_current", 0.0) or 0.0) > 0.0:
+            return True
+        return float(getattr(self, "_vi_ptc_sigma_current", 0.0) or 0.0) > 0.0
+
+    def _vi_should_arm_working_set_guard_after_accept(
+        self,
+        *,
+        metrics: dict[str, float],
+        active_stable_count: int,
+        changed: int,
+        accepted_alpha: float,
+        merit_ratio: float,
+        accepted_g_ratio: float,
+    ) -> bool:
+        if max(0, int(getattr(self.vi_params, "working_set_guard_after_affine", 0) or 0)) <= 0:
+            return False
+        if int(changed) != 0:
+            return False
+        field_ready = self._vi_should_try_field_proximal_recovery(
+            metrics=metrics,
+            active_stable_count=int(active_stable_count),
+        )
+        ptc_ready = self._vi_should_try_ptc_recovery(
+            metrics=metrics,
+            active_stable_count=int(active_stable_count),
+        )
+        if not field_ready and not ptc_ready:
+            return False
+        force_field = bool(
+            field_ready
+            and self._vi_should_force_field_proximal_on_identified_window(
+                metrics=metrics,
+                active_stable_count=int(active_stable_count),
+                changed=int(changed),
+            )
+        )
+        force_ptc = bool(
+            ptc_ready
+            and self._vi_should_force_ptc_on_identified_window(
+                metrics=metrics,
+                active_stable_count=int(active_stable_count),
+                changed=int(changed),
+            )
+        )
+        if force_field or force_ptc:
+            # The identified-window guard is useful while the fixed working set
+            # is still producing meaningful progress. If accepted steps have
+            # already flattened out, repeatedly re-arming the guard can pin the
+            # solver on a stale manifold and prevent the next active-set move.
+            progress_alpha = float(accepted_alpha) >= 0.5
+            progress_merit = float(merit_ratio) < 0.995
+            progress_g = float(accepted_g_ratio) < 0.995
+            if progress_alpha and (progress_merit or progress_g):
+                return True
+            return False
+        if (
+            field_ready
+            and self._vi_should_arm_field_proximal_after_accept(
+                accepted_alpha=float(accepted_alpha),
+                merit_ratio=float(merit_ratio),
+                accepted_g_ratio=float(accepted_g_ratio),
+            )
+        ) or (
+            ptc_ready
+            and self._vi_should_arm_ptc_after_accept(
+                accepted_alpha=float(accepted_alpha),
+                merit_ratio=float(merit_ratio),
+                accepted_g_ratio=float(accepted_g_ratio),
+            )
+        ):
+            return True
+        return False
+
+    def _vi_update_field_proximal_after_accept(
+        self,
+        *,
+        prox_mask: np.ndarray,
+        metrics: dict[str, float],
+        active_stable_count: int,
+        changed: int,
+        accepted_alpha: float,
+        merit_ratio: float,
+        accepted_g_ratio: float,
+    ) -> None:
+        if not bool(getattr(self.vi_params, "field_proximal_recovery", False)):
+            return
+        if not np.any(np.asarray(prox_mask, dtype=bool)):
+            return
+        prox_lam0 = max(
+            float(getattr(self.vi_params, "field_proximal_recovery_lambda0", 1.0e-3) or 1.0e-3),
+            0.0,
+        )
+        prox_lam_max = max(
+            prox_lam0,
+            float(getattr(self.vi_params, "field_proximal_recovery_lambda_max", 1.0e6) or 1.0e6),
+        )
+        prox_growth = max(
+            float(getattr(self.vi_params, "field_proximal_recovery_growth", 10.0) or 10.0),
+            1.0,
+        )
+        prox_stalled = self._vi_should_arm_field_proximal_after_accept(
+            accepted_alpha=float(accepted_alpha),
+            merit_ratio=float(merit_ratio),
+            accepted_g_ratio=float(accepted_g_ratio),
+        )
+        force_identified = self._vi_should_force_field_proximal_on_identified_window(
+            metrics=metrics,
+            active_stable_count=int(active_stable_count),
+            changed=int(changed),
+        )
+        if (
+            self._vi_should_try_field_proximal_recovery(
+                metrics=metrics,
+                active_stable_count=int(active_stable_count),
+            )
+            and (prox_stalled or force_identified)
+        ):
+            cur = float(getattr(self, "_vi_field_prox_lambda_current", 0.0) or 0.0)
+            cur = prox_lam0 if cur <= 0.0 else min(prox_lam_max, cur * prox_growth)
+            self._vi_field_prox_lambda_current = float(cur)
+            if os.getenv("PYCUTFEM_VI_TRACE_PROX", "").lower() in {"1", "true", "yes"}:
+                reason = "identified-window" if force_identified and not prox_stalled else "accepted-stall"
+                print(
+                    f"        [vi-prox] {reason} alpha={float(accepted_alpha):.2e} "
+                    f"merit_ratio={float(merit_ratio):.3f} G_ratio={float(accepted_g_ratio):.3f} "
+                    f"λ->{self._vi_field_prox_lambda_current:.2e}"
+                )
+        elif float(accepted_alpha) >= 0.5 and float(merit_ratio) < 0.9:
+            self._vi_field_prox_lambda_current = 0.0
+
+    def _vi_update_ptc_after_accept(
+        self,
+        *,
+        ptc_mask: np.ndarray,
+        metrics: dict[str, float],
+        active_stable_count: int,
+        changed: int,
+        accepted_alpha: float,
+        merit_ratio: float,
+        accepted_g_ratio: float,
+    ) -> None:
+        if not bool(getattr(self.vi_params, "ptc_recovery", False)):
+            return
+        if not np.any(np.asarray(ptc_mask, dtype=bool)):
+            return
+        sigma0 = max(float(getattr(self.vi_params, "ptc_sigma0", 1.0e-2) or 1.0e-2), 0.0)
+        sigma_max = max(sigma0, float(getattr(self.vi_params, "ptc_sigma_max", 1.0e6) or 1.0e6))
+        sigma_growth = max(float(getattr(self.vi_params, "ptc_growth", 5.0) or 5.0), 1.0)
+        sigma_decay = float(getattr(self.vi_params, "ptc_decay", 0.5) or 0.5)
+        ptc_stalled = self._vi_should_arm_ptc_after_accept(
+            accepted_alpha=float(accepted_alpha),
+            merit_ratio=float(merit_ratio),
+            accepted_g_ratio=float(accepted_g_ratio),
+        )
+        force_identified = self._vi_should_force_ptc_on_identified_window(
+            metrics=metrics,
+            active_stable_count=int(active_stable_count),
+            changed=int(changed),
+        )
+        if not self._vi_should_try_ptc_recovery(
+            metrics=metrics,
+            active_stable_count=int(active_stable_count),
+        ):
+            return
+
+        cur = float(getattr(self, "_vi_ptc_sigma_current", 0.0) or 0.0)
+        accepted_has_meaningful_progress = (
+            float(accepted_alpha) >= 0.5
+            and (float(merit_ratio) < 0.995 or float(accepted_g_ratio) < 0.995)
+        )
+        if (ptc_stalled or force_identified) and not (cur > 0.0 and accepted_has_meaningful_progress):
+            next_sigma = float(sigma0) if cur <= 0.0 else float(min(cur * sigma_growth, sigma_max))
+            if next_sigma > 0.0:
+                self._vi_ptc_sigma_current = float(next_sigma)
+                if os.getenv("PYCUTFEM_VI_TRACE_PTC", "").lower() in {"1", "true", "yes"}:
+                    reason = "identified-window" if force_identified and not ptc_stalled else "accepted-stall"
+                    print(
+                        f"        [vi-ptc] {reason} alpha={float(accepted_alpha):.2e} "
+                        f"merit_ratio={float(merit_ratio):.3f} G_ratio={float(accepted_g_ratio):.3f} "
+                        f"sigma->{self._vi_ptc_sigma_current:.2e}"
+                    )
+            return
+        if cur <= 0.0:
+            return
+
+        # Once the PTC phase is already active, accepted steps should not make
+        # the pseudo-time stronger. Escalation stays on the explicit retry path
+        # after a failed local solve. Here we only keep or decay sigma.
+        progress_alpha = float(accepted_alpha) >= 0.5
+        progress_merit = float(merit_ratio) < 0.9
+        progress_g = float(accepted_g_ratio) < 0.9
+        if progress_alpha and (progress_merit or progress_g):
+            if 0.0 < sigma_decay < 1.0:
+                cur *= sigma_decay
+            else:
+                cur = 0.0
+            if cur < sigma0:
+                cur = 0.0
+            self._vi_ptc_sigma_current = float(cur)
+            return
+
+        self._vi_ptc_sigma_current = float(min(cur, sigma_max))
+
+    def _vi_should_try_anderson(
+        self,
+        *,
+        metrics: dict[str, float],
+        active_stable_count: int,
+        changed: int,
+    ) -> bool:
+        if not bool(getattr(self.vi_params, "anderson_acceleration", False)):
+            return False
+        if int(changed) != 0:
+            return False
+        stable_req = max(1, int(getattr(self.vi_params, "anderson_stable_iters", 1) or 1))
+        if int(active_stable_count) < stable_req:
+            return False
+        if len(list(getattr(self, "_vi_anderson_history", []) or [])) <= 0:
+            return False
+        guard_active = getattr(self, "_vi_working_set_guard_active", None)
+        prox_on = float(getattr(self, "_vi_field_prox_lambda_current", 0.0) or 0.0) > 0.0
+        ptc_on = float(getattr(self, "_vi_ptc_sigma_current", 0.0) or 0.0) > 0.0
+        if guard_active is None and not prox_on and not ptc_on:
+            return False
+        ginf = float(metrics.get("G_inf", 0.0) or 0.0)
+        ginf_trigger = float(getattr(self.vi_params, "anderson_ginf_trigger", 5.0e-2) or 0.0)
+        if ginf_trigger > 0.0 and ginf < ginf_trigger:
+            return False
+        ginf_max = float(getattr(self.vi_params, "anderson_ginf_max", 0.0) or 0.0)
+        if ginf_max > 0.0 and ginf > ginf_max:
+            return False
+        gap_ratio = float(getattr(self.vi_params, "anderson_gap_ratio", 1.0) or 1.0)
+        eq_abs = float(getattr(self.vi_params, "anderson_eq_abs", 1.0e-10) or 1.0e-10)
+        inactive_res = float(metrics.get("inactive_res_inf", 0.0) or 0.0)
+        active_gap = float(metrics.get("active_gap_inf", 0.0) or 0.0)
+        equality = float(metrics.get("equality_inf", 0.0) or 0.0)
+        if active_gap > max(eq_abs, gap_ratio * max(inactive_res, 1.0e-30)):
+            return False
+        if equality > max(eq_abs, 1.0e-2 * max(inactive_res, 1.0e-30)):
+            return False
+        return True
+
+    def _vi_clear_anderson_history(self) -> None:
+        self._vi_anderson_history = []
+
+    def _vi_record_anderson_history(
+        self,
+        *,
+        x_prev: np.ndarray,
+        lambda_prev: np.ndarray,
+        x_next: np.ndarray,
+        lambda_next: np.ndarray,
+    ) -> None:
+        hist_len = max(0, int(getattr(self.vi_params, "anderson_history", 0) or 0))
+        if hist_len <= 0 or not bool(getattr(self.vi_params, "anderson_acceleration", False)):
+            self._vi_clear_anderson_history()
+            return
+        z_prev = np.hstack([np.asarray(x_prev, dtype=float).ravel(), np.asarray(lambda_prev, dtype=float).ravel()])
+        z_next = np.hstack([np.asarray(x_next, dtype=float).ravel(), np.asarray(lambda_next, dtype=float).ravel()])
+        if z_prev.shape != z_next.shape or z_prev.size == 0:
+            return
+        if not np.all(np.isfinite(z_prev)) or not np.all(np.isfinite(z_next)):
+            return
+        history = list(getattr(self, "_vi_anderson_history", []) or [])
+        history.append({"z": z_prev.copy(), "g": z_next.copy()})
+        if len(history) > hist_len:
+            history = history[-hist_len:]
+        self._vi_anderson_history = history
+
+    def _vi_build_anderson_candidate(
+        self,
+        *,
+        x_curr: np.ndarray,
+        lambda_curr: np.ndarray,
+        x_proposed: np.ndarray,
+        lambda_proposed: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray] | None:
+        history = list(getattr(self, "_vi_anderson_history", []) or [])
+        if not bool(getattr(self.vi_params, "anderson_acceleration", False)) or not history:
+            return None
+        z_curr = np.hstack([np.asarray(x_curr, dtype=float).ravel(), np.asarray(lambda_curr, dtype=float).ravel()])
+        g_curr = np.hstack([np.asarray(x_proposed, dtype=float).ravel(), np.asarray(lambda_proposed, dtype=float).ravel()])
+        if z_curr.shape != g_curr.shape or z_curr.size == 0:
+            return None
+        hist_len = max(1, int(getattr(self.vi_params, "anderson_history", 3) or 3))
+        pairs = history[-hist_len:] + [{"z": z_curr.copy(), "g": g_curr.copy()}]
+        if len(pairs) < 2:
+            return None
+        G = np.column_stack([np.asarray(item["g"], dtype=float).ravel() for item in pairs])
+        F = np.column_stack(
+            [
+                np.asarray(item["g"], dtype=float).ravel() - np.asarray(item["z"], dtype=float).ravel()
+                for item in pairs
+            ]
+        )
+        if not np.all(np.isfinite(G)) or not np.all(np.isfinite(F)):
+            return None
+        reg = max(float(getattr(self.vi_params, "anderson_regularization", 1.0e-10) or 1.0e-10), 0.0)
+        m = int(F.shape[1])
+        kkt = np.zeros((m + 1, m + 1), dtype=float)
+        kkt[:m, :m] = np.asarray(F.T @ F, dtype=float)
+        if reg > 0.0:
+            kkt[:m, :m] += reg * np.eye(m, dtype=float)
+        kkt[:m, m] = 1.0
+        kkt[m, :m] = 1.0
+        rhs = np.zeros((m + 1,), dtype=float)
+        rhs[m] = 1.0
+        try:
+            sol = np.linalg.solve(kkt, rhs)
+        except np.linalg.LinAlgError:
+            return None
+        alpha = np.asarray(sol[:m], dtype=float)
+        if not np.all(np.isfinite(alpha)):
+            return None
+        z_mix = np.asarray(G @ alpha, dtype=float).ravel()
+        damping = float(getattr(self.vi_params, "anderson_damping", 1.0) or 1.0)
+        damping = min(max(damping, 0.0), 1.0)
+        if damping < 1.0:
+            z_mix = z_curr + damping * (z_mix - z_curr)
+        if not np.all(np.isfinite(z_mix)):
+            return None
+        nx = int(np.asarray(x_curr, dtype=float).size)
+        step = np.asarray(z_mix[:nx], dtype=float).ravel() - np.asarray(x_curr, dtype=float).ravel()
+        lambda_target = np.asarray(z_mix[nx:], dtype=float).ravel()
+        if not np.any(np.abs(step) > 0.0):
+            return None
+        return step, lambda_target
+
+    def _vi_state_from_sets(self, act_lo: np.ndarray, act_hi: np.ndarray) -> np.ndarray:
+        state = np.zeros(act_lo.shape, dtype=np.int8)
+        state[np.asarray(act_lo, dtype=bool)] = 1
+        state[np.asarray(act_hi, dtype=bool)] = -1
+        return state
+
+    def _vi_semismooth_residual_from_state(
+        self,
+        *,
+        x_red: np.ndarray,
+        stationarity_red: np.ndarray,
+        lo_red: np.ndarray,
+        hi_red: np.ndarray,
+        state: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        state = np.asarray(state, dtype=np.int8).ravel()
+        x_red = np.asarray(x_red, dtype=float).ravel()
+        lo_red = np.asarray(lo_red, dtype=float).ravel()
+        hi_red = np.asarray(hi_red, dtype=float).ravel()
+        stat_red = np.asarray(stationarity_red, dtype=float).ravel()
+        if not (state.shape == x_red.shape == lo_red.shape == hi_red.shape == stat_red.shape):
+            raise ValueError("Fixed-state semismooth residual inputs must have matching shapes.")
+        lo_f = np.isfinite(lo_red)
+        hi_f = np.isfinite(hi_red)
+        act_lo = lo_f & (state == 1)
+        act_hi = hi_f & (state == -1)
+        G = stat_red.copy()
+        gap_lo = x_red - lo_red
+        gap_hi = hi_red - x_red
+        G[act_lo] = gap_lo[act_lo]
+        G[act_hi] = -gap_hi[act_hi]
+        return G, act_lo, act_hi
+
+    def _vi_clear_working_set_guard(self) -> None:
+        self._vi_working_set_guard_state = None
+        self._vi_working_set_guard_remaining = 0
+        self._vi_working_set_guard_active = None
+
+    def _vi_arm_working_set_guard(self, state: np.ndarray | None) -> None:
+        nit = max(0, int(getattr(self.vi_params, "working_set_guard_after_affine", 0) or 0))
+        if nit <= 0 or state is None:
+            self._vi_clear_working_set_guard()
+            return
+        self._vi_working_set_guard_state = np.asarray(state, dtype=np.int8).copy()
+        self._vi_working_set_guard_remaining = int(nit)
+        self._vi_working_set_guard_active = None
+
+    def _vi_begin_working_set_guard_iteration(self) -> None:
+        state = getattr(self, "_vi_working_set_guard_state", None)
+        rem = int(getattr(self, "_vi_working_set_guard_remaining", 0) or 0)
+        if state is None or rem <= 0:
+            self._vi_working_set_guard_active = None
+            if rem <= 0:
+                self._vi_working_set_guard_state = None
+            return
+        self._vi_working_set_guard_active = np.asarray(state, dtype=np.int8).copy()
+        self._vi_working_set_guard_remaining = max(rem - 1, 0)
+        if self._vi_working_set_guard_remaining <= 0:
+            self._vi_working_set_guard_state = None
+
+    def _vi_guard_state_after_affine_rescue(
+        self,
+        *,
+        state_base: np.ndarray,
+        state_affine: np.ndarray,
+        x_affine: np.ndarray,
+        lo_red: np.ndarray,
+        hi_red: np.ndarray,
+    ) -> np.ndarray:
+        guard_state = np.asarray(state_base, dtype=np.int8).copy()
+        state_aff = np.asarray(state_affine, dtype=np.int8).ravel()
+        x_aff = np.asarray(x_affine, dtype=float).ravel()
+        if (
+            guard_state.shape != state_aff.shape
+            or guard_state.shape != x_aff.shape
+            or guard_state.shape != np.asarray(lo_red).shape
+            or guard_state.shape != np.asarray(hi_red).shape
+        ):
+            return guard_state
+        tol = max(
+            _vi_filter_abs_floor(self.vi_params),
+            float(getattr(self.vi_params, "enter_tol", 0.0) or 0.0),
+            1.0e-8,
+        )
+        lo_f = np.isfinite(lo_red)
+        hi_f = np.isfinite(hi_red)
+        new_lo = (
+            (guard_state == 0)
+            & (state_aff == 1)
+            & lo_f
+            & (x_aff <= np.asarray(lo_red, dtype=float) + tol)
+        )
+        new_hi = (
+            (guard_state == 0)
+            & (state_aff == -1)
+            & hi_f
+            & (x_aff >= np.asarray(hi_red, dtype=float) - tol)
+        )
+        both = new_lo & new_hi
+        if np.any(both):
+            gap_lo = np.abs(x_aff[both] - np.asarray(lo_red, dtype=float)[both])
+            gap_hi = np.abs(np.asarray(hi_red, dtype=float)[both] - x_aff[both])
+            choose_lo = gap_lo <= gap_hi
+            new_lo[both] = choose_lo
+            new_hi[both] = ~choose_lo
+        guard_state[new_lo] = 1
+        guard_state[new_hi] = -1
+        return guard_state
+
+    def _vi_capture_classification_state(self) -> dict[str, object]:
+        return {
+            "prev_state": None if self._vi_prev_state is None else np.asarray(self._vi_prev_state, dtype=np.int8).copy(),
+            "pending_state": None if self._vi_pending_state is None else np.asarray(self._vi_pending_state, dtype=np.int8).copy(),
+            "pending_count": None if self._vi_pending_count is None else np.asarray(self._vi_pending_count, dtype=np.int16).copy(),
+            "forced_state": None if self._vi_forced_state is None else np.asarray(self._vi_forced_state, dtype=np.int8).copy(),
+            "guard_state": None
+            if self._vi_working_set_guard_state is None
+            else np.asarray(self._vi_working_set_guard_state, dtype=np.int8).copy(),
+            "guard_remaining": int(getattr(self, "_vi_working_set_guard_remaining", 0) or 0),
+            "guard_active": None
+            if self._vi_working_set_guard_active is None
+            else np.asarray(self._vi_working_set_guard_active, dtype=np.int8).copy(),
+        }
+
+    def _vi_restore_classification_state(self, state: dict[str, object] | None) -> None:
+        snap = dict(state or {})
+        prev_state = snap.get("prev_state", None)
+        pending_state = snap.get("pending_state", None)
+        pending_count = snap.get("pending_count", None)
+        forced_state = snap.get("forced_state", None)
+        guard_state = snap.get("guard_state", None)
+        guard_remaining = int(snap.get("guard_remaining", 0) or 0)
+        guard_active = snap.get("guard_active", None)
+        self._vi_prev_state = None if prev_state is None else np.asarray(prev_state, dtype=np.int8).copy()
+        self._vi_pending_state = None if pending_state is None else np.asarray(pending_state, dtype=np.int8).copy()
+        self._vi_pending_count = None if pending_count is None else np.asarray(pending_count, dtype=np.int16).copy()
+        self._vi_forced_state = None if forced_state is None else np.asarray(forced_state, dtype=np.int8).copy()
+        self._vi_working_set_guard_state = None if guard_state is None else np.asarray(guard_state, dtype=np.int8).copy()
+        self._vi_working_set_guard_remaining = int(guard_remaining)
+        self._vi_working_set_guard_active = None if guard_active is None else np.asarray(guard_active, dtype=np.int8).copy()
+
+    def _vi_rebuild_carried_state_from_endpoint(
+        self,
+        *,
+        x_red: np.ndarray,
+        stationarity_red: np.ndarray,
+        lo_red: np.ndarray,
+        hi_red: np.ndarray,
+        c_red: np.ndarray,
+        state_base: np.ndarray | None = None,
+    ) -> np.ndarray:
+        x_arr = np.asarray(x_red, dtype=float).ravel()
+        stat_arr = np.asarray(stationarity_red, dtype=float).ravel()
+        if state_base is not None and np.asarray(state_base).shape == x_arr.shape:
+            base_state = np.asarray(state_base, dtype=np.int8).copy()
+            prev_state = base_state
+        else:
+            base_state = np.zeros(x_arr.shape, dtype=np.int8)
+            prev_state = None
+        act_lo_end, act_hi_end = self._vi_predict_sets_from_state(
+            x_red=x_arr,
+            stationarity_red=stat_arr,
+            lo_red=lo_red,
+            hi_red=hi_red,
+            c_red=c_red,
+            prev_state=prev_state,
+        )
+        end_state = self._vi_state_from_sets(act_lo_end, act_hi_end)
+        return self._vi_guard_state_after_affine_rescue(
+            state_base=base_state,
+            state_affine=end_state,
+            x_affine=x_arr,
+            lo_red=lo_red,
+            hi_red=hi_red,
+        )
+
+    def _vi_commit_carried_state(self, state: np.ndarray | None) -> None:
+        if state is None:
+            self._vi_prev_state = None
+            self._vi_pending_state = None
+            self._vi_pending_count = None
+            self._vi_forced_state = None
+            return
+        state_arr = np.asarray(state, dtype=np.int8).copy()
+        self._vi_prev_state = state_arr.copy()
+        self._vi_pending_state = state_arr.copy()
+        self._vi_pending_count = np.zeros(state_arr.shape, dtype=np.int16)
+        self._vi_forced_state = state_arr.copy()
+
+    def _vi_apply_state_persistence(self, proposed_state: np.ndarray) -> np.ndarray:
+        persist = max(0, int(getattr(self.vi_params, "active_set_persistence", 0) or 0))
+        if persist <= 0:
+            self._vi_pending_state = proposed_state.copy()
+            self._vi_pending_count = np.zeros(proposed_state.shape, dtype=np.int16)
+            return proposed_state
+
+        prev = getattr(self, "_vi_prev_state", None)
+        if prev is None or prev.shape != proposed_state.shape:
+            self._vi_pending_state = proposed_state.copy()
+            self._vi_pending_count = np.zeros(proposed_state.shape, dtype=np.int16)
+            return proposed_state
+
+        pending = getattr(self, "_vi_pending_state", None)
+        counts = getattr(self, "_vi_pending_count", None)
+        if pending is None or counts is None or pending.shape != proposed_state.shape or counts.shape != proposed_state.shape:
+            pending = prev.copy()
+            counts = np.zeros(proposed_state.shape, dtype=np.int16)
+
+        changed = proposed_state != prev
+        same_pending = proposed_state == pending
+        counts = np.where(changed & same_pending, counts + 1, np.where(changed, 1, 0)).astype(np.int16, copy=False)
+        pending = np.where(changed, proposed_state, prev).astype(np.int8, copy=False)
+
+        accepted = prev.copy()
+        promote = changed & (counts > persist)
+        accepted[promote] = proposed_state[promote]
+
+        self._vi_pending_state = pending.astype(np.int8, copy=False)
+        self._vi_pending_count = counts.astype(np.int16, copy=False)
+        return accepted.astype(np.int8, copy=False)
+
+    def _vi_metrics(
+        self,
+        x_red: np.ndarray,
+        stationarity_red: np.ndarray,
+        lo_red: np.ndarray,
+        hi_red: np.ndarray,
+        act_lo: np.ndarray,
+        act_hi: np.ndarray,
+        G_red: np.ndarray,
+        eq_res: np.ndarray | None = None,
+    ) -> dict[str, float]:
+        active = np.asarray(act_lo | act_hi, dtype=bool)
+        inactive = ~active
+        gap = np.zeros_like(x_red, dtype=float)
+        gap[act_lo] = np.abs(x_red[act_lo] - lo_red[act_lo])
+        gap[act_hi] = np.abs(hi_red[act_hi] - x_red[act_hi])
+        R_inactive = np.asarray(stationarity_red[inactive], dtype=float)
+        gap_active = np.asarray(gap[active], dtype=float)
+        eq_vec = np.asarray(np.zeros((0,), dtype=float) if eq_res is None else eq_res, dtype=float).ravel()
+        res_inf = float(np.linalg.norm(R_inactive, ord=np.inf)) if R_inactive.size else 0.0
+        gap_inf = float(np.linalg.norm(gap_active, ord=np.inf)) if gap_active.size else 0.0
+        eq_inf = float(np.linalg.norm(eq_vec, ord=np.inf)) if eq_vec.size else 0.0
+        res_l2 = float(R_inactive @ R_inactive) if R_inactive.size else 0.0
+        gap_l2 = float(gap_active @ gap_active) if gap_active.size else 0.0
+        eq_l2 = float(eq_vec @ eq_vec) if eq_vec.size else 0.0
+        G_aug = self._vi_augmented_residual(G_red, eq_vec)
+        merit = (
+            0.5 * float(getattr(self.vi_params, "merit_residual_weight", 1.0) or 1.0) * res_l2
+            + 0.5 * float(getattr(self.vi_params, "merit_gap_weight", 1.0) or 1.0) * gap_l2
+            + 0.5 * float(getattr(self.vi_params, "merit_equality_weight", 1.0) or 1.0) * eq_l2
+        )
+        return {
+            "G_inf": float(np.linalg.norm(np.asarray(G_aug, dtype=float), ord=np.inf)),
+            "G_half": 0.5 * float(np.asarray(G_aug, dtype=float) @ np.asarray(G_aug, dtype=float)),
+            "inactive_res_inf": res_inf,
+            "active_gap_inf": gap_inf,
+            "equality_inf": eq_inf,
+            "inactive_res_l2_sq": res_l2,
+            "active_gap_l2_sq": gap_l2,
+            "equality_l2_sq": eq_l2,
+            "merit": merit,
+        }
+
+    def _vi_apply_inactive_regularization(
+        self,
+        A_mod: sp.csr_matrix,
+        A_base: sp.csr_matrix,
+        active: np.ndarray,
+        lam: float,
+    ) -> tuple[sp.csr_matrix, np.ndarray]:
+        inactive = ~np.asarray(active, dtype=bool)
+        if lam <= 0.0 or not np.any(inactive):
+            return A_mod, np.zeros(active.shape, dtype=float)
+
+        diag = np.abs(np.asarray(A_base.diagonal(), dtype=float))
+        floor = float(getattr(self.vi_params, "inactive_reg_min_diag", 1.0e-12) or 1.0e-12)
+        diag = np.where(np.isfinite(diag) & (diag > floor), diag, floor)
+        add = np.zeros(active.shape, dtype=float)
+        add[inactive] = float(lam) * diag[inactive]
+
+        A_reg = A_mod.tolil(copy=True)
+        for idx in np.flatnonzero(inactive).tolist():
+            A_reg[int(idx), int(idx)] = float(A_reg[int(idx), int(idx)]) + float(add[int(idx)])
+        return A_reg.tocsr(), add
+
+    def _vi_should_grow_inactive_regularization(
+        self,
+        *,
+        accepted_alpha: float,
+        merit_ratio: float,
+        accepted_metrics: dict[str, float] | None,
+        current_lambda: float,
+    ) -> bool:
+        lam0 = float(getattr(self.vi_params, "inactive_reg_lambda0", 0.0) or 0.0)
+        lam_max = float(getattr(self.vi_params, "inactive_reg_lambda_max", 1.0e6) or 1.0e6)
+        stall_alpha = float(getattr(self.vi_params, "inactive_reg_stall_alpha", 0.25) or 0.25)
+        stall_ratio = float(getattr(self.vi_params, "inactive_reg_stall_merit_ratio", 0.95) or 0.95)
+        if lam0 <= 0.0 or float(current_lambda) >= lam_max:
+            return False
+        if not (float(accepted_alpha) < stall_alpha and float(merit_ratio) > stall_ratio):
+            return False
+
+        metrics = dict(accepted_metrics or {})
+        inactive_res_inf = float(metrics.get("inactive_res_inf", 0.0) or 0.0)
+        active_gap_inf = float(metrics.get("active_gap_inf", 0.0) or 0.0)
+        # Only grow inactive-row regularization when the stalled step still has
+        # a meaningful complementarity component. If the active-gap residual is
+        # already negligible compared with the inactive PDE residual, inflating
+        # the inactive block mostly hardens the whole coupled system without
+        # targeting the dominant source of nonlinearity.
+        active_gap_floor = 1.0e-12
+        active_gap_ratio = 1.0e-3
+        return active_gap_inf > max(active_gap_floor, active_gap_ratio * max(inactive_res_inf, 1.0e-30))
+
+    def _vi_build_unconstrained_lm_system(
+        self,
+        A_red: sp.csr_matrix,
+        R_red: np.ndarray,
+        lam: float,
+    ) -> tuple[sp.csr_matrix, np.ndarray, np.ndarray]:
+        rhs = -np.asarray(R_red, dtype=float)
+        return self._vi_build_lm_system(A_red, rhs, lam)
+
+    def _vi_build_lm_system(
+        self,
+        A_red: sp.csr_matrix,
+        rhs_red: np.ndarray,
+        lam: float,
+        *,
+        x_block_size: int | None = None,
+    ) -> tuple[sp.csr_matrix, np.ndarray, np.ndarray]:
+        if not sp.isspmatrix_csr(A_red):
+            A_red = A_red.tocsr()
+        diag_full = np.abs(np.asarray(A_red.diagonal(), dtype=float))
+        row_abs_full = np.asarray(np.abs(A_red).sum(axis=1)).ravel()
+        floor = float(getattr(self.vi_params, "unconstrained_lm_min_diag", 1.0e-12) or 1.0e-12)
+        n = int(A_red.shape[0])
+        if x_block_size is None:
+            x_block = n
+        else:
+            x_block = int(max(0, min(int(x_block_size), n)))
+        diag = np.zeros((n,), dtype=float)
+        if x_block > 0:
+            diag_x = np.asarray(diag_full[:x_block], dtype=float)
+            row_x = np.asarray(row_abs_full[:x_block], dtype=float)
+            # Mixed saddle-point rows, especially pressure, often have an
+            # identically zero diagonal even though the row is strongly
+            # coupled. Falling back to the tiny floor leaves the LM shift
+            # effectively inactive on those DOFs and can produce enormous
+            # first-step pressure corrections. Use the row 1-norm as the
+            # local regularization scale when the diagonal is structurally
+            # zero or unusable.
+            diag[:x_block] = np.where(
+                np.isfinite(diag_x) & (diag_x > floor),
+                diag_x,
+                np.where(np.isfinite(row_x) & (row_x > floor), row_x, floor),
+            )
+        H = A_red.copy().tocsr()
+        if lam > 0.0:
+            H = H + sp.diags(float(lam) * diag, format="csr")
+        rhs = np.asarray(rhs_red, dtype=float).copy()
+        return H, rhs, diag
+
+    def _vi_unconstrained_lm_model(
+        self,
+        R_red: np.ndarray,
+        A_red: sp.csr_matrix,
+        step: np.ndarray,
+        lam: float,
+        diag: np.ndarray,
+        *,
+        phi_try: float | None = None,
+    ) -> tuple[float, float, float, float]:
+        phi0 = 0.5 * float(np.asarray(R_red, dtype=float) @ np.asarray(R_red, dtype=float))
+        lin_res = np.asarray(R_red, dtype=float) + np.asarray(A_red @ step, dtype=float)
+        model_phi = 0.5 * float(lin_res @ lin_res)
+        # IMPORTANT:
+        # The current unconstrained "LM" branch solves a shifted Newton system
+        #   (A + λ D) s = -R
+        # for speed, not the classical least-squares LM normal equations.
+        # Therefore `phi0 - model_phi` is *not* a reliable predicted reduction
+        # for the accepted step, and using it in rho can produce ±inf / nonsense.
+        #
+        # We still return the linearized merit model value for diagnostics, but
+        # the acceptance ratio uses the *actual* relative reduction instead.
+        rho = float("nan")
+        if phi_try is not None:
+            actual = phi0 - float(phi_try)
+            rho = actual / max(phi0, 1.0e-30)
+        pred_model = phi0 - model_phi
+        return phi0, model_phi, pred_model, rho
+
+    def _vi_strong_active_mask(
+        self,
+        x_red: np.ndarray,
+        stationarity_red: np.ndarray,
+        lo_red: np.ndarray,
+        hi_red: np.ndarray,
+        act_lo: np.ndarray,
+        act_hi: np.ndarray,
+        c_red: np.ndarray,
+    ) -> np.ndarray:
+        tol0 = float(getattr(self.vi_params, "active_tol", 0.0) or 0.0)
+        enter_tol = getattr(self.vi_params, "enter_tol", None)
+        leave_tol = getattr(self.vi_params, "leave_tol", None)
+        enter_tol = tol0 if enter_tol is None else float(enter_tol)
+        leave_tol = enter_tol if leave_tol is None else float(leave_tol)
+        base_tol = max(abs(enter_tol), abs(leave_tol), 1.0e-16)
+        factor = float(getattr(self.vi_params, "active_step_strong_factor", 5.0) or 5.0)
+        gap_lo = x_red - lo_red
+        gap_hi = hi_red - x_red
+        ind_lo = stationarity_red - c_red * gap_lo
+        ind_hi = stationarity_red + c_red * gap_hi
+        strong_lo = np.asarray(act_lo, dtype=bool) & (ind_lo >= factor * base_tol)
+        strong_hi = np.asarray(act_hi, dtype=bool) & ((-ind_hi) >= factor * base_tol)
+        return np.asarray(strong_lo | strong_hi, dtype=bool)
+
+    def _vi_predicted_bound_activity(
+        self,
+        *,
+        x_red: np.ndarray,
+        step_red: np.ndarray,
+        lo_red: np.ndarray,
+        hi_red: np.ndarray,
+        act_lo: np.ndarray,
+        act_hi: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, int]:
+        tol0 = float(getattr(self.vi_params, "active_tol", 0.0) or 0.0)
+        enter_tol = getattr(self.vi_params, "enter_tol", None)
+        leave_tol = getattr(self.vi_params, "leave_tol", None)
+        enter_tol = tol0 if enter_tol is None else float(enter_tol)
+        leave_tol = enter_tol if leave_tol is None else float(leave_tol)
+        pred_tol = max(abs(enter_tol), abs(leave_tol), 1.0e-8)
+
+        x_target = np.asarray(x_red, dtype=float) + np.asarray(step_red, dtype=float)
+        lo_f = np.isfinite(lo_red)
+        hi_f = np.isfinite(hi_red)
+        pred_lo = np.asarray(lo_f & (x_target <= (lo_red + pred_tol)), dtype=bool)
+        pred_hi = np.asarray(hi_f & (x_target >= (hi_red - pred_tol)), dtype=bool)
+
+        current = np.asarray(act_lo | act_hi, dtype=bool)
+        predicted = np.asarray(current | pred_lo | pred_hi, dtype=bool)
+        entering = np.asarray(predicted & (~current), dtype=bool)
+        predicted_delta = int(np.count_nonzero(entering))
+        return predicted, entering, predicted_delta
+
+    def _vi_predict_sets_from_state(
+        self,
+        *,
+        x_red: np.ndarray,
+        stationarity_red: np.ndarray,
+        lo_red: np.ndarray,
+        hi_red: np.ndarray,
+        c_red: np.ndarray,
+        prev_state: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        tol0 = float(getattr(self.vi_params, "active_tol", 0.0) or 0.0)
+        enter_tol = getattr(self.vi_params, "enter_tol", None)
+        leave_tol = getattr(self.vi_params, "leave_tol", None)
+        enter_tol = tol0 if enter_tol is None else float(enter_tol)
+        leave_tol = enter_tol if leave_tol is None else float(leave_tol)
+
+        lo_f = np.isfinite(lo_red)
+        hi_f = np.isfinite(hi_red)
+        gap_lo = np.asarray(x_red, dtype=float) - np.asarray(lo_red, dtype=float)
+        gap_hi = np.asarray(hi_red, dtype=float) - np.asarray(x_red, dtype=float)
+        ind_lo = np.asarray(stationarity_red, dtype=float) - np.asarray(c_red, dtype=float) * gap_lo
+        ind_hi = np.asarray(stationarity_red, dtype=float) + np.asarray(c_red, dtype=float) * gap_hi
+
+        if prev_state is not None and prev_state.shape == gap_lo.shape:
+            prev_lo_mask = np.asarray(prev_state == 1, dtype=bool)
+            prev_hi_mask = np.asarray(prev_state == -1, dtype=bool)
+        else:
+            prev_lo_mask = np.zeros(gap_lo.shape, dtype=bool)
+            prev_hi_mask = np.zeros(gap_lo.shape, dtype=bool)
+
+        enter_lo = lo_f & (ind_lo > enter_tol)
+        enter_hi = hi_f & (ind_hi < -enter_tol)
+        keep_lo = prev_lo_mask & lo_f & (ind_lo > -leave_tol)
+        keep_hi = prev_hi_mask & hi_f & (ind_hi < leave_tol)
+
+        act_lo = np.asarray(enter_lo | keep_lo, dtype=bool)
+        act_hi = np.asarray(enter_hi | keep_hi, dtype=bool)
+        both = act_lo & act_hi
+        if np.any(both):
+            choose_lo = gap_lo[both] <= gap_hi[both]
+            act_lo[both] &= choose_lo
+            act_hi[both] &= ~choose_lo
+        return act_lo, act_hi
+
+    def _vi_apply_active_step_policy(
+        self,
+        *,
+        alpha: float,
+        S_red: np.ndarray,
+        active_mask: np.ndarray | None,
+        strong_active_mask: np.ndarray | None,
+        active_delta_ref: int,
+    ) -> tuple[np.ndarray, bool]:
+        step = alpha * np.asarray(S_red, dtype=float)
+        if active_mask is None or active_mask.size != step.size:
+            return step, False
+        active_mask = np.asarray(active_mask, dtype=bool)
+        if not np.any(active_mask):
+            return step, False
+
+        trigger = int(getattr(self.vi_params, "active_step_delta_active_trigger", 0) or 0)
+        soft_alpha = float(getattr(self.vi_params, "active_step_soft_alpha", 1.0) or 1.0)
+        use_soft = trigger > 0 and active_delta_ref >= trigger and soft_alpha < 1.0
+        if not use_soft:
+            # When the soft-active policy is disabled, respect the line-search
+            # scaling on every DOF. Forcing active DOFs to take the full Newton
+            # step defeats backtracking and can stall the semismooth VI search
+            # even when the underlying Newton direction is good.
+            return step, False
+
+        strong_active_mask = np.zeros(step.shape, dtype=bool) if strong_active_mask is None else np.asarray(strong_active_mask, dtype=bool)
+        if strong_active_mask.shape != step.shape:
+            strong_active_mask = np.zeros(step.shape, dtype=bool)
+        weak_active_mask = active_mask & (~strong_active_mask)
+        weak_alpha = min(max(alpha, 0.0), soft_alpha)
+        step = step.copy()
+        step[strong_active_mask] = np.asarray(S_red, dtype=float)[strong_active_mask]
+        step[weak_active_mask] = weak_alpha * np.asarray(S_red, dtype=float)[weak_active_mask]
+        return step, True
+
+    def _vi_feasible_step_alpha_cap(
+        self,
+        x_red: np.ndarray,
+        S_red: np.ndarray,
+        lo_red: np.ndarray,
+        hi_red: np.ndarray,
+        *,
+        active_mask: np.ndarray | None = None,
+    ) -> float:
+        if not bool(getattr(self.vi_params, "bound_step_limit", False)):
+            return 1.0
+        alpha_cap, _, _ = self._vi_blocking_step_data(
+            x_red,
+            S_red,
+            lo_red,
+            hi_red,
+            active_mask=active_mask,
+        )
+        tau = float(getattr(self.vi_params, "bound_step_tau", 1.0) or 0.0)
+        tau = min(max(tau, 0.0), 1.0)
+        alpha_cap = max(0.0, min(1.0, float(alpha_cap)))
+        if alpha_cap < 1.0:
+            alpha_cap *= tau
+        return max(0.0, min(1.0, alpha_cap))
+
+    def _vi_blocking_step_data(
+        self,
+        x_red: np.ndarray,
+        S_red: np.ndarray,
+        lo_red: np.ndarray,
+        hi_red: np.ndarray,
+        *,
+        active_mask: np.ndarray | None = None,
+    ) -> tuple[float, np.ndarray, np.ndarray]:
+        x = np.asarray(x_red, dtype=float).ravel()
+        s = np.asarray(S_red, dtype=float).ravel()
+        lo = np.asarray(lo_red, dtype=float).ravel()
+        hi = np.asarray(hi_red, dtype=float).ravel()
+        if not (x.size == s.size == lo.size == hi.size):
+            raise ValueError("Feasible-step limiter inputs must have the same size.")
+        if active_mask is None:
+            active = np.zeros(x.shape, dtype=bool)
+        else:
+            active = np.asarray(active_mask, dtype=bool).ravel()
+            if active.shape != x.shape:
+                raise ValueError("Active mask size does not match the step vector.")
+        tol = 1.0e-14
+        alpha_cap = 1.0
+        caps_hi = np.full(x.shape, np.inf, dtype=float)
+        caps_lo = np.full(x.shape, np.inf, dtype=float)
+
+        pos = (~active) & np.isfinite(hi) & (s > 0.0)
+        if np.any(pos):
+            dist_hi = np.asarray(hi[pos] - x[pos], dtype=float)
+            bad_hi = dist_hi < -tol * np.maximum(np.abs(hi[pos]), 1.0)
+            if np.any(bad_hi):
+                return 0.0, np.zeros(x.shape, dtype=bool), np.zeros(x.shape, dtype=bool)
+            caps_pos = np.asarray(dist_hi / s[pos], dtype=float)
+            caps_hi[pos] = np.where(np.isfinite(caps_pos), caps_pos, np.inf)
+            caps_pos = caps_pos[np.isfinite(caps_pos)]
+            if caps_pos.size:
+                alpha_cap = min(alpha_cap, float(np.min(caps_pos)))
+
+        neg = (~active) & np.isfinite(lo) & (s < 0.0)
+        if np.any(neg):
+            dist_lo = np.asarray(lo[neg] - x[neg], dtype=float)
+            bad_lo = dist_lo > tol * np.maximum(np.abs(lo[neg]), 1.0)
+            if np.any(bad_lo):
+                return 0.0, np.zeros(x.shape, dtype=bool), np.zeros(x.shape, dtype=bool)
+            caps_neg = np.asarray(dist_lo / s[neg], dtype=float)
+            caps_lo[neg] = np.where(np.isfinite(caps_neg), caps_neg, np.inf)
+            caps_neg = caps_neg[np.isfinite(caps_neg)]
+            if caps_neg.size:
+                alpha_cap = min(alpha_cap, float(np.min(caps_neg)))
+
+        if not np.isfinite(alpha_cap):
+            alpha_cap = 1.0
+        alpha_cap = max(0.0, min(1.0, alpha_cap))
+        block_lo = np.zeros(x.shape, dtype=bool)
+        block_hi = np.zeros(x.shape, dtype=bool)
+        if alpha_cap < 1.0:
+            scale = max(abs(alpha_cap), 1.0)
+            block_lo = neg & np.isfinite(caps_lo) & (caps_lo <= alpha_cap + tol * scale)
+            block_hi = pos & np.isfinite(caps_hi) & (caps_hi <= alpha_cap + tol * scale)
+        return float(alpha_cap), np.asarray(block_lo, dtype=bool), np.asarray(block_hi, dtype=bool)
+
+    def set_box_bounds(self, lower=None, upper=None, by_field: dict | None = None) -> None:
+        """
+        Define componentwise bounds on the full DOF vector.
+
+        Parameters
+        ----------
+        lower/upper:
+            Scalar or full-size numpy arrays (total_dofs). Missing bound -> ±inf.
+        by_field:
+            Dict like {'ux': (lo, hi), 'uy': (lo, hi), 'p': (None, None)} applied on
+            the corresponding field slices.
+        """
+        n = int(self.dh.total_dofs)
+        lo_full = np.full(n, -np.inf, dtype=float)
+        hi_full = np.full(n, np.inf, dtype=float)
+
+        if isinstance(lower, (int, float)):
+            lo_full[:] = float(lower)
+        elif isinstance(lower, np.ndarray):
+            if int(lower.size) != n:
+                raise ValueError(f"lower bound array has size {int(lower.size)}, expected {n}.")
+            lo_full[:] = np.asarray(lower, dtype=float)
+
+        if isinstance(upper, (int, float)):
+            hi_full[:] = float(upper)
+        elif isinstance(upper, np.ndarray):
+            if int(upper.size) != n:
+                raise ValueError(f"upper bound array has size {int(upper.size)}, expected {n}.")
+            hi_full[:] = np.asarray(upper, dtype=float)
+
+        if by_field:
+            for name, (lo, hi) in by_field.items():
+                sl = self.dh.get_field_slice(name)
+                if sl is None:
+                    raise KeyError(f"Unknown field '{name}'.")
+                if lo is not None:
+                    lo_full[sl] = float(lo)
+                if hi is not None:
+                    hi_full[sl] = float(hi)
+
+        # sanitize NaNs to ±inf
+        lo_full = np.where(np.isfinite(lo_full), lo_full, -np.inf)
+        hi_full = np.where(np.isfinite(hi_full), hi_full, np.inf)
+
+        if np.any(lo_full > hi_full):
+            bad = np.flatnonzero(lo_full > hi_full)
+            raise ValueError(f"Inconsistent bounds: lower > upper at {int(bad.size)} DOFs (e.g. {int(bad[0])}).")
+
+        self._box_lower_full = lo_full
+        self._box_upper_full = hi_full
+        self._trace_reduced_box_bounds_summary()
+
+        if getattr(self, "constraints", None) is not None:
+            try:
+                slaves = np.asarray(self.constraints.slaves, dtype=int)
+                if slaves.size:
+                    lo_s = lo_full[slaves]
+                    hi_s = hi_full[slaves]
+                    if np.any(np.isfinite(lo_s)) or np.any(np.isfinite(hi_s)):
+                        warnings.warn(
+                            "Box bounds were set on slave/hanging DOFs; these bounds are ignored in the "
+                            "condensed master-space VI solve. Apply bounds to master DOFs instead.",
+                            RuntimeWarning,
+                        )
+            except Exception:
+                pass
+
+    def _bounds_reduced(self) -> tuple[np.ndarray, np.ndarray]:
+        lo_full = getattr(self, "_box_lower_full", None)
+        hi_full = getattr(self, "_box_upper_full", None)
+        if lo_full is None or hi_full is None:
+            raise RuntimeError("Box bounds are not set. Call set_box_bounds() before solving.")
+        if getattr(self, "constraints", None) is not None:
+            master_ids = np.asarray(self.constraints.master_ids, dtype=int)
+            lo_master = np.asarray(lo_full, dtype=float)[master_ids]
+            hi_master = np.asarray(hi_full, dtype=float)[master_ids]
+            return lo_master[self.active_dofs].copy(), hi_master[self.active_dofs].copy()
+        return np.asarray(lo_full, dtype=float)[self.active_dofs].copy(), np.asarray(hi_full, dtype=float)[self.active_dofs].copy()
+
+    def _gather_full_iterate(self, funcs: list) -> np.ndarray:
+        """
+        Gather the current iterate into a full global DOF vector in *global index*
+        order.
+
+        IMPORTANT: Function/VectorFunction nodal storage is in their local order
+        (the order of `._g_dofs`), which is not necessarily sorted by global DOF id.
+        Do not use `np.hstack([f.nodal_values ...])` when you need a global vector.
+        """
+        n = int(self.dh.total_dofs)
+        x_full = np.zeros(n, dtype=float)
+        for f in funcs:
+            g = getattr(f, "_g_dofs", None)
+            vals = getattr(f, "nodal_values", None)
+            if g is None or vals is None:
+                continue
+            g_arr = np.asarray(g, dtype=int).ravel()
+            if g_arr.size == 0:
+                continue
+            v_arr = np.asarray(vals, dtype=float).ravel()
+            if v_arr.size != g_arr.size:
+                raise ValueError(
+                    f"Function '{getattr(f, 'name', '<unnamed>')}' has nodal_values size {int(v_arr.size)} "
+                    f"but _g_dofs size {int(g_arr.size)}."
+                )
+            x_full[g_arr] = v_arr
+        return x_full
+
+    def _pack_reduced_iterate(self, funcs: list) -> np.ndarray:
+        x_full = self._gather_full_iterate(funcs)
+        if getattr(self, "constraints", None) is not None:
+            master_ids = np.asarray(self.constraints.master_ids, dtype=int)
+            x_master = np.asarray(x_full, dtype=float)[master_ids]
+            return x_master[self.active_dofs].copy()
+        return np.asarray(x_full, dtype=float)[self.active_dofs].copy()
+
+    def _project_box_with_prepared_equalities(
+        self,
+        *,
+        x: np.ndarray,
+        lo: np.ndarray,
+        hi: np.ndarray,
+        eq_data: _PreparedLinearEqualities,
+        tol: float,
+    ) -> np.ndarray:
+        proj_rows = np.asarray(eq_data.project_feasible, dtype=bool).ravel()
+        if int(np.count_nonzero(proj_rows)) == 0:
+            return np.minimum(np.maximum(np.asarray(x, dtype=float), np.asarray(lo, dtype=float)), np.asarray(hi, dtype=float))
+
+        x_proj = np.minimum(np.maximum(np.asarray(x, dtype=float), np.asarray(lo, dtype=float)), np.asarray(hi, dtype=float))
+        rows = np.flatnonzero(proj_rows)
+        if rows.size == 1:
+            row_idx = int(rows[0])
+            weights = np.asarray(eq_data.B_red[row_idx], dtype=float).ravel()
+            field_name = eq_data.field_names[row_idx] if row_idx < len(eq_data.field_names) else None
+            nz_mask = np.abs(weights) > max(float(tol), 1.0e-18)
+            if np.any(nz_mask):
+                field_local = True
+                if field_name is not None:
+                    field_mask = np.asarray(self._vi_red_field_names, dtype=object) == str(field_name)
+                    if np.any(nz_mask & (~field_mask)):
+                        field_local = False
+                if field_local:
+                    proj_mask = nz_mask.copy()
+                    lo_sub = np.asarray(lo, dtype=float)[proj_mask]
+                    hi_sub = np.asarray(hi, dtype=float)[proj_mask]
+                    if np.all(np.isfinite(lo_sub)) and np.all(np.isfinite(hi_sub)):
+                        weights_sub = np.asarray(weights[proj_mask], dtype=float)
+                        if np.all(weights_sub >= -1.0e-14):
+                            x_proj_sub = _project_box_with_single_linear_equality(
+                                x=np.asarray(x_proj, dtype=float)[proj_mask],
+                                weights=weights_sub,
+                                lo=lo_sub,
+                                hi=hi_sub,
+                                target=float(np.asarray(eq_data.b_eff, dtype=float).ravel()[row_idx]),
+                                tol=float(tol),
+                            )
+                            x_proj = np.asarray(x_proj, dtype=float).copy()
+                            x_proj[proj_mask] = np.asarray(x_proj_sub, dtype=float)
+                            return x_proj
+
+        B_proj = np.asarray(eq_data.B_red[proj_rows, :], dtype=float)
+        b_proj = np.asarray(eq_data.b_eff[proj_rows], dtype=float)
+        return _project_box_with_linear_equalities(
+            x=np.asarray(x_proj, dtype=float),
+            B=B_proj,
+            lo=np.asarray(lo, dtype=float),
+            hi=np.asarray(hi, dtype=float),
+            b=np.asarray(b_proj, dtype=float),
+            tol=float(tol),
+        )
+
+    def _project_funcs_to_bounds(
+        self,
+        funcs: list,
+        bcs_now,
+        lo_red: np.ndarray,
+        hi_red: np.ndarray,
+        eq_data: _PreparedLinearEqualities | None = None,
+        eq_prepare_callback: Optional[Callable[[], _PreparedLinearEqualities]] = None,
+    ) -> None:
+        proj_tol = float(getattr(self.vi_params, "projection_tol", 1.0e-12) or 1.0e-12)
+        proj_outer = max(1, int(getattr(self.vi_params, "projection_max_outer", 8) or 1))
+
+        eq_local = eq_data
+        lo_curr = np.asarray(lo_red, dtype=float)
+        hi_curr = np.asarray(hi_red, dtype=float)
+        if eq_local is None and callable(eq_prepare_callback):
+            eq_local = eq_prepare_callback()
+
+        for _ in range(proj_outer):
+            if self.pre_cb is not None:
+                self.pre_cb(funcs)
+                lo_curr, hi_curr = self._bounds_reduced()
+            x_red = self._pack_reduced_iterate(funcs)
+            x_proj = np.minimum(np.maximum(x_red, lo_curr), hi_curr)
+            if eq_local is not None and int(eq_local.B_red.shape[0]) > 0:
+                x_proj = self._project_box_with_prepared_equalities(
+                    x=np.asarray(x_proj, dtype=float),
+                    lo=np.asarray(lo_curr, dtype=float),
+                    hi=np.asarray(hi_curr, dtype=float),
+                    eq_data=eq_local,
+                    tol=proj_tol,
+                )
+
+            d_red = x_proj - x_red
+            if np.any(d_red):
+                dU_full = self.restrictor.expand_vec(d_red)
+                self.dh.add_to_functions(dU_full, funcs)
+                self.dh.apply_bcs(bcs_now, *funcs)
+                if getattr(self, "constraints", None) is not None:
+                    self._enforce_constraints_on_functions(funcs)
+
+            if not callable(eq_prepare_callback):
+                return
+
+            eq_next = eq_prepare_callback()
+            x_chk = self._pack_reduced_iterate(funcs)
+            eq_res = self._vi_equality_residual(x_chk, eq_next)
+            box_lo = np.maximum(np.asarray(lo_curr, dtype=float) - x_chk, 0.0)
+            box_hi = np.maximum(x_chk - np.asarray(hi_curr, dtype=float), 0.0)
+            box_res = max(
+                float(np.linalg.norm(box_lo, ord=np.inf)) if box_lo.size else 0.0,
+                float(np.linalg.norm(box_hi, ord=np.inf)) if box_hi.size else 0.0,
+            )
+            step_res = float(np.linalg.norm(d_red, ord=np.inf)) if d_red.size else 0.0
+            eq_inf = float(np.linalg.norm(eq_res, ord=np.inf)) if eq_res.size else 0.0
+            eq_local = eq_next
+            if step_res <= proj_tol and box_res <= 10.0 * proj_tol and eq_inf <= 10.0 * proj_tol:
+                return
+
+    def _pdas_residual_and_sets(
+        self,
+        x_red: np.ndarray,
+        R_red: np.ndarray,
+        lo_red: np.ndarray,
+        hi_red: np.ndarray,
+        c_red: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Build the semismooth residual for the bound VI and the corresponding
+        PDAS active sets.
+
+        Residual (componentwise):
+          - inactive:    F(x) = 0
+          - lower-active: x - lo = 0
+          - upper-active: x - hi = 0
+
+        Active set prediction:
+          - lower-active if   F(x) - c(x-lo) >  tol
+          - upper-active if   F(x) + c(hi-x) < -tol
+        """
+        tol0 = float(getattr(self.vi_params, "active_tol", 0.0) or 0.0)
+        enter_tol = getattr(self.vi_params, "enter_tol", None)
+        leave_tol = getattr(self.vi_params, "leave_tol", None)
+        enter_tol = tol0 if enter_tol is None else float(enter_tol)
+        leave_tol = enter_tol if leave_tol is None else float(leave_tol)
+        if c_red is None:
+            c_red = np.full(x_red.shape, float(getattr(self.vi_params, "c", 1.0) or 1.0), dtype=float)
+        c_red = np.where(np.isfinite(c_red) & (c_red > 0.0), c_red, 1.0)
+
+        lo_f = np.isfinite(lo_red)
+        hi_f = np.isfinite(hi_red)
+        gap_lo = x_red - lo_red
+        gap_hi = hi_red - x_red
+
+        ind_lo = R_red - c_red * gap_lo
+        ind_hi = R_red + c_red * gap_hi
+
+        prev_state = getattr(self, "_vi_prev_state", None)
+        prev_lo = prev_state is not None and prev_state.shape == x_red.shape
+        if prev_lo:
+            prev_lo_mask = prev_state == 1
+            prev_hi_mask = prev_state == -1
+        else:
+            prev_lo_mask = np.zeros(x_red.shape, dtype=bool)
+            prev_hi_mask = np.zeros(x_red.shape, dtype=bool)
+
+        # Candidate actives (masked to finite bounds) with hysteresis.
+        enter_lo = lo_f & (ind_lo > enter_tol)
+        enter_hi = hi_f & (ind_hi < -enter_tol)
+        keep_lo = prev_lo_mask & lo_f & (ind_lo > -leave_tol)
+        keep_hi = prev_hi_mask & hi_f & (ind_hi < leave_tol)
+
+        act_lo = enter_lo | keep_lo
+        act_hi = enter_hi | keep_hi
+
+        # Resolve overlaps (should not happen for consistent bounds, but be safe).
+        both = act_lo & act_hi
+        if np.any(both):
+            # Prefer the closer bound in terms of current gap.
+            choose_lo = gap_lo[both] <= gap_hi[both]
+            act_lo[both] &= choose_lo
+            act_hi[both] &= ~choose_lo
+
+        forced_state = getattr(self, "_vi_forced_state", None)
+        if forced_state is not None and forced_state.shape == x_red.shape:
+            act_lo |= lo_f & (np.asarray(forced_state, dtype=np.int8) == 1)
+            act_hi |= hi_f & (np.asarray(forced_state, dtype=np.int8) == -1)
+            self._vi_forced_state = None
+
+        proposed_state = self._vi_state_from_sets(act_lo, act_hi)
+        state = self._vi_apply_state_persistence(proposed_state)
+        act_lo = state == 1
+        act_hi = state == -1
+
+        guard_state = getattr(self, "_vi_working_set_guard_active", None)
+        if guard_state is not None and np.asarray(guard_state).shape == x_red.shape:
+            guard_state = np.asarray(guard_state, dtype=np.int8)
+            act_lo = lo_f & (guard_state == 1)
+            act_hi = hi_f & (guard_state == -1)
+            state = self._vi_state_from_sets(act_lo, act_hi)
+
+        # Semismooth residual.
+        G = np.asarray(R_red, dtype=float).copy()
+        G[act_lo] = gap_lo[act_lo]
+        G[act_hi] = -gap_hi[act_hi]  # x - hi
+        self._vi_prev_state = state.copy()
+        return G, act_lo, act_hi
+
+    def _vi_detect_period2_cycle(
+        self,
+        *,
+        current_state: np.ndarray,
+        prev_state: np.ndarray | None,
+        prevprev_state: np.ndarray | None,
+    ) -> dict[str, object] | None:
+        cur = np.asarray(current_state, dtype=np.int8).ravel()
+        if cur.size == 0 or prev_state is None or prevprev_state is None:
+            return None
+        prev = np.asarray(prev_state, dtype=np.int8).ravel()
+        prevprev = np.asarray(prevprev_state, dtype=np.int8).ravel()
+        if prev.shape != cur.shape or prevprev.shape != cur.shape:
+            return None
+        if np.array_equal(cur, prev):
+            return None
+        if not np.array_equal(cur, prevprev):
+            return None
+        flip_idx = np.flatnonzero(prev != cur)
+        if flip_idx.size == 0:
+            return None
+        fields = tuple(
+            sorted(
+                {
+                    str(name)
+                    for name in np.asarray(self._vi_red_field_names, dtype=object)[flip_idx].tolist()
+                    if str(name)
+                }
+            )
+        )
+        return {
+            "period": 2,
+            "flip_idx": np.asarray(flip_idx, dtype=int),
+            "nflip": int(flip_idx.size),
+            "fields": fields,
+        }
+
+    def _vi_should_try_affine_identified_acceleration(
+        self,
+        *,
+        metrics: dict[str, float],
+        changed: int,
+        active_stable_count: int,
+    ) -> bool:
+        if not bool(getattr(self.vi_params, "affine_identified_acceleration", False)):
+            return False
+        stable_iters = max(1, int(getattr(self.vi_params, "affine_identified_stable_iters", 2) or 2))
+        if int(changed) != 0 or int(active_stable_count) < stable_iters:
+            return False
+        ginf_trigger = float(getattr(self.vi_params, "affine_identified_ginf_trigger", 0.0) or 0.0)
+        if ginf_trigger > 0.0 and float(metrics.get("G_inf", float("inf"))) > ginf_trigger:
+            return False
+        inactive = max(float(metrics.get("inactive_res_inf", 0.0)), 1.0e-30)
+        gap_ratio = float(getattr(self.vi_params, "affine_identified_gap_ratio", 1.0) or 1.0)
+        eq_abs = float(getattr(self.vi_params, "affine_identified_eq_abs", 1.0e-10) or 1.0e-10)
+        if float(metrics.get("active_gap_inf", float("inf"))) > max(eq_abs, gap_ratio * inactive):
+            return False
+        if float(metrics.get("equality_inf", float("inf"))) > max(eq_abs, 1.0e-2 * inactive):
+            return False
+        return True
+
+    def _vi_affine_residual_and_sets(
+        self,
+        *,
+        A_red: sp.csr_matrix,
+        rhs_aff_red: np.ndarray,
+        x_red: np.ndarray,
+        lambda_eq: np.ndarray,
+        lo_red: np.ndarray,
+        hi_red: np.ndarray,
+        c_red: np.ndarray,
+        eq_data: _PreparedLinearEqualities,
+        row_scale_red: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        x_red = np.asarray(x_red, dtype=float).ravel()
+        rhs_aff_red = np.asarray(rhs_aff_red, dtype=float).ravel()
+        lambda_eq = np.asarray(lambda_eq, dtype=float).ravel()
+        F_red = np.asarray(A_red @ x_red, dtype=float).ravel() - rhs_aff_red
+        if int(eq_data.B_red.shape[0]) > 0 and lambda_eq.size:
+            bt_lam = np.asarray(eq_data.B_red.T @ lambda_eq, dtype=float).ravel()
+            if row_scale_red is not None:
+                bt_lam = self._vi_scale_vector_rows(bt_lam, row_scale_red)
+            F_red += bt_lam
+        G_red, act_lo, act_hi = self._pdas_residual_and_sets(
+            x_red,
+            F_red,
+            lo_red,
+            hi_red,
+            c_red=c_red,
+        )
+        eq_res = self._vi_equality_residual(x_red, eq_data)
+        return F_red, G_red, act_lo, act_hi, eq_res
+
+    def _vi_affine_residual_fixed_sets(
+        self,
+        *,
+        A_red: sp.csr_matrix,
+        rhs_aff_red: np.ndarray,
+        x_red: np.ndarray,
+        lambda_eq: np.ndarray,
+        lo_red: np.ndarray,
+        hi_red: np.ndarray,
+        act_lo: np.ndarray,
+        act_hi: np.ndarray,
+        eq_data: _PreparedLinearEqualities,
+        row_scale_red: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        x_red = np.asarray(x_red, dtype=float).ravel()
+        rhs_aff_red = np.asarray(rhs_aff_red, dtype=float).ravel()
+        lambda_eq = np.asarray(lambda_eq, dtype=float).ravel()
+        act_lo = np.asarray(act_lo, dtype=bool).ravel()
+        act_hi = np.asarray(act_hi, dtype=bool).ravel()
+        F_red = np.asarray(A_red @ x_red, dtype=float).ravel() - rhs_aff_red
+        if int(eq_data.B_red.shape[0]) > 0 and lambda_eq.size:
+            bt_lam = np.asarray(eq_data.B_red.T @ lambda_eq, dtype=float).ravel()
+            if row_scale_red is not None:
+                bt_lam = self._vi_scale_vector_rows(bt_lam, row_scale_red)
+            F_red += bt_lam
+        G_red = np.asarray(F_red, dtype=float).copy()
+        G_red[act_lo] = np.asarray(x_red[act_lo] - lo_red[act_lo], dtype=float)
+        G_red[act_hi] = np.asarray(x_red[act_hi] - hi_red[act_hi], dtype=float)
+        eq_res = self._vi_equality_residual(x_red, eq_data)
+        return F_red, G_red, eq_res
+
+    def _vi_affine_fixed_working_set_solve(
+        self,
+        *,
+        A_red: sp.csr_matrix,
+        rhs_aff_red: np.ndarray,
+        x0_red: np.ndarray,
+        lambda0_eq: np.ndarray,
+        lo_red: np.ndarray,
+        hi_red: np.ndarray,
+        act_lo_fixed: np.ndarray,
+        act_hi_fixed: np.ndarray,
+        eq_data: _PreparedLinearEqualities,
+        tol: float,
+        row_scale_red: np.ndarray | None = None,
+        col_scale_red: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, dict[str, float]] | None:
+        max_it = max(1, int(getattr(self.vi_params, "affine_cycle_fallback_max_it", 12) or 12))
+        c1 = float(getattr(self.vi_params, "affine_cycle_fallback_armijo_c1", 1.0e-4) or 1.0e-4)
+        lm0 = float(getattr(self.vi_params, "affine_cycle_fallback_lm_lambda0", 1.0e-6) or 1.0e-6)
+        lm_growth = float(getattr(self.vi_params, "affine_cycle_fallback_lm_growth", 10.0) or 10.0)
+        lm_max_tries = max(1, int(getattr(self.vi_params, "affine_cycle_fallback_lm_max_tries", 8) or 8))
+
+        y_red = np.asarray(x0_red, dtype=float).copy()
+        lam_eq = np.asarray(lambda0_eq, dtype=float).copy()
+        act_lo_fixed = np.asarray(act_lo_fixed, dtype=bool).copy()
+        act_hi_fixed = np.asarray(act_hi_fixed, dtype=bool).copy()
+        active_fixed = np.asarray(act_lo_fixed | act_hi_fixed, dtype=bool)
+        best: tuple[np.ndarray, np.ndarray, dict[str, float]] | None = None
+
+        for _ in range(max_it):
+            F_red, G_red, eq_res = self._vi_affine_residual_fixed_sets(
+                A_red=A_red,
+                rhs_aff_red=rhs_aff_red,
+                x_red=y_red,
+                lambda_eq=lam_eq,
+                lo_red=lo_red,
+                hi_red=hi_red,
+                act_lo=act_lo_fixed,
+                act_hi=act_hi_fixed,
+                eq_data=eq_data,
+                row_scale_red=row_scale_red,
+            )
+            metrics = self._vi_metrics(y_red, F_red, lo_red, hi_red, act_lo_fixed, act_hi_fixed, G_red, eq_res)
+            if best is None or float(metrics["G_inf"]) < float(best[2]["G_inf"]):
+                best = (y_red.copy(), lam_eq.copy(), dict(metrics))
+            if float(metrics["G_inf"]) <= float(tol):
+                return y_red, lam_eq, dict(metrics)
+
+            rhs = (-F_red).astype(float, copy=True)
+            if np.any(act_lo_fixed):
+                rhs[act_lo_fixed] = lo_red[act_lo_fixed] - y_red[act_lo_fixed]
+            if np.any(act_hi_fixed):
+                rhs[act_hi_fixed] = hi_red[act_hi_fixed] - y_red[act_hi_fixed]
+            A_mod = self._apply_identity_rows(A_red, np.flatnonzero(active_fixed)) if np.any(active_fixed) else A_red
+            A_aug, rhs_aug = self._vi_build_augmented_system(
+                A_mod, rhs, active_fixed, eq_data, eq_res, row_scale_red=row_scale_red, col_scale_red=col_scale_red
+            )
+
+            merit0 = float(metrics["G_half"])
+            step_aug = None
+            lm = 0.0
+            for lm_try in range(lm_max_tries):
+                if lm_try == 0 and lm0 <= 0.0:
+                    H = A_aug
+                    rhs_work = rhs_aug
+                else:
+                    lm = lm0 if lm <= 0.0 else lm * lm_growth
+                    H, rhs_work, _ = self._vi_build_lm_system(
+                        A_aug,
+                        rhs_aug,
+                        lm,
+                        x_block_size=int(y_red.size),
+                    )
+                try:
+                    step_aug_try = self._solve_linear_system_with_context(
+                        H,
+                        rhs_work,
+                        context="vi_augmented",
+                    )
+                except RuntimeError:
+                    continue
+                if np.all(np.isfinite(step_aug_try)):
+                    step_aug = np.asarray(step_aug_try, dtype=float).ravel()
+                    break
+            if step_aug is None:
+                break
+
+            dy_red, dlam_eq = self._vi_split_augmented_step(step_aug, eq_data, col_scale_red=col_scale_red)
+            alpha_cap = self._vi_feasible_step_alpha_cap(
+                y_red,
+                dy_red,
+                lo_red,
+                hi_red,
+                active_mask=active_fixed,
+            )
+            if alpha_cap <= 0.0:
+                break
+
+            descent = max(2.0 * merit0, 1.0e-30)
+            alpha = float(alpha_cap)
+            accepted = False
+            best_trial: tuple[np.ndarray, np.ndarray, dict[str, float]] | None = None
+            for _ in range(20):
+                y_try = y_red + alpha * np.asarray(dy_red, dtype=float)
+                lam_try = lam_eq + alpha * np.asarray(dlam_eq, dtype=float)
+                F_try, G_try, eq_try = self._vi_affine_residual_fixed_sets(
+                    A_red=A_red,
+                    rhs_aff_red=rhs_aff_red,
+                    x_red=y_try,
+                    lambda_eq=lam_try,
+                    lo_red=lo_red,
+                    hi_red=hi_red,
+                    act_lo=act_lo_fixed,
+                    act_hi=act_hi_fixed,
+                    eq_data=eq_data,
+                    row_scale_red=row_scale_red,
+                )
+                metrics_try = self._vi_metrics(
+                    y_try, F_try, lo_red, hi_red, act_lo_fixed, act_hi_fixed, G_try, eq_try
+                )
+                if (
+                    best_trial is None
+                    or float(metrics_try["G_half"]) < float(best_trial[2]["G_half"])
+                    or (
+                        float(metrics_try["G_half"]) <= float(best_trial[2]["G_half"]) + 1.0e-16
+                        and float(metrics_try["G_inf"]) < float(best_trial[2]["G_inf"])
+                    )
+                ):
+                    best_trial = (
+                        np.asarray(y_try, dtype=float).copy(),
+                        np.asarray(lam_try, dtype=float).copy(),
+                        dict(metrics_try),
+                    )
+                if float(metrics_try["G_half"]) <= merit0 - c1 * alpha * descent:
+                    y_red = np.asarray(y_try, dtype=float)
+                    lam_eq = np.asarray(lam_try, dtype=float)
+                    if best is None or float(metrics_try["G_inf"]) < float(best[2]["G_inf"]):
+                        best = (y_red.copy(), lam_eq.copy(), dict(metrics_try))
+                    accepted = True
+                    break
+                alpha *= 0.5
+            if not accepted:
+                if (
+                    best_trial is not None
+                    and (
+                        float(best_trial[2]["G_half"]) + 1.0e-16 < merit0
+                        or float(best_trial[2]["G_inf"]) + 1.0e-16 < float(metrics["G_inf"])
+                    )
+                ):
+                    y_red = np.asarray(best_trial[0], dtype=float).copy()
+                    lam_eq = np.asarray(best_trial[1], dtype=float).copy()
+                    if best is None or float(best_trial[2]["G_inf"]) < float(best[2]["G_inf"]):
+                        best = (y_red.copy(), lam_eq.copy(), dict(best_trial[2]))
+                    continue
+                break
+
+        return best
+
+    def _vi_affine_cycle_fallback(
+        self,
+        *,
+        A_red: sp.csr_matrix,
+        rhs_aff_red: np.ndarray,
+        x0_red: np.ndarray,
+        lambda0_eq: np.ndarray,
+        lo_red: np.ndarray,
+        hi_red: np.ndarray,
+        c_red: np.ndarray,
+        eq_data: _PreparedLinearEqualities,
+        tol: float,
+        row_scale_red: np.ndarray | None = None,
+        col_scale_red: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, dict[str, float]] | None:
+        max_it = max(1, int(getattr(self.vi_params, "affine_cycle_fallback_max_it", 12) or 12))
+        c1 = float(getattr(self.vi_params, "affine_cycle_fallback_armijo_c1", 1.0e-4) or 1.0e-4)
+        lm0 = float(getattr(self.vi_params, "affine_cycle_fallback_lm_lambda0", 1.0e-6) or 1.0e-6)
+        lm_growth = float(getattr(self.vi_params, "affine_cycle_fallback_lm_growth", 10.0) or 10.0)
+        lm_max_tries = max(1, int(getattr(self.vi_params, "affine_cycle_fallback_lm_max_tries", 8) or 8))
+
+        y_red = np.asarray(x0_red, dtype=float).copy()
+        lam_eq = np.asarray(lambda0_eq, dtype=float).copy()
+        best: tuple[np.ndarray, np.ndarray, dict[str, float]] | None = None
+
+        for _ in range(max_it):
+            F_red, G_red, act_lo, act_hi, eq_res = self._vi_affine_residual_and_sets(
+                A_red=A_red,
+                rhs_aff_red=rhs_aff_red,
+                x_red=y_red,
+                lambda_eq=lam_eq,
+                lo_red=lo_red,
+                hi_red=hi_red,
+                c_red=c_red,
+                eq_data=eq_data,
+                row_scale_red=row_scale_red,
+            )
+            metrics = self._vi_metrics(y_red, F_red, lo_red, hi_red, act_lo, act_hi, G_red, eq_res)
+            if best is None or float(metrics["G_inf"]) < float(best[2]["G_inf"]):
+                best = (y_red.copy(), lam_eq.copy(), dict(metrics))
+            if float(metrics["G_inf"]) <= float(tol):
+                return y_red, lam_eq, dict(metrics)
+
+            active = np.asarray(act_lo | act_hi, dtype=bool)
+            rhs = (-F_red).astype(float, copy=True)
+            if np.any(act_lo):
+                rhs[act_lo] = lo_red[act_lo] - y_red[act_lo]
+            if np.any(act_hi):
+                rhs[act_hi] = hi_red[act_hi] - y_red[act_hi]
+            A_mod = self._apply_identity_rows(A_red, np.flatnonzero(active)) if np.any(active) else A_red
+            A_aug, rhs_aug = self._vi_build_augmented_system(
+                A_mod, rhs, active, eq_data, eq_res, row_scale_red=row_scale_red, col_scale_red=col_scale_red
+            )
+
+            merit0 = float(metrics["G_half"])
+            step_aug = None
+            lm = 0.0
+            for lm_try in range(lm_max_tries):
+                if lm_try == 0 and lm0 <= 0.0:
+                    H = A_aug
+                    rhs_work = rhs_aug
+                else:
+                    lm = lm0 if lm <= 0.0 else lm * lm_growth
+                    H, rhs_work, _ = self._vi_build_lm_system(
+                        A_aug,
+                        rhs_aug,
+                        lm,
+                        x_block_size=int(y_red.size),
+                    )
+                try:
+                    step_aug_try = self._solve_linear_system_with_context(
+                        H,
+                        rhs_work,
+                        context="vi_augmented",
+                    )
+                except RuntimeError:
+                    continue
+                if np.all(np.isfinite(step_aug_try)):
+                    step_aug = np.asarray(step_aug_try, dtype=float).ravel()
+                    break
+            if step_aug is None:
+                break
+
+            dy_red, dlam_eq = self._vi_split_augmented_step(step_aug, eq_data, col_scale_red=col_scale_red)
+            # In the fixed-active affine regime, the merit is phi = 1/2 ||G_aug||^2.
+            # The correct Armijo decrease scale is therefore ||G_aug||^2 = 2*phi,
+            # not the raw step norm. Using ||step||^2 can make the sufficient-
+            # decrease condition unrealistically strict on ill-scaled mixed
+            # systems and reject small but genuinely improving affine trials.
+            descent = max(2.0 * merit0, 1.0e-30)
+            alpha = 1.0
+            accepted = False
+            best_trial: tuple[np.ndarray, np.ndarray, dict[str, float]] | None = None
+            for _ in range(20):
+                y_try = y_red + alpha * np.asarray(dy_red, dtype=float)
+                lam_try = lam_eq + alpha * np.asarray(dlam_eq, dtype=float)
+                F_try, G_try, act_lo_try, act_hi_try, eq_try = self._vi_affine_residual_and_sets(
+                    A_red=A_red,
+                    rhs_aff_red=rhs_aff_red,
+                    x_red=y_try,
+                    lambda_eq=lam_try,
+                    lo_red=lo_red,
+                    hi_red=hi_red,
+                    c_red=c_red,
+                    eq_data=eq_data,
+                    row_scale_red=row_scale_red,
+                )
+                metrics_try = self._vi_metrics(y_try, F_try, lo_red, hi_red, act_lo_try, act_hi_try, G_try, eq_try)
+                if (
+                    best_trial is None
+                    or float(metrics_try["G_half"]) < float(best_trial[2]["G_half"])
+                    or (
+                        float(metrics_try["G_half"]) <= float(best_trial[2]["G_half"]) + 1.0e-16
+                        and float(metrics_try["G_inf"]) < float(best_trial[2]["G_inf"])
+                    )
+                ):
+                    best_trial = (
+                        np.asarray(y_try, dtype=float).copy(),
+                        np.asarray(lam_try, dtype=float).copy(),
+                        dict(metrics_try),
+                    )
+                if float(metrics_try["G_half"]) <= merit0 - c1 * alpha * descent:
+                    y_red = np.asarray(y_try, dtype=float)
+                    lam_eq = np.asarray(lam_try, dtype=float)
+                    if best is None or float(metrics_try["G_inf"]) < float(best[2]["G_inf"]):
+                        best = (y_red.copy(), lam_eq.copy(), dict(metrics_try))
+                    accepted = True
+                    break
+                alpha *= 0.5
+            if not accepted:
+                if (
+                    best_trial is not None
+                    and (
+                        float(best_trial[2]["G_half"]) + 1.0e-16 < merit0
+                        or float(best_trial[2]["G_inf"]) + 1.0e-16 < float(metrics["G_inf"])
+                    )
+                ):
+                    y_red = np.asarray(best_trial[0], dtype=float).copy()
+                    lam_eq = np.asarray(best_trial[1], dtype=float).copy()
+                    if best is None or float(best_trial[2]["G_inf"]) < float(best[2]["G_inf"]):
+                        best = (y_red.copy(), lam_eq.copy(), dict(best_trial[2]))
+                    continue
+                break
+
+        return best
+
+    def _apply_identity_rows(self, A: sp.csr_matrix, rows: np.ndarray) -> sp.csr_matrix:
+        if rows.size == 0:
+            return A
+        if not sp.isspmatrix_csr(A):
+            A = A.tocsr()
+        A_mod = A.copy()
+        indptr = A_mod.indptr
+        indices = A_mod.indices
+        data = A_mod.data
+        missing_diag = False
+        for r in rows.tolist():
+            rr = int(r)
+            start = int(indptr[rr])
+            end = int(indptr[rr + 1])
+            if end <= start:
+                missing_diag = True
+                continue
+            data[start:end] = 0.0
+            hit = np.nonzero(indices[start:end] == rr)[0]
+            if hit.size:
+                data[start + int(hit[0])] = 1.0
+            else:
+                missing_diag = True
+        if not missing_diag:
+            return A_mod
+
+        # Fallback: allow pattern change for rows missing a diagonal entry.
+        A_lil = A.tolil(copy=True)
+        for r in rows.tolist():
+            rr = int(r)
+            A_lil.rows[rr] = [rr]
+            A_lil.data[rr] = [1.0]
+        return A_lil.tocsr()
+
+    def _line_search_vi_reduced(
+        self,
+        *,
+        A_red: sp.csr_matrix | None = None,
+        row_scale_red: np.ndarray | None = None,
+        x0_red: np.ndarray,
+        R0_red: np.ndarray,
+        G0: np.ndarray,
+        eq0_res: np.ndarray,
+        act_lo0: np.ndarray,
+        act_hi0: np.ndarray,
+        lambda0_eq: np.ndarray,
+        S_red: np.ndarray,
+        S_lam_eq: np.ndarray,
+        c_red: np.ndarray,
+        eq_data: _PreparedLinearEqualities,
+        strong_active_mask: np.ndarray | None = None,
+        active_delta_ref: int = 0,
+        active_mask: np.ndarray | None = None,
+        funcs: list,
+        coeffs: dict,
+        bcs_now,
+        lo_red: np.ndarray,
+        hi_red: np.ndarray,
+        eq_prepare_callback: Optional[Callable[[], _PreparedLinearEqualities]] = None,
+        active_stable_count: int = 0,
+        merit_history: list[float] | tuple[float, ...] | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        dh = self.dh
+        np_ = self.np
+        mode = str(getattr(np_, "ls_mode", "armijo") or "armijo").lower()
+        c1 = float(getattr(np_, "ls_c1", 1.0e-4))
+        merit_mode = str(getattr(self.vi_params, "merit_mode", "split") or "split").lower()
+        trace_ls = os.getenv("PYCUTFEM_VI_TRACE_LS", "").lower() in {"1", "true", "yes"}
+
+        snap = [f.nodal_values.copy() for f in funcs]
+        stat0 = self._vi_stationarity_residual(R0_red, eq_data, lambda0_eq)
+        metrics0 = self._vi_metrics(x0_red, stat0, lo_red, hi_red, act_lo0, act_hi0, G0, eq0_res)
+        self._current_newton_residual_norm = float(metrics0["G_inf"])
+        norm0 = float(metrics0["G_inf"])
+        phi0 = float(metrics0["G_half"])
+        merit0 = norm0 if merit_mode == "legacy" and mode == "dealii" else (phi0 if merit_mode == "legacy" else float(metrics0["merit"]))
+        gap0 = float(metrics0["active_gap_inf"])
+        res0 = float(metrics0["inactive_res_inf"])
+        eq0 = float(metrics0["equality_inf"])
+        merit_history = list(merit_history or [])
+        best_alpha = 0.0
+        best_merit = merit0
+        best_metrics = dict(metrics0)
+        best_lambda = np.asarray(lambda0_eq, dtype=float).copy()
+        best_filter_alpha = 0.0
+        best_filter_merit = float("inf")
+        best_filter_metrics = dict(metrics0)
+        best_filter_lambda = np.asarray(lambda0_eq, dtype=float).copy()
+        G0_aug = self._vi_augmented_residual(G0, eq0_res)
+        filter_abs_floor = _vi_filter_abs_floor(self.vi_params)
+        nonmono_window = int(getattr(self.vi_params, "line_search_nonmonotone_window", 0) or 0)
+        nonmono_stable_iters = int(
+            getattr(self.vi_params, "line_search_nonmonotone_active_stable_iters", 0) or 0
+        )
+        nonmono_ginf_trigger = float(
+            getattr(self.vi_params, "line_search_nonmonotone_ginf_trigger", 0.0) or 0.0
+        )
+        nonmono_gap_ratio = float(
+            getattr(self.vi_params, "line_search_nonmonotone_gap_ratio", 1.0) or 1.0
+        )
+        nonmono_eq_abs = float(
+            getattr(self.vi_params, "line_search_nonmonotone_eq_abs", 1.0e-10) or 1.0e-10
+        )
+        nonmono_disable_filter = bool(
+            getattr(self.vi_params, "line_search_nonmonotone_disable_filter", False)
+        )
+        use_nonmonotone = (
+            nonmono_window > 0
+            and int(active_stable_count) >= nonmono_stable_iters
+            and (nonmono_ginf_trigger <= 0.0 or norm0 <= nonmono_ginf_trigger)
+            and gap0 <= max(nonmono_eq_abs, nonmono_gap_ratio * max(res0, 1.0e-30))
+            and eq0 <= max(nonmono_eq_abs, 1.0e-2 * max(res0, 1.0e-30))
+        )
+        use_local_merit_only = bool(use_nonmonotone and nonmono_disable_filter)
+        if use_nonmonotone and merit_history:
+            merit_ref = max(merit_history[-min(nonmono_window, len(merit_history)) :])
+        else:
+            merit_ref = merit0
+        eq_active_step_threshold = float(
+            getattr(self.vi_params, "equality_active_step_ginf_threshold", 5.0e-2) or 0.0
+        )
+        use_active_step_policy = int(eq_data.B_red.shape[0]) == 0 or norm0 <= eq_active_step_threshold
+        freeze_trial_model = self._vi_should_freeze_local_trial_model()
+        prox_phase_active = float(getattr(self, "_vi_field_prox_lambda_current", 0.0) or 0.0) > 0.0
+        ptc_phase_active = float(getattr(self, "_vi_ptc_sigma_current", 0.0) or 0.0) > 0.0
+        guard_active_now = getattr(self, "_vi_working_set_guard_active", None)
+        trial_guard_state = None
+        if freeze_trial_model and guard_active_now is None and (prox_phase_active or ptc_phase_active):
+            trial_guard_state = self._vi_state_from_sets(
+                np.asarray(act_lo0, dtype=bool),
+                np.asarray(act_hi0, dtype=bool),
+            )
+        if trial_guard_state is not None:
+            use_active_step_policy = False
+        active_mask_policy = None if active_mask is None else np.asarray(active_mask, dtype=bool)
+        strong_active_policy = None if strong_active_mask is None else np.asarray(strong_active_mask, dtype=bool)
+        active_delta_policy = int(active_delta_ref)
+
+        def _trial(alpha: float) -> tuple[dict[str, float], np.ndarray, np.ndarray]:
+            for f, buf in zip(funcs, snap):
+                f.nodal_values[:] = buf
+            if use_active_step_policy:
+                step, soft_active = self._vi_apply_active_step_policy(
+                    alpha=alpha,
+                    S_red=S_red,
+                    active_mask=active_mask_policy,
+                    strong_active_mask=strong_active_policy,
+                    active_delta_ref=active_delta_policy,
+                )
+            else:
+                step = float(alpha) * np.asarray(S_red, dtype=float)
+                soft_active = False
+            lam_try = np.asarray(lambda0_eq, dtype=float) + float(alpha) * np.asarray(S_lam_eq, dtype=float)
+            dU_full = self.restrictor.expand_vec(step)
+            dh.add_to_functions(dU_full, funcs)
+            dh.apply_bcs(bcs_now, *funcs)
+            if getattr(self, "constraints", None) is not None:
+                self._enforce_constraints_on_functions(funcs)
+            if self.pre_cb is not None:
+                self.pre_cb(funcs)
+            if freeze_trial_model:
+                trial_lo_red = np.asarray(lo_red, dtype=float).copy()
+                trial_hi_red = np.asarray(hi_red, dtype=float).copy()
+                trial_eq_data = eq_data
+            else:
+                trial_lo_red, trial_hi_red = self._bounds_reduced()
+                trial_eq_data = eq_prepare_callback() if eq_prepare_callback is not None else eq_data
+            if bool(getattr(self.vi_params, "project_each_iteration", True)):
+                self._project_funcs_to_bounds(
+                    funcs,
+                    bcs_now,
+                    trial_lo_red,
+                    trial_hi_red,
+                    eq_data=trial_eq_data,
+                    eq_prepare_callback=None if freeze_trial_model else eq_prepare_callback,
+                )
+                if self.pre_cb is not None and not freeze_trial_model:
+                    self.pre_cb(funcs)
+                if freeze_trial_model:
+                    trial_lo_red = np.asarray(lo_red, dtype=float).copy()
+                    trial_hi_red = np.asarray(hi_red, dtype=float).copy()
+                    trial_eq_data = eq_data
+                else:
+                    trial_lo_red, trial_hi_red = self._bounds_reduced()
+                    trial_eq_data = eq_prepare_callback() if eq_prepare_callback is not None else eq_data
+
+            _, R_try_raw = self._assemble_system_reduced(coeffs, need_matrix=False)
+            x_try = self._pack_reduced_iterate(funcs)
+            stat_try = self._vi_stationarity_residual(R_try_raw, trial_eq_data, lam_try)
+            eq_try = self._vi_equality_residual(x_try, trial_eq_data)
+            if trial_guard_state is not None:
+                G_try, act_lo_try, act_hi_try = self._vi_semismooth_residual_from_state(
+                    x_red=x_try,
+                    stationarity_red=stat_try,
+                    lo_red=trial_lo_red,
+                    hi_red=trial_hi_red,
+                    state=trial_guard_state,
+                )
+            else:
+                vi_state_save = self._vi_capture_classification_state()
+                G_try, act_lo_try, act_hi_try = self._pdas_residual_and_sets(
+                    x_try, stat_try, trial_lo_red, trial_hi_red, c_red=c_red
+                )
+            metrics = self._vi_metrics(x_try, stat_try, trial_lo_red, trial_hi_red, act_lo_try, act_hi_try, G_try, eq_try)
+            metrics["delta_active"] = float(
+                np.count_nonzero(self._vi_state_from_sets(act_lo_try, act_hi_try) != self._vi_state_from_sets(act_lo0, act_hi0))
+            )
+            metrics["soft_active"] = 1.0 if soft_active else 0.0
+            metrics["alpha_trial"] = float(alpha)
+            if trial_guard_state is None:
+                self._vi_restore_classification_state(vi_state_save)
+            return metrics, step, lam_try
+
+        alpha_full = self._vi_feasible_step_alpha_cap(
+            x0_red,
+            S_red,
+            lo_red,
+            hi_red,
+            active_mask=active_mask,
+        )
+        if alpha_full <= 0.0:
+            raise RuntimeError("Line search failed: feasible bound-preserving step size is zero.")
+        if use_active_step_policy:
+            predicted_active, entering_active, predicted_delta = self._vi_predicted_bound_activity(
+                x_red=x0_red,
+                step_red=float(alpha_full) * np.asarray(S_red, dtype=float),
+                lo_red=lo_red,
+                hi_red=hi_red,
+                act_lo=act_lo0,
+                act_hi=act_hi0,
+            )
+            if A_red is not None:
+                prev_state0 = self._vi_state_from_sets(act_lo0, act_hi0)
+                stat_lin_full = (
+                    np.asarray(stat0, dtype=float)
+                    + np.asarray(A_red @ (float(alpha_full) * np.asarray(S_red, dtype=float)), dtype=float)
+                )
+                bt_step = np.asarray(eq_data.B_red.T @ (float(alpha_full) * np.asarray(S_lam_eq, dtype=float)), dtype=float).ravel()
+                stat_lin_full += bt_step
+                pred_lo_lin, pred_hi_lin = self._vi_predict_sets_from_state(
+                    x_red=np.asarray(x0_red, dtype=float) + float(alpha_full) * np.asarray(S_red, dtype=float),
+                    stationarity_red=stat_lin_full,
+                    lo_red=lo_red,
+                    hi_red=hi_red,
+                    c_red=c_red,
+                    prev_state=prev_state0,
+                )
+                predicted_linear_active = np.asarray(pred_lo_lin | pred_hi_lin, dtype=bool)
+                entering_linear = np.asarray(
+                    predicted_linear_active & (~np.asarray(act_lo0 | act_hi0, dtype=bool)),
+                    dtype=bool,
+                )
+                predicted_linear_delta = int(np.count_nonzero(entering_linear))
+
+                if predicted_linear_delta >= predicted_delta:
+                    predicted_active = predicted_linear_active
+                    entering_active = entering_linear
+                    predicted_delta = predicted_linear_delta
+
+            if predicted_delta > 0:
+                active_mask_policy = np.asarray(predicted_active, dtype=bool)
+                active_delta_policy = max(int(active_delta_ref), int(predicted_delta))
+                if strong_active_policy is None or strong_active_policy.shape != active_mask_policy.shape:
+                    strong_active_policy = np.zeros(active_mask_policy.shape, dtype=bool)
+                else:
+                    strong_active_policy = np.asarray(strong_active_policy, dtype=bool).copy()
+                # New predicted actives are damped as weak entries on the first
+                # semismooth step; only the already-identified strong active
+                # set keeps the full Newton move.
+                strong_active_policy[np.asarray(entering_active, dtype=bool)] = False
+        # Always try the largest bound-preserving step first.
+        metrics1, step1, lam1 = _trial(alpha_full)
+        merit1 = metrics1["G_inf"] if merit_mode == "legacy" and mode == "dealii" else (metrics1["G_half"] if merit_mode == "legacy" else metrics1["merit"])
+        if merit1 < best_merit:
+            best_merit = merit1
+            best_alpha = float(alpha_full)
+            best_metrics = dict(metrics1)
+            best_lambda = np.asarray(lam1, dtype=float).copy()
+
+        def _filter_ok(metrics: dict[str, float]) -> bool:
+            ginf_ok = float(metrics["G_inf"]) <= max(
+                _vi_filter_threshold(
+                    base=norm0,
+                    growth=float(getattr(self.vi_params, "filter_max_ginf_growth", 1.0) or 1.0),
+                    abs_floor=filter_abs_floor,
+                ),
+                filter_abs_floor,
+            )
+            if not ginf_ok:
+                return False
+            res_ok = float(metrics["inactive_res_inf"]) <= max(
+                _vi_filter_threshold(
+                    base=res0,
+                    growth=float(getattr(self.vi_params, "filter_max_residual_growth", 1.25) or 1.25),
+                    abs_floor=filter_abs_floor,
+                ),
+                filter_abs_floor,
+            )
+            gap_ok = float(metrics["active_gap_inf"]) <= max(
+                _vi_filter_threshold(
+                    base=gap0,
+                    growth=float(getattr(self.vi_params, "filter_max_gap_growth", 1.25) or 1.25),
+                    abs_floor=filter_abs_floor,
+                ),
+                filter_abs_floor,
+            )
+            eq_ok = float(metrics["equality_inf"]) <= max(
+                _vi_filter_threshold(
+                    base=eq0,
+                    growth=float(getattr(self.vi_params, "filter_max_equality_growth", 1.25) or 1.25),
+                    abs_floor=filter_abs_floor,
+                ),
+                filter_abs_floor,
+            )
+            if not (res_ok and gap_ok and eq_ok):
+                return False
+            max_delta_active = int(getattr(self.vi_params, "filter_max_delta_active", 0) or 0)
+            if max_delta_active > 0 and int(metrics.get("delta_active", 0.0)) > max_delta_active:
+                return False
+            return True
+
+        def _accept(metrics: dict[str, float], alpha: float) -> bool:
+            if merit_mode == "legacy":
+                if mode == "dealii":
+                    return float(metrics["G_inf"]) < norm0
+                return float(metrics["G_half"]) <= phi0 - c1 * alpha * float(G0_aug @ G0_aug)
+            local_accept = bool(use_local_merit_only and int(metrics.get("delta_active", 1.0)) == 0)
+            if not local_accept and not _filter_ok(metrics):
+                return False
+            merit = float(metrics["merit"])
+            # Literature-backed globalization: use a semismooth merit function
+            # with Armijo descent globally, but allow a nonmonotone reference
+            # merit once the active set is already stable and the
+            # complementarity/equality components are small. This avoids
+            # over-damping the local semismooth-Newton regime.
+            return merit <= merit_ref - c1 * alpha * max(merit0, 1.0e-30)
+
+        if _filter_ok(metrics1):
+            best_filter_alpha = float(alpha_full)
+            best_filter_merit = float(metrics1["merit"])
+            best_filter_metrics = dict(metrics1)
+            best_filter_lambda = np.asarray(lam1, dtype=float).copy()
+
+        def _trace_trial(metrics: dict[str, float], accepted: bool) -> None:
+            if not trace_ls:
+                return
+            msg = (
+                f"        [vi-ls] alpha={float(metrics.get('alpha_trial', 0.0)):.3e} "
+                f"merit={float(metrics.get('merit', 0.0)):.3e} "
+                f"Ginf={float(metrics.get('G_inf', 0.0)):.3e} "
+                f"resI={float(metrics.get('inactive_res_inf', 0.0)):.3e} "
+                f"gapA={float(metrics.get('active_gap_inf', 0.0)):.3e} "
+                f"eq={float(metrics.get('equality_inf', 0.0)):.3e} "
+                f"ΔA={int(metrics.get('delta_active', 0.0))} "
+                f"soft={int(metrics.get('soft_active', 0.0))} "
+                f"accepted={int(bool(accepted))}"
+            )
+            if use_nonmonotone:
+                msg += f" merit_ref={float(merit_ref):.3e}"
+            if use_local_merit_only:
+                msg += f" local_filter_free={int(int(metrics.get('delta_active', 1.0)) == 0)}"
+            if not np.any(act_lo0 | act_hi0):
+                alpha_trial = float(metrics.get("alpha_trial", 0.0))
+                pred_ratio = (1.0 - alpha_trial) ** 2
+                actual_ratio = float(metrics.get("merit", 0.0)) / max(merit0, 1.0e-30)
+                msg += f" pred_ratio={pred_ratio:.3e} model_ratio={actual_ratio / max(pred_ratio, 1.0e-30):.3e}"
+            print(msg)
+
+        ok1 = _accept(metrics1, float(alpha_full))
+        _trace_trial(metrics1, ok1)
+        if ok1:
+            for f, buf in zip(funcs, snap):
+                f.nodal_values[:] = buf
+            self._ls_alpha_prev = float(alpha_full)
+            self._vi_last_metrics = dict(metrics1)
+            return step1, np.asarray(lam1, dtype=float)
+
+        alpha = float(alpha_full) * float(getattr(np_, "ls_reduction", 0.5))
+        if not (0.0 < alpha < 1.0):
+            alpha = 0.5
+
+        for _ in range(int(getattr(np_, "ls_max_iter", 12))):
+            metrics, step, lam_try = _trial(alpha)
+            merit = metrics["G_inf"] if merit_mode == "legacy" and mode == "dealii" else (metrics["G_half"] if merit_mode == "legacy" else metrics["merit"])
+            if merit < best_merit:
+                best_merit = merit
+                best_alpha = alpha
+                best_metrics = dict(metrics)
+                best_lambda = np.asarray(lam_try, dtype=float).copy()
+            if _filter_ok(metrics) and float(metrics["merit"]) < best_filter_merit:
+                best_filter_alpha = alpha
+                best_filter_merit = float(metrics["merit"])
+                best_filter_metrics = dict(metrics)
+                best_filter_lambda = np.asarray(lam_try, dtype=float).copy()
+            ok = _accept(metrics, alpha)
+            _trace_trial(metrics, ok)
+            if ok:
+                for f, buf in zip(funcs, snap):
+                    f.nodal_values[:] = buf
+                self._ls_alpha_prev = alpha
+                self._vi_last_metrics = dict(metrics)
+                return step, np.asarray(lam_try, dtype=float)
+            alpha *= float(getattr(np_, "ls_reduction", 0.5))
+
+        for f, buf in zip(funcs, snap):
+            f.nodal_values[:] = buf
+
+        relaxed_g = float(getattr(self.vi_params, "relaxed_filter_accept_ginf", 0.0) or 0.0)
+        relaxed_merit_growth = float(getattr(self.vi_params, "relaxed_filter_merit_growth", 1.05) or 1.05)
+        if (
+            bool(getattr(self.vi_params, "accept_best_filtered_descent", False))
+            and best_filter_alpha > 0.0
+            and best_filter_merit < merit0
+        ):
+            self._ls_alpha_prev = best_filter_alpha
+            self._vi_last_metrics = dict(best_filter_metrics)
+            if use_active_step_policy:
+                step, _ = self._vi_apply_active_step_policy(
+                    alpha=best_filter_alpha,
+                    S_red=S_red,
+                    active_mask=active_mask_policy,
+                    strong_active_mask=strong_active_policy,
+                    active_delta_ref=active_delta_policy,
+                )
+            else:
+                step = float(best_filter_alpha) * np.asarray(S_red, dtype=float)
+            return step, np.asarray(best_filter_lambda, dtype=float)
+
+        if (
+            relaxed_g > 0.0
+            and norm0 <= relaxed_g
+            and best_filter_alpha > 0.0
+            and best_filter_merit <= relaxed_merit_growth * merit0
+        ):
+            self._ls_alpha_prev = best_filter_alpha
+            self._vi_last_metrics = dict(best_filter_metrics)
+            if use_active_step_policy:
+                step, _ = self._vi_apply_active_step_policy(
+                    alpha=best_filter_alpha,
+                    S_red=S_red,
+                    active_mask=active_mask_policy,
+                    strong_active_mask=strong_active_policy,
+                    active_delta_ref=active_delta_policy,
+                )
+            else:
+                step = float(best_filter_alpha) * np.asarray(S_red, dtype=float)
+            return step, np.asarray(best_filter_lambda, dtype=float)
+
+        min_alpha = alpha
+        if os.getenv("PYCUTFEM_LS_FAIL_HARD", "1").lower() not in {"0", "false", "no"}:
+            raise RuntimeError("Line search failed: no semismooth residual decrease.")
+        self._ls_alpha_prev = min_alpha
+        self._vi_last_metrics = dict(metrics0)
+        if use_active_step_policy:
+            step, _ = self._vi_apply_active_step_policy(
+                alpha=min_alpha,
+                S_red=S_red,
+                active_mask=active_mask_policy,
+                strong_active_mask=strong_active_policy,
+                active_delta_ref=active_delta_policy,
+            )
+        else:
+            step = float(min_alpha) * np.asarray(S_red, dtype=float)
+        lam_min = np.asarray(lambda0_eq, dtype=float) + float(min_alpha) * np.asarray(S_lam_eq, dtype=float)
+        return step, np.asarray(lam_min, dtype=float)
+
+    def _newton_loop(self, funcs, prev_funcs, aux_funcs, bcs_now):
+        # If no bounds are set, fall back to the standard Newton solver.
+        if getattr(self, "_box_lower_full", None) is None or getattr(self, "_box_upper_full", None) is None:
+            return super()._newton_loop(funcs, prev_funcs, aux_funcs, bcs_now)
+
+        self._current_bcs = bcs_now
+        dh = self.dh
+        ndof_eff = getattr(self.restrictor, "full_size", dh.total_dofs)
+        preserve_imported_state = bool(getattr(self, "_vi_preserve_state_on_next_solve", False))
+        if not preserve_imported_state:
+            self._vi_prev_state = None
+            self._vi_pending_state = None
+            self._vi_pending_count = None
+            self._vi_clear_working_set_guard()
+        self._vi_preserve_state_on_next_solve = False
+        self._vi_lambda_current = float(getattr(self.vi_params, "inactive_reg_lambda0", 0.0) or 0.0)
+
+        if getattr(self, "constraints", None) is not None:
+            self._enforce_constraints_on_functions(funcs)
+            self._enforce_constraints_on_functions(prev_funcs)
+
+        eq_prepare_callback = lambda: self._vi_prepare_linear_equalities(funcs, prev_funcs, aux_funcs, bcs_now)
+        if self.pre_cb is not None:
+            self.pre_cb(funcs)
+        eq_data = eq_prepare_callback()
+        self._vi_eq_lambda_current = self._vi_eq_lambda_accepted.copy()
+
+        # Optionally project the initial guess to be feasible.
+        lo_red, hi_red = self._bounds_reduced()
+        no_finite_bounds = not np.any(np.isfinite(lo_red) | np.isfinite(hi_red))
+        no_linear_equalities = int(np.asarray(getattr(eq_data, "B_red", np.zeros((0, 0), dtype=float))).shape[0]) == 0
+        if no_finite_bounds and no_linear_equalities:
+            print(
+                "    [solver] current reduced PDAS stage has no finite box bounds or linear equalities; "
+                "falling back to plain Newton for this solve.",
+                flush=True,
+            )
+            return super()._newton_loop(funcs, prev_funcs, aux_funcs, bcs_now)
+        if bool(getattr(self.vi_params, "project_initial_guess", True)):
+            self._project_funcs_to_bounds(
+                funcs,
+                bcs_now,
+                lo_red,
+                hi_red,
+                eq_data=eq_data,
+                eq_prepare_callback=eq_prepare_callback,
+            )
+            eq_data = eq_prepare_callback()
+
+        norm_G0: float | None = None
+        last_active: np.ndarray | None = None
+        active_stable_count = 0
+        merit_history: list[float] = []
+        state_hist_prev: np.ndarray | None = None
+        state_hist_prevprev: np.ndarray | None = None
+        affine_identified_attempted_states: set[bytes] = set()
+        last_norm_G = float("inf")
+        last_norm_R = float("inf")
+        last_it = 0
+        accept_factor = float(getattr(self.np, "accept_nonconverged_atol_factor", 0.0) or 0.0)
+        atol = float(getattr(self.np, "newton_tol", 0.0) or 0.0)
+        # Each accepted time step defines a new nonlinear subproblem. Reusing a
+        # previously saturated LM damping parameter across solves can freeze the
+        # next step at an almost-zero trust-region correction.
+        self._vi_lm_lambda_current = float(getattr(self.vi_params, "unconstrained_lm_lambda0", 1.0e-4) or 1.0e-4)
+        self._vi_field_prox_lambda_current = max(
+            0.0,
+            float(getattr(self, "_vi_force_initial_field_prox_lambda", 0.0) or 0.0),
+        )
+        self._vi_ptc_sigma_current = max(
+            0.0,
+            float(getattr(self, "_vi_force_initial_ptc_sigma", 0.0) or 0.0),
+        )
+        self._vi_force_initial_field_prox_lambda = 0.0
+        self._vi_force_initial_ptc_sigma = 0.0
+        if (
+            self._vi_field_prox_lambda_current > 0.0
+            and os.getenv("PYCUTFEM_VI_TRACE_PROX", "").lower() in {"1", "true", "yes"}
+        ):
+            print(
+                "        [vi-prox] pre-armed identified-manifold proximal phase at solve start "
+                f"(λ={self._vi_field_prox_lambda_current:.2e})"
+            )
+        if (
+            self._vi_ptc_sigma_current > 0.0
+            and os.getenv("PYCUTFEM_VI_TRACE_PTC", "").lower() in {"1", "true", "yes"}
+        ):
+            print(
+                "        [vi-ptc] pre-armed pseudo-transient phase at solve start "
+                f"(σ={self._vi_ptc_sigma_current:.2e})"
+            )
+        elif os.getenv("PYCUTFEM_VI_TRACE_PTC", "").lower() in {"1", "true", "yes"}:
+            ptc_fields = tuple(getattr(self.vi_params, "ptc_fields", ()) or ())
+            ptc_mask = self._vi_selected_field_mask(ptc_fields)
+            print(
+                "        [vi-ptc] config "
+                f"enabled={int(bool(getattr(self.vi_params, 'ptc_recovery', False)))} "
+                f"identified={int(bool(getattr(self.vi_params, 'ptc_identified_window', False)))} "
+                f"fields={ptc_fields} mask={int(np.count_nonzero(ptc_mask))} "
+                f"reduced={tuple(np.unique(np.asarray(self._vi_red_field_names, dtype=object)).tolist())}"
+            )
+        self._vi_clear_anderson_history()
+        self._vi_last_accepted_alpha = None
+        self._vi_last_accepted_merit_ratio = None
+        self._vi_last_accepted_g_ratio = None
+
+        for it in range(int(self.np.max_newton_iter)):
+            self._current_newton_it = int(it + 1)
+            self._vi_begin_working_set_guard_iteration()
+            if self.pre_cb is not None:
+                self.pre_cb(funcs)
+            if getattr(self, "constraints", None) is not None:
+                self._enforce_constraints_on_functions(funcs)
+                self._enforce_constraints_on_functions(prev_funcs)
+            lo_red, hi_red = self._bounds_reduced()
+
+            current: Dict[str, "Function"] = {f.name: f for f in funcs}
+            current.update({f.name: f for f in prev_funcs})
+            if aux_funcs:
+                current.update(aux_funcs)
+            eq_data = eq_prepare_callback()
+
+            # Assemble reduced Jacobian and residual.
+            if str(getattr(self, "backend", "")).lower() == "cpp":
+                print(f"        VI Newton {it+1}: assembling...", flush=True)
+            t_asm = time.perf_counter()
+            A_red_raw, R_red_raw = self._assemble_system_reduced(current, need_matrix=True)
+            asm_time = time.perf_counter() - t_asm
+
+            # Prune decoupled rows/cols (CutFEM restriction).
+            A_red_raw, R_red_raw, pruned, extra_asm = self._prune_decoupled_rows_cols(
+                current, A_red_raw, R_red_raw, ndof_eff
+            )
+            asm_time += extra_asm
+            if pruned:
+                lo_red, hi_red = self._bounds_reduced()
+                eq_data = eq_prepare_callback()
+
+            row_scale_red, col_scale_red = self._vi_system_scale_vectors(A_red_raw)
+            A_red = self._vi_scale_matrix_rows(A_red_raw, row_scale_red)
+            A_red_step = self._vi_scale_matrix_cols(A_red, col_scale_red)
+            R_red_lin = self._vi_scale_vector_rows(R_red_raw, row_scale_red)
+
+            # Optional Jacobian eigenvalue tracing (debugging/conditioning studies).
+            #
+            # IMPORTANT:
+            # - This is potentially expensive; it is off by default and can be
+            #   restricted to a single step/iteration via env vars.
+            # - These are eigenvalues of the *reduced, pruned* Jacobian A_red
+            #   (before PDAS identity-row modification). Row/field scaling of
+            #   equations will generally change these eigenvalues.
+            if os.getenv("PYCUTFEM_TRACE_JAC_EIGS", "").lower() in {"1", "true", "yes"}:
+                try:
+                    step_filter = int(os.getenv("PYCUTFEM_TRACE_JAC_EIGS_STEP", "-1") or "-1")
+                except Exception:
+                    step_filter = -1
+                try:
+                    it_filter = int(os.getenv("PYCUTFEM_TRACE_JAC_EIGS_IT", "1") or "1")
+                except Exception:
+                    it_filter = 1
+
+                step_now = int(getattr(self, "_current_step_no", -1))
+                do_trace = (step_filter < 0 or step_now == step_filter) and (it + 1 == it_filter)
+                if do_trace:
+                    traced = getattr(self, "_trace_jac_eigs_done", None)
+                    if traced is None:
+                        traced = set()
+                        setattr(self, "_trace_jac_eigs_done", traced)
+                    key = (step_now, it + 1)
+                    if key not in traced:
+                        traced.add(key)
+                        try:
+                            n = int(getattr(A_red_raw, "shape", (0, 0))[0])
+                            nnz = int(getattr(A_red_raw, "nnz", 0))
+                        except Exception:
+                            n = 0
+                            nnz = 0
+                        print(f"        [vi-jac] A_red: n={n} nnz={nnz}")
+                        try:
+                            k_req = int(os.getenv("PYCUTFEM_TRACE_JAC_EIGS_K", "6") or "6")
+                        except Exception:
+                            k_req = 6
+                        try:
+                            which = str(os.getenv("PYCUTFEM_TRACE_JAC_EIGS_WHICH", "LM") or "LM").strip().upper()
+                        except Exception:
+                            which = "LM"
+                        try:
+                            maxiter = int(os.getenv("PYCUTFEM_TRACE_JAC_EIGS_MAXITER", "300") or "300")
+                        except Exception:
+                            maxiter = 300
+                        try:
+                            tol = float(os.getenv("PYCUTFEM_TRACE_JAC_EIGS_TOL", "1e-6") or "1e-6")
+                        except Exception:
+                            tol = 1.0e-6
+
+                        if n >= 3 and k_req >= 1:
+                            k_eigs = int(min(max(k_req, 1), n - 2))
+                            try:
+                                evals = spla.eigs(
+                                    A_red_raw, k=k_eigs, which=which, tol=tol, maxiter=maxiter, return_eigenvectors=False
+                                )
+                                evals = np.asarray(evals)
+                                # Sort by magnitude (descending) for stable printing.
+                                order = np.argsort(-np.abs(evals))
+                                evals = evals[order]
+
+                                def _fmt(ev: complex) -> str:
+                                    evc = complex(ev)
+                                    if abs(evc.imag) < 1.0e-12:
+                                        return f"{evc.real:.3e}"
+                                    sgn = "+" if evc.imag >= 0.0 else "-"
+                                    return f"{evc.real:.3e}{sgn}{abs(evc.imag):.3e}j"
+
+                                print(
+                                    f"        [vi-jac] eigs(A_red) which={which} k={k_eigs}: "
+                                    + ", ".join(_fmt(ev) for ev in evals)
+                                )
+                            except Exception as e:
+                                print(f"        [vi-jac] eigs(A_red) failed: {e}")
+                        else:
+                            print("        [vi-jac] eigs(A_red) skipped: matrix too small.")
+                # else: not traced
+
+            # Current reduced iterate and semismooth residual.
+            x_red = self._pack_reduced_iterate(funcs)
+            c_red_raw = self._vi_c_vector(A_red_raw, lo_red, hi_red)
+            c_red = np.asarray(c_red_raw, dtype=float).copy()
+            prox_fields = tuple(getattr(self.vi_params, "field_proximal_recovery_fields", ()) or ())
+            prox_mask = self._vi_selected_field_mask(prox_fields)
+            ptc_fields = tuple(getattr(self.vi_params, "ptc_fields", ()) or ())
+            ptc_mask = self._vi_selected_field_mask(ptc_fields)
+            eq_res = self._vi_equality_residual(x_red, eq_data)
+            stat_red = self._vi_stationarity_residual(R_red_raw, eq_data, self._vi_eq_lambda_current)
+            stat_red_lin = self._vi_stationarity_residual(
+                R_red_lin,
+                eq_data,
+                self._vi_eq_lambda_current,
+                row_scale_red=row_scale_red,
+            )
+            G_red, act_lo, act_hi = self._pdas_residual_and_sets(x_red, stat_red, lo_red, hi_red, c_red=c_red)
+            state_red = self._vi_state_from_sets(act_lo, act_hi)
+            cycle_info = self._vi_detect_period2_cycle(
+                current_state=state_red,
+                prev_state=state_hist_prev,
+                prevprev_state=state_hist_prevprev,
+            )
+            self._vi_last_cycle_info = None if cycle_info is None else {
+                "period": int(cycle_info["period"]),
+                "nflip": int(cycle_info["nflip"]),
+                "fields": tuple(cycle_info["fields"]),
+            }
+            metrics0 = self._vi_metrics(x_red, stat_red, lo_red, hi_red, act_lo, act_hi, G_red, eq_res)
+            norm_G = float(np.linalg.norm(G_red, ord=np.inf))
+            norm_R = float(np.linalg.norm(R_red_raw, ord=np.inf))
+            norm_eq = float(np.linalg.norm(eq_res, ord=np.inf)) if eq_res.size else 0.0
+            last_norm_G = float(metrics0["G_inf"])
+            last_norm_R = float(norm_R)
+            last_it = int(it + 1)
+            self._last_nonlinear_norm = float(metrics0["G_inf"])
+            self._last_nonlinear_norm_label = "|G|_∞"
+            self._last_nonlinear_reason = None
+            self._last_nonlinear_accepted = False
+            self._last_nonlinear_relaxed_accept = False
+
+            if norm_G0 is None:
+                norm_G0 = float(metrics0["G_inf"])
+            tol_eff = max(float(self.np.newton_tol), float(getattr(self.np, "newton_rtol", 0.0) or 0.0) * float(norm_G0))
+
+            active = act_lo | act_hi
+
+            nA = int(np.count_nonzero(active))
+            nI = int(active.size - nA)
+            changed = -1
+            active_ref = last_active
+            if active_ref is None and self._vi_prev_state is not None:
+                try:
+                    prev_active = np.asarray(self._vi_prev_state, dtype=np.int8).ravel() != 0
+                    if prev_active.shape == active.shape:
+                        active_ref = prev_active
+                except Exception:
+                    active_ref = None
+            if active_ref is not None and active_ref.shape == active.shape:
+                changed = int(np.count_nonzero(active_ref != active))
+            active_stable_count = int(active_stable_count + 1) if changed == 0 else 0
+            if int(changed) != 0:
+                self._vi_clear_anderson_history()
+            last_active = active.copy()
+            merit_history.append(float(metrics0["merit"]))
+            if len(merit_history) > 16:
+                merit_history = merit_history[-16:]
+            strong_active = self._vi_strong_active_mask(x_red, stat_red, lo_red, hi_red, act_lo, act_hi, c_red)
+            guard_state_active = getattr(self, "_vi_working_set_guard_active", None)
+            guard_is_active = guard_state_active is not None and np.asarray(guard_state_active).shape == active.shape
+            nonmono_window_cur = int(getattr(self.vi_params, "line_search_nonmonotone_window", 0) or 0)
+            nonmono_stable_iters_cur = int(
+                getattr(self.vi_params, "line_search_nonmonotone_active_stable_iters", 0) or 0
+            )
+            nonmono_ginf_trigger_cur = float(
+                getattr(self.vi_params, "line_search_nonmonotone_ginf_trigger", 0.0) or 0.0
+            )
+            nonmono_gap_ratio_cur = float(
+                getattr(self.vi_params, "line_search_nonmonotone_gap_ratio", 1.0) or 1.0
+            )
+            nonmono_eq_abs_cur = float(
+                getattr(self.vi_params, "line_search_nonmonotone_eq_abs", 1.0e-10) or 1.0e-10
+            )
+            stable_local_merit_only = bool(
+                bool(getattr(self.vi_params, "line_search_nonmonotone_disable_filter", False))
+                and nonmono_window_cur > 0
+                and int(active_stable_count) >= nonmono_stable_iters_cur
+                and changed == 0
+                and (nonmono_ginf_trigger_cur <= 0.0 or float(metrics0["G_inf"]) <= nonmono_ginf_trigger_cur)
+                and float(metrics0["active_gap_inf"])
+                <= max(nonmono_eq_abs_cur, nonmono_gap_ratio_cur * max(float(metrics0["inactive_res_inf"]), 1.0e-30))
+                and float(metrics0["equality_inf"])
+                <= max(nonmono_eq_abs_cur, 1.0e-2 * max(float(metrics0["inactive_res_inf"]), 1.0e-30))
+            )
+            if (
+                bool(getattr(self.vi_params, "field_proximal_recovery", False))
+                and np.any(prox_mask)
+                and float(getattr(self, "_vi_field_prox_lambda_current", 0.0) or 0.0) <= 0.0
+            ):
+                prev_alpha = getattr(self, "_vi_last_accepted_alpha", None)
+                prev_merit_ratio = getattr(self, "_vi_last_accepted_merit_ratio", None)
+                prev_g_ratio = getattr(self, "_vi_last_accepted_g_ratio", None)
+                should_force_identified = self._vi_should_force_field_proximal_on_identified_window(
+                    metrics=metrics0,
+                    active_stable_count=int(active_stable_count),
+                    changed=int(changed),
+                )
+                if not should_force_identified and int(it) == 0 and changed == 0:
+                    prox_stable_req = max(
+                        0,
+                        int(
+                            getattr(
+                                self.vi_params,
+                                "field_proximal_recovery_stable_iters",
+                                1,
+                            )
+                            or 1
+                        ),
+                    )
+                    if prox_stable_req > 0:
+                        should_force_identified = self._vi_should_force_field_proximal_on_identified_window(
+                            metrics=metrics0,
+                            active_stable_count=prox_stable_req,
+                            changed=int(changed),
+                        )
+                should_arm_from_prev = (
+                    changed == 0
+                    and self._vi_should_try_field_proximal_recovery(
+                        metrics=metrics0,
+                        active_stable_count=int(active_stable_count),
+                    )
+                    and prev_alpha is not None
+                    and prev_merit_ratio is not None
+                    and prev_g_ratio is not None
+                    and self._vi_should_arm_field_proximal_after_accept(
+                        accepted_alpha=float(prev_alpha),
+                        merit_ratio=float(prev_merit_ratio),
+                        accepted_g_ratio=float(prev_g_ratio),
+                    )
+                )
+                if (
+                    should_force_identified
+                    or should_arm_from_prev
+                ):
+                    prox_lam0 = max(
+                        float(getattr(self.vi_params, "field_proximal_recovery_lambda0", 1.0e-3) or 1.0e-3),
+                        0.0,
+                    )
+                    if prox_lam0 > 0.0:
+                        self._vi_field_prox_lambda_current = float(prox_lam0)
+                        if os.getenv("PYCUTFEM_VI_TRACE_PROX", "").lower() in {"1", "true", "yes"}:
+                            if should_force_identified:
+                                print(
+                                    f"        [vi-prox] identified-window G={float(metrics0['G_inf']):.3e} "
+                                    f"ΔA={int(changed)} λ->{self._vi_field_prox_lambda_current:.2e}"
+                                )
+                            else:
+                                print(
+                                    f"        [vi-prox] identified-stall alpha={float(prev_alpha):.2e} "
+                                    f"merit_ratio={float(prev_merit_ratio):.3f} G_ratio={float(prev_g_ratio):.3f} "
+                                    f"λ->{self._vi_field_prox_lambda_current:.2e}"
+                                )
+
+            if (
+                bool(getattr(self.vi_params, "ptc_recovery", False))
+                and np.any(ptc_mask)
+                and float(getattr(self, "_vi_ptc_sigma_current", 0.0) or 0.0) <= 0.0
+            ):
+                prev_alpha = getattr(self, "_vi_last_accepted_alpha", None)
+                prev_merit_ratio = getattr(self, "_vi_last_accepted_merit_ratio", None)
+                prev_g_ratio = getattr(self, "_vi_last_accepted_g_ratio", None)
+                should_force_identified = self._vi_should_force_ptc_on_identified_window(
+                    metrics=metrics0,
+                    active_stable_count=int(active_stable_count),
+                    changed=int(changed),
+                )
+                if not should_force_identified and int(it) == 0 and changed == 0:
+                    ptc_stable_req = max(
+                        0,
+                        int(getattr(self.vi_params, "ptc_stable_iters", 1) or 1),
+                    )
+                    if ptc_stable_req > 0:
+                        should_force_identified = self._vi_should_force_ptc_on_identified_window(
+                            metrics=metrics0,
+                            active_stable_count=ptc_stable_req,
+                            changed=int(changed),
+                        )
+                if os.getenv("PYCUTFEM_VI_TRACE_PTC", "").lower() in {"1", "true", "yes"}:
+                    print(
+                        "        [vi-ptc] arm-check "
+                        f"it={int(it)+1} changed={int(changed)} stable={int(active_stable_count)} "
+                        f"identified={int(bool(getattr(self.vi_params, 'ptc_identified_window', False)))} "
+                        f"try={int(self._vi_should_try_ptc_recovery(metrics=metrics0, active_stable_count=int(active_stable_count)))} "
+                        f"force={int(bool(should_force_identified))} "
+                        f"mask={int(np.count_nonzero(ptc_mask))} "
+                        f"G={float(metrics0.get('G_inf', 0.0) or 0.0):.3e} "
+                        f"gap={float(metrics0.get('active_gap_inf', 0.0) or 0.0):.3e} "
+                        f"eq={float(metrics0.get('equality_inf', 0.0) or 0.0):.3e}"
+                    )
+                should_arm_from_prev = (
+                    changed == 0
+                    and self._vi_should_try_ptc_recovery(
+                        metrics=metrics0,
+                        active_stable_count=int(active_stable_count),
+                    )
+                    and prev_alpha is not None
+                    and prev_merit_ratio is not None
+                    and prev_g_ratio is not None
+                    and self._vi_should_arm_ptc_after_accept(
+                        accepted_alpha=float(prev_alpha),
+                        merit_ratio=float(prev_merit_ratio),
+                        accepted_g_ratio=float(prev_g_ratio),
+                    )
+                )
+                if should_force_identified or should_arm_from_prev:
+                    ptc_sigma0 = max(
+                        float(getattr(self.vi_params, "ptc_sigma0", 1.0e-2) or 1.0e-2),
+                        0.0,
+                    )
+                    if ptc_sigma0 > 0.0:
+                        self._vi_ptc_sigma_current = float(ptc_sigma0)
+                        if os.getenv("PYCUTFEM_VI_TRACE_PTC", "").lower() in {"1", "true", "yes"}:
+                            if should_force_identified:
+                                print(
+                                    f"        [vi-ptc] identified-window G={float(metrics0['G_inf']):.3e} "
+                                    f"ΔA={int(changed)} σ->{self._vi_ptc_sigma_current:.2e}"
+                                )
+                            else:
+                                print(
+                                    f"        [vi-ptc] identified-stall alpha={float(prev_alpha):.2e} "
+                                    f"merit_ratio={float(prev_merit_ratio):.3f} G_ratio={float(prev_g_ratio):.3f} "
+                                    f"σ->{self._vi_ptc_sigma_current:.2e}"
+                                )
+
+            if os.getenv("PYCUTFEM_SAVE_VI_STATE", "").lower() in {"1", "true", "yes"}:
+                step_target_raw = os.getenv("PYCUTFEM_SAVE_VI_STATE_STEP", "").strip()
+                it_target_raw = os.getenv("PYCUTFEM_SAVE_VI_STATE_IT", "").strip()
+                outdir = str(os.getenv("PYCUTFEM_SAVE_VI_STATE_DIR", "") or "").strip()
+                if not outdir:
+                    outdir = os.path.join(os.getcwd(), "_pycutfem_vi_dumps")
+                try:
+                    step_now = int(getattr(self, "_current_step_no", -1))
+                except Exception:
+                    step_now = -1
+                try:
+                    want_step = int(step_target_raw) if step_target_raw else None
+                except Exception:
+                    want_step = None
+                try:
+                    want_it = int(it_target_raw) if it_target_raw else 1
+                except Exception:
+                    want_it = 1
+                do_dump = (want_step is None or want_step == step_now) and (int(it + 1) == int(want_it))
+                if do_dump:
+                    dumped = getattr(self, "_saved_vi_state_keys", None)
+                    if dumped is None:
+                        dumped = set()
+                        setattr(self, "_saved_vi_state_keys", dumped)
+                    key = (step_now, int(it + 1))
+                    if key not in dumped:
+                        dumped.add(key)
+                        try:
+                            os.makedirs(outdir, exist_ok=True)
+                            stem = f"step{int(step_now):04d}_it{int(it + 1):02d}"
+                            A_csr = A_red.tocsr() if hasattr(A_red, "tocsr") else sp.csr_matrix(A_red)
+                            sp.save_npz(os.path.join(outdir, f"{stem}_A_red.npz"), A_csr)
+                            np.save(os.path.join(outdir, f"{stem}_R_red.npy"), np.asarray(R_red, dtype=np.float64))
+                            np.save(os.path.join(outdir, f"{stem}_R_raw_red.npy"), np.asarray(R_red_raw, dtype=np.float64))
+                            np.save(os.path.join(outdir, f"{stem}_row_scale_red.npy"), np.asarray(row_scale_red, dtype=np.float64))
+                            np.save(os.path.join(outdir, f"{stem}_x_red.npy"), np.asarray(x_red, dtype=np.float64))
+                            np.save(os.path.join(outdir, f"{stem}_lo_red.npy"), np.asarray(lo_red, dtype=np.float64))
+                            np.save(os.path.join(outdir, f"{stem}_hi_red.npy"), np.asarray(hi_red, dtype=np.float64))
+                            np.save(os.path.join(outdir, f"{stem}_c_red.npy"), np.asarray(c_red, dtype=np.float64))
+                            np.save(os.path.join(outdir, f"{stem}_stat_red.npy"), np.asarray(stat_red, dtype=np.float64))
+                            np.save(os.path.join(outdir, f"{stem}_G_red.npy"), np.asarray(G_red, dtype=np.float64))
+                            np.save(os.path.join(outdir, f"{stem}_act_lo.npy"), np.asarray(act_lo, dtype=np.int8))
+                            np.save(os.path.join(outdir, f"{stem}_act_hi.npy"), np.asarray(act_hi, dtype=np.int8))
+                            np.save(
+                                os.path.join(outdir, f"{stem}_active_dofs.npy"),
+                                np.asarray(self.active_dofs, dtype=np.int64),
+                            )
+                            np.save(
+                                os.path.join(outdir, f"{stem}_vi_red_field_names.npy"),
+                                np.asarray(self._vi_red_field_names, dtype=object),
+                                allow_pickle=True,
+                            )
+                            np.save(
+                                os.path.join(outdir, f"{stem}_eq_B_red.npy"),
+                                np.asarray(eq_data.B_red, dtype=np.float64),
+                            )
+                            np.save(
+                                os.path.join(outdir, f"{stem}_eq_b_eff.npy"),
+                                np.asarray(eq_data.b_eff, dtype=np.float64),
+                            )
+                            np.save(
+                                os.path.join(outdir, f"{stem}_eq_project.npy"),
+                                np.asarray(eq_data.project_feasible, dtype=np.int8),
+                            )
+                            np.save(
+                                os.path.join(outdir, f"{stem}_eq_lambda.npy"),
+                                np.asarray(self._vi_eq_lambda_current, dtype=np.float64),
+                            )
+                            meta = {
+                                "step_no": int(step_now),
+                                "iteration": int(it + 1),
+                                "n_red": int(A_csr.shape[0]),
+                                "nnz": int(A_csr.nnz),
+                                "n_active": int(np.count_nonzero(active)),
+                                "n_equalities": int(np.asarray(eq_data.B_red).shape[0]),
+                                "metrics": {k: float(v) for k, v in dict(metrics0).items()},
+                                "field_names": [str(s) for s in np.asarray(self._vi_red_field_names, dtype=object).tolist()],
+                                "eq_names": [str(s) for s in tuple(getattr(eq_data, "names", tuple()))],
+                                "eq_fields": [
+                                    (None if s is None else str(s))
+                                    for s in tuple(getattr(eq_data, "field_names", tuple()))
+                                ],
+                            }
+                            with open(os.path.join(outdir, f"{stem}_meta.json"), "w", encoding="utf-8") as fh:
+                                json.dump(meta, fh, indent=2)
+                            print(f"        [vi-save] saved reduced VI state to {outdir}/{stem}_*")
+                        except Exception as exc:
+                            print(f"        [vi-save] failed: {exc}")
+
+            print(
+                f"        VI Newton {it+1}: |G|_∞={metrics0['G_inf']:.2e}  |R_raw|_∞={norm_R:.2e}  nA={nA} nI={nI}"
+                + (f"  ΔA={changed}" if changed >= 0 else "")
+                + f"  |R_I|_∞={metrics0['inactive_res_inf']:.2e}  |gap_A|_∞={metrics0['active_gap_inf']:.2e}"
+                + f"  |eq|_∞={norm_eq:.2e}"
+                + f"  λ={float(getattr(self, '_vi_lambda_current', 0.0)):.2e}"
+                + f"  nA_strong={int(np.count_nonzero(strong_active))}"
+                + (f"  Wfix={int(np.count_nonzero(np.asarray(guard_state_active, dtype=np.int8)))}" if guard_is_active else "")
+                + f"  (asm={asm_time:.2e}s)"
+            )
+            if os.getenv("PYCUTFEM_VI_TRACE_FIELDS", "").lower() in {"1", "true", "yes"}:
+                items = []
+                for fld in np.unique(self._vi_red_field_names):
+                    fld = str(fld)
+                    if not fld:
+                        continue
+                    mask = self._vi_red_field_names == fld
+                    n_lo = int(np.count_nonzero(act_lo & mask))
+                    n_hi = int(np.count_nonzero(act_hi & mask))
+                    c_f = float(np.median(c_red[mask])) if np.any(mask) else float(getattr(self.vi_params, "c", 1.0) or 1.0)
+                    if n_lo or n_hi or np.any(np.isfinite(lo_red[mask]) | np.isfinite(hi_red[mask])):
+                        items.append(f"{fld}:lo={n_lo},hi={n_hi},c={c_f:.2e}")
+                if items:
+                    print("        [vi-set] " + "  ".join(items))
+
+            # Match the standard Newton field-residual tracing output for VI solves.
+            # (Useful to identify which PDE block dominates the raw residual.)
+            if os.getenv("PYCUTFEM_NEWTON_TRACE_RES_FIELDS", "").lower() in {"1", "true", "yes"}:
+                try:
+                    R_full_dbg = self.restrictor.expand_vec(R_red_raw)
+                    field_norms = []
+                    for fld in getattr(self.dh, "field_names", []):
+                        try:
+                            sl = self.dh.get_field_slice(fld)
+                        except Exception:
+                            continue
+                        if sl is None or len(sl) == 0:
+                            continue
+                        sl = np.asarray(sl, dtype=int).ravel()
+                        field_norms.append((float(np.linalg.norm(R_full_dbg[sl], ord=np.inf)), str(fld)))
+                    field_norms.sort(reverse=True, key=lambda t: t[0])
+                    n_show_raw = os.getenv("PYCUTFEM_NEWTON_TRACE_RES_FIELDS_N", "8").strip()
+                    try:
+                        n_show = max(1, int(n_show_raw))
+                    except Exception:
+                        n_show = 8
+                    items = ", ".join(f"{name}:{val:.2e}" for val, name in field_norms[:n_show])
+                    print(f"        [res] {items}")
+                except Exception as exc:
+                    print(f"        [res] trace failed: {exc}")
+
+            # Optional residual tracing (same env vars as the standard Newton solver).
+            # For VI, we expose both the semismooth residual G and the raw residual R
+            # so users can identify whether non-convergence comes from active-set
+            # complementarity (gap) or from a particular PDE block.
+            if os.getenv("PYCUTFEM_RESIDUAL_TRACE", "").lower() in {"1", "true", "yes"}:
+                try:
+                    G_full = self.restrictor.expand_vec(G_red)
+                    R_full = self.restrictor.expand_vec(R_red_raw)
+                except Exception:
+                    G_full = None
+                    R_full = None
+
+                def _trace_vec(tag: str, vec: np.ndarray | None) -> None:
+                    if vec is None:
+                        return
+                    vec = np.asarray(vec, dtype=float).ravel()
+                    if vec.size == 0:
+                        return
+                    worst = int(np.argmax(np.abs(vec)))
+                    worst_val = float(vec[worst])
+                    field = None
+                    try:
+                        field = getattr(self.dh, "_dof_to_node_map", {}).get(worst, (None, None))[0]
+                    except Exception:
+                        field = None
+                    fmsg = f", field={field}" if field is not None else ""
+
+                    coords_msg = ""
+                    if os.getenv("PYCUTFEM_RESIDUAL_TRACE_COORDS", "").lower() in {"1", "true", "yes"}:
+                        try:
+                            self.dh._ensure_dof_coords()
+                            coords = np.asarray(getattr(self.dh, "_dof_coords", None), dtype=float)
+                            if coords.ndim == 2 and coords.shape[0] > worst and coords.shape[1] >= 2:
+                                coords_msg = f", x={coords[worst, 0]:.3e}, y={coords[worst, 1]:.3e}"
+                        except Exception:
+                            coords_msg = ""
+
+                    print(f"        [vi-res] worst_{tag}: gdof={worst} val={worst_val:.3e}{fmsg}{coords_msg}")
+
+                    if os.getenv("PYCUTFEM_RESIDUAL_TRACE_FIELDS", "").lower() in {"1", "true", "yes"}:
+                        field_norms = []
+                        for fld in getattr(self.dh, "field_names", []):
+                            try:
+                                sl = self.dh.get_field_slice(fld)
+                            except Exception:
+                                continue
+                            if sl is None or len(sl) == 0:
+                                continue
+                            try:
+                                field_norms.append(f"{fld}:{np.linalg.norm(vec[sl], ord=np.inf):.2e}")
+                            except Exception:
+                                continue
+                        if field_norms:
+                            print(f"        [vi-res] per-field |{tag}|_∞: " + ", ".join(field_norms))
+
+                _trace_vec("G", G_full)
+                _trace_vec("R", R_full)
+
+            if float(metrics0["G_inf"]) <= tol_eff:
+                self._last_nonlinear_reason = 2
+                self._last_nonlinear_accepted = True
+                self._last_nonlinear_relaxed_accept = False
+                self._vi_eq_lambda_accepted = np.asarray(self._vi_eq_lambda_current, dtype=float).copy()
+                delta = np.hstack([f.nodal_values - f_prev.nodal_values for f, f_prev in zip(funcs, prev_funcs)])
+                return delta, True, it + 1
+
+            affine_reason: str | None = None
+            affine_note: str | None = None
+            prefer_field_proximal_now = self._vi_should_prefer_field_proximal_phase(prox_mask=prox_mask)
+            prefer_ptc_now = self._vi_should_prefer_ptc_phase(ptc_mask=ptc_mask)
+            if bool(getattr(self.vi_params, "affine_cycle_fallback", False)) and cycle_info is not None:
+                affine_reason = "cycle"
+                affine_note = (
+                    "period-2 state cycle on "
+                    f"{tuple(cycle_info['fields'])} (nflip={int(cycle_info['nflip'])})"
+                )
+            else:
+                signature = np.asarray(state_red, dtype=np.int8).tobytes()
+                if (
+                    not prefer_field_proximal_now
+                    and not prefer_ptc_now
+                    and
+                    signature not in affine_identified_attempted_states
+                    and self._vi_should_try_affine_identified_acceleration(
+                        metrics=metrics0,
+                        changed=changed,
+                        active_stable_count=active_stable_count,
+                    )
+                ):
+                    affine_identified_attempted_states.add(signature)
+                    affine_reason = "identified"
+                    affine_note = (
+                        "active set identified "
+                        f"(stable_iters={int(active_stable_count)}, nA={int(nA)})"
+                    )
+
+            if affine_reason is not None:
+                rhs_aff_red = (
+                    np.asarray(A_red @ x_red, dtype=float).ravel()
+                    - np.asarray(stat_red, dtype=float).ravel()
+                )
+                if int(eq_data.B_red.shape[0]) > 0 and np.asarray(self._vi_eq_lambda_current, dtype=float).size:
+                    rhs_aff_red += np.asarray(eq_data.B_red.T @ self._vi_eq_lambda_current, dtype=float).ravel()
+                if affine_reason == "identified":
+                    cycle_result = self._vi_affine_fixed_working_set_solve(
+                        A_red=A_red,
+                        rhs_aff_red=rhs_aff_red,
+                        x0_red=x_red,
+                        lambda0_eq=np.asarray(self._vi_eq_lambda_current, dtype=float),
+                        lo_red=lo_red,
+                        hi_red=hi_red,
+                        act_lo_fixed=np.asarray(act_lo, dtype=bool),
+                        act_hi_fixed=np.asarray(act_hi, dtype=bool),
+                        eq_data=eq_data,
+                        tol=max(float(tol_eff), 1.0e-6),
+                        row_scale_red=row_scale_red,
+                        col_scale_red=col_scale_red,
+                    )
+                else:
+                    cycle_result = self._vi_affine_cycle_fallback(
+                        A_red=A_red,
+                        rhs_aff_red=rhs_aff_red,
+                        x0_red=x_red,
+                        lambda0_eq=np.asarray(self._vi_eq_lambda_current, dtype=float),
+                        lo_red=lo_red,
+                        hi_red=hi_red,
+                        c_red=c_red,
+                        eq_data=eq_data,
+                        tol=max(float(tol_eff), 1.0e-6),
+                        row_scale_red=row_scale_red,
+                        col_scale_red=col_scale_red,
+                    )
+                if cycle_result is not None:
+                    y_cycle, lam_cycle, metrics_cycle = cycle_result
+                    if float(metrics_cycle.get("G_inf", float("inf"))) < float(metrics0["G_inf"]):
+                        _, _, act_lo_cycle, act_hi_cycle, _ = self._vi_affine_residual_and_sets(
+                            A_red=A_red,
+                            rhs_aff_red=rhs_aff_red,
+                            x_red=np.asarray(y_cycle, dtype=float),
+                            lambda_eq=np.asarray(lam_cycle, dtype=float),
+                            lo_red=lo_red,
+                            hi_red=hi_red,
+                            c_red=c_red,
+                            eq_data=eq_data,
+                            row_scale_red=row_scale_red,
+                        )
+                        cycle_state = self._vi_state_from_sets(
+                            np.asarray(act_lo_cycle, dtype=bool),
+                            np.asarray(act_hi_cycle, dtype=bool),
+                        )
+                        guard_state = self._vi_guard_state_after_affine_rescue(
+                            state_base=np.asarray(state_red, dtype=np.int8),
+                            state_affine=np.asarray(cycle_state, dtype=np.int8),
+                            x_affine=np.asarray(y_cycle, dtype=float),
+                            lo_red=lo_red,
+                            hi_red=hi_red,
+                        )
+                        dU_full = self.restrictor.expand_vec(np.asarray(y_cycle, dtype=float) - np.asarray(x_red, dtype=float))
+                        dh.add_to_functions(dU_full, funcs)
+                        dh.apply_bcs(bcs_now, *funcs)
+                        if getattr(self, "constraints", None) is not None:
+                            self._enforce_constraints_on_functions(funcs)
+                        self._vi_eq_lambda_current = np.asarray(lam_cycle, dtype=float).copy()
+                        self._vi_eq_lambda_accepted = self._vi_eq_lambda_current.copy()
+                        # This affine solve is a local working-set SQP step.
+                        # Carry the identified working set forward, but enrich
+                        # it with genuinely blocking constraints hit by the
+                        # accepted affine step. That is the standard working-set
+                        # update and avoids both extremes:
+                        # - reclassifying everything at the affine endpoint,
+                        # - or ignoring newly hit bounds and getting alpha=0 in
+                        #   the next bound-preserving line search.
+                        self._vi_prev_state = np.asarray(guard_state, dtype=np.int8).copy()
+                        self._vi_pending_state = self._vi_prev_state.copy()
+                        self._vi_pending_count = np.zeros(self._vi_prev_state.shape, dtype=np.int16)
+                        self._vi_forced_state = self._vi_prev_state.copy()
+                        self._vi_arm_working_set_guard(guard_state)
+                        state_hist_prev = self._vi_prev_state.copy()
+                        state_hist_prevprev = None
+                        if affine_reason == "cycle":
+                            print(
+                                "        [vi-cycle] "
+                                f"{affine_note}; affine semismooth fallback reduced |G|_∞ "
+                                f"from {float(metrics0['G_inf']):.3e} to {float(metrics_cycle['G_inf']):.3e}."
+                            )
+                        else:
+                            print(
+                                "        [vi-local] "
+                                f"{affine_note}; affine semismooth local solve reduced |G|_∞ "
+                                f"from {float(metrics0['G_inf']):.3e} to {float(metrics_cycle['G_inf']):.3e}."
+                            )
+                        continue
+
+            state_hist_prevprev = None if state_hist_prev is None else state_hist_prev.copy()
+            state_hist_prev = np.asarray(state_red, dtype=np.int8).copy()
+
+            # Build semismooth Newton system (PDAS): inactive rows use Newton, active rows are identity.
+            rhs = (-stat_red_lin).astype(float, copy=True)
+            if nA:
+                rhs[act_lo] = lo_red[act_lo] - x_red[act_lo]
+                rhs[act_hi] = hi_red[act_hi] - x_red[act_hi]
+                A_mod_x = self._apply_identity_rows(A_red, np.flatnonzero(active))
+            else:
+                A_mod_x = A_red
+            A_mod = self._vi_scale_matrix_cols(A_mod_x, col_scale_red)
+            A_aug, rhs_aug = self._vi_build_augmented_system(
+                A_mod, rhs, active, eq_data, eq_res,
+                row_scale_red=row_scale_red,
+                col_scale_red=col_scale_red,
+                x_block_col_scaled=True,
+            )
+            G_aug = self._vi_augmented_residual(G_red, eq_res)
+
+            lam = float(getattr(self, "_vi_lambda_current", 0.0) or 0.0)
+            delta_trigger = int(getattr(self.vi_params, "inactive_reg_delta_active_trigger", 0) or 0)
+            if delta_trigger > 0 and changed >= delta_trigger:
+                lam = max(lam, float(getattr(self.vi_params, "inactive_reg_lambda0", 0.0) or 0.0))
+                lam = min(
+                    float(getattr(self.vi_params, "inactive_reg_lambda_max", 1.0e6) or 1.0e6),
+                    lam * float(getattr(self.vi_params, "inactive_reg_growth", 5.0) or 5.0) if lam > 0.0 else 0.0,
+                )
+
+            lin_time = 0.0
+            ls_time = 0.0
+            reg_retries = 0
+            used_lm = False
+            lm_info: dict[str, float] = {}
+
+            def _eval_reduced_trial(
+                step_red: np.ndarray,
+                lambda_try: np.ndarray,
+            ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[str, float]]:
+                step_red = np.asarray(step_red, dtype=float)
+                lambda_try = np.asarray(lambda_try, dtype=float)
+                if not np.all(np.isfinite(step_red)):
+                    raise RuntimeError("Trial step contains non-finite entries.")
+                if not np.all(np.isfinite(lambda_try)):
+                    raise RuntimeError("Trial equality multiplier contains non-finite entries.")
+                snap = [f.nodal_values.copy() for f in funcs]
+                vi_state_save = self._vi_capture_classification_state()
+                try:
+                    dU_full = self.restrictor.expand_vec(step_red)
+                    if not np.all(np.isfinite(dU_full)):
+                        raise RuntimeError("Expanded trial step contains non-finite entries.")
+                    dh.add_to_functions(dU_full, funcs)
+                    dh.apply_bcs(bcs_now, *funcs)
+                    if getattr(self, "constraints", None) is not None:
+                        self._enforce_constraints_on_functions(funcs)
+                    if self.pre_cb is not None:
+                        self.pre_cb(funcs)
+                    trial_lo_red, trial_hi_red = self._bounds_reduced()
+                    trial_eq_data = eq_prepare_callback()
+                    for f in funcs:
+                        vals = np.asarray(getattr(f, "nodal_values", np.array([], dtype=float)), dtype=float)
+                        if vals.size and not np.all(np.isfinite(vals)):
+                            raise RuntimeError(
+                                f"Trial iterate became non-finite after constraint enforcement in field "
+                                f"'{getattr(f, 'name', '<unnamed>')}'."
+                            )
+                    if bool(getattr(self.vi_params, "project_each_iteration", True)):
+                        self._project_funcs_to_bounds(
+                            funcs,
+                            bcs_now,
+                            trial_lo_red,
+                            trial_hi_red,
+                            eq_data=trial_eq_data,
+                            eq_prepare_callback=eq_prepare_callback,
+                        )
+                        if self.pre_cb is not None:
+                            self.pre_cb(funcs)
+                        trial_lo_red, trial_hi_red = self._bounds_reduced()
+                        trial_eq_data = eq_prepare_callback()
+                    _, R_try_raw = self._assemble_system_reduced(current, need_matrix=False)
+                    R_try_raw = np.asarray(R_try_raw, dtype=float)
+                    if not np.all(np.isfinite(R_try_raw)):
+                        raise RuntimeError("Trial residual contains non-finite entries.")
+                    x_try = self._pack_reduced_iterate(funcs)
+                    if not np.all(np.isfinite(x_try)):
+                        raise RuntimeError("Trial reduced iterate contains non-finite entries.")
+                    stat_try = self._vi_stationarity_residual(R_try_raw, trial_eq_data, lambda_try)
+                    eq_try = self._vi_equality_residual(x_try, trial_eq_data)
+                    G_try, act_lo_try, act_hi_try = self._pdas_residual_and_sets(
+                        x_try, stat_try, trial_lo_red, trial_hi_red, c_red=c_red
+                    )
+                    metrics_try = self._vi_metrics(
+                        x_try, stat_try, trial_lo_red, trial_hi_red, act_lo_try, act_hi_try, G_try, eq_try
+                    )
+                    metrics_try["delta_active"] = float(
+                        np.count_nonzero(self._vi_state_from_sets(act_lo_try, act_hi_try) != self._vi_state_from_sets(act_lo, act_hi))
+                    )
+                    return x_try, R_try_raw, stat_try, eq_try, G_try, act_lo_try, act_hi_try, metrics_try
+                finally:
+                    self._vi_restore_classification_state(vi_state_save)
+                    for f, buf in zip(funcs, snap):
+                        f.nodal_values[:] = buf
+
+            lambda_iter0 = np.asarray(self._vi_eq_lambda_current, dtype=float).copy()
+            lm_requested = bool(getattr(self.vi_params, "unconstrained_lm", False))
+            lm_trace = os.getenv("PYCUTFEM_VI_TRACE_LM", "").lower() in {"1", "true", "yes"}
+            prefer_field_proximal = self._vi_should_prefer_field_proximal_phase(prox_mask=prox_mask)
+            prefer_ptc = self._vi_should_prefer_ptc_phase(ptc_mask=ptc_mask)
+            use_lm = bool(lm_requested and not prefer_field_proximal and not prefer_ptc)
+            external_vi_solver = str(os.getenv("PYCUTFEM_VI_LINEARIZED_SOLVER", "") or "").strip().lower()
+            use_external_vi = external_vi_solver == "dealii"
+            external_step_ready = False
+            if (
+                prefer_field_proximal
+                and os.getenv("PYCUTFEM_VI_TRACE_PROX", "").lower() in {"1", "true", "yes"}
+            ):
+                print(
+                    "        [vi-prox] preferring proximal identified-manifold step over LM "
+                    f"(λ={float(getattr(self, '_vi_field_prox_lambda_current', 0.0) or 0.0):.2e})"
+                )
+            if (
+                prefer_ptc
+                and os.getenv("PYCUTFEM_VI_TRACE_PTC", "").lower() in {"1", "true", "yes"}
+            ):
+                print(
+                    "        [vi-ptc] preferring pseudo-transient identified-manifold step over LM "
+                    f"(σ={float(getattr(self, '_vi_ptc_sigma_current', 0.0) or 0.0):.2e})"
+                )
+            if lm_requested and nA > 0 and lm_trace:
+                active_items = []
+                for fld in np.unique(self._vi_red_field_names):
+                    fld = str(fld)
+                    if not fld:
+                        continue
+                    mask = self._vi_red_field_names == fld
+                    n_lo = int(np.count_nonzero(act_lo & mask))
+                    n_hi = int(np.count_nonzero(act_hi & mask))
+                    if n_lo or n_hi:
+                        active_items.append(f"{fld}:lo={n_lo},hi={n_hi}")
+                msg = f"        [vi-lm] active-set mode: nA={nA} semismooth LM will use the PDAS-modified system."
+                if active_items:
+                    msg += " active={" + ", ".join(active_items) + "}"
+                print(msg)
+            if use_lm:
+                lm_lam = float(getattr(self, "_vi_lm_lambda_current", 0.0) or 0.0)
+                lm0 = float(getattr(self.vi_params, "unconstrained_lm_lambda0", 1.0e-4) or 1.0e-4)
+                lm_max = float(getattr(self.vi_params, "unconstrained_lm_lambda_max", 1.0e6) or 1.0e6)
+                lm_growth = float(getattr(self.vi_params, "unconstrained_lm_growth", 5.0) or 5.0)
+                lm_decay = float(getattr(self.vi_params, "unconstrained_lm_decay", 0.5) or 0.5)
+                lm_accept = float(getattr(self.vi_params, "unconstrained_lm_accept_ratio", 1.0e-3) or 1.0e-3)
+                lm_good = float(getattr(self.vi_params, "unconstrained_lm_good_ratio", 0.75) or 0.75)
+                lm_max_tries = int(getattr(self.vi_params, "unconstrained_lm_max_tries", 6) or 6)
+                phi0_lm = float(metrics0["merit"])
+                ginf0_lm = float(metrics0["G_inf"])
+                best_step = None
+                best_step_lam = None
+                best_phi = phi0_lm
+                best_rho = -np.inf
+                best_metrics = None
+                best_filtered_step = None
+                best_filtered_step_lam = None
+                best_filtered_phi = phi0_lm
+                best_filtered_rho = -np.inf
+                best_filtered_metrics = None
+                res0_lm = float(metrics0["inactive_res_inf"])
+                gap0_lm = float(metrics0["active_gap_inf"])
+                eq0_lm = float(metrics0["equality_inf"])
+                max_delta_active = int(getattr(self.vi_params, "filter_max_delta_active", 0) or 0)
+                max_ginf_growth = float(getattr(self.vi_params, "filter_max_ginf_growth", 1.0) or 1.0)
+                max_res_growth = float(getattr(self.vi_params, "filter_max_residual_growth", 1.25) or 1.25)
+                max_gap_growth = float(getattr(self.vi_params, "filter_max_gap_growth", 1.25) or 1.25)
+                max_eq_growth = float(getattr(self.vi_params, "filter_max_equality_growth", 1.25) or 1.25)
+                fallback_rho_min = max(1.0e-6, 0.1 * lm_accept)
+
+                for lm_try in range(max(lm_max_tries, 1)):
+                    try:
+                        H_lm, rhs_lm, lm_diag = self._vi_build_lm_system(
+                            A_aug,
+                            rhs_aug,
+                            lm_lam,
+                            x_block_size=int(x_red.size),
+                        )
+                        t_lin = time.perf_counter()
+                        step_lm_aug = self._solve_linear_system_with_context(
+                            H_lm,
+                            rhs_lm,
+                            context="vi_augmented",
+                        )
+                        lin_time += time.perf_counter() - t_lin
+                    except RuntimeError as exc:
+                        if lm_trace:
+                            print(f"        [vi-lm] try={lm_try+1} λ={lm_lam:.2e} linear solve failed: {exc}")
+                        lm_lam = min(lm_max, max(lm_lam, lm0) * lm_growth if max(lm_lam, lm0) > 0.0 else lm0)
+                        continue
+                    step_lm, step_lm_eq = self._vi_split_augmented_step(
+                        step_lm_aug, eq_data, col_scale_red=col_scale_red
+                    )
+                    alpha_lm = self._vi_feasible_step_alpha_cap(
+                        x_red,
+                        step_lm,
+                        lo_red,
+                        hi_red,
+                        active_mask=active,
+                    )
+                    step_lm = float(alpha_lm) * np.asarray(step_lm, dtype=float)
+                    step_lm_eq = float(alpha_lm) * np.asarray(step_lm_eq, dtype=float)
+                    try:
+                        _, _, _, _, _, _, _, metrics_try = _eval_reduced_trial(
+                            step_lm,
+                            np.asarray(self._vi_eq_lambda_current, dtype=float) + np.asarray(step_lm_eq, dtype=float),
+                        )
+                        phi_try = float(metrics_try["merit"])
+                    except RuntimeError as exc:
+                        if lm_trace:
+                            print(f"        [vi-lm] try={lm_try+1} λ={lm_lam:.2e} rejected: {exc}")
+                        lm_lam = min(lm_max, max(lm_lam, lm0) * lm_growth if max(lm_lam, lm0) > 0.0 else lm0)
+                        continue
+                    if not np.isfinite(phi_try):
+                        if lm_trace:
+                            print(f"        [vi-lm] try={lm_try+1} λ={lm_lam:.2e} rejected: non-finite phi_try")
+                        lm_lam = min(lm_max, max(lm_lam, lm0) * lm_growth if max(lm_lam, lm0) > 0.0 else lm0)
+                        continue
+                    _, model_phi, pred_model, _ = self._vi_unconstrained_lm_model(G_aug, A_aug, step_lm_aug, lm_lam, lm_diag, phi_try=phi_try)
+                    actual = phi0_lm - phi_try
+                    rho = actual / max(phi0_lm, 1.0e-30)
+                    ginf_ok = float(metrics_try["G_inf"]) <= max(max_ginf_growth * max(ginf0_lm, 1.0e-16), 1.0e-16)
+                    res_ok = float(metrics_try["inactive_res_inf"]) <= max(max_res_growth * max(res0_lm, 1.0e-16), 1.0e-16)
+                    gap_ok = float(metrics_try["active_gap_inf"]) <= max(max_gap_growth * max(gap0_lm, 1.0e-16), 1.0e-16)
+                    eq_ok = float(metrics_try["equality_inf"]) <= max(max_eq_growth * max(eq0_lm, 1.0e-16), 1.0e-16)
+                    delta_ok = max_delta_active <= 0 or int(metrics_try.get("delta_active", 0.0)) <= max_delta_active
+                    filtered_ok = ginf_ok and res_ok and gap_ok and eq_ok and delta_ok
+                    if stable_local_merit_only and int(metrics_try.get("delta_active", 1.0)) == 0:
+                        filtered_ok = True
+                    if lm_trace:
+                        print(
+                            f"        [vi-lm] try={lm_try+1} λ={lm_lam:.2e} "
+                            f"phi0={phi0_lm:.3e} phitry={phi_try:.3e} "
+                            f"pred_model={pred_model:.3e} act={actual:.3e} rho={rho:.3e} "
+                            f"Ginf={float(metrics_try['G_inf']):.3e} "
+                            f"ginf_ok={int(ginf_ok)} res_ok={int(res_ok)} gap_ok={int(gap_ok)} eq_ok={int(eq_ok)} delta_ok={int(delta_ok)}"
+                        )
+                    if phi_try < best_phi:
+                        best_phi = phi_try
+                        best_step = np.asarray(step_lm, dtype=float).copy()
+                        best_step_lam = np.asarray(step_lm_eq, dtype=float).copy()
+                        best_rho = float(rho)
+                        best_metrics = dict(metrics_try)
+                    if filtered_ok and phi_try < best_filtered_phi:
+                        best_filtered_phi = phi_try
+                        best_filtered_step = np.asarray(step_lm, dtype=float).copy()
+                        best_filtered_step_lam = np.asarray(step_lm_eq, dtype=float).copy()
+                        best_filtered_rho = float(rho)
+                        best_filtered_metrics = dict(metrics_try)
+                    if np.isfinite(rho) and actual > 0.0 and rho >= lm_accept and filtered_ok:
+                        used_lm = True
+                        S_red = np.asarray(step_lm, dtype=float)
+                        self._vi_eq_lambda_current = np.asarray(self._vi_eq_lambda_current, dtype=float) + np.asarray(step_lm_eq, dtype=float)
+                        accepted_alpha = float(alpha_lm)
+                        merit_ratio = phi_try / max(phi0_lm, 1.0e-30)
+                        lm_info = {"rho": float(rho), "phi_try": float(phi_try), "phi0": float(phi0_lm)}
+                        if rho >= lm_good:
+                            lm_lam = max(lm0, lm_lam * lm_decay if lm_lam > 0.0 else lm0)
+                        self._vi_lm_lambda_current = float(min(max(lm_lam, lm0), lm_max))
+                        self._ls_alpha_prev = float(alpha_lm)
+                        self._vi_last_metrics = dict(metrics_try)
+                        break
+                    lm_lam = min(lm_max, max(lm_lam, lm0) * lm_growth if max(lm_lam, lm0) > 0.0 else lm0)
+                if (
+                    not used_lm
+                    and best_filtered_step is not None
+                    and best_filtered_phi < phi0_lm
+                    and np.isfinite(best_filtered_rho)
+                    and best_filtered_rho >= fallback_rho_min
+                ):
+                    used_lm = True
+                    S_red = np.asarray(best_filtered_step, dtype=float)
+                    if best_filtered_step_lam is not None:
+                        self._vi_eq_lambda_current = np.asarray(self._vi_eq_lambda_current, dtype=float) + np.asarray(best_filtered_step_lam, dtype=float)
+                    accepted_alpha = float(
+                        self._vi_feasible_step_alpha_cap(
+                            x_red,
+                            best_filtered_step,
+                            lo_red,
+                            hi_red,
+                            active_mask=active,
+                        )
+                    )
+                    merit_ratio = best_filtered_phi / max(phi0_lm, 1.0e-30)
+                    lm_info = {"rho": float(best_filtered_rho), "phi_try": float(best_filtered_phi), "phi0": float(phi0_lm)}
+                    self._vi_lm_lambda_current = float(min(max(lm_lam, lm0), lm_max))
+                    self._ls_alpha_prev = float(accepted_alpha)
+                    self._vi_last_metrics = dict(best_filtered_metrics or {"merit": float(best_filtered_phi)})
+                elif not used_lm and best_step is not None and best_phi < phi0_lm and lm_trace:
+                    print(
+                        "        [vi-lm] best trial rejected by globalization filter or insufficient improvement: "
+                        f"rho={float(best_rho):.3e} fallback_min={fallback_rho_min:.3e}"
+                    )
+                if not used_lm:
+                    self._vi_lm_lambda_current = float(lm0)
+
+            if use_external_vi and not used_lm:
+                t_lin = time.perf_counter()
+                y_target, lambda_target, dealii_info = self._solve_vi_linearized_dealii(
+                    A_red=A_red,
+                    x_red=x_red,
+                    lo_red=lo_red,
+                    hi_red=hi_red,
+                    c_red=c_red,
+                    stat_red=stat_red,
+                    eq_data=eq_data,
+                    lambda_eq=np.asarray(self._vi_eq_lambda_current, dtype=float),
+                )
+                lin_time += time.perf_counter() - t_lin
+                S_red = np.asarray(y_target, dtype=float) - np.asarray(x_red, dtype=float)
+                S_lam_eq = np.asarray(lambda_target, dtype=float) - np.asarray(self._vi_eq_lambda_current, dtype=float)
+                external_step_ready = True
+                if os.getenv("PYCUTFEM_VI_TRACE_DEALII", "").lower() in {"1", "true", "yes"}:
+                    hist = dealii_info.get("history", [])
+                    last_hist = hist[-1] if isinstance(hist, list) and hist else {}
+                    print(
+                        "        [vi-dealii] linearized PDAS"
+                        f" converged={int(bool(dealii_info.get('converged', False)))}"
+                        f" it={int(dealii_info.get('iterations', 0) or 0)}"
+                        f" Ginf={float(dealii_info.get('g_inf', 0.0) or 0.0):.3e}"
+                        f" eq={float(dealii_info.get('equality_inf', 0.0) or 0.0):.3e}"
+                        f" active_lo={int(dealii_info.get('n_active_lo', 0) or 0)}"
+                        f" active_hi={int(dealii_info.get('n_active_hi', 0) or 0)}"
+                        f" shift={float(last_hist.get('shift_factor', 0.0) or 0.0):.1e}"
+                        f" gmres={int(last_hist.get('gmres_steps', 0) or 0)}"
+                        f" linres={float(last_hist.get('linear_res_inf', 0.0) or 0.0):.3e}"
+                    )
+
+            if used_lm:
+                self._vi_last_retry_count = 0
+                dU_full = self.restrictor.expand_vec(S_red)
+                if not np.all(np.isfinite(dU_full)):
+                    raise RuntimeError("Accepted LM step expanded to non-finite full increment.")
+                dh.add_to_functions(dU_full, funcs)
+                dh.apply_bcs(bcs_now, *funcs)
+                if getattr(self, "constraints", None) is not None:
+                    self._enforce_constraints_on_functions(funcs)
+                if bool(getattr(self.vi_params, "project_each_iteration", True)):
+                    self._project_funcs_to_bounds(
+                        funcs,
+                        bcs_now,
+                        lo_red,
+                        hi_red,
+                        eq_data=eq_data,
+                        eq_prepare_callback=eq_prepare_callback,
+                    )
+                if self.post_cb is not None:
+                    self.post_cb(funcs)
+                if getattr(self, "constraints", None) is not None:
+                    self._enforce_constraints_on_functions(funcs)
+                self._assert_functions_finite(funcs, context="after accepted LM step")
+                x_acc = self._pack_reduced_iterate(funcs)
+                _, R_acc_raw = self._assemble_system_reduced(current, need_matrix=False)
+                stat_acc = self._vi_stationarity_residual(
+                    np.asarray(R_acc_raw, dtype=float),
+                    eq_data,
+                    self._vi_eq_lambda_current,
+                )
+                base_state = self._vi_state_from_sets(act_lo, act_hi)
+                carry_state = self._vi_rebuild_carried_state_from_endpoint(
+                    x_red=x_acc,
+                    stationarity_red=stat_acc,
+                    lo_red=lo_red,
+                    hi_red=hi_red,
+                    c_red=c_red,
+                    state_base=base_state,
+                )
+                self._vi_commit_carried_state(carry_state)
+                accepted_metrics = dict(getattr(self, "_vi_last_metrics", None) or metrics0)
+                accepted_g_ratio = float(accepted_metrics.get("G_inf", metrics0["G_inf"])) / max(
+                    float(metrics0["G_inf"]),
+                    1.0e-30,
+                )
+                self._vi_update_field_proximal_after_accept(
+                    prox_mask=prox_mask,
+                    metrics=metrics0,
+                    active_stable_count=int(active_stable_count),
+                    changed=int(changed),
+                    accepted_alpha=float(accepted_alpha),
+                    merit_ratio=float(merit_ratio),
+                    accepted_g_ratio=float(accepted_g_ratio),
+                )
+                self._vi_update_ptc_after_accept(
+                    ptc_mask=ptc_mask,
+                    metrics=metrics0,
+                    active_stable_count=int(active_stable_count),
+                    changed=int(changed),
+                    accepted_alpha=float(accepted_alpha),
+                    merit_ratio=float(merit_ratio),
+                    accepted_g_ratio=float(accepted_g_ratio),
+                )
+                if self._vi_should_arm_working_set_guard_after_accept(
+                    metrics=metrics0,
+                    active_stable_count=int(active_stable_count),
+                    changed=int(changed),
+                    accepted_alpha=float(accepted_alpha),
+                    merit_ratio=float(merit_ratio),
+                    accepted_g_ratio=float(accepted_g_ratio),
+                ):
+                    self._vi_arm_working_set_guard(carry_state)
+                self._vi_record_anderson_history(
+                    x_prev=x_red,
+                    lambda_prev=lambda_iter0,
+                    x_next=x_acc,
+                    lambda_next=np.asarray(self._vi_eq_lambda_current, dtype=float),
+                )
+                print(
+                    f"          timings: solve={lin_time:.2e}s, line-search={ls_time:.2e}s, "
+                    f"alpha={float(accepted_alpha):.2e}, merit_ratio={float(lm_info.get('phi_try', 0.0)) / max(float(lm_info.get('phi0', 1.0)), 1.0e-30):.3f}, "
+                    f"lm_rho={float(lm_info.get('rho', 0.0)):.3f}, lm_lambda={float(getattr(self, '_vi_lm_lambda_current', 0.0)):.2e}"
+                )
+                continue
+
+            while True:
+                if external_step_ready:
+                    external_step_ready = False
+                    reg_diag = np.zeros(np.asarray(S_red, dtype=float).shape, dtype=float)
+                else:
+                    A_work, reg_diag = self._vi_apply_inactive_regularization(A_mod, A_red_step, active, lam)
+                    rhs_work = np.asarray(rhs, dtype=float).copy()
+                    ptc_sigma = float(getattr(self, "_vi_ptc_sigma_current", 0.0) or 0.0)
+                    ptc_diag = np.zeros(np.asarray(x_red, dtype=float).shape, dtype=float)
+                    if (
+                        ptc_sigma > 0.0
+                        and np.any(ptc_mask)
+                        and bool(getattr(self.vi_params, "ptc_freeze_complement", True))
+                    ):
+                        A_work, rhs_work = self._vi_apply_selected_field_freeze(A_work, rhs_work, ptc_mask)
+                    if ptc_sigma > 0.0 and np.any(ptc_mask):
+                        A_work, ptc_diag = self._vi_apply_ptc_regularization(
+                            A_work,
+                            A_red_step,
+                            ptc_mask,
+                            ptc_sigma,
+                        )
+                    field_prox_lam = float(getattr(self, "_vi_field_prox_lambda_current", 0.0) or 0.0)
+                    field_prox_diag = np.zeros(np.asarray(x_red, dtype=float).shape, dtype=float)
+                    if field_prox_lam > 0.0 and np.any(prox_mask):
+                        A_work, field_prox_diag = self._vi_apply_field_proximal(
+                            A_work,
+                            A_red_step,
+                            prox_mask,
+                            field_prox_lam,
+                        )
+                    A_work_aug, rhs_work_aug = self._vi_build_augmented_system(
+                        A_work, rhs_work, active, eq_data, eq_res,
+                        row_scale_red=row_scale_red,
+                        col_scale_red=col_scale_red,
+                        x_block_col_scaled=True,
+                    )
+                    try:
+                        t_lin = time.perf_counter()
+                        step_aug = self._solve_linear_system_with_context(
+                            A_work_aug,
+                            rhs_work_aug,
+                            context="vi_augmented",
+                        )
+                        lin_time += time.perf_counter() - t_lin
+                    except RuntimeError as exc:
+                        lam_max = float(getattr(self.vi_params, "inactive_reg_lambda_max", 1.0e6) or 1.0e6)
+                        lam_growth = float(getattr(self.vi_params, "inactive_reg_growth", 5.0) or 5.0)
+                        lam0 = float(getattr(self.vi_params, "inactive_reg_lambda0", 0.0) or 0.0)
+                        if lam < lam_max and (lam > 0.0 or lam0 > 0.0):
+                            lam = max(lam, lam0)
+                            lam = min(lam_max, lam * lam_growth if lam > 0.0 else lam0)
+                            reg_retries += 1
+                            if os.getenv("PYCUTFEM_VI_TRACE_REG", "").lower() in {"1", "true", "yes"}:
+                                print(f"        [vi-reg] retry={reg_retries}  λ->{lam:.2e}  after linear solve failure: {exc}")
+                            continue
+                        raise
+                    S_red, S_lam_eq = self._vi_split_augmented_step(
+                        step_aug, eq_data, col_scale_red=col_scale_red
+                    )
+                if (
+                    (not use_external_vi)
+                    and bool(getattr(self.vi_params, "bound_blocking_activate", False))
+                    and not self._vi_should_freeze_local_trial_model()
+                ):
+                    trigger_alpha = float(getattr(self.vi_params, "bound_blocking_trigger_alpha", 0.95) or 0.95)
+                    trigger_alpha = min(max(trigger_alpha, 0.0), 1.0)
+                    max_block = max(0, int(getattr(self.vi_params, "bound_blocking_max_iter", 12) or 0))
+                    act_lo_step = np.asarray(act_lo, dtype=bool).copy()
+                    act_hi_step = np.asarray(act_hi, dtype=bool).copy()
+                    active_step = np.asarray(active, dtype=bool).copy()
+                    rhs_step = np.asarray(rhs, dtype=float).copy()
+                    A_mod_step = A_mod
+                    block_trace = os.getenv("PYCUTFEM_VI_TRACE_BLOCKING", "").lower() in {"1", "true", "yes"}
+                    for block_it in range(max_block):
+                        alpha_block, block_lo, block_hi = self._vi_blocking_step_data(
+                            x_red,
+                            S_red,
+                            lo_red,
+                            hi_red,
+                            active_mask=active_step,
+                        )
+                        new_lo = np.asarray(block_lo, dtype=bool) & (~act_lo_step)
+                        new_hi = np.asarray(block_hi, dtype=bool) & (~act_hi_step)
+                        if float(alpha_block) >= trigger_alpha or not np.any(new_lo | new_hi):
+                            break
+                        act_lo_step |= new_lo
+                        act_hi_step |= new_hi
+                        active_step = np.asarray(act_lo_step | act_hi_step, dtype=bool)
+                        rhs_step = (-stat_red_lin).astype(float, copy=True)
+                        rhs_step[act_lo_step] = lo_red[act_lo_step] - x_red[act_lo_step]
+                        rhs_step[act_hi_step] = hi_red[act_hi_step] - x_red[act_hi_step]
+                        A_mod_step_x = self._apply_identity_rows(A_red, np.flatnonzero(active_step))
+                        A_mod_step = self._vi_scale_matrix_cols(A_mod_step_x, col_scale_red)
+                        A_work, reg_diag = self._vi_apply_inactive_regularization(A_mod_step, A_red_step, active_step, lam)
+                        rhs_step_work = np.asarray(rhs_step, dtype=float).copy()
+                        ptc_sigma = float(getattr(self, "_vi_ptc_sigma_current", 0.0) or 0.0)
+                        ptc_diag = np.zeros(np.asarray(x_red, dtype=float).shape, dtype=float)
+                        if (
+                            ptc_sigma > 0.0
+                            and np.any(ptc_mask)
+                            and bool(getattr(self.vi_params, "ptc_freeze_complement", True))
+                        ):
+                            A_work, rhs_step_work = self._vi_apply_selected_field_freeze(A_work, rhs_step_work, ptc_mask)
+                        if ptc_sigma > 0.0 and np.any(ptc_mask):
+                            A_work, ptc_diag = self._vi_apply_ptc_regularization(
+                                A_work,
+                                A_red_step,
+                                ptc_mask,
+                                ptc_sigma,
+                            )
+                        field_prox_lam = float(getattr(self, "_vi_field_prox_lambda_current", 0.0) or 0.0)
+                        field_prox_diag = np.zeros(np.asarray(x_red, dtype=float).shape, dtype=float)
+                        if field_prox_lam > 0.0 and np.any(prox_mask):
+                            A_work, field_prox_diag = self._vi_apply_field_proximal(
+                                A_work,
+                                A_red_step,
+                                prox_mask,
+                                field_prox_lam,
+                            )
+                        A_work_aug, rhs_work_aug = self._vi_build_augmented_system(
+                            A_work, rhs_step_work, active_step, eq_data, eq_res,
+                            row_scale_red=row_scale_red,
+                            col_scale_red=col_scale_red,
+                            x_block_col_scaled=True,
+                        )
+                        try:
+                            t_lin = time.perf_counter()
+                            step_aug = self._solve_linear_system_with_context(
+                                A_work_aug,
+                                rhs_work_aug,
+                                context="vi_augmented",
+                            )
+                            lin_time += time.perf_counter() - t_lin
+                        except RuntimeError:
+                            raise
+                        S_red, S_lam_eq = self._vi_split_augmented_step(
+                            step_aug, eq_data, col_scale_red=col_scale_red
+                        )
+                        if block_trace:
+                            print(
+                                f"        [vi-block] it={block_it+1} alpha_cap={float(alpha_block):.2e} "
+                                f"new_lo={int(np.count_nonzero(new_lo))} new_hi={int(np.count_nonzero(new_hi))} "
+                                f"nA={int(np.count_nonzero(active_step))}"
+                            )
+                    active = np.asarray(active_step, dtype=bool)
+                    act_lo = np.asarray(act_lo_step, dtype=bool)
+                    act_hi = np.asarray(act_hi_step, dtype=bool)
+                    rhs = np.asarray(rhs_step, dtype=float)
+                    A_mod = A_mod_step
+                    strong_active = self._vi_strong_active_mask(x_red, stat_red, lo_red, hi_red, act_lo, act_hi, c_red)
+
+                if bool(getattr(self.np, "line_search", True)):
+                    t_ls = time.perf_counter()
+                    try:
+                        used_anderson = False
+                        if (
+                            not use_external_vi
+                            and self._vi_should_try_anderson(
+                                metrics=metrics0,
+                                active_stable_count=int(active_stable_count),
+                                changed=int(changed),
+                            )
+                        ):
+                            aa_candidate = self._vi_build_anderson_candidate(
+                                x_curr=x_red,
+                                lambda_curr=lambda_iter0,
+                                x_proposed=np.asarray(x_red, dtype=float) + np.asarray(S_red, dtype=float),
+                                lambda_proposed=np.asarray(lambda_iter0, dtype=float) + np.asarray(S_lam_eq, dtype=float),
+                            )
+                            if aa_candidate is not None:
+                                aa_step, aa_lambda_target = aa_candidate
+                                try:
+                                    S_red, lambda_next = self._line_search_vi_reduced(
+                                        A_red=A_red_raw,
+                                        row_scale_red=row_scale_red,
+                                        x0_red=x_red,
+                                        R0_red=R_red_raw,
+                                        G0=G_red,
+                                        eq0_res=eq_res,
+                                        act_lo0=act_lo,
+                                        act_hi0=act_hi,
+                                        lambda0_eq=lambda_iter0,
+                                        S_red=aa_step,
+                                        S_lam_eq=np.asarray(aa_lambda_target, dtype=float) - np.asarray(lambda_iter0, dtype=float),
+                                        c_red=c_red,
+                                        eq_data=eq_data,
+                                        strong_active_mask=strong_active,
+                                        active_delta_ref=max(changed, 0),
+                                        active_mask=active,
+                                        funcs=funcs,
+                                        coeffs=current,
+                                        bcs_now=bcs_now,
+                                        lo_red=lo_red,
+                                        hi_red=hi_red,
+                                        eq_prepare_callback=eq_prepare_callback,
+                                        active_stable_count=int(active_stable_count),
+                                        merit_history=tuple(merit_history),
+                                    )
+                                    used_anderson = True
+                                    if os.getenv("PYCUTFEM_VI_TRACE_AA", "").lower() in {"1", "true", "yes"}:
+                                        print(
+                                            f"        [vi-aa] accepted Anderson mixed candidate with m={len(list(getattr(self, '_vi_anderson_history', []) or [])) + 1}"
+                                        )
+                                except RuntimeError as aa_exc:
+                                    if os.getenv("PYCUTFEM_VI_TRACE_AA", "").lower() in {"1", "true", "yes"}:
+                                        print(f"        [vi-aa] candidate rejected: {aa_exc}")
+                        if not used_anderson:
+                            S_red, lambda_next = self._line_search_vi_reduced(
+                                A_red=A_red_raw,
+                                row_scale_red=row_scale_red,
+                                x0_red=x_red,
+                                R0_red=R_red_raw,
+                                G0=G_red,
+                                eq0_res=eq_res,
+                                act_lo0=act_lo,
+                                act_hi0=act_hi,
+                                lambda0_eq=self._vi_eq_lambda_current,
+                                S_red=S_red,
+                                S_lam_eq=S_lam_eq,
+                                c_red=c_red,
+                                eq_data=eq_data,
+                                strong_active_mask=strong_active,
+                                active_delta_ref=max(changed, 0),
+                                active_mask=active,
+                                funcs=funcs,
+                                coeffs=current,
+                                bcs_now=bcs_now,
+                                lo_red=lo_red,
+                                hi_red=hi_red,
+                                eq_prepare_callback=eq_prepare_callback,
+                                active_stable_count=int(active_stable_count),
+                                merit_history=tuple(merit_history),
+                            )
+                        ls_time += time.perf_counter() - t_ls
+                        break
+                    except RuntimeError as exc:
+                        ls_time += time.perf_counter() - t_ls
+                        ls_msg = str(exc)
+                        relaxed_g = float(getattr(self.vi_params, "relaxed_filter_accept_ginf", 0.0) or 0.0)
+                        tol_accept = accept_factor * max(tol_eff, 1.0e-30) if accept_factor > 0.0 else 0.0
+                        ls_factor_ok = tol_accept > 0.0 and float(metrics0["G_inf"]) <= tol_accept
+                        ls_relaxed_ok = relaxed_g > 0.0 and float(metrics0["G_inf"]) <= relaxed_g
+                        if "Line search failed" in ls_msg and (ls_factor_ok or ls_relaxed_ok):
+                            if ls_factor_ok:
+                                why = f"{accept_factor:g}·tol_eff (tol_eff={float(tol_eff):.3e})"
+                            else:
+                                why = f"relaxed_filter_accept_ginf={relaxed_g:.3e}"
+                            print(
+                                f"        [vi-ls] accepting current iterate after line-search failure since "
+                                f"|G|_∞={float(metrics0['G_inf']):.3e} <= {why}."
+                            )
+                            self._last_nonlinear_reason = 2
+                            self._last_nonlinear_accepted = True
+                            self._last_nonlinear_relaxed_accept = True
+                            self._vi_eq_lambda_accepted = np.asarray(self._vi_eq_lambda_current, dtype=float).copy()
+                            delta = np.hstack([f.nodal_values - f_prev.nodal_values for f, f_prev in zip(funcs, prev_funcs)])
+                            return delta, True, it + 1
+                        ptc_fields = tuple(getattr(self.vi_params, "ptc_fields", ()) or ())
+                        ptc_mask = self._vi_selected_field_mask(ptc_fields)
+                        if (
+                            not use_external_vi
+                            and np.any(ptc_mask)
+                            and self._vi_should_try_ptc_recovery(
+                                metrics=metrics0,
+                                active_stable_count=int(active_stable_count),
+                            )
+                        ):
+                            ptc_sigma0 = max(float(getattr(self.vi_params, "ptc_sigma0", 1.0e-2) or 1.0e-2), 0.0)
+                            ptc_sigma_max = max(
+                                ptc_sigma0,
+                                float(getattr(self.vi_params, "ptc_sigma_max", 1.0e6) or 1.0e6),
+                            )
+                            ptc_growth = max(float(getattr(self.vi_params, "ptc_growth", 5.0) or 5.0), 1.0)
+                            cur_sigma = max(
+                                float(getattr(self, "_vi_ptc_sigma_current", 0.0) or 0.0),
+                                ptc_sigma0,
+                            )
+                            if 0.0 < cur_sigma < ptc_sigma_max:
+                                self._vi_ptc_sigma_current = min(ptc_sigma_max, cur_sigma * ptc_growth)
+                                if os.getenv("PYCUTFEM_VI_TRACE_PTC", "").lower() in {"1", "true", "yes"}:
+                                    print(
+                                        f"        [vi-ptc] retry after line-search failure: σ->{self._vi_ptc_sigma_current:.2e}"
+                                    )
+                                continue
+                        prox_fields = tuple(getattr(self.vi_params, "field_proximal_recovery_fields", ()) or ())
+                        prox_mask = self._vi_selected_field_mask(prox_fields)
+                        if (
+                            not use_external_vi
+                            and np.any(prox_mask)
+                            and self._vi_should_try_field_proximal_recovery(
+                                metrics=metrics0,
+                                active_stable_count=int(active_stable_count),
+                            )
+                        ):
+                            prox_lam = max(
+                                float(getattr(self.vi_params, "field_proximal_recovery_lambda0", 1.0e-3) or 1.0e-3),
+                                0.0,
+                            )
+                            prox_lam_max = max(
+                                prox_lam,
+                                float(getattr(self.vi_params, "field_proximal_recovery_lambda_max", 1.0e6) or 1.0e6),
+                            )
+                            prox_growth = max(
+                                float(getattr(self.vi_params, "field_proximal_recovery_growth", 10.0) or 10.0),
+                                1.0,
+                            )
+                            prox_max_tries = max(
+                                1,
+                                int(getattr(self.vi_params, "field_proximal_recovery_max_tries", 6) or 6),
+                            )
+                            prox_trace = os.getenv("PYCUTFEM_VI_TRACE_PROX", "").lower() in {"1", "true", "yes"}
+                            prox_used = False
+                            prox_attempts = 0
+                            while prox_attempts < prox_max_tries and prox_lam > 0.0:
+                                prox_attempts += 1
+                                try:
+                                    A_prox, prox_diag = self._vi_apply_field_proximal(A_mod, A_red_step, prox_mask, prox_lam)
+                                    A_prox_aug, rhs_prox_aug = self._vi_build_augmented_system(
+                                        A_prox,
+                                        rhs,
+                                        active,
+                                        eq_data,
+                                        eq_res,
+                                        row_scale_red=row_scale_red,
+                                        col_scale_red=col_scale_red,
+                                        x_block_col_scaled=True,
+                                    )
+                                    t_lin = time.perf_counter()
+                                    step_prox_aug = self._solve_linear_system_with_context(
+                                        A_prox_aug,
+                                        rhs_prox_aug,
+                                        context="vi_augmented",
+                                    )
+                                    lin_time += time.perf_counter() - t_lin
+                                    step_prox_red, step_prox_eq = self._vi_split_augmented_step(
+                                        step_prox_aug,
+                                        eq_data,
+                                        col_scale_red=col_scale_red,
+                                    )
+                                except RuntimeError as prox_exc:
+                                    if prox_trace:
+                                        print(
+                                            f"        [vi-prox] try={prox_attempts} λ={prox_lam:.2e} "
+                                            f"linear solve failed: {prox_exc}"
+                                        )
+                                    if prox_lam >= prox_lam_max:
+                                        break
+                                    prox_lam = min(prox_lam_max, max(prox_lam, 1.0e-30) * prox_growth)
+                                    continue
+                                t_ls_prox = time.perf_counter()
+                                try:
+                                    S_red, lambda_next = self._line_search_vi_reduced(
+                                        A_red=A_red_raw,
+                                        row_scale_red=row_scale_red,
+                                        x0_red=x_red,
+                                        R0_red=R_red_raw,
+                                        G0=G_red,
+                                        eq0_res=eq_res,
+                                        act_lo0=act_lo,
+                                        act_hi0=act_hi,
+                                        lambda0_eq=self._vi_eq_lambda_current,
+                                        S_red=step_prox_red,
+                                        S_lam_eq=step_prox_eq,
+                                        c_red=c_red,
+                                        eq_data=eq_data,
+                                        strong_active_mask=strong_active,
+                                        active_delta_ref=max(changed, 0),
+                                        active_mask=active,
+                                        funcs=funcs,
+                                        coeffs=current,
+                                        bcs_now=bcs_now,
+                                        lo_red=lo_red,
+                                        hi_red=hi_red,
+                                        eq_prepare_callback=eq_prepare_callback,
+                                        active_stable_count=int(active_stable_count),
+                                        merit_history=tuple(merit_history),
+                                    )
+                                    ls_time += time.perf_counter() - t_ls_prox
+                                    prox_used = True
+                                    if prox_trace:
+                                        print(
+                                            f"        [vi-prox] accepted try={prox_attempts} λ={prox_lam:.2e} "
+                                            f"diag∞={float(np.max(prox_diag)):.2e}"
+                                        )
+                                    break
+                                except RuntimeError as prox_exc:
+                                    ls_time += time.perf_counter() - t_ls_prox
+                                    if prox_trace:
+                                        print(
+                                            f"        [vi-prox] try={prox_attempts} λ={prox_lam:.2e} "
+                                            f"line search failed: {prox_exc}"
+                                        )
+                                    if prox_lam >= prox_lam_max:
+                                        break
+                                    prox_lam = min(prox_lam_max, max(prox_lam, 1.0e-30) * prox_growth)
+                            if prox_used:
+                                break
+                        if use_external_vi:
+                            raise
+                        lam_max = float(getattr(self.vi_params, "inactive_reg_lambda_max", 1.0e6) or 1.0e6)
+                        lam_growth = float(getattr(self.vi_params, "inactive_reg_growth", 5.0) or 5.0)
+                        lam0 = float(getattr(self.vi_params, "inactive_reg_lambda0", 0.0) or 0.0)
+                        if lam < lam_max and (lam > 0.0 or lam0 > 0.0):
+                            lam = max(lam, lam0)
+                            lam = min(lam_max, lam * lam_growth if lam > 0.0 else lam0)
+                            reg_retries += 1
+                            if os.getenv("PYCUTFEM_VI_TRACE_REG", "").lower() in {"1", "true", "yes"}:
+                                print(f"        [vi-reg] retry={reg_retries}  λ->{lam:.2e}  diag∞={float(np.max(reg_diag)):.2e}")
+                            continue
+                        raise
+                else:
+                    alpha_direct = self._vi_feasible_step_alpha_cap(
+                        x_red,
+                        S_red,
+                        lo_red,
+                        hi_red,
+                        active_mask=active,
+                    )
+                    S_red = float(alpha_direct) * np.asarray(S_red, dtype=float)
+                    S_lam_eq = float(alpha_direct) * np.asarray(S_lam_eq, dtype=float)
+                    lambda_next = np.asarray(self._vi_eq_lambda_current, dtype=float) + np.asarray(S_lam_eq, dtype=float)
+                    self._ls_alpha_prev = float(alpha_direct)
+                    break
+            self._vi_lambda_current = float(lam)
+            self._vi_eq_lambda_current = np.asarray(lambda_next, dtype=float).copy()
+            self._vi_last_retry_count = int(reg_retries)
+            accepted_alpha = float(getattr(self, "_ls_alpha_prev", 1.0) or 1.0)
+            accepted_metrics = dict(getattr(self, "_vi_last_metrics", None) or metrics0)
+            merit_ratio = float(accepted_metrics.get("merit", metrics0["merit"])) / max(float(metrics0["merit"]), 1.0e-30)
+            accepted_g_ratio = float(accepted_metrics.get("G_inf", metrics0["G_inf"])) / max(
+                float(metrics0["G_inf"]),
+                1.0e-30,
+            )
+            self._vi_last_accepted_alpha = float(accepted_alpha)
+            self._vi_last_accepted_merit_ratio = float(merit_ratio)
+            self._vi_last_accepted_g_ratio = float(accepted_g_ratio)
+
+            # Apply the accepted step.
+            dU_full = self.restrictor.expand_vec(S_red)
+            if not np.all(np.isfinite(dU_full)):
+                raise RuntimeError("Accepted semismooth Newton step expanded to non-finite full increment.")
+            dh.add_to_functions(dU_full, funcs)
+            dh.apply_bcs(bcs_now, *funcs)
+            if getattr(self, "constraints", None) is not None:
+                self._enforce_constraints_on_functions(funcs)
+            if bool(getattr(self.vi_params, "project_each_iteration", True)):
+                self._project_funcs_to_bounds(
+                    funcs,
+                    bcs_now,
+                    lo_red,
+                    hi_red,
+                    eq_data=eq_data,
+                    eq_prepare_callback=eq_prepare_callback,
+                )
+            if self.post_cb is not None:
+                self.post_cb(funcs)
+            if getattr(self, "constraints", None) is not None:
+                self._enforce_constraints_on_functions(funcs)
+            self._assert_functions_finite(funcs, context="after accepted semismooth Newton step")
+            x_acc = self._pack_reduced_iterate(funcs)
+            _, R_acc_raw = self._assemble_system_reduced(current, need_matrix=False)
+            stat_acc = self._vi_stationarity_residual(
+                np.asarray(R_acc_raw, dtype=float),
+                eq_data,
+                self._vi_eq_lambda_current,
+            )
+            base_state = self._vi_state_from_sets(act_lo, act_hi)
+            carry_state = self._vi_rebuild_carried_state_from_endpoint(
+                x_red=x_acc,
+                stationarity_red=stat_acc,
+                lo_red=lo_red,
+                hi_red=hi_red,
+                c_red=c_red,
+                state_base=base_state,
+            )
+            self._vi_commit_carried_state(carry_state)
+            self._vi_update_field_proximal_after_accept(
+                prox_mask=prox_mask,
+                metrics=metrics0,
+                active_stable_count=int(active_stable_count),
+                changed=int(changed),
+                accepted_alpha=float(accepted_alpha),
+                merit_ratio=float(merit_ratio),
+                accepted_g_ratio=float(accepted_g_ratio),
+            )
+            self._vi_update_ptc_after_accept(
+                ptc_mask=ptc_mask,
+                metrics=metrics0,
+                active_stable_count=int(active_stable_count),
+                changed=int(changed),
+                accepted_alpha=float(accepted_alpha),
+                merit_ratio=float(merit_ratio),
+                accepted_g_ratio=float(accepted_g_ratio),
+            )
+            if self._vi_should_arm_working_set_guard_after_accept(
+                metrics=metrics0,
+                active_stable_count=int(active_stable_count),
+                changed=int(changed),
+                accepted_alpha=float(accepted_alpha),
+                merit_ratio=float(merit_ratio),
+                accepted_g_ratio=float(accepted_g_ratio),
+            ):
+                self._vi_arm_working_set_guard(carry_state)
+            self._vi_record_anderson_history(
+                x_prev=x_red,
+                lambda_prev=lambda_iter0,
+                x_next=x_acc,
+                lambda_next=np.asarray(self._vi_eq_lambda_current, dtype=float),
+            )
+            accepted_norm_G = float(accepted_metrics.get("G_inf", metrics0["G_inf"]))
+            relaxed_why = _vi_relaxed_accept_reason(
+                norm_G=float(accepted_norm_G),
+                accept_factor=float(accept_factor),
+                atol=float(atol),
+                relaxed_g=float(getattr(self.vi_params, "relaxed_filter_accept_ginf", 0.0) or 0.0),
+            )
+            if relaxed_why is not None:
+                print(
+                    f"        [vi-accept] accepting current iterate since |G|_∞={float(accepted_norm_G):.3e} "
+                    f"<= {relaxed_why}."
+                )
+                self._last_nonlinear_norm = float(accepted_norm_G)
+                self._last_nonlinear_norm_label = "|G|_∞"
+                self._last_nonlinear_reason = 2
+                self._last_nonlinear_accepted = True
+                self._last_nonlinear_relaxed_accept = True
+                self._vi_eq_lambda_accepted = np.asarray(self._vi_eq_lambda_current, dtype=float).copy()
+                delta = np.hstack([f.nodal_values - f_prev.nodal_values for f, f_prev in zip(funcs, prev_funcs)])
+                return delta, True, it + 1
+
+            lam0 = float(getattr(self.vi_params, "inactive_reg_lambda0", 0.0) or 0.0)
+            lam_max = float(getattr(self.vi_params, "inactive_reg_lambda_max", 1.0e6) or 1.0e6)
+            lam_growth = float(getattr(self.vi_params, "inactive_reg_growth", 5.0) or 5.0)
+            if self._vi_should_grow_inactive_regularization(
+                accepted_alpha=accepted_alpha,
+                merit_ratio=merit_ratio,
+                accepted_metrics=accepted_metrics,
+                current_lambda=float(self._vi_lambda_current),
+            ):
+                self._vi_lambda_current = min(lam_max, max(self._vi_lambda_current, lam0) * lam_growth)
+                if os.getenv("PYCUTFEM_VI_TRACE_REG", "").lower() in {"1", "true", "yes"}:
+                    print(f"        [vi-reg] accepted-stall  alpha={accepted_alpha:.2e}  merit_ratio={merit_ratio:.3f}  λ->{self._vi_lambda_current:.2e}")
+            elif accepted_alpha >= 0.999 and reg_retries == 0:
+                lam_decay = float(getattr(self.vi_params, "inactive_reg_decay", 0.5) or 0.5)
+                if 0.0 < lam_decay < 1.0:
+                    self._vi_lambda_current *= lam_decay
+                    if self._vi_lambda_current < lam0:
+                        self._vi_lambda_current = lam0
+
+            print(f"          timings: solve={lin_time:.2e}s, line-search={ls_time:.2e}s, alpha={accepted_alpha:.2e}, merit_ratio={merit_ratio:.3f}")
+
+        final_why = _vi_relaxed_accept_reason(
+            norm_G=float(last_norm_G),
+            accept_factor=float(accept_factor),
+            atol=float(atol),
+            relaxed_g=float(getattr(self.vi_params, "relaxed_filter_accept_ginf", 0.0) or 0.0),
+        )
+        if final_why is not None:
+            print(
+                f"    [warn] Accepting VI Newton best iterate since |G|_∞={last_norm_G:.3e} "
+                f"≤ {final_why}."
+            )
+            self._last_nonlinear_norm = float(last_norm_G)
+            self._last_nonlinear_norm_label = "|G|_∞"
+            self._last_nonlinear_reason = 2
+            self._last_nonlinear_accepted = True
+            self._last_nonlinear_relaxed_accept = True
+            self._vi_eq_lambda_accepted = np.asarray(self._vi_eq_lambda_current, dtype=float).copy()
+            delta = np.hstack([f.nodal_values - f_prev.nodal_values for f, f_prev in zip(funcs, prev_funcs)])
+            return delta, True, int(last_it)
+
+        raise RuntimeError("VI Newton did not converge – adjust tolerances/Δt or verify Jacobian.")
+
+
+class InteriorPointNewtonSolver(PdasNewtonSolver):
+    """
+    Internal primal-dual interior-point Newton solver for box constraints plus
+    optional linear equalities.
+
+    The primal variables remain the physical reduced DOFs. Bounds are enforced
+    through strictly positive slacks/multipliers and a barrier homotopy instead
+    of active-set switching.
+    """
+
+    def __init__(self, *args, vi_params: VIParameters = VIParameters(), **kwargs):
+        super().__init__(*args, vi_params=vi_params, **kwargs)
+        self._ipm_z_lo_current: np.ndarray | None = None
+        self._ipm_z_hi_current: np.ndarray | None = None
+        self._ipm_forced_state: dict[str, np.ndarray | float] | None = None
+        self._ipm_mu_current: float = max(
+            float(getattr(self.vi_params, "interior_point_mu0", 1.0e-2) or 1.0e-2),
+            0.0,
+        )
+
+    @staticmethod
+    def _ipm_bound_masks(lo_red: np.ndarray, hi_red: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        return np.isfinite(np.asarray(lo_red, dtype=float)), np.isfinite(np.asarray(hi_red, dtype=float))
+
+    def _ipm_write_reduced_iterate(self, funcs: list, bcs_now, x_target_red: np.ndarray) -> None:
+        x_curr_red = self._pack_reduced_iterate(funcs)
+        d_red = np.asarray(x_target_red, dtype=float).ravel() - np.asarray(x_curr_red, dtype=float).ravel()
+        if not np.any(d_red):
+            return
+        d_full = self.restrictor.expand_vec(d_red)
+        self.dh.add_to_functions(d_full, funcs)
+        self.dh.apply_bcs(bcs_now, *funcs)
+        if getattr(self, "constraints", None) is not None:
+            self._enforce_constraints_on_functions(funcs)
+
+    def _ipm_push_strictly_interior(
+        self,
+        *,
+        x_red: np.ndarray,
+        lo_red: np.ndarray,
+        hi_red: np.ndarray,
+        eq_data: _PreparedLinearEqualities,
+    ) -> np.ndarray:
+        x_work = np.minimum(np.maximum(np.asarray(x_red, dtype=float), np.asarray(lo_red, dtype=float)), np.asarray(hi_red, dtype=float))
+        push0 = max(float(getattr(self.vi_params, "interior_point_initial_push", 1.0e-8) or 1.0e-8), 1.0e-14)
+        lo_mask, hi_mask = self._ipm_bound_masks(lo_red, hi_red)
+        if not np.any(lo_mask | hi_mask):
+            return x_work.copy()
+
+        push = float(push0)
+        for _ in range(10):
+            lo_tight = np.asarray(lo_red, dtype=float).copy()
+            hi_tight = np.asarray(hi_red, dtype=float).copy()
+
+            both = lo_mask & hi_mask
+            if np.any(both):
+                width = np.maximum(np.asarray(hi_red[both] - lo_red[both], dtype=float), 1.0)
+                lo_tight[both] = np.asarray(lo_red[both], dtype=float) + push * width
+                hi_tight[both] = np.asarray(hi_red[both], dtype=float) - push * width
+                if np.any(lo_tight[both] >= hi_tight[both]):
+                    push *= 0.1
+                    continue
+
+            lo_only = lo_mask & (~hi_mask)
+            if np.any(lo_only):
+                scale = np.maximum(np.abs(np.asarray(x_work[lo_only], dtype=float)), 1.0)
+                lo_tight[lo_only] = np.asarray(lo_red[lo_only], dtype=float) + push * scale
+
+            hi_only = hi_mask & (~lo_mask)
+            if np.any(hi_only):
+                scale = np.maximum(np.abs(np.asarray(x_work[hi_only], dtype=float)), 1.0)
+                hi_tight[hi_only] = np.asarray(hi_red[hi_only], dtype=float) - push * scale
+
+            try:
+                if int(eq_data.B_red.shape[0]) > 0:
+                    x_try = self._project_box_with_prepared_equalities(
+                        x=x_work,
+                        lo=lo_tight,
+                        hi=hi_tight,
+                        eq_data=eq_data,
+                        tol=max(1.0e-14, 0.1 * push),
+                    )
+                else:
+                    x_try = np.minimum(np.maximum(x_work, lo_tight), hi_tight)
+            except Exception:
+                push *= 0.1
+                continue
+
+            strict_tol = max(1.0e-14, 0.25 * push)
+            ok_lo = (not np.any(lo_mask)) or bool(np.all(np.asarray(x_try[lo_mask] - lo_red[lo_mask], dtype=float) > strict_tol))
+            ok_hi = (not np.any(hi_mask)) or bool(np.all(np.asarray(hi_red[hi_mask] - x_try[hi_mask], dtype=float) > strict_tol))
+            if ok_lo and ok_hi:
+                return np.asarray(x_try, dtype=float).copy()
+            x_work = np.asarray(x_try, dtype=float).copy()
+            push *= 0.1
+
+        raise RuntimeError("Interior-point initialization could not find a strictly interior feasible point.")
+
+    def _ipm_initialize_duals(
+        self,
+        *,
+        x_red: np.ndarray,
+        stationarity_red: np.ndarray,
+        lo_red: np.ndarray,
+        hi_red: np.ndarray,
+        mu: float,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        x_red = np.asarray(x_red, dtype=float).ravel()
+        stat = np.asarray(stationarity_red, dtype=float).ravel()
+        lo_mask, hi_mask = self._ipm_bound_masks(lo_red, hi_red)
+        shift = max(float(getattr(self.vi_params, "interior_point_initial_push", 1.0e-8) or 1.0e-8), 1.0e-12)
+        mu_use = max(float(mu), shift)
+        slack_lo = np.zeros(x_red.shape, dtype=float)
+        slack_hi = np.zeros(x_red.shape, dtype=float)
+        if np.any(lo_mask):
+            slack_lo[lo_mask] = np.maximum(np.asarray(x_red[lo_mask] - lo_red[lo_mask], dtype=float), shift)
+        if np.any(hi_mask):
+            slack_hi[hi_mask] = np.maximum(np.asarray(hi_red[hi_mask] - x_red[hi_mask], dtype=float), shift)
+        z_lo = np.zeros(x_red.shape, dtype=float)
+        z_hi = np.zeros(x_red.shape, dtype=float)
+        weight_dual = 1.0
+        for i in range(int(x_red.size)):
+            has_lo = bool(lo_mask[i])
+            has_hi = bool(hi_mask[i])
+            if not has_lo and not has_hi:
+                continue
+            a = float(slack_lo[i]) if has_lo else 0.0
+            b = float(slack_hi[i]) if has_hi else 0.0
+            s = float(stat[i])
+
+            if has_lo and has_hi:
+                m11 = weight_dual + a * a
+                m22 = weight_dual + b * b
+                det = m11 * m22 - weight_dual * weight_dual
+                if det <= 1.0e-30 or not np.isfinite(det):
+                    z_lo_i = max(mu_use / max(a, shift), shift)
+                    z_hi_i = max(mu_use / max(b, shift), shift)
+                else:
+                    rhs1 = weight_dual * s + a * mu_use
+                    rhs2 = -weight_dual * s + b * mu_use
+                    z_lo_i = (m22 * rhs1 + weight_dual * rhs2) / det
+                    z_hi_i = (weight_dual * rhs1 + m11 * rhs2) / det
+                z_lo[i] = max(float(z_lo_i), shift)
+                z_hi[i] = max(float(z_hi_i), shift)
+                continue
+
+            if has_lo:
+                denom = weight_dual + a * a
+                rhs = weight_dual * s + a * mu_use
+                z_lo[i] = max(float(rhs / max(denom, 1.0e-30)), shift)
+                continue
+
+            denom = weight_dual + b * b
+            rhs = -weight_dual * s + b * mu_use
+            z_hi[i] = max(float(rhs / max(denom, 1.0e-30)), shift)
+        return z_lo, z_hi
+
+    def _ipm_residual_data(
+        self,
+        *,
+        x_red: np.ndarray,
+        R_red: np.ndarray,
+        lo_red: np.ndarray,
+        hi_red: np.ndarray,
+        eq_data: _PreparedLinearEqualities,
+        lambda_eq: np.ndarray,
+        z_lo: np.ndarray,
+        z_hi: np.ndarray,
+        mu: float,
+    ) -> dict[str, np.ndarray | float]:
+        x_red = np.asarray(x_red, dtype=float).ravel()
+        R_red = np.asarray(R_red, dtype=float).ravel()
+        z_lo = np.asarray(z_lo, dtype=float).ravel()
+        z_hi = np.asarray(z_hi, dtype=float).ravel()
+        lo_red = np.asarray(lo_red, dtype=float).ravel()
+        hi_red = np.asarray(hi_red, dtype=float).ravel()
+        lo_mask, hi_mask = self._ipm_bound_masks(lo_red, hi_red)
+
+        stationarity_red = self._vi_stationarity_residual(R_red, eq_data, lambda_eq)
+        slack_lo = np.zeros(x_red.shape, dtype=float)
+        slack_hi = np.zeros(x_red.shape, dtype=float)
+        if np.any(lo_mask):
+            slack_lo[lo_mask] = np.asarray(x_red[lo_mask] - lo_red[lo_mask], dtype=float)
+        if np.any(hi_mask):
+            slack_hi[hi_mask] = np.asarray(hi_red[hi_mask] - x_red[hi_mask], dtype=float)
+
+        dual_red = np.asarray(stationarity_red, dtype=float).copy()
+        dual_red -= np.where(lo_mask, z_lo, 0.0)
+        dual_red += np.where(hi_mask, z_hi, 0.0)
+
+        eq_res = self._vi_equality_residual(x_red, eq_data)
+        cent_lo = np.asarray(slack_lo[lo_mask] * z_lo[lo_mask] - float(mu), dtype=float) if np.any(lo_mask) else np.zeros((0,), dtype=float)
+        cent_hi = np.asarray(slack_hi[hi_mask] * z_hi[hi_mask] - float(mu), dtype=float) if np.any(hi_mask) else np.zeros((0,), dtype=float)
+        box_lo = np.maximum(np.asarray(lo_red - x_red, dtype=float), 0.0)
+        box_hi = np.maximum(np.asarray(x_red - hi_red, dtype=float), 0.0)
+        zneg_lo = np.maximum(-np.asarray(z_lo[lo_mask], dtype=float), 0.0) if np.any(lo_mask) else np.zeros((0,), dtype=float)
+        zneg_hi = np.maximum(-np.asarray(z_hi[hi_mask], dtype=float), 0.0) if np.any(hi_mask) else np.zeros((0,), dtype=float)
+
+        residual_blocks = [dual_red]
+        if eq_res.size:
+            residual_blocks.append(eq_res)
+        if cent_lo.size:
+            residual_blocks.append(cent_lo)
+        if cent_hi.size:
+            residual_blocks.append(cent_hi)
+        if np.any(box_lo):
+            residual_blocks.append(box_lo)
+        if np.any(box_hi):
+            residual_blocks.append(box_hi)
+        if zneg_lo.size:
+            residual_blocks.append(zneg_lo)
+        if zneg_hi.size:
+            residual_blocks.append(zneg_hi)
+        residual_vec = np.concatenate(residual_blocks, axis=0) if residual_blocks else np.zeros((0,), dtype=float)
+        residual_norm_inf = float(np.linalg.norm(residual_vec, ord=np.inf)) if residual_vec.size else 0.0
+        residual_merit = 0.5 * float(residual_vec @ residual_vec)
+
+        return {
+            "stationarity": stationarity_red,
+            "dual": dual_red,
+            "eq": eq_res,
+            "slack_lo": slack_lo,
+            "slack_hi": slack_hi,
+            "cent_lo": cent_lo,
+            "cent_hi": cent_hi,
+            "box_lo": box_lo,
+            "box_hi": box_hi,
+            "residual_vec": residual_vec,
+            "G_inf": float(residual_norm_inf),
+            "merit": float(residual_merit),
+            "lo_mask": lo_mask,
+            "hi_mask": hi_mask,
+        }
+
+    def _ipm_metrics(
+        self,
+        *,
+        residual_data: dict[str, np.ndarray | float],
+        mu: float,
+        alpha_trial: float | None = None,
+    ) -> dict[str, float]:
+        dual_inf = float(np.linalg.norm(np.asarray(residual_data["dual"], dtype=float), ord=np.inf)) if np.asarray(residual_data["dual"], dtype=float).size else 0.0
+        eq_inf = float(np.linalg.norm(np.asarray(residual_data["eq"], dtype=float), ord=np.inf)) if np.asarray(residual_data["eq"], dtype=float).size else 0.0
+        box_lo_inf = float(np.linalg.norm(np.asarray(residual_data["box_lo"], dtype=float), ord=np.inf)) if np.asarray(residual_data["box_lo"], dtype=float).size else 0.0
+        box_hi_inf = float(np.linalg.norm(np.asarray(residual_data["box_hi"], dtype=float), ord=np.inf)) if np.asarray(residual_data["box_hi"], dtype=float).size else 0.0
+        cent_lo_inf = float(np.linalg.norm(np.asarray(residual_data["cent_lo"], dtype=float), ord=np.inf)) if np.asarray(residual_data["cent_lo"], dtype=float).size else 0.0
+        cent_hi_inf = float(np.linalg.norm(np.asarray(residual_data["cent_hi"], dtype=float), ord=np.inf)) if np.asarray(residual_data["cent_hi"], dtype=float).size else 0.0
+        stat_inf = float(np.linalg.norm(np.asarray(residual_data["dual"], dtype=float), ord=np.inf)) if np.asarray(residual_data["dual"], dtype=float).size else 0.0
+        slack_feas_inf = float(max(box_lo_inf, box_hi_inf))
+        return {
+            "G_inf": float(residual_data["G_inf"]),
+            "stationarity_inf": float(stat_inf),
+            "inactive_res_inf": float(dual_inf),
+            "slack_feas_inf": float(slack_feas_inf),
+            "active_gap_inf": float(slack_feas_inf),
+            "equality_inf": float(eq_inf),
+            "centrality_inf": float(max(cent_lo_inf, cent_hi_inf)),
+            "merit": float(residual_data["merit"]),
+            "G_half": float(np.sqrt(max(2.0 * float(residual_data["merit"]), 0.0))),
+            "delta_active": 0.0,
+            "soft_active": 0.0,
+            "mu": float(mu),
+            "alpha_trial": float(1.0 if alpha_trial is None else alpha_trial),
+        }
+
+    @staticmethod
+    def _ipm_filter_components(metrics: dict[str, float]) -> tuple[float, float]:
+        feas = max(
+            float(metrics.get("stationarity_inf", metrics.get("inactive_res_inf", 0.0))),
+            float(metrics.get("equality_inf", 0.0)),
+            float(metrics.get("slack_feas_inf", metrics.get("active_gap_inf", 0.0))),
+        )
+        cent = float(metrics.get("centrality_inf", 0.0))
+        return float(feas), float(cent)
+
+    @staticmethod
+    def _ipm_prune_filter_entries(entries: list[tuple[float, float]]) -> list[tuple[float, float]]:
+        if not entries:
+            return []
+        keep: list[tuple[float, float]] = []
+        for i, entry in enumerate(entries):
+            dominated = False
+            for j, other in enumerate(entries):
+                if i == j:
+                    continue
+                if (
+                    float(other[0]) <= float(entry[0]) + 1.0e-16
+                    and float(other[1]) <= float(entry[1]) + 1.0e-16
+                    and (
+                        float(other[0]) < float(entry[0]) - 1.0e-16
+                        or float(other[1]) < float(entry[1]) - 1.0e-16
+                    )
+                ):
+                    dominated = True
+                    break
+            if not dominated:
+                keep.append((float(entry[0]), float(entry[1])))
+        keep.sort(key=lambda item: (float(item[0]), float(item[1])))
+        return keep
+
+    def _ipm_register_filter_entry(
+        self,
+        entries: list[tuple[float, float]],
+        metrics: dict[str, float],
+    ) -> list[tuple[float, float]]:
+        next_entries = list(entries)
+        next_entries.append(self._ipm_filter_components(metrics))
+        next_entries = self._ipm_prune_filter_entries(next_entries)
+        max_entries = max(1, int(getattr(self.vi_params, "interior_point_filter_max_entries", 16) or 16))
+        if len(next_entries) > max_entries:
+            next_entries = next_entries[:max_entries]
+        return next_entries
+
+    def _ipm_filter_accepts(
+        self,
+        *,
+        metrics_trial: dict[str, float],
+        metrics_ref: dict[str, float],
+        filter_entries: list[tuple[float, float]],
+        alpha_trial: float,
+    ) -> tuple[bool, str]:
+        abs_floor = _vi_filter_abs_floor(self.vi_params)
+        slack_ok = float(metrics_trial.get("slack_feas_inf", metrics_trial["active_gap_inf"])) <= max(
+            _vi_filter_threshold(
+                base=float(metrics_ref.get("slack_feas_inf", metrics_ref["active_gap_inf"])),
+                growth=float(getattr(self.vi_params, "filter_max_gap_growth", 1.25) or 1.25),
+                abs_floor=abs_floor,
+            ),
+            abs_floor,
+        )
+        if not slack_ok:
+            return False, "slack_guard"
+        eq_ok = float(metrics_trial["equality_inf"]) <= max(
+            _vi_filter_threshold(
+                base=float(metrics_ref["equality_inf"]),
+                growth=float(getattr(self.vi_params, "filter_max_equality_growth", 1.25) or 1.25),
+                abs_floor=abs_floor,
+            ),
+            abs_floor,
+        )
+        if not eq_ok:
+            return False, "eq_guard"
+
+        gamma = max(float(getattr(self.vi_params, "interior_point_filter_margin", 1.0e-4) or 1.0e-4), 1.0e-8)
+        alpha_eff = max(float(alpha_trial), 1.0e-3)
+        trial_feas, trial_cent = self._ipm_filter_components(metrics_trial)
+        ref_feas, ref_cent = self._ipm_filter_components(metrics_ref)
+        feas_scale = max(float(ref_feas), abs_floor)
+        cent_scale = max(float(ref_cent), abs_floor)
+        feas_growth = float(
+            getattr(
+                self.vi_params,
+                "interior_point_filter_max_feas_growth",
+                getattr(self.vi_params, "filter_max_residual_growth", 1.25) or 1.25,
+            )
+            or 1.25
+        )
+        if float(ref_cent) > 10.0 * feas_scale:
+            feas_growth = max(float(feas_growth), 2.0)
+        feas_growth_limit = max(
+            _vi_filter_threshold(
+                base=float(ref_feas),
+                growth=float(feas_growth),
+                abs_floor=abs_floor,
+            ),
+            abs_floor,
+        )
+        improved_feas = float(trial_feas) <= max((1.0 - gamma * alpha_eff) * feas_scale, abs_floor)
+        improved_cent = float(trial_cent) <= max((1.0 - gamma * alpha_eff) * cent_scale, abs_floor)
+        if float(trial_feas) > float(feas_growth_limit) and not improved_feas:
+            return False, "feas_guard"
+        dominant_feas = feas_scale >= 2.0 * cent_scale
+        if dominant_feas and improved_cent and not improved_feas:
+            merit_ref = max(float(metrics_ref["merit"]), abs_floor)
+            merit_trial = float(metrics_trial["merit"])
+            if float(trial_feas) > 1.01 * feas_scale:
+                return False, "dominant_feas_guard"
+            if merit_trial > (1.0 - 0.25 * gamma * alpha_eff) * merit_ref:
+                return False, "dominant_feas_guard"
+
+        for entry_feas, entry_cent in filter_entries:
+            entry_feas_scale = max(float(entry_feas), abs_floor)
+            entry_cent_scale = max(float(entry_cent), abs_floor)
+            dominated = (
+                float(trial_feas) >= (1.0 - gamma * alpha_eff) * entry_feas_scale
+                and float(trial_cent) >= (1.0 - gamma * alpha_eff) * entry_cent_scale
+            )
+            if dominated:
+                return False, "filter_dominated"
+
+        if improved_feas and improved_cent:
+            return True, "filter_feas+cent"
+        if improved_feas:
+            return True, "filter_feas"
+        if improved_cent:
+            return True, "filter_cent"
+
+        merit_ref = max(float(metrics_ref["merit"]), abs_floor)
+        merit_trial = float(metrics_trial["merit"])
+        if (
+            merit_trial <= (1.0 - gamma * alpha_eff) * merit_ref
+            and float(trial_feas) <= 1.05 * feas_scale
+            and float(trial_cent) <= 1.05 * cent_scale
+        ):
+            return True, "filter_merit"
+        return False, "no_filter_improvement"
+
+    @staticmethod
+    def _ipm_slack_directions(
+        *,
+        dx_red: np.ndarray,
+        lo_mask: np.ndarray,
+        hi_mask: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        dx_red = np.asarray(dx_red, dtype=float).ravel()
+        ds_lo = np.zeros(dx_red.shape, dtype=float)
+        ds_hi = np.zeros(dx_red.shape, dtype=float)
+        if np.any(lo_mask):
+            ds_lo[lo_mask] = np.asarray(dx_red[lo_mask], dtype=float)
+        if np.any(hi_mask):
+            ds_hi[hi_mask] = -np.asarray(dx_red[hi_mask], dtype=float)
+        return ds_lo, ds_hi
+
+    @staticmethod
+    def _ipm_mean_complementarity(
+        *,
+        slack_lo: np.ndarray,
+        slack_hi: np.ndarray,
+        z_lo: np.ndarray,
+        z_hi: np.ndarray,
+        lo_mask: np.ndarray,
+        hi_mask: np.ndarray,
+    ) -> float:
+        comp_vals: list[np.ndarray] = []
+        if np.any(lo_mask):
+            comp_vals.append(np.asarray(slack_lo[lo_mask], dtype=float) * np.asarray(z_lo[lo_mask], dtype=float))
+        if np.any(hi_mask):
+            comp_vals.append(np.asarray(slack_hi[hi_mask], dtype=float) * np.asarray(z_hi[hi_mask], dtype=float))
+        if not comp_vals:
+            return 0.0
+        comp_concat = np.concatenate(comp_vals, axis=0)
+        if comp_concat.size == 0:
+            return 0.0
+        return float(np.mean(comp_concat))
+
+    def _ipm_multiplier_step(
+        self,
+        *,
+        dx_red: np.ndarray,
+        z_lo: np.ndarray,
+        z_hi: np.ndarray,
+        slack_lo: np.ndarray,
+        slack_hi: np.ndarray,
+        lo_mask: np.ndarray,
+        hi_mask: np.ndarray,
+        cent_lo_res: np.ndarray | None = None,
+        cent_hi_res: np.ndarray | None = None,
+        residual_data: dict[str, np.ndarray | float] | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        dx_red = np.asarray(dx_red, dtype=float).ravel()
+        z_lo = np.asarray(z_lo, dtype=float).ravel()
+        z_hi = np.asarray(z_hi, dtype=float).ravel()
+        slack_lo = np.asarray(slack_lo, dtype=float).ravel()
+        slack_hi = np.asarray(slack_hi, dtype=float).ravel()
+        dz_lo = np.zeros(dx_red.shape, dtype=float)
+        dz_hi = np.zeros(dx_red.shape, dtype=float)
+        if cent_lo_res is None:
+            if residual_data is None:
+                raise ValueError("residual_data is required when cent_lo_res is not provided.")
+            cent_lo_use = np.asarray(residual_data["cent_lo"], dtype=float)
+        else:
+            cent_lo_use = np.asarray(cent_lo_res, dtype=float)
+        if cent_hi_res is None:
+            if residual_data is None:
+                raise ValueError("residual_data is required when cent_hi_res is not provided.")
+            cent_hi_use = np.asarray(residual_data["cent_hi"], dtype=float)
+        else:
+            cent_hi_use = np.asarray(cent_hi_res, dtype=float)
+        if np.any(lo_mask):
+            dz_lo[lo_mask] = (
+                -cent_lo_use
+                - np.asarray(z_lo[lo_mask], dtype=float) * np.asarray(dx_red[lo_mask], dtype=float)
+            ) / np.maximum(np.asarray(slack_lo[lo_mask], dtype=float), 1.0e-300)
+        if np.any(hi_mask):
+            dz_hi[hi_mask] = (
+                -cent_hi_use
+                + np.asarray(z_hi[hi_mask], dtype=float) * np.asarray(dx_red[hi_mask], dtype=float)
+            ) / np.maximum(np.asarray(slack_hi[hi_mask], dtype=float), 1.0e-300)
+        return dz_lo, dz_hi
+
+    def _ipm_primal_dual_direction(
+        self,
+        *,
+        A_red,
+        eq_data: _PreparedLinearEqualities,
+        residual_data: dict[str, np.ndarray | float],
+        z_lo: np.ndarray,
+        z_hi: np.ndarray,
+        slack_lo: np.ndarray,
+        slack_hi: np.ndarray,
+        lo_mask: np.ndarray,
+        hi_mask: np.ndarray,
+        cent_lo_res: np.ndarray | None = None,
+        cent_hi_res: np.ndarray | None = None,
+        dual_rhs: np.ndarray | None = None,
+        eq_rhs: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
+        x_shape = np.asarray(z_lo, dtype=float).shape
+        rhs_red = -np.asarray(
+            np.asarray(residual_data["dual"], dtype=float) if dual_rhs is None else np.asarray(dual_rhs, dtype=float),
+            dtype=float,
+        ).copy()
+        diag_red = np.zeros(x_shape, dtype=float)
+        cent_lo_use = (
+            np.asarray(residual_data["cent_lo"], dtype=float)
+            if cent_lo_res is None
+            else np.asarray(cent_lo_res, dtype=float)
+        )
+        cent_hi_use = (
+            np.asarray(residual_data["cent_hi"], dtype=float)
+            if cent_hi_res is None
+            else np.asarray(cent_hi_res, dtype=float)
+        )
+        if np.any(lo_mask):
+            diag_red[lo_mask] += np.asarray(z_lo[lo_mask], dtype=float) / np.maximum(np.asarray(slack_lo[lo_mask], dtype=float), 1.0e-300)
+            rhs_red[lo_mask] += -cent_lo_use / np.maximum(np.asarray(slack_lo[lo_mask], dtype=float), 1.0e-300)
+        if np.any(hi_mask):
+            diag_red[hi_mask] += np.asarray(z_hi[hi_mask], dtype=float) / np.maximum(np.asarray(slack_hi[hi_mask], dtype=float), 1.0e-300)
+            rhs_red[hi_mask] += cent_hi_use / np.maximum(np.asarray(slack_hi[hi_mask], dtype=float), 1.0e-300)
+
+        H_x = (A_red + sp.diags(diag_red, format="csr")).tocsr()
+        eq_res = np.asarray(
+            np.asarray(residual_data["eq"], dtype=float) if eq_rhs is None else np.asarray(eq_rhs, dtype=float),
+            dtype=float,
+        )
+        A_aug, rhs_aug = self._vi_build_augmented_system(
+            H_x,
+            rhs_red,
+            np.zeros(x_shape, dtype=bool),
+            eq_data,
+            eq_res,
+        )
+
+        t_lin = time.perf_counter()
+        step_aug = self._solve_linear_system_with_context(
+            A_aug,
+            rhs_aug,
+            context="vi_augmented",
+        )
+        lin_time = time.perf_counter() - t_lin
+        dx_red, dlam_eq = self._vi_split_augmented_step(step_aug, eq_data)
+        dz_lo, dz_hi = self._ipm_multiplier_step(
+            dx_red=dx_red,
+            z_lo=z_lo,
+            z_hi=z_hi,
+            slack_lo=slack_lo,
+            slack_hi=slack_hi,
+            lo_mask=lo_mask,
+            hi_mask=hi_mask,
+            cent_lo_res=cent_lo_use,
+            cent_hi_res=cent_hi_use,
+        )
+        return dx_red, dlam_eq, dz_lo, dz_hi, float(lin_time)
+
+    def _ipm_predictor_corrector_direction(
+        self,
+        *,
+        A_red,
+        eq_data: _PreparedLinearEqualities,
+        residual_data: dict[str, np.ndarray | float],
+        z_lo: np.ndarray,
+        z_hi: np.ndarray,
+        slack_lo: np.ndarray,
+        slack_hi: np.ndarray,
+        lo_mask: np.ndarray,
+        hi_mask: np.ndarray,
+        mu: float,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, dict[str, float]]:
+        dx_red, dlam_eq, dz_lo, dz_hi, lin_time = self._ipm_primal_dual_direction(
+            A_red=A_red,
+            eq_data=eq_data,
+            residual_data=residual_data,
+            z_lo=z_lo,
+            z_hi=z_hi,
+            slack_lo=slack_lo,
+            slack_hi=slack_hi,
+            lo_mask=lo_mask,
+            hi_mask=hi_mask,
+        )
+        info = {
+            "used": 0.0,
+            "mu_curr": 0.0,
+            "mu_aff": 0.0,
+            "sigma": 1.0,
+            "alpha_aff_pri": 0.0,
+            "alpha_aff_dual": 0.0,
+        }
+        if not bool(getattr(self.vi_params, "interior_point_mehrotra_predictor_corrector", True)):
+            return dx_red, dlam_eq, dz_lo, dz_hi, float(lin_time), info
+        if not np.any(lo_mask) and not np.any(hi_mask):
+            return dx_red, dlam_eq, dz_lo, dz_hi, float(lin_time), info
+
+        mu_curr = self._ipm_mean_complementarity(
+            slack_lo=slack_lo,
+            slack_hi=slack_hi,
+            z_lo=z_lo,
+            z_hi=z_hi,
+            lo_mask=lo_mask,
+            hi_mask=hi_mask,
+        )
+        if not np.isfinite(mu_curr) or mu_curr <= 0.0:
+            return dx_red, dlam_eq, dz_lo, dz_hi, float(lin_time), info
+
+        cent_lo_aff = np.asarray(residual_data["cent_lo"], dtype=float).copy()
+        cent_hi_aff = np.asarray(residual_data["cent_hi"], dtype=float).copy()
+        if cent_lo_aff.size:
+            cent_lo_aff += float(mu)
+        if cent_hi_aff.size:
+            cent_hi_aff += float(mu)
+
+        dx_aff, dlam_aff, dz_lo_aff, dz_hi_aff, lin_aff = self._ipm_primal_dual_direction(
+            A_red=A_red,
+            eq_data=eq_data,
+            residual_data=residual_data,
+            z_lo=z_lo,
+            z_hi=z_hi,
+            slack_lo=slack_lo,
+            slack_hi=slack_hi,
+            lo_mask=lo_mask,
+            hi_mask=hi_mask,
+            cent_lo_res=cent_lo_aff,
+            cent_hi_res=cent_hi_aff,
+        )
+        lin_time += float(lin_aff)
+
+        alpha_aff_pri, alpha_aff_dual = self._ipm_fraction_to_boundary_caps(
+            slack_lo=slack_lo,
+            slack_hi=slack_hi,
+            z_lo=z_lo,
+            z_hi=z_hi,
+            dx_red=dx_aff,
+            dz_lo=dz_lo_aff,
+            dz_hi=dz_hi_aff,
+            lo_mask=lo_mask,
+            hi_mask=hi_mask,
+        )
+        ds_lo_aff, ds_hi_aff = self._ipm_slack_directions(
+            dx_red=dx_aff,
+            lo_mask=lo_mask,
+            hi_mask=hi_mask,
+        )
+        slack_lo_aff = np.asarray(slack_lo, dtype=float).copy()
+        slack_hi_aff = np.asarray(slack_hi, dtype=float).copy()
+        z_lo_aff = np.asarray(z_lo, dtype=float).copy()
+        z_hi_aff = np.asarray(z_hi, dtype=float).copy()
+        if np.any(lo_mask):
+            slack_lo_aff[lo_mask] += float(alpha_aff_pri) * np.asarray(ds_lo_aff[lo_mask], dtype=float)
+            z_lo_aff[lo_mask] += float(alpha_aff_dual) * np.asarray(dz_lo_aff[lo_mask], dtype=float)
+        if np.any(hi_mask):
+            slack_hi_aff[hi_mask] += float(alpha_aff_pri) * np.asarray(ds_hi_aff[hi_mask], dtype=float)
+            z_hi_aff[hi_mask] += float(alpha_aff_dual) * np.asarray(dz_hi_aff[hi_mask], dtype=float)
+        mu_aff = self._ipm_mean_complementarity(
+            slack_lo=slack_lo_aff,
+            slack_hi=slack_hi_aff,
+            z_lo=z_lo_aff,
+            z_hi=z_hi_aff,
+            lo_mask=lo_mask,
+            hi_mask=hi_mask,
+        )
+        sigma = 1.0
+        if np.isfinite(mu_aff) and mu_aff >= 0.0:
+            sigma = float((max(float(mu_aff), 0.0) / max(float(mu_curr), 1.0e-30)) ** 3)
+        sigma = min(
+            max(
+                float(sigma),
+                float(getattr(self.vi_params, "interior_point_mehrotra_sigma_min", 0.0) or 0.0),
+            ),
+            max(
+                float(getattr(self.vi_params, "interior_point_mehrotra_sigma_max", 1.0) or 1.0),
+                0.0,
+            ),
+        )
+
+        cent_lo_corr = np.asarray(residual_data["cent_lo"], dtype=float).copy()
+        cent_hi_corr = np.asarray(residual_data["cent_hi"], dtype=float).copy()
+        if cent_lo_corr.size:
+            cent_lo_corr += (1.0 - float(sigma)) * (
+                np.asarray(ds_lo_aff[lo_mask], dtype=float) * np.asarray(dz_lo_aff[lo_mask], dtype=float)
+            )
+        if cent_hi_corr.size:
+            cent_hi_corr += (1.0 - float(sigma)) * (
+                np.asarray(ds_hi_aff[hi_mask], dtype=float) * np.asarray(dz_hi_aff[hi_mask], dtype=float)
+            )
+
+        dx_pc, dlam_pc, dz_lo_pc, dz_hi_pc, lin_corr = self._ipm_primal_dual_direction(
+            A_red=A_red,
+            eq_data=eq_data,
+            residual_data=residual_data,
+            z_lo=z_lo,
+            z_hi=z_hi,
+            slack_lo=slack_lo,
+            slack_hi=slack_hi,
+            lo_mask=lo_mask,
+            hi_mask=hi_mask,
+            cent_lo_res=cent_lo_corr,
+            cent_hi_res=cent_hi_corr,
+        )
+        lin_time += float(lin_corr)
+        info = {
+            "used": 1.0,
+            "mu_curr": float(mu_curr),
+            "mu_aff": float(mu_aff),
+            "sigma": float(sigma),
+            "alpha_aff_pri": float(alpha_aff_pri),
+            "alpha_aff_dual": float(alpha_aff_dual),
+        }
+        return dx_pc, dlam_pc, dz_lo_pc, dz_hi_pc, float(lin_time), info
+
+    def _ipm_eval_trial_step(
+        self,
+        *,
+        funcs: list,
+        prev_funcs: list,
+        aux_funcs,
+        bcs_now,
+        x_trial_red: np.ndarray,
+        lo_red: np.ndarray,
+        hi_red: np.ndarray,
+        eq_data: _PreparedLinearEqualities,
+        lambda_trial: np.ndarray,
+        z_lo_trial: np.ndarray,
+        z_hi_trial: np.ndarray,
+        mu: float,
+        alpha_trial: float,
+        recenter_duals: bool = False,
+    ) -> tuple[dict[str, np.ndarray | float], dict[str, float], np.ndarray, np.ndarray]:
+        self._ipm_write_reduced_iterate(funcs, bcs_now, x_trial_red)
+        if self.pre_cb is not None:
+            self.pre_cb(funcs)
+        if getattr(self, "constraints", None) is not None:
+            self._enforce_constraints_on_functions(funcs)
+
+        coeffs_trial: Dict[str, "Function"] = {f.name: f for f in funcs}
+        coeffs_trial.update({f.name: f for f in prev_funcs})
+        if aux_funcs:
+            coeffs_trial.update(aux_funcs)
+        _, R_trial = self._assemble_system_reduced(coeffs_trial, need_matrix=False)
+        x_trial_eff = self._pack_reduced_iterate(funcs)
+        z_lo_eval = np.asarray(z_lo_trial, dtype=float).ravel().copy()
+        z_hi_eval = np.asarray(z_hi_trial, dtype=float).ravel().copy()
+        if recenter_duals:
+            stationarity_trial = self._vi_stationarity_residual(np.asarray(R_trial, dtype=float), eq_data, lambda_trial)
+            z_lo_eval, z_hi_eval = self._ipm_initialize_duals(
+                x_red=x_trial_eff,
+                stationarity_red=stationarity_trial,
+                lo_red=lo_red,
+                hi_red=hi_red,
+                mu=float(mu),
+            )
+        trial_residual = self._ipm_residual_data(
+            x_red=x_trial_eff,
+            R_red=R_trial,
+            lo_red=lo_red,
+            hi_red=hi_red,
+            eq_data=eq_data,
+            lambda_eq=lambda_trial,
+            z_lo=z_lo_eval,
+            z_hi=z_hi_eval,
+            mu=float(mu),
+        )
+        metrics_trial = self._ipm_metrics(
+            residual_data=trial_residual,
+            mu=float(mu),
+            alpha_trial=float(alpha_trial),
+        )
+        return trial_residual, metrics_trial, z_lo_eval, z_hi_eval
+
+    def _ipm_fraction_to_boundary_caps(
+        self,
+        *,
+        slack_lo: np.ndarray,
+        slack_hi: np.ndarray,
+        z_lo: np.ndarray,
+        z_hi: np.ndarray,
+        dx_red: np.ndarray,
+        dz_lo: np.ndarray,
+        dz_hi: np.ndarray,
+        lo_mask: np.ndarray,
+        hi_mask: np.ndarray,
+    ) -> float:
+        tau = min(
+            max(float(getattr(self.vi_params, "interior_point_fraction_to_boundary", 0.995) or 0.995), 1.0e-6),
+            0.999999,
+        )
+        alpha_pri = 1.0
+        alpha_dual = 1.0
+
+        if np.any(lo_mask):
+            neg_dx = np.asarray(lo_mask & (np.asarray(dx_red, dtype=float) < 0.0), dtype=bool)
+            if np.any(neg_dx):
+                caps = np.asarray(slack_lo[neg_dx], dtype=float) / np.maximum(-np.asarray(dx_red[neg_dx], dtype=float), 1.0e-300)
+                alpha_pri = min(alpha_pri, float(np.min(caps)))
+            neg_dz = np.asarray(lo_mask & (np.asarray(dz_lo, dtype=float) < 0.0), dtype=bool)
+            if np.any(neg_dz):
+                caps = np.asarray(z_lo[neg_dz], dtype=float) / np.maximum(-np.asarray(dz_lo[neg_dz], dtype=float), 1.0e-300)
+                alpha_dual = min(alpha_dual, float(np.min(caps)))
+
+        if np.any(hi_mask):
+            pos_dx = np.asarray(hi_mask & (np.asarray(dx_red, dtype=float) > 0.0), dtype=bool)
+            if np.any(pos_dx):
+                caps = np.asarray(slack_hi[pos_dx], dtype=float) / np.maximum(np.asarray(dx_red[pos_dx], dtype=float), 1.0e-300)
+                alpha_pri = min(alpha_pri, float(np.min(caps)))
+            neg_dz = np.asarray(hi_mask & (np.asarray(dz_hi, dtype=float) < 0.0), dtype=bool)
+            if np.any(neg_dz):
+                caps = np.asarray(z_hi[neg_dz], dtype=float) / np.maximum(-np.asarray(dz_hi[neg_dz], dtype=float), 1.0e-300)
+                alpha_dual = min(alpha_dual, float(np.min(caps)))
+
+        if not np.isfinite(alpha_pri):
+            alpha_pri = 1.0
+        if not np.isfinite(alpha_dual):
+            alpha_dual = 1.0
+        return (
+            max(0.0, min(1.0, tau * float(alpha_pri))),
+            max(0.0, min(1.0, tau * float(alpha_dual))),
+        )
+
+    def _ipm_fraction_to_boundary_step(
+        self,
+        *,
+        slack_lo: np.ndarray,
+        slack_hi: np.ndarray,
+        z_lo: np.ndarray,
+        z_hi: np.ndarray,
+        dx_red: np.ndarray,
+        dz_lo: np.ndarray,
+        dz_hi: np.ndarray,
+        lo_mask: np.ndarray,
+        hi_mask: np.ndarray,
+    ) -> float:
+        alpha_pri, alpha_dual = self._ipm_fraction_to_boundary_caps(
+            slack_lo=slack_lo,
+            slack_hi=slack_hi,
+            z_lo=z_lo,
+            z_hi=z_hi,
+            dx_red=dx_red,
+            dz_lo=dz_lo,
+            dz_hi=dz_hi,
+            lo_mask=lo_mask,
+            hi_mask=hi_mask,
+        )
+        return min(float(alpha_pri), float(alpha_dual))
+
+    def _ipm_reinitialize_state(
+        self,
+        *,
+        funcs: list,
+        prev_funcs: list,
+        aux_funcs,
+        bcs_now,
+        eq_prepare_callback: Callable[[], _PreparedLinearEqualities],
+        lo_red: np.ndarray,
+        hi_red: np.ndarray,
+        lambda_eq: np.ndarray,
+        mu: float,
+    ) -> tuple[np.ndarray, _PreparedLinearEqualities, np.ndarray, np.ndarray]:
+        eq_data = eq_prepare_callback()
+        x_red = self._pack_reduced_iterate(funcs)
+        x_interior = self._ipm_push_strictly_interior(
+            x_red=x_red,
+            lo_red=lo_red,
+            hi_red=hi_red,
+            eq_data=eq_data,
+        )
+        self._ipm_write_reduced_iterate(funcs, bcs_now, x_interior)
+        if self.pre_cb is not None:
+            self.pre_cb(funcs)
+        if getattr(self, "constraints", None) is not None:
+            self._enforce_constraints_on_functions(funcs)
+        x_red = self._pack_reduced_iterate(funcs)
+        eq_data = eq_prepare_callback()
+        coeffs: Dict[str, "Function"] = {f.name: f for f in funcs}
+        coeffs.update({f.name: f for f in prev_funcs})
+        if aux_funcs:
+            coeffs.update(aux_funcs)
+        _, R_red = self._assemble_system_reduced(coeffs, need_matrix=False)
+        stationarity = self._vi_stationarity_residual(np.asarray(R_red, dtype=float), eq_data, lambda_eq)
+        z_lo, z_hi = self._ipm_initialize_duals(
+            x_red=x_red,
+            stationarity_red=stationarity,
+            lo_red=lo_red,
+            hi_red=hi_red,
+            mu=float(mu),
+        )
+        warm_z_lo = getattr(self, "_ipm_z_lo_current", None)
+        warm_z_hi = getattr(self, "_ipm_z_hi_current", None)
+        z_floor = max(float(getattr(self.vi_params, "interior_point_initial_push", 1.0e-8) or 1.0e-8), 1.0e-12)
+        lo_mask, hi_mask = self._ipm_bound_masks(lo_red, hi_red)
+        if (
+            warm_z_lo is not None
+            and warm_z_hi is not None
+            and np.asarray(warm_z_lo).shape == x_red.shape
+            and np.asarray(warm_z_hi).shape == x_red.shape
+        ):
+            warm_lo = np.asarray(warm_z_lo, dtype=float).ravel()
+            warm_hi = np.asarray(warm_z_hi, dtype=float).ravel()
+            if np.any(lo_mask):
+                z_lo[lo_mask] = np.maximum(
+                    np.where(np.isfinite(warm_lo[lo_mask]), warm_lo[lo_mask], z_lo[lo_mask]),
+                    z_floor,
+                )
+            if np.any(hi_mask):
+                z_hi[hi_mask] = np.maximum(
+                    np.where(np.isfinite(warm_hi[hi_mask]), warm_hi[hi_mask], z_hi[hi_mask]),
+                    z_floor,
+                )
+        return x_red, eq_data, z_lo, z_hi
+
+    def _ipm_choose_barrier_transition_duals(
+        self,
+        *,
+        x_red: np.ndarray,
+        R_red: np.ndarray,
+        lo_red: np.ndarray,
+        hi_red: np.ndarray,
+        eq_data: _PreparedLinearEqualities,
+        lambda_eq: np.ndarray,
+        z_lo: np.ndarray,
+        z_hi: np.ndarray,
+        mu: float,
+        stationarity_red: np.ndarray,
+        trace_ipm: bool = False,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        x_red = np.asarray(x_red, dtype=float).ravel()
+        R_red = np.asarray(R_red, dtype=float).ravel()
+        lambda_eq = np.asarray(lambda_eq, dtype=float).ravel()
+        lo_mask, hi_mask = self._ipm_bound_masks(lo_red, hi_red)
+        z_lo_keep = np.asarray(z_lo, dtype=float).ravel().copy()
+        z_hi_keep = np.asarray(z_hi, dtype=float).ravel().copy()
+        z_lo_init, z_hi_init = self._ipm_initialize_duals(
+            x_red=x_red,
+            stationarity_red=np.asarray(stationarity_red, dtype=float),
+            lo_red=lo_red,
+            hi_red=hi_red,
+            mu=float(mu),
+        )
+
+        candidates: list[tuple[str, np.ndarray, np.ndarray, dict[str, np.ndarray | float], dict[str, float], float]] = []
+        for name, z_lo_cand, z_hi_cand in (
+            ("keep", z_lo_keep, z_hi_keep),
+            ("recenter", z_lo_init, z_hi_init),
+        ):
+            residual_cand = self._ipm_residual_data(
+                x_red=x_red,
+                R_red=R_red,
+                lo_red=lo_red,
+                hi_red=hi_red,
+                eq_data=eq_data,
+                lambda_eq=lambda_eq,
+                z_lo=z_lo_cand,
+                z_hi=z_hi_cand,
+                mu=float(mu),
+            )
+            metrics_cand = self._ipm_metrics(
+                residual_data=residual_cand,
+                mu=float(mu),
+            )
+            mu_curr_cand = self._ipm_mean_complementarity(
+                slack_lo=np.asarray(residual_cand["slack_lo"], dtype=float),
+                slack_hi=np.asarray(residual_cand["slack_hi"], dtype=float),
+                z_lo=z_lo_cand,
+                z_hi=z_hi_cand,
+                lo_mask=lo_mask,
+                hi_mask=hi_mask,
+            )
+            candidates.append((name, z_lo_cand, z_hi_cand, residual_cand, metrics_cand, float(mu_curr_cand)))
+
+        def _score(
+            item: tuple[str, np.ndarray, np.ndarray, dict[str, np.ndarray | float], dict[str, float], float]
+        ) -> tuple[float, float, float]:
+            metrics = item[4]
+            return (
+                float(max(metrics["inactive_res_inf"], metrics["centrality_inf"])),
+                float(metrics["G_inf"]),
+                float(metrics["merit"]),
+            )
+
+        best_name, best_z_lo, best_z_hi, _, best_metrics, best_mu_curr = min(candidates, key=_score)
+        keep_item = next((item for item in candidates if item[0] == "keep"), None)
+        recenter_item = next((item for item in candidates if item[0] == "recenter"), None)
+        if keep_item is not None and recenter_item is not None:
+            keep_metrics = keep_item[4]
+            recenter_metrics = recenter_item[4]
+            keep_mu_curr = float(keep_item[5])
+            dual_growth_max = max(
+                float(getattr(self.vi_params, "interior_point_transition_dual_growth_max", 2.0) or 2.0),
+                1.0,
+            )
+            recenter_ratio_max = max(
+                float(getattr(self.vi_params, "interior_point_transition_recenter_ratio_max", 2.5) or 2.5),
+                1.0,
+            )
+            if (
+                best_name == "keep"
+                and keep_mu_curr > recenter_ratio_max * max(float(mu), 1.0e-30)
+                and float(recenter_metrics["inactive_res_inf"]) <= dual_growth_max * max(float(keep_metrics["inactive_res_inf"]), 1.0e-30)
+            ):
+                best_name = "recenter"
+                best_z_lo = np.asarray(recenter_item[1], dtype=float)
+                best_z_hi = np.asarray(recenter_item[2], dtype=float)
+                best_metrics = recenter_metrics
+                best_mu_curr = float(recenter_item[5])
+        if trace_ipm:
+            parts = []
+            for name, _, _, _, metrics, mu_curr_cand in candidates:
+                parts.append(
+                    f"{name}: dual={float(metrics['inactive_res_inf']):.3e} "
+                    f"cent={float(metrics['centrality_inf']):.3e} "
+                    f"Ginf={float(metrics['G_inf']):.3e} "
+                    f"mu_curr={float(mu_curr_cand):.3e}"
+                )
+            print(
+                "        [vi-ipm] barrier dual transition "
+                f"mu={float(mu):.3e} chose={best_name} ({'; '.join(parts)})"
+            )
+        return np.asarray(best_z_lo, dtype=float).copy(), np.asarray(best_z_hi, dtype=float).copy()
+
+    def _newton_loop(self, funcs, prev_funcs, aux_funcs, bcs_now):
+        if getattr(self, "_box_lower_full", None) is None or getattr(self, "_box_upper_full", None) is None:
+            return super()._newton_loop(funcs, prev_funcs, aux_funcs, bcs_now)
+
+        self._current_bcs = bcs_now
+        dh = self.dh
+        ndof_eff = getattr(self.restrictor, "full_size", dh.total_dofs)
+
+        if getattr(self, "constraints", None) is not None:
+            self._enforce_constraints_on_functions(funcs)
+            self._enforce_constraints_on_functions(prev_funcs)
+
+        eq_prepare_callback = lambda: self._vi_prepare_linear_equalities(funcs, prev_funcs, aux_funcs, bcs_now)
+        if self.pre_cb is not None:
+            self.pre_cb(funcs)
+        eq_data = eq_prepare_callback()
+        forced_ipm_state = getattr(self, "_ipm_forced_state", None)
+        if forced_ipm_state:
+            eq_forced = forced_ipm_state.get("eq_lambda", None)
+            if eq_forced is not None:
+                eq_arr = np.asarray(eq_forced, dtype=float).ravel()
+                if int(eq_arr.size) == int(getattr(self, "_vi_eq_lambda_accepted", np.array([], dtype=float)).size):
+                    self._vi_eq_lambda_accepted = eq_arr.copy()
+                    self._vi_eq_lambda_current = eq_arr.copy()
+            z_lo_forced = forced_ipm_state.get("z_lo", None)
+            z_hi_forced = forced_ipm_state.get("z_hi", None)
+            if z_lo_forced is not None and z_hi_forced is not None:
+                z_lo_arr = np.asarray(z_lo_forced, dtype=float).ravel()
+                z_hi_arr = np.asarray(z_hi_forced, dtype=float).ravel()
+                if z_lo_arr.shape == tuple(np.asarray(self.active_dofs, dtype=int).shape):
+                    self._ipm_z_lo_current = z_lo_arr.copy()
+                if z_hi_arr.shape == tuple(np.asarray(self.active_dofs, dtype=int).shape):
+                    self._ipm_z_hi_current = z_hi_arr.copy()
+            if "mu" in forced_ipm_state:
+                try:
+                    self._ipm_mu_current = float(forced_ipm_state["mu"])
+                except Exception:
+                    pass
+            self._ipm_forced_state = None
+        self._vi_eq_lambda_current = self._vi_eq_lambda_accepted.copy()
+
+        lo_red, hi_red = self._bounds_reduced()
+        if bool(getattr(self.vi_params, "project_initial_guess", True)):
+            self._project_funcs_to_bounds(
+                funcs,
+                bcs_now,
+                lo_red,
+                hi_red,
+                eq_data=eq_data,
+                eq_prepare_callback=eq_prepare_callback,
+            )
+            if self.pre_cb is not None:
+                self.pre_cb(funcs)
+            if getattr(self, "constraints", None) is not None:
+                self._enforce_constraints_on_functions(funcs)
+            eq_data = eq_prepare_callback()
+            lo_red, hi_red = self._bounds_reduced()
+
+        mu0 = max(float(getattr(self.vi_params, "interior_point_mu0", 1.0e-2) or 1.0e-2), 0.0)
+        mu_min = max(float(getattr(self.vi_params, "interior_point_mu_min", 1.0e-10) or 1.0e-10), 1.0e-16)
+        mu_decay = min(max(float(getattr(self.vi_params, "interior_point_mu_decay", 0.2) or 0.2), 1.0e-3), 0.95)
+        stage_tol_factor = max(float(getattr(self.vi_params, "interior_point_stage_tol_factor", 0.25) or 0.25), 1.0e-3)
+        stage_dual_factor = max(float(getattr(self.vi_params, "interior_point_stage_dual_factor", 1.5) or 1.5), 1.0e-3)
+        stage_cent_factor = max(float(getattr(self.vi_params, "interior_point_stage_cent_factor", 1.5) or 1.5), 1.0e-3)
+        stage_gap_factor = max(float(getattr(self.vi_params, "interior_point_stage_gap_factor", 1.0) or 1.0), 1.0e-3)
+        stage_eq_factor = max(float(getattr(self.vi_params, "interior_point_stage_eq_factor", 1.0e-4) or 1.0e-4), 1.0e-12)
+        armijo_c1 = max(float(getattr(self.vi_params, "interior_point_armijo_c1", 1.0e-4) or 1.0e-4), 0.0)
+        step_reduction = min(max(float(getattr(self.vi_params, "interior_point_step_reduction", 0.5) or 0.5), 1.0e-3), 0.95)
+        step_min = max(float(getattr(self.vi_params, "interior_point_step_min", 1.0e-10) or 1.0e-10), 1.0e-16)
+        n_barrier = max(1, int(getattr(self.vi_params, "interior_point_max_barrier_steps", 12) or 12))
+        accept_factor = float(getattr(self.np, "accept_nonconverged_atol_factor", 0.0) or 0.0)
+        atol = float(getattr(self.np, "newton_tol", 0.0) or 0.0)
+        relaxed_g = float(getattr(self.vi_params, "relaxed_filter_accept_ginf", 0.0) or 0.0)
+
+        total_iters = 0
+        last_metrics = {
+            "G_inf": float("inf"),
+            "inactive_res_inf": float("inf"),
+            "active_gap_inf": float("inf"),
+            "equality_inf": float("inf"),
+            "centrality_inf": float("inf"),
+            "merit": float("inf"),
+            "G_half": float("inf"),
+            "delta_active": 0.0,
+            "soft_active": 0.0,
+            "mu": float("inf"),
+            "alpha_trial": 0.0,
+        }
+        norm0_ref: float | None = None
+        self._last_nonlinear_accepted = False
+        self._last_nonlinear_relaxed_accept = False
+        self._last_nonlinear_reason = None
+
+        mu_warm = float(getattr(self, "_ipm_mu_current", mu0) or mu0)
+        mu = max(mu_min, min(max(mu0, mu_min), mu_warm if np.isfinite(mu_warm) and mu_warm > 0.0 else mu0))
+        x_red, eq_data, z_lo, z_hi = self._ipm_reinitialize_state(
+            funcs=funcs,
+            prev_funcs=prev_funcs,
+            aux_funcs=aux_funcs,
+            bcs_now=bcs_now,
+            eq_prepare_callback=eq_prepare_callback,
+            lo_red=lo_red,
+            hi_red=hi_red,
+            lambda_eq=np.asarray(self._vi_eq_lambda_current, dtype=float),
+            mu=float(mu),
+        )
+        lo_red, hi_red = self._bounds_reduced()
+        lo_mask, hi_mask = self._ipm_bound_masks(lo_red, hi_red)
+        trace_ipm = os.getenv("PYCUTFEM_VI_TRACE_IPM", "").lower() in {"1", "true", "yes"}
+        trace_ipm_lm = os.getenv("PYCUTFEM_VI_TRACE_IPM_LM", "").lower() in {"1", "true", "yes"}
+        trace_ptc = os.getenv("PYCUTFEM_VI_TRACE_PTC", "").lower() in {"1", "true", "yes"}
+        lm_trace = trace_ipm_lm or (os.getenv("PYCUTFEM_VI_TRACE_LM", "").lower() in {"1", "true", "yes"})
+        trace_raw_fields = os.getenv("PYCUTFEM_NEWTON_TRACE_RES_FIELDS", "").lower() in {"1", "true", "yes"}
+        trace_raw_worst = os.getenv("PYCUTFEM_RESIDUAL_TRACE", "").lower() in {"1", "true", "yes"}
+        lm_requested = bool(getattr(self.vi_params, "unconstrained_lm", False))
+        ptc_fields = tuple(getattr(self.vi_params, "ptc_fields", ()) or ())
+        ptc_mask_template = self._vi_selected_field_mask(ptc_fields)
+        ptc_sigma0 = max(float(getattr(self.vi_params, "ptc_sigma0", 1.0e-2) or 1.0e-2), 0.0)
+        ptc_sigma_max = max(ptc_sigma0, float(getattr(self.vi_params, "ptc_sigma_max", 1.0e6) or 1.0e6))
+        ptc_growth = max(float(getattr(self.vi_params, "ptc_growth", 5.0) or 5.0), 1.0)
+        self._vi_ptc_sigma_current = max(
+            0.0,
+            float(getattr(self, "_vi_force_initial_ptc_sigma", 0.0) or 0.0),
+        )
+        self._vi_force_initial_ptc_sigma = 0.0
+        if self._vi_ptc_sigma_current > 0.0 and trace_ptc:
+            print(
+                "        [vi-ipm-ptc] pre-armed regularized IPM solve "
+                f"(sigma={self._vi_ptc_sigma_current:.2e}, fields={ptc_fields})"
+            )
+
+        for stage in range(n_barrier):
+            stage_converged = False
+            stage_filter_entries: list[tuple[float, float]] = []
+            for it in range(int(self.np.max_newton_iter)):
+                total_iters += 1
+                if self.pre_cb is not None:
+                    self.pre_cb(funcs)
+                if getattr(self, "constraints", None) is not None:
+                    self._enforce_constraints_on_functions(funcs)
+                    self._enforce_constraints_on_functions(prev_funcs)
+                lo_red, hi_red = self._bounds_reduced()
+                eq_data = eq_prepare_callback()
+
+                x_red = self._pack_reduced_iterate(funcs)
+                if z_lo.shape != x_red.shape or z_hi.shape != x_red.shape:
+                    x_red, eq_data, z_lo, z_hi = self._ipm_reinitialize_state(
+                        funcs=funcs,
+                        prev_funcs=prev_funcs,
+                        aux_funcs=aux_funcs,
+                        bcs_now=bcs_now,
+                        eq_prepare_callback=eq_prepare_callback,
+                        lo_red=lo_red,
+                        hi_red=hi_red,
+                        lambda_eq=np.asarray(self._vi_eq_lambda_current, dtype=float),
+                        mu=float(mu),
+                    )
+                    lo_red, hi_red = self._bounds_reduced()
+                lo_mask, hi_mask = self._ipm_bound_masks(lo_red, hi_red)
+
+                current: Dict[str, "Function"] = {f.name: f for f in funcs}
+                current.update({f.name: f for f in prev_funcs})
+                if aux_funcs:
+                    current.update(aux_funcs)
+
+                t_asm = time.perf_counter()
+                A_red, R_red = self._assemble_system_reduced(current, need_matrix=True)
+                asm_time = time.perf_counter() - t_asm
+                A_red, R_red, pruned, extra_asm = self._prune_decoupled_rows_cols(current, A_red, R_red, ndof_eff)
+                asm_time += extra_asm
+                if pruned:
+                    lo_red, hi_red = self._bounds_reduced()
+                    x_red, eq_data, z_lo, z_hi = self._ipm_reinitialize_state(
+                        funcs=funcs,
+                        prev_funcs=prev_funcs,
+                        aux_funcs=aux_funcs,
+                        bcs_now=bcs_now,
+                        eq_prepare_callback=eq_prepare_callback,
+                        lo_red=lo_red,
+                        hi_red=hi_red,
+                        lambda_eq=np.asarray(self._vi_eq_lambda_current, dtype=float),
+                        mu=float(mu),
+                    )
+                    lo_mask, hi_mask = self._ipm_bound_masks(lo_red, hi_red)
+                    current = {f.name: f for f in funcs}
+                    current.update({f.name: f for f in prev_funcs})
+                    if aux_funcs:
+                        current.update(aux_funcs)
+                    t_asm = time.perf_counter()
+                    A_red, R_red = self._assemble_system_reduced(current, need_matrix=True)
+                    asm_time += time.perf_counter() - t_asm
+
+                residual_data = self._ipm_residual_data(
+                    x_red=x_red,
+                    R_red=R_red,
+                    lo_red=lo_red,
+                    hi_red=hi_red,
+                    eq_data=eq_data,
+                    lambda_eq=np.asarray(self._vi_eq_lambda_current, dtype=float),
+                    z_lo=z_lo,
+                    z_hi=z_hi,
+                    mu=float(mu),
+                )
+                metrics0 = self._ipm_metrics(residual_data=residual_data, mu=float(mu))
+                stage_filter_entries = self._ipm_register_filter_entry(stage_filter_entries, metrics0)
+                self._vi_last_metrics = dict(metrics0)
+                last_metrics = dict(metrics0)
+                self._last_nonlinear_norm = float(metrics0["G_inf"])
+                self._last_nonlinear_norm_label = "|G|_∞"
+                norm0_ref = float(metrics0["G_inf"]) if norm0_ref is None else float(norm0_ref)
+                tol_eff = max(float(self.np.newton_tol), float(getattr(self.np, "newton_rtol", 0.0) or 0.0) * max(norm0_ref, 1.0e-30))
+                stage_tol = max(float(tol_eff), stage_tol_factor * float(mu))
+                dual_stage_tol = max(float(tol_eff), stage_dual_factor * float(mu))
+                cent_stage_tol = max(float(tol_eff), stage_cent_factor * float(mu))
+                gap_stage_tol = max(float(tol_eff), stage_gap_factor * float(mu))
+                eq_stage_tol = max(float(tol_eff), stage_eq_factor * float(mu))
+
+                if trace_ipm:
+                    print(
+                        "        [vi-ipm] "
+                        f"stage={stage+1}/{n_barrier} it={it+1} mu={float(mu):.3e} "
+                        f"Ginf={float(metrics0['G_inf']):.3e} stat={float(metrics0['stationarity_inf']):.3e} "
+                        f"slack={float(metrics0['slack_feas_inf']):.3e} eq={float(metrics0['equality_inf']):.3e} "
+                        f"cent={float(metrics0['centrality_inf']):.3e} "
+                        f"asm={asm_time:.2e}s"
+                    )
+                if trace_raw_fields:
+                    try:
+                        R_full_dbg = self.restrictor.expand_vec(np.asarray(R_red, dtype=float))
+                        field_norms = []
+                        for fld in getattr(self.dh, "field_names", []):
+                            try:
+                                sl = self.dh.get_field_slice(fld)
+                            except Exception:
+                                continue
+                            if sl is None or len(sl) == 0:
+                                continue
+                            sl = np.asarray(sl, dtype=int).ravel()
+                            field_norms.append((float(np.linalg.norm(R_full_dbg[sl], ord=np.inf)), str(fld)))
+                        field_norms.sort(reverse=True, key=lambda item: item[0])
+                        n_show_raw = os.getenv("PYCUTFEM_NEWTON_TRACE_RES_FIELDS_N", "8").strip()
+                        try:
+                            n_show = max(1, int(n_show_raw))
+                        except Exception:
+                            n_show = 8
+                        items = ", ".join(f"{name}:{val:.2e}" for val, name in field_norms[:n_show])
+                        print(f"        [res] {items}")
+                    except Exception as exc:
+                        print(f"        [res] trace failed: {exc}")
+                if trace_raw_worst:
+                    try:
+                        R_full = np.asarray(self.restrictor.expand_vec(np.asarray(R_red, dtype=float)), dtype=float).ravel()
+                        if R_full.size:
+                            worst_full = int(np.argmax(np.abs(R_full)))
+                            worst_val = float(R_full[worst_full])
+                            field = None
+                            try:
+                                field = getattr(self.dh, "_dof_to_node_map", {}).get(worst_full, (None, None))[0]
+                            except Exception:
+                                field = None
+                            fmsg = f", field={field}" if field is not None else ""
+                            print(f"        [res] worst_gdof={worst_full} worst_val={worst_val:.3e}{fmsg}")
+                    except Exception as exc:
+                        print(f"        [res] trace failed: {exc}")
+
+                if (
+                    float(metrics0["inactive_res_inf"]) <= dual_stage_tol
+                    and float(metrics0["equality_inf"]) <= eq_stage_tol
+                    and float(metrics0["active_gap_inf"]) <= gap_stage_tol
+                    and float(metrics0["centrality_inf"]) <= cent_stage_tol
+                ):
+                    if trace_ipm:
+                        print(
+                            "        [vi-ipm] stage target reached "
+                            f"(dual<={dual_stage_tol:.3e}, eq<={eq_stage_tol:.3e}, "
+                            f"gap<={gap_stage_tol:.3e}, cent<={cent_stage_tol:.3e})"
+                        )
+                    stage_converged = True
+                    break
+
+                slack_lo = np.asarray(residual_data["slack_lo"], dtype=float)
+                slack_hi = np.asarray(residual_data["slack_hi"], dtype=float)
+                if (np.any(lo_mask & (slack_lo <= 0.0)) or np.any(hi_mask & (slack_hi <= 0.0))):
+                    x_red, eq_data, z_lo, z_hi = self._ipm_reinitialize_state(
+                        funcs=funcs,
+                        prev_funcs=prev_funcs,
+                        aux_funcs=aux_funcs,
+                        bcs_now=bcs_now,
+                        eq_prepare_callback=eq_prepare_callback,
+                        lo_red=lo_red,
+                        hi_red=hi_red,
+                        lambda_eq=np.asarray(self._vi_eq_lambda_current, dtype=float),
+                        mu=float(mu),
+                    )
+                    continue
+
+                rhs_red = -np.asarray(residual_data["dual"], dtype=float).copy()
+                diag_red = np.zeros(x_red.shape, dtype=float)
+                if np.any(lo_mask):
+                    diag_red[lo_mask] += np.asarray(z_lo[lo_mask], dtype=float) / np.maximum(np.asarray(slack_lo[lo_mask], dtype=float), 1.0e-300)
+                    rhs_red[lo_mask] += -np.asarray(residual_data["cent_lo"], dtype=float) / np.maximum(np.asarray(slack_lo[lo_mask], dtype=float), 1.0e-300)
+                if np.any(hi_mask):
+                    diag_red[hi_mask] += np.asarray(z_hi[hi_mask], dtype=float) / np.maximum(np.asarray(slack_hi[hi_mask], dtype=float), 1.0e-300)
+                    rhs_red[hi_mask] += np.asarray(residual_data["cent_hi"], dtype=float) / np.maximum(np.asarray(slack_hi[hi_mask], dtype=float), 1.0e-300)
+                H_x_base = (A_red + sp.diags(diag_red, format="csr")).tocsr()
+                eq_res = np.asarray(residual_data["eq"], dtype=float)
+                merit0 = float(metrics0["merit"])
+                lambda0 = np.asarray(self._vi_eq_lambda_current, dtype=float).copy()
+                z_lo0 = np.asarray(z_lo, dtype=float).copy()
+                z_hi0 = np.asarray(z_hi, dtype=float).copy()
+                snap = [f.nodal_values.copy() for f in funcs]
+
+                ptc_mask = np.asarray(ptc_mask_template, dtype=bool)
+                if ptc_mask.shape != x_red.shape:
+                    ptc_mask = np.zeros(x_red.shape, dtype=bool)
+                ptc_ready = bool(np.any(ptc_mask)) and (
+                    self._vi_should_try_ptc_recovery(
+                        metrics=metrics0,
+                        active_stable_count=0,
+                    )
+                    or float(getattr(self, "_vi_ptc_sigma_current", 0.0) or 0.0) > 0.0
+                )
+
+                lin_time = 0.0
+                accepted = False
+                accepted_metrics = dict(metrics0)
+                while True:
+                    ptc_sigma = float(getattr(self, "_vi_ptc_sigma_current", 0.0) or 0.0)
+                    H_x = H_x_base
+                    pc_info = {
+                        "used": 0.0,
+                        "mu_curr": 0.0,
+                        "mu_aff": 0.0,
+                        "sigma": 1.0,
+                        "alpha_aff_pri": 0.0,
+                        "alpha_aff_dual": 0.0,
+                    }
+                    if ptc_sigma > 0.0 and np.any(ptc_mask):
+                        H_x, _ = self._vi_apply_ptc_regularization(H_x, H_x_base, ptc_mask, ptc_sigma)
+                        A_aug, rhs_aug = self._vi_build_augmented_system(
+                            H_x,
+                            np.asarray(rhs_red, dtype=float).copy(),
+                            np.zeros(x_red.shape, dtype=bool),
+                            eq_data,
+                            eq_res,
+                        )
+                        t_lin = time.perf_counter()
+                        step_aug = self._solve_linear_system_with_context(
+                            A_aug,
+                            rhs_aug,
+                            context="vi_augmented",
+                        )
+                        lin_time += time.perf_counter() - t_lin
+                        dx_red, dlam_eq = self._vi_split_augmented_step(step_aug, eq_data)
+                        dz_lo, dz_hi = self._ipm_multiplier_step(
+                            dx_red=dx_red,
+                            z_lo=z_lo,
+                            z_hi=z_hi,
+                            slack_lo=slack_lo,
+                            slack_hi=slack_hi,
+                            lo_mask=lo_mask,
+                            hi_mask=hi_mask,
+                            residual_data=residual_data,
+                        )
+                    else:
+                        dx_red, dlam_eq, dz_lo, dz_hi, lin_time_step, pc_info = self._ipm_predictor_corrector_direction(
+                            A_red=A_red,
+                            eq_data=eq_data,
+                            residual_data=residual_data,
+                            z_lo=z_lo,
+                            z_hi=z_hi,
+                            slack_lo=slack_lo,
+                            slack_hi=slack_hi,
+                            lo_mask=lo_mask,
+                            hi_mask=hi_mask,
+                            mu=float(mu),
+                        )
+                        lin_time += float(lin_time_step)
+                        A_aug, rhs_aug = self._vi_build_augmented_system(
+                            H_x_base,
+                            np.asarray(rhs_red, dtype=float).copy(),
+                            np.zeros(x_red.shape, dtype=bool),
+                            eq_data,
+                            eq_res,
+                        )
+
+                    alpha_pri_max, alpha_dual_max = self._ipm_fraction_to_boundary_caps(
+                        slack_lo=slack_lo,
+                        slack_hi=slack_hi,
+                        z_lo=z_lo,
+                        z_hi=z_hi,
+                        dx_red=dx_red,
+                        dz_lo=dz_lo,
+                        dz_hi=dz_hi,
+                        lo_mask=lo_mask,
+                        hi_mask=hi_mask,
+                    )
+                    alpha_max = min(float(alpha_pri_max), float(alpha_dual_max))
+                    if alpha_max <= 0.0 or not np.all(np.isfinite(dx_red)):
+                        next_sigma = ptc_sigma0 if ptc_sigma <= 0.0 else min(ptc_sigma_max, max(ptc_sigma, ptc_sigma0) * ptc_growth)
+                        if ptc_ready and next_sigma > ptc_sigma + max(1.0e-30, 1.0e-12 * max(abs(ptc_sigma), abs(next_sigma))):
+                            self._vi_ptc_sigma_current = float(next_sigma)
+                            if trace_ptc:
+                                print(
+                                    "          [vi-ipm-ptc] retry after non-interior direction "
+                                    f"sigma->{self._vi_ptc_sigma_current:.2e}"
+                                )
+                            continue
+                        raise RuntimeError("Interior-point Newton produced a non-interior or non-finite step.")
+
+                    alpha = 1.0
+                    retry_with_ptc = False
+                    accepted = False
+                    accepted_branch = "none"
+                    accepted_metrics = dict(metrics0)
+                    best_filtered_alpha = 0.0
+                    best_filtered_metrics = None
+                    best_filtered_x = None
+                    best_filtered_lam = None
+                    best_filtered_z_lo = None
+                    best_filtered_z_hi = None
+                    best_filtered_reason = None
+                    g0_ls = float(metrics0["G_inf"])
+                    merit0_ls = float(metrics0["merit"])
+                    eq0_ls = float(metrics0["equality_inf"])
+                    cent0_ls = float(metrics0["centrality_inf"])
+                    if trace_ipm:
+                        dx_inf = float(np.linalg.norm(np.asarray(dx_red, dtype=float), ord=np.inf)) if np.asarray(dx_red, dtype=float).size else 0.0
+                        dz_lo_inf = float(np.linalg.norm(np.asarray(dz_lo[lo_mask], dtype=float), ord=np.inf)) if np.any(lo_mask) else 0.0
+                        dz_hi_inf = float(np.linalg.norm(np.asarray(dz_hi[hi_mask], dtype=float), ord=np.inf)) if np.any(hi_mask) else 0.0
+                        ptc_msg = f" sigma={ptc_sigma:.2e}" if ptc_sigma > 0.0 else ""
+                        print(
+                            "          [vi-ipm] "
+                            f"alpha_pri_max={float(alpha_pri_max):.2e} alpha_dual_max={float(alpha_dual_max):.2e} "
+                            f"|dx|_inf={dx_inf:.3e} "
+                            f"|dz_lo|_inf={dz_lo_inf:.3e} |dz_hi|_inf={dz_hi_inf:.3e}{ptc_msg}"
+                        )
+                        if float(pc_info.get("used", 0.0)) > 0.5:
+                            print(
+                                "          [vi-ipm-pc] "
+                                f"mu_curr={float(pc_info.get('mu_curr', 0.0)):.3e} "
+                                f"mu_aff={float(pc_info.get('mu_aff', 0.0)):.3e} "
+                                f"sigma={float(pc_info.get('sigma', 1.0)):.3e} "
+                                f"alpha_aff_pri={float(pc_info.get('alpha_aff_pri', 0.0)):.2e} "
+                                f"alpha_aff_dual={float(pc_info.get('alpha_aff_dual', 0.0)):.2e}"
+                            )
+                    while alpha >= step_min:
+                        alpha_pri = float(alpha) * float(alpha_pri_max)
+                        alpha_dual = float(alpha) * float(alpha_dual_max)
+                        x_trial = np.asarray(x_red, dtype=float) + float(alpha_pri) * np.asarray(dx_red, dtype=float)
+                        lam_trial = np.asarray(lambda0, dtype=float) + float(alpha_dual) * np.asarray(dlam_eq, dtype=float)
+                        z_lo_trial = np.asarray(z_lo0, dtype=float) + float(alpha_dual) * np.asarray(dz_lo, dtype=float)
+                        z_hi_trial = np.asarray(z_hi0, dtype=float) + float(alpha_dual) * np.asarray(dz_hi, dtype=float)
+
+                        for f, buf in zip(funcs, snap):
+                            f.nodal_values[:] = buf
+                        _, metrics_trial, _, _ = self._ipm_eval_trial_step(
+                            funcs=funcs,
+                            prev_funcs=prev_funcs,
+                            aux_funcs=aux_funcs,
+                            bcs_now=bcs_now,
+                            x_trial_red=x_trial,
+                            lo_red=lo_red,
+                            hi_red=hi_red,
+                            eq_data=eq_data,
+                            lambda_trial=lam_trial,
+                            z_lo_trial=z_lo_trial,
+                            z_hi_trial=z_hi_trial,
+                            mu=float(mu),
+                            alpha_trial=float(min(alpha_pri, alpha_dual)),
+                        )
+                        accepted_metrics = dict(metrics_trial)
+                        filter_ok, filter_reason = self._ipm_filter_accepts(
+                            metrics_trial=metrics_trial,
+                            metrics_ref=metrics0,
+                            filter_entries=stage_filter_entries,
+                            alpha_trial=float(min(alpha_pri, alpha_dual)),
+                        )
+                        armijo_ok = float(metrics_trial["merit"]) <= (1.0 - armijo_c1 * float(alpha)) * max(merit0, 1.0e-30)
+                        if trace_ipm:
+                            print(
+                                "          [vi-ipm] "
+                                f"trial alpha_pri={float(alpha_pri):.2e} alpha_dual={float(alpha_dual):.2e} "
+                                f"merit={float(metrics_trial['merit']):.3e} "
+                                f"Ginf={float(metrics_trial['G_inf']):.3e} stat={float(metrics_trial['stationarity_inf']):.3e} "
+                                f"slack={float(metrics_trial['slack_feas_inf']):.3e} eq={float(metrics_trial['equality_inf']):.3e} "
+                                f"cent={float(metrics_trial['centrality_inf']):.3e} "
+                                f"filter={int(filter_ok)} reason={filter_reason} armijo={int(armijo_ok)}"
+                            )
+                        if filter_ok:
+                            better_g = best_filtered_metrics is None or float(metrics_trial["G_inf"]) < float(best_filtered_metrics["G_inf"]) - 1.0e-15
+                            tie_g = best_filtered_metrics is not None and abs(float(metrics_trial["G_inf"]) - float(best_filtered_metrics["G_inf"])) <= 1.0e-15
+                            better_merit = best_filtered_metrics is None or float(metrics_trial["merit"]) < float(best_filtered_metrics["merit"]) - 1.0e-15
+                            if better_g or (tie_g and better_merit):
+                                best_filtered_alpha = float(alpha_pri)
+                                best_filtered_metrics = dict(metrics_trial)
+                                best_filtered_x = np.asarray(x_trial, dtype=float).copy()
+                                best_filtered_lam = np.asarray(lam_trial, dtype=float).copy()
+                                best_filtered_z_lo = np.asarray(z_lo_trial, dtype=float).copy()
+                                best_filtered_z_hi = np.asarray(z_hi_trial, dtype=float).copy()
+                                best_filtered_reason = str(filter_reason)
+                        if filter_ok:
+                            accepted_alpha_try = float(alpha_pri)
+                            merit_ratio_try = float(metrics_trial["merit"]) / max(merit0, 1.0e-30)
+                            g_ratio_try = float(metrics_trial["G_inf"]) / max(float(metrics0["G_inf"]), 1.0e-30)
+                            next_sigma = ptc_sigma0 if ptc_sigma <= 0.0 else min(ptc_sigma_max, max(ptc_sigma, ptc_sigma0) * ptc_growth)
+                            meaningful_progress = (
+                                merit_ratio_try <= 0.95
+                                or g_ratio_try <= 0.95
+                            )
+                            tiny_accept = accepted_alpha_try <= max(1.0e-3, 100.0 * float(step_min))
+                            if (
+                                ptc_ready
+                                and next_sigma > ptc_sigma + max(1.0e-30, 1.0e-12 * max(abs(ptc_sigma), abs(next_sigma)))
+                                and tiny_accept
+                                and not meaningful_progress
+                                and self._vi_should_arm_ptc_after_accept(
+                                    accepted_alpha=accepted_alpha_try,
+                                    merit_ratio=merit_ratio_try,
+                                    accepted_g_ratio=g_ratio_try,
+                                )
+                            ):
+                                retry_with_ptc = True
+                                self._vi_ptc_sigma_current = float(next_sigma)
+                                if trace_ptc:
+                                    print(
+                                        "          [vi-ipm-ptc] retry after null accepted step "
+                                        f"alpha={accepted_alpha_try:.2e} merit_ratio={merit_ratio_try:.3f} "
+                                        f"G_ratio={g_ratio_try:.3f} sigma->{self._vi_ptc_sigma_current:.2e}"
+                                )
+                                for f, buf in zip(funcs, snap):
+                                    f.nodal_values[:] = buf
+                                break
+                            if tiny_accept and not meaningful_progress:
+                                if trace_ipm:
+                                    print(
+                                        "          [vi-ipm] rejecting tiny filtered step "
+                                        f"alpha={accepted_alpha_try:.2e} merit_ratio={merit_ratio_try:.3f} "
+                                        f"G_ratio={g_ratio_try:.3f}; escalating to fallback globalization."
+                                    )
+                                for f, buf in zip(funcs, snap):
+                                    f.nodal_values[:] = buf
+                                break
+
+                            accepted = True
+                            self._vi_eq_lambda_current = np.asarray(lam_trial, dtype=float).copy()
+                            z_lo = np.asarray(z_lo_trial, dtype=float).copy()
+                            z_hi = np.asarray(z_hi_trial, dtype=float).copy()
+                            self._ls_alpha_prev = float(alpha_pri)
+                            self._vi_last_metrics = dict(metrics_trial)
+                            accepted_branch = "filter+armijo" if armijo_ok else f"filter:{filter_reason}"
+                            self._assert_functions_finite(funcs, context="after accepted interior-point step")
+                            if self.post_cb is not None:
+                                self.post_cb(funcs)
+                            if getattr(self, "constraints", None) is not None:
+                                self._enforce_constraints_on_functions(funcs)
+                            break
+                        alpha *= step_reduction
+
+                    if retry_with_ptc:
+                        continue
+
+                    if not accepted:
+                        for f, buf in zip(funcs, snap):
+                            f.nodal_values[:] = buf
+                        best_filtered_progress_ok = False
+                        if best_filtered_metrics is not None and best_filtered_alpha is not None:
+                            best_filtered_merit_ratio = float(best_filtered_metrics["merit"]) / max(merit0_ls, 1.0e-30)
+                            best_filtered_g_ratio = float(best_filtered_metrics["G_inf"]) / max(g0_ls, 1.0e-30)
+                            best_filtered_tiny = float(best_filtered_alpha) <= max(1.0e-3, 100.0 * float(step_min))
+                            best_filtered_progress_ok = (
+                                (not best_filtered_tiny)
+                                or best_filtered_merit_ratio <= 0.95
+                                or best_filtered_g_ratio <= 0.95
+                            )
+                        if (
+                            best_filtered_metrics is not None
+                            and best_filtered_x is not None
+                            and best_filtered_lam is not None
+                            and best_filtered_z_lo is not None
+                            and best_filtered_z_hi is not None
+                            and bool(best_filtered_progress_ok)
+                            and (
+                                float(best_filtered_metrics["G_inf"]) < g0_ls - max(1.0e-10, 1.0e-6 * max(g0_ls, 1.0))
+                                or float(best_filtered_metrics["merit"]) < merit0_ls - max(1.0e-12, 1.0e-6 * max(merit0_ls, 1.0))
+                            )
+                        ):
+                            self._ipm_write_reduced_iterate(funcs, bcs_now, best_filtered_x)
+                            if self.pre_cb is not None:
+                                self.pre_cb(funcs)
+                            if getattr(self, "constraints", None) is not None:
+                                self._enforce_constraints_on_functions(funcs)
+                            accepted = True
+                            accepted_metrics = dict(best_filtered_metrics)
+                            self._vi_eq_lambda_current = np.asarray(best_filtered_lam, dtype=float).copy()
+                            z_lo = np.asarray(best_filtered_z_lo, dtype=float).copy()
+                            z_hi = np.asarray(best_filtered_z_hi, dtype=float).copy()
+                            self._ls_alpha_prev = float(best_filtered_alpha)
+                            self._vi_last_metrics = dict(best_filtered_metrics)
+                            accepted_branch = f"best-filter:{best_filtered_reason or 'fallback'}"
+                            self._assert_functions_finite(funcs, context="after accepted interior-point best-filtered step")
+                            if self.post_cb is not None:
+                                self.post_cb(funcs)
+                            if getattr(self, "constraints", None) is not None:
+                                self._enforce_constraints_on_functions(funcs)
+                            if trace_ipm:
+                                print(
+                                    "          [vi-ipm] accepted best filtered fallback step "
+                                    f"alpha={float(best_filtered_alpha):.2e} "
+                                    f"Ginf={float(best_filtered_metrics['G_inf']):.3e} "
+                                    f"reason={best_filtered_reason or 'fallback'}"
+                                )
+
+                    if not accepted:
+                        tol_accept = accept_factor * max(tol_eff, 1.0e-30) if accept_factor > 0.0 else 0.0
+                        ls_factor_ok = tol_accept > 0.0 and float(metrics0["G_inf"]) <= tol_accept
+                        next_sigma = ptc_sigma0 if ptc_sigma <= 0.0 else min(ptc_sigma_max, max(ptc_sigma, ptc_sigma0) * ptc_growth)
+                        if ptc_ready and next_sigma > ptc_sigma + max(1.0e-30, 1.0e-12 * max(abs(ptc_sigma), abs(next_sigma))):
+                            self._vi_ptc_sigma_current = float(next_sigma)
+                            if trace_ptc:
+                                print(
+                                    "          [vi-ipm-ptc] retry after line-search stall "
+                                    f"sigma->{self._vi_ptc_sigma_current:.2e}"
+                                )
+                            continue
+                        if lm_requested:
+                            lm_lam = float(getattr(self, "_vi_lm_lambda_current", 0.0) or 0.0)
+                            lm0 = float(getattr(self.vi_params, "unconstrained_lm_lambda0", 1.0e-4) or 1.0e-4)
+                            lm_max = float(getattr(self.vi_params, "unconstrained_lm_lambda_max", 1.0e6) or 1.0e6)
+                            lm_growth = float(getattr(self.vi_params, "unconstrained_lm_growth", 5.0) or 5.0)
+                            lm_decay = float(getattr(self.vi_params, "unconstrained_lm_decay", 0.5) or 0.5)
+                            lm_accept = float(getattr(self.vi_params, "unconstrained_lm_accept_ratio", 1.0e-3) or 1.0e-3)
+                            lm_good = float(getattr(self.vi_params, "unconstrained_lm_good_ratio", 0.75) or 0.75)
+                            lm_max_tries = max(1, int(getattr(self.vi_params, "unconstrained_lm_max_tries", 6) or 6))
+                            max_ginf_growth = float(getattr(self.vi_params, "filter_max_ginf_growth", 1.0) or 1.0)
+                            max_res_growth = float(getattr(self.vi_params, "filter_max_residual_growth", 1.25) or 1.25)
+                            max_gap_growth = float(getattr(self.vi_params, "filter_max_gap_growth", 1.25) or 1.25)
+                            max_eq_growth = float(getattr(self.vi_params, "filter_max_equality_growth", 1.25) or 1.25)
+                            fallback_rho_min = max(1.0e-6, 0.1 * lm_accept)
+                            phi0_lm = float(metrics0["merit"])
+                            dual0_lm = float(metrics0["inactive_res_inf"])
+                            gap0_lm = float(metrics0["active_gap_inf"])
+                            eq0_lm = float(metrics0["equality_inf"])
+                            cent0_lm = float(metrics0["centrality_inf"])
+                            best_filtered_phi = phi0_lm
+                            best_filtered_rho = -np.inf
+                            best_filtered_alpha = 0.0
+                            best_filtered_metrics = None
+                            best_filtered_x = None
+                            best_filtered_lam = None
+                            best_filtered_z_lo = None
+                            best_filtered_z_hi = None
+
+                            for lm_try in range(lm_max_tries):
+                                try:
+                                    H_lm, rhs_lm, _ = self._vi_build_lm_system(
+                                        A_aug,
+                                        rhs_aug,
+                                        lm_lam,
+                                        x_block_size=int(x_red.size),
+                                    )
+                                    t_lin_lm = time.perf_counter()
+                                    step_lm_aug = self._solve_linear_system_with_context(
+                                        H_lm,
+                                        rhs_lm,
+                                        context="vi_augmented",
+                                    )
+                                    lin_time += time.perf_counter() - t_lin_lm
+                                except RuntimeError as exc:
+                                    if lm_trace:
+                                        print(f"          [vi-ipm-lm] try={lm_try+1} λ={lm_lam:.2e} linear solve failed: {exc}")
+                                    lm_lam = min(lm_max, max(lm_lam, lm0) * lm_growth if max(lm_lam, lm0) > 0.0 else lm0)
+                                    continue
+
+                                dx_lm, dlam_lm = self._vi_split_augmented_step(step_lm_aug, eq_data)
+                                dz_lo_lm, dz_hi_lm = self._ipm_multiplier_step(
+                                    dx_red=dx_lm,
+                                    z_lo=z_lo0,
+                                    z_hi=z_hi0,
+                                    slack_lo=slack_lo,
+                                    slack_hi=slack_hi,
+                                    lo_mask=lo_mask,
+                                    hi_mask=hi_mask,
+                                    residual_data=residual_data,
+                                )
+                                alpha_pri_lm, alpha_dual_lm = self._ipm_fraction_to_boundary_caps(
+                                    slack_lo=slack_lo,
+                                    slack_hi=slack_hi,
+                                    z_lo=z_lo0,
+                                    z_hi=z_hi0,
+                                    dx_red=dx_lm,
+                                    dz_lo=dz_lo_lm,
+                                    dz_hi=dz_hi_lm,
+                                    lo_mask=lo_mask,
+                                    hi_mask=hi_mask,
+                                )
+                                alpha_lm = min(float(alpha_pri_lm), float(alpha_dual_lm))
+                                if alpha_lm <= 0.0 or not np.all(np.isfinite(dx_lm)):
+                                    if lm_trace:
+                                        print(
+                                            f"          [vi-ipm-lm] try={lm_try+1} λ={lm_lam:.2e} rejected: "
+                                            f"non-interior alpha={float(alpha_lm):.2e}"
+                                        )
+                                    lm_lam = min(lm_max, max(lm_lam, lm0) * lm_growth if max(lm_lam, lm0) > 0.0 else lm0)
+                                    continue
+
+                                x_trial = np.asarray(x_red, dtype=float) + float(alpha_pri_lm) * np.asarray(dx_lm, dtype=float)
+                                lam_trial = np.asarray(lambda0, dtype=float) + float(alpha_dual_lm) * np.asarray(dlam_lm, dtype=float)
+                                z_lo_lm_trial = np.asarray(z_lo0, dtype=float) + float(alpha_dual_lm) * np.asarray(dz_lo_lm, dtype=float)
+                                z_hi_lm_trial = np.asarray(z_hi0, dtype=float) + float(alpha_dual_lm) * np.asarray(dz_hi_lm, dtype=float)
+
+                                for f, buf in zip(funcs, snap):
+                                    f.nodal_values[:] = buf
+                                _, metrics_trial, z_lo_trial, z_hi_trial = self._ipm_eval_trial_step(
+                                    funcs=funcs,
+                                    prev_funcs=prev_funcs,
+                                    aux_funcs=aux_funcs,
+                                    bcs_now=bcs_now,
+                                    x_trial_red=x_trial,
+                                    lo_red=lo_red,
+                                    hi_red=hi_red,
+                                    eq_data=eq_data,
+                                    lambda_trial=lam_trial,
+                                    z_lo_trial=z_lo_lm_trial,
+                                    z_hi_trial=z_hi_lm_trial,
+                                    mu=float(mu),
+                                    alpha_trial=float(min(alpha_pri_lm, alpha_dual_lm)),
+                                    recenter_duals=False,
+                                )
+                                phi_try = float(metrics_trial["merit"])
+                                actual = phi0_lm - phi_try
+                                rho = actual / max(phi0_lm, 1.0e-30)
+                                filtered_ok, lm_reason = self._ipm_filter_accepts(
+                                    metrics_trial=metrics_trial,
+                                    metrics_ref=metrics0,
+                                    filter_entries=stage_filter_entries,
+                                    alpha_trial=float(min(alpha_pri_lm, alpha_dual_lm)),
+                                )
+                                if lm_trace:
+                                    print(
+                                        f"          [vi-ipm-lm] try={lm_try+1} λ={lm_lam:.2e} "
+                                        f"alpha_pri={float(alpha_pri_lm):.2e} alpha_dual={float(alpha_dual_lm):.2e} "
+                                        f"phi0={phi0_lm:.3e} phitry={phi_try:.3e} "
+                                        f"act={actual:.3e} rho={rho:.3e} Ginf={float(metrics_trial['G_inf']):.3e} "
+                                        f"stat={float(metrics_trial['stationarity_inf']):.3e} "
+                                        f"slack={float(metrics_trial['slack_feas_inf']):.3e} "
+                                        f"eq={float(metrics_trial['equality_inf']):.3e} "
+                                        f"cent={float(metrics_trial['centrality_inf']):.3e} "
+                                        f"filter={int(filtered_ok)} reason={lm_reason}"
+                                    )
+                                if filtered_ok and phi_try < best_filtered_phi:
+                                    best_filtered_phi = phi_try
+                                    best_filtered_rho = float(rho)
+                                    best_filtered_alpha = float(min(alpha_pri_lm, alpha_dual_lm))
+                                    best_filtered_metrics = dict(metrics_trial)
+                                    best_filtered_x = np.asarray(x_trial, dtype=float).copy()
+                                    best_filtered_lam = np.asarray(lam_trial, dtype=float).copy()
+                                    best_filtered_z_lo = np.asarray(z_lo_trial, dtype=float).copy()
+                                    best_filtered_z_hi = np.asarray(z_hi_trial, dtype=float).copy()
+                                if np.isfinite(rho) and actual > 0.0 and rho >= lm_accept and filtered_ok:
+                                    accepted = True
+                                    accepted_branch = f"lm:{lm_reason}"
+                                    accepted_metrics = dict(metrics_trial)
+                                    self._vi_eq_lambda_current = np.asarray(lam_trial, dtype=float).copy()
+                                    z_lo = np.asarray(z_lo_trial, dtype=float).copy()
+                                    z_hi = np.asarray(z_hi_trial, dtype=float).copy()
+                                    self._ls_alpha_prev = float(min(alpha_pri_lm, alpha_dual_lm))
+                                    self._vi_last_metrics = dict(metrics_trial)
+                                    self._assert_functions_finite(funcs, context="after accepted interior-point LM step")
+                                    if self.post_cb is not None:
+                                        self.post_cb(funcs)
+                                    if getattr(self, "constraints", None) is not None:
+                                        self._enforce_constraints_on_functions(funcs)
+                                    if rho >= lm_good:
+                                        lm_lam = max(lm0, lm_lam * lm_decay if lm_lam > 0.0 else lm0)
+                                    self._vi_lm_lambda_current = float(min(max(lm_lam, lm0), lm_max))
+                                    break
+                                lm_lam = min(lm_max, max(lm_lam, lm0) * lm_growth if max(lm_lam, lm0) > 0.0 else lm0)
+
+                            if (
+                                not accepted
+                                and best_filtered_x is not None
+                                and best_filtered_lam is not None
+                                and best_filtered_z_lo is not None
+                                and best_filtered_z_hi is not None
+                                and best_filtered_phi < phi0_lm
+                                and np.isfinite(best_filtered_rho)
+                                and best_filtered_rho >= fallback_rho_min
+                            ):
+                                for f, buf in zip(funcs, snap):
+                                    f.nodal_values[:] = buf
+                                self._ipm_write_reduced_iterate(funcs, bcs_now, best_filtered_x)
+                                if self.pre_cb is not None:
+                                    self.pre_cb(funcs)
+                                if getattr(self, "constraints", None) is not None:
+                                    self._enforce_constraints_on_functions(funcs)
+                                accepted = True
+                                accepted_metrics = dict(best_filtered_metrics or metrics0)
+                                self._vi_eq_lambda_current = np.asarray(best_filtered_lam, dtype=float).copy()
+                                z_lo = np.asarray(best_filtered_z_lo, dtype=float).copy()
+                                z_hi = np.asarray(best_filtered_z_hi, dtype=float).copy()
+                                self._ls_alpha_prev = float(best_filtered_alpha)
+                                self._vi_last_metrics = dict(best_filtered_metrics or metrics0)
+                                accepted_branch = "lm:best-filter"
+                                self._assert_functions_finite(funcs, context="after accepted interior-point LM fallback step")
+                                if self.post_cb is not None:
+                                    self.post_cb(funcs)
+                                if getattr(self, "constraints", None) is not None:
+                                    self._enforce_constraints_on_functions(funcs)
+                                self._vi_lm_lambda_current = float(min(max(lm_lam, lm0), lm_max))
+                                if lm_trace:
+                                    print(
+                                        f"          [vi-ipm-lm] accepted best filtered fallback step "
+                                        f"rho={float(best_filtered_rho):.3e} alpha={float(best_filtered_alpha):.2e}"
+                                    )
+                            elif not accepted:
+                                self._vi_lm_lambda_current = float(max(lm0, 1.0e-30))
+
+                        if not accepted and ls_factor_ok:
+                            if trace_ipm:
+                                why = f"{accept_factor:g}·tol_eff (tol_eff={float(tol_eff):.3e})"
+                                print(
+                                    f"          [vi-ipm] accepting current iterate after line-search failure since "
+                                    f"|G|_∞={float(metrics0['G_inf']):.3e} <= {why}."
+                                )
+                            accepted = True
+                            accepted_metrics = dict(metrics0)
+                            self._ls_alpha_prev = 0.0
+                            self._vi_last_metrics = dict(metrics0)
+                            accepted_branch = "current-iterate-relaxed"
+
+                        if not accepted:
+                            for f, buf in zip(funcs, snap):
+                                f.nodal_values[:] = buf
+                            raise RuntimeError("Interior-point line search failed to decrease the barrier residual.")
+
+                    break
+
+                accepted_alpha_raw = getattr(self, "_ls_alpha_prev", None)
+                accepted_alpha = 1.0 if accepted_alpha_raw is None else float(accepted_alpha_raw)
+                accepted_g_ratio = float(accepted_metrics["G_inf"]) / max(float(metrics0["G_inf"]), 1.0e-30)
+                merit_ratio = float(accepted_metrics["merit"]) / max(merit0, 1.0e-30)
+                stage_filter_entries = self._ipm_register_filter_entry(stage_filter_entries, accepted_metrics)
+                self._vi_update_ptc_after_accept(
+                    ptc_mask=ptc_mask,
+                    metrics=metrics0,
+                    active_stable_count=0,
+                    changed=0,
+                    accepted_alpha=float(accepted_alpha),
+                    merit_ratio=float(merit_ratio),
+                    accepted_g_ratio=float(accepted_g_ratio),
+                )
+                if trace_ipm:
+                    print(
+                        "          [vi-ipm] "
+                        f"solve={lin_time:.2e}s alpha={accepted_alpha:.2e} "
+                        f"merit_ratio={merit_ratio:.3f} branch={accepted_branch}"
+                    )
+
+                z_floor = max(float(getattr(self.vi_params, "interior_point_initial_push", 1.0e-8) or 1.0e-8), 1.0e-14)
+                if np.any(lo_mask):
+                    z_lo[lo_mask] = np.maximum(np.asarray(z_lo[lo_mask], dtype=float), z_floor)
+                if np.any(hi_mask):
+                    z_hi[hi_mask] = np.maximum(np.asarray(z_hi[hi_mask], dtype=float), z_floor)
+
+            if stage_converged:
+                comp_vals = []
+                x_red = self._pack_reduced_iterate(funcs)
+                if np.any(lo_mask):
+                    comp_vals.append(np.asarray((x_red[lo_mask] - lo_red[lo_mask]) * z_lo[lo_mask], dtype=float))
+                if np.any(hi_mask):
+                    comp_vals.append(np.asarray((hi_red[hi_mask] - x_red[hi_mask]) * z_hi[hi_mask], dtype=float))
+                mu_prev = float(mu)
+                if comp_vals:
+                    comp_concat = np.concatenate(comp_vals, axis=0)
+                    mu = max(mu_min, min(float(mu) * mu_decay, 0.25 * float(np.mean(comp_concat))))
+                else:
+                    mu = mu_min
+                if mu < mu_prev - max(1.0e-30, 1.0e-12 * max(abs(mu_prev), abs(mu))):
+                    z_lo, z_hi = self._ipm_choose_barrier_transition_duals(
+                        x_red=x_red,
+                        R_red=R_red,
+                        lo_red=lo_red,
+                        hi_red=hi_red,
+                        eq_data=eq_data,
+                        lambda_eq=np.asarray(self._vi_eq_lambda_current, dtype=float),
+                        z_lo=z_lo,
+                        z_hi=z_hi,
+                        mu=float(mu),
+                        stationarity_red=np.asarray(residual_data["stationarity"], dtype=float),
+                        trace_ipm=bool(trace_ipm),
+                    )
+                final_barrier_tol = max(
+                    float(self.np.newton_tol),
+                    float(getattr(self.np, "newton_rtol", 0.0) or 0.0) * max(norm0_ref or 1.0, 1.0e-30),
+                    stage_tol_factor * mu_min,
+                )
+                if float(last_metrics["G_inf"]) <= final_barrier_tol and mu <= mu_min:
+                    break
+                continue
+            break
+
+        self._vi_eq_lambda_accepted = np.asarray(self._vi_eq_lambda_current, dtype=float).copy()
+        self._ipm_z_lo_current = np.asarray(z_lo, dtype=float).copy()
+        self._ipm_z_hi_current = np.asarray(z_hi, dtype=float).copy()
+        self._ipm_mu_current = float(mu)
+        self._last_nonlinear_norm = float(last_metrics["G_inf"])
+        self._last_nonlinear_norm_label = "|G|_∞"
+
+        tol_eff_final = max(
+            float(self.np.newton_tol),
+            float(getattr(self.np, "newton_rtol", 0.0) or 0.0) * max(norm0_ref or 1.0, 1.0e-30),
+            stage_tol_factor * mu_min,
+        )
+        converged = float(last_metrics["G_inf"]) <= tol_eff_final and float(mu) <= mu_min
+        if converged:
+            self._last_nonlinear_accepted = True
+            delta = np.hstack([f.nodal_values - f_prev.nodal_values for f, f_prev in zip(funcs, prev_funcs)])
+            return delta, True, int(total_iters)
+
+        final_accept = False
+        final_why = None
+        if accept_factor > 0.0 and atol > 0.0 and np.isfinite(float(last_metrics["G_inf"])) and float(last_metrics["G_inf"]) <= accept_factor * atol:
+            final_accept = True
+            final_why = f"{accept_factor:g}·atol (atol={atol:.3e})"
+        elif relaxed_g > 0.0 and np.isfinite(float(last_metrics["G_inf"])) and float(last_metrics["G_inf"]) <= relaxed_g:
+            final_accept = True
+            final_why = f"relaxed_filter_accept_ginf={relaxed_g:.3e}"
+        if final_accept:
+            print(
+                f"    [warn] Accepting interior-point best iterate since |G|_∞={float(last_metrics['G_inf']):.3e} "
+                f"≤ {final_why}."
+            )
+            self._last_nonlinear_reason = 2
+            self._last_nonlinear_accepted = True
+            self._last_nonlinear_relaxed_accept = True
+            delta = np.hstack([f.nodal_values - f_prev.nodal_values for f, f_prev in zip(funcs, prev_funcs)])
+            return delta, True, int(total_iters)
+
+        raise RuntimeError("Interior-point Newton did not converge – adjust tolerances/Δt or verify Jacobian.")
 
 
 
 
-
-
-
-
-# --- Helper functions for scattering into global NumPy arrays for PETSc ---
-# These can be added to the bottom of nonlinear_solver.py
-
-def _scatter_element_contribs_petsc(F_elem, element_ids, gdofs_map, target_vec):
-    """Scatters local vectors into a global NumPy vector."""
-    for i in range(len(element_ids)):
-        gdofs = gdofs_map[i]
-        valid = gdofs >= 0
-        if not np.any(valid):
-            continue
-        np.add.at(target_vec, gdofs[valid], F_elem[i][valid])
-
-def _scatter_mat_vec_petsc(K_elem, vec_loc_vals, element_ids, gdofs_map, target_vec):
-    """Computes local mat-vec products and scatters them into a global vector."""
-    for i in range(len(element_ids)):
-        gdofs = gdofs_map[i]
-        valid = gdofs >= 0
-        if not np.any(valid):
-            continue
-        
-        # Get local part of the input vector
-        v_loc = vec_loc_vals[gdofs[valid]]
-        
-        # Local mat-vec product
-        res_loc = K_elem[i][np.ix_(valid, valid)] @ v_loc
-        
-        # Add to global result vector
-        np.add.at(target_vec, gdofs[valid], res_loc)
 
 
 
@@ -1597,19 +17853,28 @@ if HAS_GIANT:
         def _newton_loop(self, funcs, prev_funcs, aux_funcs, bcs_now):
 
             dh      = self.dh
-            n_total = dh.total_dofs
+            self._current_bcs = bcs_now
+            n_total_eff = getattr(self.restrictor, "full_size", dh.total_dofs)
+            n_phys = getattr(self.restrictor, "phys_size", dh.total_dofs)
             active  = self.active_dofs         # free dofs (length n_free)
             n_free  = active.size
 
             # 1) pack the CURRENT iterate into a reduced vector x_red
             def _pack_reduced():
                 x_full = np.hstack([f.nodal_values for f in funcs])
+                if getattr(self, "constraints", None) is not None:
+                    x_master = self.constraints.restrict_full(x_full)
+                    return x_master[active].copy()
                 return x_full[active].copy()
 
             def _unpack_into_funcs(x_red):
                 # expand reduced → full, add to fields, re-apply BCs
-                dU_full = np.zeros(n_total)
-                dU_full[active] = x_red - _pack_reduced()  # delta on free dofs
+                delta_red = x_red - _pack_reduced()  # delta on free dofs
+                if getattr(self, "constraints", None) is not None:
+                    dU_full = self.restrictor.expand_vec(delta_red)
+                else:
+                    dU_full = np.zeros(n_phys)
+                    dU_full[active] = delta_red
                 dh.add_to_functions(dU_full, funcs)
                 dh.apply_bcs(bcs_now, *funcs)
 
@@ -1768,6 +18033,7 @@ class AdamNewtonSolver(NewtonSolver):
     def _newton_loop(self, funcs, prev_funcs, aux_funcs, bcs_now):
         dh     = self.dh
         np_    = self.np
+        self._current_bcs = bcs_now
 
         # allocate Adam buffers lazily
         ndof = sum(f.nodal_values.size for f in funcs)

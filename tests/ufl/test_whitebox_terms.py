@@ -1,7 +1,7 @@
 import numpy as np
 import scipy.sparse.linalg as spla
 import sympy as sp
-from pycutfem.ufl.functionspace import FunctionSpace
+from pycutfem.ufl.spaces import FunctionSpace
 from pycutfem.ufl.expressions import (
     VectorTrialFunction, VectorTestFunction, VectorFunction, div,
     grad, inner, dot, Constant, TrialFunction, TestFunction, Derivative

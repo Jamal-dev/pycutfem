@@ -1,0 +1,47 @@
+{
+  "benchmark": "example1",
+  "paper_selected_modes": {
+    "pressure_modes": 3,
+    "section_modes": 9
+  },
+  "mode_sweep": {
+    "best_validation_error": 9.324862259336908e-05,
+    "best_entry": {
+      "force_modes": 4,
+      "displacement_modes": 12,
+      "validation_error": 9.324862259336908e-05,
+      "regression_error": 6.86086603487704e-09
+    }
+  },
+  "structural_rom_against_fom": {
+    "same_mu_mean_sample_l2_error": 1.8414440238909275e-05,
+    "same_mu_max_relative_error": 0.000158656952902982,
+    "other_mu_mean_sample_l2_error": 8.488997085819404e-06,
+    "other_mu_max_relative_error": 2.0700817637129635e-05,
+    "same_mu_mean_inference_time_per_snapshot": 1.2650565865139167e-05,
+    "other_mu_mean_inference_time_per_snapshot": 1.12666057733198e-05
+  },
+  "published_coupled_results": {
+    "same_mu_pressure_mean_sample_l2_error": 0.0192003637241367,
+    "same_mu_diameter_mean_sample_l2_error": 1.4929067443078629e-05,
+    "same_mu_pressure_max_relative_error": 0.010771789265243513,
+    "same_mu_diameter_max_relative_error": 0.00016316346999993429,
+    "same_mu_iteration_overhead": 0.123334977799704,
+    "other_mu_pressure_mean_sample_l2_error": 0.007886075737353759,
+    "other_mu_diameter_mean_sample_l2_error": 9.898811149099407e-06,
+    "other_mu_pressure_max_relative_error": 0.0015872685871169971,
+    "other_mu_diameter_max_relative_error": 2.2832315645698795e-05,
+    "other_mu_iteration_overhead": 0.09657320872274143
+  },
+  "artifacts": {
+    "train_dataset": "/home/bhatti/Documents/pycutfem/examples/NIRB/artifacts/example1/train_snapshots.npz",
+    "same_forces": "/home/bhatti/Documents/pycutfem/examples/NIRB/artifacts/example1/same_mu_forces.npy",
+    "same_reference": "/home/bhatti/Documents/pycutfem/examples/NIRB/artifacts/example1/same_mu_reference.npy",
+    "other_forces": "/home/bhatti/Documents/pycutfem/examples/NIRB/artifacts/example1/other_mu_forces.npy",
+    "other_reference": "/home/bhatti/Documents/pycutfem/examples/NIRB/artifacts/example1/other_mu_reference.npy",
+    "same_coupled": "/home/bhatti/Documents/pycutfem/examples/NIRB/artifacts/example1/same_mu_coupled_rom_fom.npz",
+    "other_coupled": "/home/bhatti/Documents/pycutfem/examples/NIRB/artifacts/example1/other_mu_coupled_rom_fom.npz",
+    "model": "/home/bhatti/Documents/pycutfem/examples/NIRB/artifacts/example1/model.pkl",
+    "results": "/home/bhatti/Documents/pycutfem/examples/NIRB/artifacts/example1/results.json"
+  }
+}

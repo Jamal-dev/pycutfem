@@ -24,6 +24,20 @@ def gauss_legendre(order: int):
         raise ValueError(order)
     return leggauss(order)  # (points, weights)
 
+def gauss_lobatto(order: int):
+    """Gauss-Lobatto-Legendre nodes and weights on [-1, 1]."""
+    order = int(order)
+    if order < 2:
+        raise ValueError("Gauss-Lobatto quadrature requires at least two points.")
+    if order == 2:
+        return np.asarray([-1.0, 1.0], dtype=float), np.asarray([1.0, 1.0], dtype=float)
+    basis = np.polynomial.legendre.Legendre.basis(order - 1)
+    interior = np.sort(basis.deriv().roots())
+    xi = np.concatenate(([-1.0], interior, [1.0])).astype(float)
+    p = basis(xi)
+    weights = 2.0 / (order * (order - 1) * p * p)
+    return xi, weights.astype(float)
+
 def _gl01(order: int):
     """Gauss–Legendre nodes and weights mapped to [0,1]."""
     xi, w = gauss_legendre(int(order))
@@ -46,10 +60,15 @@ def tri_rule(order: int,dunavant_deg: int = None):
     degree = 2 * order if dunavant_deg is None else dunavant_deg
     if degree in range(1, 21):
         pts = DUNAVANT[degree].points
+        wts = DUNAVANT[degree].weights
         # Guard against accidental barycentric triplets
         if pts.ndim == 2 and pts.shape[1] == 3:
             pts = pts[:, 1:]  # (xi, eta) = (L2, L3)
-        return pts, DUNAVANT[degree].weights
+        if degree == 2 and pts.shape == (3, 2):
+            # Match Kratos TriangleGaussLegendreIntegrationPoints2 q-loop order.
+            kratos_order = np.array([2, 1, 0], dtype=np.int64)
+            return pts[kratos_order], wts[kratos_order]
+        return pts, wts
     
     xi, wi = gauss_legendre(order)
     u = 0.5 * (xi + 1.0)   # [0,1]
@@ -328,15 +347,42 @@ def _barycentric_basis_mats(order: int, p: int):
     # Broadcasted barycentric eval
     # t_{i,j} = w_j / (s_i - x_j)
     denom = (s_i[:, None] - x[None, :])
-    t = w[None, :] / denom                         # (ng, m)
-    T1 = t.sum(axis=1, keepdims=True)              # (ng,1)
-    N = t / T1                                     # (ng, m)
+    close_mask = np.isclose(denom, 0.0, atol=1e-14)
 
-    # For derivatives, use: N'_j(s) = [ -w_j/(s-x_j)^2 * T1 + (w_j/(s-x_j)) * T2 ] / T1^2
-    inv = 1.0 / denom
-    inv2 = inv * inv                               # (ng, m)
-    T2 = (w[None, :] * inv2).sum(axis=1, keepdims=True)  # (ng,1)
-    dN = ((-w[None, :] * inv2) * T1 + (w[None, :] * inv) * T2) / (T1 * T1)
+    denom_safe = denom.copy()
+    denom_safe[close_mask] = 1.0  # temporary placeholder to avoid division by zero
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        t = w[None, :] / denom_safe                   # (ng, m)
+    T1 = t.sum(axis=1, keepdims=True)                 # (ng,1)
+    N = t / T1                                        # (ng, m)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        inv = 1.0 / denom_safe
+        inv2 = inv * inv                               # (ng, m)
+        T2 = (w[None, :] * inv2).sum(axis=1, keepdims=True)  # (ng,1)
+        dN = ((-w[None, :] * inv2) * T1 + (w[None, :] * inv) * T2) / (T1 * T1)
+
+    if np.any(close_mask):
+        ng, m = close_mask.shape
+        for iq in range(ng):
+            if not np.any(close_mask[iq]):
+                continue
+            js = np.flatnonzero(close_mask[iq])
+            if js.size != 1:
+                raise ValueError("Multiple coincident interpolation nodes detected in barycentric quadrature.")
+            k = js[0]
+            # Basis value: l_k(s_i)=1, others 0
+            N[iq, :] = 0.0
+            N[iq, k] = 1.0
+
+            # Derivative limits using barycentric weights
+            for j in range(m):
+                if j == k:
+                    continue
+                dN[iq, j] = w[j] / (w[k] * (x[k] - x[j]))
+            dN[iq, k] = -np.sum(dN[iq, np.arange(m) != k])
+
     return s_i, w_g, N, dN
 
 def _eval_phi_batch(level_set, X):

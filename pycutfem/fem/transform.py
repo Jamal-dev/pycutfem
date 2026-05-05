@@ -6,6 +6,7 @@ from pycutfem.fem.reference import get_reference
 from functools import lru_cache
 import warnings
 from typing import Tuple, Dict, Any
+import os
 
 # ---------- small utilities ----------
 
@@ -80,6 +81,48 @@ def inv_jac_T(mesh, elem_id, xi_eta):
     J = jacobian(mesh, elem_id, xi_eta)
     return np.linalg.inv(J).T
 
+
+def piola_contravariant(J: np.ndarray, detJ: float, uhat: np.ndarray) -> np.ndarray:
+    """
+    Contravariant Piola map for H(div) vector fields (2D).
+
+        u(x) = (J * û(ξ)) / det(J)
+
+    Parameters
+    ----------
+    J : np.ndarray, shape (2,2)
+        Jacobian of the element map at the evaluation point.
+    detJ : float
+        Determinant of J at the evaluation point.
+    uhat : np.ndarray
+        Reference vector values. Supported shapes:
+        - (2,)
+        - (n,2)
+        - (...,2)
+
+    Returns
+    -------
+    np.ndarray
+        Mapped values with the same shape as `uhat`.
+    """
+    J = np.asarray(J, dtype=float)
+    detJ = float(detJ)
+    if J.shape != (2, 2):
+        raise ValueError(f"piola_contravariant expects J shape (2,2), got {J.shape}")
+    if abs(detJ) < 1e-30:
+        raise ValueError("piola_contravariant: detJ is too small")
+
+    v = np.asarray(uhat, dtype=float)
+    if v.ndim == 1:
+        if v.shape != (2,):
+            raise ValueError(f"piola_contravariant expects (2,), got {v.shape}")
+        return (J @ v) / detJ
+
+    if v.shape[-1] != 2:
+        raise ValueError(f"piola_contravariant expects last dim 2, got {v.shape}")
+
+    # Treat last axis as vector components stored as row vectors.
+    return (v @ J.T) / detJ
 
 
 @staticmethod
@@ -246,7 +289,21 @@ def inverse_mapping(mesh, elem_id, x, tol=1e-10, maxiter=50):
             # IMPORTANT: The _invmap_q1_try assumes a node order that may not match your
             # project's lexicographical order. Ensure `coords[:4]` is ordered correctly.
             if mesh.element_type == 'quad' and coords.shape[0] >= 4:
-                r = _invmap_q1_try(coords[:4], x, tol, maxiter)
+                # The numba Q1 inverse-map kernel (_q1_shape_grad) uses a CCW corner
+                # ordering: [(-1,-1),(+1,-1),(+1,+1),(-1,+1)] i.e. [bl, br, tr, tl].
+                # Our meshes typically store Q1 element lattice nodes in lexicographic
+                # order [bl, br, tl, tr]. Prefer `corner_connectivity` when available
+                # and fall back to a swap of the last two corners.
+                try:
+                    cc = getattr(mesh, "corner_connectivity", None)
+                    if cc is not None:
+                        coords_q1 = mesh.nodes_x_y_pos[np.asarray(cc[int(elem_id)], dtype=int)].astype(float)
+                    else:
+                        coords_q1 = coords[:4].copy()
+                        coords_q1 = coords_q1[[0, 1, 3, 2]]
+                except Exception:
+                    coords_q1 = coords[:4]
+                r = _invmap_q1_try(coords_q1[:4], x, tol, maxiter)
                 if r[2] == 1.0: return r[:2]
         
         # --- ADDED: Fast path for Q2 elements ---
@@ -620,8 +677,14 @@ def inverse_A4_material(A: np.ndarray, A2: np.ndarray,
 
 class InverseJetCache:
     """Cache geometry jets per (mesh, elem_id, xi, eta)."""
-    def __init__(self):
+    def __init__(self, *, max_entries: int | None = None):
         self.store: Dict[tuple, Dict[str, Any]] = {}
+        if max_entries is None:
+            try:
+                max_entries = int(os.getenv("PYCUTFEM_INVERSE_JET_CACHE_MAX", "200000") or "200000")
+            except Exception:
+                max_entries = 200000
+        self.max_entries = int(max_entries)
 
     def get(self, mesh, elem_id: int, xi: float, eta: float, upto: int = 4) -> Dict[str, Any]:
         k = _key(mesh, elem_id, xi, eta)
@@ -629,6 +692,14 @@ class InverseJetCache:
         if rec is None:
             rec = {}
             self.store[k] = rec
+            # Bound memory: moving-interface problems can generate a huge number
+            # of distinct (elem,xi,eta) keys over time. Keep this cache bounded.
+            if self.max_entries > 0:
+                while len(self.store) > self.max_entries:
+                    try:
+                        self.store.pop(next(iter(self.store)))
+                    except Exception:
+                        break
 
         # J, A
         if "J" not in rec or "A" not in rec:

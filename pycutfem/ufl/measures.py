@@ -43,7 +43,14 @@ class Measure:
     @property
     def on_facet(self) -> bool:
         return self.domain_type in {
-            "interior_facet", "exterior_facet", "interface", "ghost_edge"
+            "interior_facet",
+            "cut_interior_facet",
+            "exterior_facet",
+            "interface",
+            "nonmatching_interface",
+            "trace_link",
+            "ghost_edge",
+            "facet_patch",
         }
 
     def __call__(self, 
@@ -97,11 +104,44 @@ dx = Measure("volume")
 #: Measure for integration over interior facets (edges).
 ds = Measure("interior_facet")
 
+#: Measure for integration over (a subset of) interior facets, restricted to one
+#: side of a level-set-defined domain.
+#:
+#: Mathematically, this represents integrals of the form
+#:
+#:   ∫_{F_h ∩ Ω^±}  f  ds,
+#:
+#: where F_h is the mesh skeleton (interior facets) and Ω^± = {φ ≶ 0}.
+#: This is used by facet-based stabilizations (e.g. CIP/ghost-penalty terms)
+#: that penalize jumps of derivatives across interior facets to control
+#: cut-cell ill-conditioning while remaining consistent with the physical side Ω^±.
+dCutSkeleton = Measure("cut_interior_facet")
+
 #: Measure for integration over exterior (boundary) facets (edges).
 dS = Measure("exterior_facet")
 
 #: Measure for integration over a level-set-defined interface.
 dInterface = Measure("interface")
 
+# Measure for integration over a non-matching interface (common-refinement segments).
+dNonmatchingInterface = Measure("nonmatching_interface")
+
+#: Measure for integration over discrete trace/link entities.
+#:
+#: ``dTraceLink`` is used for Trace-FEM style line entities whose traces are
+#: not a mesh facet and not a common refinement of two facets.  The integration
+#: domain supplies explicit quadrature/station tables through
+#: ``metadata={'trace': TraceLinkInterface(...)}``; UFL forms can still use
+#: ``Pos(...)``, ``Neg(...)``, ``FacetNormal()``, gradients and quadrature-state
+#: coefficients, but the sided values come from the trace-link table contract.
+dTraceLink = Measure("trace_link")
+
 # New: Measure for integration over ghost edges for CutFEM stabilization.
 dGhost = Measure("ghost_edge")
+
+# Facet-patch (two-element volume patch) integrals.
+# These represent patch measures on the union of the two elements adjacent to an
+# interior facet, with polynomial extension/traces evaluated from both sides.
+# Patch integrals are a standard device for CutFEM/AgFEM stabilizations because
+# they give control on small cut cells by coupling them to their neighbors.
+dFacetPatch = Measure("facet_patch")

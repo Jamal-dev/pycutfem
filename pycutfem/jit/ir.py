@@ -1,5 +1,5 @@
 # pycutfem/jit/ir.py
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Union, Tuple, Callable, Any, Optional, List
 
 # --- IR Node Definitions ---
@@ -14,6 +14,7 @@ class LoadVariable:
     field_names: list = field(default_factory=list) 
     side: str = ""           # "", "+", or "-"   ← NEW
     field_sides: Optional[List[str]] = None
+    component_index: Optional[int] = None
 
 @dataclass(frozen=True, slots=True)
 class LoadConstant:
@@ -24,6 +25,13 @@ class LoadConstant:
 class LoadElementWiseConstant:
     """Instruction to load a value from a per-element data array."""
     name: str          # An identifier for the data array
+    tensor_shape: tuple[int, ...] = field(default=())
+
+
+@dataclass(frozen=True, slots=True)
+class LoadQuadratureState:
+    """Instruction to load a value from a per-element, per-quadrature data array."""
+    name: str
     tensor_shape: tuple[int, ...] = field(default=())
 
 @dataclass(frozen=True, slots=True)
@@ -45,9 +53,25 @@ class Grad:
     """Instruction to compute the gradient of the top of the stack."""
     pass
 
+
+@dataclass(frozen=True, slots=True)
+class PackGradient:
+    """Pack two scalar derivative components (dx, dy) into a gradient value."""
+    pass
+
 @dataclass(frozen=True, slots =True)
 class Div:
     """Instruction to compute the divergence of the top of the stack."""
+    pass
+
+@dataclass(frozen=True, slots=True)
+class HdivDiv:
+    """
+    Instruction to compute divergence of an H(div) (RT) quantity.
+
+    Unlike `Div`, this does not require a gradient tensor on the stack. The code
+    generator lowers this using pre-tabulated RT divergence tables.
+    """
     pass
 
 @dataclass(frozen=True, slots =True)
@@ -58,6 +82,99 @@ class PosOp:
 @dataclass(frozen=True, slots =True)
 class NegOp:
     """Instruction to apply the negative-side restriction: v if phi<0 else 0."""
+    pass
+
+@dataclass(frozen=True, slots=True)
+class PositivePartOp:
+    """Instruction to apply the hard positive part: max(x, 0)."""
+    pass
+
+@dataclass(frozen=True, slots=True)
+class HeavisideOp:
+    """Instruction to apply a hard Heaviside step: 1 if x>0 else 0 (H(0)=0)."""
+    pass
+
+@dataclass(frozen=True, slots=True)
+class LogOp:
+    """Instruction to apply the natural logarithm log(x)."""
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class ExpOp:
+    """Instruction to apply the natural exponential exp(x)."""
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class TanhOp:
+    """Instruction to apply the hyperbolic tangent tanh(x)."""
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class SinOp:
+    """Instruction to apply the trigonometric sine sin(x)."""
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class CosOp:
+    """Instruction to apply the trigonometric cosine cos(x)."""
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class TanOp:
+    """Instruction to apply the trigonometric tangent tan(x)."""
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class AsinOp:
+    """Instruction to apply the inverse sine asin(x)."""
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class AcosOp:
+    """Instruction to apply the inverse cosine acos(x)."""
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class AtanOp:
+    """Instruction to apply the inverse tangent atan(x)."""
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class SinhOp:
+    """Instruction to apply the hyperbolic sine sinh(x)."""
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class CoshOp:
+    """Instruction to apply the hyperbolic cosine cosh(x)."""
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class AsinhOp:
+    """Instruction to apply the inverse hyperbolic sine asinh(x)."""
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class AcoshOp:
+    """Instruction to apply the inverse hyperbolic cosine acosh(x)."""
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class AtanhOp:
+    """Instruction to apply the inverse hyperbolic tangent atanh(x)."""
     pass
 
 @dataclass(frozen=True, slots =True)
@@ -75,6 +192,11 @@ class Dot:
     """Instruction to compute the dot product of the top two stack items."""
     pass
 
+@dataclass(frozen=True, slots=True)
+class Outer:
+    """Instruction to compute the outer product (dyad) of the top two stack items."""
+    pass
+
 @dataclass(frozen=True, slots =True)
 class Store:
     """Instruction to store the final result to an accumulator."""
@@ -86,6 +208,9 @@ class LoadConstantArray:
     """Instruction to load a constant array passed as a kernel argument."""
     name: str # A unique identifier for the constant array
     shape: Tuple[int, ...] # Shape of the constant array
+    role: str = "const"
+    is_vector: bool = False
+    is_gradient: bool = False
 
 @dataclass(frozen=True, slots=True)
 class Transpose:
@@ -97,6 +222,11 @@ class CellDiameter:
     pass
 
 @dataclass(frozen=True, slots=True)
+class MeshSize:
+    """Pointwise NGSolve-like specialcf.mesh_size (depends on detJ at the QP)."""
+    pass
+
+@dataclass(frozen=True, slots=True)
 class LoadFacetNormalComponent:
     """Load n[idx] (scalar component of the facet normal)."""
     idx: int
@@ -105,6 +235,29 @@ class LoadFacetNormalComponent:
 class CheckDomain:
     """Instruction to check if the current element is in a domain BitSet."""
     bitset_id: str
+    side: str = ""
+
+
+def strip_side_metadata(ir_sequence: list, *, on_facet: bool) -> list:
+    """
+    Remove side/field_sides annotations for volume kernels.
+    This keeps Pos/Neg gating intact while preventing sided tables/args
+    from being requested outside facet integrals.
+    """
+    if on_facet:
+        return ir_sequence
+    out = []
+    for op in ir_sequence:
+        if isinstance(op, LoadVariable):
+            if op.side or getattr(op, "field_sides", None):
+                out.append(replace(op, side="", field_sides=None))
+            else:
+                out.append(op)
+        elif isinstance(op, CheckDomain) and op.side:
+            out.append(replace(op, side=""))
+        else:
+            out.append(op)
+    return out
 
 @dataclass(frozen=True, slots=True)
 class Trace:
@@ -112,7 +265,37 @@ class Trace:
     pass
 
 @dataclass(frozen=True, slots=True)
-class Hessian:   pass
+class Determinant:
+    """Instruction to compute the determinant of the tensor on top of the stack."""
+    pass
 
 @dataclass(frozen=True, slots=True)
-class Laplacian: pass
+class Inverse:
+    """Instruction to compute the inverse of the tensor on top of the stack."""
+    pass
+
+@dataclass(frozen=True, slots=True)
+class Cofactor:
+    """Instruction to compute the cofactor (adjugate) of the tensor on top of the stack."""
+    pass
+
+@dataclass(frozen=True, slots=True)
+class Hessian:
+    """Instruction to compute the Hessian of the top of the stack.
+
+    `field_names` is used by backends to request the required second-derivative tables.
+    """
+
+    field_names: list = field(default_factory=list)
+    side: str = ""  # "", "+", or "-"
+
+
+@dataclass(frozen=True, slots=True)
+class Laplacian:
+    """Instruction to compute the Laplacian of the top of the stack.
+
+    `field_names` is used by backends to request the required second-derivative tables.
+    """
+
+    field_names: list = field(default_factory=list)
+    side: str = ""  # "", "+", or "-"

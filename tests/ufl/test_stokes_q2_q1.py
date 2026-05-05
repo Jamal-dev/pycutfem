@@ -10,7 +10,7 @@ from pycutfem.fem.mixedelement import MixedElement
 from pycutfem.utils.meshgen  import structured_quad
 
 # --- UFL-like front-end ---
-from pycutfem.ufl.functionspace import FunctionSpace
+from pycutfem.ufl.spaces import FunctionSpace
 from pycutfem.ufl.expressions   import (
     TrialFunction, TestFunction, VectorTrialFunction, VectorTestFunction,
     grad, inner, dot, div, Constant

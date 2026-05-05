@@ -1,0 +1,104 @@
+{
+  "name": "lie_best_fit_v3_similarity_optflow",
+  "description": "Best-fit parameters for the Lie (Li et al. 2020, BIT27491) deformation benchmark using similarity-based anchor alignment (Fig. 5a), a slit-sealed smoothed t=0 polygon, and a DIC-like optical-flow experimental dx(t) extraction. NOTE: these are effective poroelastic surrogate parameters (not the Oldroyd-B PF parameters from Li et al.).",
+  "reference": {
+    "paper_doi": "10.1002/bit.27491",
+    "video_s1": "examples/biofilms/benchmarks/lie/additional_data/bit27491-sup-0001-si_v1.avi",
+    "fig5a_jpg": "examples/biofilms/benchmarks/lie/additional_data/figure_5_a.jpg",
+    "anchor_json": "examples/biofilms/benchmarks/lie/anchor_frame0_similarity.json",
+    "exp_target_csv": "examples/biofilms/benchmarks/lie/exp_s1_dx_optflow_leftmost_similarity.csv",
+    "alpha0_polygon_mm_csv": "examples/biofilms/benchmarks/lie/biofilm_exp_s1_frame0_polygon_mm_similarity_smooth.csv"
+  },
+  "geometry_m": {
+    "L": 0.015,
+    "H": 0.01,
+    "block_w": 0.001,
+    "block_h": 0.003,
+    "block_xc": 0.0075
+  },
+  "flow": {
+    "rho_f": 1000.0,
+    "mu_f": 0.001,
+    "u_avg": 0.0006,
+    "t_ramp": 8.0
+  },
+  "indicator_transport": {
+    "transport_mode": "pde",
+    "D_alpha": 0.0,
+    "alpha_advection_form": "conservative",
+    "alpha_ch_M": 1e-12,
+    "alpha_ch_gamma": 0.002,
+    "alpha_ch_eps": 0.0002,
+    "alpha_ch_mobility": "degenerate",
+    "alpha_supg": 0.0,
+    "alpha_cip": 0.0
+  },
+  "mixture_viscosity": {
+    "mu_b_model": "mu",
+    "mu_b_fluid": 0.001
+  },
+  "skeleton_effective_params": {
+    "solid_model": "linear",
+    "G_b": 0.000120536,
+    "mu_b": 0.03,
+    "nu": 0.49,
+    "kappa_inv": 100000000.0
+  },
+  "skeleton_dof_restriction": {
+    "restrict_skeleton_dofs": true,
+    "restrict_skeleton_alpha_min": 0.01
+  },
+  "dx_measurement": {
+    "sim_dx_intersection": "leftmost",
+    "exp_dx_method": "opticalflow",
+    "exp_scale_mode": "scalebar",
+    "exp_hb_from_polygon_mm_csv": true
+  },
+  "numerics": {
+    "dt": 1.0,
+    "t_final": 20.0,
+    "theta": 1.0,
+    "newton_tol": 1e-5,
+    "max_it": 15,
+    "snes_accept_factor": 5.0,
+    "allow_dt_reduction": true,
+    "dt_min": 0.2,
+    "dt_reduction_factor": 0.5,
+    "stop_on_steady": true,
+    "steady_tol": 1e-11,
+    "backend": "cpp",
+    "quadrature_order_q": 6,
+    "mesh_cells": {
+      "nx": 60,
+      "ny": 30,
+      "nx_left": 21,
+      "nx_mid": 18,
+      "nx_right": 21,
+      "ny_bottom": 6,
+      "ny_top": 24
+    }
+  },
+  "fit_metrics": {
+    "rmse_total_um": 20.357796,
+    "rmse_lines_um": {
+      "line1": 20.19866,
+      "line2": 24.91386,
+      "line3": 14.65036
+    },
+    "mae_total_um": 16.18721,
+    "mae_lines_um": {
+      "line1": 15.92596,
+      "line2": 20.43904,
+      "line3": 12.19663
+    },
+    "relative_errors_percent": {
+      "line1": 19.8,
+      "line2": 25.4,
+      "line3": 21.1,
+      "total": 22.2
+    },
+    "notes": "Metrics computed by examples/biofilms/benchmarks/lie/compare_exp_sim_timeseries_dx.py with --smooth-exp 5. Relative error uses the paper's 'every second datum' convention as implemented in the script."
+  },
+  "repro_command": "conda run --no-capture-output -n fenicsx python -u examples/biofilms/benchmarks/lie/lie_synthetic_deformation_one_domain.py --backend cpp --transport-mode pde --alpha-advection-form conservative --alpha-ch-M 1e-12 --alpha-ch-gamma 2e-3 --D-alpha 0 --alpha0-kind polygon --alpha0-file examples/biofilms/benchmarks/lie/biofilm_exp_s1_frame0_polygon_mm_similarity_smooth.csv --alpha0-scale 1e-3 --alpha0-align block --mu-b-model mu --mu-b-fluid 1e-3 --solid-model linear --G-b 1.20536e-4 --mu-b 3e-2 --kappa-inv 1e8 --u-avg 6e-4 --t-ramp 8 --dt 1.0 --t-final 20 --newton-tol 1e-5 --max-it 15 --snes-accept-factor 5 --allow-dt-reduction --dt-min 0.2 --dt-reduction-factor 0.5 --stop-on-steady --steady-tol 1e-11 --restrict-skeleton-alpha-min 0.01 --nx 60 --ny 30 --nx-left 21 --nx-mid 18 --nx-right 21 --ny-bottom 6 --ny-top 24 --q 6 --vtk-every 0 --dx-intersection leftmost --out-dir out/_lie_best_fit_v3_similarity_optflow"
+}
+

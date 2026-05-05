@@ -1,0 +1,6 @@
+# Keep literature TeX/PDF copies and generated outputs out of git.
+*.tex
+*.pdf
+results/
+__pycache__/
+*.pyc

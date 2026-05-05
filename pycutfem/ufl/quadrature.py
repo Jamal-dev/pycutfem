@@ -7,9 +7,10 @@ from typing import TYPE_CHECKING, Dict
 from pycutfem.ufl.analytic import Analytic
 from pycutfem.ufl.expressions import (
     Expression, Constant, TestFunction, TrialFunction, VectorTestFunction,
-    VectorTrialFunction, Function, VectorFunction, Grad, DivOperation, Inner,
+    VectorTrialFunction, Function, VectorFunction, HdivTestFunction, HdivTrialFunction, Grad, DivOperation, Inner,
     Dot, Sum, Sub, Prod, Pos, Neg, Div, FacetNormal, ElementWiseConstant, Jump,
-    Derivative
+    Derivative, Transpose, Trace, Determinant, Cofactor, Inverse, PositivePart, Heaviside, Log, Exp, Tanh,
+    Sin, Cos, Tan, Asin, Acos, Atan, Sinh, Cosh, Asinh, Acosh, Atanh
 )
 
 if TYPE_CHECKING:
@@ -58,6 +59,9 @@ class PolynomialDegreeEstimator:
             result = self.me._field_orders[expr.field_name]
         elif isinstance(expr, (VectorTestFunction, VectorTrialFunction, VectorFunction)):
             result = self.me._field_orders[expr.field_names[0]]
+        elif isinstance(expr, (HdivTestFunction, HdivTrialFunction)):
+            # RT_k vector basis components are degree (k+1) on affine cells.
+            result = int(self.me._field_orders[expr.field_name]) + 1
 
         # --- Recursive Cases: Operators ---
         elif isinstance(expr, Grad):
@@ -72,8 +76,35 @@ class PolynomialDegreeEstimator:
             result = self._get_degree(expr.a) + self._get_degree(expr.b)
         elif isinstance(expr, (Pos, Neg)):
             result = self._get_degree(expr.operand)
+        elif isinstance(expr, (PositivePart, Heaviside)):
+            # Non-smooth unary wrappers; treat as degree of operand.
+            result = self._get_degree(expr.operand)
+        elif isinstance(expr, (Log, Exp, Tanh, Sin, Cos, Tan, Asin, Acos, Atan, Sinh, Cosh, Asinh, Acosh, Atanh)):
+            # Smooth unary non-polynomial wrappers reuse the operand degree as a conservative proxy.
+            result = self._get_degree(expr.operand)
+        elif isinstance(expr, Transpose):
+            # Transpose does not change polynomial degree.
+            result = self._get_degree(expr.A)
+        elif isinstance(expr, Trace):
+            # trace(A) is a sum of diagonal entries → same degree as A.
+            result = self._get_degree(expr.A)
+        elif isinstance(expr, Determinant):
+            # In 2D: det(A) = a11*a22 - a12*a21 → degree bounded by 2*max(deg(A_ij)).
+            # Use spatial_dim*deg(A) as a conservative heuristic.
+            dim = int(getattr(self.me.mesh, "spatial_dim", 2) or 2)
+            result = dim * self._get_degree(expr.A)
+        elif isinstance(expr, Cofactor):
+            # cof(A) contains (dim-1)x(dim-1) minors. In 2D this is the same degree as A.
+            dim = int(getattr(self.me.mesh, "spatial_dim", 2) or 2)
+            result = max(0, dim - 1) * self._get_degree(expr.A)
+        elif isinstance(expr, Inverse):
+            # inv(A) is generally rational (adj(A)/det(A)); pick a conservative polynomial proxy.
+            dim = int(getattr(self.me.mesh, "spatial_dim", 2) or 2)
+            result = dim * self._get_degree(expr.A)
         elif isinstance(expr, FacetNormal):
             result = self._geom_deg
+        elif getattr(expr, "_is_quadrature_state_coefficient", False):
+            result = 0
         elif isinstance(expr, ElementWiseConstant):
             # ElementWiseConstant is a special case that should not be confused with Constant.
             # It represents a constant value that is element-wise, so its degree is 0.

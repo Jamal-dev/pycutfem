@@ -1,0 +1,22 @@
+{
+  "local_output_dir": "/home/bhatti/Documents/pycutfem/examples/NIRB/artifacts/example2_local_re301_step1_fixprev_g1e-4",
+  "reference_case": "08.3",
+  "reference_interface_coords_path": "/home/bhatti/Documents/pycutfem/.tmp/nirb_benchmarks/DoubleFlap/coSimData/downloaded_coords_interf.npy",
+  "reference_cfd_vtk": "/home/bhatti/Documents/pycutfem/.tmp/nirb_benchmarks/DoubleFlap_lfs_step1/Double_E10/08.3/vtk_data/vtk_output_fsi_cfd/FluidParts_FluidPart_0_1.vtk",
+  "reference_csm_vtk": "/home/bhatti/Documents/pycutfem/.tmp/nirb_benchmarks/DoubleFlap_lfs_step1/Double_E10/08.3/vtk_data/vtk_output_fsi_csm/Structure_0_1.vtk",
+  "reference_iters_path": "/home/bhatti/Documents/pycutfem/.tmp/nirb_benchmarks/DoubleFlap_lfs_step1/Double_E10/08.3/coSimData/iters.npy",
+  "reference_step1_coupling_iterations": 6,
+  "reference_interface_points": 265,
+  "local_interface_points": 10,
+  "snapshot_index": -1,
+  "disp_abs_rms": 5.81291394488679e-07,
+  "disp_abs_max": 1.460923639757039e-06,
+  "disp_rel_l2": 0.7888839527968825,
+  "velocity_abs_rms": 0.00015462473828562143,
+  "velocity_abs_max": 0.0003862776682360278,
+  "velocity_rel_l2": 0.8865942687589422,
+  "reference_disp_max_norm": 1.8566539663701081e-06,
+  "reference_velocity_max_norm": 0.00043944472278835124,
+  "local_disp_max_norm": 4.756370328031894e-07,
+  "local_velocity_max_norm": 5.945462910039867e-05
+}

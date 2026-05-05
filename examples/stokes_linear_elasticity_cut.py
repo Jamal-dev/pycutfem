@@ -32,7 +32,7 @@ from pycutfem.fem.mixedelement import MixedElement
 from pycutfem.core.geometry import hansbo_cut_ratio
 
 # UFL-like front-end
-from pycutfem.ufl.functionspace import FunctionSpace
+from pycutfem.ufl.spaces import FunctionSpace
 from pycutfem.ufl.expressions import (
     TrialFunction, TestFunction, VectorTrialFunction, VectorTestFunction,
     Function, VectorFunction, Constant, grad, inner, dot, div, Jump,
@@ -331,11 +331,14 @@ l_svc = (
 
 # Interface Γ: symmetric Nitsche for u_f = u_s; traction equilibrium enforced symmetrically
 tau_N = Constant(beta_N)/hcell# * Constant(max(mu_f, mu_s)) 
-# Hansbo weights θ^+, θ^- (per element); element-wise constants
+# Hansbo weights θ^+, θ^- (per element); normalize across interface edges
 theta_pos_vals = hansbo_cut_ratio(mesh, level_set, side='+')
-theta_neg_vals = 1.0 - theta_pos_vals
-kappa_pos = Pos(ElementWiseConstant(theta_pos_vals))
-kappa_neg = Neg(ElementWiseConstant(theta_neg_vals))
+theta_neg_vals = hansbo_cut_ratio(mesh, level_set, side='-')
+theta_pos_cell = ElementWiseConstant(theta_pos_vals)
+theta_neg_cell = ElementWiseConstant(theta_neg_vals)
+theta_sum = Pos(theta_pos_cell) + Neg(theta_neg_cell) + Constant(1.0e-12)
+kappa_pos = Pos(theta_pos_cell) / theta_sum
+kappa_neg = Neg(theta_neg_cell) / theta_sum
 jump_u_trial = Pos(du_f) - Neg(du_s)
 jump_u_test  = Pos(v_f)  - Neg(v_s)
 jump_u_res   = Pos(uf_k) - Neg(us_k)

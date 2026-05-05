@@ -99,7 +99,7 @@ from pycutfem.core.dofhandler import DofHandler
 from pycutfem.utils.meshgen import structured_quad
 
 # --- UFL-like imports ---
-from pycutfem.ufl.functionspace import FunctionSpace
+from pycutfem.ufl.spaces import FunctionSpace
 from pycutfemufl.expressions import (
     TrialFunction, TestFunction, VectorTrialFunction, VectorTestFunction,
     grad, inner, dot, div, Constant, Function, VectorFunction

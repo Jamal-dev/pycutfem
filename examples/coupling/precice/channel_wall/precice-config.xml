@@ -1,0 +1,54 @@
+<?xml version="1.0"?>
+<precice-configuration>
+  <log enabled="true">
+    <sink enabled="true" filter="%Severity% >= info" format="[%Time%] %Message%" />
+  </log>
+
+  <data:scalar name="Pressure" />
+  <data:scalar name="DisplacementY" />
+
+  <mesh name="Fluid-Interface-Mesh" dimensions="2">
+    <use-data name="Pressure" />
+    <use-data name="DisplacementY" />
+  </mesh>
+
+  <mesh name="Solid-Interface-Mesh" dimensions="2">
+    <use-data name="Pressure" />
+    <use-data name="DisplacementY" />
+  </mesh>
+
+  <participant name="FluidSolver">
+    <provide-mesh name="Fluid-Interface-Mesh" />
+    <receive-mesh name="Solid-Interface-Mesh" from="SolidSolver" />
+    <write-data name="Pressure" mesh="Fluid-Interface-Mesh" />
+    <read-data name="DisplacementY" mesh="Fluid-Interface-Mesh" />
+    <mapping:nearest-neighbor direction="write" from="Fluid-Interface-Mesh" to="Solid-Interface-Mesh" constraint="consistent" />
+    <mapping:nearest-neighbor direction="read" from="Solid-Interface-Mesh" to="Fluid-Interface-Mesh" constraint="consistent" />
+    <watch-point mesh="Fluid-Interface-Mesh" name="FluidCenter" coordinate="0.5; 1.0" />
+  </participant>
+
+  <participant name="SolidSolver">
+    <provide-mesh name="Solid-Interface-Mesh" />
+    <write-data name="DisplacementY" mesh="Solid-Interface-Mesh" />
+    <read-data name="Pressure" mesh="Solid-Interface-Mesh" />
+    <watch-point mesh="Solid-Interface-Mesh" name="SolidCenter" coordinate="0.5; 1.0" />
+  </participant>
+
+  <m2n:sockets acceptor="FluidSolver" connector="SolidSolver" />
+
+  <coupling-scheme:serial-implicit>
+    <participants first="FluidSolver" second="SolidSolver" />
+    <max-time-windows value="1" />
+    <time-window-size value="1.0" />
+    <exchange data="Pressure" mesh="Solid-Interface-Mesh" from="FluidSolver" to="SolidSolver" />
+    <exchange data="DisplacementY" mesh="Solid-Interface-Mesh" from="SolidSolver" to="FluidSolver" />
+    <max-iterations value="40" />
+    <relative-convergence-measure limit="1e-6" data="DisplacementY" mesh="Solid-Interface-Mesh" />
+    <acceleration:IQN-ILS>
+      <data name="DisplacementY" mesh="Solid-Interface-Mesh" />
+      <initial-relaxation value="0.1" />
+      <max-used-iterations value="20" />
+      <time-windows-reused value="1" />
+    </acceleration:IQN-ILS>
+  </coupling-scheme:serial-implicit>
+</precice-configuration>

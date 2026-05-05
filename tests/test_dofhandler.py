@@ -102,32 +102,33 @@ class TestDofHandlerCG:
         me = MixedElement(mesh, field_specs={'u': 2, 'v': 2})
         dof_handler = DofHandler(me, method='cg')
 
-        # 2. DEFINE BC for a single point (the mesh center) for field 'u' only.
-        # We give it a domain_tag 'pinned' which is NOT on the mesh.
-        bcs = [
-            BoundaryCondition(field='u', domain_tag='pinned', method="dirichlet", value=99.0)
-        ]
-        # We provide a locator function for 'pinned' at runtime.
-        locators = {'pinned': lambda x, y: np.isclose(x, 0.5) and np.isclose(y, 0.5)}
+        dof_handler.tag_dof_by_locator(
+            tag="pinned",
+            field="u",
+            locator=lambda x, y: np.isclose(x, 0.5) and np.isclose(y, 0.5),
+            find_first=True,
+        )
 
-        # 3. ACT
-        dirichlet_data = dof_handler.get_dirichlet_data(bcs, locators=locators)
+        bcs = [BoundaryCondition(field="u", domain_tag="pinned", method="dirichlet", value=99.0)]
+        dirichlet_data = dof_handler.get_dirichlet_data(bcs)
+
+
         results = analyze_dirichlet_result(dof_handler, dirichlet_data)
         
         # 4. ASSERT
         # We expect exactly one DOF to be constrained in total.
-        assert len(dirichlet_data) == 1, "Expected exactly one constrained DOF."
+        assert len(dirichlet_data) == 1, f"Expected exactly one constrained DOF. got {len(dirichlet_data)}"
         
         # The constrained DOF must belong to field 'u'.
-        assert len(results['u']) == 1, "Expected one constrained DOF for field 'u'."
-        assert len(results['v']) == 0, "Field 'v' should have no constrained DOFs."
+        assert len(results['u']) == 1, f"Expected one constrained DOF for field 'u'. got {len(results['u'])}."
+        assert len(results['v']) == 0, f"Field 'v' should have no constrained DOFs. got {len(results['v'])}."
 
         # Verify the node location and value.
         pinned_node_id = list(results['u'].keys())[0]
         pinned_node_coords = mesh.nodes_x_y_pos[pinned_node_id]
         assert np.allclose(pinned_node_coords, [0.5, 0.5]), \
             f"Pinned node has wrong coordinates: {pinned_node_coords}"
-        assert results['u'][pinned_node_id] == 99.0, "Pinned node has wrong value."
+        assert results['u'][pinned_node_id] == 99.0, f"Pinned node has wrong value: got {results['u'][pinned_node_id]}"
         
     def test_cg_shared_dofs(self):
         """

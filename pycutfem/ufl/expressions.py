@@ -1,17 +1,27 @@
 import numpy as np
 from hashlib import blake2b
 from typing import Callable, Dict, List, Optional, Union
-import matplotlib.pyplot as plt
-import matplotlib.tri as tri
-from matplotlib.tri import LinearTriInterpolator
 import numbers
-from matplotlib.colors import LinearSegmentedColormap
-from pycutfem.plotting.triangulate import triangulate_field
-from matplotlib.animation import FuncAnimation
 from pycutfem.utils.bitset import BitSet
 
+try:  # optional plotting dependency
+    import matplotlib.pyplot as plt
+    import matplotlib.tri as tri
+    from matplotlib.tri import LinearTriInterpolator
+    from matplotlib.colors import LinearSegmentedColormap
+    from matplotlib.animation import FuncAnimation
+except ModuleNotFoundError:  # pragma: no cover
+    plt = None
+    tri = None
+    LinearTriInterpolator = None
+    LinearSegmentedColormap = None
+    FuncAnimation = None
 
-custom_cmap = LinearSegmentedColormap.from_list('blue_red', ['blue', 'red'])
+custom_cmap = (
+    LinearSegmentedColormap.from_list("blue_red", ["blue", "red"])
+    if LinearSegmentedColormap is not None
+    else None
+)
 
 
 
@@ -30,21 +40,37 @@ class Expression:
     def __add__(self, other):
         if not isinstance(other, Expression):
             other = Constant(other)
+        if _is_zero_expression_exact(self):
+            return other
+        if _is_zero_expression_exact(other):
+            return self
         return Sum(self, other)
 
     def __radd__(self, other):
         if not isinstance(other, Expression):
             other = Constant(other)
+        if _is_zero_expression_exact(other):
+            return self
+        if _is_zero_expression_exact(self):
+            return other
         return Sum(other, self)
 
     def __sub__(self, other):
         if not isinstance(other, Expression):
             other = Constant(other)
+        if _is_zero_expression_exact(other):
+            return self
+        if _is_zero_expression_exact(self):
+            return -other
         return Sub(self, other)
 
     def __rsub__(self, other):
         if not isinstance(other, Expression):
             other = Constant(other)
+        if _is_zero_expression_exact(self):
+            return other
+        if _is_zero_expression_exact(other):
+            return -self
         return Sub(other, self)
 
     def __mul__(self, other):
@@ -54,6 +80,16 @@ class Expression:
             return other.__rmul__(self)
         if not isinstance(other, Expression):
             other = Constant(other)
+        if _is_zero_expression_exact(self):
+            return _preserve_zero_product(self, other)
+        if _is_zero_expression_exact(other):
+            return _preserve_zero_product(self, other)
+        if _is_scalar_one_expression_exact(self):
+            return other
+        if _is_scalar_one_expression_exact(other):
+            return self
+        if _should_promote_product_to_outer(self, other):
+            return Outer(self, other)
         return Prod(self, other)
 
     def __rmul__(self, other):
@@ -63,11 +99,26 @@ class Expression:
             return other.__rmul__(self)
         if not isinstance(other, Expression):
             other = Constant(other)
+        if _is_zero_expression_exact(other):
+            return _preserve_zero_product(other, self)
+        if _is_zero_expression_exact(self):
+            return _preserve_zero_product(other, self)
+        if _is_scalar_one_expression_exact(other):
+            return self
+        if _is_scalar_one_expression_exact(self):
+            return other
+        if _should_promote_product_to_outer(other, self):
+            return Outer(other, self)
         return Prod(other, self)
 
     def __truediv__(self, other):
         if not isinstance(other, Expression): other = Constant(other)
         return Div(self, other)
+
+    def __rtruediv__(self, other):
+        if not isinstance(other, Expression):
+            other = Constant(other)
+        return Div(other, self)
 
     def __neg__(self): return Prod(Constant(-1.0), self)
     def __hash__(self):
@@ -122,12 +173,401 @@ class Expression:
 
         return dfs(self)
 
+    def __getitem__(self, index):
+        return _index_expression(self, index)
+
+
+def _normalize_index(index):
+    if isinstance(index, tuple):
+        if not index:
+            raise IndexError("Empty index is not valid.")
+        return tuple(int(i) for i in index)
+    return (int(index),)
+
+
+def _shape_after_slice(shape: tuple[int, ...], index: tuple[int, ...]) -> tuple[int, ...]:
+    if len(index) > len(shape):
+        raise IndexError(f"Too many indices {index!r} for shape {shape!r}.")
+    for axis, ind in enumerate(index):
+        dim = int(shape[axis])
+        if ind < 0 or ind >= dim:
+            raise IndexError(f"Index {ind} out of range for axis {axis} with size {dim}.")
+    return tuple(shape[len(index):])
+
+
+def _expr_shape(expr) -> tuple[int, ...]:
+    if isinstance(expr, Constant):
+        return tuple(expr.shape)
+    if getattr(expr, "_is_quadrature_state_coefficient", False):
+        return tuple(expr.shape)
+    if isinstance(expr, ElementWiseConstant):
+        return tuple(expr.shape)
+    if isinstance(expr, (CellDiameter, MeshSize, NodalFunction)):
+        return ()
+    if hasattr(expr, "tensor_shape") and hasattr(expr, "eval"):
+        return tuple(getattr(expr, "tensor_shape", ()) or ())
+    if isinstance(expr, FacetNormal):
+        return (_SPATIAL_DIM,)
+    if isinstance(expr, (VectorFunction, VectorTrialFunction, VectorTestFunction,
+                         HdivFunction, HdivTrialFunction, HdivTestFunction)):
+        return (int(expr.num_components),)
+    if isinstance(expr, (Function, TrialFunction, TestFunction, NormalComponent, Derivative, DivOperation, Laplacian,
+                         HdivFunctionComponent, HdivTrialFunctionComponent, HdivTestFunctionComponent,
+                         PositivePart, Heaviside, Log, Inner, Trace, Determinant)):
+        return ()
+    if isinstance(expr, (Pos, Neg, Restriction)):
+        return _expr_shape(expr.operand)
+    if isinstance(expr, Side):
+        return _expr_shape(expr.f)
+    if isinstance(expr, Avg):
+        return _expr_shape(expr.v)
+    if isinstance(expr, Jump):
+        return _expr_shape(expr.u_pos)
+    if isinstance(expr, Transpose):
+        shape = _expr_shape(expr.A)
+        if len(shape) != 2:
+            raise TypeError(f"Transpose is only defined for rank-2 tensors, got shape {shape!r}.")
+        return (shape[1], shape[0])
+    if isinstance(expr, Grad):
+        base_shape = _expr_shape(expr.operand)
+        if base_shape == ():
+            return (2,)
+        if len(base_shape) == 1:
+            return (base_shape[0], 2)
+        raise TypeError(f"Grad shape not supported for operand shape {base_shape!r}.")
+    if isinstance(expr, Hessian):
+        base_shape = _expr_shape(expr.operand)
+        if base_shape == ():
+            return (2, 2)
+        if len(base_shape) == 1:
+            return (base_shape[0], 2, 2)
+        raise TypeError(f"Hessian shape not supported for operand shape {base_shape!r}.")
+    if isinstance(expr, (PositivePart, Heaviside, Log, Exp, Tanh, Sin, Cos, Tan, Asin, Acos, Atan, Sinh, Cosh, Asinh, Acosh, Atanh)):
+        return _expr_shape(expr.operand)
+    if isinstance(expr, (Sum, Sub)):
+        shape_a = _expr_shape(expr.a)
+        shape_b = _expr_shape(expr.b)
+        if shape_a == shape_b:
+            return shape_a
+        if shape_a == ():
+            return shape_b
+        if shape_b == ():
+            return shape_a
+        raise TypeError(f"Cannot infer shape for {type(expr).__name__} with {shape_a!r}/{shape_b!r}.")
+    if isinstance(expr, Prod):
+        shape_a = _expr_shape(expr.a)
+        shape_b = _expr_shape(expr.b)
+        if shape_a == ():
+            return shape_b
+        if shape_b == ():
+            return shape_a
+        return shape_a + shape_b
+    if isinstance(expr, Div):
+        shape_a = _expr_shape(expr.a)
+        shape_b = _expr_shape(expr.b)
+        if shape_b == ():
+            return shape_a
+        if shape_a == shape_b:
+            return shape_a
+        raise TypeError(f"Cannot infer shape for Div with {shape_a!r}/{shape_b!r}.")
+    if isinstance(expr, Outer):
+        return _expr_shape(expr.a) + _expr_shape(expr.b)
+    if isinstance(expr, Dot):
+        shape_a = _expr_shape(expr.a)
+        shape_b = _expr_shape(expr.b)
+        if shape_a == ():
+            return shape_b
+        if shape_b == ():
+            return shape_a
+        if shape_a[-1] != shape_b[0]:
+            raise TypeError(f"Dot shape mismatch: {shape_a!r} vs {shape_b!r}.")
+        return shape_a[:-1] + shape_b[1:]
+    if isinstance(expr, (Inverse, Cofactor)):
+        return _expr_shape(expr.A)
+    if isinstance(expr, Power):
+        return _expr_shape(expr.a)
+    raise TypeError(f"Cannot infer expression shape for {type(expr).__name__}.")
+
+
+def _scalar_sum(terms):
+    total = None
+    for term in terms:
+        total = term if total is None else total + term
+    return total if total is not None else Constant(0.0)
+
+
+_SPATIAL_DIM = 2
+
+
+def _is_constant_like(expr) -> bool:
+    return isinstance(expr, (Constant, ElementWiseConstant)) and not getattr(expr, "_preserve_runtime_structure", False)
+
+
+def _constant_array(expr):
+    if getattr(expr, "_preserve_runtime_structure", False):
+        return None
+    if isinstance(expr, Constant):
+        return np.asarray(expr.value, dtype=float)
+    if isinstance(expr, ElementWiseConstant):
+        return np.asarray(expr.values, dtype=float)
+    return None
+
+
+def _is_zero_expression_exact(expr) -> bool:
+    if expr is None:
+        return False
+    arr = _constant_array(expr)
+    if arr is not None:
+        return bool(np.all(arr == 0.0))
+
+    seen = set()
+
+    def _walk(node) -> bool:
+        if node is None:
+            return False
+        nid = id(node)
+        if nid in seen:
+            return False
+        seen.add(nid)
+
+        arr = _constant_array(node)
+        if arr is not None:
+            return bool(np.all(arr == 0.0))
+
+        if isinstance(node, (Pos, Neg, Restriction, Side, Avg, Transpose)):
+            child = getattr(node, "operand", None)
+            if child is None:
+                child = getattr(node, "f", None)
+            if child is None:
+                child = getattr(node, "v", None)
+            if child is None:
+                child = getattr(node, "A", None)
+            return _walk(child)
+
+        if isinstance(node, Jump):
+            return _walk(node.u_pos) and _walk(node.u_neg)
+
+        if isinstance(node, (Sum, Sub)):
+            return _walk(node.a) and _walk(node.b)
+
+        if isinstance(node, Prod):
+            return _walk(node.a) or _walk(node.b)
+
+        if isinstance(node, (Dot, Inner, Outer)):
+            return _walk(node.a) or _walk(node.b)
+
+        return False
+
+    return _walk(expr)
+
+
+def _is_scalar_one_expression_exact(expr) -> bool:
+    arr = _constant_array(expr)
+    return bool(arr is not None and arr.shape == () and float(arr) == 1.0)
+
+
+def _zero_product_expression(expr):
+    try:
+        return _zero_expression(_expr_shape(expr))
+    except Exception:
+        return Constant(0.0)
+
+
+def _preserve_zero_product(a, b):
+    if _is_constant_like(a) and _is_constant_like(b):
+        try:
+            return _zero_expression(_expr_shape(Prod(a, b)))
+        except Exception:
+            return Constant(0.0)
+    return Prod(a, b)
+
+
+def _zero_expression(shape: tuple[int, ...]):
+    shp = tuple(int(v) for v in shape)
+    if shp == ():
+        return Constant(0.0)
+    return Constant(np.zeros(shp, dtype=float))
+
+
+def _grad_result_shape(shape: tuple[int, ...]) -> tuple[int, ...]:
+    shp = tuple(int(v) for v in shape)
+    if shp == ():
+        return (_SPATIAL_DIM,)
+    if len(shp) == 1:
+        return (shp[0], _SPATIAL_DIM)
+    raise TypeError(f"Grad is only defined for scalar or vector operands, got shape {shp!r}.")
+
+
+def _div_result_shape(shape: tuple[int, ...]) -> tuple[int, ...]:
+    shp = tuple(int(v) for v in shape)
+    if shp == ():
+        raise TypeError("Divergence is not defined for scalar operands.")
+    if int(shp[-1]) != _SPATIAL_DIM:
+        raise TypeError(
+            f"Divergence expects the trailing axis to be the spatial axis of size {_SPATIAL_DIM}, got {shp!r}."
+        )
+    return shp[:-1]
+
+
+def _laplacian_result_shape(shape: tuple[int, ...]) -> tuple[int, ...]:
+    shp = tuple(int(v) for v in shape)
+    if shp == ():
+        return ()
+    if len(shp) == 1:
+        return shp
+    raise TypeError(f"Laplacian is only defined for scalar or vector operands, got shape {shp!r}.")
+
+
+def _should_promote_product_to_outer(a, b) -> bool:
+    """
+    Tensor-calculus multiplication rule:
+    non-scalar * non-scalar -> tensor product.
+    """
+    try:
+        shape_a = _expr_shape(a)
+        shape_b = _expr_shape(b)
+    except Exception:
+        return False
+    return shape_a != () and shape_b != ()
+
+
+def _slice_constant(value, index):
+    arr = np.asarray(value)
+    sliced = arr[index]
+    if np.ndim(sliced) == 0:
+        return Constant(float(sliced))
+    return Constant(np.asarray(sliced, dtype=float))
+
+
+def _dot_component(a, b, index):
+    idx = _normalize_index(index)
+    shape_a = _expr_shape(a)
+    shape_b = _expr_shape(b)
+    if shape_a == ():
+        return (a * b)[idx if len(idx) > 1 else idx[0]]
+    if shape_b == ():
+        return (a * b)[idx if len(idx) > 1 else idx[0]]
+    if shape_a[-1] != shape_b[0]:
+        raise TypeError(f"Dot shape mismatch: {shape_a!r} vs {shape_b!r}.")
+    result_shape = shape_a[:-1] + shape_b[1:]
+    if result_shape == ():
+        raise IndexError("Scalar dot result is not subscriptable.")
+    _shape_after_slice(result_shape, idx)
+    prefix = idx[: len(shape_a) - 1]
+    suffix = idx[len(shape_a) - 1 :]
+    return _scalar_sum(
+        (
+            a[prefix + (k,) if len(prefix) + 1 > 1 else prefix[0] if prefix else k]
+            * b[(k,) + suffix if len(suffix) + 1 > 1 else suffix[0] if suffix else k]
+        )
+        for k in range(int(shape_a[-1]))
+    )
+
+
+def _index_expression(expr, index):
+    idx = _normalize_index(index)
+    shape = _expr_shape(expr)
+    if shape == ():
+        raise IndexError(f"Scalar expression {type(expr).__name__} is not subscriptable.")
+    _shape_after_slice(shape, idx)
+
+    if isinstance(expr, Constant):
+        return _slice_constant(expr.value, idx)
+    if getattr(expr, "_is_quadrature_state_coefficient", False):
+        return expr.slice_component(idx)
+    if isinstance(expr, ElementWiseConstant):
+        return ElementWiseConstant(expr.values[(slice(None),) + idx])
+    if isinstance(expr, (Pos, Neg)):
+        return type(expr)(expr.operand[idx if len(idx) > 1 else idx[0]])
+    if isinstance(expr, Restriction):
+        return Restriction(expr.operand[idx if len(idx) > 1 else idx[0]], expr.domain)
+    if isinstance(expr, Side):
+        return Side(expr.f[idx if len(idx) > 1 else idx[0]], expr.side)
+    if isinstance(expr, Avg):
+        return Avg(expr.v[idx if len(idx) > 1 else idx[0]])
+    if isinstance(expr, Jump):
+        return Jump(expr.u_pos[idx if len(idx) > 1 else idx[0]], expr.u_neg[idx if len(idx) > 1 else idx[0]])
+    if isinstance(expr, Transpose):
+        if len(idx) != 2:
+            raise IndexError("Transpose indexing expects two indices.")
+        return expr.A[idx[1], idx[0]]
+    if isinstance(expr, Sum):
+        key = idx if len(idx) > 1 else idx[0]
+        return expr.a[key] + expr.b[key]
+    if isinstance(expr, Sub):
+        key = idx if len(idx) > 1 else idx[0]
+        return expr.a[key] - expr.b[key]
+    if isinstance(expr, Prod):
+        shape_a = _expr_shape(expr.a)
+        shape_b = _expr_shape(expr.b)
+        if shape_a == ():
+            key = idx if len(idx) > 1 else idx[0]
+            return expr.a * expr.b[key]
+        if shape_b == ():
+            key = idx if len(idx) > 1 else idx[0]
+            return expr.a[key] * expr.b
+        split = len(shape_a)
+        a_idx = idx[:split]
+        b_idx = idx[split:]
+        a_key = a_idx if len(a_idx) > 1 else a_idx[0]
+        b_key = b_idx if len(b_idx) > 1 else b_idx[0]
+        return expr.a[a_key] * expr.b[b_key]
+    if isinstance(expr, Div):
+        key = idx if len(idx) > 1 else idx[0]
+        shape_b = _expr_shape(expr.b)
+        if shape_b == ():
+            return expr.a[key] / expr.b
+        if _expr_shape(expr.a) == shape_b:
+            return expr.a[key] / expr.b[key]
+        raise TypeError(f"Cannot index Div with operand shapes {_expr_shape(expr.a)!r}/{shape_b!r}.")
+    if isinstance(expr, Outer):
+        if len(idx) == 1:
+            raise IndexError("Outer-product indexing expects at least two indices.")
+        shape_a = _expr_shape(expr.a)
+        split = len(shape_a)
+        a_idx = idx[:split]
+        b_idx = idx[split:]
+        a_key = a_idx if len(a_idx) > 1 else a_idx[0]
+        b_key = b_idx if len(b_idx) > 1 else b_idx[0]
+        return expr.a[a_key] * expr.b[b_key]
+    if isinstance(expr, Dot):
+        return _dot_component(expr.a, expr.b, idx)
+    if isinstance(expr, Inverse):
+        if shape != (2, 2) or len(idx) != 2:
+            raise NotImplementedError("Only 2x2 inverse component access is implemented.")
+        i, j = idx
+        A = expr.A
+        detA = det(A)
+        if (i, j) == (0, 0):
+            return A[1, 1] / detA
+        if (i, j) == (0, 1):
+            return -A[0, 1] / detA
+        if (i, j) == (1, 0):
+            return -A[1, 0] / detA
+        return A[0, 0] / detA
+    if isinstance(expr, Cofactor):
+        if shape != (2, 2) or len(idx) != 2:
+            raise NotImplementedError("Only 2x2 cofactor component access is implemented.")
+        i, j = idx
+        A = expr.A
+        if (i, j) == (0, 0):
+            return A[1, 1]
+        if (i, j) == (0, 1):
+            return -A[0, 1]
+        if (i, j) == (1, 0):
+            return -A[1, 0]
+        return A[0, 0]
+    raise TypeError(f"Component access not implemented for {type(expr).__name__}.")
+
 
 
 class Transpose(Expression):
     """Symbolic transpose (for 2-D tensors)."""
     def __init__(self, A: Expression):
         super().__init__()
+        shape = _expr_shape(A)
+        if len(shape) != 2:
+            raise TypeError(f"Transpose is only defined for rank-2 tensors, got shape {shape!r}.")
         self.A = A
     def __repr__(self):
         return f"Transpose({self.A!r})"
@@ -314,6 +754,8 @@ class Function(Expression):
             mask : BitSet | ndarray[bool] | callable(x,y)->bool, optional
                 Only plot within this region. Implemented by masking triangles.
         """
+        if plt is None:
+            raise RuntimeError("Plotting requires matplotlib; install it to use Function.plot().")
         if self._dof_handler is None:
             raise RuntimeError("Cannot plot a function without an associated DofHandler.")
         mask_arg = kwargs.pop('mask', None)
@@ -324,6 +766,7 @@ class Function(Expression):
             raise RuntimeError(f"Field '{self.field_name}' not found in DofHandler's fe_map.")
 
         z = self.nodal_values
+        from pycutfem.plotting.triangulate import triangulate_field
         tri = triangulate_field(mesh, dh, self.field_name)
 
         if mask_arg is not None:
@@ -363,11 +806,14 @@ class Function(Expression):
         **kwargs     :
             Passed straight to `tricontourf` (cmap, levels, …).
         """
+        if plt is None or tri is None:
+            raise RuntimeError("Plotting requires matplotlib; install it to use Function.plot_deformed().")
         if self._dof_handler is None:
             raise RuntimeError("Function needs an attached DofHandler.")
         mesh = self._dof_handler.fe_map[self.field_name]
 
         # --- original triangulation & coords --------------------------------
+        from pycutfem.plotting.triangulate import triangulate_field
         tri_orig = triangulate_field(mesh, self._dof_handler, self.field_name)
         node_ids = [self._dof_handler._dof_to_node_map[d][1]
                     for d in self._dof_handler.get_field_slice(self.field_name)]
@@ -410,15 +856,24 @@ class VectorFunction(Expression):
         self.parent_name = ""
         # --- Side metadata for vector-valued functions ---
         self.side = side
-        if side in ("+","-",""):
+        if side in ("+","-"):
             s = "pos" if side == "+" else "neg"
             self.field_sides = [s] * len(self.field_names)
+        else:
+            # Volume/default case: no per-component side tagging
+            self.field_sides = [""] * len(self.field_names)
         
         
         # This function holds the data for multiple fields.
         g_dofs_list = [dof_handler.get_field_slice(f) for f in field_names]
         self._g_dofs = np.concatenate(g_dofs_list)
         self._g2l = {gd: i for i, gd in enumerate(self._g_dofs)}
+        self._component_local_slices = []
+        _offset = 0
+        for g_dofs in g_dofs_list:
+            _next = _offset + len(g_dofs)
+            self._component_local_slices.append(slice(_offset, _next))
+            _offset = _next
         self.nodal_values = np.zeros(len(self._g_dofs), dtype=float)
         self._dof_handler = dof_handler
         
@@ -443,14 +898,10 @@ class VectorFunction(Expression):
     
 
     def nodal_values_component(self, idx: int):
-        s = self._dh.get_field_slice(self.field_names[idx])
-        return self.nodal_values[[self._g2l[d] for d in s if d in self._g2l]]
+        return self.nodal_values[self._component_local_slices[idx]]
 
     def set_component_values(self, idx: int, vals):
-        s = self._dh.get_field_slice(self.field_names[idx])
-        for i, gdof in enumerate(s):
-            if gdof in self._g2l:
-                self.nodal_values[self._g2l[gdof]] = vals[i]
+        self.nodal_values[self._component_local_slices[idx]] = vals
 
     def get_nodal_values(self, global_dofs: np.ndarray) -> np.ndarray:
         """
@@ -817,7 +1268,7 @@ class TrialFunction(Function):
                  component_index: int = None, name: str = None, side: str = ""):
         # A TrialFunction is purely symbolic. It has no dof_handler or data.
         # Its name and field_name are the same.
-        from pycutfem.ufl.functionspace import FunctionSpace
+        from pycutfem.ufl.spaces import FunctionSpace
         if isinstance(field_name, FunctionSpace):
             # If field_name is a FunctionSpace, use its name and field_names
             name = field_name.name if name is None else name
@@ -848,7 +1299,7 @@ class TestFunction(Function):
                  component_index: int = None, name: str = None,
                  side: str = ""):
         # A TestFunction is purely symbolic.
-        from pycutfem.ufl.functionspace import FunctionSpace
+        from pycutfem.ufl.spaces import FunctionSpace
         if isinstance(field_name, FunctionSpace):
             # If field_name is a FunctionSpace, use its name and field_names
             name = field_name.name if name is None else name
@@ -867,7 +1318,156 @@ class TestFunction(Function):
             self.field_sides = [s] 
         else:
             self.field_sides = ""
- 
+	 
+
+class HdivTrialFunction(Expression):
+    """
+    Vector-valued trial function backed by a *single* H(div) field name (e.g. RT_k).
+
+    Unlike VectorTrialFunction, this does not split into separate scalar fields; it
+    represents one coefficient vector multiplying vector basis functions.
+    """
+
+    is_trial = True
+    is_function = False
+    is_test = False
+
+    def __init__(self, field_name: str, *, value_dim: int = 2, side: str = ""):
+        super().__init__()
+        self.field_name = str(field_name)
+        self.field_names = [self.field_name]
+        self.num_components = int(value_dim)
+        self.dim = 1
+        self.parent_name = ""
+        self.side = side
+        if self.side in ("+","-"):
+            s = "pos" if self.side == "+" else "neg"
+            self.field_sides = [s] * self.num_components
+        else:
+            self.field_sides = [""] * self.num_components
+
+    def __repr__(self):
+        return f"HdivTrialFunction(field='{self.field_name}')"
+
+    def __getitem__(self, i):
+        idx = int(i)
+        if idx not in (0, 1):
+            raise IndexError("HdivTrialFunction has two components (0, 1).")
+        return HdivTrialFunctionComponent(self, idx)
+
+
+class HdivTestFunction(Expression):
+    """Vector-valued test function backed by a *single* H(div) field name."""
+
+    is_test = True
+    is_function = False
+    is_trial = False
+
+    def __init__(self, field_name: str, *, value_dim: int = 2, side: str = ""):
+        super().__init__()
+        self.field_name = str(field_name)
+        self.field_names = [self.field_name]
+        self.num_components = int(value_dim)
+        self.dim = 1
+        self.parent_name = ""
+        self.side = side
+        if self.side in ("+","-"):
+            s = "pos" if self.side == "+" else "neg"
+            self.field_sides = [s] * self.num_components
+        else:
+            self.field_sides = [""] * self.num_components
+
+    def __repr__(self):
+        return f"HdivTestFunction(field='{self.field_name}')"
+
+    def __getitem__(self, i):
+        idx = int(i)
+        if idx not in (0, 1):
+            raise IndexError("HdivTestFunction has two components (0, 1).")
+        return HdivTestFunctionComponent(self, idx)
+
+
+class HdivFunction(Function):
+    """
+    Vector-valued coefficient function backed by a *single* H(div) field name (e.g. RT_k).
+
+    Stores one scalar coefficient per RT basis function, but evaluates to a 2D vector
+    via the vector-valued RT basis.
+    """
+
+    is_function = True
+    is_trial = False
+    is_test = False
+    num_components = 2
+
+    def __init__(self, name: str, field_name: str, dof_handler: 'DofHandler' = None, *, side: str = ""):
+        super().__init__(name=name, field_name=field_name, dof_handler=dof_handler, side=side)
+        self.field_names = [self.field_name]
+        self.dim = 1
+        self.num_components = 2
+        self.parent_name = ""
+        self.side = side
+        if self.side in ("+","-"):
+            s = "pos" if self.side == "+" else "neg"
+            self.field_sides = [s] * self.num_components
+        else:
+            self.field_sides = [""] * self.num_components
+
+    def __repr__(self):
+        return f"HdivFunction(name='{self.name}', field='{self.field_name}')"
+
+    def __getitem__(self, i):
+        idx = int(i)
+        if idx not in (0, 1):
+            raise IndexError("HdivFunction has two components (0, 1).")
+        return HdivFunctionComponent(self, idx)
+
+
+class _HdivComponentBase(Expression):
+    """Scalar component view of a single H(div) field."""
+
+    dim = 0
+    num_components = 1
+
+    def __init__(self, parent, component_index: int):
+        super().__init__()
+        self.parent = parent
+        self.component_index = int(component_index)
+        self.field_name = str(parent.field_name)
+        self.field_names = [self.field_name]
+        self.parent_name = getattr(parent, "name", getattr(parent, "parent_name", ""))
+        self.side = getattr(parent, "side", "")
+        if self.side in ("+", "-"):
+            s = "pos" if self.side == "+" else "neg"
+            self.field_sides = [s]
+        else:
+            self.field_sides = [""]
+
+    def __repr__(self):
+        cls = type(self).__name__
+        return f"{cls}(field='{self.field_name}', component={self.component_index})"
+
+    def get_nodal_values(self, local_dofs):
+        return self.parent.get_nodal_values(local_dofs)
+
+
+class HdivTrialFunctionComponent(_HdivComponentBase):
+    is_trial = True
+    is_function = False
+    is_test = False
+
+
+class HdivTestFunctionComponent(_HdivComponentBase):
+    is_test = True
+    is_function = False
+    is_trial = False
+
+
+class HdivFunctionComponent(_HdivComponentBase):
+    is_function = True
+    is_trial = False
+    is_test = False
+
 
 def _scalar_token(value: float) -> str:
     return f"s_{format(float(value), '.16g')}"
@@ -936,6 +1536,19 @@ class Constant(Expression, numbers.Number):
     @property
     def cache_token(self) -> str:
         return self._cache_token
+
+
+class Identity(Constant):
+    """
+    Identity matrix expression that behaves like a Constant np.eye(size).
+    """
+    def __init__(self, size: int):
+        size = int(size)
+        super().__init__(np.eye(size, dtype=float))
+        self.size = size
+
+    def __repr__(self):
+        return f"Identity({self.size})"
 
 class VectorTrialFunction(Expression):
     is_trial = True
@@ -1091,7 +1704,21 @@ class Derivative(Expression):
 
 
 class Grad(Expression):
-    """Gradient of a scalar expression in 2-D (returns a length-2 vector)."""
+    """
+    Gradient in 2-D.
+
+    Shape conventions:
+      - scalar operand: grad(a) has shape (spatial,)
+      - vector operand: grad(v) has shape (component, spatial)
+
+    Indexing follows those shapes:
+      - grad(a)[j]      -> d_j a
+      - grad(v)[i]      -> grad(v_i)
+      - grad(v)[i, j]   -> d_j v_i
+
+    If a directional derivative of the whole vector field is needed, use
+    ``Derivative(v, ox, oy)`` explicitly rather than ``grad(v)[j]``.
+    """
 
     def __init__(self, operand):
         self.operand = operand          # scalar Expression
@@ -1106,11 +1733,27 @@ class Grad(Expression):
     #   Grad(u)[1]   → ∂u/∂y   = Derivative(u, 0, 1)
     # ------------------------------------------------------------------
     def __getitem__(self, index):
-        if index == 0:
-            return Derivative(self.operand, 1, 0)
-        elif index == 1:
-            return Derivative(self.operand, 0, 1)
-        raise IndexError("Grad supports indices 0 (x) or 1 (y)")
+        idx = _normalize_index(index)
+        base_shape = _expr_shape(self.operand)
+        if len(idx) == 1:
+            if len(base_shape) == 1:
+                comp = idx[0]
+                if comp < 0 or comp >= int(base_shape[0]):
+                    raise IndexError(f"Vector component {comp} out of range for shape {base_shape!r}.")
+                return Grad(self.operand[comp])
+            if idx[0] == 0:
+                return Derivative(self.operand, 1, 0)
+            if idx[0] == 1:
+                return Derivative(self.operand, 0, 1)
+            raise IndexError("Grad supports indices 0 (x) or 1 (y)")
+        if len(idx) == 2:
+            comp, coord = idx
+            if len(base_shape) != 1:
+                raise IndexError(f"Grad component indexing requires a vector operand, got shape {base_shape!r}.")
+            if comp < 0 or comp >= int(base_shape[0]):
+                raise IndexError(f"Vector component {comp} out of range for shape {base_shape!r}.")
+            return Grad(self.operand[comp])[coord]
+        raise IndexError("Grad supports one index for scalar operands or two for vector operands.")
 
 
 
@@ -1127,6 +1770,141 @@ class Laplacian(Expression):
     """Trace of the Hessian (Δu)."""
     def __init__(self, operand): self.operand = operand
     def __repr__(self): return f"Laplacian({self.operand!r})"
+
+class PositivePart(Expression):
+    """Hard positive part ⟨x⟩₊ := max(x, 0) (non-smooth at x=0)."""
+    def __init__(self, operand): self.operand = operand
+    def __repr__(self): return f"PositivePart({self.operand!r})"
+
+class Heaviside(Expression):
+    """Hard Heaviside step H(x):=1 if x>0 else 0 (convention H(0)=0)."""
+    def __init__(self, operand): self.operand = operand
+    def __repr__(self): return f"Heaviside({self.operand!r})"
+
+class Log(Expression):
+    """Natural logarithm log(x) (defined for x>0)."""
+    def __init__(self, operand):
+        super().__init__()
+        self.operand = operand
+    def __repr__(self):
+        return f"Log({self.operand!r})"
+
+
+class Exp(Expression):
+    """Natural exponential exp(x)."""
+    def __init__(self, operand):
+        super().__init__()
+        self.operand = operand
+    def __repr__(self):
+        return f"Exp({self.operand!r})"
+
+
+class Tanh(Expression):
+    """Hyperbolic tangent tanh(x)."""
+    def __init__(self, operand):
+        super().__init__()
+        self.operand = operand
+    def __repr__(self):
+        return f"Tanh({self.operand!r})"
+
+
+class Sin(Expression):
+    """Trigonometric sine sin(x)."""
+    def __init__(self, operand):
+        super().__init__()
+        self.operand = operand
+    def __repr__(self):
+        return f"Sin({self.operand!r})"
+
+
+class Cos(Expression):
+    """Trigonometric cosine cos(x)."""
+    def __init__(self, operand):
+        super().__init__()
+        self.operand = operand
+    def __repr__(self):
+        return f"Cos({self.operand!r})"
+
+
+class Tan(Expression):
+    """Trigonometric tangent tan(x)."""
+    def __init__(self, operand):
+        super().__init__()
+        self.operand = operand
+    def __repr__(self):
+        return f"Tan({self.operand!r})"
+
+
+class Asin(Expression):
+    """Inverse sine asin(x)."""
+    def __init__(self, operand):
+        super().__init__()
+        self.operand = operand
+    def __repr__(self):
+        return f"Asin({self.operand!r})"
+
+
+class Acos(Expression):
+    """Inverse cosine acos(x)."""
+    def __init__(self, operand):
+        super().__init__()
+        self.operand = operand
+    def __repr__(self):
+        return f"Acos({self.operand!r})"
+
+
+class Atan(Expression):
+    """Inverse tangent atan(x)."""
+    def __init__(self, operand):
+        super().__init__()
+        self.operand = operand
+    def __repr__(self):
+        return f"Atan({self.operand!r})"
+
+
+class Sinh(Expression):
+    """Hyperbolic sine sinh(x)."""
+    def __init__(self, operand):
+        super().__init__()
+        self.operand = operand
+    def __repr__(self):
+        return f"Sinh({self.operand!r})"
+
+
+class Cosh(Expression):
+    """Hyperbolic cosine cosh(x)."""
+    def __init__(self, operand):
+        super().__init__()
+        self.operand = operand
+    def __repr__(self):
+        return f"Cosh({self.operand!r})"
+
+
+class Asinh(Expression):
+    """Inverse hyperbolic sine asinh(x)."""
+    def __init__(self, operand):
+        super().__init__()
+        self.operand = operand
+    def __repr__(self):
+        return f"Asinh({self.operand!r})"
+
+
+class Acosh(Expression):
+    """Inverse hyperbolic cosine acosh(x)."""
+    def __init__(self, operand):
+        super().__init__()
+        self.operand = operand
+    def __repr__(self):
+        return f"Acosh({self.operand!r})"
+
+
+class Atanh(Expression):
+    """Inverse hyperbolic tangent atanh(x)."""
+    def __init__(self, operand):
+        super().__init__()
+        self.operand = operand
+    def __repr__(self):
+        return f"Atanh({self.operand!r})"
 
 class Inner(Expression):
     def __init__(self, a, b): self.a, self.b = a, b
@@ -1221,12 +1999,27 @@ class Integral(Expression):
         return Equation(Form([self]), other)
 
 class Dot(Expression):
-    def __init__(self, a, b): self.a, self.b = a, b
+    def __init__(self, a, b): self.a, self.b = a, b; 
     def __repr__(self): return f"Dot({self.a!r}, {self.b!r})"
 
 
 class CellDiameter(Expression):
-    """Return element‑wise √area — identical to mesh.element_char_length(eid)."""
+    """Return the UFL/FEniCS-style cell diameter (max vertex-to-vertex distance)."""
+    def __init__(self):
+        super().__init__()
+        self.role = "none"
+
+
+class MeshSize(Expression):
+    """Pointwise NGSolve-like `specialcf.mesh_size`.
+
+    Evaluated at the current quadrature point using the (possibly deformed)
+    geometry Jacobian determinant:
+
+      - tri  reference (0,0)-(1,0)-(0,1):        h = sqrt(|detJ|)
+      - quad reference [-1,1]^2 (area factor 4): h = 2*sqrt(|detJ|)
+    """
+
     def __init__(self):
         super().__init__()
         self.role = "none"
@@ -1248,10 +2041,15 @@ class Restriction(Expression):
         self.is_function = getattr(operand, "is_function", False)
         self.is_trial    = getattr(operand, "is_trial",    False)
         self.is_test     = getattr(operand, "is_test",     False)
-        self.num_components = operand.num_components
+        self.num_components = getattr(operand, "num_components", 1)
 
     def __repr__(self):
         return f"Restriction({self.operand!r}, '{self.domain}')"
+    
+    def __getattr__(self, name):
+        # Delegate missing attributes to the underlying operand so wrappers
+        # behave like the wrapped expression (field_name, field_names, etc.).
+        return getattr(self.operand, name)
 
 class Trace(Expression):
     """Symbolic trace of a tensor expression."""
@@ -1261,18 +2059,169 @@ class Trace(Expression):
     def __repr__(self):
         return f"Trace({self.A!r})"
 
+class Determinant(Expression):
+    """Symbolic determinant of a tensor expression."""
+    def __init__(self, A: Expression):
+        super().__init__()
+        self.A = A
+    def __repr__(self):
+        return f"Determinant({self.A!r})"
+
+class Inverse(Expression):
+    """Symbolic inverse of a tensor expression."""
+    def __init__(self, A: Expression):
+        super().__init__()
+        self.A = A
+    def __repr__(self):
+        return f"Inverse({self.A!r})"
+
+class Cofactor(Expression):
+    """Symbolic cofactor (adjugate) of a 2×2 tensor expression."""
+    def __init__(self, A: Expression):
+        super().__init__()
+        self.A = A
+    def __repr__(self):
+        return f"Cofactor({self.A!r})"
+
 def trace(A):
     """Helper function to create a Trace expression."""
     return Trace(A)
 
+def det(A):
+    """Helper function to create a Determinant expression."""
+    return Determinant(A)
+
+def inv(A):
+    """Helper function to create an Inverse expression."""
+    return Inverse(A)
+
+def cof(A):
+    """Helper function to create a Cofactor expression."""
+    return Cofactor(A)
+
 # --- Helper functions to create operator instances ---
-def grad(v): return Grad(v)
+def grad(v):
+    """Create a symbolic gradient, expanding constant operands to exact zeros."""
+    if _is_constant_like(v):
+        return _zero_expression(_grad_result_shape(_expr_shape(v)))
+    return Grad(v)
+
+
+def laplacian(v):
+    """Create a symbolic Laplacian, expanding constant operands to exact zeros."""
+    if _is_constant_like(v):
+        return _zero_expression(_laplacian_result_shape(_expr_shape(v)))
+    return Laplacian(v)
+
+
 def div(v):
-    """Creates a symbolic representation of the divergence of a field."""
+    """Create a symbolic divergence with basic product and dyad identities."""
+    if _is_constant_like(v):
+        return _zero_expression(_div_result_shape(_expr_shape(v)))
+    if isinstance(v, Pos):
+        return Pos(div(v.operand))
+    if isinstance(v, Neg):
+        return Neg(div(v.operand))
+    if isinstance(v, Restriction):
+        return Restriction(div(v.operand), v.domain)
+    if isinstance(v, Jump):
+        return Jump(div(v.u_pos), div(v.u_neg))
+    if isinstance(v, Sum):
+        return div(v.a) + div(v.b)
+    if isinstance(v, Sub):
+        return div(v.a) - div(v.b)
+    if isinstance(v, Grad):
+        return laplacian(v.operand)
+    if isinstance(v, Prod):
+        shape_a = _expr_shape(v.a)
+        shape_b = _expr_shape(v.b)
+        if shape_a == () and shape_b != ():
+            return dot(v.b, grad(v.a)) + v.a * div(v.b)
+        if shape_b == () and shape_a != ():
+            return dot(v.a, grad(v.b)) + div(v.a) * v.b
+    if isinstance(v, Outer):
+        shape_a = _expr_shape(v.a)
+        shape_b = _expr_shape(v.b)
+        if len(shape_a) == 1 and int(shape_a[0]) == _SPATIAL_DIM and len(shape_b) <= 1:
+            return v.b * div(v.a) + dot(grad(v.b), v.a)
     return DivOperation(v)
+
+
 def inner(a, b): return Inner(a, b)
 def outer(a, b): return Outer(a, b)
-def jump(v, n=None): return Jump(v, n)
+def dyad(a, b): return Outer(a, b)
+def pos_part(x): return PositivePart(x)
+def heaviside(x): return Heaviside(x)
+
+
+def _named_scalar_constant(value, name: str):
+    c = Constant(value)
+    c._jit_name = str(name)
+    c._preserve_runtime_structure = True
+    return c
+
+
+def sqrt(x): return Power(x, _named_scalar_constant(0.5, "ufl_sqrt_half"))
+def abs_value(x):
+    minus_one = _named_scalar_constant(-1.0, "ufl_abs_minus_one")
+    return PositivePart(x) + PositivePart(minus_one * x)
+def signum(x):
+    minus_one = _named_scalar_constant(-1.0, "ufl_sign_minus_one")
+    return Heaviside(x) - Heaviside(minus_one * x)
+def log(x): return Log(x)
+def exp(x): return Exp(x)
+def tanh(x): return Tanh(x)
+def sin(x): return Sin(x)
+def cos(x): return Cos(x)
+def tan(x): return Tan(x)
+def asin(x): return Asin(x)
+def acos(x): return Acos(x)
+def atan(x): return Atan(x)
+def sinh(x): return Sinh(x)
+def cosh(x): return Cosh(x)
+def asinh(x): return Asinh(x)
+def acosh(x): return Acosh(x)
+def atanh(x): return Atanh(x)
+def jump(v, n=None):
+    """
+    Jump operator.
+
+    Semantics
+    ---------
+    - ``jump(v)``  ->  v(+) - v(-)
+    - ``jump(v, n)`` -> v(+)·n(+) + v(-)·n(-)   (standard UFL "jump with normal")
+
+    Backwards Compatibility
+    -----------------------
+    Historically, this project also allowed ``jump(v_pos, v_neg)`` as a convenience
+    wrapper for ``Jump(v_pos, v_neg)``. This clashes with the UFL meaning of a 2nd
+    argument (a normal vector). We disambiguate by treating the 2nd argument as a
+    normal only when it *looks like* one (e.g. ``FacetNormal()`` or a length-2
+    constant); otherwise we interpret it as an explicit negative-side expression.
+    """
+    if n is None:
+        return Jump(v)
+
+    def _unwrap_side(expr):
+        while isinstance(expr, (Pos, Neg)):
+            expr = expr.operand
+        return expr
+
+    n_base = _unwrap_side(n)
+    is_normal = isinstance(n_base, FacetNormal) or (getattr(n_base, "shape", None) == (2,))
+
+    # Legacy: jump(v_pos, v_neg) -> Jump(v_pos, v_neg)
+    if not is_normal:
+        return Jump(v, n)
+
+    v_pos, v_neg = Pos(v), Neg(v)
+    n_pos, n_neg = Pos(n), Neg(n)
+
+    # For scalar v, UFL defines jump(v,n) as a vector-valued flux jump: v(+) n(+) + v(-) n(-).
+    # Only treat `v` as scalar if it explicitly declares scalar shape (Grad/Div/etc do not).
+    if hasattr(v, "dim") and getattr(v, "dim", 0) == 0 and getattr(v, "num_components", 1) == 1:
+        return v_pos * n_pos + v_neg * n_neg
+    return Dot(v_pos, n_pos) + Dot(v_neg, n_neg)
 def avg(v): return Avg(v)
 def dot(a, b): return Dot(a, b)
 def restrict(expression, domain_tag):

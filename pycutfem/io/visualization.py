@@ -3,7 +3,7 @@ import numpy as np
 from matplotlib.collections import LineCollection, PolyCollection
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
-from typing import Union, List
+from typing import Union, List, Iterable, Optional, Sequence
 from pycutfem.ufl.helpers_geom import (corner_tris, 
                                        clip_triangle_to_side, 
                                        fan_triangulate,
@@ -17,27 +17,45 @@ _ELEM_FILL = {
     "inside": (0.4, 0.6, 1.0, 0.7),
     "outside": (1.0, 0.8, 0.4, 0.7),
     "cut": (1.0, 0.55, 0.0, 0.7),
-    "default": (0.9, 0.9, 0.9, 0.5)
+    "default": (0.75, 0.85, 1.0, 0.55),  # light, but visible against white background
 }
 _EDGE_COLOR = {
     "boundary": "black",
     "ghost": "blue",
     "ghost_pos": "cyan",
     "ghost_neg": "darkviolet",
-    "ghost_both": "red",
-    "interface": "green",
+    "ghost_both": "azure",
+    "interface": "olive",
     "cut_boundary": "red",
     "default": "black",
+}
+_EDGE_WIDTH = {
+    "boundary": 1.2,
+    "ghost": 1.0,
+    "ghost_pos": 2.5,
+    "ghost_neg": 2.5,
+    "ghost_both": 2.5,
+    "interface": 3.0,
+    "cut_boundary": 1.6,
+    "default": 0.9,
+}
+
+_NODE_COLOR = {
+    "corner": "navy",
+    "ho": "deepskyblue",
+    "hanging": "magenta",
 }
 
 def _edge_col(tag):
     return _EDGE_COLOR.get(tag, 'black')
 
+def _edge_lw(tag):
+    return _EDGE_WIDTH.get(tag, _EDGE_WIDTH["default"])
+
 def _elem_fill(tag):
     # If tag is not in _ELEM_FILL, use the default color.
-    # If tag is None or empty string, no fill will be used.
     if not tag:
-        return 'none'
+        return _ELEM_FILL["default"]
     return _ELEM_FILL.get(tag, _ELEM_FILL["default"])
 
 # --- Refactored and Generalized plot_mesh Function ---
@@ -100,46 +118,77 @@ def plot_mesh(mesh, *, solution_on_nodes=None, level_set=None, plot_nodes=True,
     if plot_edges and hasattr(mesh, 'edges'):
         edge_segments = [mesh.nodes_x_y_pos[list(edge.nodes)] for edge in mesh.edges]
         edge_colors_list = []
+        edge_widths_list = []
         for edge in mesh.edges:
             color = 'black'  # Default for internal, untagged edges
+            lw = _edge_lw("default")
             # Check for boundary edges first
             if edge.right is None:
                 color = 'dimgray' # Specific color for boundary edges
+                lw = _edge_lw("boundary")
             # Tagged edges override other colors
             if edge_colors and hasattr(mesh, 'edge_tag') and mesh.edge_tag[edge.id]:
-                color = _EDGE_COLOR.get(mesh.edge_tag[edge.id], color)
+                tag = mesh.edge_tag[edge.id]
+                color = _EDGE_COLOR.get(tag, color)
+                lw = _edge_lw(tag)
             edge_colors_list.append(color)
+            edge_widths_list.append(lw)
         
         line_collection = LineCollection(edge_segments, colors=edge_colors_list, 
-                                         linewidths=0.9, zorder=2)
+                                         linewidths=edge_widths_list, zorder=2)
         ax.add_collection(line_collection)
 
     # --- Plot Nodes (all of them, differentiating corners) ---
     if plot_nodes:
-        # Identify all unique corner node global indices
         corner_node_gids = set()
-        if hasattr(mesh, '_get_element_corner_global_indices'):
+        hanging_node_gids = set(getattr(mesh, "hanging_nodes", []))
+        if hasattr(mesh, "_get_element_corner_global_indices"):
             for eid in range(len(mesh.elements)):
                 corners = mesh._get_element_corner_global_indices(eid)
-                for gid in corners:
-                    corner_node_gids.add(gid)
-        
+                corner_node_gids.update(corners)
+
         all_node_gids = set(range(len(mesh.nodes_x_y_pos)))
-        ho_node_gids = list(all_node_gids - corner_node_gids)
+        ho_node_gids = list(all_node_gids - corner_node_gids - hanging_node_gids)
         corner_node_gids_list = list(corner_node_gids)
+        hanging_node_gids_list = list(hanging_node_gids)
 
-        # Plot higher-order nodes (e.g., edge midpoints) first, smaller and lighter
         if ho_node_gids:
-            ax.plot(mesh.nodes_x_y_pos[ho_node_gids, 0], mesh.nodes_x_y_pos[ho_node_gids, 1], 'o', 
-                    color='deepskyblue', markersize=2, zorder=3, label="Higher-Order Nodes", linestyle='None')
+            ax.plot(
+                mesh.nodes_x_y_pos[ho_node_gids, 0],
+                mesh.nodes_x_y_pos[ho_node_gids, 1],
+                "o",
+                color=_NODE_COLOR["ho"],
+                markersize=2,
+                zorder=3,
+                label="Higher-Order Nodes",
+                linestyle="None",
+            )
 
-        # Plot corner nodes on top, more prominently
+        if hanging_node_gids_list:
+            ax.plot(
+                mesh.nodes_x_y_pos[hanging_node_gids_list, 0],
+                mesh.nodes_x_y_pos[hanging_node_gids_list, 1],
+                "o",
+                color=_NODE_COLOR["hanging"],
+                markersize=4,
+                zorder=4,
+                label="Hanging Nodes",
+                linestyle="None",
+            )
+
         if corner_node_gids_list:
-            ax.plot(mesh.nodes_x_y_pos[corner_node_gids_list, 0], mesh.nodes_x_y_pos[corner_node_gids_list, 1], 'o',
-                    color='navy', markersize=4, zorder=4, label="Corner Nodes", linestyle='None')
-        
-        # Add a legend if both types of nodes were plotted
-        if ho_node_gids and corner_node_gids_list:
+            ax.plot(
+                mesh.nodes_x_y_pos[corner_node_gids_list, 0],
+                mesh.nodes_x_y_pos[corner_node_gids_list, 1],
+                "o",
+                color=_NODE_COLOR["corner"],
+                markersize=4,
+                zorder=5,
+                label="Corner Nodes",
+                linestyle="None",
+            )
+
+        if any([ho_node_gids, corner_node_gids_list, hanging_node_gids_list]):
             ax.legend()
 
 
@@ -192,10 +241,23 @@ def plot_mesh(mesh, *, solution_on_nodes=None, level_set=None, plot_nodes=True,
         
     return ax
 
-def plot_mesh_2(mesh, *, solution_on_nodes=None, level_set=None, plot_nodes=True,
-              plot_edges=True, elem_tags=True, edge_colors=True,
-              show=True, ax=None, resolution=200, plot_interface=True,
-              edge_filter: Union[str, List[str]] = None):
+def plot_mesh_2(
+    mesh,
+    *,
+    solution_on_nodes=None,
+    level_set=None,
+    plot_nodes=True,
+    plot_edges=True,
+    elem_tags=True,
+    edge_colors=True,
+    show=True,
+    ax=None,
+    resolution=200,
+    plot_interface=True,
+    edge_filter: Union[str, List[str]] = None,
+    highlight_edges: Optional[Iterable[int]] = None,
+    fluid_solid_overlay: bool = True,
+):
     """
     Plots a 2D mesh, correctly using the nodes_x_y_pos attribute for coordinates
     and adding a descriptive legend for tags.
@@ -205,6 +267,24 @@ def plot_mesh_2(mesh, *, solution_on_nodes=None, level_set=None, plot_nodes=True
 
     node_coords = mesh.nodes_x_y_pos
     legend_handles = []
+
+    if fluid_solid_overlay and hasattr(mesh, "elements_list"):
+        fluid_polys, solid_polys = [], []
+        for elem in mesh.elements_list:
+            tag = getattr(elem, "tag", "")
+            coords = node_coords[list(elem.corner_nodes)]
+            if tag == "fluid":
+                fluid_polys.append(coords)
+            elif tag == "solid":
+                solid_polys.append(coords)
+        if fluid_polys:
+            pc = PolyCollection(fluid_polys, facecolors=(0.0, 0.5, 1.0, 0.18), edgecolors='none', zorder=0)
+            ax.add_collection(pc)
+            legend_handles.append(patches.Patch(color=(0.0, 0.5, 1.0, 0.3), label="Fluid domain"))
+        if solid_polys:
+            pc = PolyCollection(solid_polys, facecolors=(1.0, 0.5, 0.0, 0.18), edgecolors='none', zorder=0)
+            ax.add_collection(pc)
+            legend_handles.append(patches.Patch(color=(1.0, 0.5, 0.0, 0.3), label="Solid domain"))
 
     if elem_tags:
         polys_by_color = {}
@@ -219,7 +299,7 @@ def plot_mesh_2(mesh, *, solution_on_nodes=None, level_set=None, plot_nodes=True
 
         for color, polys_list in polys_by_color.items():
             poly_collection = PolyCollection(polys_list, facecolors=color,
-                                             edgecolors='black', lw=0.5, zorder=1)
+                                             edgecolors='black', lw=0.8, zorder=1)
             ax.add_collection(poly_collection)
 
         for tag in sorted(list(unique_elem_tags)):
@@ -242,10 +322,26 @@ def plot_mesh_2(mesh, *, solution_on_nodes=None, level_set=None, plot_nodes=True
             indices = np.flatnonzero(combined_mask)
             edges_to_draw = [mesh.edges_list[i] for i in indices]
 
-        # 2. Build segments and colors using the (potentially filtered) list
-        edge_segments = [node_coords[list(edge.nodes)] for edge in edges_to_draw]
-        colors = [_EDGE_COLOR.get(edge.tag, 'black') if edge.right is not None else _EDGE_COLOR.get('boundary', 'black') for edge in edges_to_draw]
-        line_collection = LineCollection(edge_segments, colors=colors, linewidths=1.2, zorder=2)
+        # 2. Build segments and colors using the (potentially filtered) list.
+        #    If an edge carries intermediate nodes (hanging-edge subdivision),
+        #    draw each sub-segment so the nonconforming interface is visible.
+        edge_segments = []
+        colors = []
+        widths = []
+        for edge in edges_to_draw:
+            nids = list(edge.all_nodes) if getattr(edge, "all_nodes", ()) else list(edge.nodes)
+            if len(nids) < 2:
+                continue
+            pts = node_coords[nids]
+            for i in range(len(nids) - 1):
+                edge_segments.append(pts[i : i + 2])
+                if edge_colors:
+                    tag = edge.tag or ("boundary" if edge.right is None else "default")
+                else:
+                    tag = "boundary" if edge.right is None else "default"
+                colors.append(_edge_col(tag))
+                widths.append(_edge_lw(tag))
+        line_collection = LineCollection(edge_segments, colors=colors, linewidths=widths, zorder=2)
         ax.add_collection(line_collection)
 
         # 3. Build legend using only the tags from the drawn edges
@@ -254,8 +350,41 @@ def plot_mesh_2(mesh, *, solution_on_nodes=None, level_set=None, plot_nodes=True
             unique_edge_tags.add('boundary')
 
         for tag in sorted(list(unique_edge_tags)):
-             if tag in _EDGE_COLOR:
-                legend_handles.append(plt.Line2D([0], [0], color=_EDGE_COLOR[tag], lw=2, label=f'Edge: {tag}'))
+            if tag in _EDGE_COLOR:
+                legend_handles.append(
+                    plt.Line2D(
+                        [0],
+                        [0],
+                        color=_EDGE_COLOR[tag],
+                        lw=_edge_lw(tag),
+                        label=f'Edge: {tag}',
+                    )
+                )
+
+        # 4. Highlight problematic edges (e.g., cracks/zero-length) if provided
+        if highlight_edges is not None:
+            hl_edges = list(highlight_edges)
+            midpoints = []
+            edge_segments_hl = []
+            for gid in hl_edges:
+                if gid is None or gid < 0 or gid >= len(mesh.edges_list):
+                    continue
+                e = mesh.edges_list[int(gid)]
+                nids = list(e.all_nodes) if getattr(e, "all_nodes", ()) else list(e.nodes)
+                if len(nids) < 2:
+                    continue
+                pts = node_coords[nids]
+                midpoints.append(pts.mean(axis=0))
+                for i in range(len(nids) - 1):
+                    edge_segments_hl.append(pts[i : i + 2])
+            # Always add a legend entry when a list was provided so users know what to look for.
+            legend_handles.append(plt.Line2D([0], [0], color='red', lw=3.5, label='Pathology edge'))
+            if edge_segments_hl:
+                lc_hl = LineCollection(edge_segments_hl, colors='red', linewidths=4.5, zorder=8, capstyle='round')
+                ax.add_collection(lc_hl)
+            if midpoints:
+                mp = np.asarray(midpoints, float)
+                ax.plot(mp[:, 0], mp[:, 1], 'o', color='red', markersize=5.5, markeredgecolor='white', zorder=9)
     # --- END MODIFIED SECTION ---
 
     if level_set is not None:
@@ -320,7 +449,14 @@ def plot_mesh_2(mesh, *, solution_on_nodes=None, level_set=None, plot_nodes=True
     if plot_interface:
         all_pts, segments = [], []
         for elem in mesh.elements_list:
-            if hasattr(elem, 'interface_pts') and elem.interface_pts:
+            # Prefer polyline segments when available, fall back to endpoints
+            if hasattr(elem, "interface_segments") and elem.interface_segments:
+                for seg in elem.interface_segments:
+                    if len(seg) == 2:
+                        p0, p1 = seg
+                        segments.append([p0, p1])
+                        all_pts.extend([p0, p1])
+            elif hasattr(elem, 'interface_pts') and elem.interface_pts:
                 all_pts.extend(elem.interface_pts)
                 if len(elem.interface_pts) == 2:
                     segments.append(elem.interface_pts)
@@ -328,13 +464,21 @@ def plot_mesh_2(mesh, *, solution_on_nodes=None, level_set=None, plot_nodes=True
             lc = LineCollection(segments, colors='magenta', linewidths=3.5, zorder=6, label='Interface Segment')
             ax.add_collection(lc)
             legend_handles.append(lc)
-        if all_pts:
-            all_pts_np = np.array(all_pts)
-            ax.plot(all_pts_np[:, 0], all_pts_np[:, 1], 'o', color='cyan', markersize=9,
-                    markeredgecolor='black', zorder=7)
-            legend_handles.append(plt.Line2D([0], [0], marker='o', color='w',
-                                             markerfacecolor='cyan', markeredgecolor='black',
-                                             markersize=9, linestyle='None', label='Interface Point'))
+            if all_pts:
+                all_pts_np = np.array(all_pts)
+                ax.plot(all_pts_np[:, 0], all_pts_np[:, 1], 'o', color='cyan', markersize=9,
+                        markeredgecolor='black', zorder=7)
+                legend_handles.append(plt.Line2D([0], [0], marker='o', color='w',
+                                                 markerfacecolor='cyan', markeredgecolor='black',
+                                                 markersize=9, linestyle='None', label='Interface Point'))
+
+    # Ensure plot limits follow the drawn data (important when coordinates are not in [0,1]).
+    xmin, ymin = node_coords.min(axis=0)
+    xmax, ymax = node_coords.max(axis=0)
+    span = max(xmax - xmin, ymax - ymin, 1e-12)
+    pad = 0.05 * span
+    ax.set_xlim(float(xmin - pad), float(xmax + pad))
+    ax.set_ylim(float(ymin - pad), float(ymax + pad))
 
     ax.set_aspect('equal', 'box')
     ax.set_title("Mesh Visualization with Domain Tags")
@@ -349,7 +493,7 @@ def plot_mesh_2(mesh, *, solution_on_nodes=None, level_set=None, plot_nodes=True
 
 
 
-def visualize_mesh_node_order(pts, element_connectivity, order, element_shape, title="Mesh with Node Order"):
+def visualize_mesh_node_order(pts, element_connectivity, order, element_type, title="Mesh with Node Order"):
     """
     Visualizes the mesh, showing elements and the order of nodes within each element.
     Works for both quadrilateral ('quad') and triangular ('triangle') elements.
@@ -366,18 +510,18 @@ def visualize_mesh_node_order(pts, element_connectivity, order, element_shape, t
     ax.set_aspect('equal')
     ax.set_title(title, fontsize=10)
 
-    if element_shape == 'quad':
+    if element_type == 'quad':
         expected_nodes_per_element = (order + 1)**2
         nodes_1d_edge = order + 1 # For quads, order is 'n' in (n+1) nodes per edge
-    elif element_shape == 'triangle':
+    elif element_type == 'triangle':
         expected_nodes_per_element = (order + 1) * (order + 2) // 2
     else:
-        raise ValueError(f"Unsupported element_shape: {element_shape}. Choose 'quad' or 'triangle'.")
+        raise ValueError(f"Unsupported element_shape: {element_type}. Choose 'quad' or 'triangle'.")
 
     if element_connectivity.shape[0] > 0:
         if element_connectivity.shape[1] != expected_nodes_per_element:
             raise ValueError(
-                f"Mismatch in nodes per element for {element_shape} of order {order}. "
+                f"Mismatch in nodes per element for {element_type} of order {order}. "
                 f"Expected {expected_nodes_per_element}, but connectivity array has "
                 f"{element_connectivity.shape[1]} nodes."
             )
@@ -389,7 +533,7 @@ def visualize_mesh_node_order(pts, element_connectivity, order, element_shape, t
 
     for i, single_element_node_indices in enumerate(element_connectivity):
         boundary_node_global_indices = []
-        if element_shape == 'quad':
+        if element_type == 'quad':
             # Local indices for corners in lexicographical order for Qn:
             idx_bl = 0
             idx_br = order # order here is the highest index along one edge (0 to order)
@@ -406,7 +550,7 @@ def visualize_mesh_node_order(pts, element_connectivity, order, element_shape, t
                 single_element_node_indices[idx_tr],
                 single_element_node_indices[idx_tl]
             ])
-        elif element_shape == 'triangle':
+        elif element_type == 'triangle':
             # Local indices for the 3 primary vertices for Pk (V0, V1, V2)
             # V0 is local index 0
             # V1 is local index `order` (node at end of first edge group)
@@ -430,7 +574,7 @@ def visualize_mesh_node_order(pts, element_connectivity, order, element_shape, t
             polygon = patches.Polygon(polygon_coords, closed=True, edgecolor='blue', facecolor='lightblue', alpha=0.5, zorder=1)
             ax.add_patch(polygon)
         else:
-            print(f"Warning: Element {i} ({element_shape}) has boundary node indices out of bounds for pts array.")
+            print(f"Warning: Element {i} ({element_type}) has boundary node indices out of bounds for pts array.")
 
         # Annotate all nodes within the element with their local index
         for local_idx in range(nodes_per_element):
@@ -441,7 +585,7 @@ def visualize_mesh_node_order(pts, element_connectivity, order, element_shape, t
                         color='red', fontsize=7, ha='center', va='center', zorder=3,
                         bbox=dict(facecolor='white', alpha=0.4, pad=0.01, boxstyle='circle'))
             else:
-                print(f"Warning: Node with local_idx {local_idx} in element {i} ({element_shape}) "
+                print(f"Warning: Node with local_idx {local_idx} in element {i} ({element_type}) "
                       f"has global_idx {node_global_idx} out of bounds.")
 
     # Set plot limits with padding
@@ -465,6 +609,179 @@ def visualize_mesh_node_order(pts, element_connectivity, order, element_shape, t
     plt.ylabel("Y-coordinate")
     plt.grid(True, linestyle=':', alpha=0.5)
     plt.show()
+
+
+def visualize_corner_labels(mesh, *, element_ids=None, max_elements=40, annotate_node_ids=True,
+                             ax=None, title="Element corner labeling", corner_labels=None):
+    """
+    Plot selected elements and annotate each corner with labels (bl/br/tr/tl).
+
+    Args:
+        mesh: ``Mesh`` instance with ``corner_connectivity`` populated.
+        element_ids: Optional iterable of element indices to annotate. Defaults to
+            the first ``max_elements`` elements.
+        max_elements: Limit when ``element_ids`` is None to avoid clutter.
+        annotate_node_ids: If True, append the global node id next to the label.
+        ax: Optional Matplotlib axes to draw on.
+        title: Plot title.
+        corner_labels: Optional list of four labels replacing ['bl','br','tr','tl'].
+    """
+    if not hasattr(mesh, "corner_connectivity"):
+        raise AttributeError("Mesh is missing corner_connectivity; cannot annotate corners.")
+
+    if element_ids is None:
+        total = mesh.num_elements() if hasattr(mesh, "num_elements") else len(mesh.corner_connectivity)
+        count = min(total, max_elements if max_elements is not None else total)
+        element_ids = list(range(count))
+    else:
+        element_ids = list(element_ids)
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(8, 6))
+
+    ax.set_aspect("equal")
+    ax.set_title(title)
+    labels = corner_labels or ["bl", "br", "tr", "tl"]
+
+    for eid in element_ids:
+        corners = mesh.corner_connectivity[eid]
+        coords = mesh.nodes_x_y_pos[list(corners)]
+        polygon = patches.Polygon(coords, closed=True, edgecolor="black", facecolor="none", linewidth=1.0)
+        ax.add_patch(polygon)
+
+        centroid = coords.mean(axis=0)
+        ax.text(centroid[0], centroid[1], f"e{eid}", color="tab:gray", fontsize=7,
+                ha="center", va="center", bbox=dict(facecolor="white", alpha=0.5, pad=0.2))
+
+        for label, gid, (x, y) in zip(labels, corners, coords):
+            txt = f"{label}\n{gid}" if annotate_node_ids else label
+            ax.text(x, y, txt, color="tab:red", fontsize=8, ha="center", va="center",
+                    bbox=dict(facecolor="white", alpha=0.7, pad=0.15))
+
+    ax.set_xlabel("X")
+    ax.set_ylabel("Y")
+    ax.grid(True, linestyle=":", alpha=0.4)
+    return ax
+
+
+def visualize_boundary_dofs(
+    mesh,
+    *,
+    tags: Union[str, Iterable[str]],
+    dof_handler=None,
+    fields: Optional[Union[str, Sequence[str]]] = None,
+    annotate_nodes: bool = False,
+    annotate_dofs: bool = False,
+    ax=None,
+    title: str = "Boundary DOF overview",
+    markersize: int = 40,
+    show: bool = True,
+):
+    """
+    Plot the mesh nodes (and optionally DOFs) that belong to specific edge tags.
+
+    Parameters
+    ----------
+    mesh : Mesh
+        Mesh instance whose edges carry boundary tags.
+    tags : str | Iterable[str]
+        Boundary tag(s) to visualize (e.g. ``\"cylinder\"``).
+    dof_handler : DofHandler, optional
+        When provided, DOF ids for the requested fields can be annotated.
+    fields : str | Sequence[str], optional
+        Field(s) to use when looking up DOF ids. Defaults to all fields on the
+        handler when omitted.
+    annotate_nodes : bool
+        If True, prepend the node id to the annotation label.
+    annotate_dofs : bool
+        If True, append ``field:global_dof`` information for each requested field.
+    ax : matplotlib Axes, optional
+        Existing axes object; created automatically when omitted.
+    title : str
+        Plot title.
+    markersize : int
+        Marker size passed to ``ax.scatter``.
+    """
+    if isinstance(tags, str):
+        tag_list = [tags]
+    else:
+        tag_list = list(tags)
+    if not tag_list:
+        raise ValueError("At least one boundary tag must be provided.")
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(8, 6))
+
+    nodes_by_tag: dict[str, List[int]] = {}
+    for tag in tag_list:
+        node_ids: set[int] = set()
+        for edge in getattr(mesh, "edges_list", []):
+            if getattr(edge, "tag", None) != tag:
+                continue
+            ids = getattr(edge, "all_nodes", ()) or edge.nodes
+            node_ids.update(int(nid) for nid in ids)
+        if node_ids:
+            nodes_by_tag[tag] = sorted(node_ids)
+        else:
+            nodes_by_tag[tag] = []
+
+    colors = plt.rcParams["axes.prop_cycle"].by_key().get("color", None)
+    if not colors:
+        colors = ["tab:blue", "tab:orange", "tab:green", "tab:red"]
+
+    if dof_handler is not None:
+        if fields is None:
+            field_names = list(getattr(dof_handler, "field_names", []))
+        elif isinstance(fields, str):
+            field_names = [fields]
+        else:
+            field_names = list(fields)
+    else:
+        field_names = []
+
+    coords = mesh.nodes_x_y_pos
+    for idx, (tag, node_ids) in enumerate(nodes_by_tag.items()):
+        if not node_ids:
+            continue
+        color = colors[idx % len(colors)]
+        pts = coords[node_ids]
+        ax.scatter(pts[:, 0], pts[:, 1], s=markersize, color=color, label=tag, zorder=3)
+
+        for node_id in node_ids:
+            labels = []
+            if annotate_nodes:
+                labels.append(f"n{node_id}")
+            if annotate_dofs and dof_handler is not None and field_names:
+                dof_labels = []
+                for field in field_names:
+                    gd = getattr(dof_handler, "dof_map", {}).get(field, {}).get(node_id)
+                    if gd is not None:
+                        dof_labels.append(f"{field}:{gd}")
+                if dof_labels:
+                    labels.append("/".join(dof_labels))
+            if labels:
+                x, y = coords[node_id]
+                ax.text(
+                    x,
+                    y,
+                    "\n".join(labels),
+                    fontsize=7,
+                    color="black",
+                    ha="center",
+                    va="center",
+                    zorder=4,
+                    bbox=dict(facecolor="white", alpha=0.7, pad=0.2),
+                )
+
+    ax.set_aspect("equal", "box")
+    ax.set_xlabel("X")
+    ax.set_ylabel("Y")
+    ax.set_title(title)
+    ax.grid(True, linestyle=":", alpha=0.4)
+    ax.legend(loc="best")
+    if show:
+        plt.show()
+    return ax
 
 
 # ------------- measure area plotting

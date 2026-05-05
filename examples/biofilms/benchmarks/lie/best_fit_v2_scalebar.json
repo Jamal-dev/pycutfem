@@ -1,0 +1,87 @@
+{
+  "name": "lie_best_fit_v2_scalebar",
+  "description": "Best-fit parameters for the Lie (Li et al. 2020, BIT27491) deformation benchmark using corrected scale-bar-based experimental extraction and a smoothed t=0 polygon. NOTE: these are effective poroelastic surrogate parameters (not the Oldroyd-B PF parameters from Li et al.).",
+  "reference": {
+    "paper_doi": "10.1002/bit.27491",
+    "video_s1": "examples/biofilms/benchmarks/lie/additional_data/bit27491-sup-0001-si_v1.avi",
+    "exp_target_csv": "examples/biofilms/benchmarks/lie/exp_s1_dx_leftmost_scalebar.csv",
+    "alpha0_polygon_mm_csv": "examples/biofilms/benchmarks/lie/biofilm_exp_s1_frame0_polygon_mm_scalebar_smooth.csv",
+    "optimizer_run_dir": "out/_lie_opt_scalebar_v2_mid/run_219554f3cd97"
+  },
+  "geometry_m": {
+    "L": 0.015,
+    "H": 0.01,
+    "block_w": 0.001,
+    "block_h": 0.003,
+    "block_xc": 0.0075
+  },
+  "flow": {
+    "rho_f": 1000.0,
+    "mu_f": 0.001,
+    "u_avg": 0.0006,
+    "t_ramp": 8.0
+  },
+  "indicator_transport": {
+    "transport_mode": "pde",
+    "D_alpha": 0.0,
+    "alpha_advection_form": "conservative",
+    "alpha_ch_M": 1e-12,
+    "alpha_ch_gamma": 0.002,
+    "alpha_ch_eps": 0.0002,
+    "alpha_ch_mobility": "degenerate",
+    "alpha_supg": 0.0,
+    "alpha_cip": 0.0
+  },
+  "mixture_viscosity": {
+    "mu_b_model": "mu",
+    "mu_b_fluid": 0.001
+  },
+  "skeleton_effective_params": {
+    "solid_model": "linear",
+    "G_b": 0.000120536,
+    "mu_b": 0.03,
+    "nu": 0.49,
+    "kappa_inv": 100000000.0
+  },
+  "numerics": {
+    "dt": 1.0,
+    "t_final": 20.0,
+    "theta": 1.0,
+    "newton_tol": 1e-5,
+    "max_it": 15,
+    "snes_accept_factor": 5.0,
+    "allow_dt_reduction": true,
+    "dt_min": 0.2,
+    "dt_reduction_factor": 0.5,
+    "stop_on_steady": true,
+    "steady_tol": 1e-11,
+    "backend": "cpp",
+    "quadrature_order_q": 6,
+    "mesh_cells": {
+      "nx": 60,
+      "ny": 30,
+      "nx_left": 21,
+      "nx_mid": 18,
+      "nx_right": 21,
+      "ny_bottom": 6,
+      "ny_top": 24
+    }
+  },
+  "fit_metrics": {
+    "rmse_total_um": 31.721113,
+    "rmse_lines_um": {
+      "line1": 45.17661,
+      "line2": 28.36093,
+      "line3": 13.16885
+    },
+    "relative_errors_percent": {
+      "line1": 43.1,
+      "line2": 38.5,
+      "line3": 27.7,
+      "total": 38.7
+    },
+    "notes": "Metrics computed by examples/biofilms/benchmarks/lie/compare_exp_sim_timeseries_dx.py for the optimizer run directory. Relative error uses the paper's 'every second datum' convention as implemented in the script."
+  },
+  "repro_command": "conda run --no-capture-output -n fenicsx python -u examples/biofilms/benchmarks/lie/lie_synthetic_deformation_one_domain.py --backend cpp --transport-mode pde --alpha-advection-form conservative --alpha-ch-M 1e-12 --alpha-ch-gamma 2e-3 --D-alpha 0 --alpha0-file examples/biofilms/benchmarks/lie/biofilm_exp_s1_frame0_polygon_mm_scalebar_smooth.csv --mu-b-model mu --mu-b-fluid 1e-3 --solid-model linear --G-b 1.20536e-4 --mu-b 3e-2 --kappa-inv 1e8 --u-avg 6e-4 --t-ramp 8 --dt 1.0 --t-final 20 --newton-tol 1e-5 --max-it 15 --snes-accept-factor 5 --allow-dt-reduction --dt-min 0.2 --dt-reduction-factor 0.5 --stop-on-steady --steady-tol 1e-11 --nx 60 --ny 30 --nx-left 21 --nx-mid 18 --nx-right 21 --ny-bottom 6 --ny-top 24 --q 6 --vtk-every 0 --out-dir out/_lie_best_fit_v2_scalebar_linear_mid"
+}
+

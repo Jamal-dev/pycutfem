@@ -1,6 +1,6 @@
 import numpy as np
 import meshio
-from typing import Dict, Union, Callable
+from typing import Dict, Union, Callable, Optional
 
 from pycutfem.core.mesh import Mesh
 from pycutfem.core.dofhandler import DofHandler
@@ -10,7 +10,10 @@ def export_vtk(
     filename: str,
     mesh: Mesh,
     dof_handler: DofHandler,
-    functions: Dict[str, Union[Function, VectorFunction, np.ndarray, Callable[[float, float], float]]]
+    functions: Dict[str, Union[Function, VectorFunction, np.ndarray, Callable[[float, float], float]]],
+    *,
+    cell_data: Optional[Dict[str, np.ndarray]] = None,
+    point_displacement: Optional[np.ndarray] = None,
 ):
     """
     Exports simulation data to a VTK (.vtu) file for visualization. (CORRECTED)
@@ -21,9 +24,20 @@ def export_vtk(
         dof_handler: The DofHandler linking DOFs to nodes.
         functions: A dictionary mapping field names to the Function or
                    VectorFunction objects to be exported.
+        point_displacement: Optional nodal displacement used only for the
+                    written VTK coordinates. The original mesh is not modified.
     """
     # 1. Prepare mesh geometry 
-    points_3d = np.pad(mesh.nodes_x_y_pos, ((0, 0), (0, 1)), constant_values=0)
+    points_2d = np.asarray(mesh.nodes_x_y_pos, dtype=float).copy()
+    if point_displacement is not None:
+        disp = np.asarray(point_displacement, dtype=float)
+        if disp.ndim != 2 or disp.shape[0] != points_2d.shape[0] or disp.shape[1] not in (2, 3):
+            raise ValueError(
+                "point_displacement must have shape (num_nodes, 2) or (num_nodes, 3); "
+                f"got {disp.shape}."
+            )
+        points_2d[:, :2] += disp[:, :2]
+    points_3d = np.pad(points_2d, ((0, 0), (0, 1)), constant_values=0)
     if mesh.element_type == 'quad':
         cell_type = 'quad'
     elif mesh.element_type == 'tri':
@@ -41,7 +55,9 @@ def export_vtk(
         if isinstance(obj, VectorFunction):
             vec = np.zeros((num_nodes, 3))
             for gdof, lidx in obj._g2l.items():
-                field, node_id = dof_handler._dof_to_node_map[gdof]
+                field, node_id = dof_handler._dof_to_node_map.get(int(gdof), (None, None))
+                if node_id is None:
+                    continue
                 if field in obj.field_names:
                     comp = obj.field_names.index(field)
                     vec[node_id, comp] = obj.nodal_values[lidx]
@@ -50,10 +66,62 @@ def export_vtk(
 
         # Function -> scalar field
         if isinstance(obj, Function):
-            scal = np.zeros(num_nodes)
+            scal = np.zeros(num_nodes, dtype=float)
+            assigned = np.zeros(num_nodes, dtype=bool)
             for gdof, lidx in obj._g2l.items():
-                _field, node_id = dof_handler._dof_to_node_map[gdof]
+                _field, node_id = dof_handler._dof_to_node_map.get(int(gdof), (None, None))
+                if node_id is None:
+                    continue
                 scal[node_id] = obj.nodal_values[lidx]
+                assigned[node_id] = True
+
+            # Visualization quality: when a lower-order CG field (e.g. Q1) lives on a
+            # higher-order geometry mesh (e.g. Q2), the DOF-to-node map touches only a
+            # subset of mesh nodes. Leaving the remaining nodes at 0 makes ParaView
+            # show spurious "holes" and can mislead interpretation (especially when
+            # combining fields, e.g. (1-d)*alpha).
+            #
+            # For quadrilateral Lagrange meshes, we can safely upsample Q1 fields to
+            # the mesh nodes by evaluating the bilinear interpolation defined by the
+            # element corner values at the high-order node locations.
+            if (not np.all(assigned)) and mesh.element_type == "quad" and int(getattr(mesh, "poly_order", 1) or 1) > 1:
+                try:
+                    p = int(mesh.poly_order)
+                    conn_all = np.asarray(getattr(mesh, "elements_connectivity", None))
+                    if conn_all.ndim == 2 and conn_all.shape[1] == (p + 1) * (p + 1) and p > 0:
+                        for conn in conn_all:
+                            # Corner nodes in row-major (j,i) ordering.
+                            bl = int(conn[0])
+                            br = int(conn[p])
+                            tl = int(conn[p * (p + 1)])
+                            tr = int(conn[p * (p + 1) + p])
+                            if not (assigned[bl] and assigned[br] and assigned[tl] and assigned[tr]):
+                                continue
+                            f_bl = float(scal[bl])
+                            f_br = float(scal[br])
+                            f_tr = float(scal[tr])
+                            f_tl = float(scal[tl])
+                            inv_p = 1.0 / float(p)
+                            for j in range(p + 1):
+                                t = float(j) * inv_p
+                                one_m_t = 1.0 - t
+                                for i in range(p + 1):
+                                    nid = int(conn[j * (p + 1) + i])
+                                    if assigned[nid]:
+                                        continue
+                                    s = float(i) * inv_p
+                                    one_m_s = 1.0 - s
+                                    scal[nid] = (
+                                        (one_m_s * one_m_t) * f_bl
+                                        + (s * one_m_t) * f_br
+                                        + (s * t) * f_tr
+                                        + (one_m_s * t) * f_tl
+                                    )
+                        # Do not mark newly filled nodes as "assigned"; corners still remain authoritative.
+                except Exception:
+                    # Fall back to the sparse mapping (zeros on non-DOF nodes).
+                    pass
+
             point_data[name] = scal
             continue
 
@@ -70,15 +138,60 @@ def export_vtk(
                 raise ValueError(f"{name}: unexpected array shape {arr.shape}")
             continue
 
-        # NEW: callable (x,y) -> value  -> evaluate at nodes
+        # NEW: callable defined on coordinates (analytic fields, level sets, ...)
         if callable(obj):
             xy = mesh.nodes_x_y_pos
-            vals = np.fromiter((obj(float(x), float(y)) for x, y in xy), count=num_nodes, dtype=float)
-            point_data[name] = vals
-            continue
+
+            def _eval_callable(f, x, y):
+                """Try f(x, y); fall back to f([x, y]) if signature differs."""
+                try:
+                    return f(x, y)
+                except TypeError:
+                    try:
+                        return f(np.array([x, y], dtype=float))
+                    except TypeError:
+                        return f((x, y))
+
+            first = _eval_callable(obj, float(xy[0, 0]), float(xy[0, 1]))
+            first_arr = np.asarray(first, dtype=float)
+
+            if first_arr.ndim == 0:
+                vals = np.empty(num_nodes, dtype=float)
+                vals[0] = float(first_arr)
+                for i, (x, y) in enumerate(xy[1:], start=1):
+                    vals[i] = float(_eval_callable(obj, float(x), float(y)))
+                point_data[name] = vals
+                continue
+
+            if first_arr.ndim == 1 and first_arr.size in (2, 3):
+                vec = np.zeros((num_nodes, 3), dtype=float)
+                vec[0, : first_arr.size] = first_arr
+                for i, (x, y) in enumerate(xy[1:], start=1):
+                    res = np.asarray(_eval_callable(obj, float(x), float(y)), dtype=float)
+                    if res.ndim != 1 or res.size != first_arr.size:
+                        raise ValueError(f"{name}: callable returned inconsistent vector shape {res.shape}")
+                    vec[i, : first_arr.size] = res
+                point_data[name] = vec
+                continue
+
+            raise ValueError(
+                f"{name}: callable result with shape {first_arr.shape} is not supported for VTK export"
+            )
 
         raise TypeError(f"{name}: unsupported data type {type(obj)}")
 
     # 3) write
-    meshio.Mesh(points_3d, cells, point_data=point_data).write(filename)
+    cell_data_payload = None
+    if cell_data:
+        n_cells = len(mesh.corner_connectivity)
+        cell_data_payload = {}
+        for key, values in cell_data.items():
+            arr = np.asarray(values)
+            if arr.shape[0] != n_cells:
+                raise ValueError(
+                    f"cell_data['{key}'] has length {arr.shape[0]}, expected {n_cells} (one value per cell)."
+                )
+            cell_data_payload[key] = [arr]
+
+    meshio.Mesh(points_3d, cells, point_data=point_data, cell_data=cell_data_payload).write(filename)
     print(f"Solution exported to {filename}")
