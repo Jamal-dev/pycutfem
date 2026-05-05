@@ -19,23 +19,50 @@ while keeping the workflow close to classical FEM tooling.
 
 ## Installation
 
-`pycutfem` targets Python 3.9 or newer. Creating a virtual environment is
-recommended.
+`pycutfem` targets Python 3.9 or newer.  The recommended developer and paper
+workflow is the Conda environment in `environment.yml`, because it installs the
+Python stack, `pybind11`, Eigen headers, and platform compilers consistently on
+Linux, macOS, and Windows.
+
+```bash
+conda env create -f environment.yml
+conda activate pycutfem
+python -m pytest -q tests/test_three_constituent_benchmark_suite.py
+```
+
+If you prefer a plain Python virtual environment, install the package in editable
+mode.  The package metadata reads `requirements.txt`, so editable installation
+now installs the runtime dependencies as well:
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-python -m pip install -U pip
-python -m pip install -r requirements.txt
+python -m pip install -U pip setuptools wheel
 python -m pip install -e .
 ```
 
 Optional extras:
 
-- `petsc4py` enables PETSc-based Krylov solvers (`python -m pip install petsc4py`).
-- `pypardiso` enables the direct PARDISO backend (`python -m pip install pypardiso`).
-- `ngsolve`, `fenics`, or `fenics-dolfinx` are only needed for the comparison
-  notebooks in `examples/`.
+- `petsc4py` enables PETSc-based Krylov solvers.
+- `pypardiso` enables the direct PARDISO backend (`python -m pip install -e ".[pardiso]"`).
+- `ngsolve`, `fenics`, or `fenics-dolfinx` are only needed for comparison
+  notebooks and external-code studies in `examples/`.
+
+### Windows Notes
+
+The supported Windows path is Miniforge or Mambaforge plus the checked-in Conda
+environment:
+
+```powershell
+conda env create -f environment.yml
+conda activate pycutfem
+python -m pytest -q tests/test_three_constituent_benchmark_suite.py
+```
+
+For C++ backend tests on Windows, install the Microsoft C++ Build Tools if they
+are not already present.  The Conda environment provides Eigen under
+`%CONDA_PREFIX%\Library\include\eigen3`; the CI pipeline sets
+`EIGEN_INCLUDE_DIR` to that path automatically.
 
 ## What is CutFEM?
 
@@ -79,17 +106,75 @@ ParaView or any VTK viewer.
   studies and comparisons against external FEM codes.
 - Repository structure and ownership rules are documented in `ARCHITECTURE.md`.
 
-### Experimental C++ backend
+### C++ backend
 
-An early scaffold for a C++/Eigen codegen path lives under
-`pycutfem/jit/cpp_backend`. Set `PYCUTFEM_JIT_BACKEND=cpp` to route kernel
-compilation through the pybind11-based cache. Requirements:
+The C++/Eigen code-generation path lives under `pycutfem/jit/cpp_backend`.  Set
+`PYCUTFEM_JIT_BACKEND=cpp` to route kernel compilation through the pybind11-based
+cache.  Requirements:
 
-- `pybind11` (added to `requirements.txt`) and a compiler with C++17 support.
-- Eigen headers available (set `EIGEN_INCLUDE_DIR` if they are not under
-  `/usr/include/eigen3`).
+- `pybind11`, NumPy headers, and a compiler with C++17 support.
+- Eigen headers available through `EIGEN_INCLUDE_DIR`, the Conda environment, or
+  `/usr/include/eigen3`.
 
-The generated kernels currently raise a runtime error because the C++ bodies
-are still under construction; the code falls back to the existing Numba path
-when compilation fails. The structure mirrors the Python backend so we can
-incrementally port kernels without touching the assembly front-end.
+The Docker image and GitHub Actions workflow both exercise the C++ backend on
+the current three-constituent regression tests.
+
+## Three-Constituent Paper Suite
+
+The current paper-suite entry point is:
+
+```bash
+python examples/biofilms/benchmarks/three_constituent/run_paper_benchmarks.py \
+  --suite smoke \
+  --skip-seboldt \
+  --outdir out/three_constituent_smoke \
+  --backend cpp \
+  --linear-backend scipy
+```
+
+Use `--suite paper` for the full paper asset generation.  The Seboldt/deformable
+layer run is intentionally long; for routine CI and local checks, use
+`--skip-seboldt` or `--reuse-seboldt /path/to/completed/run`.
+
+## Docker
+
+The checked-in `Dockerfile` builds a reproducible Linux image with the full
+runtime stack, compilers, Eigen, pybind11, and the package installed in editable
+mode.
+
+```bash
+docker build -t pycutfem:local .
+docker run --rm pycutfem:local
+```
+
+To run the paper smoke suite and keep outputs on the host:
+
+```bash
+mkdir -p out
+docker run --rm -v "$PWD/out:/workspace/pycutfem/out" pycutfem:local \
+  python examples/biofilms/benchmarks/three_constituent/run_paper_benchmarks.py \
+    --suite smoke \
+    --skip-seboldt \
+    --outdir out/docker_three_constituent_smoke \
+    --backend cpp \
+    --linear-backend scipy
+```
+
+The Docker build context excludes local credentials, nested paper repositories,
+and generated numerical output through `.dockerignore`.
+
+## CI/CD
+
+GitHub Actions is configured in `.github/workflows/ci.yml`.
+
+- The test job runs on `ubuntu-latest` and `windows-latest` from
+  `environment.yml`.
+- The Linux job also runs the three-constituent paper smoke suite without the
+  long Seboldt case.
+- The Docker job builds the image and runs a smoke test inside it.
+- On non-PR events, the Docker job pushes `latest` and `${GITHUB_SHA}` tags to
+  Docker Hub when these repository secrets are configured:
+  `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN`.
+
+Do not commit Docker Hub, Overleaf, or other service credentials to the
+repository.  Store them as GitHub repository secrets or local untracked files.

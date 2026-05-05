@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from hashlib import blake2b
 from typing import Sequence
 
 from pycutfem.ufl.analytic import Analytic
@@ -110,6 +111,32 @@ def _is_zero(expr: Expression | None) -> bool:
 
 def _is_scalar_expr(expr: Expression) -> bool:
     return _expr_shape(expr) == ()
+
+
+def _derived_runtime_constant(reference: Expression, value: float, suffix: str) -> Constant:
+    """Create a scalar Constant derived from a runtime-preserved Constant.
+
+    Autodiff of powers introduces coefficients such as ``p`` and ``p-1``.  If
+    the original exponent was named for JIT parametrization, the derived
+    constants must also be named so generated kernels remain reusable across
+    parameter values.
+    """
+
+    out = Constant(float(value))
+    ref_name = getattr(reference, "_jit_name", None) or getattr(reference, "_name", None)
+    if ref_name is not None:
+        derived_name = f"{str(ref_name)}_{str(suffix)}"
+        setattr(out, "_jit_name", derived_name)
+        setattr(out, "_name", derived_name)
+        setattr(out, "_preserve_runtime_structure", True)
+    elif bool(getattr(reference, "_preserve_runtime_structure", False)):
+        raw = f"{float(value):.17g}:{str(suffix)}".encode("ascii", errors="ignore")
+        token = blake2b(raw, digest_size=8).hexdigest()
+        derived_name = f"autodiff_runtime_const_{token}"
+        setattr(out, "_jit_name", derived_name)
+        setattr(out, "_name", derived_name)
+        setattr(out, "_preserve_runtime_structure", True)
+    return out
 
 
 def _same_shape(a: Expression, b: Expression) -> bool:
@@ -385,8 +412,10 @@ def _differentiate_expression(expr: Expression, ctx: _GateauxContext) -> Express
         if _is_zero(db):
             if isinstance(expr.b, Constant):
                 p = float(expr.b.value)
-                return Constant(p) * (expr.a ** Constant(p - 1.0)) * da
-            return expr.b * (expr.a ** (expr.b - Constant(1.0))) * da
+                return _derived_runtime_constant(expr.b, p, "factor") * (
+                    expr.a ** _derived_runtime_constant(expr.b, p - 1.0, "minus_one")
+                ) * da
+            return expr.b * (expr.a ** (expr.b - _derived_runtime_constant(expr.b, 1.0, "one"))) * da
         return (expr.a ** expr.b) * (db * log(expr.a) + expr.b * da / expr.a)
 
     if isinstance(expr, Log):

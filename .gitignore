@@ -198,6 +198,18 @@ cython_debug/
 __pycache__
 **/__pycache__/
 garbage/
+
+# Local credentials and reproducibility artifacts
+*token*.txt
+*password*.txt
+*.env
+out/
+results/
+vtk/
+*.vtu
+*.pvtu
+*.xdmf
+*.h5
 project/
 examples/*_results/
 pycutfem/solvers/giant/*

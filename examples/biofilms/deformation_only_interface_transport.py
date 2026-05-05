@@ -337,16 +337,24 @@ def _save_snapshot_png(
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    from pycutfem.plotting.triangulate import triangulate_field
-
     tri = problem.get("alpha_tri")
     if tri is None:
+        from pycutfem.plotting.triangulate import triangulate_field
+
         tri = triangulate_field(problem["mesh"], problem["dh"], "alpha")
-    z = np.asarray(alpha_f.nodal_values, dtype=float).ravel()
+    z = np.clip(np.asarray(alpha_f.nodal_values, dtype=float).ravel(), 0.0, 1.0)
 
     fig, ax = plt.subplots(figsize=(5.4, 4.2), constrained_layout=True)
-    cf = ax.tricontourf(tri, z, levels=np.linspace(0.0, 1.0, 21), cmap="viridis")
-    grid = np.linspace(0.0, 1.0, int(max(256, grid_resolution)))
+    pc = ax.tripcolor(
+        tri,
+        z,
+        shading="gouraud",
+        vmin=0.0,
+        vmax=1.0,
+        cmap="viridis",
+        rasterized=True,
+    )
+    grid = np.linspace(0.0, 1.0, int(max(256, grid_resolution)), dtype=float)
     gx, gy = np.meshgrid(grid, grid)
     exact = np.asarray(case.alpha(gx, gy, float(t_now)), dtype=float)
     ax.contour(gx, gy, exact, levels=[0.5], colors="white", linewidths=1.5)
@@ -357,7 +365,7 @@ def _save_snapshot_png(
     ax.set_title(f"{case.title}, t={float(t_now):.3f}")
     ax.set_xlabel("x")
     ax.set_ylabel("y")
-    fig.colorbar(cf, ax=ax, label=r"$\alpha$")
+    fig.colorbar(pc, ax=ax, label=r"$\alpha$")
 
     if metrics:
         text = "\n".join(
@@ -439,6 +447,7 @@ def _solve_case(
     final_grid: int,
     snapshot_grid: int,
     geom_every: int,
+    enforce_box_mass_projection: bool,
 ) -> dict[str, float]:
     case = build_interface_transport_case(case_key)
     problem = _create_problem(nx)
@@ -664,11 +673,12 @@ def _solve_case(
             solve_seconds = time.perf_counter() - t_start
             if not converged:
                 raise RuntimeError(f"Newton did not converge for case={case.case_id}, nx={nx}, step={step}.")
-            mass_target = float(alpha_weights_full @ _function_to_full_vector(problem, problem["alpha_n"]))
-            # This benchmark isolates transport in a CG space. The post-step
-            # projection is the limiter: it enforces 0 <= alpha <= 1 while
-            # preserving the previous-step alpha mass exactly.
-            _project_alpha_box_mass(problem, alpha_weights_full=alpha_weights_full, mass_target=mass_target)
+            if bool(enforce_box_mass_projection):
+                mass_target = float(alpha_weights_full @ _function_to_full_vector(problem, problem["alpha_n"]))
+                # This benchmark isolates transport in a CG space. The post-step
+                # projection is the limiter: it enforces 0 <= alpha <= 1 while
+                # preserving the previous-step alpha mass exactly.
+                _project_alpha_box_mass(problem, alpha_weights_full=alpha_weights_full, mass_target=mass_target)
 
             should_snapshot = False
             while pending_snapshots and t_k + 1.0e-12 >= float(pending_snapshots[0]):
@@ -722,9 +732,9 @@ def _solve_case(
         "geometry": case.geometry,
         "alpha_transport_velocity": "prescribed_support_velocity",
         "alpha_transport_form": "conservative_strong",
-        "alpha_bounds_enforced": True,
-        "alpha_mass_equality_enforced": True,
-        "solver": "newton_plus_box_mass_projection",
+        "alpha_bounds_enforced": bool(enforce_box_mass_projection),
+        "alpha_mass_equality_enforced": bool(enforce_box_mass_projection),
+        "solver": "newton_plus_box_mass_projection" if bool(enforce_box_mass_projection) else "newton_transport",
         "nx": int(nx),
         "h": h,
         "dt": float(dt),
@@ -884,6 +894,11 @@ def main() -> None:
     ap.add_argument("--final-grid", type=int, default=640)
     ap.add_argument("--snapshot-grid", type=int, default=700)
     ap.add_argument("--geom-every", type=int, default=1)
+    ap.add_argument(
+        "--no-box-mass-projection",
+        action="store_true",
+        help="Disable the optional post-step box/mass projection and report the raw conservative transport result.",
+    )
     ap.add_argument("--convergence", action="store_true")
     ap.add_argument("--outdir", type=str, default="examples/biofilms/results/deformation_only_interface_transport")
     args = ap.parse_args()
@@ -915,6 +930,7 @@ def main() -> None:
             final_grid=max(int(args.final_grid), min(1024, 6 * int(nx))),
             snapshot_grid=max(int(args.snapshot_grid), min(1200, 8 * int(nx))),
             geom_every=max(1, int(args.geom_every)),
+            enforce_box_mass_projection=not bool(args.no_box_mass_projection),
         )
         rows.append(row)
     if len(rows) >= 2:

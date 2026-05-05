@@ -32,6 +32,11 @@ from pycutfem.ufl.expressions import (
 from pycutfem.ufl.measures import dx, ds, dInterface, dNonmatchingInterface, dTraceLink, dGhost  # noqa: F401
 from pycutfem.ufl.analytic import Analytic, x, y  # noqa: F401
 from pycutfem.ufl.spaces import FunctionSpace
+from pycutfem.ufl.linalg import (
+    PairSpaceCholeskyResult,
+    apply_pair_space_cholesky,
+    pair_space_cholesky_coefficients,
+)
 
 __all__ = [
     "Equation",
@@ -67,6 +72,9 @@ __all__ = [
     "dNonmatchingInterface",
     "dTraceLink",
     "dGhost",
+    "PairSpaceCholeskyResult",
+    "apply_pair_space_cholesky",
+    "pair_space_cholesky_coefficients",
 ]
 
 derivative = gateaux_derivative

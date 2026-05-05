@@ -101,9 +101,12 @@ from pycutfem.utils.functionals import NamedFunctionalEvaluator
 from pycutfem.utils.mpi import barrier, get_mpi_context
 
 from examples.utils.biofilm.deformation_only import build_deformation_only_forms
-from examples.utils.biofilm.final_form_tensor import build_biofilm_one_domain_final_form
-from examples.utils.biofilm.final_form_decomposed import (
-    build_biofilm_one_domain_final_form as build_biofilm_one_domain_final_form_decomposed,
+from examples.utils.biofilm.bulk_interface_split_form_tensor import (
+    build_biofilm_one_domain_bulk_interface_split_form,
+)
+from examples.utils.biofilm.bulk_interface_split_form_decomposed import (
+    build_biofilm_one_domain_bulk_interface_split_form
+    as build_biofilm_one_domain_bulk_interface_split_form_decomposed,
 )
 from examples.utils.biofilm.one_domain import build_biofilm_one_domain_forms
 from examples.utils.shared.nonlinear_solid_refmap import (
@@ -111,6 +114,9 @@ from examples.utils.shared.nonlinear_solid_refmap import (
     dsigma_svk,
     sigma_neo_hookean_seboldt,
     sigma_svk,
+)
+from examples.biofilms.benchmarks.three_constituent.seboldt_physical import (
+    run_physical_seboldt_three_constituent,
 )
 
 
@@ -320,6 +326,27 @@ def _transport_update_mode_key(value: str | None) -> str:
     return key
 
 
+def _alpha_advection_form_key(value: str | None) -> str:
+    key = str(value or "conservative_weak").strip().lower().replace("-", "_")
+    if key not in {"advective", "conservative", "conservative_weak", "interface_band_conservative"}:
+        raise ValueError(
+            f"Unsupported alpha_advection_form={value!r}. "
+            "Use 'advective', 'conservative', 'conservative_weak', or 'interface_band_conservative'."
+        )
+    return key
+
+
+def _alpha_advection_form_is_conservative(value: str | None) -> bool:
+    return _alpha_advection_form_key(value) in {"conservative", "conservative_weak", "interface_band_conservative"}
+
+
+def _alpha_regularization_key(value: str | None) -> str:
+    key = str(value or "none").strip().lower().replace("-", "_")
+    if key not in {"none", "ch", "olsson_nt"}:
+        raise ValueError(f"Unsupported alpha_regularization={value!r}. Use 'none', 'ch', or 'olsson_nt'.")
+    return key
+
+
 def _interface_closure_method_key(value: str | None) -> str:
     key = str(value or "penalty").strip().lower().replace("-", "_")
     if key in {"nitsche", "consistent", "symmetric_nitsche", "fully_consistent"}:
@@ -381,6 +408,13 @@ def _full_ratio_free_state_enabled(args: argparse.Namespace) -> bool:
 
 def _final_form_enabled(args: argparse.Namespace) -> bool:
     return str(getattr(args, "one_domain_formulation", "legacy")).strip().lower().replace("-", "_") == "final_form"
+
+
+def _three_constituent_enabled(args: argparse.Namespace) -> bool:
+    return str(getattr(args, "one_domain_formulation", "legacy")).strip().lower().replace("-", "_") in {
+        "three_constituent",
+        "three_constituent_one_domain",
+    }
 
 
 def _final_form_phi_mode_key(raw) -> str:
@@ -922,13 +956,185 @@ def _parse_args() -> argparse.Namespace:
         "--one-domain-formulation",
         type=str,
         default="legacy",
-        choices=("legacy", "final_form"),
+        choices=("legacy", "final_form", "three_constituent"),
         help=(
             "One-domain formulation family. "
             "'legacy' keeps the historical alpha/B/phi branches; "
             "'final_form' activates the bulk/interface-separated v_f,v_p,v_s,rho_s,p_p,p,alpha,phi formulation "
-            "from examples/biofilms/benchmarks/seboldt/final_form.md."
+            "from examples/biofilms/benchmarks/seboldt/final_form.md; "
+            "'three_constituent' runs the physical free-fluid/pore-fluid/skeleton Seboldt case with the "
+            "canonical three-constituent residual."
         ),
+    )
+    ap.add_argument(
+        "--three-constituent-nx",
+        type=int,
+        default=None,
+        help="Number of x elements for one_domain_formulation=three_constituent. Defaults to --nx.",
+    )
+    ap.add_argument(
+        "--three-constituent-ny",
+        type=int,
+        default=None,
+        help="Number of y elements for one_domain_formulation=three_constituent. Defaults to --ny.",
+    )
+    ap.add_argument(
+        "--three-constituent-resistance-model",
+        type=str,
+        default="full_cholesky",
+        choices=("diagonal", "full_cholesky"),
+        help="Pair-resistance closure used by the physical three-constituent Seboldt run.",
+    )
+    ap.add_argument(
+        "--three-constituent-transfer-velocity",
+        type=str,
+        default="free",
+        choices=("average", "free", "pore"),
+        help=(
+            "Velocity carried by free/pore relabeling momentum in the physical three-constituent Seboldt run. "
+            "For the upward free-to-pore Seboldt inflow, 'free' carries donor free-fluid momentum into the pore phase."
+        ),
+    )
+    ap.add_argument(
+        "--three-constituent-lag-alpha",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use previous-step alpha in the coupled constitutive coefficients while phi remains current.",
+    )
+    ap.add_argument(
+        "--three-constituent-r-fp-factor",
+        type=float,
+        default=1.0,
+        help="Multiplier on R_fp relative to mu_f/kappa for the three-constituent Seboldt run.",
+    )
+    ap.add_argument(
+        "--three-constituent-r-fs-factor",
+        type=float,
+        default=1.0,
+        help="Multiplier on R_fs relative to mu_f/kappa for the three-constituent Seboldt run.",
+    )
+    ap.add_argument(
+        "--three-constituent-r-ps-factor",
+        type=float,
+        default=1.0,
+        help="Multiplier on R_ps relative to mu_f/kappa for the three-constituent Seboldt run.",
+    )
+    ap.add_argument(
+        "--three-constituent-ell-gamma-factor",
+        type=float,
+        default=1.0,
+        help="Multiplier on ell_Gamma relative to mu_f/kappa for the three-constituent Seboldt run.",
+    )
+    ap.add_argument(
+        "--three-constituent-gamma-mobility",
+        type=str,
+        default="interface_delta",
+        choices=("interface_delta", "grad_alpha", "phi_grad_alpha", "FP", "fp", "off"),
+        help=(
+            "Free/pore relabeling mobility for the physical three-constituent Seboldt run. "
+            "'interface_delta' uses ell_Gamma phi |grad(alpha)|; 'FP' uses the volumetric overlap ell_Gamma F P."
+        ),
+    )
+    ap.add_argument(
+        "--three-constituent-gamma-delta-epsilon",
+        type=float,
+        default=1.0e-12,
+        help="Smooth norm epsilon for the interface-delta gamma mobility.",
+    )
+    ap.add_argument(
+        "--three-constituent-inactive-velocity-extension-factor",
+        type=float,
+        default=0.0,
+        help=(
+            "Free-side extension strength for inactive pore/solid velocities, scaled by R_ps. "
+            "This is zero in the generic model and should be enabled for production one-domain Seboldt runs."
+        ),
+    )
+    ap.add_argument(
+        "--three-constituent-inactive-pressure-extension-factor",
+        type=float,
+        default=0.0,
+        help="Free-side extension strength for inactive pore pressure, scaled by ell_Gamma/rho_f.",
+    )
+    ap.add_argument(
+        "--three-constituent-inactive-phi-extension-factor",
+        type=float,
+        default=0.0,
+        help="Free-side extension strength for inactive phi, scaled by rho_s/dt.",
+    )
+    ap.add_argument(
+        "--three-constituent-inactive-displacement-extension-factor",
+        type=float,
+        default=0.0,
+        help="Free-side extension strength for inactive skeleton displacement, scaled by rho_s/dt.",
+    )
+    ap.add_argument(
+        "--three-constituent-inactive-domain-closure",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Deactivate phase fields in elements that are fully outside their support "
+            "while keeping the diffuse interface band active."
+        ),
+    )
+    ap.add_argument(
+        "--three-constituent-inactive-alpha-low",
+        type=float,
+        default=0.02,
+        help="Alpha threshold below which pore/skeleton/phi fields are inactive when inactive-domain closure is enabled.",
+    )
+    ap.add_argument(
+        "--three-constituent-inactive-alpha-high",
+        type=float,
+        default=0.98,
+        help="Alpha threshold above which free-fluid fields are inactive when inactive-domain closure is enabled.",
+    )
+    ap.add_argument(
+        "--three-constituent-pdas-c",
+        type=float,
+        default=1.0,
+        help="PDAS complementarity scaling for bounded alpha, phi, and optional pore pressure.",
+    )
+    ap.add_argument(
+        "--three-constituent-pore-pressure-lower-bound",
+        type=float,
+        default=0.0,
+        help="Lower PDAS bound for physical pore pressure in the three-constituent Seboldt run. Use NaN to disable.",
+    )
+    ap.add_argument(
+        "--three-constituent-pore-pressure-upper-bound",
+        type=float,
+        default=float("nan"),
+        help="Upper PDAS bound for physical pore pressure in the three-constituent Seboldt run. Use NaN for no upper bound.",
+    )
+    ap.add_argument(
+        "--three-constituent-history-stride",
+        type=int,
+        default=10,
+        help="Accepted-step stride for physical three-constituent Seboldt history diagnostics. Use 0 to disable.",
+    )
+    ap.add_argument(
+        "--three-constituent-pore-momentum-outflow",
+        type=str,
+        default="conservative",
+        choices=("none", "conservative", "outflow_only"),
+        help=(
+            "Top-boundary pore momentum flux used with the weak conservative pore momentum row. "
+            "'conservative' adds rho_p P (v_p·n) v_p·w_p on the drained top; "
+            "'outflow_only' uses a smooth positive part of v_p·n as a backflow-stable variant."
+        ),
+    )
+    ap.add_argument(
+        "--three-constituent-pore-momentum-outflow-factor",
+        type=float,
+        default=1.0,
+        help="Multiplier for the top-boundary pore momentum flux term.",
+    )
+    ap.add_argument(
+        "--three-constituent-pore-momentum-outflow-smooth-eta",
+        type=float,
+        default=1.0e-12,
+        help="Smooth positive-part epsilon used by --three-constituent-pore-momentum-outflow outflow_only.",
     )
     ap.add_argument(
         "--full-ratio-free-state",
@@ -2913,6 +3119,18 @@ def _parse_args() -> argparse.Namespace:
     args._gamma_p_pore_explicit = any(
         arg == "--gamma-p-pore" or arg.startswith("--gamma-p-pore=") for arg in raw_argv
     )
+    args._predictor_corrector_startup_explicit = any(
+        arg in {"--predictor-corrector-startup", "--no-predictor-corrector-startup"}
+        for arg in raw_argv
+    )
+    args._alpha_regularization_explicit = any(
+        arg == "--alpha-regularization" or arg.startswith("--alpha-regularization=")
+        for arg in raw_argv
+    )
+    args._eps_alpha_over_h_explicit = any(
+        arg == "--eps-alpha-over-h" or arg.startswith("--eps-alpha-over-h=")
+        for arg in raw_argv
+    )
     return args
 
 
@@ -4577,21 +4795,17 @@ def _final_form_phi_is_algebraic(problem: dict[str, object]) -> bool:
 
 
 def _post_accept_lag_phi_in_main(problem: dict[str, object]) -> bool:
+    # The post-accept split is only a geometric-support split: the mechanics
+    # solve uses alpha frozen at time level n, then alpha is transported with
+    # the accepted skeleton velocity.  Phi remains part of the main solve so
+    # its bounds are enforced there and the post branch does not spend a second
+    # bounded VI solve on phi/S.
     if not bool(problem.get("final_form", False)):
-        return True
+        return False
     override = problem.get("final_form_lag_phi_in_main", None)
     if override is not None:
         return bool(override)
     if _final_form_phi_is_algebraic(problem):
-        return True
-    # On the constant-density final_form branch the post_accept split is the
-    # only robust path. Keeping phi active in the main flow/solid Newton solve
-    # leaves the exact step dominated by the coupled transport block, while the
-    # accepted-step transport update is already responsible for restoring the
-    # bounded transport state. Lag phi consistently there and update it together
-    # with alpha after the mechanics step accepts unless the caller explicitly
-    # requests otherwise.
-    if _final_form_constant_rho_s(problem):
         return True
     return False
 
@@ -5580,6 +5794,35 @@ def _normalize_benchmark7_solver_choice(args: argparse.Namespace) -> argparse.Na
                 "so alpha/B/mu/S stay at time level n during the main flow/solid Newton solve and are updated once "
                 "after the accepted step."
             )
+        support_key_for_post = str(getattr(args, "support_physics", "legacy_exchange")).strip().lower()
+        if support_key_for_post == "stored_support":
+            if str(getattr(args, "alpha_advect_with", "vS")).strip().lower() != "vs":
+                print(
+                    "[info] forcing alpha_advect_with=vS for post_accept stored-support updates; "
+                    "alpha is the skeleton-carried geometric support and is advanced with the accepted vS."
+                )
+                args.alpha_advect_with = "vS"
+            if _alpha_advection_form_key(getattr(args, "alpha_advection_form", "advective")) != "advective":
+                print(
+                    "[info] forcing alpha_advection_form=advective for post_accept stored-support updates; "
+                    "the post step solves the nonconservative skeleton-material alpha kinematics."
+                )
+                args.alpha_advection_form = "advective"
+        if (
+            _alpha_regularization_key(getattr(args, "alpha_regularization", "none")) != "none"
+            and not bool(getattr(args, "_alpha_regularization_explicit", False))
+        ):
+            print(
+                "[info] forcing alpha_regularization=none for post_accept transport updates; "
+                "no default CH/Olsson regularization is added to the alpha-only post step."
+            )
+            args.alpha_regularization = "none"
+        if bool(getattr(args, "alpha_mass_constraint", False)):
+            print(
+                "[info] disabling alpha_mass_constraint for post_accept transport updates; "
+                "the post step advances alpha with its transport law and PDAS bounds, without a global alpha_mass_lm row."
+            )
+            args.alpha_mass_constraint = False
         if str(getattr(args, "predictor", "prev")).strip().lower() != "prev":
             print(
                 "[info] forcing predictor=prev for post_accept transport updates so the lagged transport block "
@@ -5592,6 +5835,19 @@ def _normalize_benchmark7_solver_choice(args: argparse.Namespace) -> argparse.Na
                 "must keep alpha/B frozen at time level n."
             )
             args.startup_bootstrap = False
+        solver_key = str(getattr(args, "nonlinear_solver", "pdas")).strip().lower()
+        if (
+            solver_key in {"pdas", "ipm"}
+            and bool(getattr(args, "predictor_corrector_startup", False))
+            and not bool(getattr(args, "_predictor_corrector_startup_explicit", False))
+        ):
+            print(
+                "[info] disabling predictor_corrector_startup by default for post_accept bounded PDAS/IPM: "
+                "the first step should start from the accepted time-n state and let the active-set solve "
+                "enforce alpha/phi bounds directly. Pass --predictor-corrector-startup to request the "
+                "G-anchor predictor explicitly."
+            )
+            args.predictor_corrector_startup = False
         if bool(getattr(args, "stall_frozen_transport_restart", False)):
             print(
                 "[info] disabling frozen-transport restart for post_accept transport updates because the main solve "
@@ -5686,6 +5942,14 @@ def _normalize_benchmark7_solver_choice(args: argparse.Namespace) -> argparse.Na
                 "[info] disabling the exact alpha-mass equality because --alpha-from-refmap does not solve alpha as an independent unknown."
             )
             args.alpha_mass_constraint = False
+    if bool(getattr(args, "alpha_mass_constraint", False)) and not _alpha_advection_form_is_conservative(
+        getattr(args, "alpha_advection_form", "conservative_weak")
+    ):
+        print(
+            "[info] disabling alpha_mass_constraint because the selected alpha law is nonconservative; "
+            "the global alpha_mass_lm equality is valid only for conservative alpha transport."
+        )
+        args.alpha_mass_constraint = False
     if bool(getattr(args, "logistic_bounded_transform", False)):
         requested_logistic_fields = _parse_csv_fields(getattr(args, "logistic_bounded_fields", ""))
         effective_logistic_fields = _effective_logistic_bounded_fields(args)
@@ -7724,6 +7988,7 @@ def _create_problem(
     latent_bounded_map: str = "sigmoid",
     latent_bounded_formulation: str = "embedded",
     alpha_mass_constraint: bool = False,
+    alpha_regularization: str = "none",
     pressure_mean_constraint: bool = False,
     solid_volumetric_split: bool = False,
     drag_formulation: str = "direct",
@@ -7802,6 +8067,7 @@ def _create_problem(
         )
     use_hdiv_primary_darcy_flux = bool(use_primary_darcy_flux) and darcy_flux_space_key == "hdiv"
     use_pressure_mean_constraint = bool(pressure_mean_constraint) and bool(use_ratio_free_full_state)
+    alpha_regularization_key = _alpha_regularization_key(alpha_regularization)
     reduced_support_uses_B = (
         False
         if bool(use_final_form)
@@ -7905,7 +8171,7 @@ def _create_problem(
         ),
         "alpha": int(scalar_order),
         **({"B": int(scalar_order)} if bool(reduced_support_uses_B) else {}),
-        **({"mu_alpha": int(scalar_order)} if not bool(use_final_form) else {}),
+        **({"mu_alpha": int(scalar_order)} if (not bool(use_final_form)) and alpha_regularization_key == "ch" else {}),
     }
     if fluid_space_key == "cg":
         field_specs = {"v_x": int(poly_order), "v_y": int(poly_order), **field_specs}
@@ -8133,6 +8399,7 @@ def _create_problem(
         "latent_bounded_map": str(latent_bounded_map),
         "latent_bounded_formulation": str(latent_bounded_formulation),
         "alpha_mass_constraint": bool(bool(alpha_mass_constraint) and not bool(latent_bounded_transport)),
+        "alpha_regularization": str(alpha_regularization_key),
         "pressure_mean_constraint": bool(use_pressure_mean_constraint),
         "solid_volumetric_split": bool(solid_volumetric_split),
         "one_domain_formulation": str(formulation_key),
@@ -8657,12 +8924,12 @@ def _build_forms(
             raise ValueError("one_domain_formulation=final_form requires vP and p_pore fields.")
         if (not bool(final_form_constant_rho_s)) and problem.get("rho_s_k") is None:
             raise ValueError("variable-density one_domain_formulation=final_form requires the rho_s field.")
-        final_form_builder = (
-            build_biofilm_one_domain_final_form_decomposed
+        bulk_interface_split_builder = (
+            build_biofilm_one_domain_bulk_interface_split_form_decomposed
             if _final_form_implementation_key(problem.get("final_form_implementation", "tensor")) == "decomposed"
-            else build_biofilm_one_domain_final_form
+            else build_biofilm_one_domain_bulk_interface_split_form
         )
-        forms = final_form_builder(
+        forms = bulk_interface_split_builder(
             v_k=problem["v_k"],
             p_k=problem["p_k"],
             vP_k=problem["vP_k"],
@@ -10060,11 +10327,7 @@ def _build_bcs(
         darcy_flux_space_key = "hdiv" if str(fluid_space).strip().lower() == "hdiv" else "cg"
     alpha_bc = lambda x, y, t: float(_alpha_equilibrium(y, y_interface=float(y_interface), eps_alpha=float(eps_alpha)).reshape(()))
     phi_eq = lambda x, y, t: float(
-        np.clip(
-            1.0 - (1.0 - float(phi_b)) * _alpha_equilibrium(y, y_interface=float(y_interface), eps_alpha=float(eps_alpha)),
-            0.0,
-            1.0,
-        ).reshape(())
+        (1.0 - (1.0 - float(phi_b)) * _alpha_equilibrium(y, y_interface=float(y_interface), eps_alpha=float(eps_alpha))).reshape(())
     )
     alpha_one = lambda x, y, t: 1.0
     zero = lambda x, y, t: 0.0
@@ -10486,19 +10749,10 @@ def _apply_open_top_global_phi_cleanup(
     funcs,
     find_named_function,
 ) -> None:
-    if bool(problem.get("latent_bounded_transport", False)):
-        return
-    if not bool(args.enable_phi_evolution) or problem["phi_k"] is None or not bool(args.phi_box_constraints):
-        return
-    if not _full_top_drainage_transport_enabled(
-        enable_phi_evolution=bool(args.enable_phi_evolution),
-        top_drainage_transport=bool(args.top_drainage_transport),
-    ):
-        return
-    phi_cur = find_named_function(funcs, problem["phi_k"])
-    phi_vals = np.asarray(getattr(phi_cur, "nodal_values", np.array([], dtype=float)), dtype=float)
-    if phi_vals.size:
-        np.clip(phi_vals, 0.0, 1.0, out=phi_vals)
+    # Physical phi bounds are enforced by the active-set/IPM solver.  This hook
+    # used to clip the accepted field for open-top drainage, which can silently
+    # discard transport energy; keep it as a no-op for compatibility.
+    return
 
 
 def _build_vi_linear_equalities(
@@ -10803,6 +11057,7 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         latent_bounded_map=str(args.latent_bounded_map),
         latent_bounded_formulation=str(args.latent_bounded_formulation),
         alpha_mass_constraint=bool(args.alpha_mass_constraint),
+        alpha_regularization=str(args.alpha_regularization),
         pressure_mean_constraint=bool(args.pressure_mean_constraint),
         solid_volumetric_split=bool(args.solid_volumetric_split),
         drag_formulation=str(args.drag_formulation),
@@ -10979,17 +11234,22 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
     if problem["phi_n"] is not None:
         uniform_initial_phi = float(getattr(args, "uniform_initial_phi", float("nan")))
         if np.isfinite(uniform_initial_phi):
+            if uniform_initial_phi < -1.0e-14 or uniform_initial_phi > 1.0 + 1.0e-14:
+                raise ValueError("--uniform-initial-phi must lie in [0, 1] when phi is a bounded PDAS field.")
             phi_init = np.full_like(
                 np.asarray(problem["alpha_n"].nodal_values, dtype=float),
-                np.clip(uniform_initial_phi, 0.0, 1.0),
+                float(uniform_initial_phi),
                 dtype=float,
             )
         else:
-            phi_init = np.clip(
-                1.0 - (1.0 - float(args.phi_b)) * np.asarray(problem["alpha_n"].nodal_values, dtype=float),
-                0.0,
-                1.0,
-            )
+            phi_init = 1.0 - (1.0 - float(args.phi_b)) * np.asarray(problem["alpha_n"].nodal_values, dtype=float)
+            phi_min = float(np.min(phi_init)) if phi_init.size else float("nan")
+            phi_max = float(np.max(phi_init)) if phi_init.size else float("nan")
+            if phi_min < -1.0e-12 or phi_max > 1.0 + 1.0e-12:
+                raise ValueError(
+                    "Initial phi closure produced values outside [0, 1]; "
+                    f"range=({phi_min:.6e}, {phi_max:.6e})."
+                )
         problem["phi_n"].nodal_values[:] = phi_init
         problem["phi_k"].nodal_values[:] = phi_init
         if problem.get("mu_n") is not None:
@@ -11095,7 +11355,16 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                     ),
                     dtype=float,
                 ).ravel()
-                return np.clip(det_grad_chi * alpha_marker, 0.0, 1.0)
+                vals = det_grad_chi * alpha_marker
+                val_min = float(np.min(vals)) if vals.size else float("nan")
+                val_max = float(np.max(vals)) if vals.size else float("nan")
+                if val_min < -1.0e-12 or val_max > 1.0 + 1.0e-12:
+                    raise ValueError(
+                        "alpha_from_refmap produced alpha outside [0, 1]. "
+                        "Raw clipping is disabled; use the PDAS alpha transport branch for bounded alpha. "
+                        f"range=({val_min:.6e}, {val_max:.6e})."
+                    )
+                return vals
 
             alpha_vals = _values_for_shift(0.0)
             if np.isfinite(alpha_area_target) and alpha_integral_weights.size == alpha_vals.size:
@@ -12134,7 +12403,7 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             alpha_obj = _find_named_function(funcs_in, alpha_template) if funcs_in is not None else alpha_template
             phi_obj = _find_named_function(funcs_in, phi_template) if funcs_in is not None else phi_template
             alpha_vals = np.asarray(alpha_obj.nodal_values, dtype=float)
-            phi_vals = np.clip(1.0 - phi_scale * alpha_vals, 0.0, 1.0)
+            phi_vals = 1.0 - phi_scale * alpha_vals
             phi_obj.nodal_values[:] = phi_vals
             phi_latent_template = problem.get(f"phi_latent_{suffix}")
             if phi_latent_template is not None:
@@ -12219,16 +12488,8 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                     if funcs_in is not None:
                         alpha_ref = _find_named_function(funcs_in, problem["alpha_k"])
                         B_ref = _find_named_function(funcs_in, problem["B_k"])
-                    alpha_vals = np.clip(
-                        np.asarray(alpha_ref.nodal_values, dtype=float),
-                        0.0,
-                        1.0,
-                    )
-                    B_vals = np.clip(
-                        np.asarray(B_ref.nodal_values, dtype=float),
-                        0.0,
-                        1.0,
-                    )
+                    alpha_vals = np.asarray(alpha_ref.nodal_values, dtype=float)
+                    B_vals = np.asarray(B_ref.nodal_values, dtype=float)
                     _apply_field_box_bounds(
                         lower_full,
                         upper_full,
@@ -12252,6 +12513,14 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                         source_values=B_vals,
                     )
             if bool(args.enable_phi_evolution) and problem["phi_k"] is not None and bool(args.phi_box_constraints):
+                _apply_field_box_bounds(
+                    lower_full,
+                    upper_full,
+                    dof_handler=problem["dh"],
+                    field_name="phi",
+                    lo=0.0,
+                    hi=1.0,
+                )
                 support_key = str(args.support_physics).strip().lower()
                 if support_key == "internal_conversion":
                     freeze_bounds = bool(getattr(target_solver, "_benchmark7_freeze_support_phi_bounds", False))
@@ -12279,15 +12548,6 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                     phi_lower, phi_upper = phi_bounds_cache
                     lower_full = np.maximum(lower_full, phi_lower)
                     upper_full = np.minimum(upper_full, phi_upper)
-                else:
-                    _apply_field_box_bounds(
-                        lower_full,
-                        upper_full,
-                        dof_handler=problem["dh"],
-                        field_name="phi",
-                        lo=0.0,
-                        hi=1.0,
-                    )
                 any_box_bounds = True
             if problem.get("rho_s_k") is not None:
                 _apply_field_box_bounds(
@@ -12764,35 +13024,6 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                 _sync_alpha_from_refmap()
             if getattr(target_solver, "constraints", None) is not None:
                 target_solver._enforce_constraints_on_functions(funcs)
-            else:
-                # On the post_accept split branch, plain Newton transport stages
-                # are materially cheaper than a full bounded VI solve on the
-                # refined Seboldt meshes. If physical box bounds were requested
-                # but the active stage solver is unconstrained, project the
-                # accepted alpha/phi state back into the admissible interval
-                # here so later steps do not start from unphysical transport
-                # values.
-                if bool(getattr(args, "alpha_box_constraints", False)) and not bool(alpha_from_refmap_enabled):
-                    alpha_ref = _find_named_function(funcs, problem["alpha_k"])
-                    if alpha_ref is not None:
-                        alpha_ref.nodal_values[:] = np.clip(
-                            np.asarray(alpha_ref.nodal_values, dtype=float),
-                            0.0,
-                            1.0,
-                        )
-                if (
-                    bool(getattr(args, "phi_box_constraints", False))
-                    and bool(getattr(args, "enable_phi_evolution", False))
-                    and not bool(problem.get("full_ratio_free_state", False))
-                    and problem.get("phi_k") is not None
-                ):
-                    phi_ref = _find_named_function(funcs, problem["phi_k"])
-                    if phi_ref is not None:
-                        phi_ref.nodal_values[:] = np.clip(
-                            np.asarray(phi_ref.nodal_values, dtype=float),
-                            0.0,
-                            1.0,
-                        )
             reset_bounds_cb = getattr(target_solver, "_reset_benchmark7_vi_bounds_freeze", None)
             if callable(reset_bounds_cb):
                 reset_bounds_cb()
@@ -12911,16 +13142,15 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
         main_solver_forms = _build_post_accept_main_solver_forms_now(
             include_phi=(not _post_accept_lag_phi_in_main(problem))
         )
+    post_accept_main_solver_kind = None
+    if bool(transport_update_post_accept) and not bool(use_pdas_main_step_on_post_accept_interface_branch):
+        post_accept_main_solver_kind = "newton" if bool(_post_accept_lag_phi_in_main(problem)) else None
     solver = _make_solver(
         main_solver_forms,
         postproc_cb=_record_step,
         max_newton_iter=int(args.max_it),
         accept_factor=float(main_accept_factor),
-        solver_kind=(
-            None
-            if bool(use_pdas_main_step_on_post_accept_interface_branch)
-            else ("newton" if bool(transport_update_post_accept) else None)
-        ),
+        solver_kind=post_accept_main_solver_kind,
         freeze_support_phi_bounds=True,
     )
     if (
@@ -12983,7 +13213,9 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             )
         main_active_fields: list[str] = []
         lag_phi_in_main = _post_accept_lag_phi_in_main(problem)
-        transport_fields_preview: list[str] = ["alpha", "mu_alpha"]
+        transport_fields_preview: list[str] = ["alpha"]
+        if problem.get("mu_k") is not None:
+            transport_fields_preview.append("mu_alpha")
         if problem.get("B_k") is not None:
             transport_fields_preview.append("B")
         if problem.get("alpha_mass_lm_k") is not None:
@@ -14201,6 +14433,19 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             stage_name=stage_name,
             transport_solver_kind_override=str(getattr(args, "startup_transport_solver", "auto")),
         )
+        bounded_stage_fields = {
+            str(name)
+            for name in list(active_fields or [])
+            if (str(name) == "alpha" and bool(getattr(args, "alpha_box_constraints", False)))
+            or (str(name) == "phi" and bool(getattr(args, "phi_box_constraints", False)))
+        }
+        if stage_solver_kind == "newton" and bounded_stage_fields and str(solver_key).strip().lower() in {"pdas", "ipm"}:
+            stage_solver_kind = str(solver_key).strip().lower()
+            print(
+                "    [solver] using "
+                f"{stage_solver_kind.upper()} for {stage_name} because bounded fields "
+                f"{tuple(sorted(bounded_stage_fields))} are active."
+            )
         stage_relaxed_accept_ginf = float(startup_stage_relaxed_ginf)
         stage_accept_factor = float(startup_stage_accept_factor)
         if stage_name == "transport" and stage_solver_kind in {"pdas", "ipm"}:
@@ -16851,7 +17096,8 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
                         )
                     _set_final_form_normal_interface_weight(stage_weight)
                 else:
-                    _set_final_form_normal_interface_weight(float(normal_interface_h_info["exact"]))
+                    stage_weight = float(normal_interface_h_info["exact"])
+                    _set_final_form_normal_interface_weight(stage_weight)
                 input_snapshot = _snapshot_function_values(funcs)
                 try:
                     _set_solver_newton_trace_context(
@@ -17082,6 +17328,22 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             )
         transport_snapshot = _snapshot_selected_function_values(funcs, transport_fields)
         prev_transport_snapshot = _snapshot_selected_function_values(prev_funcs, transport_fields)
+        export_transport_vi_state = getattr(target_solver, "export_vi_state", None)
+        import_transport_vi_state = getattr(target_solver, "import_vi_state", None)
+        restore_transport_vi_classification = getattr(target_solver, "_vi_restore_classification_state", None)
+        transport_vi_state_before = (
+            export_transport_vi_state()
+            if callable(export_transport_vi_state)
+            else None
+        )
+
+        def _restore_transport_vi_state_before_retry() -> None:
+            restored = False
+            if callable(import_transport_vi_state) and transport_vi_state_before is not None:
+                restored = bool(import_transport_vi_state(transport_vi_state_before, force_once=True))
+            if not bool(restored) and callable(restore_transport_vi_classification):
+                restore_transport_vi_classification({})
+
         _write_post_accept_stage_snapshot(
             step_no=int(step_no),
             label="pre_transport",
@@ -17098,19 +17360,33 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
             )
             _sync_alpha_closure_phi_state(suffixes=("k",), funcs_in=funcs)
         except Exception as transport_exc:
-            eligible_subcycling = (
+            bounded_post_accept_transport = (
+                str(getattr(args, "nonlinear_solver", "pdas")).strip().lower() in {"pdas", "ipm"}
+                and (
+                    bool(getattr(args, "alpha_box_constraints", False))
+                    or bool(getattr(args, "phi_box_constraints", False))
+                )
+            )
+            final_form_constant_density_transport = (
                 bool(problem.get("final_form", False))
                 and _final_form_constant_rho_s(problem)
             )
+            eligible_subcycling = bool(
+                final_form_constant_density_transport
+                or bounded_post_accept_transport
+            )
             if not eligible_subcycling:
                 raise
-            n_sub = max(2, int(np.ceil(float(stage_dt) / max(float(args.dt_min), 1.0e-16))))
-            max_n_sub = max(int(n_sub), 64)
+            n_sub = 2
+            max_n_sub = max(2, int(np.ceil(float(stage_dt) / max(float(args.dt_min), 1.0e-16))))
+            if bool(final_form_constant_density_transport):
+                max_n_sub = max(int(max_n_sub), 64)
             stage_t_start = float(stage_t - stage_dt)
             subcycling_exc = transport_exc
             while int(n_sub) <= int(max_n_sub):
                 _restore_selected_function_values(funcs, transport_snapshot)
                 _restore_selected_function_values(prev_funcs, prev_transport_snapshot)
+                _restore_transport_vi_state_before_retry()
                 sub_dt = float(stage_dt) / float(n_sub)
                 print(
                     "    [transport] post-accept transport solve stalled at the full accepted step; "
@@ -20804,8 +21080,156 @@ def _run_case(args: argparse.Namespace, *, kappa: float, outdir: Path) -> CaseRe
     )
 
 
+def _run_three_constituent_benchmark7(args: argparse.Namespace) -> None:
+    outdir = Path(args.outdir).resolve()
+    nx_tc = int(getattr(args, "three_constituent_nx", None) or getattr(args, "nx", 20))
+    ny_tc = int(getattr(args, "three_constituent_ny", None) or getattr(args, "ny", 30))
+    poly_order, pressure_order, scalar_order = _resolved_orders(args)
+    if bool(getattr(args, "_eps_alpha_over_h_explicit", False)) and args.eps_alpha_over_h is not None:
+        eps_alpha = float(args.eps_alpha_over_h) * _characteristic_h(
+            Lx=float(args.Lx),
+            Ly=float(args.Ly),
+            nx=nx_tc,
+            ny=ny_tc,
+        )
+    else:
+        eps_alpha = float(args.eps_alpha)
+    kappas = _parse_float_list(args.kappa_list)
+    kappa = float(kappas[0])
+    if _mpi_io_root():
+        print(
+            "[run] Benchmark 7 physical three-constituent path "
+            f"-> {outdir}",
+            flush=True,
+        )
+        print(
+            "[run-config] "
+            "formulation=three_constituent; "
+            "unknowns=(v_f,p_f,v_p,p_p,v_s,u_s,alpha,phi,Gamma); "
+            f"backend={str(getattr(args, 'backend', 'cpp'))}; "
+            f"linear_backend={str(getattr(args, 'linear_backend', 'scipy'))}; "
+            f"nx={nx_tc}; "
+            f"ny={ny_tc}; "
+            f"dt={float(args.dt):.3e}; "
+            f"T={float(args.t_final):.3e}; "
+            f"kappa={kappa:.3e}; "
+            f"lag_alpha={int(bool(getattr(args, 'three_constituent_lag_alpha', True)))}; "
+            f"resistance_model={str(getattr(args, 'three_constituent_resistance_model', 'full_cholesky'))}; "
+            f"gamma_mobility={str(getattr(args, 'three_constituent_gamma_mobility', 'interface_delta'))}; "
+            f"transfer_velocity={str(getattr(args, 'three_constituent_transfer_velocity', 'free'))}; "
+            f"pore_momentum_outflow={str(getattr(args, 'three_constituent_pore_momentum_outflow', 'conservative'))}.",
+            flush=True,
+        )
+
+    if not _mpi_io_root():
+        barrier(MPI_CTX)
+        return
+
+    pp_lower = float(getattr(args, "three_constituent_pore_pressure_lower_bound", 0.0))
+    pp_upper = float(getattr(args, "three_constituent_pore_pressure_upper_bound", float("nan")))
+    pp_lower_arg = None if not math.isfinite(pp_lower) else pp_lower
+    pp_upper_arg = None if not math.isfinite(pp_upper) else pp_upper
+
+    result = run_physical_seboldt_three_constituent(
+        outdir=outdir,
+        Lx=float(args.Lx),
+        Ly=float(args.Ly),
+        y_interface=float(args.y_interface),
+        nx=nx_tc,
+        ny=ny_tc,
+        poly_order=poly_order,
+        pressure_order=pressure_order,
+        scalar_order=scalar_order,
+        eps_alpha=eps_alpha,
+        phi_b=float(args.phi_b),
+        v_in=float(args.v_in),
+        t_ramp=float(args.t_ramp),
+        dt=float(args.dt),
+        final_time=float(args.t_final),
+        rho_f=float(args.rho_f),
+        rho_p=float(args.rho_f),
+        rho_s=float(args.rho_s0_tilde),
+        mu_f=float(args.mu_f),
+        mu_p=float(args.mu_b),
+        mu_s=float(args.mu_s),
+        lambda_s=float(args.lambda_s),
+        kappa=kappa,
+        R_fp_factor=float(getattr(args, "three_constituent_r_fp_factor", 1.0)),
+        R_fs_factor=float(getattr(args, "three_constituent_r_fs_factor", 1.0)),
+        R_ps_factor=float(getattr(args, "three_constituent_r_ps_factor", 1.0)),
+        ell_gamma_factor=float(getattr(args, "three_constituent_ell_gamma_factor", 1.0)),
+        gamma_mobility=str(getattr(args, "three_constituent_gamma_mobility", "interface_delta")),
+        gamma_delta_epsilon=float(getattr(args, "three_constituent_gamma_delta_epsilon", 1.0e-12)),
+        resistance_model=str(getattr(args, "three_constituent_resistance_model", "full_cholesky")),
+        transfer_velocity=str(getattr(args, "three_constituent_transfer_velocity", "free")),
+        lag_alpha_in_constitutive_laws=bool(getattr(args, "three_constituent_lag_alpha", True)),
+        inactive_velocity_extension_factor=float(
+            getattr(args, "three_constituent_inactive_velocity_extension_factor", 0.0)
+        ),
+        inactive_pressure_extension_factor=float(
+            getattr(args, "three_constituent_inactive_pressure_extension_factor", 0.0)
+        ),
+        inactive_phi_extension_factor=float(
+            getattr(args, "three_constituent_inactive_phi_extension_factor", 0.0)
+        ),
+        inactive_displacement_extension_factor=float(
+            getattr(args, "three_constituent_inactive_displacement_extension_factor", 0.0)
+        ),
+        inactive_domain_closure=bool(getattr(args, "three_constituent_inactive_domain_closure", False)),
+        inactive_alpha_low=float(getattr(args, "three_constituent_inactive_alpha_low", 0.02)),
+        inactive_alpha_high=float(getattr(args, "three_constituent_inactive_alpha_high", 0.98)),
+        adaptive_interface_target_cells=float(getattr(args, "adaptive_interface_target_cells", 0.0)),
+        adaptive_interface_band_halfwidth_factor=float(getattr(args, "adaptive_interface_band_halfwidth_factor", 1.0)),
+        adaptive_interface_max_ref=int(getattr(args, "adaptive_interface_max_ref", 4)),
+        backend=str(getattr(args, "backend", "cpp")),
+        linear_backend=str(getattr(args, "linear_backend", "scipy")),
+        quad_order=max(2 * int(poly_order) + 2, 6),
+        newton_tol=float(args.newton_tol),
+        newton_rtol=float(args.newton_rtol),
+        max_newton_iter=int(args.max_it),
+        pdas_c=float(getattr(args, "three_constituent_pdas_c", 1.0)),
+        pore_pressure_lower_bound=pp_lower_arg,
+        pore_pressure_upper_bound=pp_upper_arg,
+        pore_momentum_outflow=str(getattr(args, "three_constituent_pore_momentum_outflow", "conservative")),
+        pore_momentum_outflow_factor=float(
+            getattr(args, "three_constituent_pore_momentum_outflow_factor", 1.0)
+        ),
+        pore_momentum_outflow_smooth_eta=float(
+            getattr(args, "three_constituent_pore_momentum_outflow_smooth_eta", 1.0e-12)
+        ),
+        allow_dt_reduction=not bool(getattr(args, "no_dt_reduction", False)),
+        dt_min=float(getattr(args, "dt_min", 1.0e-6)),
+        dt_reduction_factor=float(getattr(args, "dt_reduction_factor", 0.5)),
+        y_profile=float(args.y_profile),
+        profile_samples=int(args.profile_samples),
+        history_stride=int(getattr(args, "three_constituent_history_stride", 10)),
+        vtk_every=int(getattr(args, "vtk_every", 0)),
+    )
+
+    summary = result.summary
+    metrics = dict(summary.get("metrics", {}) or {})
+    print(f"[done] wrote {outdir / 'benchmark7_summary.csv'}", flush=True)
+    print(f"[done] wrote {outdir / 'benchmark7_summary.json'}", flush=True)
+    if (outdir / "benchmark7_seboldt_profiles.png").exists():
+        print(f"[done] wrote {outdir / 'benchmark7_seboldt_profiles.png'}", flush=True)
+    print("[metrics] physical three-constituent Seboldt:", flush=True)
+    for name in sorted(metrics):
+        value = metrics[name]
+        if isinstance(value, (int, float, np.number)):
+            print(f"  {name}={float(value):.6e}", flush=True)
+    print(f"[result] passed={int(bool(result.passed))}", flush=True)
+    if not result.passed and summary.get("error"):
+        print(f"[error] {summary['error']}", flush=True)
+    barrier(MPI_CTX)
+    if not result.passed:
+        raise SystemExit(1)
+
+
 def main() -> None:
     args = _parse_args()
+    if _three_constituent_enabled(args):
+        _run_three_constituent_benchmark7(args)
+        return
     args = _normalize_benchmark7_solver_choice(args)
     prev_cpp_fuse = _configure_benchmark7_cpp_fuse_integrals(
         backend=str(args.backend),

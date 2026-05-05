@@ -1,7 +1,8 @@
-"""Final-form one-domain FPSI builder with explicit bulk/interface separation.
+"""Bulk/interface-split one-domain FPSI builder.
 
-This module implements the formulation stated in
-examples/biofilms/benchmarks/seboldt/final_form.md.
+This module contains the experimental Seboldt-style branch that separates bulk
+rows from diffuse-interface transfer rows.  It is not the final one-domain
+formulation and should not be used as the canonical model spec.
 
 Primary physical variables:
   - free-fluid velocity/pressure:     v_f, p
@@ -261,10 +262,10 @@ def _solid_stress_and_tangent(*, solid_model: str, u_k, du, mu_s, lambda_s, dim:
             sigma_svk(u_k, mu_s, lambda_s, dim=int(dim)),
             dsigma_svk(u_k, du, mu_s, lambda_s, dim=int(dim)),
         )
-    raise NotImplementedError(f"final_form does not support solid_model={solid_model!r}.")
+    raise NotImplementedError(f"bulk_interface_split_form does not support solid_model={solid_model!r}.")
 
 
-def _final_form_interface_formulation_key(raw) -> str:
+def _bulk_interface_split_formulation_key(raw) -> str:
     key = str(raw or "tensor").strip().lower().replace("-", "_")
     if key not in {"tensor", "decomposed"}:
         raise ValueError(
@@ -273,7 +274,7 @@ def _final_form_interface_formulation_key(raw) -> str:
     return key
 
 
-def build_biofilm_one_domain_final_form(
+def build_biofilm_one_domain_bulk_interface_split_form(
     *,
     v_k,
     p_k,
@@ -527,7 +528,7 @@ def build_biofilm_one_domain_final_form(
         )
     rigid_darcy_head_mode = bool(rigid_darcy_head_mode)
     constant_rho_s = bool(constant_rho_s)
-    interface_formulation_key = _final_form_interface_formulation_key(interface_formulation)
+    interface_formulation_key = _bulk_interface_split_formulation_key(interface_formulation)
     solid_model_key = _solid_model_key(solid_model)
     solid_volumetric_split = bool(solid_volumetric_split)
     support_indicator_beta_val = float(support_indicator_beta)
@@ -1522,7 +1523,7 @@ def build_biofilm_one_domain_final_form(
         if quasi_static_porous_media:
             if phi_test is None:
                 raise ValueError(
-                    "quasi_static_porous_media on the constant-density final_form branch requires "
+                    "quasi_static_porous_media on the constant-density bulk/interface-split branch requires "
                     "the phi field so the pore-mass equation d_t(phi) + div(phi v_p) = 0 can be assembled."
                 )
             # Quasi-static affects the porous momentum laws, not the transient
@@ -1613,7 +1614,7 @@ def build_biofilm_one_domain_final_form(
         adv_key = "interface_band_conservative"
     if support_physics_key == "internal_conversion" and adv_key not in {"conservative", "conservative_weak"}:
         raise ValueError(
-            "final_form support_physics='internal_conversion' requires a conservative alpha law. "
+            "bulk_interface_split_form support_physics='internal_conversion' requires a conservative alpha law. "
             "Use alpha_advection_form='conservative_weak' (recommended) or 'conservative'."
         )
     if adv_with_key in {"vs", "v_s", "s", "skeleton", "solid"}:
@@ -1656,7 +1657,7 @@ def build_biofilm_one_domain_final_form(
         d_div_adv_u = _c(0.5) * (div(dvP) + div(dvS))
     else:
         raise ValueError(
-            f"Unsupported final_form alpha_advect_with={alpha_advect_with!r}. "
+            f"Unsupported bulk_interface_split_form alpha_advect_with={alpha_advect_with!r}. "
             "Use 'vS', 'v', 'biofilm_volume', 'relative', or 'interface'."
         )
 
@@ -1689,7 +1690,7 @@ def build_biofilm_one_domain_final_form(
         a_alpha = alpha_test * (dalpha * inv_dt + d_adv_alpha) * dx
     else:
         raise ValueError(
-            f"Unsupported final_form alpha_advection_form={alpha_advection_form!r}. "
+            f"Unsupported bulk_interface_split_form alpha_advection_form={alpha_advection_form!r}. "
             "Use 'advective', 'conservative', or 'conservative_weak'."
         )
 
@@ -3536,5 +3537,5 @@ def build_biofilm_one_domain_final_form(
     )
 
 
-def build_biofilm_one_domain_final_form_decomposed(**kwargs) -> BiofilmOneDomainForms:
-    return build_biofilm_one_domain_final_form(interface_formulation="decomposed", **kwargs)
+def build_biofilm_one_domain_bulk_interface_split_form_decomposed(**kwargs) -> BiofilmOneDomainForms:
+    return build_biofilm_one_domain_bulk_interface_split_form(interface_formulation="decomposed", **kwargs)

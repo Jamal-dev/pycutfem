@@ -6,4 +6,5 @@ from .mms_moving_interface import *
 from .mms_one_domain import *
 from .mms_one_domain_convergence import *
 from .one_domain import *
-
+from .three_constituent_mms import *
+from .three_constituent_one_domain import *

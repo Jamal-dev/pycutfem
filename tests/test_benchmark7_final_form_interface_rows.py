@@ -9,7 +9,10 @@ from examples.biofilms.benchmarks.seboldt.paper1_benchmark7_seboldt import (
     _tag_inactive_fields_above_alpha,
     _tag_inactive_fields_below_alpha,
 )
-from examples.utils.biofilm.final_form import _named_c, build_biofilm_one_domain_final_form
+from examples.utils.biofilm.bulk_interface_split_form import (
+    _named_c,
+    build_biofilm_one_domain_bulk_interface_split_form,
+)
 from pycutfem.core.dofhandler import DofHandler
 from pycutfem.core.mesh import Mesh
 from pycutfem.fem.mixedelement import MixedElement
@@ -1684,7 +1687,7 @@ def _build_rigid_final_form_problem(*, p_pore_shift: float = 0.0):
     for name in (mu_mass_k, mu_mass_n, mu_normal_k, mu_normal_n, mu_tangent_k, mu_tangent_n):
         name.nodal_values.fill(0.0)
 
-    forms = build_biofilm_one_domain_final_form(
+    forms = build_biofilm_one_domain_bulk_interface_split_form(
         v_k=v_k,
         p_k=p_k,
         vP_k=vP_k,

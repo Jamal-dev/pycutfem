@@ -27,6 +27,30 @@ from examples.NIRB.dvms import (
     _kratos_dvms_current_element_size_array,
     _kratos_dvms_element_size,
 )
+from examples.NIRB.fluid_fom_operator import (
+    FluidBoundaryTags,
+    FluidFOMOperator,
+    FluidFOMParameters,
+)
+from examples.NIRB.fluid_basis import fit_fluid_pod_trial_basis
+from examples.NIRB.fluid_gnat import (
+    FluidGNATSolver,
+    collect_fluid_residual_snapshots,
+    fit_fluid_gnat_sample_set,
+    fluid_elements_touching_rows,
+)
+from examples.NIRB.fluid_lspg import (
+    FluidLSPGVerifier,
+    FluidTrialSpace,
+    pack_fluid_state,
+    write_fluid_state,
+)
+from examples.NIRB.fluid_mode_selection import run_fluid_mode_cross_validation
+from examples.NIRB.fluid_snapshots import (
+    FluidStageSnapshotBatch,
+    FluidStageSnapshotWriter,
+    restore_fluid_stage,
+)
 from examples.NIRB.dvms.local_operator import (
     _compress_batch_to_fluid_block,
     _dvms_condensed_hidden_state_correction_batch,
@@ -36,6 +60,7 @@ from examples.NIRB.example2_problem import build_conforming_mesh
 from examples.NIRB.run_example2_local import (
     CoordinateLookup,
     _aitken_relaxation_factor,
+    _assemble_fluid_local_velocity_contribution_raw,
     _boundary_field_data,
     _bossak_coefficients,
     _bossak_displacement_kinematics_values,
@@ -68,6 +93,562 @@ from examples.NIRB.run_example2_local import (
 from pycutfem.solvers.nonlinear_solver import NewtonSolver
 
 from .test_nirb_double_flap_problem import _geometry
+
+
+def _build_small_fluid_fom_operator(tmp_path: Path, *, backend: str = "python"):
+    pytest.importorskip("gmsh")
+
+    geometry = _geometry()
+    mesh_path = tmp_path / f"double_flap_fluid_fom_operator_{backend}.msh"
+    build_conforming_mesh(mesh_path, geometry=geometry, mesh_size=0.20, order=1)
+    mesh_f = mesh_from_gmsh(mesh_path, surface_physical_names=["fluid"], apply_boundary_tags=True)
+    fluid = _build_fluid_problem(mesh_f, poly_order=1, pressure_order=1, quadrature_order=6)
+    operator = FluidFOMOperator(
+        prob=fluid,
+        mesh=mesh_f,
+        parameters=FluidFOMParameters(
+            rho_f=1.0,
+            mu_f=1.0,
+            dt=1.0,
+            quadrature_order=6,
+            bossak_alpha=-0.3,
+            dynamic_tau=1.0,
+            backend=backend,
+        ),
+        boundary_tags=FluidBoundaryTags(
+            interface_tag=geometry.interface_tag,
+            outlet_tag=geometry.outlet_tag,
+            walls_tag=geometry.walls_tag,
+            cylinder_tag=geometry.cylinder_tag,
+        ),
+    )
+    return geometry, mesh_f, fluid, operator
+
+
+def _fluid_row_dofs_for_elements(operator: FluidFOMOperator, element_ids: np.ndarray) -> np.ndarray:
+    dh = operator.dh
+    eids = np.asarray(element_ids, dtype=int).reshape(-1)
+    rows = np.concatenate(
+        [
+            np.asarray(dh.element_maps["ux"], dtype=int)[eids].reshape(-1),
+            np.asarray(dh.element_maps["uy"], dtype=int)[eids].reshape(-1),
+            np.asarray(dh.element_maps["p"], dtype=int)[eids].reshape(-1),
+        ]
+    )
+    rows = np.unique(rows[rows >= 0]).astype(int, copy=False)
+    return np.intersect1d(rows, operator.free_fluid_dofs()).astype(int, copy=False)
+
+
+def test_fluid_fom_operator_configures_boundary_state_and_free_dofs(tmp_path: Path) -> None:
+    geometry, _mesh_f, fluid, operator = _build_small_fluid_fom_operator(tmp_path)
+
+    iface_coords, ux_ids = _boundary_field_data(fluid["dh"], "ux", geometry.interface_tag)
+    _, uy_ids = _boundary_field_data(fluid["dh"], "uy", geometry.interface_tag)
+    iface_values = np.column_stack(
+        [
+            np.full(int(iface_coords.shape[0]), 0.125, dtype=float),
+            np.full(int(iface_coords.shape[0]), -0.25, dtype=float),
+        ]
+    )
+    operator.configure_boundary_conditions(
+        iface_velocity=CoordinateLookup(iface_coords, iface_values, dim=2),
+        inlet_lookup=lambda x, y: 0.5 * float(y),
+        apply_to_state=True,
+    )
+
+    ux = fluid["u_k"].components[0].get_nodal_values(ux_ids)
+    uy = fluid["u_k"].components[1].get_nodal_values(uy_ids)
+    free = operator.free_fluid_dofs()
+    fixed = np.fromiter(
+        (int(gdof) for gdof in fluid["dh"].get_dirichlet_data(fluid["_current_bcs_homog"]).keys()),
+        dtype=int,
+    )
+
+    np.testing.assert_allclose(ux, 0.125)
+    np.testing.assert_allclose(uy, -0.25)
+    assert free.size > 0
+    assert fixed.size > 0
+    assert np.intersect1d(free, fixed).size == 0
+
+
+def test_fluid_fom_operator_assembly_matches_legacy_raw_helper(tmp_path: Path) -> None:
+    _geometry_obj, _mesh_f, fluid, operator = _build_small_fluid_fom_operator(tmp_path)
+    element_ids = np.asarray([0, 1], dtype=int)
+
+    assembly = operator.assemble(
+        need_matrix=True,
+        element_ids=element_ids,
+        convention="kratos_rhs",
+        refresh_predicted=False,
+    )
+    expected_matrix, expected_rhs = _assemble_fluid_local_velocity_contribution_raw(
+        prob=fluid,
+        rho_f=1.0,
+        mu_f=1.0,
+        dt=1.0,
+        quad_order=6,
+        bossak_alpha=-0.3,
+        need_matrix=True,
+        contribution_mode="system",
+        backend="python",
+        element_ids=element_ids,
+    )
+    newton_assembly = operator.assemble(
+        need_matrix=False,
+        element_ids=element_ids,
+        convention="newton",
+        refresh_predicted=False,
+    )
+
+    assert assembly.matrix is not None
+    assert expected_matrix is not None
+    matrix_diff = (assembly.matrix - expected_matrix).tocoo()
+    max_matrix_diff = float(np.max(np.abs(matrix_diff.data))) if matrix_diff.nnz else 0.0
+    assert max_matrix_diff == pytest.approx(0.0, abs=1.0e-12)
+    np.testing.assert_allclose(assembly.residual, expected_rhs, atol=1.0e-12)
+    np.testing.assert_allclose(newton_assembly.residual, -np.asarray(expected_rhs), atol=1.0e-12)
+
+
+def test_fluid_fom_operator_reaction_matches_legacy_helper(tmp_path: Path) -> None:
+    geometry, _mesh_f, fluid, operator = _build_small_fluid_fom_operator(tmp_path)
+    iface_coords, _ = _boundary_field_data(fluid["dh"], "ux", geometry.interface_tag)
+    zero_iface = CoordinateLookup(
+        iface_coords,
+        np.zeros((int(iface_coords.shape[0]), 2), dtype=float),
+        dim=2,
+    )
+    operator.configure_boundary_conditions(
+        iface_velocity=zero_iface,
+        inlet_lookup=lambda x, y: 0.0,
+        apply_to_state=True,
+    )
+
+    reaction = operator.reaction_loads(refresh_state=False)
+    expected = _fluid_interface_reaction_loads(
+        prob=fluid,
+        rho_f=1.0,
+        mu_f=1.0,
+        dt=1.0,
+        quad_order=6,
+        bossak_alpha=-0.3,
+        dynamic_tau=1.0,
+        interface_tag=geometry.interface_tag,
+        backend="python",
+        contribution_mode="system",
+        refresh_state=False,
+    )
+
+    np.testing.assert_allclose(reaction.coords, expected.coords)
+    np.testing.assert_allclose(reaction.values, expected.values)
+
+
+def test_fluid_fom_operator_snapshots_and_restores_dvms_history(tmp_path: Path) -> None:
+    _geometry_obj, _mesh_f, fluid, operator = _build_small_fluid_fom_operator(tmp_path)
+    state = fluid["dvms_state"]
+    state.predicted_subscale_velocity[:, 0] = 0.5
+    state.old_mass_residual[:] = -0.25
+    state.sync_coefficients_from_samples()
+
+    snapshot = operator.snapshot_history()
+    state.predicted_subscale_velocity[:, :] = 3.0
+    state.old_mass_residual[:] = 4.0
+    state.sync_coefficients_from_samples()
+    operator.restore_history(snapshot)
+
+    np.testing.assert_allclose(state.predicted_subscale_velocity[:, 0], 0.5)
+    np.testing.assert_allclose(state.predicted_subscale_velocity[:, 1], 0.0)
+    np.testing.assert_allclose(state.old_mass_residual, -0.25)
+
+
+def test_fluid_lspg_verifier_projects_exact_operator_rows(tmp_path: Path) -> None:
+    geometry, _mesh_f, _fluid, operator = _build_small_fluid_fom_operator(tmp_path)
+    iface_coords, _ = _boundary_field_data(operator.dh, "ux", geometry.interface_tag)
+    operator.configure_boundary_conditions(
+        iface_velocity=CoordinateLookup(
+            iface_coords,
+            np.zeros((int(iface_coords.shape[0]), 2), dtype=float),
+            dim=2,
+        ),
+        inlet_lookup=lambda x, y: 0.0,
+        apply_to_state=True,
+    )
+
+    element_ids = np.asarray([0, 1, 2], dtype=int)
+    row_dofs = _fluid_row_dofs_for_elements(operator, element_ids)
+    assert row_dofs.size >= 3
+    n_modes = 3
+    free_basis = np.eye(int(row_dofs.size), n_modes, dtype=float)
+    if row_dofs.size > n_modes:
+        free_basis[n_modes:, :] = 0.01 * np.outer(
+            np.arange(1, int(row_dofs.size) - n_modes + 1, dtype=float),
+            np.arange(1, n_modes + 1, dtype=float),
+        )
+    trial_space = FluidTrialSpace.from_free_basis(
+        operator=operator,
+        free_basis=free_basis,
+        free_dofs=row_dofs,
+    )
+    coefficients = np.asarray([0.02, -0.01, 0.015], dtype=float)
+    reconstructed = trial_space.write(operator, coefficients)
+    np.testing.assert_allclose(pack_fluid_state(operator), reconstructed)
+
+    verifier = FluidLSPGVerifier(operator=operator, trial_space=trial_space, row_dofs=row_dofs)
+    system = verifier.assemble_system(
+        coefficients,
+        element_ids=element_ids,
+        refresh_predicted=False,
+    )
+    direct = operator.assemble(
+        need_matrix=True,
+        element_ids=element_ids,
+        convention="newton",
+        refresh_predicted=False,
+    )
+    assert direct.matrix is not None
+    expected_residual = np.asarray(direct.residual[row_dofs], dtype=float)
+    expected_trial_jacobian = np.asarray(direct.matrix[row_dofs, :] @ trial_space.basis, dtype=float)
+
+    np.testing.assert_allclose(system.residual, expected_residual, atol=1.0e-12)
+    np.testing.assert_allclose(system.trial_jacobian, expected_trial_jacobian, atol=1.0e-12)
+    np.testing.assert_allclose(system.normal_matrix, expected_trial_jacobian.T @ expected_trial_jacobian)
+    np.testing.assert_allclose(system.normal_rhs, -(expected_trial_jacobian.T @ expected_residual))
+    expected_step, *_ = np.linalg.lstsq(expected_trial_jacobian, -expected_residual, rcond=None)
+    np.testing.assert_allclose(system.gauss_newton_step(), expected_step)
+
+    weights = np.linspace(0.5, 1.5, int(row_dofs.size), dtype=float)
+    weighted_system = FluidLSPGVerifier(
+        operator=operator,
+        trial_space=trial_space,
+        row_dofs=row_dofs,
+        row_weights=weights,
+    ).assemble_system(
+        coefficients,
+        element_ids=element_ids,
+        refresh_predicted=False,
+    )
+    scale = np.sqrt(weights)
+    expected_weighted_residual = expected_residual * scale
+    expected_weighted_trial = expected_trial_jacobian * scale[:, None]
+    expected_weighted_step, *_ = np.linalg.lstsq(
+        expected_weighted_trial,
+        -expected_weighted_residual,
+        rcond=None,
+    )
+    np.testing.assert_allclose(weighted_system.weighted_residual, expected_weighted_residual)
+    np.testing.assert_allclose(weighted_system.weighted_trial_jacobian, expected_weighted_trial)
+    np.testing.assert_allclose(weighted_system.gauss_newton_step(), expected_weighted_step)
+
+
+def test_fluid_stage_snapshots_round_trip_and_build_mixed_pod_basis(tmp_path: Path) -> None:
+    geometry, _mesh_f, fluid, operator = _build_small_fluid_fom_operator(tmp_path)
+    iface_coords, _ = _boundary_field_data(operator.dh, "ux", geometry.interface_tag)
+    operator.configure_boundary_conditions(
+        iface_velocity=CoordinateLookup(
+            iface_coords,
+            np.zeros((int(iface_coords.shape[0]), 2), dtype=float),
+            dim=2,
+        ),
+        inlet_lookup=lambda x, y: 0.0,
+        apply_to_state=True,
+    )
+    base_state = pack_fluid_state(operator)
+    velocity_dofs = np.intersect1d(
+        np.concatenate(
+            [
+                np.asarray(operator.dh.get_field_slice("ux"), dtype=int),
+                np.asarray(operator.dh.get_field_slice("uy"), dtype=int),
+            ]
+        ),
+        operator.free_fluid_dofs(),
+    )
+    pressure_dofs = np.intersect1d(
+        np.asarray(operator.dh.get_field_slice("p"), dtype=int),
+        operator.free_fluid_dofs(),
+    )
+    assert velocity_dofs.size >= 4
+    assert pressure_dofs.size >= 3
+
+    velocity_pattern = np.zeros_like(base_state)
+    pressure_pattern = np.zeros_like(base_state)
+    velocity_pattern[velocity_dofs[:4]] = np.asarray([0.05, -0.02, 0.03, -0.04], dtype=float)
+    pressure_pattern[pressure_dofs[:3]] = np.asarray([0.1, -0.08, 0.04], dtype=float)
+    writer = FluidStageSnapshotWriter()
+    for stage, scale in enumerate((0.0, 1.0, 2.0)):
+        state = base_state + float(scale) * (velocity_pattern + pressure_pattern)
+        write_fluid_state(operator, state)
+        fluid["a_k"].nodal_values[:] = float(scale)
+        fluid["dvms_state"].old_mass_residual[:] = 0.25 * float(stage + 1)
+        fluid["dvms_state"].predicted_subscale_velocity[:, 0] = 0.1 * float(stage)
+        fluid["dvms_state"].sync_coefficients_from_samples()
+        writer.append_from_operator(
+            operator,
+            reaction_loads=CoordinateLookup(
+                iface_coords,
+                np.full((int(iface_coords.shape[0]), 2), float(stage), dtype=float),
+                dim=2,
+            ),
+            metadata={"stage": int(stage), "scale": float(scale)},
+        )
+
+    batch = writer.to_batch()
+    snapshot_path = tmp_path / "fluid_stage_snapshots.npz"
+    batch.save(snapshot_path)
+    loaded = FluidStageSnapshotBatch.load(snapshot_path)
+    assert loaded.n_snapshots == 3
+    np.testing.assert_array_equal(loaded.free_dofs, batch.free_dofs)
+    np.testing.assert_array_equal(loaded.fixed_dofs, batch.fixed_dofs)
+    np.testing.assert_allclose(loaded.state, batch.state)
+    np.testing.assert_allclose(loaded.reaction_coords, iface_coords)
+    assert loaded.metadata[2]["stage"] == 2
+    subset = loaded.subset([0, 2])
+    assert subset.n_snapshots == 2
+    np.testing.assert_allclose(subset.state[:, 1], loaded.state[:, 2])
+
+    write_fluid_state(operator, np.zeros(int(operator.dh.total_dofs), dtype=float))
+    fluid["dvms_state"].old_mass_residual[:] = -10.0
+    fluid["dvms_state"].sync_coefficients_from_samples()
+    restore_fluid_stage(operator, loaded.record(1))
+    np.testing.assert_allclose(pack_fluid_state(operator), loaded.state[:, 1])
+    np.testing.assert_allclose(fluid["dvms_state"].old_mass_residual, 0.5)
+
+    basis = fit_fluid_pod_trial_basis(
+        operator,
+        loaded,
+        velocity_modes=1,
+        pressure_modes=1,
+        center=False,
+    )
+    assert basis.n_velocity_modes == 1
+    assert basis.n_pressure_modes == 1
+    np.testing.assert_allclose(basis.basis[loaded.fixed_dofs, :], 0.0)
+    outside_blocks = np.setdiff1d(
+        np.arange(int(operator.dh.total_dofs), dtype=int),
+        np.union1d(basis.velocity_dofs, basis.pressure_dofs),
+    )
+    np.testing.assert_allclose(basis.basis[outside_blocks, :], 0.0)
+    coefficients = basis.project_state(loaded.state[:, 2], offset=base_state)
+    reconstructed = basis.reconstruct_state(coefficients, offset=base_state)
+    np.testing.assert_allclose(reconstructed, loaded.state[:, 2], atol=1.0e-12)
+    trial_space = basis.make_trial_space(operator, offset=base_state)
+    np.testing.assert_allclose(trial_space.reconstruct(coefficients), reconstructed)
+
+    restore_fluid_stage(operator, loaded.record(2))
+    stage_coefficients = basis.project_state(pack_fluid_state(operator), offset=base_state)
+    stage_trial_space = basis.make_trial_space(operator, offset=base_state)
+    replay_element_ids = np.asarray([0, 1, 2], dtype=int)
+    replay_row_dofs = _fluid_row_dofs_for_elements(operator, replay_element_ids)
+    assert replay_row_dofs.size > 0
+    replay_system = FluidLSPGVerifier(
+        operator=operator,
+        trial_space=stage_trial_space,
+        row_dofs=replay_row_dofs,
+    ).assemble_system(
+        stage_coefficients,
+        element_ids=replay_element_ids,
+        refresh_predicted=False,
+    )
+    direct = operator.assemble(
+        need_matrix=True,
+        element_ids=replay_element_ids,
+        convention="newton",
+        refresh_predicted=False,
+    )
+    assert direct.matrix is not None
+    np.testing.assert_allclose(replay_system.residual, direct.residual[replay_row_dofs])
+    np.testing.assert_allclose(
+        replay_system.trial_jacobian,
+        np.asarray(direct.matrix[replay_row_dofs, :] @ stage_trial_space.basis, dtype=float),
+    )
+
+    actual_reaction = operator.reaction_loads(refresh_state=False)
+    reaction_writer = FluidStageSnapshotWriter()
+    reaction_writer.append_from_operator(
+        operator,
+        reaction_loads=actual_reaction,
+        metadata={"stage": "reaction-parity"},
+    )
+    reaction_batch = reaction_writer.to_batch()
+    restore_fluid_stage(operator, reaction_batch.record(0))
+    replayed_reaction = operator.reaction_loads(refresh_state=False)
+    np.testing.assert_allclose(replayed_reaction.coords, reaction_batch.reaction_coords)
+    np.testing.assert_allclose(
+        replayed_reaction.values,
+        reaction_batch.reaction_values[:, 0].reshape(-1, 2),
+    )
+
+    mode_sweep = run_fluid_mode_cross_validation(
+        operator,
+        loaded,
+        velocity_modes=[0, 1],
+        pressure_modes=[0, 1],
+        test_indices=[2],
+        center=True,
+        include_reaction_error=False,
+    )
+    selected = mode_sweep.best(plateau_rel_tol=0.0)
+    assert selected.velocity_modes == 1
+    assert selected.pressure_modes == 1
+    assert selected.state_error <= 1.0e-12
+
+
+def test_fluid_gnat_sample_set_projects_sampled_operator(tmp_path: Path) -> None:
+    geometry, _mesh_f, fluid, operator = _build_small_fluid_fom_operator(tmp_path)
+    iface_coords, _ = _boundary_field_data(operator.dh, "ux", geometry.interface_tag)
+    operator.configure_boundary_conditions(
+        iface_velocity=CoordinateLookup(
+            iface_coords,
+            np.zeros((int(iface_coords.shape[0]), 2), dtype=float),
+            dim=2,
+        ),
+        inlet_lookup=lambda x, y: 0.0,
+        apply_to_state=True,
+    )
+    base_state = pack_fluid_state(operator)
+    training_element_ids = np.asarray([0, 1, 2, 3], dtype=int)
+    training_rows = _fluid_row_dofs_for_elements(operator, training_element_ids)
+    velocity_rows = np.intersect1d(
+        training_rows,
+        np.concatenate(
+            [
+                np.asarray(operator.dh.get_field_slice("ux"), dtype=int),
+                np.asarray(operator.dh.get_field_slice("uy"), dtype=int),
+            ]
+        ),
+    )
+    pressure_rows = np.intersect1d(training_rows, np.asarray(operator.dh.get_field_slice("p"), dtype=int))
+    assert velocity_rows.size >= 3
+    assert pressure_rows.size >= 2
+
+    writer = FluidStageSnapshotWriter()
+    for stage, scale in enumerate((0.0, 0.5, 1.0, 1.5)):
+        state = base_state.copy()
+        state[velocity_rows[:3]] += float(scale) * np.asarray([0.04, -0.03, 0.02], dtype=float)
+        state[pressure_rows[:2]] += float(scale) * np.asarray([0.08, -0.05], dtype=float)
+        write_fluid_state(operator, state)
+        fluid["a_k"].nodal_values[:] = 0.1 * float(stage)
+        fluid["dvms_state"].old_mass_residual[:] = 0.05 * float(stage + 1)
+        fluid["dvms_state"].sync_coefficients_from_samples()
+        writer.append_from_operator(operator, metadata={"stage": int(stage)})
+    snapshots = writer.to_batch()
+    trial_basis = fit_fluid_pod_trial_basis(
+        operator,
+        snapshots,
+        velocity_modes=1,
+        pressure_modes=1,
+        center=False,
+    )
+    residual_snapshots = collect_fluid_residual_snapshots(
+        operator,
+        snapshots,
+        row_dofs=training_rows,
+        element_ids=training_element_ids,
+        refresh_predicted=False,
+    )
+    sample_set = fit_fluid_gnat_sample_set(
+        operator,
+        residual_snapshots,
+        basis_dofs=training_rows,
+        residual_modes=2,
+        row_oversampling=2.0,
+        include_interface_elements=False,
+    )
+    assert sample_set.n_residual_modes == 2
+    assert sample_set.n_sample_rows >= sample_set.n_residual_modes
+    assert sample_set.sampled_basis_rank == sample_set.n_residual_modes
+    np.testing.assert_array_equal(
+        np.sort(sample_set.element_ids),
+        np.sort(fluid_elements_touching_rows(operator, sample_set.row_dofs)),
+    )
+
+    restore_fluid_stage(operator, snapshots.record(3))
+    offset = snapshots.state[:, 0]
+    coefficients = trial_basis.project_state(pack_fluid_state(operator), offset=offset)
+    trial_space = trial_basis.make_trial_space(operator, offset=offset)
+    gnat = FluidGNATSolver(operator=operator, trial_space=trial_space, sample_set=sample_set)
+    system = gnat.assemble_system(coefficients, refresh_predicted=False)
+    direct = operator.assemble(
+        need_matrix=True,
+        element_ids=sample_set.element_ids,
+        convention="newton",
+        refresh_predicted=False,
+    )
+    assert direct.matrix is not None
+    expected_sampled_residual = np.asarray(direct.residual[sample_set.row_dofs], dtype=float)
+    expected_sampled_trial = np.asarray(direct.matrix[sample_set.row_dofs, :] @ trial_space.basis, dtype=float)
+    expected_coefficients = sample_set.sample_to_residual_coefficients @ expected_sampled_residual
+    expected_gnat_trial = sample_set.sample_to_residual_coefficients @ expected_sampled_trial
+    np.testing.assert_allclose(system.sampled_residual, expected_sampled_residual)
+    np.testing.assert_allclose(system.sampled_trial_jacobian, expected_sampled_trial)
+    np.testing.assert_allclose(system.residual_coefficients, expected_coefficients)
+    np.testing.assert_allclose(system.gnat_trial_jacobian, expected_gnat_trial)
+    np.testing.assert_allclose(system.normal_matrix, expected_gnat_trial.T @ expected_gnat_trial)
+    np.testing.assert_allclose(system.normal_rhs, -(expected_gnat_trial.T @ expected_coefficients))
+
+    weighted_sample_set = fit_fluid_gnat_sample_set(
+        operator,
+        residual_snapshots,
+        basis_dofs=training_rows,
+        residual_modes=2,
+        row_oversampling=2.0,
+        include_interface_elements=False,
+        sample_weighting="snapshot-gram",
+    )
+    assert weighted_sample_set.sample_weighting == "snapshot-gram"
+    assert weighted_sample_set.sample_weights.shape == (weighted_sample_set.n_sample_rows,)
+    assert np.all(weighted_sample_set.sample_weights >= 0.0)
+    weighted_gnat = FluidGNATSolver(
+        operator=operator,
+        trial_space=trial_space,
+        sample_set=weighted_sample_set,
+        objective="sampled_lspg",
+    )
+    weighted_system = weighted_gnat.assemble_system(coefficients, refresh_predicted=False)
+    weighted_direct = operator.assemble(
+        need_matrix=True,
+        element_ids=weighted_sample_set.element_ids,
+        convention="newton",
+        refresh_predicted=False,
+    )
+    assert weighted_direct.matrix is not None
+    scale = np.sqrt(np.maximum(weighted_sample_set.sample_weights, 0.0))
+    expected_weighted_residual = scale * np.asarray(weighted_direct.residual[weighted_sample_set.row_dofs], dtype=float)
+    expected_weighted_trial = (
+        np.asarray(weighted_direct.matrix[weighted_sample_set.row_dofs, :] @ trial_space.basis, dtype=float)
+        * scale[:, None]
+    )
+    np.testing.assert_allclose(weighted_system.residual_coefficients, expected_weighted_residual)
+    np.testing.assert_allclose(weighted_system.gnat_trial_jacobian, expected_weighted_trial)
+    np.testing.assert_allclose(weighted_system.normal_matrix, expected_weighted_trial.T @ expected_weighted_trial)
+    np.testing.assert_allclose(weighted_system.normal_rhs, -(expected_weighted_trial.T @ expected_weighted_residual))
+
+    row_weights = np.linspace(0.25, 2.0, int(weighted_sample_set.n_sample_rows), dtype=float)
+    block_weighted_gnat = FluidGNATSolver(
+        operator=operator,
+        trial_space=trial_space,
+        sample_set=weighted_sample_set,
+        objective="sampled_lspg",
+        row_weights=row_weights,
+    )
+    block_weighted_system = block_weighted_gnat.assemble_system(coefficients, refresh_predicted=False)
+    block_scale = np.sqrt(np.maximum(weighted_sample_set.sample_weights, 0.0) * row_weights)
+    expected_block_weighted_residual = block_scale * np.asarray(
+        weighted_direct.residual[weighted_sample_set.row_dofs],
+        dtype=float,
+    )
+    expected_block_weighted_trial = (
+        np.asarray(weighted_direct.matrix[weighted_sample_set.row_dofs, :] @ trial_space.basis, dtype=float)
+        * block_scale[:, None]
+    )
+    np.testing.assert_allclose(block_weighted_system.residual_coefficients, expected_block_weighted_residual)
+    np.testing.assert_allclose(block_weighted_system.gnat_trial_jacobian, expected_block_weighted_trial)
+    np.testing.assert_allclose(
+        block_weighted_system.normal_matrix,
+        expected_block_weighted_trial.T @ expected_block_weighted_trial,
+    )
+    np.testing.assert_allclose(
+        block_weighted_system.normal_rhs,
+        -(expected_block_weighted_trial.T @ expected_block_weighted_residual),
+    )
 
 
 def test_local_driver_partitioned_boundary_extraction(tmp_path: Path) -> None:

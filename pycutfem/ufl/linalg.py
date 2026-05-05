@@ -19,6 +19,8 @@ tension/compression splits) in 2D.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from pycutfem.ufl.expressions import Constant, Identity, cof, det, dot, inner, log as ufl_log, trace
 
 
@@ -29,6 +31,97 @@ def _c(val: float) -> Constant:
 def sym(A):
     """Symmetric part: 0.5 * (A + Aᵀ)."""
     return _c(0.5) * (A + A.T)
+
+
+@dataclass(frozen=True)
+class PairSpaceCholeskyResult:
+    """Result of applying a 3-pair SPD Cholesky resistance in UFL form."""
+
+    coefficients: tuple
+    conjugates: tuple
+    dissipation_density: object
+
+
+def _normalize_pair_space_lower_entries(lower_entries):
+    try:
+        n_outer = len(lower_entries)
+    except TypeError as exc:
+        raise ValueError("lower_entries must contain six lower entries or a 3x3 lower-triangular factor.") from exc
+
+    if n_outer == 6:
+        return tuple(lower_entries)
+
+    if n_outer == 3:
+        try:
+            row0, row1, row2 = lower_entries
+            if len(row0) == 3 and len(row1) == 3 and len(row2) == 3:
+                return row0[0], row1[0], row1[1], row2[0], row2[1], row2[2]
+        except TypeError as exc:
+            raise ValueError("3-entry lower_entries must be a 3x3 lower-triangular factor.") from exc
+
+    raise ValueError("lower_entries must contain six lower entries or a 3x3 lower-triangular factor.")
+
+
+def pair_space_cholesky_coefficients(weights, lower_entries):
+    """Return the six upper-triangle coefficients of ``diag(w) L L.T diag(w)``.
+
+    The helper is intentionally unrolled and expression-only.  Callers that
+    need stable C++ kernels should pass named Constant objects for numerical
+    Cholesky entries and weights that are already UFL expressions.
+    """
+
+    w0, w1, w2 = weights
+    l00, l10, l11, l20, l21, l22 = _normalize_pair_space_lower_entries(lower_entries)
+
+    h00 = w0 * l00
+    h10 = w1 * l10
+    h11 = w1 * l11
+    h20 = w2 * l20
+    h21 = w2 * l21
+    h22 = w2 * l22
+
+    c00 = h00 * h00
+    c01 = h00 * h10
+    c02 = h00 * h20
+    c11 = h10 * h10 + h11 * h11
+    c12 = h10 * h20 + h11 * h21
+    c22 = h20 * h20 + h21 * h21 + h22 * h22
+    return c00, c01, c02, c11, c12, c22
+
+
+def apply_pair_space_cholesky(relative_vectors, weights, lower_entries) -> PairSpaceCholeskyResult:
+    """Apply a full SPD resistance closure to three pair-relative vectors.
+
+    For pair vectors ``r = (r0, r1, r2)`` this builds ``C = D L L.T D`` and
+    returns ``Y = C r`` plus ``r.T C r``.  No dense Python loop is involved in
+    the expression tree; generated backends receive only scalar algebra and
+    vector dot products.
+    """
+
+    r0, r1, r2 = relative_vectors
+    c00, c01, c02, c11, c12, c22 = pair_space_cholesky_coefficients(weights, lower_entries)
+
+    y0 = c00 * r0 + c01 * r1 + c02 * r2
+    y1 = c01 * r0 + c11 * r1 + c12 * r2
+    y2 = c02 * r0 + c12 * r1 + c22 * r2
+
+    dissipation_density = (
+        c00 * dot(r0, r0)
+        + c01 * dot(r0, r1)
+        + c01 * dot(r0, r1)
+        + c02 * dot(r0, r2)
+        + c02 * dot(r0, r2)
+        + c11 * dot(r1, r1)
+        + c12 * dot(r1, r2)
+        + c12 * dot(r1, r2)
+        + c22 * dot(r2, r2)
+    )
+
+    return PairSpaceCholeskyResult(
+        coefficients=(c00, c01, c02, c11, c12, c22),
+        conjugates=(y0, y1, y2),
+        dissipation_density=dissipation_density,
+    )
 
 
 def smooth_abs(x, *, eta: float = 1.0e-12):

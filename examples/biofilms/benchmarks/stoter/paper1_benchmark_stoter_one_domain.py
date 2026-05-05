@@ -46,7 +46,16 @@ from examples.biofilms.benchmarks.stoter.paper1_benchmark_stoter_channel_porous 
 from examples.biofilms.benchmarks.stoter.paper1_benchmark_stoter_channel_porous_twodomain import (
     _compare_velocity_grids,
 )
-from examples.utils.biofilm.final_form import build_biofilm_one_domain_final_form
+from examples.biofilms.benchmarks.three_constituent.paper1_three_constituent_benchmark_suite import (
+    run_stoter_fixed_bed_canonical_benchmark,
+    write_benchmark_outputs,
+)
+from examples.biofilms.benchmarks.three_constituent.stoter_physical import (
+    run_physical_stoter_three_constituent,
+)
+from examples.utils.biofilm.bulk_interface_split_form import (
+    build_biofilm_one_domain_bulk_interface_split_form,
+)
 from pycutfem.core.dofhandler import DofHandler
 from pycutfem.core.mesh import Mesh
 from pycutfem.fem.mixedelement import MixedElement
@@ -551,7 +560,7 @@ def _solve_benchmark_final_form_rigid(
         alpha_high=inactive_alpha_high,
     )
 
-    forms = build_biofilm_one_domain_final_form(
+    forms = build_biofilm_one_domain_bulk_interface_split_form(
         v_k=v_k,
         p_k=p_k,
         vP_k=vP_k,
@@ -1333,7 +1342,12 @@ def main() -> None:
     ap.add_argument("--ac-dt", type=float, default=0.05)
     ap.add_argument("--ac-max-steps", type=int, default=80)
     ap.add_argument("--compare-sharp-csv", type=str, default="out/stoter_channel_sharp_32x40_refined_nophi_cpp/velocity_grid.csv")
-    ap.add_argument("--formulation", type=str, default="diagnostic", choices=("diagnostic", "final_form_rigid"))
+    ap.add_argument(
+        "--formulation",
+        type=str,
+        default="diagnostic",
+        choices=("diagnostic", "final_form_rigid", "three_constituent", "three_constituent_gate"),
+    )
     ap.add_argument("--phi0", type=float, default=1.0)
     ap.add_argument("--gamma-v-in-porous", type=float, default=0.0)
     ap.add_argument("--gamma-p-in-porous", type=float, default=0.0)
@@ -1345,12 +1359,63 @@ def main() -> None:
     ap.add_argument("--domain-lm-vf-space", type=str, default="dg0", choices=("dg0", "dg1", "cg1"))
     ap.add_argument("--inactive-alpha-low", type=float, default=0.05)
     ap.add_argument("--inactive-alpha-high", type=float, default=0.95)
+    ap.add_argument("--three-constituent-dt", type=float, default=5.0e-3)
+    ap.add_argument("--three-constituent-final-time", type=float, default=5.0e-3)
+    ap.add_argument("--three-constituent-kappa", type=float, default=1.0)
+    ap.add_argument("--three-constituent-phi0", type=float, default=0.68)
+    ap.add_argument("--three-constituent-gamma-mobility", type=str, default="interface_delta")
+    ap.add_argument("--three-constituent-resistance-model", type=str, default="full_cholesky")
+    ap.add_argument("--three-constituent-pore-pressure-lower-bound", type=float, default=0.0)
+    ap.add_argument("--three-constituent-inactive-alpha-low", type=float, default=0.02)
+    ap.add_argument("--three-constituent-inactive-alpha-high", type=float, default=0.98)
+    ap.add_argument("--three-constituent-bjs-factor", type=float, default=1.0)
+    ap.add_argument("--three-constituent-bjs-delta-epsilon", type=float, default=1.0e-12)
     ap.add_argument("--backend", type=str, default="cpp", choices=("python", "jit", "cpp"))
     ap.add_argument("--no-export", action="store_true")
     args = ap.parse_args()
 
     outdir = Path(args.outdir).resolve()
     outdir.mkdir(parents=True, exist_ok=True)
+    formulation_key = str(args.formulation).strip().lower()
+    if formulation_key == "three_constituent_gate":
+        result = run_stoter_fixed_bed_canonical_benchmark(nx=max(int(args.nx), 121), ny=max(int(args.ny), 151))
+        summary_path = write_benchmark_outputs([result], outdir)
+        summary = {
+            "benchmark": "stoter_section_5_3_three_constituent_gate",
+            "formulation": "three_constituent_gate",
+            "passed": bool(result.passed),
+            "summary_path": str(summary_path),
+            "metrics": {key: float(value) for key, value in result.metrics.items()},
+            "tolerances": {key: float(value) for key, value in result.tolerances.items()},
+        }
+        (outdir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        print(json.dumps(summary, indent=2, sort_keys=True))
+        return
+    if formulation_key == "three_constituent":
+        pp_lower = float(args.three_constituent_pore_pressure_lower_bound)
+        result = run_physical_stoter_three_constituent(
+            outdir=outdir,
+            nx=int(args.nx),
+            ny=int(args.ny),
+            eps=float(args.eps),
+            phi0=float(args.three_constituent_phi0),
+            u_max=float(args.Umax),
+            dt=float(args.three_constituent_dt),
+            final_time=float(args.three_constituent_final_time),
+            kappa=float(args.three_constituent_kappa),
+            friction_alpha=float(args.friction_alpha),
+            hydraulic_conductivity=float(args.K),
+            bjs_factor=float(args.three_constituent_bjs_factor),
+            bjs_delta_epsilon=float(args.three_constituent_bjs_delta_epsilon),
+            gamma_mobility=str(args.three_constituent_gamma_mobility),
+            resistance_model=str(args.three_constituent_resistance_model),
+            backend=str(args.backend),
+            pore_pressure_lower_bound=None if not math.isfinite(pp_lower) else pp_lower,
+            inactive_alpha_low=float(args.three_constituent_inactive_alpha_low),
+            inactive_alpha_high=float(args.three_constituent_inactive_alpha_high),
+        )
+        print(json.dumps(result.summary, indent=2, sort_keys=True))
+        return
     compare_csv = None if not str(args.compare_sharp_csv).strip() else Path(args.compare_sharp_csv).resolve()
     summary = solve_benchmark(
         nx=int(args.nx),

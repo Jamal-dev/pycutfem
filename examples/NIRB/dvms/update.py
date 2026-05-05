@@ -45,6 +45,17 @@ def _all_element_ids(state: FluidDVMSState) -> np.ndarray:
     return np.arange(int(state.n_elements), dtype=int)
 
 
+def _selected_element_ids(state: FluidDVMSState, element_ids: np.ndarray | None) -> np.ndarray:
+    if element_ids is None:
+        return _all_element_ids(state)
+    eids = np.asarray(element_ids, dtype=int).reshape(-1)
+    if eids.size == 0:
+        return eids
+    if np.any(eids < 0) or np.any(eids >= int(state.n_elements)):
+        raise ValueError("DVMS element_ids contain out-of-range entries.")
+    return np.unique(eids)
+
+
 def _first_bad_element(values: np.ndarray) -> int | None:
     bad = np.argwhere(~np.isfinite(np.asarray(values, dtype=float)))
     if bad.size == 0:
@@ -673,8 +684,12 @@ def _update_fluid_dvms_predicted_subscale(
     abs_tol: float = 1.0e-14,
     backend: str | None = None,
     use_oss: bool = False,
+    element_ids: np.ndarray | None = None,
 ) -> None:
     if int(state.sample_count) == 0:
+        return
+    work_element_ids = _selected_element_ids(state, element_ids)
+    if int(work_element_ids.size) == 0:
         return
     fast = _dvms_fast_p1_tri_cache(state, dh, mesh)
     if fast is not None:
@@ -686,43 +701,49 @@ def _update_fluid_dvms_predicted_subscale(
         del dynamic_tau
         dynamic_tau_value = 1.0
         bossak = _bossak_coefficients(alpha=float(bossak_alpha), dt=dt_value)
-        n_elem = int(state.n_elements)
+        n_elem_total = int(state.n_elements)
+        n_elem = int(work_element_ids.size)
         n_q = int(state.n_qp_per_element)
         basis_u = np.asarray(fast["basis"]["ux"], dtype=float)
         basis_p = np.asarray(fast["basis"]["p"], dtype=float)
-        grad_phi_u = _grad_phi_phys(fast["grad_ref"]["ux"], fast["J_inv"])
-        grad_phi_p = _grad_phi_phys(fast["grad_ref"]["p"], fast["J_inv"])
-        grad_phi_mx = _grad_phi_phys(fast["grad_ref"]["mx"], fast["J_inv"])
-        grad_phi_my = _grad_phi_phys(fast["grad_ref"]["my"], fast["J_inv"])
+        J_inv = np.asarray(fast["J_inv"], dtype=float)[work_element_ids]
+        element_maps = {
+            key: np.asarray(value, dtype=int)[work_element_ids]
+            for key, value in dict(fast["element_maps"]).items()
+        }
+        grad_phi_u = _grad_phi_phys(fast["grad_ref"]["ux"], J_inv)
+        grad_phi_p = _grad_phi_phys(fast["grad_ref"]["p"], J_inv)
+        grad_phi_mx = _grad_phi_phys(fast["grad_ref"]["mx"], J_inv)
+        grad_phi_my = _grad_phi_phys(fast["grad_ref"]["my"], J_inv)
 
-        ux_k = _scalar_locals(dh, "ux", u_k.components[0].nodal_values, fast["element_maps"]["ux"])
-        uy_k = _scalar_locals(dh, "uy", u_k.components[1].nodal_values, fast["element_maps"]["uy"])
-        ux_prev = _scalar_locals(dh, "ux", u_prev.components[0].nodal_values, fast["element_maps"]["ux"])
-        uy_prev = _scalar_locals(dh, "uy", u_prev.components[1].nodal_values, fast["element_maps"]["uy"])
-        ax_prev = _scalar_locals(dh, "ux", a_prev.components[0].nodal_values, fast["element_maps"]["ux"])
-        ay_prev = _scalar_locals(dh, "uy", a_prev.components[1].nodal_values, fast["element_maps"]["uy"])
+        ux_k = _scalar_locals(dh, "ux", u_k.components[0].nodal_values, element_maps["ux"])
+        uy_k = _scalar_locals(dh, "uy", u_k.components[1].nodal_values, element_maps["uy"])
+        ux_prev = _scalar_locals(dh, "ux", u_prev.components[0].nodal_values, element_maps["ux"])
+        uy_prev = _scalar_locals(dh, "uy", u_prev.components[1].nodal_values, element_maps["uy"])
+        ax_prev = _scalar_locals(dh, "ux", a_prev.components[0].nodal_values, element_maps["ux"])
+        ay_prev = _scalar_locals(dh, "uy", a_prev.components[1].nodal_values, element_maps["uy"])
         if a_curr is not None:
-            ax_curr = _scalar_locals(dh, "ux", a_curr.components[0].nodal_values, fast["element_maps"]["ux"])
-            ay_curr = _scalar_locals(dh, "uy", a_curr.components[1].nodal_values, fast["element_maps"]["uy"])
+            ax_curr = _scalar_locals(dh, "ux", a_curr.components[0].nodal_values, element_maps["ux"])
+            ay_curr = _scalar_locals(dh, "uy", a_curr.components[1].nodal_values, element_maps["uy"])
         else:
             ax_curr = None
             ay_curr = None
-        p_vals = _scalar_locals(dh, "p", p_k.nodal_values, fast["element_maps"]["p"])
-        mx_k = _scalar_locals(dh, "mx", d_mesh.components[0].nodal_values, fast["element_maps"]["mx"])
-        my_k = _scalar_locals(dh, "my", d_mesh.components[1].nodal_values, fast["element_maps"]["my"])
-        mx_prev = _scalar_locals(dh, "mx", d_prev.components[0].nodal_values, fast["element_maps"]["mx"])
-        my_prev = _scalar_locals(dh, "my", d_prev.components[1].nodal_values, fast["element_maps"]["my"])
+        p_vals = _scalar_locals(dh, "p", p_k.nodal_values, element_maps["p"])
+        mx_k = _scalar_locals(dh, "mx", d_mesh.components[0].nodal_values, element_maps["mx"])
+        my_k = _scalar_locals(dh, "my", d_mesh.components[1].nodal_values, element_maps["my"])
+        mx_prev = _scalar_locals(dh, "mx", d_prev.components[0].nodal_values, element_maps["mx"])
+        my_prev = _scalar_locals(dh, "my", d_prev.components[1].nodal_values, element_maps["my"])
         if mesh_v is not None:
-            mx_vel = _scalar_locals(dh, "mx", mesh_v.components[0].nodal_values, fast["element_maps"]["mx"])
-            my_vel = _scalar_locals(dh, "my", mesh_v.components[1].nodal_values, fast["element_maps"]["my"])
+            mx_vel = _scalar_locals(dh, "mx", mesh_v.components[0].nodal_values, element_maps["mx"])
+            my_vel = _scalar_locals(dh, "my", mesh_v.components[1].nodal_values, element_maps["my"])
         else:
             mx_vel = np.zeros_like(mx_prev)
             my_vel = np.zeros_like(my_prev)
         if mesh_v_prev is not None and mesh_a_prev is not None:
-            mx_vel_prev = _scalar_locals(dh, "mx", mesh_v_prev.components[0].nodal_values, fast["element_maps"]["mx"])
-            my_vel_prev = _scalar_locals(dh, "my", mesh_v_prev.components[1].nodal_values, fast["element_maps"]["my"])
-            mx_acc_prev = _scalar_locals(dh, "mx", mesh_a_prev.components[0].nodal_values, fast["element_maps"]["mx"])
-            my_acc_prev = _scalar_locals(dh, "my", mesh_a_prev.components[1].nodal_values, fast["element_maps"]["my"])
+            mx_vel_prev = _scalar_locals(dh, "mx", mesh_v_prev.components[0].nodal_values, element_maps["mx"])
+            my_vel_prev = _scalar_locals(dh, "my", mesh_v_prev.components[1].nodal_values, element_maps["my"])
+            mx_acc_prev = _scalar_locals(dh, "mx", mesh_a_prev.components[0].nodal_values, element_maps["mx"])
+            my_acc_prev = _scalar_locals(dh, "my", mesh_a_prev.components[1].nodal_values, element_maps["my"])
         else:
             mx_vel_prev = np.zeros_like(mx_prev)
             my_vel_prev = np.zeros_like(my_prev)
@@ -732,8 +753,8 @@ def _update_fluid_dvms_predicted_subscale(
             mx_prev2 = np.zeros_like(mx_prev)
             my_prev2 = np.zeros_like(my_prev)
         else:
-            mx_prev2 = _scalar_locals(dh, "mx", d_prev2.components[0].nodal_values, fast["element_maps"]["mx"])
-            my_prev2 = _scalar_locals(dh, "my", d_prev2.components[1].nodal_values, fast["element_maps"]["my"])
+            mx_prev2 = _scalar_locals(dh, "mx", d_prev2.components[0].nodal_values, element_maps["mx"])
+            my_prev2 = _scalar_locals(dh, "my", d_prev2.components[1].nodal_values, element_maps["my"])
 
         u_k_q = np.stack(
             [
@@ -825,7 +846,9 @@ def _update_fluid_dvms_predicted_subscale(
         detF = F[:, 0, 0] * F[:, 1, 1] - F[:, 0, 1] * F[:, 1, 0]
         bad = np.argwhere(~np.isfinite(detF) | (np.abs(detF) <= 1.0e-14))
         if bad.size:
-            raise RuntimeError(f"Singular ALE deformation gradient on element {int(bad[0, 0])}.")
+            raise RuntimeError(
+                f"Singular ALE deformation gradient on element {int(work_element_ids[int(bad[0, 0])])}."
+            )
         Finv = np.zeros_like(F)
         Finv[:, 0, 0] = F[:, 1, 1] / detF
         Finv[:, 0, 1] = -F[:, 0, 1] / detF
@@ -854,10 +877,14 @@ def _update_fluid_dvms_predicted_subscale(
             current_acceleration_q = a_curr_q
         a_relaxed = current_acceleration_q
         if bool(use_oss):
-            momentum_projection = np.asarray(state.momentum_projection, dtype=float).reshape(n_elem, n_q, 2)
+            momentum_projection = np.asarray(state.momentum_projection, dtype=float).reshape(n_elem_total, n_q, 2)[
+                work_element_ids
+            ]
         else:
             momentum_projection = np.zeros((n_elem, n_q, 2), dtype=float)
-        old_subscale = np.asarray(state.old_subscale_velocity, dtype=float).reshape(n_elem, n_q, 2)
+        old_subscale = np.asarray(state.old_subscale_velocity, dtype=float).reshape(n_elem_total, n_q, 2)[
+            work_element_ids
+        ]
         static_residual = -(
             rho_value * a_relaxed
             + rho_value * np.einsum("eij,eqj->eqi", grad_u_phys, resolved_conv_velocity, optimize=True)
@@ -865,10 +892,13 @@ def _update_fluid_dvms_predicted_subscale(
             + momentum_projection
         ) + (rho_value / dt_value) * old_subscale
 
-        h_e = _kratos_dvms_current_element_size_array(mesh, dh, d_mesh).reshape(-1)
+        h_e = _kratos_dvms_current_element_size_array(mesh, dh, d_mesh, element_ids=work_element_ids).reshape(-1)
         if h_e.shape[0] != n_elem:
             raise RuntimeError(f"DVMS predictor element-size mismatch: expected {n_elem}, got {h_e.shape[0]}.")
-        predicted = np.asarray(state.predicted_subscale_velocity, dtype=float).reshape(n_elem, n_q, 2).copy()
+        predicted_full = np.asarray(state.predicted_subscale_velocity, dtype=float).reshape(
+            n_elem_total, n_q, 2
+        ).copy()
+        predicted = predicted_full[work_element_ids].copy()
         failed = np.zeros((n_elem, n_q), dtype=bool)
         converged = np.zeros_like(failed)
         max_it = max(int(max_iterations), 1)
@@ -922,7 +952,8 @@ def _update_fluid_dvms_predicted_subscale(
             # Kratos d_vms.cpp stores ZeroVector(Dim) at capped,
             # non-converged quadrature points.
             predicted[remaining, :] = 0.0
-        state.predicted_subscale_velocity[:, :] = predicted.reshape(int(state.sample_count), 2)
+        predicted_full[work_element_ids, :, :] = predicted
+        state.predicted_subscale_velocity[:, :] = predicted_full.reshape(int(state.sample_count), 2)
         state.sync_coefficient("predicted_subscale_velocity")
         return
 
@@ -967,16 +998,16 @@ def _update_fluid_dvms_predicted_subscale(
             "resolved_conv_velocity": predictor.kinematics.resolved_conv_velocity,
         },
         layout=state.quadrature_layout,
-        element_ids=_all_element_ids(state),
+        element_ids=work_element_ids,
     )
     static_residual = np.asarray(evaluated["static_residual"], dtype=float).reshape(
-        int(state.n_elements), int(state.n_qp_per_element), 2
+        int(work_element_ids.size), int(state.n_qp_per_element), 2
     )
     grad_u_phys = np.asarray(evaluated["grad_u_phys"], dtype=float).reshape(
-        int(state.n_elements), int(state.n_qp_per_element), 2, 2
+        int(work_element_ids.size), int(state.n_qp_per_element), 2, 2
     )
     resolved_conv_velocity = np.asarray(evaluated["resolved_conv_velocity"], dtype=float).reshape(
-        int(state.n_elements), int(state.n_qp_per_element), 2
+        int(work_element_ids.size), int(state.n_qp_per_element), 2
     )
     if (
         not np.all(np.isfinite(static_residual))
@@ -985,16 +1016,17 @@ def _update_fluid_dvms_predicted_subscale(
     ):
         raise RuntimeError("DVMS predictor evaluation produced non-finite quadrature data.")
 
-    h_e = _kratos_dvms_current_element_size_array(mesh, dh, d_mesh).reshape(-1)
-    if h_e.shape[0] != int(state.n_elements):
+    h_e = _kratos_dvms_current_element_size_array(mesh, dh, d_mesh, element_ids=work_element_ids).reshape(-1)
+    if h_e.shape[0] != int(work_element_ids.size):
         raise RuntimeError(
-            f"DVMS predictor element-size mismatch: expected {state.n_elements}, got {h_e.shape[0]}."
+            f"DVMS predictor element-size mismatch: expected {work_element_ids.size}, got {h_e.shape[0]}."
         )
-    h_qp = np.broadcast_to(h_e[:, None], (int(state.n_elements), int(state.n_qp_per_element)))
-    predicted = np.asarray(state.predicted_subscale_velocity, dtype=float).reshape(
+    h_qp = np.broadcast_to(h_e[:, None], (int(work_element_ids.size), int(state.n_qp_per_element)))
+    predicted_full = np.asarray(state.predicted_subscale_velocity, dtype=float).reshape(
         int(state.n_elements), int(state.n_qp_per_element), 2
     ).copy()
-    failed = np.zeros((int(state.n_elements), int(state.n_qp_per_element)), dtype=bool)
+    predicted = predicted_full[work_element_ids].copy()
+    failed = np.zeros((int(work_element_ids.size), int(state.n_qp_per_element)), dtype=bool)
     converged = np.zeros_like(failed)
     eye = np.eye(2, dtype=float)
 
@@ -1069,7 +1101,8 @@ def _update_fluid_dvms_predicted_subscale(
         # mPredictedSubscaleVelocity = converged ? u : ZeroVector(Dim).
         predicted[remaining, :] = 0.0
 
-    state.predicted_subscale_velocity[:, :] = predicted.reshape(int(state.sample_count), 2)
+    predicted_full[work_element_ids, :, :] = predicted
+    state.predicted_subscale_velocity[:, :] = predicted_full.reshape(int(state.sample_count), 2)
     state.sync_coefficient("predicted_subscale_velocity")
 
 
