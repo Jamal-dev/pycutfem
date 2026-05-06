@@ -4,6 +4,23 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+    inputs:
+      test_scope:
+        description: Test scope to run
+        required: true
+        type: choice
+        default: core
+        options:
+          - core
+          - full
+      full_runner:
+        description: Runner for manual full tests
+        required: true
+        type: choice
+        default: self-hosted
+        options:
+          - self-hosted
+          - github-hosted
 
 permissions:
   contents: read
@@ -75,9 +92,26 @@ jobs:
 
       - name: Run core regression tests
         run: |
+          mkdir -p out/test-results
           python -m pytest -q \
+            --junitxml=out/test-results/core-${{ runner.os }}.xml \
             tests/test_three_constituent_benchmark_suite.py \
             tests/test_three_constituent_one_domain_cpp.py
+
+      - name: Summarize core regression tests
+        if: always()
+        run: |
+          python .github/junit_summary.py \
+            out/test-results/core-${{ runner.os }}.xml \
+            "Core regression tests (${{ runner.os }})"
+
+      - name: Upload core test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-core-${{ runner.os }}
+          path: out/test-results/core-${{ runner.os }}.xml
+          if-no-files-found: ignore
 
       - name: Run three-constituent paper smoke suite
         if: runner.os == 'Linux'
@@ -88,6 +122,72 @@ jobs:
             --outdir out/ci_three_constituent_smoke \
             --backend cpp \
             --linear-backend scipy
+
+  full-tests:
+    name: Full test suite
+    if: github.event_name == 'workflow_dispatch' && inputs.test_scope == 'full'
+    runs-on: ${{ fromJSON(inputs.full_runner == 'self-hosted' && '["self-hosted","linux","x64"]' || '["ubuntu-latest"]') }}
+    timeout-minutes: ${{ inputs.full_runner == 'self-hosted' && 1440 || 360 }}
+    defaults:
+      run:
+        shell: bash -el {0}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Create Conda environment
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          miniforge-version: latest
+          use-mamba: true
+          environment-file: environment.yml
+          activate-environment: pycutfem
+          auto-activate-base: false
+
+      - name: Configure Eigen include directory
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          prefix = Path(os.environ["CONDA_PREFIX"])
+          candidates = [
+              prefix / "include" / "eigen3",
+              prefix / "Library" / "include" / "eigen3",
+              Path("/usr/include/eigen3"),
+          ]
+          for candidate in candidates:
+              if candidate.exists():
+                  with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as handle:
+                      handle.write(f"EIGEN_INCLUDE_DIR={candidate}\n")
+                  print(f"EIGEN_INCLUDE_DIR={candidate}")
+                  break
+          else:
+              raise SystemExit("Eigen include directory was not found.")
+          PY
+
+      - name: Run all pytest tests
+        run: |
+          mkdir -p out/test-results
+          python -m pytest -q \
+            --junitxml=out/test-results/full-${{ runner.os }}.xml \
+            tests
+
+      - name: Summarize full test suite
+        if: always()
+        run: |
+          python .github/junit_summary.py \
+            out/test-results/full-${{ runner.os }}.xml \
+            "Full test suite (${{ runner.os }})"
+
+      - name: Upload full test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-full-${{ runner.os }}
+          path: out/test-results/full-${{ runner.os }}.xml
+          if-no-files-found: ignore
 
   docker:
     name: Docker image
@@ -105,8 +205,27 @@ jobs:
 
       - name: Test Docker image
         run: |
-          docker run --rm pycutfem:ci python -m pytest -q \
+          mkdir -p out/test-results
+          docker run --rm \
+            -v "${PWD}/out/test-results:/test-results" \
+            pycutfem:ci python -m pytest -q \
+            --junitxml=/test-results/docker.xml \
             tests/test_three_constituent_benchmark_suite.py
+
+      - name: Summarize Docker test
+        if: always()
+        run: |
+          python .github/junit_summary.py \
+            out/test-results/docker.xml \
+            "Docker smoke test"
+
+      - name: Upload Docker test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-docker
+          path: out/test-results/docker.xml
+          if-no-files-found: ignore
 
       - name: Push Docker image to Docker Hub
         if: github.event_name != 'pull_request' && env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != ''

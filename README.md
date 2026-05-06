@@ -171,6 +171,12 @@ GitHub Actions is configured in `.github/workflows/ci.yml`.
   `environment.yml`.
 - The Linux job also runs the three-constituent paper smoke suite without the
   long Seboldt case.
+- Core, full, and Docker test jobs write compact pass/fail/skip counts to the
+  GitHub Actions job summary and upload the raw JUnit XML report as an artifact.
+- The full pytest suite is available through the manual `workflow_dispatch`
+  input `test_scope=full`.  By default it targets a self-hosted Linux x64 runner
+  so long numerical tests are not constrained by standard hosted-runner wall
+  time; use `full_runner=github-hosted` only for shorter diagnostic runs.
 - The Docker job builds the image and runs a smoke test inside it.
 - On non-PR events, the Docker job pushes `latest` and `${GITHUB_SHA}` tags to
   Docker Hub when these repository secrets are configured:
