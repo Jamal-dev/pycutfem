@@ -9,6 +9,7 @@ import numpy as np
 
 from pycutfem.mor.interface import InterfaceRestriction
 from pycutfem.mor.io import load_model
+from pycutfem.nirb.reduced_interface import ReducedInterfaceDecoder
 
 
 @dataclass(frozen=True)
@@ -43,6 +44,101 @@ class NIRBSolidPrediction:
     elapsed_s: float
     interface_displacement: np.ndarray | None = None
     reduced_displacement: np.ndarray | None = None
+    reduced_interface_displacement: np.ndarray | None = None
+
+
+@dataclass(frozen=True)
+class NIRBInterfaceTangentCorrector:
+    """Secant interface-compliance correction for NIRB solid predictions.
+
+    The tangent matrices map a flattened interface-load increment to either a
+    flattened full solid displacement increment or a flattened interface
+    displacement increment.  They are trained from consecutive FSI coupling
+    states and are used online as a local impedance anchor:
+
+        d_k ~= d_{k-1} + C_Gamma (f_k - f_{k-1}).
+    """
+
+    load_coords: np.ndarray
+    interface_coords: np.ndarray
+    full_tangent: np.ndarray | None = None
+    interface_tangent: np.ndarray | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_npz(cls, path: str | Path) -> "NIRBInterfaceTangentCorrector":
+        with np.load(Path(path), allow_pickle=True) as data:
+            load_coords = np.asarray(data["load_coords"], dtype=float)
+            interface_coords = np.asarray(data["interface_coords"], dtype=float)
+            full_tangent = np.asarray(data["full_tangent"], dtype=float) if "full_tangent" in data else None
+            interface_tangent = (
+                np.asarray(data["interface_tangent"], dtype=float) if "interface_tangent" in data else None
+            )
+            metadata: dict[str, Any] = {}
+            if "metadata_json" in data:
+                try:
+                    import json
+
+                    metadata = json.loads(str(np.asarray(data["metadata_json"]).reshape(())))
+                except Exception:
+                    metadata = {}
+        return cls(
+            load_coords=load_coords,
+            interface_coords=interface_coords,
+            full_tangent=full_tangent,
+            interface_tangent=interface_tangent,
+            metadata=metadata,
+        )
+
+    @property
+    def n_load_dofs(self) -> int:
+        return int(np.asarray(self.load_coords, dtype=float).shape[0] * 2)
+
+    @property
+    def n_interface_dofs(self) -> int:
+        return int(np.asarray(self.interface_coords, dtype=float).shape[0] * 2)
+
+    def validate(self) -> None:
+        load_coords = np.asarray(self.load_coords, dtype=float)
+        interface_coords = np.asarray(self.interface_coords, dtype=float)
+        if load_coords.ndim != 2 or load_coords.shape[1] != 2:
+            raise ValueError("NIRB tangent load_coords must have shape (n, 2)")
+        if interface_coords.ndim != 2 or interface_coords.shape[1] != 2:
+            raise ValueError("NIRB tangent interface_coords must have shape (n, 2)")
+        n_load = int(load_coords.shape[0] * 2)
+        n_interface = int(interface_coords.shape[0] * 2)
+        if self.full_tangent is None and self.interface_tangent is None:
+            raise ValueError("NIRB tangent artifact must contain full_tangent or interface_tangent")
+        if self.full_tangent is not None:
+            full = np.asarray(self.full_tangent, dtype=float)
+            if full.ndim != 2 or full.shape[1] != n_load:
+                raise ValueError(
+                    "NIRB full_tangent must have shape (n_full_displacement_dofs, n_load_dofs); "
+                    f"got {full.shape}, expected second dimension {n_load}."
+                )
+        if self.interface_tangent is not None:
+            interface = np.asarray(self.interface_tangent, dtype=float)
+            if interface.shape != (n_interface, n_load):
+                raise ValueError(
+                    "NIRB interface_tangent must have shape "
+                    f"{(n_interface, n_load)}, got {interface.shape}."
+                )
+
+    def full_increment(self, load_increment: np.ndarray) -> np.ndarray | None:
+        if self.full_tangent is None:
+            return None
+        delta = np.asarray(load_increment, dtype=float).reshape(-1)
+        if delta.size != self.n_load_dofs:
+            raise ValueError(f"expected {self.n_load_dofs} load increment dofs, got {delta.size}")
+        return np.asarray(self.full_tangent, dtype=float) @ delta
+
+    def interface_increment(self, load_increment: np.ndarray) -> np.ndarray | None:
+        if self.interface_tangent is None:
+            return None
+        delta = np.asarray(load_increment, dtype=float).reshape(-1)
+        if delta.size != self.n_load_dofs:
+            raise ValueError(f"expected {self.n_load_dofs} load increment dofs, got {delta.size}")
+        return np.asarray(self.interface_tangent, dtype=float) @ delta
 
 
 @dataclass
@@ -54,6 +150,7 @@ class NIRBSolidPredictor:
     interface_matrix: np.ndarray | None = None
     interface_shape: tuple[int, ...] | None = None
     zero_load_tolerance: float = 0.0
+    reduced_interface_decoder: ReducedInterfaceDecoder | None = None
     _interface_decoder: Any = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -72,6 +169,7 @@ class NIRBSolidPredictor:
         interface_matrix: np.ndarray | None = None,
         interface_shape: tuple[int, ...] | None = None,
         zero_load_tolerance: float = 0.0,
+        reduced_interface_decoder: ReducedInterfaceDecoder | None = None,
     ) -> "NIRBSolidPredictor":
         return cls(
             model=load_model(path),
@@ -79,6 +177,7 @@ class NIRBSolidPredictor:
             interface_matrix=interface_matrix,
             interface_shape=interface_shape,
             zero_load_tolerance=float(zero_load_tolerance),
+            reduced_interface_decoder=reduced_interface_decoder,
         )
 
     def _zero_full_displacement(self) -> np.ndarray:
@@ -115,6 +214,106 @@ class NIRBSolidPredictor:
             elapsed_s=float(elapsed),
         )
 
+    def predict_reduced_from_force_coefficients(self, force_coefficients: np.ndarray) -> NIRBSolidPrediction:
+        """Evaluate the solid ROM from reduced force coordinates.
+
+        This is the fully reduced counterpart of :meth:`predict_reduced`.
+        It assumes the supplied coefficients are already in the trained force
+        POD coordinates, so it does not reconstruct or re-project a full
+        interface load vector.
+        """
+
+        coeffs = np.asarray(force_coefficients, dtype=float).reshape(-1)
+        n_force_modes = int(np.asarray(self.model.force_basis.basis).shape[1])
+        if int(coeffs.size) != n_force_modes:
+            raise ValueError(f"expected {n_force_modes} force coefficients, got {coeffs.size}.")
+        if np.linalg.norm(coeffs) <= float(self.zero_load_tolerance):
+            reduced_zero = np.zeros((int(self.model.decoder.n_linear_modes),), dtype=float)
+            return NIRBSolidPrediction(
+                full_displacement=None,
+                interface_displacement=None,
+                reduced_displacement=reduced_zero,
+                reduced_interface_displacement=(
+                    None
+                    if self.reduced_interface_decoder is None
+                    else self.reduced_interface_decoder.decode_coefficients(reduced_zero)
+                ),
+                elapsed_s=0.0,
+            )
+
+        started = perf_counter()
+        if hasattr(self.model, "predict_reduced_from_force_coefficients"):
+            reduced = np.asarray(self.model.predict_reduced_from_force_coefficients(coeffs), dtype=float)
+        else:
+            reduced = np.asarray(self.model.regressor.predict(coeffs.reshape(1, -1)), dtype=float).T
+        elapsed = perf_counter() - started
+        if reduced.ndim != 2 or reduced.shape[1] != 1:
+            raise ValueError("NIRB solid model must return a single feature-major reduced displacement column")
+        reduced_displacement = reduced[:, 0]
+        reduced_interface = (
+            None
+            if self.reduced_interface_decoder is None
+            else self.reduced_interface_decoder.decode_coefficients(reduced_displacement)
+        )
+        return NIRBSolidPrediction(
+            full_displacement=None,
+            interface_displacement=None,
+            reduced_displacement=reduced_displacement,
+            reduced_interface_displacement=reduced_interface,
+            elapsed_s=float(elapsed),
+        )
+
+    def predict_reduced_interface_from_force_coefficients(self, force_coefficients: np.ndarray) -> NIRBSolidPrediction:
+        if self.reduced_interface_decoder is None:
+            raise RuntimeError("reduced_interface_decoder is required for reduced-interface solid prediction")
+        prediction = self.predict_reduced_from_force_coefficients(force_coefficients)
+        if prediction.reduced_interface_displacement is not None:
+            return prediction
+        if prediction.reduced_displacement is None:
+            raise RuntimeError("NIRB prediction does not contain reduced displacement coordinates.")
+        reduced_interface = self.reduced_interface_decoder.decode_coefficients(prediction.reduced_displacement)
+        return NIRBSolidPrediction(
+            full_displacement=None,
+            interface_displacement=None,
+            reduced_displacement=prediction.reduced_displacement,
+            reduced_interface_displacement=reduced_interface,
+            elapsed_s=prediction.elapsed_s,
+        )
+
+    def predict_interface_from_force_coefficients(self, force_coefficients: np.ndarray) -> NIRBSolidPrediction:
+        """Evaluate an interface-displacement ROM from force POD coordinates."""
+
+        prediction = self.predict_reduced_from_force_coefficients(force_coefficients)
+        if prediction.reduced_displacement is None:
+            raise RuntimeError("NIRB prediction does not contain reduced displacement coordinates.")
+        started = perf_counter()
+        interface_displacement = self.reconstruct_interface(prediction.reduced_displacement)
+        elapsed = prediction.elapsed_s + (perf_counter() - started)
+        return NIRBSolidPrediction(
+            full_displacement=None,
+            interface_displacement=interface_displacement,
+            reduced_displacement=prediction.reduced_displacement,
+            reduced_interface_displacement=prediction.reduced_interface_displacement,
+            elapsed_s=float(elapsed),
+        )
+
+    def predict_from_force_coefficients(self, force_coefficients: np.ndarray) -> NIRBSolidPrediction:
+        """Evaluate the full-displacement ROM from force POD coordinates."""
+
+        prediction = self.predict_reduced_from_force_coefficients(force_coefficients)
+        if prediction.reduced_displacement is None:
+            raise RuntimeError("NIRB prediction does not contain reduced displacement coordinates.")
+        started = perf_counter()
+        full_displacement = self.reconstruct_full(prediction.reduced_displacement)
+        elapsed = prediction.elapsed_s + (perf_counter() - started)
+        return NIRBSolidPrediction(
+            full_displacement=full_displacement,
+            interface_displacement=None,
+            reduced_displacement=prediction.reduced_displacement,
+            reduced_interface_displacement=prediction.reduced_interface_displacement,
+            elapsed_s=float(elapsed),
+        )
+
     def reconstruct_full(self, reduced_displacement: np.ndarray) -> np.ndarray:
         reduced = np.asarray(reduced_displacement, dtype=float).reshape(-1, 1)
         displacement = np.asarray(self.model.decoder.decode(reduced), dtype=float)
@@ -131,12 +330,13 @@ class NIRBSolidPredictor:
     def reconstruct_interface(self, reduced_displacement: np.ndarray) -> np.ndarray:
         reduced = np.asarray(reduced_displacement, dtype=float).reshape(-1, 1)
         if self._interface_decoder is None:
-            if self.interface_shape is not None:
+            vector = self.reconstruct_full(reduced[:, 0])
+            if self.interface_shape is not None and vector.size != int(np.prod(self.interface_shape)):
                 raise RuntimeError(
-                    "NIRB interface prediction requires an interface restriction matrix "
-                    "when interface_shape is provided."
+                    "NIRB interface prediction requires an interface restriction matrix unless the "
+                    "decoder output is already interface-sized."
                 )
-            return self.reconstruct_full(reduced[:, 0])
+            return vector
         displacement = np.asarray(self._interface_decoder.decode(reduced), dtype=float)
         if displacement.ndim != 2 or displacement.shape[1] != 1:
             raise ValueError("NIRB interface decoder must return a single feature-major column")
@@ -165,6 +365,11 @@ class NIRBSolidPredictor:
             full_displacement=None,
             interface_displacement=interface_displacement,
             reduced_displacement=prediction.reduced_displacement,
+            reduced_interface_displacement=(
+                None
+                if self.reduced_interface_decoder is None or prediction.reduced_displacement is None
+                else self.reduced_interface_decoder.decode_coefficients(prediction.reduced_displacement)
+            ),
             elapsed_s=float(elapsed),
         )
 
@@ -183,5 +388,10 @@ class NIRBSolidPredictor:
             full_displacement=full_displacement,
             interface_displacement=None,
             reduced_displacement=prediction.reduced_displacement,
+            reduced_interface_displacement=(
+                None
+                if self.reduced_interface_decoder is None or prediction.reduced_displacement is None
+                else self.reduced_interface_decoder.decode_coefficients(prediction.reduced_displacement)
+            ),
             elapsed_s=float(elapsed),
         )

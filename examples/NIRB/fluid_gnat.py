@@ -9,8 +9,14 @@ from pycutfem.mor.pod import fit_pod
 
 from examples.NIRB.fluid_fom_operator import FluidFOMOperator
 from examples.NIRB.fluid_lspg import FluidLSPGResult, FluidTrialSpace
+from examples.NIRB.reduced_fluid import (
+    ReducedFluidNativeOnlineSpec,
+    reduced_fluid_gnat_step_backend,
+    reduced_fluid_online_backend,
+)
 from examples.NIRB.fluid_snapshots import FluidStageSnapshotBatch, restore_fluid_stage
 from examples.NIRB.run_example2_local import (
+    _assemble_fluid_sampled_galerkin_reduced_system_raw,
     _assemble_fluid_sampled_lspg_rows_raw,
     _fluid_interface_reaction_element_ids,
 )
@@ -301,7 +307,19 @@ class FluidGNATSystem:
     row_dofs: np.ndarray
     element_ids: np.ndarray
 
-    def gauss_newton_step(self, *, rcond: float | None = None) -> np.ndarray:
+    def gauss_newton_step(self, *, rcond: float | None = None, backend: str = "python") -> np.ndarray:
+        backend_name = str(backend).strip().lower()
+        if backend_name in {"cpp", "c++"}:
+            from pycutfem.mor import gauss_newton_step
+
+            return gauss_newton_step(
+                self.gnat_trial_jacobian,
+                self.residual_coefficients,
+                backend="cpp",
+                rcond=rcond,
+            ).step
+        if backend_name != "python":
+            raise ValueError("FluidGNATSystem Gauss-Newton step backend must be 'python' or 'cpp'.")
         step, *_ = np.linalg.lstsq(self.gnat_trial_jacobian, -self.residual_coefficients, rcond=rcond)
         return np.asarray(step, dtype=float).reshape(-1)
 
@@ -319,6 +337,10 @@ class FluidGNATSolver:
         nonlinear_update_hook: Callable[[], None] | None = None,
         objective: str = "gnat",
         row_weights: np.ndarray | None = None,
+        incompressibility_stabilization_scale: float = 1.0,
+        native_online_spec: ReducedFluidNativeOnlineSpec | None = None,
+        online_backend: str | None = None,
+        gnat_step_backend: str | None = None,
     ) -> None:
         self.operator = operator
         self.trial_space = trial_space
@@ -326,8 +348,8 @@ class FluidGNATSolver:
         self.state_update_hook = state_update_hook
         self.nonlinear_update_hook = nonlinear_update_hook
         objective_key = str(objective).strip().lower().replace("-", "_")
-        if objective_key not in {"gnat", "sampled_lspg"}:
-            raise ValueError("FluidGNATSolver objective must be 'gnat' or 'sampled_lspg'.")
+        if objective_key not in {"gnat", "sampled_lspg", "sampled_galerkin"}:
+            raise ValueError("FluidGNATSolver objective must be 'gnat', 'sampled_lspg', or 'sampled_galerkin'.")
         self.objective = objective_key
         if row_weights is None:
             self.row_weights = None
@@ -338,6 +360,27 @@ class FluidGNATSolver:
             if np.any(weights < 0.0):
                 raise ValueError("FluidGNATSolver row_weights must be nonnegative.")
             self.row_weights = weights
+        self.incompressibility_stabilization_scale = float(incompressibility_stabilization_scale)
+        if (
+            not np.isfinite(self.incompressibility_stabilization_scale)
+            or self.incompressibility_stabilization_scale <= 0.0
+        ):
+            raise ValueError("FluidGNATSolver incompressibility_stabilization_scale must be finite and positive.")
+        online_backend_name = (
+            reduced_fluid_online_backend() if online_backend is None else str(online_backend).strip().lower()
+        )
+        if online_backend_name not in {"python", "cpp"}:
+            raise ValueError("FluidGNATSolver online_backend must be 'python' or 'cpp'.")
+        step_backend_name = (
+            reduced_fluid_gnat_step_backend() if gnat_step_backend is None else str(gnat_step_backend).strip().lower()
+        )
+        if step_backend_name in {"c++"}:
+            step_backend_name = "cpp"
+        if step_backend_name not in {"python", "cpp"}:
+            raise ValueError("FluidGNATSolver gnat_step_backend must be 'python' or 'cpp'.")
+        self.native_online_spec = native_online_spec
+        self.online_backend = online_backend_name
+        self.gnat_step_backend = step_backend_name
 
     def assemble_system(
         self,
@@ -351,8 +394,44 @@ class FluidGNATSolver:
             self.state_update_hook(coeffs)
         rows = np.asarray(self.sample_set.row_dofs, dtype=int)
         element_weights = np.asarray(self.sample_set.element_weights, dtype=float).reshape(-1)
+        if self.objective == "sampled_galerkin":
+            if refresh_predicted is None or bool(refresh_predicted):
+                self.operator.refresh_predicted_subscale()
+            p = self.operator.parameters
+            reduced_residual, reduced_tangent = _assemble_fluid_sampled_galerkin_reduced_system_raw(
+                prob=self.operator.prob,
+                rho_f=float(p.rho_f),
+                mu_f=float(p.mu_f),
+                dt=float(p.dt),
+                quad_order=int(p.quadrature_order),
+                bossak_alpha=float(p.bossak_alpha),
+                contribution_mode=str(p.contribution_mode),
+                backend=str(p.backend),
+                element_ids=self.sample_set.element_ids,
+                basis=self.trial_space.basis,
+                element_weights=element_weights,
+                incompressibility_stabilization_scale=float(self.incompressibility_stabilization_scale),
+            )
+            residual_coefficients = np.asarray(reduced_residual, dtype=float).reshape(-1)
+            gnat_trial_jacobian = np.asarray(reduced_tangent, dtype=float)
+            normal_matrix = gnat_trial_jacobian.T @ gnat_trial_jacobian
+            normal_rhs = -(gnat_trial_jacobian.T @ residual_coefficients)
+            return FluidGNATSystem(
+                coefficients=coeffs.copy(),
+                sampled_residual=residual_coefficients.copy(),
+                sampled_trial_jacobian=gnat_trial_jacobian.copy(),
+                residual_coefficients=residual_coefficients,
+                gnat_trial_jacobian=gnat_trial_jacobian,
+                normal_matrix=np.asarray(normal_matrix, dtype=float),
+                normal_rhs=np.asarray(normal_rhs, dtype=float).reshape(-1),
+                estimated_residual_norm=float(np.linalg.norm(residual_coefficients)),
+                row_dofs=rows.copy(),
+                element_ids=np.asarray(self.sample_set.element_ids, dtype=int).copy(),
+            )
+
         use_element_cubature = element_weights.size and not np.allclose(element_weights, 1.0)
-        if bool(use_element_cubature):
+        use_scaled_operator = abs(float(self.incompressibility_stabilization_scale) - 1.0) > 1.0e-14
+        if bool(use_element_cubature) or bool(use_scaled_operator):
             if refresh_predicted is None or bool(refresh_predicted):
                 self.operator.refresh_predicted_subscale()
             p = self.operator.parameters
@@ -369,6 +448,7 @@ class FluidGNATSolver:
                 row_dofs=rows,
                 basis=self.trial_space.basis,
                 element_weights=element_weights,
+                incompressibility_stabilization_scale=float(self.incompressibility_stabilization_scale),
             )
         else:
             assembly = self.operator.assemble(
@@ -418,6 +498,28 @@ class FluidGNATSolver:
         max_line_search: int = 6,
         sufficient_decrease: float = 1.0e-4,
     ) -> FluidLSPGResult:
+        if self.online_backend == "cpp":
+            if self.native_online_spec is None:
+                raise RuntimeError(
+                    "FluidGNATSolver online_backend='cpp' requires a ReducedFluidNativeOnlineSpec."
+                )
+            native = self.native_online_spec.solve(
+                initial_coefficients,
+                max_iterations=max_iterations,
+                residual_tol=residual_tol,
+                step_tol=step_tol,
+                line_search=line_search,
+                max_line_search=max_line_search,
+                sufficient_decrease=sufficient_decrease,
+            )
+            return FluidLSPGResult(
+                coefficients=np.asarray(native.coefficients, dtype=float).reshape(-1),
+                residual_norm=float(native.residual_norm),
+                iterations=int(native.iterations),
+                converged=bool(native.converged),
+                trajectory=tuple(native.trajectory),
+            )
+
         coeffs = np.asarray(initial_coefficients, dtype=float).reshape(-1).copy()
         if coeffs.size != self.trial_space.n_modes:
             raise ValueError(f"Expected {self.trial_space.n_modes} coefficients, got {coeffs.size}.")
@@ -427,7 +529,7 @@ class FluidGNATSolver:
             last_norm = float(system.estimated_residual_norm)
             if last_norm <= float(residual_tol):
                 return FluidLSPGResult(coeffs, last_norm, iteration, True)
-            step = system.gauss_newton_step()
+            step = system.gauss_newton_step(backend=self.gnat_step_backend)
             if bool(line_search):
                 history = self.operator.snapshot_history()
                 best_coeffs = coeffs + step

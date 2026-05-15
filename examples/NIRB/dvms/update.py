@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Mapping
+
 import numpy as np
 
 from pycutfem.core.dofhandler import DofHandler
@@ -685,6 +687,7 @@ def _update_fluid_dvms_predicted_subscale(
     backend: str | None = None,
     use_oss: bool = False,
     element_ids: np.ndarray | None = None,
+    field_locals: Mapping[str, np.ndarray] | None = None,
 ) -> None:
     if int(state.sample_count) == 0:
         return
@@ -707,43 +710,148 @@ def _update_fluid_dvms_predicted_subscale(
         basis_u = np.asarray(fast["basis"]["ux"], dtype=float)
         basis_p = np.asarray(fast["basis"]["p"], dtype=float)
         J_inv = np.asarray(fast["J_inv"], dtype=float)[work_element_ids]
-        element_maps = {
-            key: np.asarray(value, dtype=int)[work_element_ids]
-            for key, value in dict(fast["element_maps"]).items()
-        }
+        all_element_maps = {key: np.asarray(value, dtype=int) for key, value in dict(fast["element_maps"]).items()}
+        element_maps = {key: value[work_element_ids] for key, value in all_element_maps.items()}
+        local_inputs = {} if field_locals is None else dict(field_locals)
+
+        def local_values(
+            names: tuple[str, ...],
+            field_name: str,
+            fallback,
+        ) -> np.ndarray:
+            for name in names:
+                if name not in local_inputs:
+                    continue
+                arr = np.asarray(local_inputs[name], dtype=float)
+                expected = np.asarray(element_maps[field_name], dtype=int).shape
+                full_expected = np.asarray(all_element_maps[field_name], dtype=int).shape
+                if arr.shape == full_expected and arr.shape != expected:
+                    arr = arr[work_element_ids]
+                if arr.shape != expected:
+                    raise ValueError(
+                        f"DVMS field_locals[{name!r}] must have shape {expected} "
+                        f"or full element shape {full_expected}, got {arr.shape}."
+                    )
+                if not np.all(np.isfinite(arr)):
+                    raise ValueError(f"DVMS field_locals[{name!r}] contains non-finite values.")
+                return arr
+            return fallback()
+
         grad_phi_u = _grad_phi_phys(fast["grad_ref"]["ux"], J_inv)
         grad_phi_p = _grad_phi_phys(fast["grad_ref"]["p"], J_inv)
         grad_phi_mx = _grad_phi_phys(fast["grad_ref"]["mx"], J_inv)
         grad_phi_my = _grad_phi_phys(fast["grad_ref"]["my"], J_inv)
 
-        ux_k = _scalar_locals(dh, "ux", u_k.components[0].nodal_values, element_maps["ux"])
-        uy_k = _scalar_locals(dh, "uy", u_k.components[1].nodal_values, element_maps["uy"])
-        ux_prev = _scalar_locals(dh, "ux", u_prev.components[0].nodal_values, element_maps["ux"])
-        uy_prev = _scalar_locals(dh, "uy", u_prev.components[1].nodal_values, element_maps["uy"])
-        ax_prev = _scalar_locals(dh, "ux", a_prev.components[0].nodal_values, element_maps["ux"])
-        ay_prev = _scalar_locals(dh, "uy", a_prev.components[1].nodal_values, element_maps["uy"])
-        if a_curr is not None:
-            ax_curr = _scalar_locals(dh, "ux", a_curr.components[0].nodal_values, element_maps["ux"])
-            ay_curr = _scalar_locals(dh, "uy", a_curr.components[1].nodal_values, element_maps["uy"])
+        ux_k = local_values(
+            ("ux", "ux_k"),
+            "ux",
+            lambda: _scalar_locals(dh, "ux", u_k.components[0].nodal_values, element_maps["ux"]),
+        )
+        uy_k = local_values(
+            ("uy", "uy_k"),
+            "uy",
+            lambda: _scalar_locals(dh, "uy", u_k.components[1].nodal_values, element_maps["uy"]),
+        )
+        ux_prev = local_values(
+            ("ux_prev",),
+            "ux",
+            lambda: _scalar_locals(dh, "ux", u_prev.components[0].nodal_values, element_maps["ux"]),
+        )
+        uy_prev = local_values(
+            ("uy_prev",),
+            "uy",
+            lambda: _scalar_locals(dh, "uy", u_prev.components[1].nodal_values, element_maps["uy"]),
+        )
+        ax_prev = local_values(
+            ("ax_prev",),
+            "ux",
+            lambda: _scalar_locals(dh, "ux", a_prev.components[0].nodal_values, element_maps["ux"]),
+        )
+        ay_prev = local_values(
+            ("ay_prev",),
+            "uy",
+            lambda: _scalar_locals(dh, "uy", a_prev.components[1].nodal_values, element_maps["uy"]),
+        )
+        has_curr_accel_locals = any(name in local_inputs for name in ("ax", "ax_curr", "ay", "ay_curr"))
+        if has_curr_accel_locals and a_curr is None:
+            has_ax_local = "ax" in local_inputs or "ax_curr" in local_inputs
+            has_ay_local = "ay" in local_inputs or "ay_curr" in local_inputs
+            if not (has_ax_local and has_ay_local):
+                raise ValueError("DVMS field_locals must provide both ax/ay current acceleration components.")
+        if a_curr is not None or has_curr_accel_locals:
+            ax_curr = local_values(
+                ("ax_curr", "ax"),
+                "ux",
+                lambda: _scalar_locals(dh, "ux", a_curr.components[0].nodal_values, element_maps["ux"]),
+            )
+            ay_curr = local_values(
+                ("ay_curr", "ay"),
+                "uy",
+                lambda: _scalar_locals(dh, "uy", a_curr.components[1].nodal_values, element_maps["uy"]),
+            )
         else:
             ax_curr = None
             ay_curr = None
-        p_vals = _scalar_locals(dh, "p", p_k.nodal_values, element_maps["p"])
-        mx_k = _scalar_locals(dh, "mx", d_mesh.components[0].nodal_values, element_maps["mx"])
-        my_k = _scalar_locals(dh, "my", d_mesh.components[1].nodal_values, element_maps["my"])
-        mx_prev = _scalar_locals(dh, "mx", d_prev.components[0].nodal_values, element_maps["mx"])
-        my_prev = _scalar_locals(dh, "my", d_prev.components[1].nodal_values, element_maps["my"])
+        p_vals = local_values(
+            ("p", "p_k"),
+            "p",
+            lambda: _scalar_locals(dh, "p", p_k.nodal_values, element_maps["p"]),
+        )
+        mx_k = local_values(
+            ("mx", "mx_k"),
+            "mx",
+            lambda: _scalar_locals(dh, "mx", d_mesh.components[0].nodal_values, element_maps["mx"]),
+        )
+        my_k = local_values(
+            ("my", "my_k"),
+            "my",
+            lambda: _scalar_locals(dh, "my", d_mesh.components[1].nodal_values, element_maps["my"]),
+        )
+        mx_prev = local_values(
+            ("mx_prev",),
+            "mx",
+            lambda: _scalar_locals(dh, "mx", d_prev.components[0].nodal_values, element_maps["mx"]),
+        )
+        my_prev = local_values(
+            ("my_prev",),
+            "my",
+            lambda: _scalar_locals(dh, "my", d_prev.components[1].nodal_values, element_maps["my"]),
+        )
         if mesh_v is not None:
-            mx_vel = _scalar_locals(dh, "mx", mesh_v.components[0].nodal_values, element_maps["mx"])
-            my_vel = _scalar_locals(dh, "my", mesh_v.components[1].nodal_values, element_maps["my"])
+            mx_vel = local_values(
+                ("mx_vel",),
+                "mx",
+                lambda: _scalar_locals(dh, "mx", mesh_v.components[0].nodal_values, element_maps["mx"]),
+            )
+            my_vel = local_values(
+                ("my_vel",),
+                "my",
+                lambda: _scalar_locals(dh, "my", mesh_v.components[1].nodal_values, element_maps["my"]),
+            )
         else:
             mx_vel = np.zeros_like(mx_prev)
             my_vel = np.zeros_like(my_prev)
         if mesh_v_prev is not None and mesh_a_prev is not None:
-            mx_vel_prev = _scalar_locals(dh, "mx", mesh_v_prev.components[0].nodal_values, element_maps["mx"])
-            my_vel_prev = _scalar_locals(dh, "my", mesh_v_prev.components[1].nodal_values, element_maps["my"])
-            mx_acc_prev = _scalar_locals(dh, "mx", mesh_a_prev.components[0].nodal_values, element_maps["mx"])
-            my_acc_prev = _scalar_locals(dh, "my", mesh_a_prev.components[1].nodal_values, element_maps["my"])
+            mx_vel_prev = local_values(
+                ("mx_vel_prev",),
+                "mx",
+                lambda: _scalar_locals(dh, "mx", mesh_v_prev.components[0].nodal_values, element_maps["mx"]),
+            )
+            my_vel_prev = local_values(
+                ("my_vel_prev",),
+                "my",
+                lambda: _scalar_locals(dh, "my", mesh_v_prev.components[1].nodal_values, element_maps["my"]),
+            )
+            mx_acc_prev = local_values(
+                ("mx_acc_prev",),
+                "mx",
+                lambda: _scalar_locals(dh, "mx", mesh_a_prev.components[0].nodal_values, element_maps["mx"]),
+            )
+            my_acc_prev = local_values(
+                ("my_acc_prev",),
+                "my",
+                lambda: _scalar_locals(dh, "my", mesh_a_prev.components[1].nodal_values, element_maps["my"]),
+            )
         else:
             mx_vel_prev = np.zeros_like(mx_prev)
             my_vel_prev = np.zeros_like(my_prev)
@@ -753,8 +861,16 @@ def _update_fluid_dvms_predicted_subscale(
             mx_prev2 = np.zeros_like(mx_prev)
             my_prev2 = np.zeros_like(my_prev)
         else:
-            mx_prev2 = _scalar_locals(dh, "mx", d_prev2.components[0].nodal_values, element_maps["mx"])
-            my_prev2 = _scalar_locals(dh, "my", d_prev2.components[1].nodal_values, element_maps["my"])
+            mx_prev2 = local_values(
+                ("mx_prev2",),
+                "mx",
+                lambda: _scalar_locals(dh, "mx", d_prev2.components[0].nodal_values, element_maps["mx"]),
+            )
+            my_prev2 = local_values(
+                ("my_prev2",),
+                "my",
+                lambda: _scalar_locals(dh, "my", d_prev2.components[1].nodal_values, element_maps["my"]),
+            )
 
         u_k_q = np.stack(
             [
@@ -956,6 +1072,9 @@ def _update_fluid_dvms_predicted_subscale(
         state.predicted_subscale_velocity[:, :] = predicted_full.reshape(int(state.sample_count), 2)
         state.sync_coefficient("predicted_subscale_velocity")
         return
+
+    if field_locals is not None:
+        raise NotImplementedError("DVMS field_locals are currently supported only by the fast P1 triangle path.")
 
     backend_name = _normalized_dvms_operator_backend(backend)
     compiler = _quadrature_expression_compiler(state, dh, backend=backend_name)

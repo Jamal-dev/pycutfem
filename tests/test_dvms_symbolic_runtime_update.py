@@ -22,9 +22,11 @@ from examples.NIRB.dvms.symbolics import (
     build_fluid_dvms_predictor_symbolics,
 )
 from examples.NIRB.dvms.update import (
+    _scalar_locals,
     _update_fluid_dvms_predicted_subscale,
     _update_fluid_dvms_state_from_previous_step,
 )
+from examples.NIRB.reduced_dvms import assemble_kratos_system_local_blocks_from_field_locals
 from pycutfem.operators import LocalAssemblyResult
 from pycutfem.solvers.nonlinear_solver import NewtonSolver
 from pycutfem.core.dofhandler import DofHandler
@@ -518,6 +520,85 @@ def test_dvms_predictor_zeroes_capped_nonconverged_points() -> None:
     np.testing.assert_allclose(state.predicted_subscale_velocity, 0.0, atol=0.0)
 
 
+def test_dvms_predictor_accepts_element_local_current_fluid_values() -> None:
+    mesh_ref, dh_ref, state_ref, u_k_ref, u_prev_ref, a_prev_ref, p_k_ref, d_mesh_ref, d_prev_ref = _make_dvms_problem(
+        poly_order=1,
+        pressure_order=1,
+        quadrature_order=1,
+        nx_quads=2,
+        ny_quads=1,
+    )
+    mesh_local, dh_local, state_local, u_k_local, u_prev_local, a_prev_local, p_k_local, d_mesh_local, d_prev_local = _make_dvms_problem(
+        poly_order=1,
+        pressure_order=1,
+        quadrature_order=1,
+        nx_quads=2,
+        ny_quads=1,
+    )
+    element_ids = np.array([0, 2], dtype=int)
+    ux_map = np.asarray(dh_ref.element_maps["ux"], dtype=int)[element_ids]
+    uy_map = np.asarray(dh_ref.element_maps["uy"], dtype=int)[element_ids]
+    p_map = np.asarray(dh_ref.element_maps["p"], dtype=int)[element_ids]
+    field_locals = {
+        "ux": _scalar_locals(dh_ref, "ux", u_k_ref.components[0].nodal_values, ux_map),
+        "uy": _scalar_locals(dh_ref, "uy", u_k_ref.components[1].nodal_values, uy_map),
+        "p": _scalar_locals(dh_ref, "p", p_k_ref.nodal_values, p_map),
+    }
+
+    _update_fluid_dvms_predicted_subscale(
+        state=state_ref,
+        dh=dh_ref,
+        mesh=mesh_ref,
+        u_k=u_k_ref,
+        u_prev=u_prev_ref,
+        a_prev=a_prev_ref,
+        p_k=p_k_ref,
+        d_mesh=d_mesh_ref,
+        d_prev=d_prev_ref,
+        rho_f=1.5,
+        mu_f=0.05,
+        dt=0.2,
+        bossak_alpha=-0.2,
+        dynamic_tau=1.0,
+        max_iterations=6,
+        rel_tol=1.0e-10,
+        abs_tol=1.0e-12,
+        element_ids=element_ids,
+    )
+
+    u_k_local.components[0].nodal_values[:] = 99.0
+    u_k_local.components[1].nodal_values[:] = -99.0
+    p_k_local.nodal_values[:] = 123.0
+    _update_fluid_dvms_predicted_subscale(
+        state=state_local,
+        dh=dh_local,
+        mesh=mesh_local,
+        u_k=u_k_local,
+        u_prev=u_prev_local,
+        a_prev=a_prev_local,
+        p_k=p_k_local,
+        d_mesh=d_mesh_local,
+        d_prev=d_prev_local,
+        rho_f=1.5,
+        mu_f=0.05,
+        dt=0.2,
+        bossak_alpha=-0.2,
+        dynamic_tau=1.0,
+        max_iterations=6,
+        rel_tol=1.0e-10,
+        abs_tol=1.0e-12,
+        element_ids=element_ids,
+        field_locals=field_locals,
+    )
+
+    np.testing.assert_allclose(
+        state_local._reshape_vector_quadrature(state_local.predicted_subscale_velocity)[element_ids],
+        state_ref._reshape_vector_quadrature(state_ref.predicted_subscale_velocity)[element_ids],
+        rtol=1.0e-11,
+        atol=1.0e-11,
+    )
+
+
 @pytest.mark.parametrize("backend", ["jit", "cpp"])
 def test_dvms_runtime_update_compiled_backends_match_python_p2(
     backend: str,
@@ -783,6 +864,98 @@ def test_dvms_local_system_batch_matches_single_element_on_structured_2x2(
         np.testing.assert_array_equal(gdofs_batch[idx], gdofs_elem)
         np.testing.assert_allclose(K_batch[idx], K_elem, rtol=1.0e-12, atol=1.0e-12)
         np.testing.assert_allclose(F_batch[idx], F_elem, rtol=1.0e-12, atol=1.0e-12)
+
+
+def test_array_only_reduced_dvms_system_blocks_match_symbolic_local_operator() -> None:
+    mesh_ref, dh_ref, state_ref, u_k_ref, u_prev_ref, a_prev_ref, p_k_ref, d_mesh_ref, d_prev_ref = _make_dvms_problem(
+        poly_order=1,
+        pressure_order=1,
+        quadrature_order=1,
+        nx_quads=2,
+        ny_quads=2,
+    )
+    element_ids = np.asarray([0, 3, 6], dtype=int)
+    rho_f = 1.5
+    mu_f = 0.05
+    dt = 0.2
+    bossak_alpha = -0.2
+    bossak = _bossak_coefficients(alpha=bossak_alpha, dt=dt)
+
+    def _emap(field_name: str) -> np.ndarray:
+        return np.asarray(dh_ref.element_maps[field_name], dtype=int)[element_ids]
+
+    ux = _scalar_locals(dh_ref, "ux", u_k_ref.components[0].nodal_values, _emap("ux"))
+    uy = _scalar_locals(dh_ref, "uy", u_k_ref.components[1].nodal_values, _emap("uy"))
+    ux_prev = _scalar_locals(
+        dh_ref, "ux", u_prev_ref.components[0].nodal_values, _emap("ux")
+    )
+    uy_prev = _scalar_locals(
+        dh_ref, "uy", u_prev_ref.components[1].nodal_values, _emap("uy")
+    )
+    ax_prev = _scalar_locals(
+        dh_ref, "ux", a_prev_ref.components[0].nodal_values, _emap("ux")
+    )
+    ay_prev = _scalar_locals(
+        dh_ref, "uy", a_prev_ref.components[1].nodal_values, _emap("uy")
+    )
+    field_locals = {
+        "ux": ux,
+        "uy": uy,
+        "p": _scalar_locals(dh_ref, "p", p_k_ref.nodal_values, _emap("p")),
+        "ux_prev": ux_prev,
+        "uy_prev": uy_prev,
+        "ax_prev": ax_prev,
+        "ay_prev": ay_prev,
+        "ax_curr": float(bossak["ma0"]) * (ux - ux_prev) + float(bossak["ma2"]) * ax_prev,
+        "ay_curr": float(bossak["ma0"]) * (uy - uy_prev) + float(bossak["ma2"]) * ay_prev,
+        "mx": _scalar_locals(dh_ref, "mx", d_mesh_ref.components[0].nodal_values, _emap("mx")),
+        "my": _scalar_locals(dh_ref, "my", d_mesh_ref.components[1].nodal_values, _emap("my")),
+        "mx_prev": _scalar_locals(
+            dh_ref, "mx", d_prev_ref.components[0].nodal_values, _emap("mx")
+        ),
+        "my_prev": _scalar_locals(
+            dh_ref, "my", d_prev_ref.components[1].nodal_values, _emap("my")
+        ),
+    }
+
+    K_array, raw_rhs_array, gdofs_array = assemble_kratos_system_local_blocks_from_field_locals(
+        mesh=mesh_ref,
+        dh=dh_ref,
+        state=state_ref,
+        element_ids=element_ids,
+        field_locals=field_locals,
+        rho_f=rho_f,
+        mu_f=mu_f,
+        dt=dt,
+        bossak_alpha=bossak_alpha,
+        incompressibility_stabilization_scale=1.0,
+    )
+    batch_ref = assemble_fluid_dvms_local_contribution_batch(
+        mesh=mesh_ref,
+        dh=dh_ref,
+        u_k=u_k_ref,
+        u_prev=u_prev_ref,
+        a_prev=a_prev_ref,
+        p_k=p_k_ref,
+        d_mesh=d_mesh_ref,
+        d_prev=d_prev_ref,
+        state=state_ref,
+        rho_f=rho_f,
+        mu_f=mu_f,
+        dt=dt,
+        bossak_alpha=bossak_alpha,
+        quadrature_order=1,
+        element_ids=element_ids,
+        contribution_mode="system",
+        backend="python",
+    )
+    K_ref, F_ref, gdofs_ref = _compress_batch_to_fluid_block(dh_ref, batch_ref)
+
+    np.testing.assert_array_equal(gdofs_array, gdofs_ref)
+    np.testing.assert_allclose(K_array, K_ref, rtol=1.0e-11, atol=1.0e-11)
+    # The array-only HROM kernel returns the same raw RHS sign consumed by the
+    # production sampled-LSPG path, i.e. the runtime local-operator convention.
+    np.testing.assert_allclose(raw_rhs_array, F_ref, rtol=1.0e-11, atol=1.0e-11)
 
 
 @pytest.mark.parametrize("backend", ["python", "cpp"])

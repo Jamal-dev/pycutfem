@@ -1579,13 +1579,14 @@ inline Eigen::MatrixXd binary_add(const Eigen::MatrixXd& a, const Eigen::MatrixX
 inline Eigen::MatrixXd binary_sub(const Eigen::MatrixXd& a, const Eigen::MatrixXd& b) { return a - b; }
 
 // Load variable component value: coeffs (nE,nU), basis (nE,nQ,nU)
-inline double load_variable_component(const py::detail::unchecked_reference<double, 2>& coeffs,
-                                      const py::detail::unchecked_reference<double, 3>& basis,
+template <typename CoeffsView, typename BasisView>
+inline double load_variable_component(const CoeffsView& coeffs,
+                                      const BasisView& basis,
                                       ssize_t e, ssize_t q, int s0, int s1) {
     const int n = s1 - s0;
     if (n <= 0) return 0.0;
-    const double* cptr = coeffs.data(e, s0);
-    const double* bptr = basis.data(e, q, s0);
+    const double* cptr = &coeffs(e, s0);
+    const double* bptr = &basis(e, q, s0);
 
     // Numpy tables may be non-contiguous (e.g. views/transposes used to avoid
     // large copies during setup). Respect the actual axis strides by deriving
@@ -1593,8 +1594,8 @@ inline double load_variable_component(const py::detail::unchecked_reference<doub
     ptrdiff_t cstride = 1;
     ptrdiff_t bstride = 1;
     if (n > 1) {
-        const double* cptr1 = coeffs.data(e, s0 + 1);
-        const double* bptr1 = basis.data(e, q, s0 + 1);
+        const double* cptr1 = &coeffs(e, s0 + 1);
+        const double* bptr1 = &basis(e, q, s0 + 1);
         cstride = cptr1 - cptr;
         bstride = bptr1 - bptr;
         if (cstride == 0) cstride = 1;
@@ -1609,9 +1610,10 @@ inline double load_variable_component(const py::detail::unchecked_reference<doub
 }
 
 // gradient of a component: accumulates coefficients * phys grad
+template <typename CoeffsView, typename GradientView>
 inline void gradient_component(Eigen::MatrixXd& out, int row,
-                               const py::detail::unchecked_reference<double, 2>& coeffs,
-                               const py::detail::unchecked_reference<double, 4>& gref,
+                               const CoeffsView& coeffs,
+                               const GradientView& gref,
                                const Eigen::Matrix<double, 2, 2>& Jloc,
                                ssize_t e, ssize_t q, int s0, int s1) {
     const int n = s1 - s0;
@@ -1621,16 +1623,16 @@ inline void gradient_component(Eigen::MatrixXd& out, int row,
         return;
     }
 
-    const double* cptr = coeffs.data(e, s0);
-    const double* gptr0 = gref.data(e, q, s0, 0);
-    const double* gptr1 = gref.data(e, q, s0, 1);
+    const double* cptr = &coeffs(e, s0);
+    const double* gptr0 = &gref(e, q, s0, 0);
+    const double* gptr1 = &gref(e, q, s0, 1);
 
     // Derive runtime strides to support arbitrary numpy layouts.
     ptrdiff_t cstride = 1;
     ptrdiff_t gstride = 2;  // default for contiguous (...,n,2) layout
     if (n > 1) {
-        const double* cptr1 = coeffs.data(e, s0 + 1);
-        const double* gptr0_1 = gref.data(e, q, s0 + 1, 0);
+        const double* cptr1 = &coeffs(e, s0 + 1);
+        const double* gptr0_1 = &gref(e, q, s0 + 1, 0);
         cstride = cptr1 - cptr;
         gstride = gptr0_1 - gptr0;
         if (cstride == 0) cstride = 1;

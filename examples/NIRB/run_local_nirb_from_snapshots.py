@@ -76,6 +76,11 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional solid-full to solid-interface restriction matrix. Defaults to coSimData/map_used.npy when present.",
     )
+    parser.add_argument(
+        "--no-interface-matrix",
+        action="store_true",
+        help="Do not attach an interface restriction, useful when the displacement snapshots are already interface-only.",
+    )
     return parser.parse_args()
 
 
@@ -94,7 +99,7 @@ def main() -> None:
     reference = np.asarray(batch.full_displacements, dtype=float)
     co_sim_dir = Path(batch.metadata["co_sim_dir"])
     interface_matrix_path = Path(args.interface_matrix_path) if args.interface_matrix_path is not None else None
-    if interface_matrix_path is None:
+    if interface_matrix_path is None and not bool(args.no_interface_matrix):
         candidate = co_sim_dir / "map_used.npy"
         if candidate.exists():
             interface_matrix_path = candidate

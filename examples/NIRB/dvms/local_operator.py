@@ -662,6 +662,7 @@ def _build_fluid_dvms_kratos_residualized_system_forms(
     body_force: np.ndarray | None,
     use_oss: bool,
     h_coefficient: ElementWiseConstant | None = None,
+    incompressibility_stabilization_scale: float = 1.0,
 ) -> _KratosResidualizedSystemForms:
     if u_prev is None or a_prev is None:
         raise ValueError("Kratos residualized DVMS system requires u_prev and a_prev.")
@@ -701,6 +702,7 @@ def _build_fluid_dvms_kratos_residualized_system_forms(
         old_mass_residual=coeffs["old_mass_residual"],
         body_force=None if body_force is None else np.asarray(body_force, dtype=float).reshape(2),
         use_oss=bool(use_oss),
+        incompressibility_stabilization_scale=Constant(float(incompressibility_stabilization_scale)),
     )
     nonviscous_lhs = _sum_forms(
         form for name, form in split.lhs_terms.items() if str(name) != "viscous"
@@ -1049,6 +1051,7 @@ class FluidDVMSLocalVelocityContributionOperator(LocalAssemblyOperator):
         apply_dirichlet_lift: bool = False,
         contribution_mode: str = "velocity",
         residualization: str = "kratos",
+        incompressibility_stabilization_scale: float = 1.0,
     ) -> None:
         self.mesh = mesh
         self.dh = dh
@@ -1078,6 +1081,12 @@ class FluidDVMSLocalVelocityContributionOperator(LocalAssemblyOperator):
         self.use_oss = bool(use_oss)
         self.apply_dirichlet_lift = bool(apply_dirichlet_lift)
         self.contribution_mode = _normalize_contribution_mode(contribution_mode)
+        self.incompressibility_stabilization_scale = float(incompressibility_stabilization_scale)
+        if (
+            not np.isfinite(self.incompressibility_stabilization_scale)
+            or self.incompressibility_stabilization_scale <= 0.0
+        ):
+            raise ValueError("incompressibility_stabilization_scale must be finite and positive.")
         residualization_name = str(residualization or "symbolic").strip().lower()
         if residualization_name not in {"symbolic", "kratos"}:
             raise ValueError(f"Unsupported FluidDVMS residualization mode {residualization!r}.")
@@ -1162,6 +1171,7 @@ class FluidDVMSLocalVelocityContributionOperator(LocalAssemblyOperator):
             body_force=self.body_force,
             use_oss=self.use_oss,
             h_coefficient=self.h_coefficient,
+            incompressibility_stabilization_scale=float(self.incompressibility_stabilization_scale),
         )
         self._kratos_residualized_forms_cache = cached
         return cached

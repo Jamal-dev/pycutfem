@@ -86,7 +86,9 @@ except ImportError:  # pragma: no cover - platform dependent.
 # - v77 invalidates kernels after adding a dedicated semantic basis-rank1
 #   inner-product branch so vector-valued test/trial interface terms no longer
 #   fall through to scalar-gradient/value lowering.
-CODEGEN_ABI_CPP = "2026-04-20-cpp-v77-basis-rank1-inner-fix"
+# - v78 invalidates kernels after adding the native-kernel ABI metadata capsule
+#   and generated metadata attributes needed by the MOR C++ online driver.
+CODEGEN_ABI_CPP = "2026-05-15-cpp-v78-native-kernel-metadata"
 
 
 @contextmanager

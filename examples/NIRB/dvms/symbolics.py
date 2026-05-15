@@ -593,6 +593,7 @@ def build_fluid_dvms_kratos_split_forms(
     old_mass_residual,
     body_force=None,
     use_oss: bool = False,
+    incompressibility_stabilization_scale=1.0,
 ) -> FluidDVMSKratosSplitForms:
     rho_expr = _as_expression(rho)
     mu_expr = _as_expression(mu)
@@ -602,6 +603,7 @@ def build_fluid_dvms_kratos_split_forms(
     bossak_ma2_expr = _as_expression(bossak_ma2)
     bossak_alpha_expr = _as_expression(bossak_alpha)
     body_expr = Constant(np.zeros((2,), dtype=float), dim=1) if body_force is None else _as_expression(body_force)
+    inc_scale = _as_expression(incompressibility_stabilization_scale)
     active_momentum_projection = (
         momentum_projection
         if bool(use_oss)
@@ -668,27 +670,27 @@ def build_fluid_dvms_kratos_split_forms(
         "v_grad_p_tau": kin.J * tau_one * dot(tau_test_conv, grad_dp_phys) * dx_measure,
         "v_grad_p_dt": -kin.J * tau_one * dot(rho_expr * inv_dt * v, grad_dp_phys) * dx_measure,
         "pressure_galerkin": -inner(kin.cof_F, grad(v)) * dp * dx_measure,
-        "q_div_tau": kin.J * tau_one * dot(grad_q_phys, tau_dres_static_conv_1) * dx_measure,
+        "q_div_tau": inc_scale * kin.J * tau_one * dot(grad_q_phys, tau_dres_static_conv_1) * dx_measure,
         "continuity": inner(kin.cof_F, grad(du)) * q * dx_measure,
-        "q_p_stabilization": kin.J * tau_one * dot(grad_q_phys, grad_dp_phys) * dx_measure,
-        "div_stabilization": kin.J * ((tau_two + tau_p) * div_du_phys * div_v_phys) * dx_measure,
+        "q_p_stabilization": inc_scale * kin.J * tau_one * dot(grad_q_phys, grad_dp_phys) * dx_measure,
+        "div_stabilization": inc_scale * kin.J * ((tau_two + tau_p) * div_du_phys * div_v_phys) * dx_measure,
         "viscous": inner(kin.J * dot(viscous_sigma_du, kin.Finv.T), grad(v)) * dx_measure,
     }
     rhs_terms = {
         "body_old_subscale": kin.J * dot(body_expr + old_uss_term, v) * dx_measure,
         "tau_velocity_source": kin.J * tau_one * dot(tau_test_source_v, add_velocity_source) * dx_measure,
-        "tau_q_source": kin.J * tau_one * dot(grad_q_phys, add_velocity_source) * dx_measure,
-        "mass_projection": -kin.J * ((tau_two + tau_p) * active_mass_projection * div_v_phys) * dx_measure,
-        "old_mass_residual": -kin.J * (tau_p * old_mass_residual * div_v_phys) * dx_measure,
+        "tau_q_source": inc_scale * kin.J * tau_one * dot(grad_q_phys, add_velocity_source) * dx_measure,
+        "mass_projection": -inc_scale * kin.J * ((tau_two + tau_p) * active_mass_projection * div_v_phys) * dx_measure,
+        "old_mass_residual": -inc_scale * kin.J * (tau_p * old_mass_residual * div_v_phys) * dx_measure,
         "minus_advective_current": -kin.J * rho_expr * dot(dot(kin.grad_u_phys, conv_velocity), v) * dx_measure,
         "minus_tau_advective_current": -kin.J * tau_one * dot(tau_test_source_v, tau_res_static_conv) * dx_measure,
         "minus_v_grad_p_tau_current": -kin.J * tau_one * dot(tau_test_conv, grad_p_phys) * dx_measure,
         "minus_v_grad_p_dt_current": kin.J * tau_one * dot(rho_expr * inv_dt * v, grad_p_phys) * dx_measure,
         "minus_pressure_galerkin_current": inner(kin.cof_F, grad(v)) * p_k * dx_measure,
-        "minus_q_div_tau_current": -kin.J * tau_one * dot(grad_q_phys, tau_res_static_conv) * dx_measure,
+        "minus_q_div_tau_current": -inc_scale * kin.J * tau_one * dot(grad_q_phys, tau_res_static_conv) * dx_measure,
         "minus_continuity_current": -inner(kin.cof_F, grad(u_k)) * q * dx_measure,
-        "minus_q_p_stabilization_current": -kin.J * tau_one * dot(grad_q_phys, grad_p_phys) * dx_measure,
-        "minus_div_stabilization_current": -kin.J * ((tau_two + tau_p) * kin.div_u_phys * div_v_phys) * dx_measure,
+        "minus_q_p_stabilization_current": -inc_scale * kin.J * tau_one * dot(grad_q_phys, grad_p_phys) * dx_measure,
+        "minus_div_stabilization_current": -inc_scale * kin.J * ((tau_two + tau_p) * kin.div_u_phys * div_v_phys) * dx_measure,
         "viscous": -inner(kin.J * dot(viscous_sigma, kin.Finv.T), grad(v)) * dx_measure,
     }
     forms = build_fluid_dvms_local_forms(

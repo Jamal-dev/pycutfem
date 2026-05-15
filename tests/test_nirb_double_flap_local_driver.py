@@ -32,7 +32,7 @@ from examples.NIRB.fluid_fom_operator import (
     FluidFOMOperator,
     FluidFOMParameters,
 )
-from examples.NIRB.fluid_basis import fit_fluid_pod_trial_basis
+from examples.NIRB.fluid_basis import enrich_fluid_pod_trial_basis_with_supremizers, fit_fluid_pod_trial_basis
 from examples.NIRB.fluid_gnat import (
     FluidGNATSolver,
     collect_fluid_residual_snapshots,
@@ -489,6 +489,57 @@ def test_fluid_stage_snapshots_round_trip_and_build_mixed_pod_basis(tmp_path: Pa
     assert selected.velocity_modes == 1
     assert selected.pressure_modes == 1
     assert selected.state_error <= 1.0e-12
+
+
+def test_fluid_pod_supremizer_enrichment_keeps_homogeneous_rows(tmp_path: Path) -> None:
+    geometry, _mesh_f, fluid, operator = _build_small_fluid_fom_operator(tmp_path)
+    iface_coords, _ = _boundary_field_data(operator.dh, "ux", geometry.interface_tag)
+    operator.configure_boundary_conditions(
+        iface_velocity=CoordinateLookup(
+            iface_coords,
+            np.zeros((int(iface_coords.shape[0]), 2), dtype=float),
+            dim=2,
+        ),
+        inlet_lookup=lambda x, y: 0.0,
+        apply_to_state=True,
+    )
+    base_state = pack_fluid_state(operator)
+    velocity_rows = operator.free_fluid_dofs(("ux", "uy"))
+    pressure_rows = operator.free_fluid_dofs(("p",))
+    assert velocity_rows.size >= 4
+    assert pressure_rows.size >= 3
+
+    writer = FluidStageSnapshotWriter()
+    for stage, scale in enumerate((0.0, 0.5, 1.0, 1.5)):
+        state = base_state.copy()
+        state[velocity_rows[:4]] += float(scale) * np.asarray([0.03, -0.02, 0.015, -0.01], dtype=float)
+        state[pressure_rows[:3]] += float(scale) * np.asarray([0.09, -0.04, 0.025], dtype=float)
+        write_fluid_state(operator, state)
+        writer.append_from_operator(operator, metadata={"stage": int(stage)})
+
+    snapshots = writer.to_batch()
+    basis = fit_fluid_pod_trial_basis(
+        operator,
+        snapshots,
+        velocity_modes=1,
+        pressure_modes=1,
+        center=False,
+    )
+    enriched = enrich_fluid_pod_trial_basis_with_supremizers(
+        operator,
+        basis,
+        supremizer_modes=1,
+        riesz="h1",
+        backend="python",
+    )
+
+    assert enriched.n_velocity_pod_modes == 1
+    assert enriched.n_velocity_supremizer_modes == 1
+    assert enriched.n_velocity_modes == 2
+    assert enriched.n_pressure_modes == 1
+    assert enriched.n_modes == 3
+    np.testing.assert_allclose(enriched.basis[snapshots.fixed_dofs, :], 0.0, atol=1.0e-13)
+    np.testing.assert_allclose(enriched.basis[:, -1], basis.basis[:, basis.n_velocity_modes])
 
 
 def test_fluid_gnat_sample_set_projects_sampled_operator(tmp_path: Path) -> None:

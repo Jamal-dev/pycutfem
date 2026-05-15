@@ -9,7 +9,7 @@ import os
 import sys
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Sequence
 from xml.sax.saxutils import escape as _xml_escape
@@ -30,7 +30,7 @@ from pycutfem.linalg import (
     kratos_iqnils_next_iterate_cpp,
 )
 from pycutfem.mor.interface import build_restriction_matrix
-from pycutfem.nirb.coupling import NIRBSolidPredictor
+from pycutfem.nirb.coupling import NIRBInterfaceTangentCorrector, NIRBSolidPredictor
 from pycutfem.operators import LocalAssemblyResult, RuntimeOperator
 from pycutfem.solvers.nonlinear_solver import (
     LinearSolverParameters,
@@ -80,6 +80,7 @@ from examples.NIRB.dvms import (
     _clear_fluid_dvms_oss_projections,
     _eval_scalar_with_grad,
     _eval_vector_with_grad,
+    _field_values_on_global_dofs,
     _fluid_dvms_summary,
     _kratos_dvms_current_element_size_coefficient,
     _update_fluid_dvms_oss_projections,
@@ -102,6 +103,20 @@ from examples.NIRB.example2_problem import (
     _named_constant,
     build_conforming_mesh,
 )
+from examples.NIRB.reduced_fluid import (
+    SampledFluidStateDecoder,
+    constrained_reaction_rows_from_local_blocks,
+    reduced_fluid_cpp_backend_status,
+    reduced_fluid_online_backend_status,
+    sampled_galerkin_element_contributions_from_local_blocks,
+    sampled_lspg_element_contributions_from_local_blocks,
+    sampled_lspg_rows_from_local_blocks,
+)
+from examples.NIRB.reduced_dvms import (
+    assemble_kratos_system_local_blocks_from_field_locals,
+    reduced_dvms_cpp_backend_status,
+)
+from examples.NIRB.reduced_mesh import ReducedMeshDisplacementMap
 from examples.utils.poromechanics import (
     UPlMaterial2D,
     build_kratos_quasistatic_upl_system_2d,
@@ -285,20 +300,23 @@ def _maybe_dump_exact_fluid_probe(
     fluid: dict[str, object],
     reaction_point_load_lookup: CoordinateLookup | None,
     reaction_solid_load_lookup: CoordinateLookup | None,
+    force: bool = False,
+    extra_payload: dict[str, object] | None = None,
 ) -> None:
-    flag = str(os.getenv("PYCUTFEM_EX2_DUMP_FLUID_STAGE", "0") or "0").strip().lower()
-    if flag not in {"1", "true", "yes"}:
-        return
-    target_step_raw = str(os.getenv("PYCUTFEM_EX2_DUMP_FLUID_STEP", "1") or "1").strip().lower()
-    target_iter_raw = str(os.getenv("PYCUTFEM_EX2_DUMP_FLUID_ITER", "1") or "1").strip().lower()
-    dump_all_steps = target_step_raw in {"all", "*", "any"}
-    dump_all_iters = target_iter_raw in {"all", "*", "any"}
-    target_step = 1 if dump_all_steps else int(target_step_raw)
-    target_iter = 1 if dump_all_iters else int(target_iter_raw)
-    if (not dump_all_steps and int(step) != target_step) or (
-        not dump_all_iters and int(coupling_iter) != target_iter
-    ):
-        return
+    if not bool(force):
+        flag = str(os.getenv("PYCUTFEM_EX2_DUMP_FLUID_STAGE", "0") or "0").strip().lower()
+        if flag not in {"1", "true", "yes"}:
+            return
+        target_step_raw = str(os.getenv("PYCUTFEM_EX2_DUMP_FLUID_STEP", "1") or "1").strip().lower()
+        target_iter_raw = str(os.getenv("PYCUTFEM_EX2_DUMP_FLUID_ITER", "1") or "1").strip().lower()
+        dump_all_steps = target_step_raw in {"all", "*", "any"}
+        dump_all_iters = target_iter_raw in {"all", "*", "any"}
+        target_step = 1 if dump_all_steps else int(target_step_raw)
+        target_iter = 1 if dump_all_iters else int(target_iter_raw)
+        if (not dump_all_steps and int(step) != target_step) or (
+            not dump_all_iters and int(coupling_iter) != target_iter
+        ):
+            return
 
     probe_dir = Path(output_dir) / "debug_fluid_stage"
     probe_dir.mkdir(parents=True, exist_ok=True)
@@ -383,7 +401,11 @@ def _maybe_dump_exact_fluid_probe(
     if reaction_solid_load_lookup is not None:
         payload["reaction_solid_coords"] = np.asarray(reaction_solid_load_lookup.coords, dtype=float)
         payload["reaction_solid_values"] = np.asarray(reaction_solid_load_lookup.values, dtype=float)
+    for key, value in dict(extra_payload or {}).items():
+        payload[str(key)] = np.asarray(value)
     np.savez(probe_dir / f"step{int(step):04d}_iter{int(coupling_iter):04d}_{str(stage_label)}.npz", **payload)
+    if bool(force):
+        return
     abort_stage = str(os.getenv("PYCUTFEM_EX2_DUMP_FLUID_ABORT_AFTER_STAGE", "") or "").strip()
     if abort_stage and abort_stage == str(stage_label):
         raise RuntimeError(f"Aborting after requested fluid debug probe stage {stage_label!r}.")
@@ -2410,6 +2432,51 @@ def _solve_kratos_exact_fluid_backend(
     }
 
 
+def _transfer_kratos_exact_fluid_state_to_local(
+    *,
+    fluid: dict[str, object],
+    mesh_ext: dict[str, object],
+    state: dict[str, CoordinateLookup],
+) -> tuple[CoordinateLookup, CoordinateLookup, CoordinateLookup, CoordinateLookup]:
+    mesh_lookup = state["mesh_displacement"]
+    mesh_vel_lookup = state["mesh_velocity"]
+    mesh_accel_lookup = state["mesh_acceleration"]
+    fluid_accel_lookup = state["acceleration"]
+    _transfer_vector_field(target_dh=fluid["dh"], target_vec=fluid["d_mesh"], source_lookup=mesh_lookup)
+    _transfer_vector_field(
+        target_dh=fluid["dh"],
+        target_vec=fluid["w_mesh_k"],
+        source_lookup=mesh_vel_lookup,
+    )
+    _transfer_vector_field(
+        target_dh=fluid["dh"],
+        target_vec=fluid["a_mesh_k"],
+        source_lookup=mesh_accel_lookup,
+    )
+    _transfer_vector_field(
+        target_dh=fluid["dh"],
+        target_vec=fluid["u_k"],
+        source_lookup=state["velocity"],
+    )
+    _transfer_vector_field(
+        target_dh=fluid["dh"],
+        target_vec=fluid["a_k"],
+        source_lookup=fluid_accel_lookup,
+    )
+    _transfer_scalar_field(
+        target_dh=fluid["dh"],
+        target_fun=fluid["p_k"],
+        source_lookup=state["pressure"],
+    )
+    _transfer_vector_field(target_dh=mesh_ext["dh"], target_vec=mesh_ext["m_k"], source_lookup=mesh_lookup)
+    _transfer_vector_field(
+        target_dh=mesh_ext["dh"],
+        target_vec=mesh_ext["m_prev_geom"],
+        source_lookup=mesh_lookup,
+    )
+    return mesh_lookup, mesh_vel_lookup, mesh_accel_lookup, fluid_accel_lookup
+
+
 def _advance_kratos_mesh_motion_backend_step(
     *,
     backend: dict[str, object],
@@ -4263,18 +4330,22 @@ def _attach_runtime_operator_post_update_hook(
     *,
     solver: NewtonSolver,
     operators: Sequence[RuntimeOperator],
+    extra_callbacks: Sequence[Callable[..., None]] = (),
 ) -> None:
     callbacks = []
     for operator in tuple(operators or ()):
         callback = getattr(operator, "after_nonlinear_update", None)
         if callable(callback):
             callbacks.append(callback)
-    if not callbacks:
+    extra = [callback for callback in tuple(extra_callbacks or ()) if callable(callback)]
+    if not callbacks and not extra:
         solver.post_cb = None
         return
 
     def _callback(functions) -> None:
         for callback in callbacks:
+            callback(solver=solver, functions=functions)
+        for callback in extra:
             callback(solver=solver, functions=functions)
 
     solver.post_cb = _callback
@@ -4892,6 +4963,7 @@ def _assemble_fluid_sampled_lspg_element_contributions_raw(
     element_ids: np.ndarray,
     row_dofs: np.ndarray,
     basis: np.ndarray,
+    incompressibility_stabilization_scale: float = 1.0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Assemble sampled residual/Jacobian contributions before cubature summation.
 
@@ -4933,6 +5005,7 @@ def _assemble_fluid_sampled_lspg_element_contributions_raw(
         contribution_mode=str(contribution_mode),
         apply_dirichlet_lift=False,
         residualization="kratos",
+        incompressibility_stabilization_scale=float(incompressibility_stabilization_scale),
     )
     solver_stub = NewtonSolver.__new__(NewtonSolver)
     solver_stub.backend = str(backend)
@@ -4948,25 +5021,80 @@ def _assemble_fluid_sampled_lspg_element_contributions_raw(
     if int(K_elem.shape[0]) != int(element_ids_arr.size):
         raise RuntimeError("Sampled LSPG local assembly element count does not match element_ids.")
 
-    row_positions = np.full(int(dh.total_dofs), -1, dtype=int)
-    row_positions[rows] = np.arange(int(rows.size), dtype=int)
-    local_row_positions = row_positions[gdofs_map]
-    selected = local_row_positions >= 0
-    elem_idx, local_i = np.nonzero(selected)
-    residual_by_element = np.zeros((int(element_ids_arr.size), int(rows.size)), dtype=float)
-    trial_by_element = np.zeros(
-        (int(element_ids_arr.size), int(rows.size), int(trial_basis.shape[1])),
-        dtype=float,
+    residual_by_element, trial_by_element = sampled_lspg_element_contributions_from_local_blocks(
+        K_elem=K_elem,
+        raw_rhs_elem=F_elem,
+        gdofs_map=gdofs_map,
+        row_dofs=rows,
+        trial_basis=trial_basis,
     )
-    if elem_idx.size:
-        sample_idx = local_row_positions[elem_idx, local_i]
-        np.add.at(residual_by_element, (elem_idx, sample_idx), F_elem[elem_idx, local_i])
-        local_basis = trial_basis[gdofs_map[elem_idx], :]
-        local_k_rows = K_elem[elem_idx, local_i, :]
-        trial_contrib = np.einsum("sl,slm->sm", local_k_rows, local_basis, optimize=True)
-        for source_idx, row_idx, contrib in zip(elem_idx, sample_idx, trial_contrib, strict=False):
-            trial_by_element[int(source_idx), int(row_idx), :] += contrib
-    return element_ids_arr.copy(), -residual_by_element, trial_by_element
+    return element_ids_arr.copy(), residual_by_element, trial_by_element
+
+
+def _fluid_hrom_complete_element_field_locals(
+    *,
+    prob: dict[str, object],
+    element_ids: np.ndarray,
+    field_locals: dict[str, np.ndarray] | None,
+) -> dict[str, np.ndarray] | None:
+    if field_locals is None:
+        return None
+    dh: DofHandler = prob["dh"]
+    eids = np.asarray(element_ids, dtype=int).reshape(-1)
+    out = {str(key): np.asarray(value, dtype=float) for key, value in dict(field_locals).items()}
+
+    def put_scalar(name: str, field_name: str, values: np.ndarray | None) -> None:
+        if name in out or values is None:
+            return
+        elem_map = np.asarray(dh.element_maps[str(field_name)], dtype=int)[eids]
+        scattered = _field_values_on_global_dofs(dh, str(field_name), np.asarray(values, dtype=float))
+        out[name] = np.asarray(scattered[elem_map], dtype=float)
+
+    u_prev = prob.get("u_prev")
+    a_prev = prob.get("a_prev")
+    a_curr = prob.get("a_k")
+    p_k = prob.get("p_k")
+    d_mesh = prob.get("d_mesh")
+    d_prev = prob.get("d_prev")
+    d_prev2 = prob.get("d_prev2")
+    mesh_v = prob.get("w_mesh_k")
+    mesh_v_prev = prob.get("w_mesh_prev")
+    mesh_a_prev = prob.get("a_mesh_prev")
+
+    u_k = prob.get("u_k")
+    if u_k is not None:
+        put_scalar("ux", u_k.components[0].field_name, u_k.components[0].nodal_values)
+        put_scalar("uy", u_k.components[1].field_name, u_k.components[1].nodal_values)
+    if p_k is not None:
+        put_scalar("p", p_k.field_name, p_k.nodal_values)
+    if u_prev is not None:
+        put_scalar("ux_prev", u_prev.components[0].field_name, u_prev.components[0].nodal_values)
+        put_scalar("uy_prev", u_prev.components[1].field_name, u_prev.components[1].nodal_values)
+    if a_prev is not None:
+        put_scalar("ax_prev", a_prev.components[0].field_name, a_prev.components[0].nodal_values)
+        put_scalar("ay_prev", a_prev.components[1].field_name, a_prev.components[1].nodal_values)
+    if a_curr is not None:
+        put_scalar("ax_curr", a_curr.components[0].field_name, a_curr.components[0].nodal_values)
+        put_scalar("ay_curr", a_curr.components[1].field_name, a_curr.components[1].nodal_values)
+    if d_mesh is not None:
+        put_scalar("mx", d_mesh.components[0].field_name, d_mesh.components[0].nodal_values)
+        put_scalar("my", d_mesh.components[1].field_name, d_mesh.components[1].nodal_values)
+    if d_prev is not None:
+        put_scalar("mx_prev", d_prev.components[0].field_name, d_prev.components[0].nodal_values)
+        put_scalar("my_prev", d_prev.components[1].field_name, d_prev.components[1].nodal_values)
+    if d_prev2 is not None:
+        put_scalar("mx_prev2", d_prev2.components[0].field_name, d_prev2.components[0].nodal_values)
+        put_scalar("my_prev2", d_prev2.components[1].field_name, d_prev2.components[1].nodal_values)
+    if mesh_v is not None:
+        put_scalar("mx_vel", mesh_v.components[0].field_name, mesh_v.components[0].nodal_values)
+        put_scalar("my_vel", mesh_v.components[1].field_name, mesh_v.components[1].nodal_values)
+    if mesh_v_prev is not None:
+        put_scalar("mx_vel_prev", mesh_v_prev.components[0].field_name, mesh_v_prev.components[0].nodal_values)
+        put_scalar("my_vel_prev", mesh_v_prev.components[1].field_name, mesh_v_prev.components[1].nodal_values)
+    if mesh_a_prev is not None:
+        put_scalar("mx_acc_prev", mesh_a_prev.components[0].field_name, mesh_a_prev.components[0].nodal_values)
+        put_scalar("my_acc_prev", mesh_a_prev.components[1].field_name, mesh_a_prev.components[1].nodal_values)
+    return out
 
 
 def _assemble_fluid_sampled_lspg_rows_raw(
@@ -4983,6 +5111,8 @@ def _assemble_fluid_sampled_lspg_rows_raw(
     row_dofs: np.ndarray,
     basis: np.ndarray,
     element_weights: np.ndarray | None = None,
+    incompressibility_stabilization_scale: float = 1.0,
+    field_locals: dict[str, np.ndarray] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     dh: DofHandler = prob["dh"]
     rows = np.asarray(row_dofs, dtype=int).reshape(-1)
@@ -5001,6 +5131,10 @@ def _assemble_fluid_sampled_lspg_rows_raw(
             raise ValueError("Sampled LSPG element_weights must be finite and nonnegative.")
     raw_residualization = str(os.getenv("PYCUTFEM_EX2_DVMS_RESIDUALIZATION", "kratos") or "kratos").strip().lower()
     if str(contribution_mode).strip().lower() != "system" or raw_residualization != "kratos":
+        if abs(float(incompressibility_stabilization_scale) - 1.0) > 1.0e-14:
+            raise RuntimeError(
+                "ROM/HROM incompressibility scaling requires the local kratos/system sampled-LSPG assembly path."
+            )
         if element_weights_arr is not None and not np.allclose(element_weights_arr, 1.0):
             raise RuntimeError(
                 "Element-level cubature requires the local kratos/system sampled-LSPG assembly path."
@@ -5023,6 +5157,33 @@ def _assemble_fluid_sampled_lspg_rows_raw(
         sampled_residual = -np.asarray(raw_rhs, dtype=float).reshape(-1)[rows]
         sampled_trial = np.asarray(matrix.tocsr()[rows, :] @ trial_basis, dtype=float)
         return sampled_residual, sampled_trial
+
+    completed_field_locals = _fluid_hrom_complete_element_field_locals(
+        prob=prob,
+        element_ids=element_ids_arr,
+        field_locals=field_locals,
+    )
+    if completed_field_locals is not None:
+        K_elem, F_elem, gdofs_map = assemble_kratos_system_local_blocks_from_field_locals(
+            mesh=dh.mixed_element.mesh,
+            dh=dh,
+            state=prob["dvms_state"],
+            element_ids=element_ids_arr,
+            field_locals=completed_field_locals,
+            rho_f=float(rho_f),
+            mu_f=float(mu_f),
+            dt=float(dt),
+            bossak_alpha=float(bossak_alpha),
+            incompressibility_stabilization_scale=float(incompressibility_stabilization_scale),
+        )
+        return sampled_lspg_rows_from_local_blocks(
+            K_elem=K_elem,
+            raw_rhs_elem=F_elem,
+            gdofs_map=gdofs_map,
+            row_dofs=rows,
+            trial_basis=trial_basis,
+            element_weights=element_weights_arr,
+        )
 
     mesh: Mesh = dh.mixed_element.mesh
     op = FluidDVMSLocalVelocityContributionOperator(
@@ -5049,6 +5210,7 @@ def _assemble_fluid_sampled_lspg_rows_raw(
         contribution_mode=str(contribution_mode),
         apply_dirichlet_lift=False,
         residualization="kratos",
+        incompressibility_stabilization_scale=float(incompressibility_stabilization_scale),
     )
     solver_stub = NewtonSolver.__new__(NewtonSolver)
     solver_stub.backend = str(backend)
@@ -5061,25 +5223,218 @@ def _assemble_fluid_sampled_lspg_rows_raw(
     gdofs_map = np.asarray(local.gdofs_map, dtype=int)
     if K_elem.ndim != 3 or F_elem.ndim != 2 or gdofs_map.ndim != 2:
         raise RuntimeError("Sampled LSPG local assembly returned invalid local block shapes.")
+    return sampled_lspg_rows_from_local_blocks(
+        K_elem=K_elem,
+        raw_rhs_elem=F_elem,
+        gdofs_map=gdofs_map,
+        row_dofs=rows,
+        trial_basis=trial_basis,
+        element_weights=element_weights_arr,
+    )
+
+
+def _assemble_fluid_sampled_galerkin_element_contributions_raw(
+    *,
+    prob: dict[str, object],
+    rho_f: float,
+    mu_f: float,
+    dt: float,
+    quad_order: int,
+    bossak_alpha: float,
+    contribution_mode: str,
+    backend: str,
+    element_ids: np.ndarray,
+    basis: np.ndarray,
+    incompressibility_stabilization_scale: float = 1.0,
+    field_locals: dict[str, np.ndarray] | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Assemble element contributions to the reduced Galerkin fluid operator."""
+
+    dh: DofHandler = prob["dh"]
+    mesh: Mesh = dh.mixed_element.mesh
+    trial_basis = np.asarray(basis, dtype=float)
+    if trial_basis.ndim != 2 or int(trial_basis.shape[0]) != int(dh.total_dofs):
+        raise ValueError("Sampled Galerkin basis shape is incompatible with the fluid dof handler.")
+    element_ids_arr = np.asarray(element_ids, dtype=int).reshape(-1)
+    raw_residualization = str(os.getenv("PYCUTFEM_EX2_DVMS_RESIDUALIZATION", "kratos") or "kratos").strip().lower()
+    if str(contribution_mode).strip().lower() != "system" or raw_residualization != "kratos":
+        raise RuntimeError("Element-level Galerkin contributions require the local kratos/system assembly path.")
+
+    completed_field_locals = _fluid_hrom_complete_element_field_locals(
+        prob=prob,
+        element_ids=element_ids_arr,
+        field_locals=field_locals,
+    )
+    if completed_field_locals is not None:
+        K_elem, raw_rhs_elem, gdofs_map = assemble_kratos_system_local_blocks_from_field_locals(
+            mesh=mesh,
+            dh=dh,
+            state=prob["dvms_state"],
+            element_ids=element_ids_arr,
+            field_locals=completed_field_locals,
+            rho_f=float(rho_f),
+            mu_f=float(mu_f),
+            dt=float(dt),
+            bossak_alpha=float(bossak_alpha),
+            incompressibility_stabilization_scale=float(incompressibility_stabilization_scale),
+        )
+        reduced_residual_by_element, reduced_tangent_by_element = (
+            sampled_galerkin_element_contributions_from_local_blocks(
+                K_elem=K_elem,
+                residual_elem=-np.asarray(raw_rhs_elem, dtype=float),
+                gdofs_map=gdofs_map,
+                trial_basis=trial_basis,
+            )
+        )
+        return element_ids_arr.copy(), reduced_residual_by_element, reduced_tangent_by_element
+
+    op = FluidDVMSLocalVelocityContributionOperator(
+        mesh=mesh,
+        dh=dh,
+        u_k=prob["u_k"],
+        u_prev=prob.get("u_prev"),
+        a_prev=prob.get("a_prev"),
+        a_curr=prob.get("a_k"),
+        p_k=prob["p_k"],
+        d_mesh=prob["d_mesh"],
+        d_prev=prob["d_prev"],
+        d_prev2=prob.get("d_prev2"),
+        mesh_v=prob.get("w_mesh_k"),
+        mesh_v_prev=prob.get("w_mesh_prev"),
+        mesh_a_prev=prob.get("a_mesh_prev"),
+        state=prob.get("dvms_state"),
+        rho_f=float(rho_f),
+        mu_f=float(mu_f),
+        dt=float(dt),
+        bossak_alpha=float(bossak_alpha),
+        element_ids=element_ids_arr,
+        quadrature_order=int(quad_order),
+        contribution_mode=str(contribution_mode),
+        apply_dirichlet_lift=False,
+        residualization="kratos",
+        incompressibility_stabilization_scale=float(incompressibility_stabilization_scale),
+    )
+    solver_stub = NewtonSolver.__new__(NewtonSolver)
+    solver_stub.backend = str(backend)
+    workset = op.build_local_workset(solver=solver_stub, coeffs=None, need_matrix=True)
+    local = op.assemble_local(workset)
+    if local.K_elem is None or local.F_elem is None:
+        raise RuntimeError("Sampled Galerkin local assembly did not return both K and residual.")
+    K_elem = np.asarray(local.K_elem, dtype=float)
+    residual_elem = np.asarray(local.F_elem, dtype=float)
+    gdofs_map = np.asarray(local.gdofs_map, dtype=int)
+    if K_elem.ndim != 3 or residual_elem.ndim != 2 or gdofs_map.ndim != 2:
+        raise RuntimeError("Sampled Galerkin local assembly returned invalid local block shapes.")
+    if int(K_elem.shape[0]) != int(element_ids_arr.size):
+        raise RuntimeError("Sampled Galerkin local assembly element count does not match element_ids.")
+
+    reduced_residual_by_element, reduced_tangent_by_element = (
+        sampled_galerkin_element_contributions_from_local_blocks(
+            K_elem=K_elem,
+            residual_elem=residual_elem,
+            gdofs_map=gdofs_map,
+            trial_basis=trial_basis,
+        )
+    )
+    return element_ids_arr.copy(), reduced_residual_by_element, reduced_tangent_by_element
+
+
+def _assemble_fluid_sampled_galerkin_reduced_system_raw(
+    *,
+    prob: dict[str, object],
+    rho_f: float,
+    mu_f: float,
+    dt: float,
+    quad_order: int,
+    bossak_alpha: float,
+    contribution_mode: str,
+    backend: str,
+    element_ids: np.ndarray,
+    basis: np.ndarray,
+    element_weights: np.ndarray | None = None,
+    incompressibility_stabilization_scale: float = 1.0,
+    field_locals: dict[str, np.ndarray] | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Assemble a hyper-reduced Galerkin coefficient residual/tangent.
+
+    This is the reduced-operator counterpart of the sampled-LSPG row assembly.
+    Instead of minimizing selected full residual rows, it sums element
+    contributions to the reduced mixed system
+
+        V^T R(U_D + V y) = 0,     V^T J(U_D + V y) V.
+
+    That is the coefficient-level ALE-DVMS operator needed for the stabilized
+    VMS-ROM path; empirical cubature can then act on complete element
+    contributions without changing the reduced equations being solved.
+    """
+
+    dh: DofHandler = prob["dh"]
+    mesh: Mesh = dh.mixed_element.mesh
+    trial_basis = np.asarray(basis, dtype=float)
+    if trial_basis.ndim != 2 or int(trial_basis.shape[0]) != int(dh.total_dofs):
+        raise ValueError("Sampled Galerkin basis shape is incompatible with the fluid dof handler.")
+    element_ids_arr = np.asarray(element_ids, dtype=int).reshape(-1)
+    element_weights_arr: np.ndarray | None = None
+    if element_weights is not None:
+        element_weights_arr = np.asarray(element_weights, dtype=float).reshape(-1)
+        if int(element_weights_arr.size) != int(element_ids_arr.size):
+            raise ValueError("Sampled Galerkin element_weights size must match element_ids.")
+        if np.any(element_weights_arr < 0.0) or not np.all(np.isfinite(element_weights_arr)):
+            raise ValueError("Sampled Galerkin element_weights must be finite and nonnegative.")
+
+    raw_residualization = str(os.getenv("PYCUTFEM_EX2_DVMS_RESIDUALIZATION", "kratos") or "kratos").strip().lower()
+    if str(contribution_mode).strip().lower() != "system" or raw_residualization != "kratos":
+        if abs(float(incompressibility_stabilization_scale) - 1.0) > 1.0e-14:
+            raise RuntimeError(
+                "ROM/HROM incompressibility scaling requires the local kratos/system Galerkin assembly path."
+            )
+        if element_weights_arr is not None and not np.allclose(element_weights_arr, 1.0):
+            raise RuntimeError(
+                "Element-level Galerkin cubature requires the local kratos/system assembly path."
+            )
+        matrix, raw_rhs = _assemble_fluid_local_velocity_contribution_raw(
+            prob=prob,
+            rho_f=float(rho_f),
+            mu_f=float(mu_f),
+            dt=float(dt),
+            quad_order=int(quad_order),
+            bossak_alpha=float(bossak_alpha),
+            need_matrix=True,
+            contribution_mode=str(contribution_mode),
+            apply_dirichlet_lift=False,
+            backend=str(backend),
+            element_ids=element_ids_arr,
+        )
+        if matrix is None:
+            raise RuntimeError("Sampled Galerkin HROM requires a reduced tangent matrix.")
+        reduced_residual = np.asarray(trial_basis.T @ (-np.asarray(raw_rhs, dtype=float).reshape(-1)), dtype=float)
+        reduced_tangent = np.asarray(trial_basis.T @ (matrix.tocsr() @ trial_basis), dtype=float)
+        return reduced_residual.reshape(-1), reduced_tangent
+
+    _ids, reduced_residual_by_element, reduced_tangent_by_element = (
+        _assemble_fluid_sampled_galerkin_element_contributions_raw(
+            prob=prob,
+            rho_f=float(rho_f),
+            mu_f=float(mu_f),
+            dt=float(dt),
+            quad_order=int(quad_order),
+            bossak_alpha=float(bossak_alpha),
+            contribution_mode=str(contribution_mode),
+            backend=str(backend),
+            element_ids=element_ids_arr,
+            basis=trial_basis,
+            incompressibility_stabilization_scale=float(incompressibility_stabilization_scale),
+            field_locals=field_locals,
+        )
+    )
     if element_weights_arr is not None:
         scale = element_weights_arr.reshape(-1)
-        K_elem = K_elem * scale[:, None, None]
-        F_elem = F_elem * scale[:, None]
-    row_positions = np.full(int(dh.total_dofs), -1, dtype=int)
-    row_positions[rows] = np.arange(int(rows.size), dtype=int)
-    local_row_positions = row_positions[gdofs_map]
-    selected = local_row_positions >= 0
-    elem_idx, local_i = np.nonzero(selected)
-    sampled_raw_rhs = np.zeros(int(rows.size), dtype=float)
-    sampled_trial = np.zeros((int(rows.size), int(trial_basis.shape[1])), dtype=float)
-    if elem_idx.size:
-        sample_idx = local_row_positions[elem_idx, local_i]
-        np.add.at(sampled_raw_rhs, sample_idx, F_elem[elem_idx, local_i])
-        local_basis = trial_basis[gdofs_map[elem_idx], :]
-        local_k_rows = K_elem[elem_idx, local_i, :]
-        trial_contrib = np.einsum("sl,slm->sm", local_k_rows, local_basis, optimize=True)
-        np.add.at(sampled_trial, sample_idx, trial_contrib)
-    return -sampled_raw_rhs, sampled_trial
+        reduced_residual_by_element = reduced_residual_by_element * scale[:, None]
+        reduced_tangent_by_element = reduced_tangent_by_element * scale[:, None, None]
+    return (
+        np.sum(reduced_residual_by_element, axis=0).reshape(-1),
+        np.sum(reduced_tangent_by_element, axis=0),
+    )
 
 
 def _refresh_fluid_reaction_reconstruction_state(
@@ -5175,6 +5530,24 @@ def _fluid_interface_reaction_element_ids(
     out = np.flatnonzero(mask).astype(int, copy=False)
     cache[key] = out
     return out
+
+
+def _fluid_reaction_element_ids_for_velocity_rows(
+    prob: dict[str, object],
+    *,
+    row_dofs: np.ndarray,
+) -> np.ndarray:
+    """Elements whose local velocity rows touch the requested global rows."""
+
+    dh: DofHandler = prob["dh"]
+    u_k: VectorFunction = prob["u_k"]
+    rows = np.asarray(row_dofs, dtype=int).reshape(-1)
+    if rows.size == 0:
+        return np.zeros((0,), dtype=int)
+    ux_map = np.asarray(dh.element_maps[u_k.components[0].field_name], dtype=int)
+    uy_map = np.asarray(dh.element_maps[u_k.components[1].field_name], dtype=int)
+    mask = np.isin(ux_map, rows).any(axis=1) | np.isin(uy_map, rows).any(axis=1)
+    return np.flatnonzero(mask).astype(int, copy=False)
 
 
 def _cached_fluid_reaction_operator(
@@ -5308,17 +5681,14 @@ def _can_use_cached_fluid_reaction_operator(prob: dict[str, object]) -> bool:
     return all(key in prob for key in ("p_k", "d_mesh", "d_prev"))
 
 
-def _fluid_interface_constrained_reaction_vector(
+def _fluid_interface_constrained_velocity_rows(
     *,
     prob: dict[str, object],
-    system_rhs: np.ndarray,
     interface_tag: str,
 ) -> np.ndarray:
-    rhs = np.asarray(system_rhs, dtype=float).reshape(-1)
-    reaction = np.zeros_like(rhs)
     interface_rows = _fluid_interface_velocity_dofs(prob, interface_tag=interface_tag)
     if interface_rows.size == 0:
-        return reaction
+        return interface_rows
 
     dh: DofHandler = prob["dh"]
     bcs_apply = prob.get("_current_bcs_homog")
@@ -5329,14 +5699,24 @@ def _fluid_interface_constrained_reaction_vector(
     if not bcs_apply:
         bcs_apply = prob.get("bcs")
     if _env_bool("PYCUTFEM_EX2_REACTION_ASSUME_INTERFACE_CONSTRAINED", True) and not bcs_apply:
-        reaction[interface_rows] = -rhs[interface_rows]
-        return reaction
+        return interface_rows
+
     bc_map = dh.get_dirichlet_data(bcs_apply) or {}
     if bc_map:
         bc_rows = np.fromiter((int(gdof) for gdof in bc_map.keys()), dtype=int)
-        constrained_rows = np.intersect1d(interface_rows, bc_rows, assume_unique=False)
-    else:
-        constrained_rows = interface_rows
+        return np.intersect1d(interface_rows, bc_rows, assume_unique=False)
+    return interface_rows
+
+
+def _fluid_interface_constrained_reaction_vector(
+    *,
+    prob: dict[str, object],
+    system_rhs: np.ndarray,
+    interface_tag: str,
+) -> np.ndarray:
+    rhs = np.asarray(system_rhs, dtype=float).reshape(-1)
+    reaction = np.zeros_like(rhs)
+    constrained_rows = _fluid_interface_constrained_velocity_rows(prob=prob, interface_tag=interface_tag)
     if constrained_rows.size == 0:
         return reaction
 
@@ -5345,6 +5725,131 @@ def _fluid_interface_constrained_reaction_vector(
     # reaction = -b for the final linearized system RHS.
     reaction[constrained_rows] = -rhs[constrained_rows]
     return reaction
+
+
+def _fluid_interface_reaction_loads_local_rows(
+    *,
+    prob: dict[str, object],
+    rho_f: float,
+    mu_f: float,
+    dt: float,
+    quad_order: int,
+    bossak_alpha: float = -0.3,
+    interface_tag: str,
+    backend: str = "python",
+    contribution_mode: str = "system",
+) -> CoordinateLookup:
+    """Compute constrained interface reaction without a full residual scatter."""
+
+    if not _can_use_cached_fluid_reaction_operator(prob):
+        return _fluid_interface_reaction_loads(
+            prob=prob,
+            rho_f=float(rho_f),
+            mu_f=float(mu_f),
+            dt=float(dt),
+            quad_order=int(quad_order),
+            bossak_alpha=float(bossak_alpha),
+            interface_tag=interface_tag,
+            backend=str(backend),
+            contribution_mode=str(contribution_mode),
+            refresh_state=False,
+        )
+
+    dh: DofHandler = prob["dh"]
+    element_ids = _fluid_interface_reaction_element_ids(prob, interface_tag=interface_tag)
+    op = _cached_fluid_reaction_operator(
+        prob=prob,
+        rho_f=float(rho_f),
+        mu_f=float(mu_f),
+        dt=float(dt),
+        quad_order=int(quad_order),
+        bossak_alpha=float(bossak_alpha),
+        contribution_mode=str(contribution_mode),
+        element_ids=element_ids,
+    )
+    solver_stub = NewtonSolver.__new__(NewtonSolver)
+    solver_stub.backend = str(backend)
+    workset = op.build_local_workset(solver=solver_stub, coeffs=None, need_matrix=False)
+    local = op.assemble_local(workset)
+    if local.F_elem is None:
+        raise RuntimeError("Local interface reaction assembly did not return element RHS blocks.")
+
+    constrained_rows = _fluid_interface_constrained_velocity_rows(prob=prob, interface_tag=interface_tag)
+    # Local operators expose Newton residual sign. Interface reaction uses
+    # the raw Kratos RHS convention, then reaction = -rhs on constrained rows.
+    reaction_rows, reaction_values = constrained_reaction_rows_from_local_blocks(
+        raw_rhs_elem=-np.asarray(local.F_elem, dtype=float),
+        gdofs_map=np.asarray(local.gdofs_map, dtype=int),
+        constrained_row_dofs=np.asarray(constrained_rows, dtype=int),
+    )
+    row_to_value = {
+        int(row): float(value)
+        for row, value in zip(np.asarray(reaction_rows, dtype=int), np.asarray(reaction_values, dtype=float))
+    }
+
+    coords_x, gdofs_x = _boundary_field_data(dh, prob["u_k"].components[0].field_name, interface_tag)
+    coords_y, gdofs_y = _boundary_field_data(dh, prob["u_k"].components[1].field_name, interface_tag)
+    if coords_x.shape != coords_y.shape:
+        raise RuntimeError(f"Mismatched boundary DOF counts for tag {interface_tag!r}: {coords_x.shape} vs {coords_y.shape}")
+    if coords_x.size and not np.allclose(coords_x, coords_y):
+        raise RuntimeError(f"Mismatched vector boundary coordinate ordering for tag {interface_tag!r}")
+    values = np.zeros((int(coords_x.shape[0]), 2), dtype=float)
+    for idx, gdof in enumerate(np.asarray(gdofs_x, dtype=int).reshape(-1)):
+        values[idx, 0] = float(row_to_value.get(int(gdof), 0.0))
+    for idx, gdof in enumerate(np.asarray(gdofs_y, dtype=int).reshape(-1)):
+        values[idx, 1] = float(row_to_value.get(int(gdof), 0.0))
+    return CoordinateLookup(coords_x, values, dim=2)
+
+
+def _fluid_interface_reaction_sample_row_values(
+    *,
+    prob: dict[str, object],
+    rho_f: float,
+    mu_f: float,
+    dt: float,
+    quad_order: int,
+    bossak_alpha: float,
+    interface_tag: str,
+    backend: str,
+    row_dofs: np.ndarray,
+    element_ids: np.ndarray,
+    contribution_mode: str = "system",
+) -> tuple[np.ndarray, np.ndarray]:
+    """Assemble nonlinear constrained reaction values only on selected interface rows."""
+
+    rows = np.asarray(row_dofs, dtype=int).reshape(-1)
+    elements = np.asarray(element_ids, dtype=int).reshape(-1)
+    if rows.size == 0:
+        return rows.astype(int, copy=False), np.zeros(0, dtype=float)
+    if np.unique(rows).size != rows.size:
+        raise RuntimeError("Sampled interface reaction rows must be unique.")
+    constrained_rows = _fluid_interface_constrained_velocity_rows(prob=prob, interface_tag=interface_tag)
+    if constrained_rows.size and not np.all(np.isin(rows, constrained_rows)):
+        raise RuntimeError("Sampled interface reaction rows must be constrained interface velocity rows.")
+    if elements.size == 0:
+        return rows.astype(int, copy=False), np.zeros(int(rows.size), dtype=float)
+
+    op = _cached_fluid_reaction_operator(
+        prob=prob,
+        rho_f=float(rho_f),
+        mu_f=float(mu_f),
+        dt=float(dt),
+        quad_order=int(quad_order),
+        bossak_alpha=float(bossak_alpha),
+        contribution_mode=str(contribution_mode),
+        element_ids=elements,
+    )
+    solver_stub = NewtonSolver.__new__(NewtonSolver)
+    solver_stub.backend = str(backend)
+    workset = op.build_local_workset(solver=solver_stub, coeffs=None, need_matrix=False)
+    local = op.assemble_local(workset)
+    if local.F_elem is None:
+        raise RuntimeError("Sampled interface reaction assembly did not return element RHS blocks.")
+    return constrained_reaction_rows_from_local_blocks(
+        raw_rhs_elem=-np.asarray(local.F_elem, dtype=float),
+        gdofs_map=np.asarray(local.gdofs_map, dtype=int),
+        constrained_row_dofs=rows,
+    )
 
 
 def _fluid_interface_reaction_loads(
@@ -5585,6 +6090,73 @@ def _interface_disp_velocity_from_values(
     else:
         vel_vals[:, :] = (disp_curr_arr - disp_prev_arr) / max(float(dt), 1.0e-14)
     return CoordinateLookup(iface_coords_arr, disp_curr_arr, dim=2), CoordinateLookup(iface_coords_arr, vel_vals, dim=2)
+
+
+def _apply_nirb_interface_tangent_correction(
+    *,
+    prediction,
+    corrector: NIRBInterfaceTangentCorrector,
+    blend: float,
+    max_rel: float,
+    map_used: np.ndarray,
+    previous_load_values: np.ndarray,
+    current_load_values: np.ndarray,
+    previous_interface_values: np.ndarray,
+    previous_full_displacement: np.ndarray | None,
+) -> tuple[object, dict[str, float | bool]]:
+    blend_value = min(1.0, max(0.0, float(blend)))
+    if blend_value <= 0.0:
+        return prediction, {"used": False, "rel": float("nan"), "blend": 0.0}
+    load_delta = (
+        np.asarray(current_load_values, dtype=float).reshape(-1)
+        - np.asarray(previous_load_values, dtype=float).reshape(-1)
+    )
+    raw_interface = np.asarray(prediction.interface_displacement, dtype=float).reshape(-1)
+    tangent_interface_delta = corrector.interface_increment(load_delta)
+    tangent_full_delta = corrector.full_increment(load_delta)
+    tangent_full: np.ndarray | None = None
+    if tangent_full_delta is not None and previous_full_displacement is not None:
+        tangent_full = np.asarray(previous_full_displacement, dtype=float).reshape(-1) + np.asarray(
+            tangent_full_delta,
+            dtype=float,
+        ).reshape(-1)
+        tangent_interface = np.asarray(map_used, dtype=float) @ tangent_full
+    elif tangent_interface_delta is not None:
+        tangent_interface = np.asarray(previous_interface_values, dtype=float).reshape(-1) + np.asarray(
+            tangent_interface_delta,
+            dtype=float,
+        ).reshape(-1)
+    else:
+        return prediction, {"used": False, "rel": float("nan"), "blend": 0.0}
+    if tangent_interface.size != raw_interface.size:
+        raise RuntimeError(
+            "NIRB tangent interface correction dimension mismatch: "
+            f"{tangent_interface.size} != {raw_interface.size}"
+        )
+    corrected_interface = (1.0 - blend_value) * raw_interface + blend_value * tangent_interface
+    denom = max(float(np.linalg.norm(raw_interface)), 1.0e-14)
+    rel = float(np.linalg.norm(corrected_interface - raw_interface) / denom)
+    if np.isfinite(float(max_rel)) and rel > float(max_rel):
+        return prediction, {"used": False, "rel": rel, "blend": blend_value}
+    if tangent_full is not None:
+        raw_full = (
+            np.asarray(prediction.full_displacement, dtype=float).reshape(-1)
+            if prediction.full_displacement is not None
+            else None
+        )
+        corrected_full = tangent_full if raw_full is None else (1.0 - blend_value) * raw_full + blend_value * tangent_full
+        return (
+            replace(
+                prediction,
+                full_displacement=np.asarray(corrected_full, dtype=float),
+                interface_displacement=corrected_interface.reshape(-1, 2),
+            ),
+            {"used": True, "rel": rel, "blend": blend_value},
+        )
+    return (
+        replace(prediction, interface_displacement=corrected_interface.reshape(-1, 2)),
+        {"used": True, "rel": rel, "blend": blend_value},
+    )
 
 
 def _assign_nirb_full_displacement(
@@ -6232,10 +6804,38 @@ def _flush_progress_artifacts(
             "load_return_max",
             "force_update_active",
             "force_omega",
+            "nirb_force_trust_modified",
+            "nirb_force_trust_projection_rel",
+            "nirb_force_trust_coefficient_ratio",
+            "nirb_force_trust_reason",
+            "nirb_force_coordinate_update_active",
+            "nirb_force_coordinate_prediction_active",
+            "nirb_force_coordinate_coeff_ratio",
+            "nirb_force_coordinate_update_backend",
+            "nirb_force_coordinate_clipped",
+            "nirb_force_coordinate_safety_alpha",
+            "nirb_force_coordinate_safety_reason",
+            "nirb_interface_trust_alpha",
+            "nirb_interface_disp_rel",
+            "nirb_interface_step_ratio",
+            "nirb_interface_corrected",
+            "nirb_interface_rejected",
+            "nirb_interface_reason",
+            "nirb_exact_fallback_used",
+            "nirb_fallback_reason",
+            "nirb_force_trust_update_alpha",
+            "nirb_force_trust_next_projection_rel",
+            "nirb_force_trust_next_coefficient_ratio",
+            "nirb_force_trust_next_reason",
             "fluid_hrom_used",
             "fluid_hrom_trial_used",
             "fluid_hrom_trial_load_rel_error",
             "fluid_hrom_disabled_by_trial_monitor",
+            "fluid_hrom_disabled_by_contraction_monitor",
+            "fluid_hrom_load_contraction_ratio",
+            "fluid_hrom_manifold_distance",
+            "fluid_hrom_eta_gamma",
+            "fluid_hrom_dwr_error",
             "fluid_hrom_exact_accept_forced",
             "fluid_hrom_interface_trust_alpha",
             "fluid_hrom_interface_load_rel",
@@ -6243,6 +6843,13 @@ def _flush_progress_artifacts(
             "fluid_hrom_interface_corrected",
             "fluid_hrom_interface_rejected",
             "fluid_hrom_interface_reason",
+            "fluid_hrom_impedance_used",
+            "fluid_hrom_impedance_blend",
+            "fluid_hrom_impedance_rel",
+            "fluid_hrom_reaction_source",
+            "fluid_hrom_certified_relaxation_reason",
+            "fluid_hrom_fallback_reason",
+            "fluid_hrom_sample_local_state_writes",
             "strict_converged",
             "kratos_disp_converged_5e-3",
             "kratos_load_converged_5e-3",
@@ -6481,6 +7088,45 @@ def _aitken_relaxation_factor(
     return float(np.clip(omega_new, float(omega_min), float(omega_max)))
 
 
+def _certified_hrom_relaxation_factor(
+    *,
+    base_omega: float,
+    previous_omega: float,
+    hrom_used: bool,
+    eta_gamma: float,
+    eta_gamma_tol: float,
+    manifold_distance: float,
+    manifold_distance_max: float,
+    contraction_ratio: float,
+    contraction_ratio_max: float,
+    growth: float,
+    shrink: float,
+    omega_min: float,
+    omega_max: float,
+) -> tuple[float, str]:
+    omega = float(np.clip(float(base_omega), float(omega_min), float(omega_max)))
+    if not bool(hrom_used):
+        return omega, "inactive_no_hrom"
+
+    def _gate_ok(value: float, limit: float) -> bool:
+        if not np.isfinite(float(limit)):
+            return True
+        return np.isfinite(float(value)) and float(value) <= float(limit)
+
+    eta_ok = _gate_ok(float(eta_gamma), float(eta_gamma_tol))
+    manifold_ok = _gate_ok(float(manifold_distance), float(manifold_distance_max))
+    contraction_ok = _gate_ok(float(contraction_ratio), float(contraction_ratio_max))
+    if eta_ok and manifold_ok and contraction_ok:
+        grown = max(omega, float(previous_omega) * max(float(growth), 1.0))
+        return float(np.clip(grown, float(omega_min), float(omega_max))), "certified_growth"
+    if (not eta_ok) or (not manifold_ok) or (
+        np.isfinite(float(contraction_ratio)) and float(contraction_ratio) > 1.0
+    ):
+        reduced = min(omega, float(previous_omega) * np.clip(float(shrink), 0.0, 1.0))
+        return float(np.clip(reduced, float(omega_min), float(omega_max))), "certified_shrink"
+    return omega, "certified_hold"
+
+
 def _iqnils_next_iterate(
     *,
     x_curr: np.ndarray,
@@ -6715,12 +7361,199 @@ class _SampledLSPGHybridModel:
     line_search: bool
     lspg_block_scale: bool
     lspg_block_scale_relative_floor: float
+    incompressibility_stabilization_scale: float
     recommended_switch_iter: int
     source_path: Path
+    reaction_matrix: np.ndarray | None = None
+    reaction_bias: np.ndarray | None = None
+    reaction_coords: np.ndarray | None = None
+    reaction_kind: str = "point"
+    reaction_nonlinear_kind: str = "none"
+    reaction_basis: np.ndarray | None = None
+    reaction_mean: np.ndarray | None = None
+    reaction_sample_row_dofs: np.ndarray | None = None
+    reaction_sample_element_ids: np.ndarray | None = None
+    reaction_sample_to_coefficients: np.ndarray | None = None
+    reaction_sample_output_positions: np.ndarray | None = None
+    impedance_matrix: np.ndarray | None = None
+    impedance_bias: np.ndarray | None = None
+    impedance_coords: np.ndarray | None = None
+    impedance_feature_basis: np.ndarray | None = None
+    impedance_feature_mean: np.ndarray | None = None
+    impedance_velocity_scale: float = 1.0
+    impedance_kind: str = "secant_point"
+    training_coefficient_mean: np.ndarray | None = None
+    training_coefficient_scale: np.ndarray | None = None
+    training_coefficient_radius: float = float("inf")
+    dwr_dual: np.ndarray | None = None
 
     @property
     def n_modes(self) -> int:
         return int(self.basis.shape[1])
+
+    @property
+    def has_reduced_reaction(self) -> bool:
+        return (
+            self.reaction_matrix is not None
+            and self.reaction_bias is not None
+            and self.reaction_coords is not None
+        )
+
+    @property
+    def has_sampled_reaction(self) -> bool:
+        return (
+            str(self.reaction_nonlinear_kind).strip().lower() not in {"", "none"}
+            and self.reaction_coords is not None
+            and self.reaction_basis is not None
+            and self.reaction_mean is not None
+            and self.reaction_sample_row_dofs is not None
+            and self.reaction_sample_element_ids is not None
+            and self.reaction_sample_to_coefficients is not None
+            and self.reaction_sample_output_positions is not None
+        )
+
+    @property
+    def reaction_is_incremental(self) -> bool:
+        key = str(self.reaction_kind).strip().lower().replace("-", "_")
+        return key in {"incremental", "incremental_point", "delta", "delta_point"}
+
+    @property
+    def has_interface_impedance(self) -> bool:
+        return (
+            self.impedance_matrix is not None
+            and self.impedance_bias is not None
+            and self.impedance_coords is not None
+            and self.impedance_feature_basis is not None
+            and self.impedance_feature_mean is not None
+        )
+
+    def reduced_reaction_lookup(
+        self,
+        coefficients: np.ndarray,
+        *,
+        base_lookup: CoordinateLookup | None = None,
+    ) -> CoordinateLookup:
+        if not self.has_reduced_reaction:
+            raise RuntimeError("Fluid HROM model does not contain a reduced reaction operator.")
+        coeffs = np.asarray(coefficients, dtype=float).reshape(-1)
+        if int(coeffs.size) != self.n_modes:
+            raise ValueError(f"Expected {self.n_modes} reduced coefficients, got {coeffs.size}.")
+        matrix = np.asarray(self.reaction_matrix, dtype=float)
+        bias = np.asarray(self.reaction_bias, dtype=float).reshape(-1)
+        coords = np.asarray(self.reaction_coords, dtype=float)
+        if matrix.shape != (int(bias.size), self.n_modes):
+            raise RuntimeError("Reduced reaction matrix shape is incompatible with the model basis.")
+        if coords.ndim != 2 or coords.shape[1] != 2 or int(bias.size) != 2 * int(coords.shape[0]):
+            raise RuntimeError("Reduced reaction coordinates/bias are incompatible.")
+        values = bias + matrix @ coeffs
+        if self.reaction_is_incremental:
+            if base_lookup is None:
+                raise RuntimeError("Incremental reduced reaction operator requires a base interface load.")
+            base_values = np.asarray(_resample_lookup_to_coords(base_lookup, coords).values, dtype=float).reshape(-1)
+            if int(base_values.size) != int(values.size):
+                raise RuntimeError("Incremental reduced reaction base size is incompatible with reaction coordinates.")
+            values = base_values + values
+        if not np.all(np.isfinite(values)):
+            raise RuntimeError("Reduced reaction operator produced non-finite values.")
+        return CoordinateLookup(coords, values.reshape(-1, 2), dim=2)
+
+    def sampled_reaction_lookup(self, sample_row_values: np.ndarray) -> CoordinateLookup:
+        if not self.has_sampled_reaction:
+            raise RuntimeError("Fluid HROM model does not contain a sampled nonlinear reaction operator.")
+        coords = np.asarray(self.reaction_coords, dtype=float)
+        basis = np.asarray(self.reaction_basis, dtype=float)
+        mean = np.asarray(self.reaction_mean, dtype=float).reshape(-1)
+        sample_positions = np.asarray(self.reaction_sample_output_positions, dtype=int).reshape(-1)
+        sample_to_coefficients = np.asarray(self.reaction_sample_to_coefficients, dtype=float)
+        values = np.asarray(sample_row_values, dtype=float).reshape(-1)
+        if coords.ndim != 2 or int(coords.shape[1]) != 2:
+            raise RuntimeError("Sampled reaction coordinates must have shape (n_points, 2).")
+        output_size = 2 * int(coords.shape[0])
+        if basis.ndim != 2 or int(basis.shape[0]) != output_size or int(mean.size) != output_size:
+            raise RuntimeError("Sampled reaction basis/mean shape is incompatible with reaction coordinates.")
+        if int(values.size) != int(sample_positions.size):
+            raise RuntimeError("Sampled reaction values size does not match sample output positions.")
+        if np.any(sample_positions < 0) or np.any(sample_positions >= output_size):
+            raise RuntimeError("Sampled reaction output positions are out of range.")
+        if sample_to_coefficients.shape != (int(basis.shape[1]), int(sample_positions.size)):
+            raise RuntimeError("Sampled reaction reconstruction map has incompatible shape.")
+        sample_delta = values - mean[sample_positions]
+        coefficients = sample_to_coefficients @ sample_delta
+        reconstructed = mean + basis @ coefficients
+        if not np.all(np.isfinite(reconstructed)):
+            raise RuntimeError("Sampled nonlinear reaction operator produced non-finite values.")
+        return CoordinateLookup(coords, reconstructed.reshape(-1, 2), dim=2)
+
+    def interface_impedance_reaction_lookup(
+        self,
+        *,
+        interface_disp_lookup: CoordinateLookup,
+        interface_velocity_lookup: CoordinateLookup,
+        previous_interface_disp_lookup: CoordinateLookup,
+        previous_interface_velocity_lookup: CoordinateLookup,
+        previous_reaction_lookup: CoordinateLookup,
+    ) -> CoordinateLookup:
+        if not self.has_interface_impedance:
+            raise RuntimeError("Fluid HROM model does not contain an interface impedance operator.")
+        coords = np.asarray(self.impedance_coords, dtype=float)
+        matrix = np.asarray(self.impedance_matrix, dtype=float)
+        bias = np.asarray(self.impedance_bias, dtype=float).reshape(-1)
+        feature_basis = np.asarray(self.impedance_feature_basis, dtype=float)
+        feature_mean = np.asarray(self.impedance_feature_mean, dtype=float).reshape(-1)
+        if coords.ndim != 2 or coords.shape[1] != 2:
+            raise RuntimeError("Interface impedance coordinates must have shape (n_points, 2).")
+        if bias.size != 2 * int(coords.shape[0]) or matrix.shape[0] != bias.size:
+            raise RuntimeError("Interface impedance output shape is incompatible with coordinates.")
+        current_disp = np.asarray(_resample_lookup_to_coords(interface_disp_lookup, coords).values, dtype=float).reshape(-1)
+        previous_disp = np.asarray(
+            _resample_lookup_to_coords(previous_interface_disp_lookup, coords).values,
+            dtype=float,
+        ).reshape(-1)
+        current_velocity = np.asarray(
+            _resample_lookup_to_coords(interface_velocity_lookup, coords).values,
+            dtype=float,
+        ).reshape(-1)
+        previous_velocity = np.asarray(
+            _resample_lookup_to_coords(previous_interface_velocity_lookup, coords).values,
+            dtype=float,
+        ).reshape(-1)
+        feature = np.concatenate(
+            [
+                current_disp - previous_disp,
+                float(self.impedance_velocity_scale) * (current_velocity - previous_velocity),
+            ]
+        )
+        if feature.size != feature_mean.size or feature_basis.shape[0] != feature.size:
+            raise RuntimeError("Interface impedance feature shape is incompatible with fitted basis.")
+        reduced_feature = (feature - feature_mean) @ feature_basis
+        if int(matrix.shape[1]) != int(reduced_feature.size):
+            raise RuntimeError("Interface impedance matrix shape is incompatible with feature modes.")
+        delta = bias + matrix @ reduced_feature
+        base_values = np.asarray(_resample_lookup_to_coords(previous_reaction_lookup, coords).values, dtype=float).reshape(-1)
+        values = base_values + delta
+        if not np.all(np.isfinite(values)):
+            raise RuntimeError("Interface impedance operator produced non-finite values.")
+        return CoordinateLookup(coords, values.reshape(-1, 2), dim=2)
+
+    def coefficient_manifold_distance(self, coefficients: np.ndarray) -> float:
+        if self.training_coefficient_mean is None or self.training_coefficient_scale is None:
+            return float("nan")
+        coeffs = np.asarray(coefficients, dtype=float).reshape(-1)
+        mean = np.asarray(self.training_coefficient_mean, dtype=float).reshape(-1)
+        scale = np.asarray(self.training_coefficient_scale, dtype=float).reshape(-1)
+        if coeffs.size != self.n_modes or mean.size != self.n_modes or scale.size != self.n_modes:
+            return float("nan")
+        scale = np.maximum(scale, 1.0e-12)
+        return float(np.linalg.norm((coeffs - mean) / scale))
+
+    def dual_weighted_residual_error(self, residual: np.ndarray | None) -> float:
+        if residual is None or self.dwr_dual is None:
+            return float("nan")
+        res = np.asarray(residual, dtype=float).reshape(-1)
+        dual = np.asarray(self.dwr_dual, dtype=float).reshape(-1)
+        if res.size != dual.size:
+            return float("nan")
+        return float(abs(np.dot(dual, res)))
 
 
 def _npz_scalar(data: object, key: str, default: object) -> object:
@@ -6769,10 +7602,225 @@ def _load_sampled_lspg_hybrid_model(path: Path, *, total_dofs: int, n_elements: 
             raise RuntimeError("Fluid HROM sample_element_weights size does not match sample_element_ids.")
         if np.any(sample_element_weights < 0.0) or not np.all(np.isfinite(sample_element_weights)):
             raise RuntimeError("Fluid HROM sample_element_weights must be finite and nonnegative.")
+        reaction_matrix = (
+            np.asarray(data["reaction_matrix"], dtype=float)
+            if "reaction_matrix" in data.files
+            else (
+                np.asarray(data["reaction/reduced_operator"], dtype=float)
+                if "reaction/reduced_operator" in data.files
+                else None
+            )
+        )
+        reaction_bias = (
+            np.asarray(data["reaction_bias"], dtype=float).reshape(-1)
+            if "reaction_bias" in data.files
+            else (
+                np.asarray(data["reaction/bias"], dtype=float).reshape(-1)
+                if "reaction/bias" in data.files
+                else None
+            )
+        )
+        reaction_coords = (
+            np.asarray(data["reaction_coords"], dtype=float)
+            if "reaction_coords" in data.files
+            else (
+                np.asarray(data["reaction/coords"], dtype=float)
+                if "reaction/coords" in data.files
+                else None
+            )
+        )
+        reaction_kind = str(_npz_scalar(data, "reaction_kind", _npz_scalar(data, "reaction/kind", "point")))
+        if any(item is not None for item in (reaction_matrix, reaction_bias)):
+            if reaction_matrix is None or reaction_bias is None or reaction_coords is None:
+                raise RuntimeError(
+                    "Fluid HROM reduced reaction operator requires reaction_matrix, reaction_bias, and reaction_coords."
+                )
+            if reaction_matrix.ndim != 2 or int(reaction_matrix.shape[1]) != int(basis.shape[1]):
+                raise RuntimeError("Fluid HROM reaction_matrix columns must match the reduced basis modes.")
+            if reaction_coords.ndim != 2 or int(reaction_coords.shape[1]) != 2:
+                raise RuntimeError("Fluid HROM reaction_coords must have shape (n_points, 2).")
+            if int(reaction_bias.size) != int(reaction_matrix.shape[0]) or int(reaction_bias.size) != 2 * int(
+                reaction_coords.shape[0]
+            ):
+                raise RuntimeError("Fluid HROM reduced reaction arrays have incompatible sizes.")
+            if not (
+                np.all(np.isfinite(reaction_matrix))
+                and np.all(np.isfinite(reaction_bias))
+                and np.all(np.isfinite(reaction_coords))
+            ):
+                raise RuntimeError("Fluid HROM reduced reaction arrays must be finite.")
+        reaction_nonlinear_kind = str(_npz_scalar(data, "reaction_nonlinear_kind", "none"))
+        reaction_basis = np.asarray(data["reaction_basis"], dtype=float) if "reaction_basis" in data.files else None
+        reaction_mean = (
+            np.asarray(data["reaction_mean"], dtype=float).reshape(-1)
+            if "reaction_mean" in data.files
+            else None
+        )
+        reaction_sample_row_dofs = (
+            np.asarray(data["reaction_sample_row_dofs"], dtype=int).reshape(-1)
+            if "reaction_sample_row_dofs" in data.files
+            else None
+        )
+        reaction_sample_element_ids = (
+            np.asarray(data["reaction_sample_element_ids"], dtype=int).reshape(-1)
+            if "reaction_sample_element_ids" in data.files
+            else None
+        )
+        reaction_sample_to_coefficients = (
+            np.asarray(data["reaction_sample_to_coefficients"], dtype=float)
+            if "reaction_sample_to_coefficients" in data.files
+            else None
+        )
+        reaction_sample_output_positions = (
+            np.asarray(data["reaction_sample_output_positions"], dtype=int).reshape(-1)
+            if "reaction_sample_output_positions" in data.files
+            else None
+        )
+        if str(reaction_nonlinear_kind).strip().lower() not in {"", "none"}:
+            if (
+                reaction_coords is None
+                or reaction_basis is None
+                or reaction_mean is None
+                or reaction_sample_row_dofs is None
+                or reaction_sample_element_ids is None
+                or reaction_sample_to_coefficients is None
+                or reaction_sample_output_positions is None
+            ):
+                raise RuntimeError(
+                    "Sampled nonlinear reaction operator requires reaction_coords, reaction_basis, reaction_mean, "
+                    "reaction_sample_row_dofs, reaction_sample_element_ids, reaction_sample_to_coefficients, "
+                    "and reaction_sample_output_positions."
+                )
+            output_size = 2 * int(reaction_coords.shape[0])
+            if reaction_basis.ndim != 2 or int(reaction_basis.shape[0]) != output_size:
+                raise RuntimeError("Sampled nonlinear reaction basis shape is incompatible with reaction_coords.")
+            if int(reaction_mean.size) != output_size:
+                raise RuntimeError("Sampled nonlinear reaction mean size is incompatible with reaction_coords.")
+            if int(reaction_sample_row_dofs.size) != int(reaction_sample_output_positions.size):
+                raise RuntimeError("Sampled nonlinear reaction rows and output positions must have the same size.")
+            if np.unique(reaction_sample_row_dofs).size != int(reaction_sample_row_dofs.size):
+                raise RuntimeError("Sampled nonlinear reaction rows must be unique.")
+            if np.any(reaction_sample_row_dofs < 0) or np.any(reaction_sample_row_dofs >= int(total_dofs)):
+                raise RuntimeError("Sampled nonlinear reaction rows contain out-of-range entries.")
+            if np.any(reaction_sample_element_ids < 0) or np.any(reaction_sample_element_ids >= int(n_elements)):
+                raise RuntimeError("Sampled nonlinear reaction sample elements contain out-of-range entries.")
+            if (
+                np.any(reaction_sample_output_positions < 0)
+                or np.any(reaction_sample_output_positions >= output_size)
+            ):
+                raise RuntimeError("Sampled nonlinear reaction output positions contain out-of-range entries.")
+            expected_map_shape = (int(reaction_basis.shape[1]), int(reaction_sample_output_positions.size))
+            if reaction_sample_to_coefficients.shape != expected_map_shape:
+                raise RuntimeError("Sampled nonlinear reaction reconstruction map has incompatible shape.")
+            if not (
+                np.all(np.isfinite(reaction_basis))
+                and np.all(np.isfinite(reaction_mean))
+                and np.all(np.isfinite(reaction_sample_to_coefficients))
+            ):
+                raise RuntimeError("Sampled nonlinear reaction arrays must be finite.")
+        impedance_matrix = np.asarray(data["impedance_matrix"], dtype=float) if "impedance_matrix" in data.files else None
+        impedance_bias = (
+            np.asarray(data["impedance_bias"], dtype=float).reshape(-1)
+            if "impedance_bias" in data.files
+            else None
+        )
+        impedance_coords = np.asarray(data["impedance_coords"], dtype=float) if "impedance_coords" in data.files else None
+        impedance_feature_basis = (
+            np.asarray(data["impedance_feature_basis"], dtype=float)
+            if "impedance_feature_basis" in data.files
+            else None
+        )
+        impedance_feature_mean = (
+            np.asarray(data["impedance_feature_mean"], dtype=float).reshape(-1)
+            if "impedance_feature_mean" in data.files
+            else None
+        )
+        impedance_velocity_scale = float(_npz_scalar(data, "impedance_velocity_scale", 1.0))
+        impedance_kind = str(_npz_scalar(data, "impedance_kind", "secant_point"))
+        if any(
+            item is not None
+            for item in (
+                impedance_matrix,
+                impedance_bias,
+                impedance_coords,
+                impedance_feature_basis,
+                impedance_feature_mean,
+            )
+        ):
+            if (
+                impedance_matrix is None
+                or impedance_bias is None
+                or impedance_coords is None
+                or impedance_feature_basis is None
+                or impedance_feature_mean is None
+            ):
+                raise RuntimeError(
+                    "Fluid HROM interface impedance operator requires matrix, bias, coords, feature basis, and feature mean."
+                )
+            if impedance_coords.ndim != 2 or int(impedance_coords.shape[1]) != 2:
+                raise RuntimeError("Fluid HROM impedance_coords must have shape (n_points, 2).")
+            if int(impedance_bias.size) != int(impedance_matrix.shape[0]) or int(impedance_bias.size) != 2 * int(
+                impedance_coords.shape[0]
+            ):
+                raise RuntimeError("Fluid HROM interface impedance output arrays have incompatible sizes.")
+            if impedance_feature_basis.ndim != 2:
+                raise RuntimeError("Fluid HROM impedance_feature_basis must be two-dimensional.")
+            if int(impedance_feature_mean.size) != int(impedance_feature_basis.shape[0]):
+                raise RuntimeError("Fluid HROM impedance feature mean/basis sizes are incompatible.")
+            if int(impedance_matrix.shape[1]) != int(impedance_feature_basis.shape[1]):
+                raise RuntimeError("Fluid HROM impedance matrix columns must match feature modes.")
+            if not (
+                np.all(np.isfinite(impedance_matrix))
+                and np.all(np.isfinite(impedance_bias))
+                and np.all(np.isfinite(impedance_coords))
+                and np.all(np.isfinite(impedance_feature_basis))
+                and np.all(np.isfinite(impedance_feature_mean))
+                and np.isfinite(float(impedance_velocity_scale))
+            ):
+                raise RuntimeError("Fluid HROM interface impedance arrays must be finite.")
+        training_coefficient_mean = (
+            np.asarray(data["training_coefficient_mean"], dtype=float).reshape(-1)
+            if "training_coefficient_mean" in data.files
+            else None
+        )
+        training_coefficient_scale = (
+            np.asarray(data["training_coefficient_scale"], dtype=float).reshape(-1)
+            if "training_coefficient_scale" in data.files
+            else None
+        )
+        training_coefficient_radius = float(_npz_scalar(data, "training_coefficient_radius", float("inf")))
+        if training_coefficient_mean is not None or training_coefficient_scale is not None:
+            if training_coefficient_mean is None or training_coefficient_scale is None:
+                raise RuntimeError(
+                    "Fluid HROM manifold gate requires both training_coefficient_mean and training_coefficient_scale."
+                )
+            if (
+                int(training_coefficient_mean.size) != int(basis.shape[1])
+                or int(training_coefficient_scale.size) != int(basis.shape[1])
+            ):
+                raise RuntimeError("Fluid HROM training coefficient statistics must match the reduced basis modes.")
+            if not (
+                np.all(np.isfinite(training_coefficient_mean))
+                and np.all(np.isfinite(training_coefficient_scale))
+                and np.all(training_coefficient_scale > 0.0)
+            ):
+                raise RuntimeError("Fluid HROM training coefficient statistics must be finite with positive scale.")
+        dwr_dual = (
+            np.asarray(data["dwr_dual"], dtype=float).reshape(-1)
+            if "dwr_dual" in data.files
+            else (
+                np.asarray(data["sample_dwr_dual"], dtype=float).reshape(-1)
+                if "sample_dwr_dual" in data.files
+                else None
+            )
+        )
+        if dwr_dual is not None and int(dwr_dual.size) != int(sample_row_dofs.size):
+            raise RuntimeError("Fluid HROM DWR dual size must match sample_row_dofs.")
         objective = str(_npz_scalar(data, "objective", "sampled_lspg"))
-        if objective.strip().lower().replace("-", "_") != "sampled_lspg":
+        objective_normalized = objective.strip().lower().replace("-", "_")
+        if objective_normalized not in {"sampled_lspg", "sampled_galerkin"}:
             raise RuntimeError(
-                "The production hybrid branch currently accepts only sampled_lspg HROM models; "
+                "The production hybrid branch accepts sampled_lspg or sampled_galerkin HROM models; "
                 f"got objective={objective!r}."
             )
         return _SampledLSPGHybridModel(
@@ -6788,8 +7836,33 @@ def _load_sampled_lspg_hybrid_model(path: Path, *, total_dofs: int, n_elements: 
             line_search=bool(_npz_scalar(data, "line_search", False)),
             lspg_block_scale=bool(_npz_scalar(data, "lspg_block_scale", False)),
             lspg_block_scale_relative_floor=float(_npz_scalar(data, "lspg_block_scale_relative_floor", 0.0)),
+            incompressibility_stabilization_scale=float(
+                _npz_scalar(data, "rom_incompressibility_scale", 1.0)
+            ),
             recommended_switch_iter=max(1, int(_npz_scalar(data, "recommended_switch_iter", 4))),
             source_path=source,
+            reaction_matrix=reaction_matrix,
+            reaction_bias=reaction_bias,
+            reaction_coords=reaction_coords,
+            reaction_kind=reaction_kind,
+            reaction_nonlinear_kind=reaction_nonlinear_kind,
+            reaction_basis=reaction_basis,
+            reaction_mean=reaction_mean,
+            reaction_sample_row_dofs=reaction_sample_row_dofs,
+            reaction_sample_element_ids=reaction_sample_element_ids,
+            reaction_sample_to_coefficients=reaction_sample_to_coefficients,
+            reaction_sample_output_positions=reaction_sample_output_positions,
+            impedance_matrix=impedance_matrix,
+            impedance_bias=impedance_bias,
+            impedance_coords=impedance_coords,
+            impedance_feature_basis=impedance_feature_basis,
+            impedance_feature_mean=impedance_feature_mean,
+            impedance_velocity_scale=impedance_velocity_scale,
+            impedance_kind=impedance_kind,
+            training_coefficient_mean=training_coefficient_mean,
+            training_coefficient_scale=training_coefficient_scale,
+            training_coefficient_radius=training_coefficient_radius,
+            dwr_dual=dwr_dual,
         )
 
 
@@ -6812,6 +7885,82 @@ def _write_fluid_state_for_hrom(*, dh: DofHandler, u_k: VectorFunction, p_k: Fun
         component.set_nodal_values(ids, values[ids])
     p_ids = np.asarray(dh.get_field_slice(p_k.field_name), dtype=int)
     p_k.set_nodal_values(p_ids, values[p_ids])
+
+
+@dataclass(frozen=True)
+class _SampledFluidHROMStateWriter:
+    """Write only the fluid dofs touched by a sampled-HROM element stencil."""
+
+    decoder: SampledFluidStateDecoder
+
+    @classmethod
+    def from_sample_elements(
+        cls,
+        *,
+        dh: DofHandler,
+        basis: np.ndarray,
+        offset: np.ndarray,
+        element_ids: np.ndarray,
+    ) -> "_SampledFluidHROMStateWriter":
+        return cls(
+            decoder=SampledFluidStateDecoder.from_sample_elements(
+                dh=dh,
+                basis=basis,
+                offset=offset,
+                element_ids=element_ids,
+                fields=("ux", "uy", "p"),
+            )
+        )
+
+    @property
+    def n_modes(self) -> int:
+        return int(self.decoder.n_modes)
+
+    def _field_values(self, field_name: str, coefficients: np.ndarray) -> np.ndarray:
+        return self.decoder.field_values(str(field_name), coefficients)
+
+    def write(
+        self,
+        *,
+        u_k: VectorFunction,
+        p_k: Function,
+        a_k: VectorFunction,
+        coefficients: np.ndarray,
+        fluid_prev_step_u: np.ndarray,
+        fluid_a_prev_stage: np.ndarray,
+        bossak: dict[str, float],
+        preserve_acceleration_seed: bool,
+    ) -> None:
+        ux_values = self._field_values("ux", coefficients)
+        uy_values = self._field_values("uy", coefficients)
+        p_values = self._field_values("p", coefficients)
+        ux_ids = self.decoder.field_dofs["ux"]
+        uy_ids = self.decoder.field_dofs["uy"]
+        p_ids = self.decoder.field_dofs["p"]
+        if ux_ids.size:
+            u_k.components[0].set_nodal_values(ux_ids, ux_values)
+        if uy_ids.size:
+            u_k.components[1].set_nodal_values(uy_ids, uy_values)
+        if p_ids.size:
+            p_k.set_nodal_values(p_ids, p_values)
+        if bool(preserve_acceleration_seed):
+            return
+        prev_u = np.asarray(fluid_prev_step_u, dtype=float).reshape(-1)
+        prev_a = np.asarray(fluid_a_prev_stage, dtype=float).reshape(-1)
+        ux_len = int(u_k.components[0].nodal_values.size)
+        uy_len = int(u_k.components[1].nodal_values.size)
+        if int(prev_u.size) != ux_len + uy_len or int(prev_a.size) != ux_len + uy_len:
+            raise ValueError("Fluid HROM acceleration history shape does not match velocity field layout.")
+        ma0 = float(bossak["ma0"])
+        ma2 = float(bossak["ma2"])
+        ux_pos = self.decoder.field_local_positions["ux"]
+        uy_pos = self.decoder.field_local_positions["uy"]
+        if ux_ids.size:
+            ax_values = ma0 * (ux_values - prev_u[ux_pos]) + ma2 * prev_a[ux_pos]
+            a_k.components[0].set_nodal_values(ux_ids, ax_values)
+        if uy_ids.size:
+            ay_values = ma0 * (uy_values - prev_u[ux_len + uy_pos]) + ma2 * prev_a[ux_len + uy_pos]
+            a_k.components[1].set_nodal_values(uy_ids, ay_values)
 
 
 def _sampled_lspg_block_weights(
@@ -6858,6 +8007,7 @@ def _solve_sampled_lspg_hybrid_fluid_stage(
     dt: float,
     bossak_alpha: float,
     dynamic_tau: float,
+    incompressibility_stabilization_scale: float,
     quad_order: int,
     backend: str,
     fluid_prev_step: Sequence[np.ndarray],
@@ -6865,6 +8015,10 @@ def _solve_sampled_lspg_hybrid_fluid_stage(
     max_iterations: int,
     residual_tol: float,
     line_search: bool,
+    reduced_objective: str = "sampled_lspg",
+    gnat_step_backend: str = "python",
+    sample_local_state_writes: bool = True,
+    final_full_state_write: bool = True,
 ) -> dict[str, object]:
     dh = prob["dh"]
     u_k = prob["u_k"]
@@ -6874,7 +8028,23 @@ def _solve_sampled_lspg_hybrid_fluid_stage(
     element_ids = np.asarray(model.sample_element_ids, dtype=int).reshape(-1)
     sample_weights = np.maximum(np.asarray(model.sample_weights, dtype=float).reshape(-1), 0.0)
     element_weights = np.maximum(np.asarray(model.sample_element_weights, dtype=float).reshape(-1), 0.0)
+    positive_element_mask = element_weights > 0.0
+    assembly_element_ids = element_ids[positive_element_mask]
+    assembly_element_weights = element_weights[positive_element_mask]
+    zero_weight_element_ids = element_ids[~positive_element_mask]
+    if int(assembly_element_ids.size) == 0:
+        raise RuntimeError("Sampled-LSPG HROM model has no positive-weight sample elements.")
     offset = _pack_fluid_state_for_hrom(dh=dh, u_k=u_k, p_k=p_k)
+    sample_writer = (
+        _SampledFluidHROMStateWriter.from_sample_elements(
+            dh=dh,
+            basis=basis,
+            offset=offset,
+            element_ids=element_ids,
+        )
+        if bool(sample_local_state_writes)
+        else None
+    )
     coeffs = np.zeros(int(basis.shape[1]), dtype=float)
     bossak = _bossak_coefficients(alpha=float(bossak_alpha), dt=max(float(dt), 1.0e-14))
     prev_u = np.asarray(fluid_prev_step[0], dtype=float)
@@ -6884,10 +8054,51 @@ def _solve_sampled_lspg_hybrid_fluid_stage(
     last_norm = float("inf")
     first_assembly = True
     trajectory: list[dict[str, float]] = []
+    objective_value = str(reduced_objective or "sampled_lspg").strip().lower()
+    if objective_value not in {"sampled_lspg", "sampled_galerkin"}:
+        raise ValueError(f"Unsupported sampled fluid reduced objective {reduced_objective!r}.")
+    gnat_step_backend_value = str(gnat_step_backend or "python").strip().lower()
+    if gnat_step_backend_value not in {"python", "cpp", "c++"}:
+        raise ValueError(f"Unsupported sampled fluid GNAT step backend {gnat_step_backend!r}.")
+    if gnat_step_backend_value == "c++":
+        gnat_step_backend_value = "cpp"
 
-    def write_coefficients(current: np.ndarray, *, preserve_seed: bool) -> None:
+    def slice_element_locals(
+        field_locals: dict[str, np.ndarray] | None,
+        mask: np.ndarray,
+    ) -> dict[str, np.ndarray] | None:
+        if field_locals is None:
+            return None
+        keep = np.asarray(mask, dtype=bool).reshape(-1)
+        out: dict[str, np.ndarray] = {}
+        for key, value in field_locals.items():
+            arr = np.asarray(value, dtype=float)
+            if arr.ndim >= 1 and int(arr.shape[0]) == int(element_ids.size):
+                out[str(key)] = np.asarray(arr[keep], dtype=float)
+            else:
+                out[str(key)] = arr
+        return out
+
+    def write_coefficients(current: np.ndarray, *, preserve_seed: bool, full_state: bool = False) -> None:
         nonlocal first_assembly
-        state = offset + basis @ np.asarray(current, dtype=float).reshape(-1)
+        current_coeffs = np.asarray(current, dtype=float).reshape(-1)
+        use_sample_local = bool(sample_writer is not None) and not bool(full_state)
+        if bool(use_sample_local):
+            sample_writer.write(
+                u_k=u_k,
+                p_k=p_k,
+                a_k=prob["a_k"],
+                coefficients=current_coeffs,
+                fluid_prev_step_u=prev_u,
+                fluid_a_prev_stage=prev_a,
+                bossak=bossak,
+                preserve_acceleration_seed=bool(first_assembly)
+                and bool(preserve_seed)
+                and float(np.linalg.norm(current_coeffs)) <= 1.0e-14,
+            )
+            first_assembly = False
+            return
+        state = offset + basis @ current_coeffs
         _write_fluid_state_for_hrom(dh=dh, u_k=u_k, p_k=p_k, state=state)
         if bool(first_assembly) and bool(preserve_seed) and float(np.linalg.norm(current)) <= 1.0e-14:
             prob["a_k"].nodal_values[:] = seed_a
@@ -6899,7 +8110,27 @@ def _solve_sampled_lspg_hybrid_fluid_stage(
 
     def assemble(current: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
         nonlocal row_weights
+        current_coeffs = np.asarray(current, dtype=float).reshape(-1)
+        preserve_acceleration_seed = (
+            bool(first_assembly)
+            and float(np.linalg.norm(current_coeffs)) <= 1.0e-14
+        )
         write_coefficients(current, preserve_seed=True)
+        field_locals = None
+        if sample_writer is not None:
+            field_locals = sample_writer.decoder.element_local_values(
+                current_coeffs,
+                **(
+                    {}
+                    if bool(preserve_acceleration_seed)
+                    else {
+                        "fluid_prev_step_u": prev_u,
+                        "fluid_a_prev_stage": prev_a,
+                        "bossak": bossak,
+                        }
+                ),
+            )
+        assembly_field_locals = slice_element_locals(field_locals, positive_element_mask)
         _update_fluid_dvms_predicted_subscale(
             state=prob["dvms_state"],
             dh=dh,
@@ -6922,8 +8153,27 @@ def _solve_sampled_lspg_hybrid_fluid_stage(
             dynamic_tau=float(dynamic_tau),
             backend=str(backend),
             use_oss=False,
-            element_ids=element_ids,
+            element_ids=assembly_element_ids,
+            field_locals=assembly_field_locals,
         )
+        if objective_value == "sampled_galerkin":
+            reduced_residual, reduced_tangent = _assemble_fluid_sampled_galerkin_reduced_system_raw(
+                prob=prob,
+                rho_f=float(rho_f),
+                mu_f=float(mu_f),
+                dt=float(dt),
+                quad_order=int(quad_order),
+                bossak_alpha=float(bossak_alpha),
+                contribution_mode="system",
+                backend=str(backend),
+                element_ids=assembly_element_ids,
+                basis=basis,
+                element_weights=assembly_element_weights,
+                incompressibility_stabilization_scale=float(incompressibility_stabilization_scale),
+                field_locals=assembly_field_locals,
+            )
+            return reduced_residual, reduced_tangent, float(np.linalg.norm(reduced_residual))
+
         sampled_residual, sampled_trial = _assemble_fluid_sampled_lspg_rows_raw(
             prob=prob,
             rho_f=float(rho_f),
@@ -6933,10 +8183,12 @@ def _solve_sampled_lspg_hybrid_fluid_stage(
             bossak_alpha=float(bossak_alpha),
             contribution_mode="system",
             backend=str(backend),
-            element_ids=element_ids,
+            element_ids=assembly_element_ids,
             row_dofs=rows,
             basis=basis,
-            element_weights=element_weights,
+            element_weights=assembly_element_weights,
+            incompressibility_stabilization_scale=float(incompressibility_stabilization_scale),
+            field_locals=assembly_field_locals,
         )
         if row_weights is None:
             if bool(model.lspg_block_scale):
@@ -6962,8 +8214,19 @@ def _solve_sampled_lspg_hybrid_fluid_stage(
         if last_norm <= float(residual_tol):
             trajectory.append({"iteration": float(iteration), "residual_norm": float(last_norm), "step_norm": 0.0})
             break
-        step, *_ = np.linalg.lstsq(trial, -residual, rcond=None)
-        step = np.asarray(step, dtype=float).reshape(-1)
+        if gnat_step_backend_value == "cpp":
+            from pycutfem.mor.gauss_newton import gauss_newton_step
+
+            step_result = gauss_newton_step(
+                trial,
+                residual,
+                method="auto",
+                backend="cpp",
+            )
+            step = np.asarray(step_result.step, dtype=float).reshape(-1)
+        else:
+            step, *_ = np.linalg.lstsq(trial, -residual, rcond=None)
+            step = np.asarray(step, dtype=float).reshape(-1)
         if not np.all(np.isfinite(step)):
             raise RuntimeError("Sampled LSPG HROM produced a non-finite reduced step.")
         step_norm = float(np.linalg.norm(step))
@@ -6994,31 +8257,66 @@ def _solve_sampled_lspg_hybrid_fluid_stage(
             break
 
     residual, _trial, last_norm = assemble(coeffs)
+    final_sampled_residual = np.asarray(residual, dtype=float).reshape(-1).copy()
     del residual, _trial
-    write_coefficients(coeffs, preserve_seed=False)
-    _update_fluid_dvms_predicted_subscale(
-        state=prob["dvms_state"],
-        dh=dh,
-        mesh=mesh,
-        u_k=u_k,
-        u_prev=prob["u_prev"],
-        a_prev=prob["a_prev"],
-        a_curr=prob.get("a_k"),
-        p_k=p_k,
-        d_mesh=prob["d_mesh"],
-        d_prev=prob["d_prev"],
-        d_prev2=prob.get("d_prev2"),
-        mesh_v=prob.get("w_mesh_k"),
-        mesh_v_prev=prob.get("w_mesh_prev"),
-        mesh_a_prev=prob.get("a_mesh_prev"),
-        rho_f=float(rho_f),
-        mu_f=float(mu_f),
-        dt=float(dt),
-        bossak_alpha=float(bossak_alpha),
-        dynamic_tau=float(dynamic_tau),
-        backend=str(backend),
-        use_oss=False,
-    )
+    if bool(final_full_state_write):
+        write_coefficients(coeffs, preserve_seed=False, full_state=True)
+        _update_fluid_dvms_predicted_subscale(
+            state=prob["dvms_state"],
+            dh=dh,
+            mesh=mesh,
+            u_k=u_k,
+            u_prev=prob["u_prev"],
+            a_prev=prob["a_prev"],
+            a_curr=prob.get("a_k"),
+            p_k=p_k,
+            d_mesh=prob["d_mesh"],
+            d_prev=prob["d_prev"],
+            d_prev2=prob.get("d_prev2"),
+            mesh_v=prob.get("w_mesh_k"),
+            mesh_v_prev=prob.get("w_mesh_prev"),
+            mesh_a_prev=prob.get("a_mesh_prev"),
+            rho_f=float(rho_f),
+            mu_f=float(mu_f),
+            dt=float(dt),
+            bossak_alpha=float(bossak_alpha),
+            dynamic_tau=float(dynamic_tau),
+            backend=str(backend),
+            use_oss=False,
+        )
+    elif sample_writer is not None and int(zero_weight_element_ids.size) > 0:
+        zero_field_locals_all = sample_writer.decoder.element_local_values(
+            coeffs,
+            fluid_prev_step_u=prev_u,
+            fluid_a_prev_stage=prev_a,
+            bossak=bossak,
+        )
+        zero_field_locals = slice_element_locals(zero_field_locals_all, ~positive_element_mask)
+        _update_fluid_dvms_predicted_subscale(
+            state=prob["dvms_state"],
+            dh=dh,
+            mesh=mesh,
+            u_k=u_k,
+            u_prev=prob["u_prev"],
+            a_prev=prob["a_prev"],
+            a_curr=prob.get("a_k"),
+            p_k=p_k,
+            d_mesh=prob["d_mesh"],
+            d_prev=prob["d_prev"],
+            d_prev2=prob.get("d_prev2"),
+            mesh_v=prob.get("w_mesh_k"),
+            mesh_v_prev=prob.get("w_mesh_prev"),
+            mesh_a_prev=prob.get("a_mesh_prev"),
+            rho_f=float(rho_f),
+            mu_f=float(mu_f),
+            dt=float(dt),
+            bossak_alpha=float(bossak_alpha),
+            dynamic_tau=float(dynamic_tau),
+            backend=str(backend),
+            use_oss=False,
+            element_ids=zero_weight_element_ids,
+            field_locals=zero_field_locals,
+        )
     if not np.all(np.isfinite(np.asarray(u_k.nodal_values, dtype=float))) or not np.all(
         np.isfinite(np.asarray(p_k.nodal_values, dtype=float))
     ):
@@ -7028,9 +8326,17 @@ def _solve_sampled_lspg_hybrid_fluid_stage(
         "iterations": int(len(trajectory)),
         "estimated_residual_norm": float(last_norm),
         "trajectory": trajectory,
+        "final_sampled_residual": final_sampled_residual,
+        "reduced_objective": str(objective_value),
         "sample_rows": int(rows.size),
         "sample_elements": int(element_ids.size),
+        "assembly_elements": int(assembly_element_ids.size),
+        "zero_weight_state_elements": int(zero_weight_element_ids.size),
         "sample_element_weight_sum": float(np.sum(element_weights)),
+        "sample_local_state_writes": bool(sample_writer is not None),
+        "final_full_state_write": bool(final_full_state_write),
+        "state_offset": np.asarray(offset, dtype=float),
+        "gnat_step_backend": str(gnat_step_backend_value),
     }
 
 
@@ -7047,6 +8353,272 @@ class _CouplingRetryPolicy:
     fluid_continuation_scales: tuple[float, ...] = ()
 
 
+@dataclass(frozen=True)
+class _NIRBForceManifoldTrustResult:
+    values: np.ndarray
+    modified: bool
+    projection_rel: float
+    coefficient_ratio: float
+    reason: str
+
+
+@dataclass(frozen=True)
+class _NIRBForceManifoldTrust:
+    basis: np.ndarray
+    mean: np.ndarray
+    coeff_limit_abs: np.ndarray
+    mode: str
+    max_projection_rel: float
+    metadata: dict[str, object]
+
+    @classmethod
+    def from_model(
+        cls,
+        model: object,
+        *,
+        mode: str,
+        quantile: float,
+        coeff_factor: float,
+        max_projection_rel: float,
+    ) -> "_NIRBForceManifoldTrust":
+        force_basis = getattr(model, "force_basis", None)
+        if force_basis is None:
+            raise RuntimeError("NIRB force-manifold trust requires a model with a force_basis.")
+        basis = np.asarray(getattr(force_basis, "basis"), dtype=float)
+        mean = np.asarray(getattr(force_basis, "mean"), dtype=float).reshape(-1)
+        if basis.ndim != 2 or basis.shape[0] != mean.size:
+            raise RuntimeError(
+                "NIRB force basis has incompatible basis/mean dimensions: "
+                f"basis={basis.shape}, mean={mean.shape}."
+            )
+        metadata = getattr(model, "metadata", {}) or {}
+        force_path: Path | None = None
+        if isinstance(metadata, dict):
+            dataset_meta = metadata.get("dataset", {})
+            if isinstance(dataset_meta, dict) and dataset_meta.get("force_path"):
+                force_path = Path(str(dataset_meta["force_path"]))
+        if force_path is None or not force_path.exists():
+            raise RuntimeError(
+                "NIRB force-manifold trust could not find the training force matrix in model metadata."
+            )
+        forces = np.asarray(np.load(force_path), dtype=float)
+        if forces.ndim != 2 or forces.shape[0] != mean.size:
+            raise RuntimeError(
+                "NIRB training force matrix has incompatible shape: "
+                f"{forces.shape}, expected first dimension {mean.size}."
+            )
+        centered = forces - mean[:, None]
+        coeffs = basis.T @ centered
+        q = float(np.clip(float(quantile), 0.0, 1.0))
+        coeff_ref = np.quantile(np.abs(coeffs), q, axis=1)
+        coeff_max = np.max(np.abs(coeffs), axis=1)
+        coeff_limit = np.maximum(coeff_ref * max(float(coeff_factor), 1.0), coeff_ref)
+        coeff_limit = np.maximum(coeff_limit, 1.0e-14)
+        train_proj = mean[:, None] + basis @ coeffs
+        train_projection_rel = np.linalg.norm(forces - train_proj, axis=0) / np.maximum(
+            np.linalg.norm(forces, axis=0),
+            1.0e-15,
+        )
+        trust_metadata: dict[str, object] = {
+            "force_path": str(force_path),
+            "force_modes": int(basis.shape[1]),
+            "quantile": float(q),
+            "coeff_factor": float(coeff_factor),
+            "training_projection_rel_max": float(np.max(train_projection_rel)),
+            "training_projection_rel_p99": float(np.quantile(train_projection_rel, 0.99)),
+            "training_projection_rel_mean": float(np.mean(train_projection_rel)),
+            "training_coeff_abs_max": [float(v) for v in coeff_max],
+        }
+        return cls(
+            basis=basis,
+            mean=mean,
+            coeff_limit_abs=coeff_limit,
+            mode=str(mode).strip().lower(),
+            max_projection_rel=float(max_projection_rel),
+            metadata=trust_metadata,
+        )
+
+    @property
+    def n_modes(self) -> int:
+        return int(np.asarray(self.basis, dtype=float).shape[1])
+
+    def coefficients(self, values: np.ndarray) -> np.ndarray:
+        raw = np.asarray(values, dtype=float).reshape(-1)
+        if raw.size != self.mean.size:
+            raise RuntimeError(
+                "NIRB force-coordinate input size mismatch: "
+                f"{raw.size} != {self.mean.size}."
+            )
+        return np.asarray(self.basis, dtype=float).T @ (raw - np.asarray(self.mean, dtype=float))
+
+    def values_from_coefficients(self, coefficients: np.ndarray, *, shape: tuple[int, ...] | None = None) -> np.ndarray:
+        coeffs = np.asarray(coefficients, dtype=float).reshape(-1)
+        if coeffs.size != self.n_modes:
+            raise RuntimeError(
+                "NIRB force-coordinate size mismatch: "
+                f"{coeffs.size} != {self.n_modes}."
+            )
+        values = np.asarray(self.mean, dtype=float) + np.asarray(self.basis, dtype=float) @ coeffs
+        if shape is not None:
+            return values.reshape(shape)
+        return values
+
+    def coefficient_ratio_from_coefficients(self, coefficients: np.ndarray) -> float:
+        coeffs = np.asarray(coefficients, dtype=float).reshape(-1)
+        if coeffs.size != self.n_modes:
+            raise RuntimeError(
+                "NIRB force-coordinate size mismatch: "
+                f"{coeffs.size} != {self.n_modes}."
+            )
+        return float(np.max(np.abs(coeffs) / np.maximum(np.asarray(self.coeff_limit_abs, dtype=float), 1.0e-14)))
+
+    def clip_coefficients(self, coefficients: np.ndarray) -> tuple[np.ndarray, bool]:
+        coeffs = np.asarray(coefficients, dtype=float).reshape(-1)
+        clipped = np.clip(coeffs, -np.asarray(self.coeff_limit_abs, dtype=float), np.asarray(self.coeff_limit_abs, dtype=float))
+        return clipped, bool(np.any(np.abs(clipped - coeffs) > 1.0e-12))
+
+    def apply(self, values: np.ndarray) -> _NIRBForceManifoldTrustResult:
+        raw = np.asarray(values, dtype=float)
+        flat = raw.reshape(-1)
+        if flat.size != self.mean.size:
+            raise RuntimeError(
+                "NIRB force-manifold trust input size mismatch: "
+                f"{flat.size} != {self.mean.size}."
+            )
+        if not np.all(np.isfinite(flat)):
+            return _NIRBForceManifoldTrustResult(
+                values=raw.copy(),
+                modified=False,
+                projection_rel=float("inf"),
+                coefficient_ratio=float("inf"),
+                reason="nonfinite_input",
+            )
+        centered = flat - self.mean
+        coeffs = self.basis.T @ centered
+        projected = self.mean + self.basis @ coeffs
+        projection_rel = float(np.linalg.norm(flat - projected) / max(np.linalg.norm(flat), 1.0e-15))
+        coefficient_ratio = float(
+            np.max(np.abs(coeffs) / np.maximum(np.asarray(self.coeff_limit_abs, dtype=float), 1.0e-14))
+        )
+        mode = str(self.mode).strip().lower()
+        if mode == "none":
+            reason = "disabled"
+            out = flat
+            modified = False
+        elif mode == "project":
+            needs_projection = (
+                np.isfinite(float(self.max_projection_rel))
+                and float(projection_rel) > float(self.max_projection_rel)
+            )
+            out = projected if bool(needs_projection) else flat
+            modified = bool(needs_projection)
+            reason = "projection_rel" if bool(needs_projection) else "inside"
+        elif mode == "clip":
+            clipped = np.clip(coeffs, -self.coeff_limit_abs, self.coeff_limit_abs)
+            needs_projection = (
+                np.isfinite(float(self.max_projection_rel))
+                and float(projection_rel) > float(self.max_projection_rel)
+            )
+            needs_clip = bool(np.any(np.abs(clipped - coeffs) > 1.0e-12))
+            out = self.mean + self.basis @ clipped if (needs_projection or needs_clip) else flat
+            modified = bool(needs_projection or needs_clip)
+            if needs_projection and needs_clip:
+                reason = "projection_rel_and_coeff_clip"
+            elif needs_projection:
+                reason = "projection_rel"
+            elif needs_clip:
+                reason = "coeff_clip"
+            else:
+                reason = "inside"
+        elif mode == "limit":
+            out = flat
+            modified = False
+            outside_projection = (
+                np.isfinite(float(self.max_projection_rel))
+                and float(projection_rel) > float(self.max_projection_rel)
+            )
+            outside_coeff = float(coefficient_ratio) > 1.0
+            if outside_projection and outside_coeff:
+                reason = "outside_projection_and_coeff"
+            elif outside_projection:
+                reason = "outside_projection"
+            elif outside_coeff:
+                reason = "outside_coeff"
+            else:
+                reason = "inside"
+        else:
+            raise ValueError(f"Unsupported NIRB force-manifold trust mode {self.mode!r}.")
+        return _NIRBForceManifoldTrustResult(
+            values=np.asarray(out, dtype=float).reshape(raw.shape),
+            modified=bool(modified),
+            projection_rel=float(projection_rel),
+            coefficient_ratio=float(coefficient_ratio),
+            reason=str(reason),
+        )
+
+    def limit_update(
+        self,
+        *,
+        current_values: np.ndarray,
+        proposed_values: np.ndarray,
+    ) -> tuple[_NIRBForceManifoldTrustResult, float]:
+        current = np.asarray(current_values, dtype=float)
+        proposed = np.asarray(proposed_values, dtype=float)
+        if current.shape != proposed.shape:
+            raise RuntimeError(f"NIRB force trust update shape mismatch: {current.shape} != {proposed.shape}.")
+
+        def _ok(result: _NIRBForceManifoldTrustResult) -> bool:
+            projection_ok = (
+                (not np.isfinite(float(self.max_projection_rel)))
+                or float(result.projection_rel) <= float(self.max_projection_rel)
+            )
+            coefficient_ok = float(result.coefficient_ratio) <= 1.0
+            return bool(projection_ok and coefficient_ok)
+
+        proposed_result = self.apply(proposed)
+        if _ok(proposed_result):
+            return proposed_result, 1.0
+        current_result = self.apply(current)
+        if not _ok(current_result):
+            return _NIRBForceManifoldTrustResult(
+                values=current.copy(),
+                modified=True,
+                projection_rel=float(current_result.projection_rel),
+                coefficient_ratio=float(current_result.coefficient_ratio),
+                reason="current_outside_trust_hold",
+            ), 0.0
+        lo = 0.0
+        hi = 1.0
+        best_values = current.copy()
+        best_result = current_result
+        for _ in range(32):
+            alpha = 0.5 * (lo + hi)
+            candidate = current + alpha * (proposed - current)
+            candidate_result = self.apply(candidate)
+            if _ok(candidate_result):
+                lo = alpha
+                best_values = candidate
+                best_result = candidate_result
+            else:
+                hi = alpha
+        return _NIRBForceManifoldTrustResult(
+            values=np.asarray(best_values, dtype=float),
+            modified=True,
+            projection_rel=float(best_result.projection_rel),
+            coefficient_ratio=float(best_result.coefficient_ratio),
+            reason=f"limited_alpha={float(lo):.6e}",
+        ), float(lo)
+
+
+def _nirb_force_trust_outside(result: _NIRBForceManifoldTrustResult, *, max_projection_rel: float) -> bool:
+    projection_ok = (
+        (not np.isfinite(float(max_projection_rel)))
+        or float(result.projection_rel) <= float(max_projection_rel)
+    )
+    coefficient_ok = float(result.coefficient_ratio) <= 1.0
+    return bool((not projection_ok) or (not coefficient_ok))
+
+
 def _build_coupling_retry_policies(
     *,
     force_update: str,
@@ -7056,6 +8628,8 @@ def _build_coupling_retry_policies(
     base_max_coupling_iters: int,
     base_max_newton_iter: int,
     max_retries: int,
+    retry_relaxations: str | None = None,
+    retry_updates: str | None = None,
 ) -> list[_CouplingRetryPolicy]:
     policies: list[_CouplingRetryPolicy] = []
 
@@ -7089,42 +8663,47 @@ def _build_coupling_retry_policies(
     base_iters = max(int(base_max_coupling_iters), 1)
     base_newton = max(int(base_max_newton_iter), 1)
     _append(str(force_update).lower(), float(force_relaxation), max_iters=base_iters, reset=False)
+    retry_omega_values = (0.05, 0.02, 0.01, 0.005)
+    if retry_relaxations is not None and str(retry_relaxations).strip():
+        parsed_omegas: list[float] = []
+        for item in str(retry_relaxations).replace(";", ",").split(","):
+            text = item.strip()
+            if not text:
+                continue
+            parsed_omegas.append(float(text))
+        if parsed_omegas:
+            retry_omega_values = tuple(parsed_omegas)
+    retry_update_values = ("constant",)
+    if retry_updates is not None and str(retry_updates).strip():
+        parsed_updates = tuple(
+            item.strip().lower()
+            for item in str(retry_updates).replace(";", ",").split(",")
+            if item.strip()
+        )
+        bad_updates = sorted({mode for mode in parsed_updates if mode not in {"constant", "aitken", "iqnils"}})
+        if bad_updates:
+            raise ValueError(f"Unsupported retry force update mode(s): {bad_updates}")
+        if parsed_updates:
+            retry_update_values = parsed_updates
     fallback_specs = [
         {
-            "omega": 0.05,
-            "max_iters": max(base_iters, 8 * base_iters),
-            "fluid_max_newton_iter": max(base_newton, 32),
-            "fluid_globalization": "line_search_then_trust",
-            "fluid_line_search": True,
-            "fluid_ls_fail_hard": False,
-        },
-        {
-            "omega": 0.02,
-            "max_iters": max(base_iters, 12 * base_iters),
-            "fluid_max_newton_iter": max(base_newton, 50),
-            "fluid_globalization": "line_search_then_trust",
-            "fluid_line_search": True,
-            "fluid_ls_fail_hard": False,
-        },
-        {
-            "omega": 0.01,
-            "max_iters": max(base_iters, 16 * base_iters),
-            "fluid_max_newton_iter": max(base_newton, 64),
-            "fluid_globalization": "line_search_then_trust",
-            "fluid_line_search": True,
-            "fluid_ls_fail_hard": False,
-        },
-        {
-            "omega": 0.005,
-            "max_iters": max(base_iters, 20 * base_iters),
+            "mode": str(
+                retry_update_values[min(i, len(retry_update_values) - 1)]
+                if len(retry_update_values) > 1
+                else retry_update_values[0]
+            ),
+            "omega": float(omega),
+            "max_iters": max(base_iters, int(np.ceil(base_iters * max(8.0, 0.4 / max(float(omega), 1.0e-12))))),
             "fluid_max_newton_iter": max(base_newton, 80),
             "fluid_globalization": "line_search_then_trust",
             "fluid_line_search": True,
             "fluid_ls_fail_hard": False,
-        },
+        }
+        for i, omega in enumerate(retry_omega_values)
     ]
     for spec in fallback_specs:
-        _append("constant", reset=True, **spec)
+        mode = str(spec.pop("mode"))
+        _append(mode, reset=True, **spec)
         if len(policies) >= int(max_retries) + 1:
             break
     return policies[: max(int(max_retries), 0) + 1]
@@ -7290,11 +8869,38 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Optional rollback/retry ladder for failed outer FSI steps. Default: disabled on the production path.",
     )
+    parser.add_argument(
+        "--step-retry-relaxations",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated relaxation values for rollback/retry attempts. "
+            "Each retry resets interface history and enables safer fluid globalization."
+        ),
+    )
+    parser.add_argument(
+        "--step-retry-updates",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated force-update modes for rollback/retry attempts. "
+            "If fewer modes than relaxations are supplied, the last mode is reused."
+        ),
+    )
     parser.add_argument("--newton-tol", type=float, default=1.0e-6)
     parser.add_argument("--max-newton-iter", type=int, default=20)
     parser.add_argument("--bossak-alpha", type=float, default=-0.3)
     parser.add_argument("--dynamic-tau", type=float, default=1.0)
     parser.add_argument("--pressure-gauge", type=float, default=1.0e-5)
+    parser.add_argument(
+        "--reduced-mesh-surrogate-path",
+        type=Path,
+        default=None,
+        help=(
+            "Optional reduced ALE displacement-map .npz. When set, the Python mesh-extension solve is "
+            "replaced by a reduced interface-to-mesh displacement map plus Bossak kinematics."
+        ),
+    )
     parser.add_argument(
         "--fluid-operator",
         choices=("exact", "continuous", "sampled_lspg_hybrid"),
@@ -7313,6 +8919,30 @@ def parse_args() -> argparse.Namespace:
         help="First coupling iteration that may use the sampled-LSPG fluid HROM. Default: model recommendation.",
     )
     parser.add_argument(
+        "--fluid-hrom-late-switch-step",
+        type=int,
+        default=0,
+        help=(
+            "Accepted step at which the sampled-LSPG HROM may switch to a different coupling-iteration gate. "
+            "This keeps the initial transient conservative while allowing more reduced stages later."
+        ),
+    )
+    parser.add_argument(
+        "--fluid-hrom-late-switch-iter",
+        type=int,
+        default=None,
+        help="Coupling-iteration HROM gate used from --fluid-hrom-late-switch-step onward.",
+    )
+    parser.add_argument(
+        "--fluid-hrom-start-step",
+        type=int,
+        default=1,
+        help=(
+            "First absolute FSI time step that may use the sampled-LSPG fluid HROM. "
+            "Earlier steps use the exact fluid operator while preserving a run that starts from step 1."
+        ),
+    )
+    parser.add_argument(
         "--fluid-hrom-max-iterations",
         type=int,
         default=None,
@@ -7323,6 +8953,69 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=None,
         help="Override the sampled-LSPG residual tolerance stored in the HROM model.",
+    )
+    parser.add_argument(
+        "--fluid-hrom-incompressibility-scale",
+        type=float,
+        default=None,
+        help=(
+            "ROM/HROM-only scale for the ALE-DVMS incompressibility stabilization terms. "
+            "Defaults to the value stored in the model, or 1.0 for older models."
+        ),
+    )
+    parser.add_argument(
+        "--fluid-hrom-reduced-objective",
+        choices=("sampled_lspg", "sampled_galerkin"),
+        default="sampled_lspg",
+        help=(
+            "Reduced coefficient equation used by the sampled fluid HROM. "
+            "'sampled_lspg' minimizes sampled full residual rows; 'sampled_galerkin' solves the sampled "
+            "element-cubature approximation of V^T R = 0 and V^T J V."
+        ),
+    )
+    parser.add_argument(
+        "--reduced-online-backend",
+        choices=("python", "cpp"),
+        default=_env_str("PYCUTFEM_NIRB_REDUCED_ONLINE_BACKEND", "python"),
+        help="Online reduced nonlinear loop backend for NIRB/HROM solvers that provide native kernel specs.",
+    )
+    parser.add_argument(
+        "--gnat-step-backend",
+        choices=("python", "cpp"),
+        default=_env_str("PYCUTFEM_NIRB_GNAT_STEP_BACKEND", "python"),
+        help="Dense Gauss-Newton step backend used by Python-loop GNAT solves.",
+    )
+    parser.add_argument(
+        "--fluid-hrom-commit-mode",
+        choices=("state", "load_only"),
+        default="state",
+        help=(
+            "How a committed sampled fluid HROM stage enters the coupled solve. "
+            "'state' keeps the reduced fluid state and load; 'load_only' returns the HROM interface load "
+            "but restores the pre-HROM full-order fluid state before the next coupling iteration."
+        ),
+    )
+    parser.add_argument(
+        "--fluid-hrom-sample-local-state-writes",
+        action=argparse.BooleanOptionalAction,
+        default=_env_bool("PYCUTFEM_EX2_FLUID_HROM_SAMPLE_LOCAL_WRITES", True),
+        help=(
+            "During sampled-HROM Newton assembly, decode only dofs touched by the sampled element stencil. "
+            "The final committed state is still written when the coupled driver needs full-order reaction/state "
+            "bookkeeping."
+        ),
+    )
+    parser.add_argument(
+        "--fluid-hrom-history-policy",
+        choices=("include", "step_local", "relaxed"),
+        default="include",
+        help=(
+            "How committed HROM stages interact with the coupling acceleration history. "
+            "'include' treats HROM load pairs like exact pairs; 'step_local' allows HROM pairs inside the "
+            "current fixed-point step but excludes them from old IQN matrices carried to the next step; "
+            "'relaxed' uses the HROM return only for a plain relaxed load update and keeps it out of the "
+            "IQN/secant history."
+        ),
     )
     parser.add_argument(
         "--fluid-hrom-fallback-exact",
@@ -7355,12 +9048,41 @@ def parse_args() -> argparse.Namespace:
         help="Optional matching gate on the previous coupling displacement relative residual.",
     )
     parser.add_argument(
+        "--fluid-hrom-max-coupling-iter",
+        type=int,
+        default=0,
+        help=(
+            "Maximum coupling iteration where a sampled-LSPG HROM stage may be committed. "
+            "Use 0 for unlimited. This prevents late reduced-load accepts from contaminating "
+            "the IQN/fixed-point path in already difficult steps."
+        ),
+    )
+    parser.add_argument(
         "--fluid-hrom-max-consecutive-stages",
         type=int,
         default=0,
         help=(
             "Maximum number of consecutive sampled-LSPG fluid stages inside one FSI step. "
             "Use 0 for unlimited."
+        ),
+    )
+    parser.add_argument(
+        "--fluid-hrom-max-stages-per-step",
+        type=int,
+        default=0,
+        help=(
+            "Maximum number of committed sampled-LSPG fluid stages inside one accepted FSI step. "
+            "Use 0 for unlimited."
+        ),
+    )
+    parser.add_argument(
+        "--fluid-hrom-max-load-contraction-ratio",
+        type=float,
+        default=float("inf"),
+        help=(
+            "Reject a candidate HROM stage and disable HROM for the rest of the current FSI step if the "
+            "candidate interface-load relative residual divided by the previous coupling load relative "
+            "residual exceeds this value."
         ),
     )
     parser.add_argument(
@@ -7434,6 +9156,82 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--fluid-hrom-impedance-blend",
+        type=float,
+        default=0.0,
+        help=(
+            "Blend the reduced reaction decoder with the learned interface impedance predictor when the model "
+            "contains one and previous interface/load data are available. 0 disables it; 1 uses only impedance."
+        ),
+    )
+    parser.add_argument(
+        "--fluid-hrom-reaction-source",
+        choices=("auto", "sampled", "local_rows", "affine", "full"),
+        default="auto",
+        help=(
+            "Interface reaction source for committed sampled-LSPG HROM stages. 'auto' prefers the sampled nonlinear "
+            "G(Vq) reaction operator, then local constrained rows, then the affine reduced decoder, then full reaction."
+        ),
+    )
+    parser.add_argument(
+        "--fluid-hrom-max-manifold-distance",
+        type=float,
+        default=float("inf"),
+        help=(
+            "Reject/fallback when the reduced coefficient vector is farther from the training coefficient cloud "
+            "than this scaled distance. Models saved by the all-state trainer carry the required statistics."
+        ),
+    )
+    parser.add_argument(
+        "--fluid-hrom-interface-load-tolerance",
+        type=float,
+        default=float("inf"),
+        help=(
+            "Reject/fallback when the cheap interface-load estimator eta_Gamma exceeds this tolerance. "
+            "When both a reduced reaction operator and an independently assembled reaction are available, "
+            "eta_Gamma is their relative difference."
+        ),
+    )
+    parser.add_argument(
+        "--fluid-hrom-use-estimator-load-on-accept",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "When eta_Gamma is evaluated and passes, commit the independently assembled interface-load "
+            "estimator instead of the cheaper decoded HROM load. This keeps the fluid stage reduced while "
+            "using the certified reaction value for the coupling update."
+        ),
+    )
+    parser.add_argument(
+        "--fluid-hrom-max-dwr-error",
+        type=float,
+        default=float("inf"),
+        help=(
+            "Reject/fallback when the dual-weighted sampled residual estimate exceeds this value. "
+            "The model must contain dwr_dual or sample_dwr_dual for this gate to be active."
+        ),
+    )
+    parser.add_argument(
+        "--fluid-hrom-adaptive-db-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Directory where HROM-attempted stages that fall back to exact fluid are dumped as pre/post "
+            "fluid-stage probes for later incremental POD and HROM retraining."
+        ),
+    )
+    parser.add_argument(
+        "--fluid-hrom-certified-relaxation",
+        choices=("none", "adaptive"),
+        default="none",
+        help=(
+            "Guarded relaxation controller for certified HROM stages. "
+            "'adaptive' grows omega only when manifold, eta_Gamma, and contraction gates are satisfied."
+        ),
+    )
+    parser.add_argument("--fluid-hrom-certified-relaxation-growth", type=float, default=1.25)
+    parser.add_argument("--fluid-hrom-certified-relaxation-shrink", type=float, default=0.5)
+    parser.add_argument(
         "--solid-operator",
         choices=("exact", "nirb", "porous"),
         default="exact",
@@ -7455,6 +9253,212 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help="First accepted global step that uses the NIRB solid surrogate.",
+    )
+    parser.add_argument(
+        "--nirb-fallback-exact",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Run the exact local solid solve for a coupling stage when the NIRB solid predictor "
+            "fails certification or returns non-finite interface data."
+        ),
+    )
+    parser.add_argument(
+        "--nirb-exact-after-coupling-iter",
+        type=int,
+        default=0,
+        help=(
+            "First coupling iteration in a time step that must use the certified exact solid fallback "
+            "instead of the NIRB predictor. 0 disables this gate."
+        ),
+    )
+    parser.add_argument(
+        "--nirb-exact-after-load-rel",
+        type=float,
+        default=float("inf"),
+        help=(
+            "Use the exact solid fallback for the next NIRB stage when the previous coupling iteration's "
+            "relative load residual is above this value."
+        ),
+    )
+    parser.add_argument(
+        "--nirb-exact-after-disp-rel",
+        type=float,
+        default=float("inf"),
+        help=(
+            "Use the exact solid fallback for the next NIRB stage when the previous coupling iteration's "
+            "relative interface-displacement residual is above this value."
+        ),
+    )
+    parser.add_argument(
+        "--nirb-exact-fallback-guess",
+        choices=("current", "zero", "previous"),
+        default="zero",
+        help=(
+            "Initial guess for certified exact solid fallback stages. "
+            "zero avoids inheriting an unsafe reconstructed NIRB full field."
+        ),
+    )
+    parser.add_argument(
+        "--nirb-interface-tangent-path",
+        type=Path,
+        default=None,
+        help=(
+            "Optional secant interface-compliance artifact trained from whole FSI coupling histories. "
+            "When enabled, the NIRB interface displacement is blended with a local tangent update."
+        ),
+    )
+    parser.add_argument(
+        "--nirb-interface-tangent-blend",
+        type=float,
+        default=0.0,
+        help="Blend weight for the NIRB tangent correction: 0 disables it, 1 uses the tangent prediction fully.",
+    )
+    parser.add_argument(
+        "--nirb-interface-tangent-start-iter",
+        type=int,
+        default=2,
+        help="First coupling iteration in a time step where the NIRB tangent correction may use a previous local anchor.",
+    )
+    parser.add_argument(
+        "--nirb-interface-tangent-max-rel",
+        type=float,
+        default=float("inf"),
+        help="Reject the tangent correction when it changes the raw NIRB interface prediction by more than this relative amount.",
+    )
+    parser.add_argument(
+        "--nirb-interface-model-path",
+        type=Path,
+        default=None,
+        help=(
+            "Optional NIRB model trained directly on interface-displacement snapshots. "
+            "The main NIRB model is still used for accepted full solid reconstruction."
+        ),
+    )
+    parser.add_argument(
+        "--nirb-interface-trust",
+        choices=("none", "fallback", "clip"),
+        default="none",
+        help=(
+            "Trust-region policy for the NIRB solid interface displacement. "
+            "'fallback' rejects unsafe reduced solid stages; 'clip' damps the NIRB interface update."
+        ),
+    )
+    parser.add_argument(
+        "--nirb-interface-max-step-ratio",
+        type=float,
+        default=float("inf"),
+        help=(
+            "Maximum NIRB interface displacement update RMS divided by the previous displacement "
+            "residual RMS. Used by --nirb-interface-trust."
+        ),
+    )
+    parser.add_argument(
+        "--nirb-interface-max-disp-rel",
+        type=float,
+        default=float("inf"),
+        help="Maximum relative interface-displacement update allowed for a NIRB solid stage.",
+    )
+    parser.add_argument(
+        "--nirb-interface-min-correction-alpha",
+        type=float,
+        default=0.0,
+        help=(
+            "When --nirb-interface-trust=clip, reject the NIRB stage if the required damping "
+            "factor is below this value."
+        ),
+    )
+    parser.add_argument(
+        "--nirb-force-manifold-trust",
+        choices=("none", "project", "clip", "limit"),
+        default="none",
+        help=(
+            "Project/clip the current online NIRB interface load, or limit the next IQN load update, "
+            "using the training force manifold."
+        ),
+    )
+    parser.add_argument(
+        "--nirb-force-manifold-max-projection-rel",
+        type=float,
+        default=float("inf"),
+        help="Project the NIRB solid load when the POD tail relative norm exceeds this value.",
+    )
+    parser.add_argument(
+        "--nirb-force-manifold-quantile",
+        type=float,
+        default=0.99,
+        help="Training coefficient quantile used by --nirb-force-manifold-trust=clip.",
+    )
+    parser.add_argument(
+        "--nirb-force-manifold-coeff-factor",
+        type=float,
+        default=2.0,
+        help="Multiplier on the training coefficient quantile used by --nirb-force-manifold-trust=clip.",
+    )
+    parser.add_argument(
+        "--nirb-force-coordinate-update",
+        choices=("none", "pod", "pod_clipped", "adaptive"),
+        default="none",
+        help=(
+            "Update the coupled interface load in the NIRB force POD coordinates. "
+            "This keeps the NIRB solid input on the trained force manifold; pod_clipped also clips "
+            "coefficients to the configured training quantile envelope. adaptive keeps the default full "
+            "coupling update and projects/clips only proposed unsafe updates."
+        ),
+    )
+    parser.add_argument(
+        "--nirb-force-coordinate-trust",
+        choices=("none", "clip", "fallback"),
+        default="none",
+        help=(
+            "Trust-region policy for the force-POD load update. clip damps the reduced-coordinate update "
+            "before reconstructing the next interface load; fallback rejects unsafe reduced updates and uses "
+            "the standard coupling update for that iteration."
+        ),
+    )
+    parser.add_argument(
+        "--nirb-force-coordinate-max-step-ratio",
+        type=float,
+        default=float("inf"),
+        help=(
+            "Maximum reduced force-POD update RMS norm divided by the current load residual RMS norm. "
+            "Only used when --nirb-force-coordinate-trust is not none."
+        ),
+    )
+    parser.add_argument(
+        "--nirb-force-coordinate-max-load-rel",
+        type=float,
+        default=float("inf"),
+        help=(
+            "Maximum relative change from the current interface load to the force-POD proposed next load. "
+            "Only used when --nirb-force-coordinate-trust is not none."
+        ),
+    )
+    parser.add_argument(
+        "--nirb-force-coordinate-min-alpha",
+        type=float,
+        default=0.0,
+        help=(
+            "Reject a clipped force-POD update when the required trust-region damping alpha is below this value."
+        ),
+    )
+    parser.add_argument(
+        "--nirb-force-coordinate-disable-on-newton-failure",
+        action="store_true",
+        help=(
+            "If a local exact-fluid Newton stage hits the iteration cap immediately after a force-POD update, "
+            "disable force-POD coupling updates for the rest of that step attempt and do not reuse its "
+            "coefficient-IQN history."
+        ),
+    )
+    parser.add_argument(
+        "--nirb-force-coordinate-newton-failure-late-iter",
+        type=int,
+        default=6,
+        help=(
+            "First coupling iteration where a local exact-fluid Newton max-iteration event is treated as a "
+            "late force-coordinate coupling instability."
+        ),
     )
     parser.add_argument("--backend", choices=("python", "jit", "cpp"), default="cpp")
     parser.add_argument("--linear-backend", choices=("scipy", "sparseqr", "petsc", "amgcl"), default="scipy")
@@ -7503,21 +9507,37 @@ def run_local_example2(
     force_history: int = 3,
     force_regularization: float = 0.0,
     step_retries: int = 0,
+    step_retry_relaxations: str | None = None,
+    step_retry_updates: str | None = None,
     newton_tol: float = 1.0e-6,
     max_newton_iter: int = 12,
     bossak_alpha: float = -0.3,
     dynamic_tau: float = 1.0,
     pressure_gauge: float = 1.0e-5,
+    reduced_mesh_surrogate_path: Path | None = None,
     fluid_operator: str = "exact",
     fluid_hrom_model_path: Path | None = None,
     fluid_hrom_switch_iter: int | None = None,
+    fluid_hrom_late_switch_step: int = 0,
+    fluid_hrom_late_switch_iter: int | None = None,
+    fluid_hrom_start_step: int = 1,
     fluid_hrom_max_iterations: int | None = None,
     fluid_hrom_residual_tol: float | None = None,
+    fluid_hrom_incompressibility_scale: float | None = None,
+    fluid_hrom_reduced_objective: str = "sampled_lspg",
+    fluid_hrom_reduced_online_backend: str = "python",
+    fluid_hrom_gnat_step_backend: str = "python",
+    fluid_hrom_commit_mode: str = "state",
+    fluid_hrom_sample_local_state_writes: bool = True,
+    fluid_hrom_history_policy: str = "include",
     fluid_hrom_fallback_exact: bool = True,
     fluid_hrom_max_previous_load_rel: float = 1.0e-2,
     fluid_hrom_min_previous_load_rel: float = 0.0,
     fluid_hrom_max_previous_disp_rel: float = float("inf"),
+    fluid_hrom_max_coupling_iter: int = 0,
     fluid_hrom_max_consecutive_stages: int = 0,
+    fluid_hrom_max_stages_per_step: int = 0,
+    fluid_hrom_max_load_contraction_ratio: float = float("inf"),
     fluid_hrom_require_exact_accept: bool = False,
     fluid_hrom_trial_exact_correct: bool = False,
     fluid_hrom_max_trial_load_rel_error: float = float("inf"),
@@ -7526,6 +9546,16 @@ def run_local_example2(
     fluid_hrom_interface_max_step_ratio: float = float("inf"),
     fluid_hrom_interface_max_load_rel: float = float("inf"),
     fluid_hrom_interface_min_correction_alpha: float = 0.0,
+    fluid_hrom_impedance_blend: float = 0.0,
+    fluid_hrom_reaction_source: str = "auto",
+    fluid_hrom_max_manifold_distance: float = float("inf"),
+    fluid_hrom_interface_load_tolerance: float = float("inf"),
+    fluid_hrom_use_estimator_load_on_accept: bool = False,
+    fluid_hrom_max_dwr_error: float = float("inf"),
+    fluid_hrom_adaptive_db_dir: Path | None = None,
+    fluid_hrom_certified_relaxation: str = "none",
+    fluid_hrom_certified_relaxation_growth: float = 1.25,
+    fluid_hrom_certified_relaxation_shrink: float = 0.5,
     solid_operator: str = "exact",
     porous_pressure_order: int | None = None,
     porous_porosity: float = 0.32,
@@ -7534,6 +9564,31 @@ def run_local_example2(
     porous_storage_inverse: float = 2.0e-4,
     nirb_model_path: Path | None = None,
     nirb_start_step: int = 1,
+    nirb_fallback_exact: bool = True,
+    nirb_exact_after_coupling_iter: int = 0,
+    nirb_exact_after_load_rel: float = float("inf"),
+    nirb_exact_after_disp_rel: float = float("inf"),
+    nirb_exact_fallback_guess: str = "zero",
+    nirb_interface_tangent_path: Path | None = None,
+    nirb_interface_tangent_blend: float = 0.0,
+    nirb_interface_tangent_start_iter: int = 2,
+    nirb_interface_tangent_max_rel: float = float("inf"),
+    nirb_interface_model_path: Path | None = None,
+    nirb_interface_trust: str = "none",
+    nirb_interface_max_step_ratio: float = float("inf"),
+    nirb_interface_max_disp_rel: float = float("inf"),
+    nirb_interface_min_correction_alpha: float = 0.0,
+    nirb_force_manifold_trust: str = "none",
+    nirb_force_manifold_max_projection_rel: float = float("inf"),
+    nirb_force_manifold_quantile: float = 0.99,
+    nirb_force_manifold_coeff_factor: float = 2.0,
+    nirb_force_coordinate_update: str = "none",
+    nirb_force_coordinate_trust: str = "none",
+    nirb_force_coordinate_max_step_ratio: float = float("inf"),
+    nirb_force_coordinate_max_load_rel: float = float("inf"),
+    nirb_force_coordinate_min_alpha: float = 0.0,
+    nirb_force_coordinate_disable_on_newton_failure: bool = False,
+    nirb_force_coordinate_newton_failure_late_iter: int = 6,
     backend: str = "cpp",
     linear_backend: str = "scipy",
     snapshot_mode: str = "all",
@@ -7663,6 +9718,45 @@ def run_local_example2(
         porous_pressure_order if porous_pressure_order is not None else max(1, int(poly_order) - 1)
     )
     nirb_start_step_value = max(1, int(nirb_start_step))
+    nirb_interface_tangent_blend_value = min(1.0, max(0.0, float(nirb_interface_tangent_blend)))
+    nirb_interface_tangent_start_iter_value = max(2, int(nirb_interface_tangent_start_iter))
+    nirb_interface_tangent_max_rel_value = float(nirb_interface_tangent_max_rel)
+    nirb_force_manifold_trust_value = str(nirb_force_manifold_trust).strip().lower()
+    if nirb_force_manifold_trust_value not in {"none", "project", "clip", "limit"}:
+        raise ValueError(
+            "nirb_force_manifold_trust must be one of: none, project, clip, limit; "
+            f"got {nirb_force_manifold_trust!r}."
+        )
+    nirb_force_manifold_max_projection_rel_value = float(nirb_force_manifold_max_projection_rel)
+    nirb_force_manifold_quantile_value = float(np.clip(float(nirb_force_manifold_quantile), 0.0, 1.0))
+    nirb_force_manifold_coeff_factor_value = max(1.0, float(nirb_force_manifold_coeff_factor))
+    nirb_force_coordinate_update_value = str(nirb_force_coordinate_update).strip().lower()
+    if nirb_force_coordinate_update_value not in {"none", "pod", "pod_clipped", "adaptive"}:
+        raise ValueError(
+            "nirb_force_coordinate_update must be one of: none, pod, pod_clipped, adaptive; "
+            f"got {nirb_force_coordinate_update!r}."
+        )
+    if nirb_force_coordinate_update_value != "none" and solid_operator_mode != "nirb":
+        raise RuntimeError("--nirb-force-coordinate-update requires --solid-operator=nirb.")
+    nirb_force_coordinate_trust_value = str(nirb_force_coordinate_trust or "none").strip().lower()
+    if nirb_force_coordinate_trust_value not in {"none", "clip", "fallback"}:
+        raise ValueError(
+            "nirb_force_coordinate_trust must be one of: none, clip, fallback; "
+            f"got {nirb_force_coordinate_trust!r}."
+        )
+    nirb_force_coordinate_max_step_ratio_value = float(nirb_force_coordinate_max_step_ratio)
+    nirb_force_coordinate_max_load_rel_value = float(nirb_force_coordinate_max_load_rel)
+    nirb_force_coordinate_min_alpha_value = float(
+        np.clip(float(nirb_force_coordinate_min_alpha), 0.0, 1.0)
+    )
+    if nirb_force_coordinate_max_step_ratio_value < 0.0:
+        raise ValueError("nirb_force_coordinate_max_step_ratio must be non-negative.")
+    if nirb_force_coordinate_max_load_rel_value < 0.0:
+        raise ValueError("nirb_force_coordinate_max_load_rel must be non-negative.")
+    nirb_force_coordinate_failure_late_iter_value = max(
+        1,
+        int(nirb_force_coordinate_newton_failure_late_iter),
+    )
     exact_backend_notes: list[str] = []
     requested_exact_fluid_backend_mode = _env_str(
         "PYCUTFEM_EX2_EXACT_FLUID_BACKEND",
@@ -7691,6 +9785,26 @@ def run_local_example2(
                 "because the HROM uses the example-level local ALE-DVMS operator"
             )
         exact_fluid_backend_mode = "local"
+    requested_hrom_exact_fallback_backend_mode = _env_str(
+        "PYCUTFEM_EX2_HROM_EXACT_FALLBACK_BACKEND",
+        "local",
+    ).strip().lower()
+    if requested_hrom_exact_fallback_backend_mode in {"", "local", "pycutfem"}:
+        hrom_exact_fallback_backend_mode = "local"
+    elif requested_hrom_exact_fallback_backend_mode in {"kratos", "kratos_live", "live"}:
+        hrom_exact_fallback_backend_mode = "kratos_live"
+    else:
+        raise ValueError(
+            "Unsupported HROM exact-fluid fallback backend mode "
+            f"{requested_hrom_exact_fallback_backend_mode!r}. "
+            "Use one of: local, kratos_live."
+        )
+    if not bool(use_sampled_lspg_hybrid_fluid):
+        hrom_exact_fallback_backend_mode = "local"
+    if hrom_exact_fallback_backend_mode == "kratos_live" and mesh_source_value != "reference":
+        raise RuntimeError("The HROM kratos_live exact-fluid fallback requires mesh_source='reference'.")
+    if hrom_exact_fallback_backend_mode == "kratos_live" and restart_payload is not None:
+        raise RuntimeError("The HROM kratos_live exact-fluid fallback is not yet supported with restart_from.")
     if requested_exact_fluid_backend_mode in {"", "auto"} and exact_fluid_backend_mode == "local":
         fluid_auto_reasons: list[str] = []
         if not bool(use_exact_fluid_operator):
@@ -7831,6 +9945,7 @@ def run_local_example2(
         or bool(need_kratos_local_mesh_backend)
         or exact_structure_backend_mode == "kratos_live"
         or exact_fluid_backend_mode == "kratos_live"
+        or hrom_exact_fallback_backend_mode == "kratos_live"
         or mesh_backend_value == "kratos"
     )
     kratos_thread_env = _configure_kratos_thread_env(enable=bool(need_kratos_runtime or need_local_amgcl_openmp_cap))
@@ -7873,6 +9988,13 @@ def run_local_example2(
             )
             exact_fluid_backend_mode = "local"
             exact_fluid_linear_backend = _select_exact_fluid_linear_backend()
+    kratos_hrom_exact_fallback_backend = None
+    if hrom_exact_fallback_backend_mode == "kratos_live":
+        kratos_hrom_exact_fallback_backend = _build_kratos_exact_fluid_backend(
+            fluid_mdpa_path=Path(mesh_descriptor["fluid_mesh_path"]),
+            dt=float(dt_value),
+            bossak_alpha=float(bossak_alpha),
+        )
     kratos_mesh_backend = (
         _build_kratos_mesh_motion_backend(
             fluid_mdpa_path=Path(mesh_descriptor["fluid_mesh_path"]),
@@ -7895,6 +10017,13 @@ def run_local_example2(
         f"exact_fluid_backend requested={requested_exact_fluid_backend_mode or 'auto'} "
         f"resolved={exact_fluid_backend_mode} linear_backend={exact_fluid_linear_backend}",
     )
+    if bool(use_sampled_lspg_hybrid_fluid):
+        _log(
+            verbose,
+            "[config] "
+            f"hrom_exact_fallback_backend requested={requested_hrom_exact_fallback_backend_mode or 'local'} "
+            f"resolved={hrom_exact_fallback_backend_mode}",
+        )
     _log(
         verbose,
         "[config] "
@@ -7929,6 +10058,8 @@ def run_local_example2(
     fluid["mesh"] = mesh_f
     solid["mesh"] = mesh_s
     nirb_solid_predictor: NIRBSolidPredictor | None = None
+    nirb_interface_predictor: NIRBSolidPredictor | None = None
+    nirb_force_manifold_trust_operator: _NIRBForceManifoldTrust | None = None
     if mesh_source_value == "reference":
         clamp_part = setup.reference.solid.submodelparts.get("DISPLACEMENT_BCDisp")
         old_to_new = getattr(mesh_s, "_mdpa_old_to_new_node", {})
@@ -7949,6 +10080,29 @@ def run_local_example2(
     solid_iface_coords, _ = _boundary_field_data(solid["dh"], "dx", geometry.interface_tag)
     if fluid_iface_coords.size == 0 or solid_iface_coords.size == 0:
         raise RuntimeError("Failed to extract interface DOF coordinates from the local fluid/solid subproblems.")
+    reduced_mesh_surrogate: ReducedMeshDisplacementMap | None = None
+    if reduced_mesh_surrogate_path is not None:
+        if mesh_backend_value != "python":
+            raise RuntimeError("--reduced-mesh-surrogate-path can only replace the Python mesh-extension branch.")
+        reduced_mesh_surrogate = ReducedMeshDisplacementMap.load(Path(reduced_mesh_surrogate_path))
+        if reduced_mesh_surrogate.interface_coords_ref is not None:
+            ref_iface = np.asarray(reduced_mesh_surrogate.interface_coords_ref, dtype=float)
+            if ref_iface.shape != solid_iface_coords.shape or not np.allclose(ref_iface, solid_iface_coords):
+                raise RuntimeError(
+                    "Reduced mesh surrogate interface coordinates do not match the current solid interface layout."
+                )
+        if reduced_mesh_surrogate.fluid_coords_ref is not None:
+            ref_fluid = np.asarray(reduced_mesh_surrogate.fluid_coords_ref, dtype=float)
+            current_fluid = np.asarray(mesh_f.nodes_x_y_pos, dtype=float)
+            if ref_fluid.shape != current_fluid.shape or not np.allclose(ref_fluid, current_fluid):
+                raise RuntimeError("Reduced mesh surrogate fluid coordinates do not match the current fluid mesh.")
+        _log(
+            verbose,
+            "[mesh-rom] "
+            f"loaded reduced mesh surrogate from {Path(reduced_mesh_surrogate_path)} "
+            f"interface_modes={reduced_mesh_surrogate.n_interface_modes} "
+            f"mesh_modes={reduced_mesh_surrogate.n_mesh_modes}",
+        )
     map_used = _build_interface_restriction_matrix(solid["dh"], solid["d_k"], geometry.interface_tag)
     np.save(co_sim_dir / "map_used.npy", map_used)
     np.save(co_sim_dir / "coords_interf.npy", solid_iface_coords)
@@ -7965,6 +10119,71 @@ def run_local_example2(
             "[nirb] "
             f"loaded solid model from {Path(nirb_model_path)} "
             f"with interface restriction {tuple(map_used.shape)}",
+        )
+        if nirb_interface_model_path is not None:
+            nirb_interface_predictor = NIRBSolidPredictor.from_path(
+                Path(nirb_interface_model_path),
+                full_shape=(int(solid_iface_coords.shape[0]), 2),
+                interface_shape=(int(solid_iface_coords.shape[0]), 2),
+            )
+            _log(
+                verbose,
+                "[nirb] "
+                f"loaded direct interface model from {Path(nirb_interface_model_path)}",
+            )
+        if nirb_force_manifold_trust_value != "none" or nirb_force_coordinate_update_value != "none":
+            trust_model = (
+                nirb_interface_predictor.model
+                if nirb_interface_predictor is not None
+                else nirb_solid_predictor.model
+            )
+            nirb_force_manifold_trust_operator = _NIRBForceManifoldTrust.from_model(
+                trust_model,
+                mode=str(nirb_force_manifold_trust_value),
+                quantile=float(nirb_force_manifold_quantile_value),
+                coeff_factor=float(nirb_force_manifold_coeff_factor_value),
+                max_projection_rel=float(nirb_force_manifold_max_projection_rel_value),
+            )
+            _log(
+                verbose,
+                "[nirb] "
+                f"force_manifold_trust={str(nirb_force_manifold_trust_value)} "
+                f"force_coordinate_update={str(nirb_force_coordinate_update_value)} "
+                f"max_projection_rel={float(nirb_force_manifold_max_projection_rel_value):.3e} "
+                f"coeff_factor={float(nirb_force_manifold_coeff_factor_value):.3e} "
+                f"train_p99={float(nirb_force_manifold_trust_operator.metadata['training_projection_rel_p99']):.3e}",
+            )
+    nirb_interface_tangent: NIRBInterfaceTangentCorrector | None = None
+    if nirb_interface_tangent_path is not None and float(nirb_interface_tangent_blend_value) > 0.0:
+        if solid_operator_mode != "nirb":
+            raise RuntimeError("--nirb-interface-tangent-path requires --solid-operator=nirb.")
+        nirb_interface_tangent = NIRBInterfaceTangentCorrector.from_npz(Path(nirb_interface_tangent_path))
+        nirb_interface_tangent.validate()
+        tangent_load_coords = np.asarray(nirb_interface_tangent.load_coords, dtype=float)
+        tangent_interface_coords = np.asarray(nirb_interface_tangent.interface_coords, dtype=float)
+        if tangent_load_coords.shape != solid_iface_coords.shape or not np.allclose(
+            tangent_load_coords,
+            solid_iface_coords,
+        ):
+            raise RuntimeError("NIRB tangent load coordinates do not match the current solid interface layout.")
+        if tangent_interface_coords.shape != solid_iface_coords.shape or not np.allclose(
+            tangent_interface_coords,
+            solid_iface_coords,
+        ):
+            raise RuntimeError("NIRB tangent interface coordinates do not match the current solid interface layout.")
+        if (
+            nirb_interface_tangent.full_tangent is not None
+            and nirb_interface_tangent.full_tangent.shape[0] != int(np.prod(np.asarray(solid["d_k"].nodal_values).shape))
+        ):
+            raise RuntimeError(
+                "NIRB tangent full displacement dimension does not match the current solid displacement field."
+            )
+        _log(
+            verbose,
+            "[nirb] "
+            f"loaded interface tangent from {Path(nirb_interface_tangent_path)} "
+            f"blend={float(nirb_interface_tangent_blend_value):.3e} "
+            f"start_iter={int(nirb_interface_tangent_start_iter_value)}",
         )
     solid_interface_mass = _build_interface_mass_matrix(mesh_s, solid_iface_coords, geometry.interface_tag)
 
@@ -7985,28 +10204,63 @@ def run_local_example2(
         dim=2,
     )
     current_load_lookup = zero_fluid_load_lookup if accelerate_on_fluid_load else zero_load_lookup
+    force_coeff_iqn_old_dr_mats = deque(maxlen=max(int(force_history) - 1, 0))
+    force_coeff_iqn_old_dg_mats = deque(maxlen=max(int(force_history) - 1, 0))
     prev_disp_iter_vals = np.zeros((solid_iface_coords.shape[0], 2), dtype=float)
 
     mu_f = float(setup.material.density * setup.material.kinematic_viscosity)
     mu_s = float(setup.material.shear_modulus)
     lambda_s = float(setup.material.lame_lambda)
     sampled_lspg_hybrid_model: _SampledLSPGHybridModel | None = None
+    sampled_lspg_hybrid_start_step = max(1, int(fluid_hrom_start_step))
     sampled_lspg_hybrid_switch_iter = 0
+    sampled_lspg_hybrid_late_switch_step = max(0, int(fluid_hrom_late_switch_step))
+    sampled_lspg_hybrid_late_switch_iter = (
+        None if fluid_hrom_late_switch_iter is None else max(1, int(fluid_hrom_late_switch_iter))
+    )
     sampled_lspg_hybrid_max_iterations = 0
     sampled_lspg_hybrid_residual_tol = 0.0
+    sampled_lspg_hybrid_incompressibility_scale = 1.0
+    sampled_lspg_hybrid_reduced_objective = str(fluid_hrom_reduced_objective or "sampled_lspg").strip().lower()
+    if sampled_lspg_hybrid_reduced_objective not in {"sampled_lspg", "sampled_galerkin"}:
+        raise ValueError(f"Unsupported fluid_hrom_reduced_objective={fluid_hrom_reduced_objective!r}.")
+    sampled_lspg_hybrid_commit_mode = str(fluid_hrom_commit_mode or "state").strip().lower()
+    if sampled_lspg_hybrid_commit_mode not in {"state", "load_only"}:
+        raise ValueError(f"Unsupported fluid_hrom_commit_mode={fluid_hrom_commit_mode!r}.")
+    sampled_lspg_hybrid_sample_local_state_writes = bool(fluid_hrom_sample_local_state_writes)
+    sampled_lspg_hybrid_history_policy = str(fluid_hrom_history_policy or "include").strip().lower()
+    if sampled_lspg_hybrid_history_policy not in {"include", "step_local", "relaxed"}:
+        raise ValueError(f"Unsupported fluid_hrom_history_policy={fluid_hrom_history_policy!r}.")
     sampled_lspg_hybrid_stage_count = 0
     sampled_lspg_hybrid_exact_stage_count = 0
     sampled_lspg_hybrid_fallback_count = 0
+    sampled_lspg_hybrid_start_gate_skips = 0
     sampled_lspg_hybrid_load_gate_skips = 0
     sampled_lspg_hybrid_disp_gate_skips = 0
     sampled_lspg_hybrid_consecutive_gate_skips = 0
+    sampled_lspg_hybrid_step_gate_skips = 0
     sampled_lspg_hybrid_disabled_gate_skips = 0
     sampled_lspg_hybrid_exact_accept_forced_count = 0
     sampled_lspg_hybrid_trial_stage_count = 0
     sampled_lspg_hybrid_exact_correction_count = 0
     sampled_lspg_hybrid_trial_monitor_failures = 0
+    sampled_lspg_hybrid_contraction_monitor_failures = 0
     sampled_lspg_hybrid_interface_reject_count = 0
     sampled_lspg_hybrid_interface_correction_count = 0
+    sampled_lspg_hybrid_manifold_gate_failures = 0
+    sampled_lspg_hybrid_dwr_gate_failures = 0
+    sampled_lspg_hybrid_eta_gamma_gate_failures = 0
+    sampled_lspg_hybrid_adaptive_stage_dump_count = 0
+    sampled_lspg_hybrid_sample_local_stage_count = 0
+    sampled_lspg_hybrid_final_full_write_count = 0
+    sampled_lspg_hybrid_skipped_final_full_write_count = 0
+    sampled_lspg_hybrid_coupling_iter_gate_skips = 0
+    nirb_interface_reject_count = 0
+    nirb_interface_correction_count = 0
+    nirb_exact_fallback_count = 0
+    nirb_force_coordinate_safety_clip_count = 0
+    nirb_force_coordinate_safety_fallback_count = 0
+    nirb_force_coordinate_newton_safety_count = 0
     fluid_hrom_disabled_until_step = -1
     fluid_hrom_min_previous_load_rel_value = max(0.0, float(fluid_hrom_min_previous_load_rel))
     fluid_hrom_max_previous_load_rel_value = float(fluid_hrom_max_previous_load_rel)
@@ -8022,16 +10276,44 @@ def run_local_example2(
     fluid_hrom_interface_min_correction_alpha_value = float(
         np.clip(float(fluid_hrom_interface_min_correction_alpha), 0.0, 1.0)
     )
+    fluid_hrom_impedance_blend_value = float(np.clip(float(fluid_hrom_impedance_blend), 0.0, 1.0))
+    fluid_hrom_reaction_source_value = str(fluid_hrom_reaction_source or "auto").strip().lower()
+    if fluid_hrom_reaction_source_value not in {"auto", "sampled", "local_rows", "affine", "full"}:
+        raise ValueError(f"Unsupported fluid_hrom_reaction_source={fluid_hrom_reaction_source!r}.")
+    fluid_hrom_max_manifold_distance_value = float(fluid_hrom_max_manifold_distance)
+    fluid_hrom_interface_load_tolerance_value = float(fluid_hrom_interface_load_tolerance)
+    fluid_hrom_max_dwr_error_value = float(fluid_hrom_max_dwr_error)
+    fluid_hrom_adaptive_db_path = None if fluid_hrom_adaptive_db_dir is None else Path(fluid_hrom_adaptive_db_dir)
+    fluid_hrom_certified_relaxation_value = str(fluid_hrom_certified_relaxation or "none").strip().lower()
+    if fluid_hrom_certified_relaxation_value not in {"none", "adaptive"}:
+        raise ValueError(
+            f"Unsupported fluid_hrom_certified_relaxation={fluid_hrom_certified_relaxation!r}."
+        )
+    fluid_hrom_certified_relaxation_growth_value = max(1.0, float(fluid_hrom_certified_relaxation_growth))
+    fluid_hrom_certified_relaxation_shrink_value = float(
+        np.clip(float(fluid_hrom_certified_relaxation_shrink), 0.0, 1.0)
+    )
     if fluid_hrom_interface_max_step_ratio_value < 0.0:
         raise ValueError("fluid_hrom_interface_max_step_ratio must be non-negative.")
     if fluid_hrom_interface_max_load_rel_value < 0.0:
         raise ValueError("fluid_hrom_interface_max_load_rel must be non-negative.")
+    if fluid_hrom_max_manifold_distance_value < 0.0:
+        raise ValueError("fluid_hrom_max_manifold_distance must be non-negative.")
+    if fluid_hrom_interface_load_tolerance_value < 0.0:
+        raise ValueError("fluid_hrom_interface_load_tolerance must be non-negative.")
+    if fluid_hrom_max_dwr_error_value < 0.0:
+        raise ValueError("fluid_hrom_max_dwr_error must be non-negative.")
     if fluid_hrom_min_previous_load_rel_value > fluid_hrom_max_previous_load_rel_value:
         raise ValueError(
             "fluid_hrom_min_previous_load_rel must be <= fluid_hrom_max_previous_load_rel "
             f"({fluid_hrom_min_previous_load_rel_value} > {fluid_hrom_max_previous_load_rel_value})."
         )
     fluid_hrom_max_consecutive_stages_value = max(0, int(fluid_hrom_max_consecutive_stages))
+    fluid_hrom_max_stages_per_step_value = max(0, int(fluid_hrom_max_stages_per_step))
+    fluid_hrom_max_coupling_iter_value = max(0, int(fluid_hrom_max_coupling_iter))
+    fluid_hrom_max_load_contraction_ratio_value = float(fluid_hrom_max_load_contraction_ratio)
+    if fluid_hrom_max_load_contraction_ratio_value < 0.0:
+        raise ValueError("fluid_hrom_max_load_contraction_ratio must be non-negative.")
     if bool(use_sampled_lspg_hybrid_fluid):
         sampled_lspg_hybrid_model = _load_sampled_lspg_hybrid_model(
             Path(fluid_hrom_model_path),
@@ -8053,6 +10335,16 @@ def run_local_example2(
             if fluid_hrom_residual_tol is not None
             else float(sampled_lspg_hybrid_model.residual_tol)
         )
+        sampled_lspg_hybrid_incompressibility_scale = (
+            float(fluid_hrom_incompressibility_scale)
+            if fluid_hrom_incompressibility_scale is not None
+            else float(sampled_lspg_hybrid_model.incompressibility_stabilization_scale)
+        )
+        if (
+            not np.isfinite(sampled_lspg_hybrid_incompressibility_scale)
+            or sampled_lspg_hybrid_incompressibility_scale <= 0.0
+        ):
+            raise ValueError("fluid_hrom_incompressibility_scale must be finite and positive.")
         _log(
             verbose,
             "[fluid-hrom] "
@@ -8062,12 +10354,22 @@ def run_local_example2(
             f"sample_elements={sampled_lspg_hybrid_model.sample_element_ids.size} "
             f"active_element_weights={int(np.count_nonzero(sampled_lspg_hybrid_model.sample_element_weights > 0.0))} "
             f"element_weight_sum={float(np.sum(sampled_lspg_hybrid_model.sample_element_weights)):.6e} "
+            f"start_step={sampled_lspg_hybrid_start_step} "
             f"switch_iter={sampled_lspg_hybrid_switch_iter} "
+            f"late_switch_step={int(sampled_lspg_hybrid_late_switch_step)} "
+            f"late_switch_iter={sampled_lspg_hybrid_late_switch_iter} "
             f"max_iterations={sampled_lspg_hybrid_max_iterations} "
+            f"incompressibility_scale={float(sampled_lspg_hybrid_incompressibility_scale):.6g} "
+            f"reduced_objective={sampled_lspg_hybrid_reduced_objective} "
+            f"commit_mode={sampled_lspg_hybrid_commit_mode} "
+            f"history_policy={sampled_lspg_hybrid_history_policy} "
             f"previous_load_rel_gate=[{float(fluid_hrom_min_previous_load_rel_value):.3e}, "
             f"{float(fluid_hrom_max_previous_load_rel_value):.3e}] "
             f"previous_disp_rel_gate={float(fluid_hrom_max_previous_disp_rel):.3e} "
+            f"max_coupling_iter={int(fluid_hrom_max_coupling_iter_value)} "
             f"max_consecutive={int(fluid_hrom_max_consecutive_stages_value)} "
+            f"max_stages_per_step={int(fluid_hrom_max_stages_per_step_value)} "
+            f"max_load_contraction_ratio={float(fluid_hrom_max_load_contraction_ratio_value):.3e} "
             f"require_exact_accept={int(bool(fluid_hrom_require_exact_accept))} "
             f"trial_exact_correct={int(bool(fluid_hrom_trial_exact_correct))} "
             f"trial_load_error_gate={float(fluid_hrom_max_trial_load_rel_error_value):.3e} "
@@ -8075,7 +10377,14 @@ def run_local_example2(
             f"interface_trust={fluid_hrom_interface_trust_value} "
             f"interface_max_step_ratio={float(fluid_hrom_interface_max_step_ratio_value):.3e} "
             f"interface_max_load_rel={float(fluid_hrom_interface_max_load_rel_value):.3e} "
-            f"interface_min_alpha={float(fluid_hrom_interface_min_correction_alpha_value):.3e}",
+            f"interface_min_alpha={float(fluid_hrom_interface_min_correction_alpha_value):.3e} "
+            f"impedance_blend={float(fluid_hrom_impedance_blend_value):.3e} "
+            f"reaction_source={fluid_hrom_reaction_source_value} "
+            f"max_manifold_distance={float(fluid_hrom_max_manifold_distance_value):.3e} "
+            f"interface_load_tolerance={float(fluid_hrom_interface_load_tolerance_value):.3e} "
+            f"use_estimator_load_on_accept={int(bool(fluid_hrom_use_estimator_load_on_accept))} "
+            f"max_dwr_error={float(fluid_hrom_max_dwr_error_value):.3e} "
+            f"adaptive_db={fluid_hrom_adaptive_db_path}",
         )
     porous_material = _default_upl_material_from_lame(
         mu_s=mu_s,
@@ -8088,6 +10397,31 @@ def run_local_example2(
         density_solid=float(setup.material.density),
         density_liquid=float(setup.material.density),
     )
+    nirb_interface_trust_value = str(nirb_interface_trust or "none").strip().lower()
+    if nirb_interface_trust_value not in {"none", "fallback", "clip"}:
+        raise ValueError(f"Unsupported nirb_interface_trust={nirb_interface_trust!r}.")
+    nirb_interface_max_step_ratio_value = float(nirb_interface_max_step_ratio)
+    nirb_interface_max_disp_rel_value = float(nirb_interface_max_disp_rel)
+    nirb_interface_min_correction_alpha_value = float(
+        np.clip(float(nirb_interface_min_correction_alpha), 0.0, 1.0)
+    )
+    nirb_exact_after_coupling_iter_value = max(0, int(nirb_exact_after_coupling_iter))
+    nirb_exact_after_load_rel_value = float(nirb_exact_after_load_rel)
+    nirb_exact_after_disp_rel_value = float(nirb_exact_after_disp_rel)
+    if nirb_exact_after_load_rel_value < 0.0:
+        raise ValueError("nirb_exact_after_load_rel must be non-negative.")
+    if nirb_exact_after_disp_rel_value < 0.0:
+        raise ValueError("nirb_exact_after_disp_rel must be non-negative.")
+    nirb_exact_fallback_guess_value = str(nirb_exact_fallback_guess or "zero").strip().lower()
+    if nirb_exact_fallback_guess_value not in {"current", "zero", "previous"}:
+        raise ValueError(
+            "nirb_exact_fallback_guess must be one of: current, zero, previous; "
+            f"got {nirb_exact_fallback_guess!r}."
+        )
+    if nirb_interface_max_step_ratio_value < 0.0:
+        raise ValueError("nirb_interface_max_step_ratio must be non-negative.")
+    if nirb_interface_max_disp_rel_value < 0.0:
+        raise ValueError("nirb_interface_max_disp_rel must be non-negative.")
 
     fixed_mesh_tags = (
         geometry.inlet_tag,
@@ -8095,6 +10429,225 @@ def run_local_example2(
         geometry.walls_tag,
         geometry.cylinder_tag,
     )
+
+    def _solve_local_exact_solid_stage(
+        *,
+        current_structure_load_lookup: CoordinateLookup,
+        load_guess_vals: np.ndarray,
+        solid_prev_step_snapshot: list[np.ndarray],
+        step_value: int,
+        coupling_iter_value: int,
+    ) -> None:
+        solid_res, solid_jac, solid_bcs, solid_bcs_homog = _solid_residual_and_jacobian(
+            prob=solid,
+            traction_lookup=zero_load_lookup,
+            mu_s=mu_s,
+            lambda_s=lambda_s,
+            interface_tag=geometry.interface_tag,
+            clamp_tag=geometry.clamp_tag,
+            quad_order=solid_quad_order,
+        )
+        use_struct_one_step = _env_bool(
+            "PYCUTFEM_EX2_STRUCT_ONE_STEP",
+            False,
+        )
+        default_use_kratos_structure_profile = bool(mesh_source_value == "reference")
+        use_kratos_structure_profile = _env_bool(
+            "PYCUTFEM_EX2_LOCAL_STRUCTURE_USE_KRATOS_PROFILE",
+            default_use_kratos_structure_profile,
+        )
+        default_structure_newton_tol = (
+            float(structure_solver_profile["residual_absolute_tolerance"])
+            if bool(use_kratos_structure_profile)
+            else float(newton_tol)
+        )
+        default_structure_newton_rtol = (
+            float(structure_solver_profile["residual_relative_tolerance"])
+            if bool(use_kratos_structure_profile)
+            else 0.0
+        )
+        default_structure_max_newton_iter = (
+            int(structure_solver_profile["max_iteration"])
+            if bool(use_kratos_structure_profile)
+            else int(max_newton_iter)
+        )
+        default_structure_linear_backend = (
+            str(structure_solver_profile["linear_backend"])
+            if bool(use_kratos_structure_profile)
+            else str(linear_backend)
+        )
+        default_structure_residual_norm = (
+            "kratos_l2_over_ndof"
+            if bool(use_kratos_structure_profile)
+            else "linf"
+        )
+        exact_structure_newton_tol = max(
+            0.0,
+            float(
+                _env_float(
+                    "PYCUTFEM_EX2_LOCAL_STRUCTURE_NEWTON_TOL",
+                    float(default_structure_newton_tol),
+                )
+            ),
+        )
+        exact_structure_newton_rtol = max(
+            0.0,
+            float(
+                _env_float(
+                    "PYCUTFEM_EX2_LOCAL_STRUCTURE_NEWTON_RTOL",
+                    float(default_structure_newton_rtol),
+                )
+            ),
+        )
+        exact_structure_max_newton_iter = int(
+            max(
+                1,
+                _env_float(
+                    "PYCUTFEM_EX2_LOCAL_STRUCTURE_MAX_NEWTON_ITER",
+                    float(default_structure_max_newton_iter),
+                ),
+            )
+        )
+        exact_structure_linear_backend = _env_str(
+            "PYCUTFEM_EX2_LOCAL_STRUCTURE_LINEAR_BACKEND",
+            str(default_structure_linear_backend),
+        ).strip().lower()
+        exact_structure_residual_norm = _env_str(
+            "PYCUTFEM_EX2_LOCAL_STRUCTURE_RESIDUAL_NORM",
+            str(default_structure_residual_norm),
+        ).strip().lower()
+        solid_solver = NewtonSolver(
+            residual_form=solid_res,
+            jacobian_form=solid_jac,
+            dof_handler=solid["dh"],
+            mixed_element=solid["me"],
+            bcs=solid_bcs,
+            bcs_homog=solid_bcs_homog,
+            newton_params=NewtonParameters(
+                newton_tol=float(exact_structure_newton_tol),
+                newton_rtol=float(exact_structure_newton_rtol),
+                residual_norm=str(exact_structure_residual_norm),
+                max_newton_iter=1 if bool(use_struct_one_step) else int(exact_structure_max_newton_iter),
+                print_level=3,
+                accept_nonconverged_atol_factor=(
+                    float(_EX2L_KRATOS_STRUCT_ONE_STEP_ACCEPT_FACTOR)
+                    if bool(use_struct_one_step)
+                    else 0.0
+                ),
+                line_search=False,
+                globalization="none",
+            ),
+            lin_params=LinearSolverParameters(backend=str(exact_structure_linear_backend)),
+            quad_order=solid_quad_order,
+            backend=str(backend),
+        )
+        use_kratos_structure_linear_permutation = _env_bool(
+            "PYCUTFEM_EX2_LOCAL_STRUCTURE_PERMUTE_TO_KRATOS_ORDER",
+            bool(use_kratos_structure_profile),
+        )
+        if bool(use_kratos_structure_linear_permutation):
+            structure_linear_perm = _structure_kratos_active_dof_permutation(
+                dh=solid["dh"],
+                mesh=mesh_s,
+                active_dofs=np.asarray(solid_solver.active_dofs, dtype=int),
+            )
+            if structure_linear_perm is not None and structure_linear_perm.size:
+                solid_solver._linear_solve_perm = np.asarray(structure_linear_perm, dtype=int)
+        solid_point_load_full = _boundary_point_load_vector(
+            solid["dh"],
+            vector=solid["d_k"],
+            tag=geometry.interface_tag,
+            values=load_guess_vals,
+        )
+        solid_point_load_red = np.asarray(
+            solid_point_load_full[np.asarray(solid_solver.active_dofs, dtype=int)],
+            dtype=float,
+        )
+        solid_runtime_ops: list[RuntimeOperator] = []
+        use_kratos_local_global_solid_system = (
+            kratos_local_solid_backend is not None
+            and _env_bool(
+                "PYCUTFEM_EX2_LOCAL_STRUCTURE_USE_KRATOS_GLOBAL_SYSTEM",
+                False,
+            )
+        )
+        use_kratos_local_structure_conditions = (
+            kratos_local_solid_backend is not None
+            and _env_bool(
+                "PYCUTFEM_EX2_LOCAL_STRUCTURE_USE_KRATOS_POINT_CONDITIONS",
+                False,
+            )
+        )
+        if bool(use_kratos_local_global_solid_system):
+            solid_runtime_ops.append(
+                _KratosLocalSolidGlobalSystemOperator(
+                    backend=kratos_local_solid_backend,
+                    d_k=solid["d_k"],
+                    structure_load=current_structure_load_lookup,
+                )
+            )
+        else:
+            if kratos_local_solid_backend is not None:
+                solid_runtime_ops.append(
+                    _KratosLocalSolidSystemOperator(
+                        backend=kratos_local_solid_backend,
+                        d_k=solid["d_k"],
+                        structure_load=(
+                            current_structure_load_lookup
+                            if bool(use_kratos_local_structure_conditions)
+                            else None
+                        ),
+                    )
+                )
+            if not bool(use_kratos_local_structure_conditions):
+                solid_runtime_ops.append(_ReducedResidualShiftOperator(solid_point_load_red))
+        solid_solver.set_runtime_operators(solid_runtime_ops)
+        if nirb_exact_fallback_guess_value == "zero":
+            solid_guess = [np.zeros_like(np.asarray(solid["d_k"].nodal_values, dtype=float))]
+        elif nirb_exact_fallback_guess_value == "previous":
+            solid_guess = [np.asarray(solid_prev_step_snapshot[0], dtype=float).copy()]
+        else:
+            solid_guess = _snapshot_function_values([solid["d_k"]])
+        _restore_function_values([solid["d_k"]], solid_guess)
+        _restore_function_values([solid["d_prev"]], solid_prev_step_snapshot)
+        _maybe_dump_structure_stage_probe(
+            output_dir=output_dir,
+            step=int(step_value),
+            coupling_iter=int(coupling_iter_value),
+            stage_label="pre_structure_solve_nirb_fallback",
+            dt=float(dt_value),
+            solid=solid,
+            interface_tag=geometry.interface_tag,
+            structure_load_lookup=current_structure_load_lookup,
+            point_load_full=solid_point_load_full,
+        )
+        solid_solver.solve_time_interval(
+            functions=[solid["d_k"]],
+            prev_functions=[solid["d_prev"]],
+            time_params=TimeStepperParameters(
+                dt=1.0,
+                max_steps=1,
+                final_time=1.0,
+                stop_on_steady=False,
+                step_initial_guess_callback=_guess_callback_from_snapshots_with_dirichlet(
+                    snapshots=solid_guess,
+                    dh=solid["dh"],
+                    bcs=solid_bcs,
+                ),
+            ),
+        )
+        _maybe_dump_structure_stage_probe(
+            output_dir=output_dir,
+            step=int(step_value),
+            coupling_iter=int(coupling_iter_value),
+            stage_label="post_structure_solve_nirb_fallback",
+            dt=float(dt_value),
+            solid=solid,
+            interface_tag=geometry.interface_tag,
+            structure_load_lookup=current_structure_load_lookup,
+            point_load_full=solid_point_load_full,
+        )
+        _restore_function_values([solid["d_prev"]], solid_prev_step_snapshot)
 
     disp_snapshots: list[np.ndarray] = (
         _column_list_from_matrix(np.load(co_sim_dir / "disp_data.npy"))
@@ -8274,6 +10827,8 @@ def run_local_example2(
             _advance_kratos_exact_structure_backend_step(backend=kratos_exact_structure_backend)
         if kratos_exact_fluid_backend is not None:
             _advance_kratos_exact_fluid_backend_step(backend=kratos_exact_fluid_backend)
+        elif kratos_hrom_exact_fallback_backend is not None:
+            _advance_kratos_exact_fluid_backend_step(backend=kratos_hrom_exact_fallback_backend)
         elif kratos_mesh_backend is not None:
             _advance_kratos_mesh_motion_backend_step(backend=kratos_mesh_backend)
         elif kratos_local_mesh_backend is not None:
@@ -8338,9 +10893,16 @@ def run_local_example2(
         current_load_lookup_step_start = _copy_lookup(current_load_lookup)
         iqn_old_dr_step_start = [np.asarray(mat, dtype=float).copy() for mat in iqn_old_dr_mats]
         iqn_old_dg_step_start = [np.asarray(mat, dtype=float).copy() for mat in iqn_old_dg_mats]
+        force_coeff_iqn_old_dr_step_start = [
+            np.asarray(mat, dtype=float).copy() for mat in force_coeff_iqn_old_dr_mats
+        ]
+        force_coeff_iqn_old_dg_step_start = [
+            np.asarray(mat, dtype=float).copy() for mat in force_coeff_iqn_old_dg_mats
+        ]
         allow_step_retries = (
             kratos_exact_structure_backend is None
             and kratos_exact_fluid_backend is None
+            and kratos_hrom_exact_fallback_backend is None
             and kratos_mesh_backend is None
         )
         if allow_step_retries:
@@ -8352,6 +10914,8 @@ def run_local_example2(
                 base_max_coupling_iters=int(max_coupling_iters),
                 base_max_newton_iter=int(max_newton_iter),
                 max_retries=int(step_retries),
+                retry_relaxations=step_retry_relaxations,
+                retry_updates=step_retry_updates,
             )
         else:
             retry_policies = [
@@ -8370,6 +10934,9 @@ def run_local_example2(
         last_mesh_vel_fluid_lookup: CoordinateLookup | None = None
         last_mesh_accel_fluid_lookup: CoordinateLookup | None = None
         last_fluid_accel_lookup: CoordinateLookup | None = None
+        last_impedance_interface_disp_lookup: CoordinateLookup | None = None
+        last_impedance_interface_velocity_lookup: CoordinateLookup | None = None
+        last_impedance_reaction_point_lookup: CoordinateLookup | None = None
         last_nirb_prediction = None
         coupling_iter = 0
         active_force_update = str(force_update).lower()
@@ -8424,6 +10991,8 @@ def run_local_example2(
             if bool(retry_policy.reset_interface_history):
                 iqn_old_dr_mats = deque(maxlen=max(int(force_history) - 1, 0))
                 iqn_old_dg_mats = deque(maxlen=max(int(force_history) - 1, 0))
+                force_coeff_iqn_old_dr_mats = deque(maxlen=max(int(force_history) - 1, 0))
+                force_coeff_iqn_old_dg_mats = deque(maxlen=max(int(force_history) - 1, 0))
             else:
                 iqn_old_dr_mats = deque(
                     [np.asarray(mat, dtype=float).copy() for mat in iqn_old_dr_step_start],
@@ -8431,6 +11000,14 @@ def run_local_example2(
                 )
                 iqn_old_dg_mats = deque(
                     [np.asarray(mat, dtype=float).copy() for mat in iqn_old_dg_step_start],
+                    maxlen=max(int(force_history) - 1, 0),
+                )
+                force_coeff_iqn_old_dr_mats = deque(
+                    [np.asarray(mat, dtype=float).copy() for mat in force_coeff_iqn_old_dr_step_start],
+                    maxlen=max(int(force_history) - 1, 0),
+                )
+                force_coeff_iqn_old_dg_mats = deque(
+                    [np.asarray(mat, dtype=float).copy() for mat in force_coeff_iqn_old_dg_step_start],
                     maxlen=max(int(force_history) - 1, 0),
                 )
 
@@ -8442,6 +11019,13 @@ def run_local_example2(
             prev_force_residual: np.ndarray | None = None
             load_guess_history = []
             load_return_history = []
+            force_coeff_guess_history = []
+            force_coeff_return_history = []
+            load_history_keep_for_old_iqn: list[bool] = []
+            force_coordinate_safety_disabled = False
+            force_coordinate_safety_step_tripped = False
+            last_force_coordinate_update_active = False
+            last_force_coordinate_update_backend = "inactive"
             prev_disp_iter_vals = np.asarray(step_prev_disp_iter_vals, dtype=float).copy()
             last_disp_abs = last_disp_rel = last_load_abs = last_load_rel = float("nan")
             last_force_omega = float(active_force_relaxation)
@@ -8449,8 +11033,15 @@ def run_local_example2(
             last_mesh_vel_fluid_lookup = None
             last_mesh_accel_fluid_lookup = None
             last_fluid_accel_lookup = None
+            last_impedance_interface_disp_lookup = None
+            last_impedance_interface_velocity_lookup = None
+            last_impedance_reaction_point_lookup = None
             last_nirb_prediction = None
+            previous_nirb_tangent_load_values: np.ndarray | None = None
+            previous_nirb_tangent_interface_values: np.ndarray | None = None
+            previous_nirb_tangent_full_values: np.ndarray | None = None
             consecutive_hrom_stages = 0
+            step_hrom_stages = 0
             increment_start = time.perf_counter()
 
             try:
@@ -8464,6 +11055,117 @@ def run_local_example2(
                     else:
                         current_structure_load_lookup = current_load_lookup
                     load_guess_vals = np.asarray(current_structure_load_lookup.values, dtype=float).copy()
+                    nirb_force_coefficients: np.ndarray | None = None
+                    nirb_force_coordinate_update_active = False
+                    nirb_force_coordinate_prediction_active = False
+                    nirb_force_coordinate_coeff_ratio = float("nan")
+                    nirb_force_coordinate_update_backend = "inactive"
+                    nirb_force_coordinate_clipped = False
+                    nirb_force_coordinate_safety_alpha = float("nan")
+                    nirb_force_coordinate_safety_reason = (
+                        "disabled_after_force_pod_failure"
+                        if bool(force_coordinate_safety_disabled)
+                        else "inactive"
+                    )
+                    nirb_force_trust_modified = False
+                    nirb_force_trust_projection_rel = float("nan")
+                    nirb_force_trust_coefficient_ratio = float("nan")
+                    nirb_force_trust_reason = "inactive"
+                    nirb_interface_trust_alpha = 1.0
+                    nirb_interface_disp_rel = float("nan")
+                    nirb_interface_step_ratio = float("nan")
+                    nirb_interface_corrected = False
+                    nirb_interface_rejected = False
+                    nirb_interface_reason = "inactive"
+                    nirb_exact_fallback_used = False
+                    nirb_fallback_reason = ""
+                    nirb_exact_gate_reason = ""
+                    if (
+                        nirb_solid_predictor is not None
+                        and int(step) >= int(nirb_start_step_value)
+                    ):
+                        if (
+                            int(nirb_exact_after_coupling_iter_value) > 0
+                            and int(coupling_iter) >= int(nirb_exact_after_coupling_iter_value)
+                        ):
+                            nirb_exact_gate_reason = (
+                                f"coupling_iter>={int(nirb_exact_after_coupling_iter_value)}"
+                            )
+                        elif (
+                            np.isfinite(float(nirb_exact_after_load_rel_value))
+                            and int(coupling_iter) > 1
+                            and np.isfinite(float(last_load_rel))
+                            and float(last_load_rel) > float(nirb_exact_after_load_rel_value)
+                        ):
+                            nirb_exact_gate_reason = (
+                                f"previous_load_rel>{float(nirb_exact_after_load_rel_value):.6e}"
+                            )
+                        elif (
+                            np.isfinite(float(nirb_exact_after_disp_rel_value))
+                            and int(coupling_iter) > 1
+                            and np.isfinite(float(last_disp_rel))
+                            and float(last_disp_rel) > float(nirb_exact_after_disp_rel_value)
+                        ):
+                            nirb_exact_gate_reason = (
+                                f"previous_disp_rel>{float(nirb_exact_after_disp_rel_value):.6e}"
+                            )
+                    if (
+                        nirb_force_manifold_trust_operator is not None
+                        and nirb_solid_predictor is not None
+                        and int(step) >= int(nirb_start_step_value)
+                    ):
+                        trust_result = nirb_force_manifold_trust_operator.apply(load_guess_vals)
+                        nirb_force_trust_modified = bool(trust_result.modified)
+                        nirb_force_trust_projection_rel = float(trust_result.projection_rel)
+                        nirb_force_trust_coefficient_ratio = float(trust_result.coefficient_ratio)
+                        nirb_force_trust_reason = str(trust_result.reason)
+                        nirb_force_coordinate_prediction_active = bool(
+                            nirb_force_coordinate_update_value in {"pod", "pod_clipped"}
+                            or (
+                                nirb_force_coordinate_update_value == "adaptive"
+                                and _nirb_force_trust_outside(
+                                    trust_result,
+                                    max_projection_rel=float(nirb_force_manifold_max_projection_rel_value),
+                                )
+                            )
+                        )
+                        if bool(trust_result.modified):
+                            current_structure_load_lookup = CoordinateLookup(
+                                solid_iface_coords,
+                                np.asarray(trust_result.values, dtype=float).reshape(-1, 2),
+                                dim=2,
+                            )
+                            if bool(accelerate_on_fluid_load):
+                                current_load_lookup = _resample_lookup_to_coords(
+                                    _negate_lookup(current_structure_load_lookup),
+                                    fluid_iface_coords,
+                                )
+                            else:
+                                current_load_lookup = current_structure_load_lookup
+                            load_guess_vals = np.asarray(current_structure_load_lookup.values, dtype=float).copy()
+                            _log(
+                                verbose,
+                                "[nirb] "
+                                f"step={step} coupling_iter={coupling_iter} "
+                                "force_manifold_projected=1 "
+                                f"proj_rel={float(nirb_force_trust_projection_rel):.3e} "
+                                f"coeff_ratio={float(nirb_force_trust_coefficient_ratio):.3e} "
+                                f"reason={nirb_force_trust_reason}",
+                            )
+
+                    if (
+                        nirb_force_manifold_trust_operator is not None
+                        and nirb_solid_predictor is not None
+                        and int(step) >= int(nirb_start_step_value)
+                    ):
+                        nirb_force_coefficients = nirb_force_manifold_trust_operator.coefficients(load_guess_vals)
+                        nirb_force_coordinate_coeff_ratio = (
+                            nirb_force_manifold_trust_operator.coefficient_ratio_from_coefficients(
+                                nirb_force_coefficients
+                            )
+                        )
+                        if nirb_force_coordinate_update_value in {"pod", "pod_clipped"}:
+                            nirb_force_coordinate_prediction_active = True
 
                     t_solid0 = time.perf_counter()
                     nirb_prediction = None
@@ -8477,12 +11179,210 @@ def run_local_example2(
                             target_vec=solid["d_k"],
                             source_lookup=kratos_structure_state["displacement"],
                         )
+                    elif (
+                        nirb_solid_predictor is not None
+                        and int(step) >= int(nirb_start_step_value)
+                        and bool(nirb_exact_gate_reason)
+                    ):
+                        if not bool(nirb_fallback_exact):
+                            raise RuntimeError(
+                                "NIRB solid certification requested exact fallback, but "
+                                "--no-nirb-fallback-exact is active: "
+                                f"reason={nirb_exact_gate_reason}"
+                            )
+                        nirb_exact_fallback_used = True
+                        nirb_exact_fallback_count += 1
+                        nirb_fallback_reason = str(nirb_exact_gate_reason)
+                        last_nirb_prediction = None
+                        _log(
+                            verbose,
+                            "[nirb] "
+                            f"step={step} coupling_iter={coupling_iter} "
+                            "exact_solid_fallback=1 "
+                            f"reason={nirb_fallback_reason}",
+                        )
+                        _solve_local_exact_solid_stage(
+                            current_structure_load_lookup=current_structure_load_lookup,
+                            load_guess_vals=load_guess_vals,
+                            solid_prev_step_snapshot=solid_prev_step,
+                            step_value=int(step),
+                            coupling_iter_value=int(coupling_iter),
+                        )
                     elif nirb_solid_predictor is not None and int(step) >= int(nirb_start_step_value):
-                        nirb_prediction = nirb_solid_predictor.predict_interface(load_guess_vals)
+                        if nirb_interface_predictor is not None:
+                            if (
+                                nirb_force_coefficients is not None
+                                and bool(nirb_force_coordinate_prediction_active)
+                            ):
+                                interface_prediction = (
+                                    nirb_interface_predictor.predict_interface_from_force_coefficients(
+                                        nirb_force_coefficients
+                                    )
+                                )
+                            else:
+                                interface_prediction = nirb_interface_predictor.predict_interface(load_guess_vals)
+                            interface_values = np.asarray(
+                                interface_prediction.interface_displacement,
+                                dtype=float,
+                            ).reshape(-1)
+                            if interface_values.size != int(solid_iface_coords.shape[0] * 2):
+                                raise RuntimeError(
+                                    "Direct NIRB interface model returned incompatible interface size: "
+                                    f"{interface_values.size} != {int(solid_iface_coords.shape[0] * 2)}"
+                                )
+                            if (
+                                nirb_force_coefficients is not None
+                                and bool(nirb_force_coordinate_prediction_active)
+                            ):
+                                full_prediction = nirb_solid_predictor.predict_from_force_coefficients(
+                                    nirb_force_coefficients
+                                )
+                            else:
+                                full_prediction = nirb_solid_predictor.predict(load_guess_vals)
+                            nirb_prediction = replace(
+                                full_prediction,
+                                interface_displacement=interface_values.reshape(-1, 2),
+                            )
+                        else:
+                            if (
+                                nirb_force_coefficients is not None
+                                and bool(nirb_force_coordinate_prediction_active)
+                            ):
+                                nirb_prediction = nirb_solid_predictor.predict_interface_from_force_coefficients(
+                                    nirb_force_coefficients
+                                )
+                            else:
+                                nirb_prediction = nirb_solid_predictor.predict_interface(load_guess_vals)
+                        if (
+                            nirb_interface_tangent is not None
+                            and nirb_interface_tangent.full_tangent is not None
+                            and nirb_prediction.full_displacement is None
+                            and nirb_prediction.reduced_displacement is not None
+                        ):
+                            nirb_prediction = replace(
+                                nirb_prediction,
+                                full_displacement=nirb_solid_predictor.reconstruct_full(
+                                    nirb_prediction.reduced_displacement
+                                ),
+                            )
+                        if (
+                            nirb_interface_tangent is not None
+                            and int(coupling_iter) >= int(nirb_interface_tangent_start_iter_value)
+                            and previous_nirb_tangent_load_values is not None
+                            and previous_nirb_tangent_interface_values is not None
+                        ):
+                            nirb_prediction, tangent_info = _apply_nirb_interface_tangent_correction(
+                                prediction=nirb_prediction,
+                                corrector=nirb_interface_tangent,
+                                blend=float(nirb_interface_tangent_blend_value),
+                                max_rel=float(nirb_interface_tangent_max_rel_value),
+                                map_used=map_used,
+                                previous_load_values=previous_nirb_tangent_load_values,
+                                current_load_values=load_guess_vals,
+                                previous_interface_values=previous_nirb_tangent_interface_values,
+                                previous_full_displacement=previous_nirb_tangent_full_values,
+                            )
+                            _log(
+                                verbose,
+                                "[nirb] "
+                                f"step={step} coupling_iter={coupling_iter} "
+                                f"tangent_used={int(bool(tangent_info['used']))} "
+                                f"blend={float(tangent_info['blend']):.3e} "
+                                f"rel={float(tangent_info['rel']):.3e}",
+                            )
                         predicted_interface = np.asarray(nirb_prediction.interface_displacement, dtype=float)
                         if not np.all(np.isfinite(predicted_interface)):
-                            raise RuntimeError("NIRB solid predictor returned non-finite interface displacement values.")
-                        last_nirb_prediction = nirb_prediction
+                            nirb_fallback_reason = "nonfinite_interface_displacement"
+                            if not bool(nirb_fallback_exact):
+                                raise RuntimeError(
+                                    "NIRB solid predictor returned non-finite interface displacement values."
+                                )
+                            nirb_exact_fallback_used = True
+                            nirb_exact_fallback_count += 1
+                            nirb_prediction = None
+                            _log(
+                                verbose,
+                                "[nirb] "
+                                f"step={step} coupling_iter={coupling_iter} "
+                                "exact_solid_fallback=1 reason=nonfinite_interface_displacement",
+                            )
+                            _solve_local_exact_solid_stage(
+                                current_structure_load_lookup=current_structure_load_lookup,
+                                load_guess_vals=load_guess_vals,
+                                solid_prev_step_snapshot=solid_prev_step,
+                                step_value=int(step),
+                                coupling_iter_value=int(coupling_iter),
+                            )
+                            last_nirb_prediction = None
+                        if nirb_prediction is not None and str(nirb_interface_trust_value) != "none":
+                            trust_result = _fluid_hrom_interface_trust_region(
+                                current_values=np.asarray(prev_disp_iter_vals, dtype=float),
+                                proposed_values=np.asarray(predicted_interface, dtype=float).reshape(-1, 2),
+                                previous_load_abs=float(last_disp_abs),
+                                mode=str(nirb_interface_trust_value),
+                                max_step_ratio=float(nirb_interface_max_step_ratio_value),
+                                max_load_rel=float(nirb_interface_max_disp_rel_value),
+                                min_correction_alpha=float(nirb_interface_min_correction_alpha_value),
+                            )
+                            nirb_interface_trust_alpha = float(trust_result.alpha)
+                            nirb_interface_disp_rel = float(trust_result.update_rel)
+                            nirb_interface_step_ratio = float(trust_result.step_ratio)
+                            nirb_interface_reason = str(trust_result.reason)
+                            if not bool(trust_result.accepted):
+                                nirb_interface_rejected = True
+                                nirb_interface_reject_count += 1
+                                nirb_fallback_reason = f"interface_trust:{trust_result.reason}"
+                                if not bool(nirb_fallback_exact):
+                                    raise RuntimeError(
+                                        "NIRB interface trust monitor failed: "
+                                        f"reason={trust_result.reason} "
+                                        f"disp_rel={float(trust_result.update_rel):.6e} "
+                                        f"step_ratio={float(trust_result.step_ratio):.6e} "
+                                        f"alpha={float(trust_result.alpha):.6e}"
+                                    )
+                                nirb_exact_fallback_used = True
+                                nirb_exact_fallback_count += 1
+                                nirb_prediction = None
+                                _log(
+                                    verbose,
+                                    "[nirb] "
+                                    f"step={step} coupling_iter={coupling_iter} "
+                                    "exact_solid_fallback=1 "
+                                    f"reason={nirb_fallback_reason}",
+                                )
+                                _solve_local_exact_solid_stage(
+                                    current_structure_load_lookup=current_structure_load_lookup,
+                                    load_guess_vals=load_guess_vals,
+                                    solid_prev_step_snapshot=solid_prev_step,
+                                    step_value=int(step),
+                                    coupling_iter_value=int(coupling_iter),
+                                )
+                                last_nirb_prediction = None
+                            if bool(trust_result.corrected):
+                                nirb_interface_corrected = True
+                                nirb_interface_correction_count += 1
+                                nirb_prediction = replace(
+                                    nirb_prediction,
+                                    interface_displacement=np.asarray(
+                                        trust_result.values,
+                                        dtype=float,
+                                    ).reshape(-1, 2),
+                                )
+                                predicted_interface = np.asarray(
+                                    nirb_prediction.interface_displacement,
+                                    dtype=float,
+                                )
+                                _log(
+                                    verbose,
+                                    "[nirb] "
+                                    f"step={step} coupling_iter={coupling_iter} "
+                                    "interface_displacement_clipped=1 "
+                                    f"alpha={float(trust_result.alpha):.3e} "
+                                    f"disp_rel={float(trust_result.update_rel):.3e} "
+                                    f"step_ratio={float(trust_result.step_ratio):.3e}",
+                                )
+                        if nirb_prediction is not None:
+                            last_nirb_prediction = nirb_prediction
                     elif solid_operator_mode == "porous":
                         solid_res, solid_jac, solid_bcs, solid_bcs_homog = _porous_solid_residual_and_jacobian(
                             prob=solid,
@@ -8815,6 +11715,17 @@ def run_local_example2(
                             a_prev_lookup=prev_iface_mesh_acc_lookup,
                             bossak_alpha=float(bossak_alpha),
                         )
+                    if nirb_prediction is not None and nirb_interface_tangent is not None:
+                        previous_nirb_tangent_load_values = np.asarray(load_guess_vals, dtype=float).reshape(-1).copy()
+                        previous_nirb_tangent_interface_values = np.asarray(
+                            solid_disp_solid_lookup.values,
+                            dtype=float,
+                        ).reshape(-1).copy()
+                        previous_nirb_tangent_full_values = (
+                            None
+                            if nirb_prediction.full_displacement is None
+                            else np.asarray(nirb_prediction.full_displacement, dtype=float).reshape(-1).copy()
+                        )
                     # Kratos uses a nearest-neighbor mapper for structure
                     # DISPLACEMENT -> fluid MESH_DISPLACEMENT in DoubleFlap. Replicate
                     # that transfer instead of evaluating the solid FE field directly
@@ -8916,6 +11827,33 @@ def run_local_example2(
                                 reaction_point_load_lookup=reaction_point_load_lookup,
                                 reaction_solid_load_lookup=reaction_solid_load_lookup,
                             )
+                            if (
+                                fluid_hrom_adaptive_db_path is not None
+                                and bool(fluid_hrom_adaptive_pre_dumped)
+                                and not bool(fluid_hrom_used)
+                            ):
+                                _maybe_dump_exact_fluid_probe(
+                                    output_dir=fluid_hrom_adaptive_db_path,
+                                    step=int(step),
+                                    coupling_iter=int(coupling_iter),
+                                    stage_label="post_fluid_solve",
+                                    bc_scale=float(continuation_scales[-1]),
+                                    dt=float(dt_value),
+                                    bossak_alpha=float(bossak_alpha),
+                                    fluid=fluid,
+                                    reaction_point_load_lookup=reaction_point_load_lookup,
+                                    reaction_solid_load_lookup=reaction_solid_load_lookup,
+                                    force=True,
+                                    extra_payload={
+                                        "adaptive_hrom_attempt": np.asarray(1, dtype=int),
+                                        "adaptive_stage_role": np.asarray("post"),
+                                        "adaptive_reason": np.asarray(str(fluid_hrom_fallback_reason or "exact_correction")),
+                                        "adaptive_manifold_distance": np.asarray(float(fluid_hrom_manifold_distance)),
+                                        "adaptive_eta_gamma": np.asarray(float(fluid_hrom_eta_gamma)),
+                                        "adaptive_dwr_error": np.asarray(float(fluid_hrom_dwr_error)),
+                                    },
+                                )
+                                sampled_lspg_hybrid_adaptive_stage_dump_count += 1
                         continuation_scales = (1.0,)
                     else:
                         t_mesh_stage0 = time.perf_counter()
@@ -8995,6 +11933,47 @@ def run_local_example2(
                                     dim=2,
                                 ),
                             )
+                        elif reduced_mesh_surrogate is not None:
+                            mesh_values = reduced_mesh_surrogate.predict_nodal_displacement(
+                                np.asarray(solid_disp_solid_lookup.values, dtype=float)
+                            )
+                            mesh_lookup = CoordinateLookup(
+                                np.asarray(mesh_f.nodes_x_y_pos, dtype=float),
+                                np.asarray(mesh_values, dtype=float),
+                                dim=2,
+                            )
+                            _transfer_vector_field(
+                                target_dh=fluid["dh"],
+                                target_vec=fluid["d_mesh"],
+                                source_lookup=mesh_lookup,
+                            )
+                            _transfer_vector_field(
+                                target_dh=mesh_ext["dh"],
+                                target_vec=mesh_ext["m_k"],
+                                source_lookup=mesh_lookup,
+                            )
+                            mesh_ext["m_prev_geom"].nodal_values.fill(0.0)
+                            mesh_vel_full_lookup, mesh_accel_full_lookup = _vector_history_full_lookup(
+                                dh=fluid["dh"],
+                                d_curr=fluid["d_mesh"],
+                                d_prev=fluid["d_prev"],
+                                v_prev=fluid["w_mesh_prev"],
+                                a_prev=fluid["a_mesh_prev"],
+                                dt=dt_value,
+                                alpha=float(bossak_alpha),
+                            )
+                            _transfer_vector_field(
+                                target_dh=fluid["dh"],
+                                target_vec=fluid["w_mesh_k"],
+                                source_lookup=mesh_vel_full_lookup,
+                            )
+                            _transfer_vector_field(
+                                target_dh=fluid["dh"],
+                                target_vec=fluid["a_mesh_k"],
+                                source_lookup=mesh_accel_full_lookup,
+                            )
+                            mesh_vel_fluid_lookup = _resample_lookup_to_coords(mesh_vel_full_lookup, fluid_iface_coords)
+                            mesh_accel_fluid_lookup = _resample_lookup_to_coords(mesh_accel_full_lookup, fluid_iface_coords)
                         else:
                             use_local_mesh_current_geometry = _env_bool(
                                 "PYCUTFEM_EX2_LOCAL_MESH_USE_CURRENT_GEOMETRY",
@@ -9077,18 +12056,23 @@ def run_local_example2(
                             d_geo=fluid["d_mesh"],
                             backend=str(backend),
                         )
-                        _warm_fluid_exact_operator_kernels(
-                            prob=fluid,
-                            mesh=mesh_f,
-                            rho_f=float(setup.material.density),
-                            mu_f=mu_f,
-                            dt=dt_value,
-                            bossak_alpha=float(bossak_alpha),
-                            dynamic_tau=float(dynamic_tau),
-                            quad_order=quad_order,
-                            backend=str(backend),
-                            contribution_mode="system",
+                        use_kratos_hrom_exact_fallback_stage = bool(
+                            use_sampled_lspg_hybrid_fluid
+                            and kratos_hrom_exact_fallback_backend is not None
                         )
+                        if not bool(use_kratos_hrom_exact_fallback_stage):
+                            _warm_fluid_exact_operator_kernels(
+                                prob=fluid,
+                                mesh=mesh_f,
+                                rho_f=float(setup.material.density),
+                                mu_f=mu_f,
+                                dt=dt_value,
+                                bossak_alpha=float(bossak_alpha),
+                                dynamic_tau=float(dynamic_tau),
+                                quad_order=quad_order,
+                                backend=str(backend),
+                                contribution_mode="system",
+                            )
         
                         # Kratos does not use an artificial step-1 continuation path for
                         # the fluid stage. Keep the production default on the direct
@@ -9111,61 +12095,65 @@ def run_local_example2(
                             fluid_guess[1].fill(0.0)
                         if _env_bool("PYCUTFEM_EX2_ZERO_VELOCITY_GUESS", False):
                             fluid_guess[0].fill(0.0)
-                        fluid_exact_operator = FluidDVMSCondensedLocalSystemOperator(
-                            mesh=mesh_f,
-                            dh=fluid["dh"],
-                            u_k=fluid["u_k"],
-                            u_prev=fluid["u_prev"],
-                            a_prev=fluid["a_prev"],
-                            a_curr=fluid["a_k"],
-                            p_k=fluid["p_k"],
-                            d_mesh=fluid["d_mesh"],
-                            d_prev=fluid["d_prev"],
-                            d_prev2=fluid["d_prev2"],
-                            mesh_v=fluid["w_mesh_k"],
-                            mesh_v_prev=fluid["w_mesh_prev"],
-                            mesh_a_prev=fluid["a_mesh_prev"],
-                            state=fluid["dvms_state"],
-                            rho_f=float(setup.material.density),
-                            mu_f=mu_f,
-                            dt=dt_value,
-                            bossak_alpha=float(bossak_alpha),
-                            quadrature_order=quad_order,
-                            dynamic_tau=float(dynamic_tau),
-                            refresh_predicted_subscale=False,
-                            apply_dirichlet_lift=False,
-                        )
-                        fluid_predictor_operator = _FluidDVMSSolverOperator(
-                            state=fluid["dvms_state"],
-                            dh=fluid["dh"],
-                            mesh=mesh_f,
-                            u_k=fluid["u_k"],
-                            u_prev=fluid["u_prev"],
-                            a_prev=fluid["a_prev"],
-                            a_curr=fluid["a_k"],
-                            p_k=fluid["p_k"],
-                            d_mesh=fluid["d_mesh"],
-                            d_prev=fluid["d_prev"],
-                            d_prev2=fluid["d_prev2"],
-                            mesh_v=fluid["w_mesh_k"],
-                            mesh_v_prev=fluid["w_mesh_prev"],
-                            mesh_a_prev=fluid["a_mesh_prev"],
-                            rho_f=float(setup.material.density),
-                            mu_f=mu_f,
-                            dt=dt_value,
-                            bossak_alpha=float(bossak_alpha),
-                            dynamic_tau=float(dynamic_tau),
-                            reset_predicted_to_old_on_step_begin=_env_bool(
-                                "PYCUTFEM_EX2_RESET_PREDICTED_SUBSCALE_EACH_FLUID_STAGE",
-                                False,
-                            ),
-                        )
-                        fluid_acceleration_operator = _FluidBossakAccelerationOperator(
-                            u_k=fluid["u_k"],
-                            a_k=fluid["a_k"],
-                            dt=dt_value,
-                            bossak_alpha=float(bossak_alpha),
-                        )
+                        fluid_exact_operator = None
+                        fluid_predictor_operator = None
+                        fluid_acceleration_operator = None
+                        if not bool(use_kratos_hrom_exact_fallback_stage):
+                            fluid_exact_operator = FluidDVMSCondensedLocalSystemOperator(
+                                mesh=mesh_f,
+                                dh=fluid["dh"],
+                                u_k=fluid["u_k"],
+                                u_prev=fluid["u_prev"],
+                                a_prev=fluid["a_prev"],
+                                a_curr=fluid["a_k"],
+                                p_k=fluid["p_k"],
+                                d_mesh=fluid["d_mesh"],
+                                d_prev=fluid["d_prev"],
+                                d_prev2=fluid["d_prev2"],
+                                mesh_v=fluid["w_mesh_k"],
+                                mesh_v_prev=fluid["w_mesh_prev"],
+                                mesh_a_prev=fluid["a_mesh_prev"],
+                                state=fluid["dvms_state"],
+                                rho_f=float(setup.material.density),
+                                mu_f=mu_f,
+                                dt=dt_value,
+                                bossak_alpha=float(bossak_alpha),
+                                quadrature_order=quad_order,
+                                dynamic_tau=float(dynamic_tau),
+                                refresh_predicted_subscale=False,
+                                apply_dirichlet_lift=False,
+                            )
+                            fluid_predictor_operator = _FluidDVMSSolverOperator(
+                                state=fluid["dvms_state"],
+                                dh=fluid["dh"],
+                                mesh=mesh_f,
+                                u_k=fluid["u_k"],
+                                u_prev=fluid["u_prev"],
+                                a_prev=fluid["a_prev"],
+                                a_curr=fluid["a_k"],
+                                p_k=fluid["p_k"],
+                                d_mesh=fluid["d_mesh"],
+                                d_prev=fluid["d_prev"],
+                                d_prev2=fluid["d_prev2"],
+                                mesh_v=fluid["w_mesh_k"],
+                                mesh_v_prev=fluid["w_mesh_prev"],
+                                mesh_a_prev=fluid["a_mesh_prev"],
+                                rho_f=float(setup.material.density),
+                                mu_f=mu_f,
+                                dt=dt_value,
+                                bossak_alpha=float(bossak_alpha),
+                                dynamic_tau=float(dynamic_tau),
+                                reset_predicted_to_old_on_step_begin=_env_bool(
+                                    "PYCUTFEM_EX2_RESET_PREDICTED_SUBSCALE_EACH_FLUID_STAGE",
+                                    False,
+                                ),
+                            )
+                            fluid_acceleration_operator = _FluidBossakAccelerationOperator(
+                                u_k=fluid["u_k"],
+                                a_k=fluid["a_k"],
+                                dt=dt_value,
+                                bossak_alpha=float(bossak_alpha),
+                            )
                         first_build_old_subscale_mode = _env_str(
                             "PYCUTFEM_EX2_FIRST_BUILD_OLD_SUBSCALE_MODE",
                             "",
@@ -9201,26 +12189,42 @@ def run_local_example2(
                         # nonlinear iteration; the carried predicted subscale is
                         # the Newton initial guess inside that refresh, not a
                         # replacement for the refresh itself.
-                        if bool(apply_first_build_old_subscale):
+                        if fluid_predictor_operator is not None and bool(apply_first_build_old_subscale):
                             fluid_predictor_operator.arm_initial_old_subscale_build()
-                        elif bool(apply_preserve_predicted_subscale):
+                        elif fluid_predictor_operator is not None and bool(apply_preserve_predicted_subscale):
                             fluid_predictor_operator.preserve_initial_predicted_subscale()
                         for bc_scale in continuation_scales:
-                            fluid_predictor_operator.configure_first_assembly_probe(
-                                output_dir=output_dir,
-                                step=int(step),
-                                coupling_iter=int(coupling_iter),
-                                bc_scale=float(bc_scale),
-                                dt=float(dt_value),
-                                bossak_alpha=float(bossak_alpha),
-                            )
+                            if fluid_predictor_operator is not None:
+                                fluid_predictor_operator.configure_first_assembly_probe(
+                                    output_dir=output_dir,
+                                    step=int(step),
+                                    coupling_iter=int(coupling_iter),
+                                    bc_scale=float(bc_scale),
+                                    dt=float(dt_value),
+                                    bossak_alpha=float(bossak_alpha),
+                                )
                             scaled_iface_velocity = _scaled_lookup(mesh_vel_fluid_lookup, float(bc_scale))
                             scale_value = float(bc_scale)
         
                             def _scaled_inlet_profile(x: float, y: float) -> float:
                                 return scale_value * float(inlet_profile(x, y))
         
-                            if use_exact_fluid_operator:
+                            stage_solver = None
+                            stage_ops: list[RuntimeOperator] = []
+                            if bool(use_kratos_hrom_exact_fallback_stage):
+                                fluid_bcs, fluid_bcs_homog = _fluid_boundary_conditions(
+                                    iface_velocity=scaled_iface_velocity,
+                                    inlet_lookup=_scaled_inlet_profile,
+                                    interface_tag=geometry.interface_tag,
+                                    outlet_tag=geometry.outlet_tag,
+                                    walls_tag=geometry.walls_tag,
+                                    cylinder_tag=geometry.cylinder_tag,
+                                )
+                                stage_max_newton_iter = 0
+                                stage_globalization = "kratos_live_fallback"
+                                stage_line_search = False
+                                stage_ls_fail_hard = True
+                            elif use_exact_fluid_operator:
                                 fluid_res, fluid_jac, fluid_bcs, fluid_bcs_homog = _fluid_zero_local_operator_forms(
                                     prob=fluid,
                                     iface_velocity=scaled_iface_velocity,
@@ -9334,18 +12338,21 @@ def run_local_example2(
                                         0.0 if fluid_mixed_solution_criteria else float(exact_fluid_newton_tol),
                                     )
                                 )
-                            stage_newton_params = NewtonParameters(
-                                newton_tol=float(stage_newton_tol),
-                                max_newton_iter=int(stage_max_newton_iter),
-                                line_search=bool(stage_line_search),
-                                ls_fail_hard=bool(stage_ls_fail_hard),
-                                globalization=str(stage_globalization),
-                                mixed_solution_criteria=fluid_mixed_solution_criteria,
-                                mixed_solution_max_residual_factor=float(fluid_mixed_solution_residual_factor),
-                                mixed_solution_residual_tol=float(exact_fluid_newton_tol),
-                            )
-                            stage_lin_params = LinearSolverParameters(backend=str(stage_linear_backend))
-                            if use_exact_fluid_operator:
+                            stage_newton_params = None
+                            stage_lin_params = None
+                            if not bool(use_kratos_hrom_exact_fallback_stage):
+                                stage_newton_params = NewtonParameters(
+                                    newton_tol=float(stage_newton_tol),
+                                    max_newton_iter=int(stage_max_newton_iter),
+                                    line_search=bool(stage_line_search),
+                                    ls_fail_hard=bool(stage_ls_fail_hard),
+                                    globalization=str(stage_globalization),
+                                    mixed_solution_criteria=fluid_mixed_solution_criteria,
+                                    mixed_solution_max_residual_factor=float(fluid_mixed_solution_residual_factor),
+                                    mixed_solution_residual_tol=float(exact_fluid_newton_tol),
+                                )
+                                stage_lin_params = LinearSolverParameters(backend=str(stage_linear_backend))
+                            if use_exact_fluid_operator and not bool(use_kratos_hrom_exact_fallback_stage):
                                 stage_solver = _get_or_create_cached_stage_solver(
                                     cache_owner=fluid,
                                     cache_name="_stage_solver_cache",
@@ -9374,7 +12381,7 @@ def run_local_example2(
                                     operators=stage_ops,
                                     active_fields=("ux", "uy", "p"),
                                 )
-                            else:
+                            elif not bool(use_kratos_hrom_exact_fallback_stage):
                                 stage_solver = NewtonSolver(
                                     residual_form=fluid_res,
                                     jacobian_form=fluid_jac,
@@ -9389,30 +12396,80 @@ def run_local_example2(
                                     operators=stage_ops,
                                 )
                                 stage_solver.set_active_fields(["ux", "uy", "p"])
-                            _attach_runtime_operator_post_update_hook(
-                                solver=stage_solver,
-                                operators=stage_ops,
-                            )
+                            fluid_newton_iterate_dump_callbacks: list[Callable[..., None]] = []
+                            if bool(use_exact_fluid_operator) and _env_bool(
+                                "PYCUTFEM_EX2_DUMP_FLUID_NEWTON_ITERATES",
+                                False,
+                            ):
+                                fluid_newton_iterate_dump_counter = {"value": 0}
+
+                                def _dump_fluid_newton_iterate_probe(*, solver, functions) -> None:
+                                    del solver, functions
+                                    fluid_newton_iterate_dump_counter["value"] += 1
+                                    reaction_point_lookup = None
+                                    reaction_solid_lookup = None
+                                    if _env_bool("PYCUTFEM_EX2_DUMP_FLUID_NEWTON_ITERATE_REACTION", True):
+                                        reaction_point_lookup = _fluid_interface_reaction_loads(
+                                            prob=fluid,
+                                            rho_f=float(setup.material.density),
+                                            mu_f=mu_f,
+                                            dt=dt_value,
+                                            quad_order=quad_order,
+                                            bossak_alpha=float(bossak_alpha),
+                                            dynamic_tau=float(dynamic_tau),
+                                            interface_tag=geometry.interface_tag,
+                                            backend=str(backend),
+                                            contribution_mode="system",
+                                            refresh_state=False,
+                                        )
+                                        reaction_solid_lookup = _resample_lookup_to_coords(
+                                            _negate_lookup(reaction_point_lookup),
+                                            solid_iface_coords,
+                                        )
+                                    _maybe_dump_exact_fluid_probe(
+                                        output_dir=output_dir,
+                                        step=int(step),
+                                        coupling_iter=int(coupling_iter),
+                                        stage_label=(
+                                            "newton_iter"
+                                            f"{int(fluid_newton_iterate_dump_counter['value']):04d}"
+                                        ),
+                                        bc_scale=float(bc_scale),
+                                        dt=float(dt_value),
+                                        bossak_alpha=float(bossak_alpha),
+                                        fluid=fluid,
+                                        reaction_point_load_lookup=reaction_point_lookup,
+                                        reaction_solid_load_lookup=reaction_solid_lookup,
+                                    )
+
+                                fluid_newton_iterate_dump_callbacks.append(_dump_fluid_newton_iterate_probe)
+                            if stage_solver is not None:
+                                _attach_runtime_operator_post_update_hook(
+                                    solver=stage_solver,
+                                    operators=stage_ops,
+                                    extra_callbacks=fluid_newton_iterate_dump_callbacks,
+                                )
                             _restore_function_values([fluid["u_prev"], fluid["p_prev"]], fluid_prev_step)
                             _restore_function_values(
                                 [fluid["d_prev"], fluid["d_prev2"], fluid["w_mesh_prev"], fluid["a_mesh_prev"]],
                                 fluid_mesh_prev_step,
                             )
                             fluid_a_prev_stage = np.asarray(fluid["a_prev"].nodal_values, dtype=float).copy()
-                            fluid_acceleration_operator.prime_stage_state(
-                                u_prev_snapshot=np.asarray(fluid_prev_step[0], dtype=float),
-                                a_prev_snapshot=np.asarray(fluid_a_prev_stage, dtype=float),
-                                # Kratos does not refresh ACCELERATION when the
-                                # ALE/interface boundary state is synchronized
-                                # before the fluid solve. The first nonlinear
-                                # assembly sees the carried value from the
-                                # previous fluid solve; subsequent assemblies
-                                # are refreshed after Newton velocity updates.
-                                preserve_seed_on_first_assembly=_env_bool(
-                                    "PYCUTFEM_EX2_PRESERVE_FLUID_ACCELERATION_SEED",
-                                    True,
-                                ),
-                            )
+                            if fluid_acceleration_operator is not None:
+                                fluid_acceleration_operator.prime_stage_state(
+                                    u_prev_snapshot=np.asarray(fluid_prev_step[0], dtype=float),
+                                    a_prev_snapshot=np.asarray(fluid_a_prev_stage, dtype=float),
+                                    # Kratos does not refresh ACCELERATION when the
+                                    # ALE/interface boundary state is synchronized
+                                    # before the fluid solve. The first nonlinear
+                                    # assembly sees the carried value from the
+                                    # previous fluid solve; subsequent assemblies
+                                    # are refreshed after Newton velocity updates.
+                                    preserve_seed_on_first_assembly=_env_bool(
+                                        "PYCUTFEM_EX2_PRESERVE_FLUID_ACCELERATION_SEED",
+                                        True,
+                                    ),
+                                )
                             if use_exact_fluid_operator:
                                 _maybe_dump_exact_fluid_probe(
                                     output_dir=output_dir,
@@ -9433,6 +12490,9 @@ def run_local_example2(
                             fluid_hrom_trial_disabled_by_monitor = False
                             hrom_trial_return_load_values: np.ndarray | None = None
                             fluid_hrom_fallback_reason = ""
+                            fluid_hrom_manifold_distance = float("nan")
+                            fluid_hrom_eta_gamma = float("nan")
+                            fluid_hrom_dwr_error = float("nan")
                             fluid_hrom_info: dict[str, object] | None = None
                             fluid_hrom_interface_trust_alpha = 1.0
                             fluid_hrom_interface_load_rel = float("nan")
@@ -9440,15 +12500,36 @@ def run_local_example2(
                             fluid_hrom_interface_corrected = False
                             fluid_hrom_interface_rejected = False
                             fluid_hrom_interface_reason = ""
+                            fluid_hrom_certified_relaxation_reason = "inactive"
+                            fluid_hrom_stage_sample_local_state_writes = False
                             hrom_reaction_point_load_lookup: CoordinateLookup | None = None
                             hrom_reaction_solid_load_lookup: CoordinateLookup | None = None
                             hrom_stress_point_load_lookup: CoordinateLookup | None = None
+                            hrom_accel_lookup: CoordinateLookup | None = None
+                            hrom_reaction_source = ""
+                            fluid_hrom_impedance_used = False
+                            fluid_hrom_impedance_blend_used = 0.0
+                            fluid_hrom_impedance_rel = float("nan")
+                            fluid_hrom_adaptive_pre_dumped = False
+                            fluid_stage_used_kratos_hrom_fallback = False
+                            hrom_load_only_commit = False
+                            hrom_history: object | None = None
+                            hrom_state_guess: list[np.ndarray] | None = None
+                            hrom_a_guess: np.ndarray | None = None
+                            active_hrom_switch_iter = int(sampled_lspg_hybrid_switch_iter)
+                            if (
+                                sampled_lspg_hybrid_late_switch_iter is not None
+                                and int(sampled_lspg_hybrid_late_switch_step) > 0
+                                and int(step) >= int(sampled_lspg_hybrid_late_switch_step)
+                            ):
+                                active_hrom_switch_iter = int(sampled_lspg_hybrid_late_switch_iter)
                             hrom_iteration_gate = bool(
                                 use_sampled_lspg_hybrid_fluid
                                 and sampled_lspg_hybrid_model is not None
-                                and int(coupling_iter) >= int(sampled_lspg_hybrid_switch_iter)
+                                and int(coupling_iter) >= int(active_hrom_switch_iter)
                                 and float(bc_scale) == float(continuation_scales[-1])
                             )
+                            hrom_start_step_ok = bool(int(step) >= int(sampled_lspg_hybrid_start_step))
                             hrom_previous_load_high_ok = bool(
                                 int(coupling_iter) > 1
                                 and np.isfinite(float(last_load_rel))
@@ -9468,28 +12549,47 @@ def run_local_example2(
                                 int(fluid_hrom_max_consecutive_stages_value) <= 0
                                 or int(consecutive_hrom_stages) < int(fluid_hrom_max_consecutive_stages_value)
                             )
+                            hrom_step_budget_ok = bool(
+                                int(fluid_hrom_max_stages_per_step_value) <= 0
+                                or int(step_hrom_stages) < int(fluid_hrom_max_stages_per_step_value)
+                            )
+                            hrom_coupling_iter_ok = bool(
+                                int(fluid_hrom_max_coupling_iter_value) <= 0
+                                or int(coupling_iter) <= int(fluid_hrom_max_coupling_iter_value)
+                            )
                             hrom_disabled_ok = int(step) > int(fluid_hrom_disabled_until_step)
                             use_hrom_stage = bool(
                                 hrom_iteration_gate
+                                and hrom_start_step_ok
                                 and hrom_previous_load_high_ok
                                 and hrom_previous_load_low_ok
                                 and hrom_previous_disp_ok
                                 and hrom_consecutive_ok
+                                and hrom_step_budget_ok
+                                and hrom_coupling_iter_ok
                                 and hrom_disabled_ok
                             )
                             if bool(hrom_iteration_gate) and not bool(use_hrom_stage):
+                                if not bool(hrom_start_step_ok):
+                                    sampled_lspg_hybrid_start_gate_skips += 1
                                 if not (bool(hrom_previous_load_high_ok) and bool(hrom_previous_load_low_ok)):
                                     sampled_lspg_hybrid_load_gate_skips += 1
                                 if not bool(hrom_previous_disp_ok):
                                     sampled_lspg_hybrid_disp_gate_skips += 1
                                 if not bool(hrom_consecutive_ok):
                                     sampled_lspg_hybrid_consecutive_gate_skips += 1
+                                if not bool(hrom_step_budget_ok):
+                                    sampled_lspg_hybrid_step_gate_skips += 1
+                                if not bool(hrom_coupling_iter_ok):
+                                    sampled_lspg_hybrid_coupling_iter_gate_skips += 1
                                 if not bool(hrom_disabled_ok):
                                     sampled_lspg_hybrid_disabled_gate_skips += 1
                                 _log(
                                     verbose,
                                     "[fluid-hrom] "
                                     f"step={step} coupling_iter={coupling_iter} gate_skip=1 "
+                                    f"start_step={int(sampled_lspg_hybrid_start_step)} "
+                                    f"switch_iter={int(active_hrom_switch_iter)} "
                                     f"previous_load_rel={float(last_load_rel):.3e} "
                                     f"load_gate=[{float(fluid_hrom_min_previous_load_rel_value):.3e}, "
                                     f"{float(fluid_hrom_max_previous_load_rel_value):.3e}] "
@@ -9497,12 +12597,69 @@ def run_local_example2(
                                     f"disp_gate={float(fluid_hrom_max_previous_disp_rel):.3e} "
                                     f"consecutive={int(consecutive_hrom_stages)} "
                                     f"max_consecutive={int(fluid_hrom_max_consecutive_stages_value)} "
+                                    f"step_hrom_stages={int(step_hrom_stages)} "
+                                    f"max_stages_per_step={int(fluid_hrom_max_stages_per_step_value)} "
+                                    f"max_coupling_iter={int(fluid_hrom_max_coupling_iter_value)} "
                                     f"disabled_until_step={int(fluid_hrom_disabled_until_step)}",
                                 )
+                            hrom_pre_stage_load_rel = float(last_load_rel)
                             if bool(use_hrom_stage):
                                 hrom_history = _snapshot_fluid_dvms_state(fluid.get("dvms_state"))
                                 hrom_state_guess = [np.asarray(item, dtype=float).copy() for item in fluid_guess]
                                 hrom_a_guess = np.asarray(fluid["a_k"].nodal_values, dtype=float).copy()
+                                hrom_reduced_reaction_available = bool(
+                                    load_transfer_value == "reaction"
+                                    and sampled_lspg_hybrid_model is not None
+                                    and sampled_lspg_hybrid_model.has_reduced_reaction
+                                )
+                                hrom_sampled_reaction_available = False
+                                if (
+                                    load_transfer_value == "reaction"
+                                    and sampled_lspg_hybrid_model is not None
+                                    and sampled_lspg_hybrid_model.has_sampled_reaction
+                                ):
+                                    reaction_sample_elements = np.asarray(
+                                        sampled_lspg_hybrid_model.reaction_sample_element_ids,
+                                        dtype=int,
+                                    )
+                                    hrom_sampled_reaction_available = bool(
+                                        not bool(sampled_lspg_hybrid_sample_local_state_writes)
+                                        or reaction_sample_elements.size == 0
+                                        or np.all(
+                                            np.isin(
+                                                reaction_sample_elements,
+                                                np.asarray(sampled_lspg_hybrid_model.sample_element_ids, dtype=int),
+                                            )
+                                        )
+                                    )
+                                hrom_local_reaction_available = False
+                                if (
+                                    load_transfer_value == "reaction"
+                                    and sampled_lspg_hybrid_model is not None
+                                    and bool(sampled_lspg_hybrid_sample_local_state_writes)
+                                ):
+                                    reaction_element_ids = _fluid_interface_reaction_element_ids(
+                                        fluid,
+                                        interface_tag=geometry.interface_tag,
+                                    )
+                                    hrom_local_reaction_available = bool(
+                                        reaction_element_ids.size == 0
+                                        or np.all(
+                                            np.isin(
+                                                np.asarray(reaction_element_ids, dtype=int),
+                                                np.asarray(sampled_lspg_hybrid_model.sample_element_ids, dtype=int),
+                                            )
+                                        )
+                                )
+                                hrom_skip_final_full_write = bool(
+                                    (
+                                        hrom_sampled_reaction_available
+                                        or hrom_reduced_reaction_available
+                                        or hrom_local_reaction_available
+                                    )
+                                    and sampled_lspg_hybrid_commit_mode == "load_only"
+                                    and not bool(fluid_hrom_trial_exact_correct)
+                                )
                                 try:
                                     fluid_hrom_info = _solve_sampled_lspg_hybrid_fluid_stage(
                                         model=sampled_lspg_hybrid_model,
@@ -9513,6 +12670,9 @@ def run_local_example2(
                                         dt=dt_value,
                                         bossak_alpha=float(bossak_alpha),
                                         dynamic_tau=float(dynamic_tau),
+                                        incompressibility_stabilization_scale=float(
+                                            sampled_lspg_hybrid_incompressibility_scale
+                                        ),
                                         quad_order=quad_order,
                                         backend=str(backend),
                                         fluid_prev_step=fluid_prev_step,
@@ -9520,7 +12680,66 @@ def run_local_example2(
                                         max_iterations=int(sampled_lspg_hybrid_max_iterations),
                                         residual_tol=float(sampled_lspg_hybrid_residual_tol),
                                         line_search=bool(sampled_lspg_hybrid_model.line_search),
+                                        reduced_objective=str(sampled_lspg_hybrid_reduced_objective),
+                                        gnat_step_backend=str(fluid_hrom_gnat_step_backend),
+                                        sample_local_state_writes=bool(
+                                            sampled_lspg_hybrid_sample_local_state_writes
+                                        ),
+                                        final_full_state_write=not bool(hrom_skip_final_full_write),
                                     )
+                                    fluid_hrom_stage_sample_local_state_writes = bool(
+                                        fluid_hrom_info.get("sample_local_state_writes", False)
+                                    )
+                                    hrom_coefficients = np.asarray(
+                                        fluid_hrom_info["coefficients"],
+                                        dtype=float,
+                                    ).reshape(-1)
+                                    fluid_hrom_manifold_distance = (
+                                        sampled_lspg_hybrid_model.coefficient_manifold_distance(hrom_coefficients)
+                                        if sampled_lspg_hybrid_model is not None
+                                        else float("nan")
+                                    )
+                                    if np.isfinite(float(fluid_hrom_max_manifold_distance_value)):
+                                        if not np.isfinite(float(fluid_hrom_manifold_distance)):
+                                            sampled_lspg_hybrid_manifold_gate_failures += 1
+                                            raise RuntimeError(
+                                                "sampled-LSPG manifold gate failed: model has no usable "
+                                                "training coefficient statistics"
+                                            )
+                                        if float(fluid_hrom_manifold_distance) > float(
+                                            fluid_hrom_max_manifold_distance_value
+                                        ):
+                                            sampled_lspg_hybrid_manifold_gate_failures += 1
+                                            raise RuntimeError(
+                                                "sampled-LSPG manifold gate failed: "
+                                                f"distance={float(fluid_hrom_manifold_distance):.6e} "
+                                                f"> {float(fluid_hrom_max_manifold_distance_value):.6e}"
+                                            )
+                                    fluid_hrom_dwr_error = (
+                                        sampled_lspg_hybrid_model.dual_weighted_residual_error(
+                                            np.asarray(
+                                                fluid_hrom_info.get("final_sampled_residual"),
+                                                dtype=float,
+                                            )
+                                            if fluid_hrom_info.get("final_sampled_residual") is not None
+                                            else None
+                                        )
+                                        if sampled_lspg_hybrid_model is not None
+                                        else float("nan")
+                                    )
+                                    if np.isfinite(float(fluid_hrom_max_dwr_error_value)):
+                                        if not np.isfinite(float(fluid_hrom_dwr_error)):
+                                            sampled_lspg_hybrid_dwr_gate_failures += 1
+                                            raise RuntimeError(
+                                                "sampled-LSPG DWR gate failed: model has no usable dwr_dual"
+                                            )
+                                        if float(fluid_hrom_dwr_error) > float(fluid_hrom_max_dwr_error_value):
+                                            sampled_lspg_hybrid_dwr_gate_failures += 1
+                                            raise RuntimeError(
+                                                "sampled-LSPG DWR gate failed: "
+                                                f"eta={float(fluid_hrom_dwr_error):.6e} "
+                                                f"> {float(fluid_hrom_max_dwr_error_value):.6e}"
+                                            )
                                     max_hrom_residual = _env_float(
                                         "PYCUTFEM_EX2_HROM_MAX_ESTIMATED_RESIDUAL_NORM",
                                         float("inf"),
@@ -9532,6 +12751,9 @@ def run_local_example2(
                                             f"> {float(max_hrom_residual):.6e}"
                                         )
                                     fluid_hrom_used = True
+                                    hrom_load_only_commit = bool(
+                                        sampled_lspg_hybrid_commit_mode == "load_only"
+                                    )
                                     if bool(fluid_hrom_trial_exact_correct):
                                         if load_transfer_value == "reaction":
                                             trial_reaction_point_lookup = _fluid_interface_reaction_loads(
@@ -9584,21 +12806,185 @@ def run_local_example2(
                                         fluid_guess = hrom_corrector_guess
                                         fluid_hrom_trial_used = True
                                         fluid_hrom_used = False
-                                    if bool(fluid_hrom_used) and fluid_hrom_interface_trust_value != "none":
+                                        hrom_load_only_commit = False
+                                    hrom_needs_candidate_load = bool(
+                                        fluid_hrom_interface_trust_value != "none"
+                                        or bool(hrom_load_only_commit)
+                                        or np.isfinite(float(fluid_hrom_max_load_contraction_ratio_value))
+                                        or np.isfinite(float(fluid_hrom_interface_load_tolerance_value))
+                                    )
+                                    if bool(fluid_hrom_used) and bool(hrom_needs_candidate_load):
                                         if load_transfer_value == "reaction":
-                                            hrom_reaction_point_load_lookup = _fluid_interface_reaction_loads(
-                                                prob=fluid,
-                                                rho_f=float(setup.material.density),
-                                                mu_f=mu_f,
-                                                dt=dt_value,
-                                                quad_order=quad_order,
-                                                bossak_alpha=float(bossak_alpha),
-                                                dynamic_tau=float(dynamic_tau),
-                                                interface_tag=geometry.interface_tag,
-                                                backend=str(backend),
-                                                contribution_mode="system",
-                                                refresh_state=False,
+                                            def _hrom_reaction_source_allowed(name: str) -> bool:
+                                                return (
+                                                    fluid_hrom_reaction_source_value == "auto"
+                                                    or fluid_hrom_reaction_source_value == str(name)
+                                                )
+
+                                            prefer_local_reaction_rows = (
+                                                np.isfinite(float(fluid_hrom_interface_load_tolerance_value))
+                                                and bool(hrom_local_reaction_available)
+                                                and _hrom_reaction_source_allowed("local_rows")
                                             )
+                                            if (
+                                                hrom_reaction_point_load_lookup is None
+                                                and _hrom_reaction_source_allowed("sampled")
+                                                and bool(hrom_sampled_reaction_available)
+                                                and sampled_lspg_hybrid_model is not None
+                                            ):
+                                                sample_rows, sample_values = _fluid_interface_reaction_sample_row_values(
+                                                    prob=fluid,
+                                                    rho_f=float(setup.material.density),
+                                                    mu_f=mu_f,
+                                                    dt=dt_value,
+                                                    quad_order=quad_order,
+                                                    bossak_alpha=float(bossak_alpha),
+                                                    interface_tag=geometry.interface_tag,
+                                                    backend=str(backend),
+                                                    row_dofs=np.asarray(
+                                                        sampled_lspg_hybrid_model.reaction_sample_row_dofs,
+                                                        dtype=int,
+                                                    ),
+                                                    element_ids=np.asarray(
+                                                        sampled_lspg_hybrid_model.reaction_sample_element_ids,
+                                                        dtype=int,
+                                                    ),
+                                                    contribution_mode="system",
+                                                )
+                                                expected_rows = np.asarray(
+                                                    sampled_lspg_hybrid_model.reaction_sample_row_dofs,
+                                                    dtype=int,
+                                                ).reshape(-1)
+                                                if not np.array_equal(np.asarray(sample_rows, dtype=int), expected_rows):
+                                                    row_values = {
+                                                        int(row): float(value)
+                                                        for row, value in zip(
+                                                            np.asarray(sample_rows, dtype=int).reshape(-1),
+                                                            np.asarray(sample_values, dtype=float).reshape(-1),
+                                                        )
+                                                    }
+                                                    sample_values = np.asarray(
+                                                        [row_values[int(row)] for row in expected_rows],
+                                                        dtype=float,
+                                                    )
+                                                hrom_reaction_point_load_lookup = sampled_lspg_hybrid_model.sampled_reaction_lookup(
+                                                    np.asarray(sample_values, dtype=float)
+                                                )
+                                                hrom_reaction_source = "sampled_reaction"
+                                            if (
+                                                hrom_reaction_point_load_lookup is None
+                                                and bool(prefer_local_reaction_rows)
+                                            ):
+                                                hrom_reaction_point_load_lookup = (
+                                                    _fluid_interface_reaction_loads_local_rows(
+                                                        prob=fluid,
+                                                        rho_f=float(setup.material.density),
+                                                        mu_f=mu_f,
+                                                        dt=dt_value,
+                                                        quad_order=quad_order,
+                                                        bossak_alpha=float(bossak_alpha),
+                                                        interface_tag=geometry.interface_tag,
+                                                        backend=str(backend),
+                                                        contribution_mode="system",
+                                                    )
+                                                )
+                                                hrom_reaction_source = "local_reaction_rows"
+                                            if (
+                                                hrom_reaction_point_load_lookup is None
+                                                and sampled_lspg_hybrid_model is not None
+                                                and sampled_lspg_hybrid_model.has_reduced_reaction
+                                                and _hrom_reaction_source_allowed("affine")
+                                            ):
+                                                hrom_reaction_point_load_lookup = (
+                                                    sampled_lspg_hybrid_model.reduced_reaction_lookup(
+                                                        np.asarray(
+                                                            fluid_hrom_info["coefficients"],
+                                                            dtype=float,
+                                                        ),
+                                                        base_lookup=current_load_lookup,
+                                                    )
+                                                )
+                                                hrom_reaction_source = "reduced_reaction"
+                                            if hrom_reaction_point_load_lookup is None:
+                                                if bool(hrom_local_reaction_available) and _hrom_reaction_source_allowed("local_rows"):
+                                                    hrom_reaction_point_load_lookup = (
+                                                        _fluid_interface_reaction_loads_local_rows(
+                                                            prob=fluid,
+                                                            rho_f=float(setup.material.density),
+                                                            mu_f=mu_f,
+                                                            dt=dt_value,
+                                                            quad_order=quad_order,
+                                                            bossak_alpha=float(bossak_alpha),
+                                                            interface_tag=geometry.interface_tag,
+                                                            backend=str(backend),
+                                                            contribution_mode="system",
+                                                        )
+                                                    )
+                                                    hrom_reaction_source = "local_reaction_rows"
+                                                elif _hrom_reaction_source_allowed("full"):
+                                                    hrom_reaction_point_load_lookup = _fluid_interface_reaction_loads(
+                                                        prob=fluid,
+                                                        rho_f=float(setup.material.density),
+                                                        mu_f=mu_f,
+                                                        dt=dt_value,
+                                                        quad_order=quad_order,
+                                                        bossak_alpha=float(bossak_alpha),
+                                                        dynamic_tau=float(dynamic_tau),
+                                                        interface_tag=geometry.interface_tag,
+                                                        backend=str(backend),
+                                                        contribution_mode="system",
+                                                        refresh_state=False,
+                                                    )
+                                                    hrom_reaction_source = "full_reaction"
+                                                else:
+                                                    raise RuntimeError(
+                                                        "Requested HROM reaction source "
+                                                        f"{fluid_hrom_reaction_source_value!r} is not available."
+                                                    )
+                                            if (
+                                                float(fluid_hrom_impedance_blend_value) > 0.0
+                                                and sampled_lspg_hybrid_model is not None
+                                                and sampled_lspg_hybrid_model.has_interface_impedance
+                                                and hrom_reaction_point_load_lookup is not None
+                                                and last_impedance_interface_disp_lookup is not None
+                                                and last_impedance_interface_velocity_lookup is not None
+                                                and last_impedance_reaction_point_lookup is not None
+                                            ):
+                                                impedance_lookup = (
+                                                    sampled_lspg_hybrid_model.interface_impedance_reaction_lookup(
+                                                        interface_disp_lookup=solid_disp_fluid_lookup,
+                                                        interface_velocity_lookup=mesh_vel_fluid_lookup,
+                                                        previous_interface_disp_lookup=last_impedance_interface_disp_lookup,
+                                                        previous_interface_velocity_lookup=last_impedance_interface_velocity_lookup,
+                                                        previous_reaction_lookup=last_impedance_reaction_point_lookup,
+                                                    )
+                                                )
+                                                reduced_values_on_impedance = _resample_lookup_to_coords(
+                                                    hrom_reaction_point_load_lookup,
+                                                    np.asarray(impedance_lookup.coords, dtype=float),
+                                                ).values
+                                                impedance_values = np.asarray(impedance_lookup.values, dtype=float)
+                                                _imp_abs, fluid_hrom_impedance_rel = _relative_change(
+                                                    impedance_values,
+                                                    np.asarray(reduced_values_on_impedance, dtype=float),
+                                                )
+                                                blend = float(fluid_hrom_impedance_blend_value)
+                                                blended_values = (
+                                                    (1.0 - blend) * np.asarray(reduced_values_on_impedance, dtype=float)
+                                                    + blend * impedance_values
+                                                )
+                                                hrom_reaction_point_load_lookup = CoordinateLookup(
+                                                    np.asarray(impedance_lookup.coords, dtype=float),
+                                                    np.asarray(blended_values, dtype=float),
+                                                    dim=2,
+                                                )
+                                                fluid_hrom_impedance_used = True
+                                                fluid_hrom_impedance_blend_used = float(blend)
+                                                hrom_reaction_source = (
+                                                    f"{hrom_reaction_source}+impedance"
+                                                    if hrom_reaction_source
+                                                    else "impedance"
+                                                )
                                             hrom_reaction_solid_load_lookup = _resample_lookup_to_coords(
                                                 _negate_lookup(hrom_reaction_point_load_lookup),
                                                 solid_iface_coords,
@@ -9624,60 +13010,198 @@ def run_local_example2(
                                             hrom_accel_lookup = hrom_stress_point_load_lookup
                                         else:
                                             raise ValueError(f"Unsupported load_transfer={load_transfer!r}")
-                                        current_accel_values = _resample_lookup_to_coords(
-                                            current_load_lookup,
-                                            np.asarray(hrom_accel_lookup.coords, dtype=float),
-                                        ).values
-                                        trust_result = _fluid_hrom_interface_trust_region(
-                                            current_values=current_accel_values,
-                                            proposed_values=np.asarray(hrom_accel_lookup.values, dtype=float),
-                                            previous_load_abs=float(last_load_abs),
-                                            mode=fluid_hrom_interface_trust_value,
-                                            max_step_ratio=float(fluid_hrom_interface_max_step_ratio_value),
-                                            max_load_rel=float(fluid_hrom_interface_max_load_rel_value),
-                                            min_correction_alpha=float(fluid_hrom_interface_min_correction_alpha_value),
-                                        )
-                                        fluid_hrom_interface_trust_alpha = float(trust_result.alpha)
-                                        fluid_hrom_interface_load_rel = float(trust_result.update_rel)
-                                        fluid_hrom_interface_step_ratio = float(trust_result.step_ratio)
-                                        fluid_hrom_interface_reason = str(trust_result.reason)
-                                        if not bool(trust_result.accepted):
-                                            fluid_hrom_interface_rejected = True
-                                            sampled_lspg_hybrid_interface_reject_count += 1
-                                            raise RuntimeError(
-                                                "sampled-LSPG interface trust monitor failed: "
-                                                f"reason={trust_result.reason} "
-                                                f"load_rel={float(trust_result.update_rel):.6e} "
-                                                f"step_ratio={float(trust_result.step_ratio):.6e} "
-                                                f"alpha={float(trust_result.alpha):.6e}"
-                                            )
-                                        if bool(trust_result.corrected):
-                                            fluid_hrom_interface_corrected = True
-                                            sampled_lspg_hybrid_interface_correction_count += 1
-                                            corrected_lookup = CoordinateLookup(
-                                                np.asarray(hrom_accel_lookup.coords, dtype=float),
-                                                np.asarray(trust_result.values, dtype=float),
-                                                dim=2,
-                                            )
-                                            if load_transfer_value == "reaction" and bool(accelerate_on_fluid_load):
-                                                hrom_reaction_point_load_lookup = corrected_lookup
+                                        if np.isfinite(float(fluid_hrom_interface_load_tolerance_value)):
+                                            if load_transfer_value == "reaction" and hrom_reaction_point_load_lookup is not None:
+                                                candidate_lookup = hrom_reaction_point_load_lookup
+                                                estimator_lookup = None
+                                                if str(hrom_reaction_source) != "local_reaction_rows" and bool(
+                                                    hrom_local_reaction_available
+                                                ):
+                                                    estimator_lookup = _fluid_interface_reaction_loads_local_rows(
+                                                        prob=fluid,
+                                                        rho_f=float(setup.material.density),
+                                                        mu_f=mu_f,
+                                                        dt=dt_value,
+                                                        quad_order=quad_order,
+                                                        bossak_alpha=float(bossak_alpha),
+                                                        interface_tag=geometry.interface_tag,
+                                                        backend=str(backend),
+                                                        contribution_mode="system",
+                                                    )
+                                                elif str(hrom_reaction_source) != "full_reaction":
+                                                    estimator_lookup = _fluid_interface_reaction_loads(
+                                                        prob=fluid,
+                                                        rho_f=float(setup.material.density),
+                                                        mu_f=mu_f,
+                                                        dt=dt_value,
+                                                        quad_order=quad_order,
+                                                        bossak_alpha=float(bossak_alpha),
+                                                        dynamic_tau=float(dynamic_tau),
+                                                        interface_tag=geometry.interface_tag,
+                                                        backend=str(backend),
+                                                        contribution_mode="system",
+                                                        refresh_state=False,
+                                                    )
+                                                elif (
+                                                    sampled_lspg_hybrid_model is not None
+                                                    and sampled_lspg_hybrid_model.has_reduced_reaction
+                                                ):
+                                                    estimator_lookup = sampled_lspg_hybrid_model.reduced_reaction_lookup(
+                                                        np.asarray(fluid_hrom_info["coefficients"], dtype=float),
+                                                        base_lookup=current_load_lookup,
+                                                    )
+                                                if estimator_lookup is not None:
+                                                    candidate_values = _resample_lookup_to_coords(
+                                                        candidate_lookup,
+                                                        np.asarray(estimator_lookup.coords, dtype=float),
+                                                    ).values
+                                                    _eta_abs, fluid_hrom_eta_gamma = _relative_change(
+                                                        np.asarray(estimator_lookup.values, dtype=float),
+                                                        np.asarray(candidate_values, dtype=float),
+                                                    )
+                                                else:
+                                                    fluid_hrom_eta_gamma = float("nan")
+                                            else:
+                                                fluid_hrom_eta_gamma = float("nan")
+                                            if not np.isfinite(float(fluid_hrom_eta_gamma)):
+                                                sampled_lspg_hybrid_eta_gamma_gate_failures += 1
+                                                raise RuntimeError(
+                                                    "sampled-LSPG eta_Gamma gate failed: no independent "
+                                                    "interface-load estimator is available"
+                                                )
+                                            if float(fluid_hrom_eta_gamma) > float(
+                                                fluid_hrom_interface_load_tolerance_value
+                                            ):
+                                                sampled_lspg_hybrid_eta_gamma_gate_failures += 1
+                                                raise RuntimeError(
+                                                    "sampled-LSPG eta_Gamma gate failed: "
+                                                    f"eta_Gamma={float(fluid_hrom_eta_gamma):.6e} "
+                                                    f"> {float(fluid_hrom_interface_load_tolerance_value):.6e}"
+                                                )
+                                            if (
+                                                bool(fluid_hrom_use_estimator_load_on_accept)
+                                                and load_transfer_value == "reaction"
+                                                and estimator_lookup is not None
+                                            ):
+                                                hrom_reaction_point_load_lookup = _resample_lookup_to_coords(
+                                                    estimator_lookup,
+                                                    np.asarray(hrom_reaction_point_load_lookup.coords, dtype=float),
+                                                )
                                                 hrom_reaction_solid_load_lookup = _resample_lookup_to_coords(
                                                     _negate_lookup(hrom_reaction_point_load_lookup),
                                                     solid_iface_coords,
                                                 )
-                                            elif load_transfer_value == "reaction":
-                                                hrom_reaction_solid_load_lookup = corrected_lookup
-                                            else:
-                                                hrom_stress_point_load_lookup = corrected_lookup
-                                            _log(
-                                                verbose,
-                                                "[fluid-hrom] "
-                                                f"step={step} coupling_iter={coupling_iter} "
-                                                "interface_load_clipped=1 "
-                                                f"alpha={float(trust_result.alpha):.3e} "
-                                                f"load_rel={float(trust_result.update_rel):.3e} "
-                                                f"step_ratio={float(trust_result.step_ratio):.3e}",
+                                                hrom_accel_lookup = (
+                                                    hrom_reaction_point_load_lookup
+                                                    if bool(accelerate_on_fluid_load)
+                                                    else hrom_reaction_solid_load_lookup
+                                                )
+                                                hrom_reaction_source = (
+                                                    f"{hrom_reaction_source}+eta_estimator"
+                                                    if hrom_reaction_source
+                                                    else "eta_estimator"
+                                                )
+                                        if fluid_hrom_interface_trust_value != "none":
+                                            current_accel_values = _resample_lookup_to_coords(
+                                                current_load_lookup,
+                                                np.asarray(hrom_accel_lookup.coords, dtype=float),
+                                            ).values
+                                            trust_result = _fluid_hrom_interface_trust_region(
+                                                current_values=current_accel_values,
+                                                proposed_values=np.asarray(hrom_accel_lookup.values, dtype=float),
+                                                previous_load_abs=float(last_load_abs),
+                                                mode=fluid_hrom_interface_trust_value,
+                                                max_step_ratio=float(fluid_hrom_interface_max_step_ratio_value),
+                                                max_load_rel=float(fluid_hrom_interface_max_load_rel_value),
+                                                min_correction_alpha=float(fluid_hrom_interface_min_correction_alpha_value),
                                             )
+                                            fluid_hrom_interface_trust_alpha = float(trust_result.alpha)
+                                            fluid_hrom_interface_load_rel = float(trust_result.update_rel)
+                                            fluid_hrom_interface_step_ratio = float(trust_result.step_ratio)
+                                            fluid_hrom_interface_reason = str(trust_result.reason)
+                                            if not bool(trust_result.accepted):
+                                                fluid_hrom_interface_rejected = True
+                                                sampled_lspg_hybrid_interface_reject_count += 1
+                                                raise RuntimeError(
+                                                    "sampled-LSPG interface trust monitor failed: "
+                                                    f"reason={trust_result.reason} "
+                                                    f"load_rel={float(trust_result.update_rel):.6e} "
+                                                    f"step_ratio={float(trust_result.step_ratio):.6e} "
+                                                    f"alpha={float(trust_result.alpha):.6e}"
+                                                )
+                                            if bool(trust_result.corrected):
+                                                fluid_hrom_interface_corrected = True
+                                                sampled_lspg_hybrid_interface_correction_count += 1
+                                                corrected_lookup = CoordinateLookup(
+                                                    np.asarray(hrom_accel_lookup.coords, dtype=float),
+                                                    np.asarray(trust_result.values, dtype=float),
+                                                    dim=2,
+                                                )
+                                                if load_transfer_value == "reaction" and bool(accelerate_on_fluid_load):
+                                                    hrom_reaction_point_load_lookup = corrected_lookup
+                                                    hrom_reaction_solid_load_lookup = _resample_lookup_to_coords(
+                                                        _negate_lookup(hrom_reaction_point_load_lookup),
+                                                        solid_iface_coords,
+                                                    )
+                                                elif load_transfer_value == "reaction":
+                                                    hrom_reaction_solid_load_lookup = corrected_lookup
+                                                else:
+                                                    hrom_stress_point_load_lookup = corrected_lookup
+                                                hrom_accel_lookup = corrected_lookup
+                                                _log(
+                                                    verbose,
+                                                    "[fluid-hrom] "
+                                                    f"step={step} coupling_iter={coupling_iter} "
+                                                    "interface_load_clipped=1 "
+                                                    f"alpha={float(trust_result.alpha):.3e} "
+                                                    f"load_rel={float(trust_result.update_rel):.3e} "
+                                                    f"step_ratio={float(trust_result.step_ratio):.3e}",
+                                                )
+                                        if (
+                                            np.isfinite(float(fluid_hrom_max_load_contraction_ratio_value))
+                                            and hrom_accel_lookup is not None
+                                            and np.isfinite(float(hrom_pre_stage_load_rel))
+                                            and float(hrom_pre_stage_load_rel) > 1.0e-15
+                                        ):
+                                            candidate_current_values = _resample_lookup_to_coords(
+                                                current_load_lookup,
+                                                np.asarray(hrom_accel_lookup.coords, dtype=float),
+                                            ).values
+                                            _candidate_load_abs, candidate_load_rel = _relative_change(
+                                                np.asarray(hrom_accel_lookup.values, dtype=float),
+                                                np.asarray(candidate_current_values, dtype=float),
+                                            )
+                                            candidate_contraction_ratio = float(candidate_load_rel) / max(
+                                                float(hrom_pre_stage_load_rel),
+                                                1.0e-15,
+                                            )
+                                            if (
+                                                not np.isfinite(float(candidate_contraction_ratio))
+                                                or float(candidate_contraction_ratio)
+                                                > float(fluid_hrom_max_load_contraction_ratio_value)
+                                            ):
+                                                sampled_lspg_hybrid_contraction_monitor_failures += 1
+                                                fluid_hrom_disabled_until_step = max(
+                                                    int(fluid_hrom_disabled_until_step),
+                                                    int(step),
+                                                )
+                                                raise RuntimeError(
+                                                    "sampled-LSPG precommit contraction monitor failed: "
+                                                    f"ratio={float(candidate_contraction_ratio):.6e} "
+                                                    f"gate={float(fluid_hrom_max_load_contraction_ratio_value):.6e} "
+                                                    f"candidate_load_rel={float(candidate_load_rel):.6e} "
+                                                    f"previous_load_rel={float(hrom_pre_stage_load_rel):.6e}"
+                                                )
+                                    if bool(fluid_hrom_used) and bool(hrom_load_only_commit):
+                                        _restore_fluid_dvms_state(fluid.get("dvms_state"), hrom_history)
+                                        _restore_function_values([fluid["u_k"], fluid["p_k"]], hrom_state_guess)
+                                        fluid["a_k"].nodal_values[:] = hrom_a_guess
+                                        _log(
+                                            verbose,
+                                            "[fluid-hrom] "
+                                            f"step={step} coupling_iter={coupling_iter} "
+                                            "commit_mode=load_only restored_pre_hrom_state=1",
+                                        )
                                 except Exception as exc:
                                     fluid_hrom_fallback_reason = str(exc)
                                     fluid_hrom_used = False
@@ -9686,6 +13210,29 @@ def run_local_example2(
                                     _restore_fluid_dvms_state(fluid.get("dvms_state"), hrom_history)
                                     _restore_function_values([fluid["u_k"], fluid["p_k"]], hrom_state_guess)
                                     fluid["a_k"].nodal_values[:] = hrom_a_guess
+                                    if fluid_hrom_adaptive_db_path is not None:
+                                        _maybe_dump_exact_fluid_probe(
+                                            output_dir=fluid_hrom_adaptive_db_path,
+                                            step=int(step),
+                                            coupling_iter=int(coupling_iter),
+                                            stage_label="pre_fluid_solve",
+                                            bc_scale=float(bc_scale),
+                                            dt=float(dt_value),
+                                            bossak_alpha=float(bossak_alpha),
+                                            fluid=fluid,
+                                            reaction_point_load_lookup=None,
+                                            reaction_solid_load_lookup=None,
+                                            force=True,
+                                            extra_payload={
+                                                "adaptive_hrom_attempt": np.asarray(1, dtype=int),
+                                                "adaptive_stage_role": np.asarray("pre"),
+                                                "adaptive_reason": np.asarray(str(fluid_hrom_fallback_reason)),
+                                                "adaptive_manifold_distance": np.asarray(float(fluid_hrom_manifold_distance)),
+                                                "adaptive_eta_gamma": np.asarray(float(fluid_hrom_eta_gamma)),
+                                                "adaptive_dwr_error": np.asarray(float(fluid_hrom_dwr_error)),
+                                            },
+                                        )
+                                        fluid_hrom_adaptive_pre_dumped = True
                                     _log(
                                         verbose,
                                         "[fluid-hrom] "
@@ -9693,68 +13240,141 @@ def run_local_example2(
                                         f"reason={fluid_hrom_fallback_reason}",
                                     )
                             if not bool(fluid_hrom_used):
-                                try:
-                                    stage_solver.solve_time_interval(
-                                        functions=[fluid["u_k"], fluid["p_k"]],
-                                        prev_functions=[fluid["u_prev"], fluid["p_prev"]],
-                                        aux_functions={
-                                            "a_prev": fluid["a_prev"],
-                                            "a_k": fluid["a_k"],
-                                            "d_mesh": fluid["d_mesh"],
-                                            "d_prev": fluid["d_prev"],
-                                            "d_prev2": fluid["d_prev2"],
-                                        },
-                                        time_params=TimeStepperParameters(
-                                            dt=dt_value,
-                                            max_steps=1,
-                                            final_time=dt_value,
-                                            stop_on_steady=False,
-                                            step_initial_guess_callback=_guess_callback_from_snapshots_with_dirichlet(
-                                                snapshots=fluid_guess,
-                                                dh=fluid["dh"],
-                                                bcs=fluid_bcs,
+                                if kratos_hrom_exact_fallback_backend is not None:
+                                    kratos_fluid_state = _solve_kratos_exact_fluid_backend(
+                                        backend=kratos_hrom_exact_fallback_backend,
+                                        interface_disp=solid_disp_fluid_lookup,
+                                    )
+                                    (
+                                        mesh_lookup,
+                                        mesh_vel_fluid_lookup,
+                                        mesh_accel_fluid_lookup,
+                                        last_fluid_accel_lookup,
+                                    ) = _transfer_kratos_exact_fluid_state_to_local(
+                                        fluid=fluid,
+                                        mesh_ext=mesh_ext,
+                                        state=kratos_fluid_state,
+                                    )
+                                    last_mesh_vel_fluid_lookup = mesh_vel_fluid_lookup
+                                    last_mesh_accel_fluid_lookup = mesh_accel_fluid_lookup
+                                    fluid_stage_used_kratos_hrom_fallback = True
+                                    if not fluid_hrom_fallback_reason and bool(use_hrom_stage):
+                                        fluid_hrom_fallback_reason = "kratos_live_exact_correction"
+                                    if load_transfer_value == "reaction" or bool(monitor_interface_loads):
+                                        reaction_point_load_lookup = _resample_lookup_to_coords(
+                                            kratos_fluid_state["reaction"],
+                                            fluid_iface_coords,
+                                        )
+                                        reaction_solid_load_lookup = _resample_lookup_to_coords(
+                                            _negate_lookup(reaction_point_load_lookup),
+                                            solid_iface_coords,
+                                        )
+                                    if bool(monitor_stress_interface_loads):
+                                        stress_point_load_lookup = _fluid_interface_point_loads_on_solid(
+                                            fluid_dh=fluid["dh"],
+                                            fluid_mesh=mesh_f,
+                                            solid_mesh=mesh_s,
+                                            u=fluid["u_k"],
+                                            p=fluid["p_k"],
+                                            d_mesh=fluid["d_mesh"],
+                                            solid_iface_coords=solid_iface_coords,
+                                            interface_tag=geometry.interface_tag,
+                                            mu_f=mu_f,
+                                            quad_order=quad_order,
+                                        )
+                                else:
+                                    try:
+                                        stage_solver.solve_time_interval(
+                                            functions=[fluid["u_k"], fluid["p_k"]],
+                                            prev_functions=[fluid["u_prev"], fluid["p_prev"]],
+                                            aux_functions={
+                                                "a_prev": fluid["a_prev"],
+                                                "a_k": fluid["a_k"],
+                                                "d_mesh": fluid["d_mesh"],
+                                                "d_prev": fluid["d_prev"],
+                                                "d_prev2": fluid["d_prev2"],
+                                            },
+                                            time_params=TimeStepperParameters(
+                                                dt=dt_value,
+                                                max_steps=1,
+                                                final_time=dt_value,
+                                                stop_on_steady=False,
+                                                step_initial_guess_callback=_guess_callback_from_snapshots_with_dirichlet(
+                                                    snapshots=fluid_guess,
+                                                    dh=fluid["dh"],
+                                                    bcs=fluid_bcs,
+                                                ),
                                             ),
-                                        ),
-                                    )
-                                except Exception as exc:
-                                    if use_exact_fluid_operator:
-                                        _maybe_dump_exact_fluid_probe(
-                                            output_dir=output_dir,
-                                            step=int(step),
-                                            coupling_iter=int(coupling_iter),
-                                            stage_label="failed_fluid_solve",
-                                            bc_scale=float(bc_scale),
-                                            dt=float(dt_value),
-                                            bossak_alpha=float(bossak_alpha),
-                                            fluid=fluid,
-                                            reaction_point_load_lookup=None,
-                                            reaction_solid_load_lookup=None,
                                         )
-                                    accept_maxiter = _env_bool(
-                                        "PYCUTFEM_EX2_EXACT_FLUID_ACCEPT_MAXITER",
-                                        True,
-                                    )
-                                    if (
-                                        bool(use_exact_fluid_operator)
-                                        and bool(accept_maxiter)
-                                        and _is_newton_maxiter_nonconvergence(exc)
-                                    ):
-                                        fluid_newton_accepted_after_maxiter = True
-                                        _log(
-                                            verbose,
-                                            "[fluid-stage] "
-                                            f"step={step} coupling_iter={coupling_iter} "
-                                            "Newton reached the iteration cap; continuing with the last iterate "
-                                            "to match Kratos NavierStokesMonolithicSolver warning semantics.",
+                                    except Exception as exc:
+                                        if use_exact_fluid_operator:
+                                            _maybe_dump_exact_fluid_probe(
+                                                output_dir=output_dir,
+                                                step=int(step),
+                                                coupling_iter=int(coupling_iter),
+                                                stage_label="failed_fluid_solve",
+                                                bc_scale=float(bc_scale),
+                                                dt=float(dt_value),
+                                                bossak_alpha=float(bossak_alpha),
+                                                fluid=fluid,
+                                                reaction_point_load_lookup=None,
+                                                reaction_solid_load_lookup=None,
+                                            )
+                                        if (
+                                            bool(nirb_force_coordinate_disable_on_newton_failure)
+                                            and bool(use_exact_fluid_operator)
+                                            and exact_fluid_backend_mode == "local"
+                                            and _is_newton_maxiter_nonconvergence(exc)
+                                            and int(coupling_iter) >= int(nirb_force_coordinate_failure_late_iter_value)
+                                            and bool(last_force_coordinate_update_active)
+                                        ):
+                                            force_coordinate_safety_disabled = True
+                                            force_coordinate_safety_step_tripped = True
+                                            nirb_force_coordinate_newton_safety_count += 1
+                                            force_coeff_guess_history.clear()
+                                            force_coeff_return_history.clear()
+                                            _log(
+                                                verbose,
+                                                "[nirb] "
+                                                f"step={step} coupling_iter={coupling_iter} "
+                                                "force_coordinate_safety_trip=1 "
+                                                f"previous_backend={last_force_coordinate_update_backend} "
+                                                "reason=local_exact_fluid_newton_maxiter",
+                                            )
+                                        accept_maxiter = _env_bool(
+                                            "PYCUTFEM_EX2_EXACT_FLUID_ACCEPT_MAXITER",
+                                            True,
                                         )
-                                    else:
-                                        raise
+                                        if (
+                                            bool(use_exact_fluid_operator)
+                                            and bool(accept_maxiter)
+                                            and _is_newton_maxiter_nonconvergence(exc)
+                                        ):
+                                            fluid_newton_accepted_after_maxiter = True
+                                            _log(
+                                                verbose,
+                                                "[fluid-stage] "
+                                                f"step={step} coupling_iter={coupling_iter} "
+                                                "Newton reached the iteration cap; continuing with the last iterate "
+                                                "to match Kratos NavierStokesMonolithicSolver warning semantics.",
+                                            )
+                                        else:
+                                            raise
                             if bool(use_sampled_lspg_hybrid_fluid):
                                 if bool(fluid_hrom_trial_used):
                                     sampled_lspg_hybrid_trial_stage_count += 1
                                     sampled_lspg_hybrid_exact_correction_count += 1
                                 if bool(fluid_hrom_used):
                                     sampled_lspg_hybrid_stage_count += 1
+                                    if bool(fluid_hrom_stage_sample_local_state_writes):
+                                        sampled_lspg_hybrid_sample_local_stage_count += 1
+                                    if (
+                                        fluid_hrom_info is not None
+                                        and bool(fluid_hrom_info.get("final_full_state_write", True))
+                                    ):
+                                        sampled_lspg_hybrid_final_full_write_count += 1
+                                    else:
+                                        sampled_lspg_hybrid_skipped_final_full_write_count += 1
                                 else:
                                     sampled_lspg_hybrid_exact_stage_count += 1
                                 if fluid_hrom_fallback_reason:
@@ -9806,6 +13426,7 @@ def run_local_example2(
                         fluid_times.append(float(fluid_elapsed))
                         if bool(fluid_hrom_used):
                             consecutive_hrom_stages += 1
+                            step_hrom_stages += 1
                         else:
                             consecutive_hrom_stages = 0
         
@@ -9821,7 +13442,7 @@ def run_local_example2(
                                         solid_iface_coords,
                                     )
                                 )
-                            else:
+                            elif reaction_point_load_lookup is None:
                                 reaction_point_load_lookup = _fluid_interface_reaction_loads(
                                     prob=fluid,
                                     rho_f=float(setup.material.density),
@@ -9839,6 +13460,38 @@ def run_local_example2(
                                     _negate_lookup(reaction_point_load_lookup),
                                     solid_iface_coords,
                                 )
+                            elif reaction_solid_load_lookup is None:
+                                reaction_solid_load_lookup = _resample_lookup_to_coords(
+                                    _negate_lookup(reaction_point_load_lookup),
+                                    solid_iface_coords,
+                                )
+                            if (
+                                fluid_hrom_adaptive_db_path is not None
+                                and bool(fluid_hrom_adaptive_pre_dumped)
+                                and not bool(fluid_hrom_used)
+                            ):
+                                _maybe_dump_exact_fluid_probe(
+                                    output_dir=fluid_hrom_adaptive_db_path,
+                                    step=int(step),
+                                    coupling_iter=int(coupling_iter),
+                                    stage_label="post_fluid_solve",
+                                    bc_scale=float(bc_scale),
+                                    dt=float(dt_value),
+                                    bossak_alpha=float(bossak_alpha),
+                                    fluid=fluid,
+                                    reaction_point_load_lookup=reaction_point_load_lookup,
+                                    reaction_solid_load_lookup=reaction_solid_load_lookup,
+                                    force=True,
+                                    extra_payload={
+                                        "adaptive_hrom_attempt": np.asarray(1, dtype=int),
+                                        "adaptive_stage_role": np.asarray("post"),
+                                        "adaptive_reason": np.asarray(str(fluid_hrom_fallback_reason or "exact_correction")),
+                                        "adaptive_manifold_distance": np.asarray(float(fluid_hrom_manifold_distance)),
+                                        "adaptive_eta_gamma": np.asarray(float(fluid_hrom_eta_gamma)),
+                                        "adaptive_dwr_error": np.asarray(float(fluid_hrom_dwr_error)),
+                                    },
+                                )
+                                sampled_lspg_hybrid_adaptive_stage_dump_count += 1
                             if _env_bool("PYCUTFEM_EX2_STAGE_TIMING", False):
                                 _log(
                                     True,
@@ -9913,6 +13566,10 @@ def run_local_example2(
                             )
                     returned_load_lookup = _resample_lookup_to_coords(fluid_point_load_lookup, solid_iface_coords)
                     last_returned_load_lookup = returned_load_lookup
+                    if reaction_point_load_lookup is not None:
+                        last_impedance_interface_disp_lookup = _copy_lookup(solid_disp_fluid_lookup)
+                        last_impedance_interface_velocity_lookup = _copy_lookup(mesh_vel_fluid_lookup)
+                        last_impedance_reaction_point_lookup = _copy_lookup(reaction_point_load_lookup)
                     mesh_vel_solid_lookup = _resample_lookup_to_coords(mesh_vel_fluid_lookup, solid_iface_coords)
                     interface_velocity_snapshot = np.asarray(mesh_vel_solid_lookup.values, dtype=float).reshape(-1)
                     interface_disp_snapshot = np.asarray(solid_disp_solid_lookup.values, dtype=float).reshape(-1)
@@ -9926,6 +13583,35 @@ def run_local_example2(
                     load_residual = accel_return_vals - accel_guess_vals
                     disp_abs, disp_rel = _relative_change(solid_disp_solid_lookup.values, prev_disp_iter_vals)
                     load_abs, load_rel = _relative_change(accel_return_vals, accel_guess_vals)
+                    fluid_hrom_load_contraction_ratio = float("nan")
+                    fluid_hrom_disabled_by_contraction_monitor = False
+                    if (
+                        bool(fluid_hrom_used)
+                        and np.isfinite(float(hrom_pre_stage_load_rel))
+                        and float(hrom_pre_stage_load_rel) > 1.0e-15
+                    ):
+                        fluid_hrom_load_contraction_ratio = float(load_rel) / max(
+                            float(hrom_pre_stage_load_rel),
+                            1.0e-15,
+                        )
+                        if float(fluid_hrom_load_contraction_ratio) > float(
+                            fluid_hrom_max_load_contraction_ratio_value
+                        ):
+                            sampled_lspg_hybrid_contraction_monitor_failures += 1
+                            fluid_hrom_disabled_by_contraction_monitor = True
+                            fluid_hrom_disabled_until_step = max(
+                                int(fluid_hrom_disabled_until_step),
+                                int(step),
+                            )
+                            _log(
+                                verbose,
+                                "[fluid-hrom] "
+                                f"step={step} coupling_iter={coupling_iter} "
+                                "contraction_monitor_failed=1 "
+                                f"ratio={float(fluid_hrom_load_contraction_ratio):.3e} "
+                                f"gate={float(fluid_hrom_max_load_contraction_ratio_value):.3e} "
+                                f"disabled_until_step={int(fluid_hrom_disabled_until_step)}",
+                            )
                     last_disp_abs = disp_abs
                     last_disp_rel = disp_rel
                     last_load_abs = load_abs
@@ -9942,6 +13628,25 @@ def run_local_example2(
                     else:
                         omega_force = float(
                             np.clip(float(active_force_relaxation), float(force_relaxation_min), float(force_relaxation_max))
+                        )
+                    if (
+                        bool(use_sampled_lspg_hybrid_fluid)
+                        and fluid_hrom_certified_relaxation_value == "adaptive"
+                    ):
+                        omega_force, fluid_hrom_certified_relaxation_reason = _certified_hrom_relaxation_factor(
+                            base_omega=float(omega_force),
+                            previous_omega=float(last_force_omega),
+                            hrom_used=bool(fluid_hrom_used),
+                            eta_gamma=float(fluid_hrom_eta_gamma),
+                            eta_gamma_tol=float(fluid_hrom_interface_load_tolerance_value),
+                            manifold_distance=float(fluid_hrom_manifold_distance),
+                            manifold_distance_max=float(fluid_hrom_max_manifold_distance_value),
+                            contraction_ratio=float(fluid_hrom_load_contraction_ratio),
+                            contraction_ratio_max=float(fluid_hrom_max_load_contraction_ratio_value),
+                            growth=float(fluid_hrom_certified_relaxation_growth_value),
+                            shrink=float(fluid_hrom_certified_relaxation_shrink_value),
+                            omega_min=float(force_relaxation_min),
+                            omega_max=float(force_relaxation_max),
                         )
 
                     disp_max = float(np.max(np.linalg.norm(np.asarray(solid_disp_solid_lookup.values, dtype=float), axis=1)))
@@ -9963,6 +13668,25 @@ def run_local_example2(
                         "load_return_max": load_return_max,
                         "force_update_active": str(active_force_update),
                         "force_omega": float(omega_force),
+                        "nirb_force_trust_modified": bool(nirb_force_trust_modified),
+                        "nirb_force_trust_projection_rel": float(nirb_force_trust_projection_rel),
+                        "nirb_force_trust_coefficient_ratio": float(nirb_force_trust_coefficient_ratio),
+                        "nirb_force_trust_reason": str(nirb_force_trust_reason),
+                        "nirb_force_coordinate_update_active": bool(nirb_force_coordinate_update_active),
+                        "nirb_force_coordinate_prediction_active": bool(nirb_force_coordinate_prediction_active),
+                        "nirb_force_coordinate_coeff_ratio": float(nirb_force_coordinate_coeff_ratio),
+                        "nirb_force_coordinate_update_backend": str(nirb_force_coordinate_update_backend),
+                        "nirb_force_coordinate_clipped": bool(nirb_force_coordinate_clipped),
+                        "nirb_force_coordinate_safety_alpha": float(nirb_force_coordinate_safety_alpha),
+                        "nirb_force_coordinate_safety_reason": str(nirb_force_coordinate_safety_reason),
+                        "nirb_interface_trust_alpha": float(nirb_interface_trust_alpha),
+                        "nirb_interface_disp_rel": float(nirb_interface_disp_rel),
+                        "nirb_interface_step_ratio": float(nirb_interface_step_ratio),
+                        "nirb_interface_corrected": bool(nirb_interface_corrected),
+                        "nirb_interface_rejected": bool(nirb_interface_rejected),
+                        "nirb_interface_reason": str(nirb_interface_reason),
+                        "nirb_exact_fallback_used": bool(nirb_exact_fallback_used),
+                        "nirb_fallback_reason": str(nirb_fallback_reason),
                     }
                     keep_snapshot = snapshot_mode == "all"
                     disp_converged = bool((disp_abs <= coupling_abs_tol) or (disp_rel <= coupling_rel_tol))
@@ -9984,10 +13708,95 @@ def run_local_example2(
                             f"step={step} coupling_iter={coupling_iter} exact_accept_required=1 "
                             f"load_rel={float(load_rel):.3e} disp_rel={float(disp_rel):.3e}",
                         )
+                    hrom_skipped_full_write = bool(
+                        fluid_hrom_used
+                        and fluid_hrom_info is not None
+                        and not bool(fluid_hrom_info.get("final_full_state_write", True))
+                    )
+                    if bool(hrom_skipped_full_write):
+                        if hrom_history is None or hrom_state_guess is None or hrom_a_guess is None:
+                            raise RuntimeError("Load-only HROM stage is missing its pre-stage restore snapshot.")
+                        t_hrom_finalize0 = time.perf_counter()
+                        _restore_fluid_dvms_state(fluid.get("dvms_state"), hrom_history)
+                        if bool(step_converged):
+                            if sampled_lspg_hybrid_model is None:
+                                raise RuntimeError("Accepted HROM stage has no loaded sampled-LSPG model.")
+                            state_offset = np.asarray(fluid_hrom_info.get("state_offset"), dtype=float)
+                            hrom_coefficients = np.asarray(fluid_hrom_info["coefficients"], dtype=float).reshape(-1)
+                            full_hrom_state = state_offset + np.asarray(
+                                sampled_lspg_hybrid_model.basis,
+                                dtype=float,
+                            ) @ hrom_coefficients
+                            _write_fluid_state_for_hrom(
+                                dh=fluid["dh"],
+                                u_k=fluid["u_k"],
+                                p_k=fluid["p_k"],
+                                state=full_hrom_state,
+                            )
+                            fluid_bossak = _bossak_coefficients(
+                                alpha=float(bossak_alpha),
+                                dt=max(float(dt_value), 1.0e-14),
+                            )
+                            fluid["a_k"].nodal_values[:] = (
+                                float(fluid_bossak["ma0"])
+                                * (
+                                    np.asarray(fluid["u_k"].nodal_values, dtype=float)
+                                    - np.asarray(fluid_prev_step[0], dtype=float)
+                                )
+                                + float(fluid_bossak["ma2"]) * np.asarray(fluid_a_prev_stage, dtype=float)
+                            )
+                            _update_fluid_dvms_predicted_subscale(
+                                state=fluid["dvms_state"],
+                                dh=fluid["dh"],
+                                mesh=mesh_f,
+                                u_k=fluid["u_k"],
+                                u_prev=fluid["u_prev"],
+                                a_prev=fluid["a_prev"],
+                                a_curr=fluid.get("a_k"),
+                                p_k=fluid["p_k"],
+                                d_mesh=fluid["d_mesh"],
+                                d_prev=fluid["d_prev"],
+                                d_prev2=fluid.get("d_prev2"),
+                                mesh_v=fluid.get("w_mesh_k"),
+                                mesh_v_prev=fluid.get("w_mesh_prev"),
+                                mesh_a_prev=fluid.get("a_mesh_prev"),
+                                rho_f=float(setup.material.density),
+                                mu_f=mu_f,
+                                dt=float(dt_value),
+                                bossak_alpha=float(bossak_alpha),
+                                dynamic_tau=float(dynamic_tau),
+                                backend=str(backend),
+                                use_oss=False,
+                            )
+                            fluid_guess = _snapshot_function_values([fluid["u_k"], fluid["p_k"]])
+                            _log(
+                                verbose,
+                                "[fluid-hrom] "
+                                f"step={step} coupling_iter={coupling_iter} "
+                                "accepted_load_only_state_reconstructed=1",
+                            )
+                        else:
+                            _restore_function_values([fluid["u_k"], fluid["p_k"]], hrom_state_guess)
+                            fluid["a_k"].nodal_values[:] = np.asarray(hrom_a_guess, dtype=float)
+                            fluid_guess = [
+                                np.asarray(item, dtype=float).copy()
+                                for item in hrom_state_guess
+                            ]
+                        fluid_elapsed += time.perf_counter() - t_hrom_finalize0
+                        if fluid_times:
+                            fluid_times[-1] = float(fluid_elapsed)
+                        row["fluid_time_s"] = float(fluid_elapsed)
                     row["fluid_hrom_used"] = bool(fluid_hrom_used)
                     row["fluid_hrom_trial_used"] = bool(fluid_hrom_trial_used)
                     row["fluid_hrom_trial_load_rel_error"] = float(fluid_hrom_trial_load_rel_error)
                     row["fluid_hrom_disabled_by_trial_monitor"] = bool(fluid_hrom_trial_disabled_by_monitor)
+                    row["fluid_hrom_disabled_by_contraction_monitor"] = bool(
+                        fluid_hrom_disabled_by_contraction_monitor
+                    )
+                    row["fluid_hrom_load_contraction_ratio"] = float(fluid_hrom_load_contraction_ratio)
+                    row["fluid_hrom_manifold_distance"] = float(fluid_hrom_manifold_distance)
+                    row["fluid_hrom_eta_gamma"] = float(fluid_hrom_eta_gamma)
+                    row["fluid_hrom_dwr_error"] = float(fluid_hrom_dwr_error)
                     row["fluid_hrom_exact_accept_forced"] = bool(hrom_exact_accept_forced)
                     row["fluid_hrom_interface_trust_alpha"] = float(fluid_hrom_interface_trust_alpha)
                     row["fluid_hrom_interface_load_rel"] = float(fluid_hrom_interface_load_rel)
@@ -9995,6 +13804,15 @@ def run_local_example2(
                     row["fluid_hrom_interface_corrected"] = bool(fluid_hrom_interface_corrected)
                     row["fluid_hrom_interface_rejected"] = bool(fluid_hrom_interface_rejected)
                     row["fluid_hrom_interface_reason"] = str(fluid_hrom_interface_reason)
+                    row["fluid_hrom_impedance_used"] = bool(fluid_hrom_impedance_used)
+                    row["fluid_hrom_impedance_blend"] = float(fluid_hrom_impedance_blend_used)
+                    row["fluid_hrom_impedance_rel"] = float(fluid_hrom_impedance_rel)
+                    row["fluid_hrom_reaction_source"] = str(hrom_reaction_source)
+                    row["fluid_hrom_certified_relaxation_reason"] = str(fluid_hrom_certified_relaxation_reason)
+                    row["fluid_hrom_fallback_reason"] = str(fluid_hrom_fallback_reason)
+                    row["fluid_hrom_sample_local_state_writes"] = bool(
+                        fluid_hrom_stage_sample_local_state_writes
+                    )
                     row["strict_converged"] = bool(step_converged)
                     row["kratos_disp_converged_5e-3"] = bool(kratos_disp_converged)
                     row["kratos_load_converged_5e-3"] = bool(kratos_load_converged)
@@ -10073,21 +13891,346 @@ def run_local_example2(
                         v_new=None,
                         w_new=None,
                     )
-                    current_load_lookup, _, load_update_debug = _advance_coupling_load_guess(
-                        step_converged=bool(step_converged),
-                        active_force_update=str(active_force_update),
-                        iface_coords=fluid_iface_coords if accelerate_on_fluid_load else solid_iface_coords,
-                        load_guess_vals=accel_guess_vals,
-                        returned_load_vals=accel_return_vals,
-                        load_guess_history=load_guess_history,
-                        load_return_history=load_return_history,
-                        iqn_old_dr_mats=list(iqn_old_dr_mats),
-                        iqn_old_dg_mats=list(iqn_old_dg_mats),
-                        omega_force=float(omega_force),
-                        force_iteration_horizon=int(force_iteration_horizon),
-                        force_regularization=float(force_regularization),
-                        include_debug=True,
+                    hrom_relaxed_history_update = bool(
+                        fluid_hrom_used and sampled_lspg_hybrid_history_policy == "relaxed"
                     )
+                    if bool(hrom_relaxed_history_update):
+                        update_iface_coords = np.asarray(
+                            fluid_iface_coords if accelerate_on_fluid_load else solid_iface_coords,
+                            dtype=float,
+                        )
+                        if bool(step_converged):
+                            current_load_lookup = CoordinateLookup(update_iface_coords, accel_return_vals, dim=2)
+                            load_update_debug = {
+                                "backend": "hrom_relaxed",
+                                "used_history": False,
+                                "v_new": None,
+                                "w_new": None,
+                            }
+                        else:
+                            current_load_lookup = _relaxed_lookup(
+                                update_iface_coords,
+                                accel_guess_vals,
+                                accel_return_vals,
+                                omega=float(omega_force),
+                            )
+                            load_update_debug = {
+                                "backend": "hrom_relaxed",
+                                "used_history": False,
+                                "v_new": None,
+                                "w_new": None,
+                            }
+                    elif (
+                        nirb_force_coordinate_update_value in {"pod", "pod_clipped"}
+                        and nirb_force_manifold_trust_operator is not None
+                        and nirb_solid_predictor is not None
+                        and int(step) >= int(nirb_start_step_value)
+                        and not bool(force_coordinate_safety_disabled)
+                    ):
+                        q_guess = nirb_force_manifold_trust_operator.coefficients(load_guess_vals)
+                        q_return = nirb_force_manifold_trust_operator.coefficients(
+                            np.asarray(returned_load_lookup.values, dtype=float)
+                        )
+                        if bool(step_converged):
+                            q_next = q_return.reshape(-1)
+                            load_update_debug = {
+                                "backend": "force_pod_accept",
+                                "used_history": False,
+                                "v_new": None,
+                                "w_new": None,
+                            }
+                        elif str(active_force_update).lower() == "iqnils":
+                            force_coeff_guess_history.append(q_guess.copy())
+                            force_coeff_return_history.append(q_return.copy())
+                            v_new, w_new = _iqnils_iteration_matrices(
+                                x_history=force_coeff_guess_history,
+                                g_history=force_coeff_return_history,
+                                iteration_horizon=int(force_iteration_horizon),
+                            )
+                            q_next = _iqnils_next_iterate(
+                                x_curr=q_guess,
+                                g_curr=q_return,
+                                x_history=force_coeff_guess_history,
+                                g_history=force_coeff_return_history,
+                                dr_old_mats=list(force_coeff_iqn_old_dr_mats),
+                                dg_old_mats=list(force_coeff_iqn_old_dg_mats),
+                                omega=float(omega_force),
+                                horizon=int(force_iteration_horizon),
+                                regularization=float(force_regularization),
+                            ).reshape(-1)
+                            load_update_debug = {
+                                "backend": f"{str(_env_str('PYCUTFEM_EX2_IQN_BACKEND', 'python')).strip().lower()}_force_pod",
+                                "used_history": bool(
+                                    (v_new is not None and int(v_new.size) > 0)
+                                    or any(np.asarray(block).size for block in force_coeff_iqn_old_dr_mats)
+                                ),
+                                "v_new": None if v_new is None else np.asarray(v_new, dtype=float),
+                                "w_new": None if w_new is None else np.asarray(w_new, dtype=float),
+                            }
+                        else:
+                            force_coeff_guess_history.append(q_guess.copy())
+                            force_coeff_return_history.append(q_return.copy())
+                            q_next = (q_guess + float(omega_force) * (q_return - q_guess)).reshape(-1)
+                            load_update_debug = {
+                                "backend": "python_force_pod",
+                                "used_history": False,
+                                "v_new": None,
+                                "w_new": None,
+                            }
+                        if nirb_force_coordinate_update_value == "pod_clipped":
+                            q_next, nirb_force_coordinate_clipped = (
+                                nirb_force_manifold_trust_operator.clip_coefficients(q_next)
+                            )
+                        next_structure_values = nirb_force_manifold_trust_operator.values_from_coefficients(
+                            q_next,
+                            shape=tuple(np.asarray(load_guess_vals).shape),
+                        )
+                        if str(nirb_force_coordinate_trust_value) != "none" and not bool(step_converged):
+                            trust_result = _fluid_hrom_interface_trust_region(
+                                current_values=np.asarray(load_guess_vals, dtype=float),
+                                proposed_values=np.asarray(next_structure_values, dtype=float),
+                                previous_load_abs=float(load_abs),
+                                mode=str(nirb_force_coordinate_trust_value),
+                                max_step_ratio=float(nirb_force_coordinate_max_step_ratio_value),
+                                max_load_rel=float(nirb_force_coordinate_max_load_rel_value),
+                                min_correction_alpha=float(nirb_force_coordinate_min_alpha_value),
+                            )
+                            nirb_force_coordinate_safety_alpha = float(trust_result.alpha)
+                            nirb_force_coordinate_safety_reason = str(trust_result.reason)
+                            if not bool(trust_result.accepted):
+                                force_coordinate_safety_disabled = True
+                                force_coordinate_safety_step_tripped = True
+                                nirb_force_coordinate_safety_fallback_count += 1
+                                force_coeff_guess_history.clear()
+                                force_coeff_return_history.clear()
+                                current_load_lookup, _, load_update_debug = _advance_coupling_load_guess(
+                                    step_converged=bool(step_converged),
+                                    active_force_update=str(active_force_update),
+                                    iface_coords=fluid_iface_coords if accelerate_on_fluid_load else solid_iface_coords,
+                                    load_guess_vals=accel_guess_vals,
+                                    returned_load_vals=accel_return_vals,
+                                    load_guess_history=load_guess_history,
+                                    load_return_history=load_return_history,
+                                    iqn_old_dr_mats=list(iqn_old_dr_mats),
+                                    iqn_old_dg_mats=list(iqn_old_dg_mats),
+                                    omega_force=float(omega_force),
+                                    force_iteration_horizon=int(force_iteration_horizon),
+                                    force_regularization=float(force_regularization),
+                                    include_debug=True,
+                                )
+                                if not bool(step_converged):
+                                    load_history_keep_for_old_iqn.append(
+                                        not (
+                                            bool(fluid_hrom_used)
+                                            and sampled_lspg_hybrid_history_policy == "step_local"
+                                        )
+                                    )
+                                nirb_force_coordinate_update_backend = "force_pod_safety_fallback"
+                                row["nirb_force_coordinate_update_backend"] = str(
+                                    nirb_force_coordinate_update_backend
+                                )
+                                _log(
+                                    verbose,
+                                    "[nirb] "
+                                    f"step={step} coupling_iter={coupling_iter} "
+                                    "force_coordinate_safety_fallback=1 "
+                                    f"reason={nirb_force_coordinate_safety_reason} "
+                                    f"alpha={float(nirb_force_coordinate_safety_alpha):.3e}",
+                                )
+                            elif bool(trust_result.corrected):
+                                q_next = (
+                                    np.asarray(q_guess, dtype=float).reshape(-1)
+                                    + float(trust_result.alpha)
+                                    * (
+                                        np.asarray(q_next, dtype=float).reshape(-1)
+                                        - np.asarray(q_guess, dtype=float).reshape(-1)
+                                    )
+                                )
+                                if nirb_force_coordinate_update_value == "pod_clipped":
+                                    q_next, clipped_after_trust = (
+                                        nirb_force_manifold_trust_operator.clip_coefficients(q_next)
+                                    )
+                                    nirb_force_coordinate_clipped = bool(
+                                        nirb_force_coordinate_clipped or clipped_after_trust
+                                    )
+                                next_structure_values = (
+                                    nirb_force_manifold_trust_operator.values_from_coefficients(
+                                        q_next,
+                                        shape=tuple(np.asarray(load_guess_vals).shape),
+                                    )
+                                )
+                                nirb_force_coordinate_safety_clip_count += 1
+                        if not bool(force_coordinate_safety_disabled):
+                            next_structure_lookup = CoordinateLookup(solid_iface_coords, next_structure_values, dim=2)
+                            if bool(accelerate_on_fluid_load):
+                                current_load_lookup = _resample_lookup_to_coords(
+                                    _negate_lookup(next_structure_lookup),
+                                    fluid_iface_coords,
+                                )
+                            else:
+                                current_load_lookup = next_structure_lookup
+                            nirb_force_coordinate_update_active = True
+                            nirb_force_coordinate_update_backend = str(load_update_debug.get("backend", "force_pod"))
+                            nirb_force_coordinate_coeff_ratio = (
+                                nirb_force_manifold_trust_operator.coefficient_ratio_from_coefficients(q_next)
+                            )
+                            row["nirb_force_coordinate_update_active"] = bool(nirb_force_coordinate_update_active)
+                            row["nirb_force_coordinate_coeff_ratio"] = float(nirb_force_coordinate_coeff_ratio)
+                            row["nirb_force_coordinate_update_backend"] = str(nirb_force_coordinate_update_backend)
+                            row["nirb_force_coordinate_clipped"] = bool(nirb_force_coordinate_clipped)
+                            _log(
+                                verbose,
+                                "[nirb] "
+                                f"step={step} coupling_iter={coupling_iter} "
+                                "force_coordinate_update=1 "
+                                f"backend={nirb_force_coordinate_update_backend} "
+                                f"coeff_ratio={float(nirb_force_coordinate_coeff_ratio):.3e} "
+                                f"clipped={int(bool(nirb_force_coordinate_clipped))} "
+                                f"safety_alpha={float(nirb_force_coordinate_safety_alpha):.3e} "
+                                f"safety_reason={nirb_force_coordinate_safety_reason}",
+                            )
+                    else:
+                        current_load_lookup, _, load_update_debug = _advance_coupling_load_guess(
+                            step_converged=bool(step_converged),
+                            active_force_update=str(active_force_update),
+                            iface_coords=fluid_iface_coords if accelerate_on_fluid_load else solid_iface_coords,
+                            load_guess_vals=accel_guess_vals,
+                            returned_load_vals=accel_return_vals,
+                            load_guess_history=load_guess_history,
+                            load_return_history=load_return_history,
+                            iqn_old_dr_mats=list(iqn_old_dr_mats),
+                            iqn_old_dg_mats=list(iqn_old_dg_mats),
+                            omega_force=float(omega_force),
+                            force_iteration_horizon=int(force_iteration_horizon),
+                            force_regularization=float(force_regularization),
+                            include_debug=True,
+                        )
+                        if not bool(step_converged):
+                            load_history_keep_for_old_iqn.append(
+                                not (
+                                    bool(fluid_hrom_used)
+                                    and sampled_lspg_hybrid_history_policy == "step_local"
+                                )
+                            )
+                    if (
+                        nirb_force_coordinate_update_value == "adaptive"
+                        and nirb_force_manifold_trust_operator is not None
+                        and nirb_solid_predictor is not None
+                        and int(step) >= int(nirb_start_step_value)
+                        and not bool(force_coordinate_safety_disabled)
+                    ):
+                        if bool(accelerate_on_fluid_load):
+                            proposed_structure_lookup = _resample_lookup_to_coords(
+                                _negate_lookup(current_load_lookup),
+                                solid_iface_coords,
+                            )
+                        else:
+                            proposed_structure_lookup = current_load_lookup
+                        adaptive_result = nirb_force_manifold_trust_operator.apply(
+                            np.asarray(proposed_structure_lookup.values, dtype=float)
+                        )
+                        if _nirb_force_trust_outside(
+                            adaptive_result,
+                            max_projection_rel=float(nirb_force_manifold_max_projection_rel_value),
+                        ):
+                            q_next = nirb_force_manifold_trust_operator.coefficients(
+                                np.asarray(proposed_structure_lookup.values, dtype=float)
+                            )
+                            q_next, nirb_force_coordinate_clipped = (
+                                nirb_force_manifold_trust_operator.clip_coefficients(q_next)
+                            )
+                            projected_structure_values = (
+                                nirb_force_manifold_trust_operator.values_from_coefficients(
+                                    q_next,
+                                    shape=tuple(np.asarray(proposed_structure_lookup.values).shape),
+                                )
+                            )
+                            projected_structure_lookup = CoordinateLookup(
+                                solid_iface_coords,
+                                projected_structure_values,
+                                dim=2,
+                            )
+                            if bool(accelerate_on_fluid_load):
+                                current_load_lookup = _resample_lookup_to_coords(
+                                    _negate_lookup(projected_structure_lookup),
+                                    fluid_iface_coords,
+                                )
+                            else:
+                                current_load_lookup = projected_structure_lookup
+                            nirb_force_coordinate_update_active = True
+                            nirb_force_coordinate_update_backend = "adaptive_force_pod"
+                            nirb_force_coordinate_coeff_ratio = (
+                                nirb_force_manifold_trust_operator.coefficient_ratio_from_coefficients(q_next)
+                            )
+                            row["nirb_force_coordinate_update_active"] = bool(nirb_force_coordinate_update_active)
+                            row["nirb_force_coordinate_coeff_ratio"] = float(nirb_force_coordinate_coeff_ratio)
+                            row["nirb_force_coordinate_update_backend"] = str(nirb_force_coordinate_update_backend)
+                            row["nirb_force_coordinate_clipped"] = bool(nirb_force_coordinate_clipped)
+                            _log(
+                                verbose,
+                                "[nirb] "
+                                f"step={step} coupling_iter={coupling_iter} "
+                                "adaptive_force_coordinate_projection=1 "
+                                f"proj_rel={float(adaptive_result.projection_rel):.3e} "
+                                f"coeff_ratio_before={float(adaptive_result.coefficient_ratio):.3e} "
+                                f"coeff_ratio_after={float(nirb_force_coordinate_coeff_ratio):.3e} "
+                                f"clipped={int(bool(nirb_force_coordinate_clipped))}",
+                            )
+                    row["nirb_force_coordinate_safety_alpha"] = float(nirb_force_coordinate_safety_alpha)
+                    row["nirb_force_coordinate_safety_reason"] = str(nirb_force_coordinate_safety_reason)
+                    nirb_force_trust_update_alpha = float("nan")
+                    nirb_force_trust_next_projection_rel = float("nan")
+                    nirb_force_trust_next_coefficient_ratio = float("nan")
+                    nirb_force_trust_next_reason = "inactive"
+                    if (
+                        not bool(step_converged)
+                        and nirb_force_manifold_trust_operator is not None
+                        and str(nirb_force_manifold_trust_value) == "limit"
+                        and nirb_solid_predictor is not None
+                        and int(step) >= int(nirb_start_step_value)
+                    ):
+                        if bool(accelerate_on_fluid_load):
+                            proposed_structure_lookup = _resample_lookup_to_coords(
+                                _negate_lookup(current_load_lookup),
+                                solid_iface_coords,
+                            )
+                        else:
+                            proposed_structure_lookup = current_load_lookup
+                        limit_result, limit_alpha = nirb_force_manifold_trust_operator.limit_update(
+                            current_values=np.asarray(load_guess_vals, dtype=float),
+                            proposed_values=np.asarray(proposed_structure_lookup.values, dtype=float),
+                        )
+                        nirb_force_trust_update_alpha = float(limit_alpha)
+                        nirb_force_trust_next_projection_rel = float(limit_result.projection_rel)
+                        nirb_force_trust_next_coefficient_ratio = float(limit_result.coefficient_ratio)
+                        nirb_force_trust_next_reason = str(limit_result.reason)
+                        if bool(limit_result.modified):
+                            limited_structure_lookup = CoordinateLookup(
+                                solid_iface_coords,
+                                np.asarray(limit_result.values, dtype=float).reshape(-1, 2),
+                                dim=2,
+                            )
+                            if bool(accelerate_on_fluid_load):
+                                current_load_lookup = _resample_lookup_to_coords(
+                                    _negate_lookup(limited_structure_lookup),
+                                    fluid_iface_coords,
+                                )
+                            else:
+                                current_load_lookup = limited_structure_lookup
+                            _log(
+                                verbose,
+                                "[nirb] "
+                                f"step={step} coupling_iter={coupling_iter} "
+                                "force_manifold_update_limited=1 "
+                                f"alpha={float(limit_alpha):.3e} "
+                                f"proj_rel={float(limit_result.projection_rel):.3e} "
+                                f"coeff_ratio={float(limit_result.coefficient_ratio):.3e} "
+                                f"reason={limit_result.reason}",
+                            )
+                    row["nirb_force_trust_update_alpha"] = float(nirb_force_trust_update_alpha)
+                    row["nirb_force_trust_next_projection_rel"] = float(nirb_force_trust_next_projection_rel)
+                    row["nirb_force_trust_next_coefficient_ratio"] = float(nirb_force_trust_next_coefficient_ratio)
+                    row["nirb_force_trust_next_reason"] = str(nirb_force_trust_next_reason)
                     _maybe_dump_coupling_update_probe(
                         output_dir=output_dir,
                         step=int(step),
@@ -10115,6 +14258,8 @@ def run_local_example2(
                         v_new=load_update_debug.get("v_new"),
                         w_new=load_update_debug.get("w_new"),
                     )
+                    last_force_coordinate_update_active = bool(nirb_force_coordinate_update_active)
+                    last_force_coordinate_update_backend = str(nirb_force_coordinate_update_backend)
                     if step_converged:
                         break
 
@@ -10231,6 +14376,28 @@ def run_local_example2(
             )
             fluid["a_k"].nodal_values[:] = fluid["a_prev"].nodal_values[:]
             _finalize_kratos_exact_fluid_backend_step(backend=kratos_exact_fluid_backend)
+        elif kratos_hrom_exact_fallback_backend is not None and last_fluid_accel_lookup is not None:
+            if last_mesh_vel_fluid_lookup is None or last_mesh_accel_fluid_lookup is None:
+                raise RuntimeError("Kratos HROM exact fallback did not produce mesh kinematics for the accepted step.")
+            _transfer_vector_field(
+                target_dh=fluid["dh"],
+                target_vec=fluid["w_mesh_prev"],
+                source_lookup=last_mesh_vel_fluid_lookup,
+            )
+            _transfer_vector_field(
+                target_dh=fluid["dh"],
+                target_vec=fluid["a_mesh_prev"],
+                source_lookup=last_mesh_accel_fluid_lookup,
+            )
+            fluid["w_mesh_k"].nodal_values[:] = fluid["w_mesh_prev"].nodal_values[:]
+            fluid["a_mesh_k"].nodal_values[:] = fluid["a_mesh_prev"].nodal_values[:]
+            _transfer_vector_field(
+                target_dh=fluid["dh"],
+                target_vec=fluid["a_prev"],
+                source_lookup=last_fluid_accel_lookup,
+            )
+            fluid["a_k"].nodal_values[:] = fluid["a_prev"].nodal_values[:]
+            _finalize_kratos_exact_fluid_backend_step(backend=kratos_hrom_exact_fallback_backend)
         elif kratos_mesh_backend is not None:
             if last_mesh_vel_fluid_lookup is None or last_mesh_accel_fluid_lookup is None:
                 raise RuntimeError("Kratos mesh backend did not produce mesh kinematics for the accepted step.")
@@ -10332,15 +14499,60 @@ def run_local_example2(
                 reaction_point_load_lookup=None,
                 reaction_solid_load_lookup=None,
             )
-        if str(active_force_update).lower() == "iqnils" and len(load_guess_history) >= 2 and len(load_return_history) >= 2:
+        old_iqn_guess_history: list[np.ndarray] = []
+        old_iqn_return_history: list[np.ndarray] = []
+        if (
+            str(active_force_update).lower() == "iqnils"
+            and len(load_guess_history) >= 2
+            and len(load_return_history) >= 2
+        ):
+            if (
+                bool(use_sampled_lspg_hybrid_fluid)
+                and sampled_lspg_hybrid_history_policy == "step_local"
+                and len(load_history_keep_for_old_iqn) == len(load_guess_history)
+            ):
+                old_iqn_guess_history = [
+                    np.asarray(values, dtype=float)
+                    for values, keep in zip(load_guess_history, load_history_keep_for_old_iqn)
+                    if bool(keep)
+                ]
+                old_iqn_return_history = [
+                    np.asarray(values, dtype=float)
+                    for values, keep in zip(load_return_history, load_history_keep_for_old_iqn)
+                    if bool(keep)
+                ]
+            else:
+                old_iqn_guess_history = load_guess_history
+                old_iqn_return_history = load_return_history
+        if (
+            str(active_force_update).lower() == "iqnils"
+            and len(old_iqn_guess_history) >= 2
+            and len(old_iqn_return_history) >= 2
+        ):
             v_new, w_new = _iqnils_iteration_matrices(
-                x_history=load_guess_history,
-                g_history=load_return_history,
+                x_history=old_iqn_guess_history,
+                g_history=old_iqn_return_history,
                 iteration_horizon=int(force_iteration_horizon),
             )
             if v_new is not None and w_new is not None:
                 iqn_old_dr_mats.appendleft(v_new)
                 iqn_old_dg_mats.appendleft(w_new)
+
+        if (
+            nirb_force_coordinate_update_value != "none"
+            and not bool(force_coordinate_safety_step_tripped)
+            and str(active_force_update).lower() == "iqnils"
+            and len(force_coeff_guess_history) >= 2
+            and len(force_coeff_return_history) >= 2
+        ):
+            coeff_v_new, coeff_w_new = _iqnils_iteration_matrices(
+                x_history=force_coeff_guess_history,
+                g_history=force_coeff_return_history,
+                iteration_horizon=int(force_iteration_horizon),
+            )
+            if coeff_v_new is not None and coeff_w_new is not None:
+                force_coeff_iqn_old_dr_mats.appendleft(coeff_v_new)
+                force_coeff_iqn_old_dg_mats.appendleft(coeff_w_new)
 
         if bool(save_vtk) and int(vtk_every) > 0 and (int(step) % int(vtk_every) == 0):
             fluid_vtk_path, solid_vtk_path = _write_vtk_outputs(
@@ -10486,6 +14698,17 @@ def run_local_example2(
         "fluid_hrom_switch_iter": (
             None if sampled_lspg_hybrid_model is None else int(sampled_lspg_hybrid_switch_iter)
         ),
+        "fluid_hrom_late_switch_step": (
+            None if sampled_lspg_hybrid_model is None else int(sampled_lspg_hybrid_late_switch_step)
+        ),
+        "fluid_hrom_late_switch_iter": (
+            None
+            if sampled_lspg_hybrid_model is None or sampled_lspg_hybrid_late_switch_iter is None
+            else int(sampled_lspg_hybrid_late_switch_iter)
+        ),
+        "fluid_hrom_start_step": (
+            None if sampled_lspg_hybrid_model is None else int(sampled_lspg_hybrid_start_step)
+        ),
         "fluid_hrom_modes": None if sampled_lspg_hybrid_model is None else int(sampled_lspg_hybrid_model.n_modes),
         "fluid_hrom_sample_rows": (
             None if sampled_lspg_hybrid_model is None else int(sampled_lspg_hybrid_model.sample_row_dofs.size)
@@ -10503,19 +14726,58 @@ def run_local_example2(
             if sampled_lspg_hybrid_model is None
             else float(np.sum(sampled_lspg_hybrid_model.sample_element_weights))
         ),
+        "fluid_hrom_incompressibility_scale": (
+            None if sampled_lspg_hybrid_model is None else float(sampled_lspg_hybrid_incompressibility_scale)
+        ),
+        "fluid_hrom_reduced_objective": (
+            None if sampled_lspg_hybrid_model is None else str(sampled_lspg_hybrid_reduced_objective)
+        ),
+        "fluid_hrom_exact_fallback_backend": (
+            None if sampled_lspg_hybrid_model is None else str(hrom_exact_fallback_backend_mode)
+        ),
+        "fluid_hrom_reduced_online_backend": str(fluid_hrom_reduced_online_backend),
+        "fluid_hrom_gnat_step_backend": str(fluid_hrom_gnat_step_backend),
+        "reduced_fluid_online_backend": reduced_fluid_online_backend_status(),
+        "fluid_hrom_commit_mode": (
+            None if sampled_lspg_hybrid_model is None else str(sampled_lspg_hybrid_commit_mode)
+        ),
+        "fluid_hrom_sample_local_state_writes": (
+            None if sampled_lspg_hybrid_model is None else bool(sampled_lspg_hybrid_sample_local_state_writes)
+        ),
+        "fluid_hrom_history_policy": (
+            None if sampled_lspg_hybrid_model is None else str(sampled_lspg_hybrid_history_policy)
+        ),
         "fluid_hrom_stage_count": int(sampled_lspg_hybrid_stage_count),
+        "fluid_hrom_sample_local_stage_count": int(sampled_lspg_hybrid_sample_local_stage_count),
+        "fluid_hrom_final_full_write_count": int(sampled_lspg_hybrid_final_full_write_count),
+        "fluid_hrom_skipped_final_full_write_count": int(sampled_lspg_hybrid_skipped_final_full_write_count),
+        "fluid_hrom_has_reduced_reaction": (
+            None if sampled_lspg_hybrid_model is None else bool(sampled_lspg_hybrid_model.has_reduced_reaction)
+        ),
+        "fluid_hrom_has_sampled_reaction": (
+            None if sampled_lspg_hybrid_model is None else bool(sampled_lspg_hybrid_model.has_sampled_reaction)
+        ),
         "fluid_hrom_exact_stage_count": int(sampled_lspg_hybrid_exact_stage_count),
         "fluid_hrom_fallback_count": int(sampled_lspg_hybrid_fallback_count),
+        "fluid_hrom_start_gate_skips": int(sampled_lspg_hybrid_start_gate_skips),
         "fluid_hrom_load_gate_skips": int(sampled_lspg_hybrid_load_gate_skips),
         "fluid_hrom_disp_gate_skips": int(sampled_lspg_hybrid_disp_gate_skips),
         "fluid_hrom_consecutive_gate_skips": int(sampled_lspg_hybrid_consecutive_gate_skips),
+        "fluid_hrom_step_gate_skips": int(sampled_lspg_hybrid_step_gate_skips),
+        "fluid_hrom_coupling_iter_gate_skips": int(sampled_lspg_hybrid_coupling_iter_gate_skips),
         "fluid_hrom_disabled_gate_skips": int(sampled_lspg_hybrid_disabled_gate_skips),
         "fluid_hrom_exact_accept_forced_count": int(sampled_lspg_hybrid_exact_accept_forced_count),
         "fluid_hrom_trial_stage_count": int(sampled_lspg_hybrid_trial_stage_count),
         "fluid_hrom_exact_correction_count": int(sampled_lspg_hybrid_exact_correction_count),
         "fluid_hrom_trial_monitor_failures": int(sampled_lspg_hybrid_trial_monitor_failures),
+        "fluid_hrom_contraction_monitor_failures": int(sampled_lspg_hybrid_contraction_monitor_failures),
         "fluid_hrom_interface_reject_count": int(sampled_lspg_hybrid_interface_reject_count),
         "fluid_hrom_interface_correction_count": int(sampled_lspg_hybrid_interface_correction_count),
+        "fluid_hrom_manifold_gate_failures": int(sampled_lspg_hybrid_manifold_gate_failures),
+        "fluid_hrom_dwr_gate_failures": int(sampled_lspg_hybrid_dwr_gate_failures),
+        "fluid_hrom_eta_gamma_gate_failures": int(sampled_lspg_hybrid_eta_gamma_gate_failures),
+        "fluid_hrom_adaptive_stage_dump_count": int(sampled_lspg_hybrid_adaptive_stage_dump_count),
+        "fluid_hrom_adaptive_db_dir": None if fluid_hrom_adaptive_db_path is None else str(fluid_hrom_adaptive_db_path),
         "fluid_hrom_disabled_until_step": (
             None if sampled_lspg_hybrid_model is None else int(fluid_hrom_disabled_until_step)
         ),
@@ -10528,8 +14790,17 @@ def run_local_example2(
         "fluid_hrom_max_previous_disp_rel": (
             None if sampled_lspg_hybrid_model is None else float(fluid_hrom_max_previous_disp_rel)
         ),
+        "fluid_hrom_max_coupling_iter": (
+            None if sampled_lspg_hybrid_model is None else int(fluid_hrom_max_coupling_iter_value)
+        ),
         "fluid_hrom_max_consecutive_stages": (
             None if sampled_lspg_hybrid_model is None else int(fluid_hrom_max_consecutive_stages_value)
+        ),
+        "fluid_hrom_max_stages_per_step": (
+            None if sampled_lspg_hybrid_model is None else int(fluid_hrom_max_stages_per_step_value)
+        ),
+        "fluid_hrom_max_load_contraction_ratio": (
+            None if sampled_lspg_hybrid_model is None else float(fluid_hrom_max_load_contraction_ratio_value)
         ),
         "fluid_hrom_require_exact_accept": (
             None if sampled_lspg_hybrid_model is None else bool(fluid_hrom_require_exact_accept)
@@ -10555,6 +14826,35 @@ def run_local_example2(
         "fluid_hrom_interface_min_correction_alpha": (
             None if sampled_lspg_hybrid_model is None else float(fluid_hrom_interface_min_correction_alpha_value)
         ),
+        "fluid_hrom_impedance_blend": (
+            None if sampled_lspg_hybrid_model is None else float(fluid_hrom_impedance_blend_value)
+        ),
+        "fluid_hrom_reaction_source": (
+            None if sampled_lspg_hybrid_model is None else str(fluid_hrom_reaction_source_value)
+        ),
+        "fluid_hrom_max_manifold_distance": (
+            None if sampled_lspg_hybrid_model is None else float(fluid_hrom_max_manifold_distance_value)
+        ),
+        "fluid_hrom_interface_load_tolerance": (
+            None if sampled_lspg_hybrid_model is None else float(fluid_hrom_interface_load_tolerance_value)
+        ),
+        "fluid_hrom_use_estimator_load_on_accept": (
+            None if sampled_lspg_hybrid_model is None else bool(fluid_hrom_use_estimator_load_on_accept)
+        ),
+        "fluid_hrom_max_dwr_error": (
+            None if sampled_lspg_hybrid_model is None else float(fluid_hrom_max_dwr_error_value)
+        ),
+        "fluid_hrom_certified_relaxation": (
+            None if sampled_lspg_hybrid_model is None else str(fluid_hrom_certified_relaxation_value)
+        ),
+        "fluid_hrom_certified_relaxation_growth": (
+            None if sampled_lspg_hybrid_model is None else float(fluid_hrom_certified_relaxation_growth_value)
+        ),
+        "fluid_hrom_certified_relaxation_shrink": (
+            None if sampled_lspg_hybrid_model is None else float(fluid_hrom_certified_relaxation_shrink_value)
+        ),
+        "reduced_fluid_cpp_backend": reduced_fluid_cpp_backend_status(),
+        "reduced_dvms_cpp_backend": reduced_dvms_cpp_backend_status(),
         "solid_operator": str(solid_operator_mode),
         "porous_pressure_order": int(porous_pressure_order_value) if solid_operator_mode == "porous" else None,
         "porous_material": (
@@ -10575,6 +14875,49 @@ def run_local_example2(
         ),
         "nirb_model_path": None if nirb_model_path is None else str(Path(nirb_model_path)),
         "nirb_start_step": int(nirb_start_step_value),
+        "nirb_fallback_exact": bool(nirb_fallback_exact),
+        "nirb_exact_after_coupling_iter": int(nirb_exact_after_coupling_iter_value),
+        "nirb_exact_after_load_rel": float(nirb_exact_after_load_rel_value),
+        "nirb_exact_after_disp_rel": float(nirb_exact_after_disp_rel_value),
+        "nirb_exact_fallback_guess": str(nirb_exact_fallback_guess_value),
+        "nirb_interface_model_path": None if nirb_interface_model_path is None else str(Path(nirb_interface_model_path)),
+        "nirb_interface_tangent_path": (
+            None if nirb_interface_tangent_path is None else str(Path(nirb_interface_tangent_path))
+        ),
+        "nirb_interface_tangent_blend": float(nirb_interface_tangent_blend_value),
+        "nirb_interface_tangent_start_iter": int(nirb_interface_tangent_start_iter_value),
+        "nirb_interface_tangent_max_rel": float(nirb_interface_tangent_max_rel_value),
+        "nirb_interface_trust": str(nirb_interface_trust_value),
+        "nirb_interface_max_step_ratio": float(nirb_interface_max_step_ratio_value),
+        "nirb_interface_max_disp_rel": float(nirb_interface_max_disp_rel_value),
+        "nirb_interface_min_correction_alpha": float(nirb_interface_min_correction_alpha_value),
+        "nirb_interface_reject_count": int(nirb_interface_reject_count),
+        "nirb_interface_correction_count": int(nirb_interface_correction_count),
+        "nirb_exact_fallback_count": int(nirb_exact_fallback_count),
+        "nirb_force_manifold_trust": str(nirb_force_manifold_trust_value),
+        "nirb_force_manifold_max_projection_rel": float(nirb_force_manifold_max_projection_rel_value),
+        "nirb_force_manifold_quantile": float(nirb_force_manifold_quantile_value),
+        "nirb_force_manifold_coeff_factor": float(nirb_force_manifold_coeff_factor_value),
+        "nirb_force_coordinate_update": str(nirb_force_coordinate_update_value),
+        "nirb_force_coordinate_trust": str(nirb_force_coordinate_trust_value),
+        "nirb_force_coordinate_max_step_ratio": float(nirb_force_coordinate_max_step_ratio_value),
+        "nirb_force_coordinate_max_load_rel": float(nirb_force_coordinate_max_load_rel_value),
+        "nirb_force_coordinate_min_alpha": float(nirb_force_coordinate_min_alpha_value),
+        "nirb_force_coordinate_disable_on_newton_failure": bool(
+            nirb_force_coordinate_disable_on_newton_failure
+        ),
+        "nirb_force_coordinate_newton_failure_late_iter": int(
+            nirb_force_coordinate_failure_late_iter_value
+        ),
+        "nirb_force_coordinate_safety_clip_count": int(nirb_force_coordinate_safety_clip_count),
+        "nirb_force_coordinate_safety_fallback_count": int(nirb_force_coordinate_safety_fallback_count),
+        "nirb_force_coordinate_newton_safety_count": int(nirb_force_coordinate_newton_safety_count),
+        "nirb_force_manifold_metadata": (
+            None if nirb_force_manifold_trust_operator is None else dict(nirb_force_manifold_trust_operator.metadata)
+        ),
+        "nirb_force_manifold_projection_count": int(
+            sum(1 for row in step_rows if bool(row.get("nirb_force_trust_modified", False)))
+        ),
         "exact_structure_backend": str(exact_structure_backend_mode),
         "exact_fluid_backend": str(exact_fluid_backend_mode),
         "exact_fluid_linear_backend": str(exact_fluid_linear_backend),
@@ -10582,6 +14925,15 @@ def run_local_example2(
         "diagnostic_solid_system_backend": str(_diagnostic_solid_system_backend_mode()),
         "kratos_structure_solver_profile": dict(structure_solver_profile),
         "mesh_extension_solver": str(_env_str("PYCUTFEM_EX2_MESH_EXTENSION_SOLVER", "direct").strip().lower()),
+        "reduced_mesh_surrogate_path": (
+            None if reduced_mesh_surrogate_path is None else str(Path(reduced_mesh_surrogate_path))
+        ),
+        "reduced_mesh_surrogate_interface_modes": (
+            None if reduced_mesh_surrogate is None else int(reduced_mesh_surrogate.n_interface_modes)
+        ),
+        "reduced_mesh_surrogate_mesh_modes": (
+            None if reduced_mesh_surrogate is None else int(reduced_mesh_surrogate.n_mesh_modes)
+        ),
         "mesh_extension_formulation": str(
             _env_str(
                 "PYCUTFEM_EX2_MESH_EXTENSION_FORMULATION",
@@ -10615,6 +14967,8 @@ def run_local_example2(
         "force_history": int(force_history),
         "force_regularization": float(force_regularization),
         "step_retries": int(step_retries),
+        "step_retry_relaxations": None if step_retry_relaxations is None else str(step_retry_relaxations),
+        "step_retry_updates": None if step_retry_updates is None else str(step_retry_updates),
         "snapshot_mode": str(snapshot_mode),
         "snapshot_count": int(disp_matrix.shape[1]),
         "interface_dofs": int(load_matrix.shape[0]),
@@ -10677,21 +15031,37 @@ def main() -> None:
         force_history=int(args.force_history),
         force_regularization=float(args.force_regularization),
         step_retries=int(args.step_retries),
+        step_retry_relaxations=args.step_retry_relaxations,
+        step_retry_updates=args.step_retry_updates,
         newton_tol=float(args.newton_tol),
         max_newton_iter=int(args.max_newton_iter),
         bossak_alpha=float(args.bossak_alpha),
         dynamic_tau=float(args.dynamic_tau),
         pressure_gauge=float(args.pressure_gauge),
+        reduced_mesh_surrogate_path=args.reduced_mesh_surrogate_path,
         fluid_operator=str(args.fluid_operator),
         fluid_hrom_model_path=args.fluid_hrom_model_path,
         fluid_hrom_switch_iter=args.fluid_hrom_switch_iter,
+        fluid_hrom_late_switch_step=int(args.fluid_hrom_late_switch_step),
+        fluid_hrom_late_switch_iter=args.fluid_hrom_late_switch_iter,
+        fluid_hrom_start_step=int(args.fluid_hrom_start_step),
         fluid_hrom_max_iterations=args.fluid_hrom_max_iterations,
         fluid_hrom_residual_tol=args.fluid_hrom_residual_tol,
+        fluid_hrom_incompressibility_scale=args.fluid_hrom_incompressibility_scale,
+        fluid_hrom_reduced_objective=str(args.fluid_hrom_reduced_objective),
+        fluid_hrom_reduced_online_backend=str(args.reduced_online_backend),
+        fluid_hrom_gnat_step_backend=str(args.gnat_step_backend),
+        fluid_hrom_commit_mode=str(args.fluid_hrom_commit_mode),
+        fluid_hrom_sample_local_state_writes=bool(args.fluid_hrom_sample_local_state_writes),
+        fluid_hrom_history_policy=str(args.fluid_hrom_history_policy),
         fluid_hrom_fallback_exact=bool(args.fluid_hrom_fallback_exact),
         fluid_hrom_max_previous_load_rel=float(args.fluid_hrom_max_previous_load_rel),
         fluid_hrom_min_previous_load_rel=float(args.fluid_hrom_min_previous_load_rel),
         fluid_hrom_max_previous_disp_rel=float(args.fluid_hrom_max_previous_disp_rel),
+        fluid_hrom_max_coupling_iter=int(args.fluid_hrom_max_coupling_iter),
         fluid_hrom_max_consecutive_stages=int(args.fluid_hrom_max_consecutive_stages),
+        fluid_hrom_max_stages_per_step=int(args.fluid_hrom_max_stages_per_step),
+        fluid_hrom_max_load_contraction_ratio=float(args.fluid_hrom_max_load_contraction_ratio),
         fluid_hrom_require_exact_accept=bool(args.fluid_hrom_require_exact_accept),
         fluid_hrom_trial_exact_correct=bool(args.fluid_hrom_trial_exact_correct),
         fluid_hrom_max_trial_load_rel_error=float(args.fluid_hrom_max_trial_load_rel_error),
@@ -10700,6 +15070,16 @@ def main() -> None:
         fluid_hrom_interface_max_step_ratio=float(args.fluid_hrom_interface_max_step_ratio),
         fluid_hrom_interface_max_load_rel=float(args.fluid_hrom_interface_max_load_rel),
         fluid_hrom_interface_min_correction_alpha=float(args.fluid_hrom_interface_min_correction_alpha),
+        fluid_hrom_impedance_blend=float(args.fluid_hrom_impedance_blend),
+        fluid_hrom_reaction_source=str(args.fluid_hrom_reaction_source),
+        fluid_hrom_max_manifold_distance=float(args.fluid_hrom_max_manifold_distance),
+        fluid_hrom_interface_load_tolerance=float(args.fluid_hrom_interface_load_tolerance),
+        fluid_hrom_use_estimator_load_on_accept=bool(args.fluid_hrom_use_estimator_load_on_accept),
+        fluid_hrom_max_dwr_error=float(args.fluid_hrom_max_dwr_error),
+        fluid_hrom_adaptive_db_dir=args.fluid_hrom_adaptive_db_dir,
+        fluid_hrom_certified_relaxation=str(args.fluid_hrom_certified_relaxation),
+        fluid_hrom_certified_relaxation_growth=float(args.fluid_hrom_certified_relaxation_growth),
+        fluid_hrom_certified_relaxation_shrink=float(args.fluid_hrom_certified_relaxation_shrink),
         solid_operator=str(args.solid_operator),
         porous_pressure_order=args.porous_pressure_order,
         porous_porosity=float(args.porous_porosity),
@@ -10708,6 +15088,35 @@ def main() -> None:
         porous_storage_inverse=float(args.porous_storage_inverse),
         nirb_model_path=args.nirb_model_path,
         nirb_start_step=int(args.nirb_start_step),
+        nirb_fallback_exact=bool(args.nirb_fallback_exact),
+        nirb_exact_after_coupling_iter=int(args.nirb_exact_after_coupling_iter),
+        nirb_exact_after_load_rel=float(args.nirb_exact_after_load_rel),
+        nirb_exact_after_disp_rel=float(args.nirb_exact_after_disp_rel),
+        nirb_exact_fallback_guess=str(args.nirb_exact_fallback_guess),
+        nirb_interface_tangent_path=args.nirb_interface_tangent_path,
+        nirb_interface_tangent_blend=float(args.nirb_interface_tangent_blend),
+        nirb_interface_tangent_start_iter=int(args.nirb_interface_tangent_start_iter),
+        nirb_interface_tangent_max_rel=float(args.nirb_interface_tangent_max_rel),
+        nirb_interface_model_path=args.nirb_interface_model_path,
+        nirb_interface_trust=str(args.nirb_interface_trust),
+        nirb_interface_max_step_ratio=float(args.nirb_interface_max_step_ratio),
+        nirb_interface_max_disp_rel=float(args.nirb_interface_max_disp_rel),
+        nirb_interface_min_correction_alpha=float(args.nirb_interface_min_correction_alpha),
+        nirb_force_manifold_trust=str(args.nirb_force_manifold_trust),
+        nirb_force_manifold_max_projection_rel=float(args.nirb_force_manifold_max_projection_rel),
+        nirb_force_manifold_quantile=float(args.nirb_force_manifold_quantile),
+        nirb_force_manifold_coeff_factor=float(args.nirb_force_manifold_coeff_factor),
+        nirb_force_coordinate_update=str(args.nirb_force_coordinate_update),
+        nirb_force_coordinate_trust=str(args.nirb_force_coordinate_trust),
+        nirb_force_coordinate_max_step_ratio=float(args.nirb_force_coordinate_max_step_ratio),
+        nirb_force_coordinate_max_load_rel=float(args.nirb_force_coordinate_max_load_rel),
+        nirb_force_coordinate_min_alpha=float(args.nirb_force_coordinate_min_alpha),
+        nirb_force_coordinate_disable_on_newton_failure=bool(
+            args.nirb_force_coordinate_disable_on_newton_failure
+        ),
+        nirb_force_coordinate_newton_failure_late_iter=int(
+            args.nirb_force_coordinate_newton_failure_late_iter
+        ),
         backend=str(args.backend),
         linear_backend=str(args.linear_backend),
         snapshot_mode=str(args.snapshot_mode),

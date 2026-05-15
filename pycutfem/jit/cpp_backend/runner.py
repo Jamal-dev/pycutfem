@@ -10,6 +10,8 @@ class KernelRunnerCpp:
     """
 
     def __init__(self, kernel, param_order, ir_sequence, dof_handler, fallback_runner=None):
+        import sys
+
         from pycutfem.jit import KernelRunner as _KernelRunner
 
         self.kernel = kernel
@@ -20,6 +22,11 @@ class KernelRunnerCpp:
         self.param_order = list(getattr(kernel, "PARAM_ORDER", param_order))
         self._delegate = _KernelRunner(kernel, self.param_order, ir_sequence, dof_handler)
         self._fallback = fallback_runner  # kept for API compatibility; unused
+        module = sys.modules.get(getattr(kernel, "__module__", ""))
+        self.native_kernel_abi = None if module is None else getattr(module, "NATIVE_KERNEL_ABI", None)
+        self.native_kernel_metadata = None if module is None else getattr(module, "NATIVE_KERNEL_METADATA", None)
+        self.native_form_rank = None if module is None else getattr(module, "NATIVE_FORM_RANK", None)
+        self.native_functional_dim = None if module is None else getattr(module, "NATIVE_FUNCTIONAL_DIM", None)
 
     def __call__(self, functions, static_args):
         import os, sys

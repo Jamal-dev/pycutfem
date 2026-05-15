@@ -70,6 +70,24 @@ class TrainedNIRBModel:
         reduced_displacements = self.regressor.predict(reduced_forces)
         return np.asarray(reduced_displacements, dtype=float).T
 
+    def predict_reduced_from_force_coefficients(self, force_coefficients: np.ndarray) -> np.ndarray:
+        """Predict displacement coordinates from already-reduced force coordinates.
+
+        Fully reduced online coupling stores the interface load in a reduced
+        space.  When that space is the model's force POD space, re-encoding a
+        reconstructed full interface load would be unnecessary work and would
+        violate the reduced-online contract.  This method bypasses the force
+        encoder and evaluates only the learned reduced map.
+        """
+
+        coeffs = np.asarray(force_coefficients, dtype=float)
+        if coeffs.ndim == 1:
+            coeffs = coeffs.reshape(1, -1)
+        if coeffs.ndim != 2:
+            raise ValueError("force_coefficients must be a 1D vector or sample-major 2D matrix")
+        reduced_displacements = self.regressor.predict(coeffs)
+        return np.asarray(reduced_displacements, dtype=float).T
+
     def predict_full(self, forces: np.ndarray) -> np.ndarray:
         return self.decoder.decode(self.predict_reduced(forces))
 
