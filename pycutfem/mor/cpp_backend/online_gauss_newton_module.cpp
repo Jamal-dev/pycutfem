@@ -17,6 +17,7 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+#include <functional>
 
 #include "native_kernel.hpp"
 
@@ -654,6 +655,34 @@ struct TargetSystem {
     matrix_type jacobian;
 };
 
+double optimality_norm(const TargetSystem& target)
+{
+    if (target.jacobian.cols() == 0) {
+        return 0.0;
+    }
+    return (target.jacobian.transpose() * target.residual).norm();
+}
+
+double effective_optimality_tol(double residual_tol, double optimality_tol)
+{
+    if (optimality_tol < 0.0) {
+        return -1.0;
+    }
+    if (!std::isfinite(optimality_tol)) {
+        throw py::value_error("optimality_tol must be finite and nonnegative, or negative to inherit residual_tol.");
+    }
+    return optimality_tol;
+}
+
+bool least_squares_converged(double residual, double optimality, double residual_tol, double optimality_tol)
+{
+    if (optimality_tol >= 0.0) {
+        return std::isfinite(optimality) && optimality <= optimality_tol;
+    }
+    return (std::isfinite(residual) && residual <= residual_tol)
+        || (std::isfinite(optimality) && optimality <= residual_tol * std::max(1.0, residual));
+}
+
 struct TimingCounters {
     double state_update_seconds = 0.0;
     double kernel_seconds = 0.0;
@@ -670,9 +699,18 @@ struct TimingCounters {
     int deim_interpolation_applications = 0;
     int deim_composition_applications = 0;
     int symbolic_state_update_calls = 0;
+    int trust_region_clipped_steps = 0;
+    int branch_guard_rejections = 0;
+    int branch_merit_rejections = 0;
+    double final_branch_distance = 0.0;
     std::int64_t sparse_lift_nonzeros = 0;
     std::int64_t sparse_lift_rows = 0;
     std::int64_t sparse_lift_cols = 0;
+    std::int64_t bound_constraint_nonzeros = 0;
+    std::int64_t bound_constraint_rows = 0;
+    std::int64_t bound_constraint_cols = 0;
+    int bound_active_lower = 0;
+    int bound_active_upper = 0;
 };
 
 struct OnlineProblem {
@@ -686,6 +724,8 @@ struct OnlineProblem {
     vector_type element_weights;
     vector_type row_weights;
     bool has_row_weights = false;
+    matrix_type galerkin_test_basis;
+    bool has_galerkin_test_basis = false;
     matrix_type lift;
     bool has_dense_lift = false;
     CsrMatrix sparse_lift;
@@ -702,6 +742,75 @@ struct DeimTarget {
     matrix_type interpolation_operator;
     matrix_type residual_terms;
 };
+
+struct BranchGuard {
+    vector_type reference_coefficients;
+    bool has_reference = false;
+    double max_distance = std::numeric_limits<double>::infinity();
+    double merit_weight = 0.0;
+    bool require_residual_convergence = false;
+
+    bool enabled() const
+    {
+        return has_reference && ((std::isfinite(max_distance) && max_distance >= 0.0) || merit_weight > 0.0);
+    }
+};
+
+struct ReferenceRegularization {
+    vector_type reference_coefficients;
+    bool has_reference = false;
+    double weight = 0.0;
+
+    bool enabled() const
+    {
+        return has_reference && std::isfinite(weight) && weight > 0.0;
+    }
+};
+
+vector_type reference_residual(
+    const OnlineProblem& problem,
+    const ReferenceRegularization& reference,
+    const vector_type& q
+)
+{
+    if (!reference.enabled()) {
+        return vector_type();
+    }
+    return problem.basis * (q - reference.reference_coefficients);
+}
+
+double regularized_merit_norm(
+    const TargetSystem& target,
+    const OnlineProblem& problem,
+    const ReferenceRegularization& reference,
+    const vector_type& q
+)
+{
+    double value = target.residual.squaredNorm();
+    if (reference.enabled()) {
+        const vector_type reg = reference_residual(problem, reference, q);
+        value += reference.weight * reg.squaredNorm();
+    }
+    return std::sqrt(std::max(0.0, value));
+}
+
+double regularized_optimality_norm(
+    const TargetSystem& target,
+    const OnlineProblem& problem,
+    const ReferenceRegularization& reference,
+    const vector_type& q
+)
+{
+    if (target.jacobian.cols() == 0) {
+        return 0.0;
+    }
+    vector_type gradient = target.jacobian.transpose() * target.residual;
+    if (reference.enabled()) {
+        const vector_type reg = reference_residual(problem, reference, q);
+        gradient += reference.weight * (problem.basis.transpose() * reg);
+    }
+    return gradient.norm();
+}
 
 void update_all_state(OnlineProblem& problem, const vector_type& q)
 {
@@ -844,6 +953,39 @@ TargetSystem assemble_target(OnlineProblem& problem, const vector_type& q)
     return apply_configured_lift(problem, assemble_sampled_rows(problem, q));
 }
 
+void ensure_galerkin_test_basis(OnlineProblem& problem)
+{
+    if (problem.has_galerkin_test_basis) {
+        return;
+    }
+    if (problem.has_dense_lift || problem.has_sparse_lift) {
+        throw std::runtime_error("native Galerkin targets cannot use a GNAT lift.");
+    }
+    problem.galerkin_test_basis.resize(static_cast<Eigen::Index>(problem.row_dofs.size()), problem.basis.cols());
+    for (std::size_t i = 0; i < problem.row_dofs.size(); ++i) {
+        const auto row = problem.row_dofs[i];
+        if (row < 0 || row >= problem.basis.rows()) {
+            throw std::runtime_error("row_dofs contains out-of-range entries.");
+        }
+        const double scale = problem.has_row_weights ? std::sqrt(problem.row_weights(static_cast<Eigen::Index>(i))) : 1.0;
+        problem.galerkin_test_basis.row(static_cast<Eigen::Index>(i)) = scale * problem.basis.row(row);
+    }
+    problem.has_galerkin_test_basis = true;
+}
+
+TargetSystem assemble_galerkin_target(OnlineProblem& problem, const vector_type& q)
+{
+    ensure_galerkin_test_basis(problem);
+    TargetSystem sampled = assemble_sampled_rows(problem, q);
+    const auto t_projection0 = clock_type::now();
+    TargetSystem target;
+    target.residual = problem.galerkin_test_basis.transpose() * sampled.residual;
+    target.jacobian = problem.galerkin_test_basis.transpose() * sampled.jacobian;
+    const auto t_projection1 = clock_type::now();
+    problem.timings.projection_seconds += elapsed_seconds(t_projection0, t_projection1);
+    return target;
+}
+
 matrix_type interpolation_operator_from_selected_basis(const matrix_type& selected_basis, double rcond)
 {
     if (selected_basis.rows() == 0 || selected_basis.cols() == 0) {
@@ -904,7 +1046,248 @@ struct StepSolve {
     std::string method;
 };
 
-StepSolve solve_step(const matrix_type& J, const vector_type& residual, double damping, double rcond)
+struct BoundConstraints {
+    matrix_type A;
+    CsrMatrix sparse_A;
+    bool has_sparse_A = false;
+    vector_type offset;
+    vector_type lower;
+    vector_type upper;
+    vector_type row_scaling;
+    bool enabled = false;
+};
+
+Eigen::Index bound_rows(const BoundConstraints& bounds)
+{
+    return bounds.has_sparse_A ? static_cast<Eigen::Index>(bounds.sparse_A.rows) : bounds.A.rows();
+}
+
+Eigen::Index bound_cols(const BoundConstraints& bounds)
+{
+    return bounds.has_sparse_A ? static_cast<Eigen::Index>(bounds.sparse_A.cols) : bounds.A.cols();
+}
+
+std::int64_t bound_nonzeros(const BoundConstraints& bounds)
+{
+    return bounds.has_sparse_A
+        ? static_cast<std::int64_t>(bounds.sparse_A.data.size())
+        : static_cast<std::int64_t>(bounds.A.size());
+}
+
+vector_type bound_matvec(const BoundConstraints& bounds, const vector_type& vector)
+{
+    return bounds.has_sparse_A ? csr_matvec(bounds.sparse_A, vector) : bounds.A * vector;
+}
+
+void fill_bound_row(matrix_type& out, Eigen::Index out_row, const BoundConstraints& bounds, Eigen::Index row, double scale)
+{
+    if (bounds.has_sparse_A) {
+        const auto r = static_cast<std::int64_t>(row);
+        const std::int64_t start = bounds.sparse_A.indptr[static_cast<std::size_t>(r)];
+        const std::int64_t stop = bounds.sparse_A.indptr[static_cast<std::size_t>(r + 1)];
+        for (std::int64_t p = start; p < stop; ++p) {
+            const Eigen::Index col = static_cast<Eigen::Index>(bounds.sparse_A.indices[static_cast<std::size_t>(p)]);
+            out(out_row, col) = scale * bounds.sparse_A.data[static_cast<std::size_t>(p)];
+        }
+    } else {
+        out.row(out_row) = scale * bounds.A.row(row);
+    }
+}
+
+void accumulate_barrier_row(
+    const BoundConstraints& bounds,
+    Eigen::Index row,
+    double gradient_scale,
+    double hessian_scale,
+    vector_type& g,
+    matrix_type& H
+)
+{
+    if (bounds.has_sparse_A) {
+        const auto r = static_cast<std::int64_t>(row);
+        const std::int64_t start = bounds.sparse_A.indptr[static_cast<std::size_t>(r)];
+        const std::int64_t stop = bounds.sparse_A.indptr[static_cast<std::size_t>(r + 1)];
+        for (std::int64_t p = start; p < stop; ++p) {
+            const Eigen::Index col_i = static_cast<Eigen::Index>(bounds.sparse_A.indices[static_cast<std::size_t>(p)]);
+            const double value_i = bounds.sparse_A.data[static_cast<std::size_t>(p)];
+            g(col_i) += gradient_scale * value_i;
+            for (std::int64_t q = start; q < stop; ++q) {
+                const Eigen::Index col_j = static_cast<Eigen::Index>(bounds.sparse_A.indices[static_cast<std::size_t>(q)]);
+                H(col_i, col_j) += hessian_scale * value_i * bounds.sparse_A.data[static_cast<std::size_t>(q)];
+            }
+        }
+    } else {
+        const auto a = bounds.A.row(row);
+        g += gradient_scale * a.transpose();
+        H += hessian_scale * (a.transpose() * a);
+    }
+}
+
+void record_bound_timing(TimingCounters& timing, const BoundConstraints& bounds)
+{
+    timing.bound_constraint_rows = static_cast<std::int64_t>(bound_rows(bounds));
+    timing.bound_constraint_cols = static_cast<std::int64_t>(bound_cols(bounds));
+    timing.bound_constraint_nonzeros = bound_nonzeros(bounds);
+}
+
+BoundConstraints parse_bound_constraints(py::handle obj, Eigen::Index n_modes)
+{
+    BoundConstraints bounds;
+    if (obj.is_none()) {
+        return bounds;
+    }
+    py::dict payload = obj.cast<py::dict>();
+    py::handle matrix_obj = payload[py::str("constraint_matrix")];
+    if (py::isinstance<py::dict>(matrix_obj)) {
+        py::dict matrix_payload = matrix_obj.cast<py::dict>();
+        if (matrix_payload.contains(py::str("layout"))) {
+            bounds.sparse_A = parse_csr_matrix(matrix_payload, "bound constraint_matrix");
+            bounds.has_sparse_A = true;
+        } else {
+            bounds.A = as_matrix(matrix_obj, "bound constraint_matrix");
+        }
+    } else {
+        bounds.A = as_matrix(matrix_obj, "bound constraint_matrix");
+    }
+    bounds.offset = as_vector(payload[py::str("offset")], "bound offset");
+    bounds.lower = as_vector(payload[py::str("lower")], "bound lower");
+    bounds.upper = as_vector(payload[py::str("upper")], "bound upper");
+    if (payload.contains(py::str("row_scaling"))) {
+        bounds.row_scaling = as_vector(payload[py::str("row_scaling")], "bound row_scaling");
+    } else {
+        bounds.row_scaling = vector_type::Ones(bound_rows(bounds));
+    }
+    if (bound_cols(bounds) != n_modes) {
+        throw py::value_error("bound constraint_matrix column count must match reduced coefficient size.");
+    }
+    const Eigen::Index n_rows = bound_rows(bounds);
+    if (n_rows != bounds.offset.size()
+        || n_rows != bounds.lower.size()
+        || n_rows != bounds.upper.size()
+        || n_rows != bounds.row_scaling.size()) {
+        throw py::value_error("bound constraint arrays must have one entry per bound row.");
+    }
+    for (Eigen::Index i = 0; i < n_rows; ++i) {
+        if (std::isnan(bounds.lower(i)) || std::isnan(bounds.upper(i))) {
+            throw py::value_error("bound lower/upper arrays must not contain NaN.");
+        }
+        if (bounds.lower(i) > bounds.upper(i)) {
+            throw py::value_error("bound lower entries must be <= upper entries.");
+        }
+        if (!std::isfinite(bounds.row_scaling(i)) || bounds.row_scaling(i) <= 0.0) {
+            throw py::value_error("bound row_scaling must be finite and positive.");
+        }
+    }
+    bounds.enabled = n_rows > 0;
+    return bounds;
+}
+
+vector_type decoded_bound_values(const BoundConstraints& bounds, const vector_type& q)
+{
+    if (!bounds.enabled) {
+        vector_type empty(0);
+        return empty;
+    }
+    return bounds.offset + bound_matvec(bounds, q);
+}
+
+double max_bound_violation(const BoundConstraints& bounds, const vector_type& q)
+{
+    if (!bounds.enabled) {
+        return 0.0;
+    }
+    const vector_type x = decoded_bound_values(bounds, q);
+    double violation = 0.0;
+    for (Eigen::Index i = 0; i < x.size(); ++i) {
+        if (std::isfinite(bounds.lower(i))) {
+            violation = std::max(violation, bounds.lower(i) - x(i));
+        }
+        if (std::isfinite(bounds.upper(i))) {
+            violation = std::max(violation, x(i) - bounds.upper(i));
+        }
+    }
+    return std::max(violation, 0.0);
+}
+
+struct ActiveEquations {
+    matrix_type C;
+    vector_type h;
+    int lower_count = 0;
+    int upper_count = 0;
+};
+
+ActiveEquations active_bound_equations(const BoundConstraints& bounds, const vector_type& q, double active_tol)
+{
+    ActiveEquations active;
+    if (!bounds.enabled) {
+        active.C.resize(0, q.size());
+        active.h.resize(0);
+        return active;
+    }
+    const vector_type x = decoded_bound_values(bounds, q);
+    std::vector<Eigen::Index> rows;
+    std::vector<double> rhs;
+    const Eigen::Index n_rows = bound_rows(bounds);
+    rows.reserve(static_cast<std::size_t>(n_rows));
+    rhs.reserve(static_cast<std::size_t>(n_rows));
+    for (Eigen::Index i = 0; i < n_rows; ++i) {
+        const bool lower_finite = std::isfinite(bounds.lower(i));
+        const bool upper_finite = std::isfinite(bounds.upper(i));
+        const bool lower_active = lower_finite && (x(i) <= bounds.lower(i) + active_tol);
+        const bool upper_active = upper_finite && !lower_active && (x(i) >= bounds.upper(i) - active_tol);
+        if (lower_active) {
+            rows.push_back(i);
+            rhs.push_back(bounds.lower(i) - x(i));
+            active.lower_count += 1;
+        } else if (upper_active) {
+            rows.push_back(i);
+            rhs.push_back(bounds.upper(i) - x(i));
+            active.upper_count += 1;
+        }
+    }
+    active.C.resize(static_cast<Eigen::Index>(rows.size()), q.size());
+    active.C.setZero();
+    active.h.resize(static_cast<Eigen::Index>(rows.size()));
+    for (Eigen::Index r = 0; r < static_cast<Eigen::Index>(rows.size()); ++r) {
+        const Eigen::Index row = rows[static_cast<std::size_t>(r)];
+        const double scale = bounds.row_scaling(row);
+        fill_bound_row(active.C, r, bounds, row, scale);
+        active.h(r) = scale * rhs[static_cast<std::size_t>(r)];
+    }
+    return active;
+}
+
+double feasible_step_alpha(const BoundConstraints& bounds, const vector_type& q, const vector_type& step, double fraction)
+{
+    if (!bounds.enabled) {
+        return 1.0;
+    }
+    const vector_type x = decoded_bound_values(bounds, q);
+    const vector_type dx = bound_matvec(bounds, step);
+    double alpha = 1.0;
+    const double frac = std::min(1.0, std::max(0.0, fraction));
+    for (Eigen::Index i = 0; i < x.size(); ++i) {
+        if (dx(i) > 0.0 && std::isfinite(bounds.upper(i))) {
+            alpha = std::min(alpha, frac * (bounds.upper(i) - x(i)) / dx(i));
+        } else if (dx(i) < 0.0 && std::isfinite(bounds.lower(i))) {
+            alpha = std::min(alpha, frac * (bounds.lower(i) - x(i)) / dx(i));
+        }
+    }
+    if (!std::isfinite(alpha)) {
+        return 0.0;
+    }
+    return std::max(0.0, std::min(1.0, alpha));
+}
+
+StepSolve solve_step(
+    const matrix_type& J,
+    const vector_type& residual,
+    double damping,
+    const matrix_type& reference_jacobian,
+    const vector_type& reference_residual_value,
+    double reference_weight,
+    double rcond
+)
 {
     if (J.cols() == 0) {
         StepSolve empty;
@@ -913,16 +1296,29 @@ StepSolve solve_step(const matrix_type& J, const vector_type& residual, double d
         return empty;
     }
     const bool has_damping = damping > 0.0;
-    matrix_type A(J.rows() + (has_damping ? J.cols() : 0), J.cols());
-    vector_type b(residual.size() + (has_damping ? J.cols() : 0));
+    const bool has_reference = reference_weight > 0.0 && reference_jacobian.rows() > 0;
+    const Eigen::Index damping_rows = has_damping ? J.cols() : 0;
+    const Eigen::Index reference_rows = has_reference ? reference_jacobian.rows() : 0;
+    matrix_type A(J.rows() + damping_rows + reference_rows, J.cols());
+    vector_type b(residual.size() + damping_rows + reference_rows);
     A.topRows(J.rows()) = J;
     b.head(residual.size()) = -residual;
+    Eigen::Index row_offset = J.rows();
     if (has_damping) {
-        A.bottomRows(J.cols()).setZero();
+        A.middleRows(row_offset, J.cols()).setZero();
         for (Eigen::Index j = 0; j < J.cols(); ++j) {
-            A(J.rows() + j, j) = std::sqrt(damping);
+            A(row_offset + j, j) = std::sqrt(damping);
         }
-        b.tail(J.cols()).setZero();
+        b.segment(row_offset, J.cols()).setZero();
+        row_offset += J.cols();
+    }
+    if (has_reference) {
+        if (reference_jacobian.cols() != J.cols() || reference_residual_value.size() != reference_jacobian.rows()) {
+            throw std::runtime_error("reference regularization dimensions are inconsistent.");
+        }
+        const double scale = std::sqrt(reference_weight);
+        A.middleRows(row_offset, reference_rows) = scale * reference_jacobian;
+        b.segment(row_offset, reference_rows) = -scale * reference_residual_value;
     }
 
     Eigen::ColPivHouseholderQR<matrix_type> qr(A);
@@ -943,6 +1339,150 @@ StepSolve solve_step(const matrix_type& J, const vector_type& residual, double d
         out.method = "svd";
     }
     return out;
+}
+
+StepSolve solve_step(const matrix_type& J, const vector_type& residual, double damping, double rcond)
+{
+    static const matrix_type empty_matrix;
+    static const vector_type empty_vector;
+    return solve_step(J, residual, damping, empty_matrix, empty_vector, 0.0, rcond);
+}
+
+StepSolve solve_equality_constrained_step(
+    const matrix_type& J,
+    const vector_type& residual,
+    const matrix_type& C,
+    const vector_type& h,
+    double damping,
+    double rcond
+)
+{
+    if (C.rows() == 0) {
+        return solve_step(J, residual, damping, rcond);
+    }
+    const bool has_damping = damping > 0.0;
+    matrix_type A(J.rows() + (has_damping ? J.cols() : 0), J.cols());
+    vector_type b(residual.size() + (has_damping ? J.cols() : 0));
+    A.topRows(J.rows()) = J;
+    b.head(residual.size()) = -residual;
+    if (has_damping) {
+        A.bottomRows(J.cols()).setZero();
+        for (Eigen::Index j = 0; j < J.cols(); ++j) {
+            A(J.rows() + j, j) = std::sqrt(damping);
+        }
+        b.tail(J.cols()).setZero();
+    }
+
+    Eigen::JacobiSVD<matrix_type> csvd(C, Eigen::ComputeFullU | Eigen::ComputeFullV);
+    if (rcond > 0.0) {
+        csvd.setThreshold(rcond);
+    }
+    const int constraint_rank = static_cast<int>(csvd.rank());
+    vector_type particular = vector_type::Zero(J.cols());
+    const auto& singular = csvd.singularValues();
+    for (int i = 0; i < constraint_rank; ++i) {
+        particular += csvd.matrixV().col(i) * (csvd.matrixU().col(i).dot(h) / singular(i));
+    }
+    if ((C * particular - h).norm() > 1.0e-10 * std::max(1.0, h.norm())) {
+        throw std::runtime_error("active bound equality constraints are inconsistent.");
+    }
+    const Eigen::Index nullity = J.cols() - constraint_rank;
+    StepSolve out;
+    out.method = "constrained_nullspace_svd";
+    if (nullity == 0) {
+        out.step = particular;
+        out.rank = 0;
+        return out;
+    }
+    matrix_type N(J.cols(), nullity);
+    for (Eigen::Index j = 0; j < nullity; ++j) {
+        N.col(j) = csvd.matrixV().col(constraint_rank + j);
+    }
+    matrix_type Ared = A * N;
+    vector_type bred = b - A * particular;
+    Eigen::JacobiSVD<matrix_type> svd(Ared, Eigen::ComputeThinU | Eigen::ComputeThinV);
+    if (rcond > 0.0) {
+        svd.setThreshold(rcond);
+    }
+    vector_type z = svd.solve(bred);
+    out.step = particular + N * z;
+    out.rank = static_cast<int>(svd.rank());
+    return out;
+}
+
+StepSolve solve_ipm_barrier_step(
+    const matrix_type& J,
+    const vector_type& residual,
+    const BoundConstraints& bounds,
+    const vector_type& q,
+    double damping,
+    double barrier,
+    double rcond
+)
+{
+    matrix_type H = J.transpose() * J;
+    vector_type g = J.transpose() * residual;
+    if (damping > 0.0) {
+        H.diagonal().array() += damping;
+    }
+    if (bounds.enabled) {
+        const vector_type x = decoded_bound_values(bounds, q);
+        for (Eigen::Index i = 0; i < bound_rows(bounds); ++i) {
+            if (std::isfinite(bounds.lower(i))) {
+                const double slack = std::max(x(i) - bounds.lower(i), 1.0e-14);
+                accumulate_barrier_row(bounds, i, -(barrier / slack), barrier / (slack * slack), g, H);
+            }
+            if (std::isfinite(bounds.upper(i))) {
+                const double slack = std::max(bounds.upper(i) - x(i), 1.0e-14);
+                accumulate_barrier_row(bounds, i, barrier / slack, barrier / (slack * slack), g, H);
+            }
+        }
+    }
+
+    StepSolve out;
+    Eigen::LDLT<matrix_type> ldlt(H);
+    if (ldlt.info() == Eigen::Success) {
+        out.step = ldlt.solve(-g);
+        if (ldlt.info() == Eigen::Success && out.step.allFinite()) {
+            out.rank = static_cast<int>(H.cols());
+            out.method = "ipm_ldlt";
+            return out;
+        }
+    }
+    Eigen::JacobiSVD<matrix_type> svd(H, Eigen::ComputeThinU | Eigen::ComputeThinV);
+    if (rcond > 0.0) {
+        svd.setThreshold(rcond);
+    }
+    out.step = svd.solve(-g);
+    out.rank = static_cast<int>(svd.rank());
+    out.method = "ipm_svd";
+    return out;
+}
+
+double barrier_merit(const TargetSystem& target, const BoundConstraints& bounds, const vector_type& q, double barrier)
+{
+    double merit = 0.5 * target.residual.squaredNorm();
+    if (!bounds.enabled || barrier <= 0.0) {
+        return merit;
+    }
+    const vector_type x = decoded_bound_values(bounds, q);
+    for (Eigen::Index i = 0; i < x.size(); ++i) {
+        if (std::isfinite(bounds.lower(i))) {
+            const double slack = x(i) - bounds.lower(i);
+            if (slack <= 0.0) {
+                return std::numeric_limits<double>::infinity();
+            }
+            merit -= barrier * std::log(slack);
+        }
+        if (std::isfinite(bounds.upper(i))) {
+            const double slack = bounds.upper(i) - x(i);
+            if (slack <= 0.0) {
+                return std::numeric_limits<double>::infinity();
+            }
+            merit -= barrier * std::log(slack);
+        }
+    }
+    return merit;
 }
 
 py::array_t<double> vector_to_array(const vector_type& values)
@@ -983,9 +1523,375 @@ py::dict timing_to_dict(const TimingCounters& timing)
     out["deim_interpolation_applications"] = timing.deim_interpolation_applications;
     out["deim_composition_applications"] = timing.deim_composition_applications;
     out["symbolic_state_update_calls"] = timing.symbolic_state_update_calls;
+    out["trust_region_clipped_steps"] = timing.trust_region_clipped_steps;
+    out["branch_guard_rejections"] = timing.branch_guard_rejections;
+    out["branch_merit_rejections"] = timing.branch_merit_rejections;
+    out["final_branch_distance"] = timing.final_branch_distance;
     out["sparse_lift_nonzeros"] = timing.sparse_lift_nonzeros;
     out["sparse_lift_rows"] = timing.sparse_lift_rows;
     out["sparse_lift_cols"] = timing.sparse_lift_cols;
+    out["bound_constraint_nonzeros"] = timing.bound_constraint_nonzeros;
+    out["bound_constraint_rows"] = timing.bound_constraint_rows;
+    out["bound_constraint_cols"] = timing.bound_constraint_cols;
+    out["bound_active_lower"] = timing.bound_active_lower;
+    out["bound_active_upper"] = timing.bound_active_upper;
+    return out;
+}
+
+BranchGuard parse_branch_guard(
+    py::handle reference_coefficients_obj,
+    Eigen::Index n_coefficients,
+    double max_reference_distance,
+    double state_merit_weight,
+    bool require_residual_convergence
+)
+{
+    BranchGuard guard;
+    guard.max_distance = max_reference_distance;
+    guard.merit_weight = state_merit_weight;
+    guard.require_residual_convergence = require_residual_convergence;
+    if (max_reference_distance < 0.0 || std::isnan(max_reference_distance)) {
+        throw py::value_error("max_reference_distance must be nonnegative or positive infinity.");
+    }
+    if (!std::isfinite(state_merit_weight) || state_merit_weight < 0.0) {
+        throw py::value_error("state_merit_weight must be finite and nonnegative.");
+    }
+    if (!reference_coefficients_obj.is_none()) {
+        guard.reference_coefficients = as_vector(reference_coefficients_obj, "reference_coefficients");
+        if (guard.reference_coefficients.size() != n_coefficients) {
+            throw py::value_error("reference_coefficients size must match initial_coefficients.");
+        }
+        guard.has_reference = true;
+    }
+    return guard;
+}
+
+ReferenceRegularization parse_reference_regularization(
+    py::handle reference_coefficients_obj,
+    Eigen::Index n_coefficients,
+    double reference_weight
+)
+{
+    ReferenceRegularization reference;
+    reference.weight = reference_weight;
+    if (!std::isfinite(reference_weight) || reference_weight < 0.0) {
+        throw py::value_error("reference_weight must be finite and nonnegative.");
+    }
+    if (!reference_coefficients_obj.is_none()) {
+        reference.reference_coefficients = as_vector(reference_coefficients_obj, "reference_coefficients");
+        if (reference.reference_coefficients.size() != n_coefficients) {
+            throw py::value_error("reference_coefficients size must match initial_coefficients.");
+        }
+        reference.has_reference = true;
+    }
+    return reference;
+}
+
+double branch_distance(const OnlineProblem& problem, const BranchGuard& guard, const vector_type& q)
+{
+    if (!guard.has_reference) {
+        return 0.0;
+    }
+    const vector_type delta = q - guard.reference_coefficients;
+    if (problem.basis.cols() == delta.size()) {
+        return (problem.basis * delta).norm();
+    }
+    return delta.norm();
+}
+
+double branch_penalty(const OnlineProblem& problem, const BranchGuard& guard, const vector_type& q)
+{
+    if (!guard.enabled() || guard.merit_weight <= 0.0) {
+        return 0.0;
+    }
+    const double dist = branch_distance(problem, guard, q);
+    const double scale = (std::isfinite(guard.max_distance) && guard.max_distance > 0.0)
+        ? guard.max_distance
+        : std::max(1.0, guard.reference_coefficients.norm());
+    const double normalized = dist / std::max(scale, 1.0e-300);
+    return guard.merit_weight * normalized * normalized;
+}
+
+bool branch_within_radius(const OnlineProblem& problem, const BranchGuard& guard, const vector_type& q)
+{
+    if (!guard.enabled() || !std::isfinite(guard.max_distance)) {
+        return true;
+    }
+    return branch_distance(problem, guard, q) <= guard.max_distance + 100.0 * std::numeric_limits<double>::epsilon();
+}
+
+double globalization_merit(
+    const OnlineProblem& problem,
+    const BranchGuard& guard,
+    const TargetSystem& target,
+    const BoundConstraints& bounds,
+    const vector_type& q,
+    const std::string& method,
+    double barrier
+)
+{
+    const double base = method == "ipm"
+        ? barrier_merit(target, bounds, q, barrier)
+        : target.residual.norm();
+    return base + branch_penalty(problem, guard, q);
+}
+
+py::dict run_bound_constrained_online_solver(
+    OnlineProblem& problem,
+    vector_type q,
+    const BoundConstraints& bounds,
+    const BranchGuard& branch_guard,
+    const std::string& method,
+    const std::function<TargetSystem(OnlineProblem&, const vector_type&)>& assemble,
+    const std::string& backend_name,
+    int max_iterations,
+    double residual_tol,
+    double optimality_tol,
+    double step_tol,
+    double damping,
+    bool adaptive_damping,
+    int max_damping_retries,
+    double damping_increase,
+    double damping_decrease,
+    bool line_search,
+    int max_line_search,
+    double sufficient_decrease,
+    double active_tol,
+    double feasibility_tol,
+    double barrier_initial,
+    double barrier_decay,
+    double fraction_to_boundary,
+    double max_step_norm,
+    double rcond
+)
+{
+    if (!std::isfinite(residual_tol) || residual_tol < 0.0 || !std::isfinite(step_tol) || step_tol < 0.0) {
+        throw py::value_error("residual_tol and step_tol must be finite and nonnegative.");
+    }
+    const double opt_tol = effective_optimality_tol(residual_tol, optimality_tol);
+    if (!std::isfinite(damping) || damping < 0.0) {
+        throw py::value_error("damping must be finite and nonnegative.");
+    }
+    if (!std::isfinite(damping_increase) || damping_increase <= 1.0) {
+        throw py::value_error("damping_increase must be finite and greater than one.");
+    }
+    if (!std::isfinite(damping_decrease) || damping_decrease <= 0.0 || damping_decrease > 1.0) {
+        throw py::value_error("damping_decrease must be in the interval (0, 1].");
+    }
+    if (max_step_norm < 0.0 || std::isnan(max_step_norm)) {
+        throw py::value_error("max_step_norm must be nonnegative or positive infinity.");
+    }
+    record_bound_timing(problem.timings, bounds);
+
+    std::vector<double> residual_history;
+    std::vector<double> optimality_history;
+    std::vector<double> step_history;
+    std::vector<double> alpha_history;
+    std::vector<double> damping_history;
+    residual_history.reserve(static_cast<std::size_t>(std::max(1, max_iterations)));
+    optimality_history.reserve(static_cast<std::size_t>(std::max(1, max_iterations)));
+    step_history.reserve(static_cast<std::size_t>(std::max(1, max_iterations)));
+    alpha_history.reserve(static_cast<std::size_t>(std::max(1, max_iterations)));
+    damping_history.reserve(static_cast<std::size_t>(std::max(1, max_iterations)));
+
+    bool converged = false;
+    int iterations = 0;
+    int rejected_step_count = 0;
+    std::string final_method = "";
+    double final_norm = std::numeric_limits<double>::infinity();
+    double final_optimality = std::numeric_limits<double>::infinity();
+    double current_damping = damping;
+    double barrier = barrier_initial;
+
+    {
+        py::gil_scoped_release release;
+        for (int iteration = 1; iteration <= std::max(1, max_iterations); ++iteration) {
+            iterations = iteration;
+            TargetSystem target = assemble(problem, q);
+            final_norm = target.residual.norm();
+            final_optimality = optimality_norm(target);
+            residual_history.push_back(final_norm);
+            optimality_history.push_back(final_optimality);
+            const double current_violation = max_bound_violation(bounds, q);
+            if (least_squares_converged(final_norm, final_optimality, residual_tol, opt_tol)
+                && current_violation <= feasibility_tol) {
+                step_history.push_back(0.0);
+                alpha_history.push_back(0.0);
+                damping_history.push_back(current_damping);
+                converged = true;
+                break;
+            }
+
+            StepSolve solved;
+            double step_norm = std::numeric_limits<double>::infinity();
+            double accepted_alpha = 1.0;
+            double accepted_norm = std::numeric_limits<double>::infinity();
+            double used_damping = current_damping;
+            vector_type accepted_q = q;
+            bool step_accepted = false;
+            const int n_attempts = adaptive_damping ? std::max(1, max_damping_retries) : 1;
+
+            for (int attempt = 0; attempt < n_attempts; ++attempt) {
+                used_damping = current_damping;
+                const auto t_solve0 = clock_type::now();
+                if (method == "pdas") {
+                    ActiveEquations active = active_bound_equations(bounds, q, active_tol);
+                    problem.timings.bound_active_lower = active.lower_count;
+                    problem.timings.bound_active_upper = active.upper_count;
+                    solved = solve_equality_constrained_step(
+                        target.jacobian,
+                        target.residual,
+                        active.C,
+                        active.h,
+                        current_damping,
+                        rcond
+                    );
+                } else {
+                    solved = solve_ipm_barrier_step(
+                        target.jacobian,
+                        target.residual,
+                        bounds,
+                        q,
+                        current_damping,
+                        barrier,
+                        rcond
+                    );
+                }
+                const auto t_solve1 = clock_type::now();
+                problem.timings.step_solve_seconds += elapsed_seconds(t_solve0, t_solve1);
+                final_method = solved.method;
+                step_norm = solved.step.norm();
+                if (!solved.step.allFinite()) {
+                    break;
+                }
+                if (max_step_norm > 0.0 && std::isfinite(max_step_norm) && step_norm > max_step_norm) {
+                    solved.step *= max_step_norm / step_norm;
+                    step_norm = max_step_norm;
+                    problem.timings.trust_region_clipped_steps += 1;
+                }
+
+                const double feasible_alpha = feasible_step_alpha(bounds, q, solved.step, method == "ipm" ? fraction_to_boundary : 1.0);
+                accepted_alpha = std::min(1.0, feasible_alpha);
+                accepted_q = q + accepted_alpha * solved.step;
+                accepted_norm = std::numeric_limits<double>::infinity();
+                bool armijo_accepted = !(line_search || method == "ipm" || branch_guard.enabled());
+
+                if (line_search || method == "ipm" || branch_guard.enabled()) {
+                    const auto t_ls0 = clock_type::now();
+                    const int n_search = std::max(1, max_line_search);
+                    double best_merit = std::numeric_limits<double>::infinity();
+                    vector_type best_q = accepted_q;
+                    const double phi0 = globalization_merit(problem, branch_guard, target, bounds, q, method, barrier);
+                    for (int search_iter = 0; search_iter < n_search; ++search_iter) {
+                        const double alpha = accepted_alpha * std::pow(0.5, static_cast<double>(search_iter));
+                        vector_type trial_q = q + alpha * solved.step;
+                        if (max_bound_violation(bounds, trial_q) > feasibility_tol) {
+                            continue;
+                        }
+                        if (!branch_within_radius(problem, branch_guard, trial_q)) {
+                            problem.timings.branch_guard_rejections += 1;
+                            continue;
+                        }
+                        TargetSystem trial_target = assemble(problem, trial_q);
+                        const double merit = globalization_merit(problem, branch_guard, trial_target, bounds, trial_q, method, barrier);
+                        if (merit < best_merit) {
+                            best_merit = merit;
+                            best_q = trial_q;
+                            accepted_norm = trial_target.residual.norm();
+                        }
+                        if (merit <= phi0 - sufficient_decrease * alpha * step_norm * step_norm) {
+                            accepted_q = trial_q;
+                            accepted_alpha = alpha;
+                            accepted_norm = trial_target.residual.norm();
+                            armijo_accepted = true;
+                            break;
+                        }
+                    }
+                    const auto t_ls1 = clock_type::now();
+                    problem.timings.line_search_seconds += elapsed_seconds(t_ls0, t_ls1);
+                    if (!armijo_accepted && branch_guard.enabled()) {
+                        problem.timings.branch_merit_rejections += 1;
+                    }
+                    if (!armijo_accepted && !branch_guard.enabled() && best_merit < std::numeric_limits<double>::infinity()) {
+                        accepted_q = best_q;
+                        accepted_alpha = 0.0;
+                        armijo_accepted = method == "ipm";
+                    }
+                }
+
+                if ((armijo_accepted || (!adaptive_damping && !branch_guard.enabled()))
+                    && max_bound_violation(bounds, accepted_q) <= feasibility_tol
+                    && branch_within_radius(problem, branch_guard, accepted_q)) {
+                    step_accepted = true;
+                    break;
+                }
+                ++rejected_step_count;
+                current_damping = current_damping > 0.0 ? current_damping * damping_increase : 1.0e-12;
+            }
+
+            step_history.push_back(step_norm);
+            alpha_history.push_back(step_accepted ? accepted_alpha : 0.0);
+            damping_history.push_back(used_damping);
+            if (!step_accepted) {
+                break;
+            }
+            const double previous_norm = final_norm;
+            q = accepted_q;
+            if (std::isfinite(accepted_norm)) {
+                final_norm = accepted_norm;
+                TargetSystem accepted_target = assemble(problem, q);
+                final_optimality = optimality_norm(accepted_target);
+            } else {
+                TargetSystem accepted_target = assemble(problem, q);
+                final_norm = accepted_target.residual.norm();
+                final_optimality = optimality_norm(accepted_target);
+            }
+            if (method == "ipm") {
+                barrier *= barrier_decay;
+            }
+            if (adaptive_damping && final_norm < previous_norm && current_damping > 0.0) {
+                current_damping *= damping_decrease;
+            }
+            const double new_violation = max_bound_violation(bounds, q);
+            const bool residual_converged = final_norm <= residual_tol && new_violation <= feasibility_tol;
+            const bool optimality_converged =
+                least_squares_converged(final_norm, final_optimality, residual_tol, opt_tol)
+                && new_violation <= feasibility_tol;
+            const bool step_converged = !branch_guard.require_residual_convergence
+                && step_norm <= step_tol * std::max(1.0, q.norm())
+                && new_violation <= feasibility_tol;
+            if (residual_converged || optimality_converged || step_converged) {
+                TargetSystem final_target = assemble(problem, q);
+                final_norm = final_target.residual.norm();
+                final_optimality = optimality_norm(final_target);
+                residual_history.push_back(final_norm);
+                optimality_history.push_back(final_optimality);
+                converged = true;
+                break;
+            }
+        }
+        problem.timings.final_branch_distance = branch_distance(problem, branch_guard, q);
+        update_all_state(problem, q);
+    }
+
+    py::dict out;
+    out["coefficients"] = vector_to_array(q);
+    out["converged"] = converged;
+    out["iterations"] = iterations;
+    out["residual_norm"] = final_norm;
+    out["optimality_norm"] = final_optimality;
+    out["linear_solver"] = final_method;
+    out["residual_norm_history"] = std_vector_to_array(residual_history);
+    out["optimality_norm_history"] = std_vector_to_array(optimality_history);
+    out["step_norm_history"] = std_vector_to_array(step_history);
+    out["line_search_alpha_history"] = std_vector_to_array(alpha_history);
+    out["damping_history"] = std_vector_to_array(damping_history);
+    out["rejected_step_count"] = rejected_step_count;
+    py::dict timing = timing_to_dict(problem.timings);
+    timing["bound_violation"] = max_bound_violation(bounds, q);
+    timing["barrier"] = barrier;
+    out["timing_counters"] = timing;
+    out["backend"] = backend_name;
     return out;
 }
 
@@ -1010,6 +1916,7 @@ py::dict solve_online_gauss_newton(
     py::sequence tangent_symbolic_state_updates_obj,
     int max_iterations,
     double residual_tol,
+    double optimality_tol,
     double step_tol,
     double damping,
     bool adaptive_damping,
@@ -1019,6 +1926,12 @@ py::dict solve_online_gauss_newton(
     bool line_search,
     int max_line_search,
     double sufficient_decrease,
+    py::handle reference_coefficients_obj,
+    double reference_weight,
+    double max_step_norm,
+    double max_reference_distance,
+    double state_merit_weight,
+    bool require_residual_convergence,
     double rcond
 )
 {
@@ -1033,6 +1946,18 @@ py::dict solve_online_gauss_newton(
     if (problem.basis.rows() != problem.offset.size() || problem.basis.cols() != q.size()) {
         throw py::value_error("trial_basis, offset, and initial_coefficients have incompatible dimensions.");
     }
+    ReferenceRegularization reference = parse_reference_regularization(
+        reference_coefficients_obj,
+        q.size(),
+        reference_weight
+    );
+    BranchGuard branch_guard = parse_branch_guard(
+        reference_coefficients_obj,
+        q.size(),
+        max_reference_distance,
+        state_merit_weight,
+        require_residual_convergence
+    );
     problem.row_dofs = as_index_vector(row_dofs_obj, "row_dofs");
     if (problem.row_dofs.empty()) {
         throw py::value_error("row_dofs must not be empty.");
@@ -1069,6 +1994,7 @@ py::dict solve_online_gauss_newton(
     if (!std::isfinite(residual_tol) || residual_tol < 0.0 || !std::isfinite(step_tol) || step_tol < 0.0) {
         throw py::value_error("residual_tol and step_tol must be finite and nonnegative.");
     }
+    const double opt_tol = effective_optimality_tol(residual_tol, optimality_tol);
     if (!std::isfinite(damping) || damping < 0.0) {
         throw py::value_error("damping must be finite and nonnegative.");
     }
@@ -1078,12 +2004,17 @@ py::dict solve_online_gauss_newton(
     if (!std::isfinite(damping_decrease) || damping_decrease <= 0.0 || damping_decrease > 1.0) {
         throw py::value_error("damping_decrease must be in the interval (0, 1].");
     }
+    if (max_step_norm < 0.0 || std::isnan(max_step_norm)) {
+        throw py::value_error("max_step_norm must be nonnegative or positive infinity.");
+    }
 
     std::vector<double> residual_history;
+    std::vector<double> optimality_history;
     std::vector<double> step_history;
     std::vector<double> alpha_history;
     std::vector<double> damping_history;
     residual_history.reserve(static_cast<std::size_t>(std::max(1, max_iterations)));
+    optimality_history.reserve(static_cast<std::size_t>(std::max(1, max_iterations)));
     step_history.reserve(static_cast<std::size_t>(std::max(1, max_iterations)));
     alpha_history.reserve(static_cast<std::size_t>(std::max(1, max_iterations)));
     damping_history.reserve(static_cast<std::size_t>(std::max(1, max_iterations)));
@@ -1092,6 +2023,7 @@ py::dict solve_online_gauss_newton(
     int rejected_step_count = 0;
     std::string final_method = "";
     double final_norm = std::numeric_limits<double>::infinity();
+    double final_optimality = std::numeric_limits<double>::infinity();
     double current_damping = damping;
 
     {
@@ -1100,8 +2032,10 @@ py::dict solve_online_gauss_newton(
             iterations = iteration;
             TargetSystem target = assemble_target(problem, q);
             final_norm = target.residual.norm();
+            final_optimality = regularized_optimality_norm(target, problem, reference, q);
             residual_history.push_back(final_norm);
-            if (final_norm <= residual_tol) {
+            optimality_history.push_back(final_optimality);
+            if (least_squares_converged(final_norm, final_optimality, residual_tol, opt_tol)) {
                 step_history.push_back(0.0);
                 alpha_history.push_back(0.0);
                 damping_history.push_back(current_damping);
@@ -1120,7 +2054,16 @@ py::dict solve_online_gauss_newton(
             for (int attempt = 0; attempt < n_attempts; ++attempt) {
                 used_damping = current_damping;
                 const auto t_solve0 = clock_type::now();
-                solved = solve_step(target.jacobian, target.residual, current_damping, rcond);
+                const vector_type reg_residual = reference_residual(problem, reference, q);
+                solved = solve_step(
+                    target.jacobian,
+                    target.residual,
+                    current_damping,
+                    problem.basis,
+                    reg_residual,
+                    reference.enabled() ? reference.weight : 0.0,
+                    rcond
+                );
                 const auto t_solve1 = clock_type::now();
                 problem.timings.step_solve_seconds += elapsed_seconds(t_solve0, t_solve1);
                 final_method = solved.method;
@@ -1128,27 +2071,44 @@ py::dict solve_online_gauss_newton(
                 if (!solved.step.allFinite()) {
                     break;
                 }
+                if (max_step_norm > 0.0 && std::isfinite(max_step_norm) && step_norm > max_step_norm) {
+                    solved.step *= max_step_norm / step_norm;
+                    step_norm = max_step_norm;
+                    problem.timings.trust_region_clipped_steps += 1;
+                }
 
                 accepted_alpha = 1.0;
                 accepted_q = q + solved.step;
                 accepted_norm = std::numeric_limits<double>::infinity();
-                bool armijo_accepted = !line_search;
+                bool armijo_accepted = !(line_search || branch_guard.enabled());
 
-                if (line_search) {
+                if (line_search || branch_guard.enabled()) {
                     const auto t_ls0 = clock_type::now();
+                    double best_merit = std::numeric_limits<double>::infinity();
                     double best_norm = std::numeric_limits<double>::infinity();
                     vector_type best_q = accepted_q;
+                    const double merit0 =
+                        regularized_merit_norm(target, problem, reference, q)
+                        + branch_penalty(problem, branch_guard, q);
                     const int n_search = std::max(1, max_line_search);
                     for (int search_iter = 0; search_iter < n_search; ++search_iter) {
                         const double alpha = std::pow(0.5, static_cast<double>(search_iter));
                         vector_type trial_q = q + alpha * solved.step;
+                        if (!branch_within_radius(problem, branch_guard, trial_q)) {
+                            problem.timings.branch_guard_rejections += 1;
+                            continue;
+                        }
                         TargetSystem trial_target = assemble_target(problem, trial_q);
                         const double trial_norm = trial_target.residual.norm();
-                        if (trial_norm < best_norm) {
+                        const double trial_merit =
+                            regularized_merit_norm(trial_target, problem, reference, trial_q)
+                            + branch_penalty(problem, branch_guard, trial_q);
+                        if (trial_merit < best_merit) {
+                            best_merit = trial_merit;
                             best_norm = trial_norm;
                             best_q = trial_q;
                         }
-                        if (trial_norm <= (1.0 - sufficient_decrease * alpha) * final_norm) {
+                        if (trial_merit <= (1.0 - sufficient_decrease * alpha) * merit0) {
                             accepted_q = trial_q;
                             accepted_alpha = alpha;
                             accepted_norm = trial_norm;
@@ -1158,6 +2118,9 @@ py::dict solve_online_gauss_newton(
                     }
                     const auto t_ls1 = clock_type::now();
                     problem.timings.line_search_seconds += elapsed_seconds(t_ls0, t_ls1);
+                    if (!armijo_accepted && branch_guard.enabled()) {
+                        problem.timings.branch_merit_rejections += 1;
+                    }
                     if (!armijo_accepted) {
                         accepted_q = best_q;
                         accepted_alpha = 0.0;
@@ -1166,10 +2129,12 @@ py::dict solve_online_gauss_newton(
                 } else if (adaptive_damping) {
                     TargetSystem trial_target = assemble_target(problem, accepted_q);
                     accepted_norm = trial_target.residual.norm();
-                    armijo_accepted = accepted_norm < final_norm;
+                    armijo_accepted = regularized_merit_norm(trial_target, problem, reference, accepted_q)
+                        < regularized_merit_norm(target, problem, reference, q);
                 }
 
-                if (armijo_accepted || !adaptive_damping) {
+                if ((armijo_accepted || (!adaptive_damping && !branch_guard.enabled()))
+                    && branch_within_radius(problem, branch_guard, accepted_q)) {
                     step_accepted = true;
                     break;
                 }
@@ -1184,18 +2149,34 @@ py::dict solve_online_gauss_newton(
             if (!step_accepted) {
                 break;
             }
+            const double previous_norm = final_norm;
             q = accepted_q;
-            if (adaptive_damping && accepted_norm < final_norm && current_damping > 0.0) {
+            {
+                TargetSystem accepted_target = assemble_target(problem, q);
+                final_norm = accepted_target.residual.norm();
+                final_optimality = regularized_optimality_norm(accepted_target, problem, reference, q);
+            }
+            if (adaptive_damping && final_norm < previous_norm && current_damping > 0.0) {
                 current_damping *= damping_decrease;
+            }
+            if (least_squares_converged(final_norm, final_optimality, residual_tol, opt_tol)) {
+                residual_history.push_back(final_norm);
+                optimality_history.push_back(final_optimality);
+                converged = true;
+                break;
             }
             if (step_norm <= step_tol * std::max(1.0, q.norm())) {
                 TargetSystem final_target = assemble_target(problem, q);
                 final_norm = final_target.residual.norm();
+                final_optimality = regularized_optimality_norm(final_target, problem, reference, q);
                 residual_history.push_back(final_norm);
-                converged = final_norm <= residual_tol;
+                optimality_history.push_back(final_optimality);
+                converged = !branch_guard.require_residual_convergence
+                    || least_squares_converged(final_norm, final_optimality, residual_tol, opt_tol);
                 break;
             }
         }
+        problem.timings.final_branch_distance = branch_distance(problem, branch_guard, q);
         update_all_state(problem, q);
     }
 
@@ -1204,8 +2185,10 @@ py::dict solve_online_gauss_newton(
     out["converged"] = converged;
     out["iterations"] = iterations;
     out["residual_norm"] = final_norm;
+    out["optimality_norm"] = final_optimality;
     out["linear_solver"] = final_method;
     out["residual_norm_history"] = std_vector_to_array(residual_history);
+    out["optimality_norm_history"] = std_vector_to_array(optimality_history);
     out["step_norm_history"] = std_vector_to_array(step_history);
     out["line_search_alpha_history"] = std_vector_to_array(alpha_history);
     out["damping_history"] = std_vector_to_array(damping_history);
@@ -1238,6 +2221,7 @@ py::dict solve_deim_online_gauss_newton(
     py::sequence tangent_symbolic_state_updates_obj,
     int max_iterations,
     double residual_tol,
+    double optimality_tol,
     double step_tol,
     double damping,
     bool adaptive_damping,
@@ -1247,6 +2231,12 @@ py::dict solve_deim_online_gauss_newton(
     bool line_search,
     int max_line_search,
     double sufficient_decrease,
+    py::handle reference_coefficients_obj,
+    double reference_weight,
+    double max_step_norm,
+    double max_reference_distance,
+    double state_merit_weight,
+    bool require_residual_convergence,
     double rcond
 )
 {
@@ -1261,6 +2251,18 @@ py::dict solve_deim_online_gauss_newton(
     if (problem.basis.rows() != problem.offset.size() || problem.basis.cols() != q.size()) {
         throw py::value_error("trial_basis, offset, and initial_coefficients have incompatible dimensions.");
     }
+    ReferenceRegularization reference = parse_reference_regularization(
+        reference_coefficients_obj,
+        q.size(),
+        reference_weight
+    );
+    BranchGuard branch_guard = parse_branch_guard(
+        reference_coefficients_obj,
+        q.size(),
+        max_reference_distance,
+        state_merit_weight,
+        require_residual_convergence
+    );
     problem.row_dofs = as_index_vector(row_dofs_obj, "row_dofs");
     if (problem.row_dofs.empty()) {
         throw py::value_error("row_dofs must not be empty.");
@@ -1312,6 +2314,7 @@ py::dict solve_deim_online_gauss_newton(
     if (!std::isfinite(residual_tol) || residual_tol < 0.0 || !std::isfinite(step_tol) || step_tol < 0.0) {
         throw py::value_error("residual_tol and step_tol must be finite and nonnegative.");
     }
+    const double opt_tol = effective_optimality_tol(residual_tol, optimality_tol);
     if (!std::isfinite(damping) || damping < 0.0) {
         throw py::value_error("damping must be finite and nonnegative.");
     }
@@ -1321,12 +2324,17 @@ py::dict solve_deim_online_gauss_newton(
     if (!std::isfinite(damping_decrease) || damping_decrease <= 0.0 || damping_decrease > 1.0) {
         throw py::value_error("damping_decrease must be in the interval (0, 1].");
     }
+    if (max_step_norm < 0.0 || std::isnan(max_step_norm)) {
+        throw py::value_error("max_step_norm must be nonnegative or positive infinity.");
+    }
 
     std::vector<double> residual_history;
+    std::vector<double> optimality_history;
     std::vector<double> step_history;
     std::vector<double> alpha_history;
     std::vector<double> damping_history;
     residual_history.reserve(static_cast<std::size_t>(std::max(1, max_iterations)));
+    optimality_history.reserve(static_cast<std::size_t>(std::max(1, max_iterations)));
     step_history.reserve(static_cast<std::size_t>(std::max(1, max_iterations)));
     alpha_history.reserve(static_cast<std::size_t>(std::max(1, max_iterations)));
     damping_history.reserve(static_cast<std::size_t>(std::max(1, max_iterations)));
@@ -1335,6 +2343,7 @@ py::dict solve_deim_online_gauss_newton(
     int rejected_step_count = 0;
     std::string final_method = "";
     double final_norm = std::numeric_limits<double>::infinity();
+    double final_optimality = std::numeric_limits<double>::infinity();
     double current_damping = damping;
 
     {
@@ -1343,8 +2352,10 @@ py::dict solve_deim_online_gauss_newton(
             iterations = iteration;
             TargetSystem target = assemble_deim_target(problem, deim, q);
             final_norm = target.residual.norm();
+            final_optimality = regularized_optimality_norm(target, problem, reference, q);
             residual_history.push_back(final_norm);
-            if (final_norm <= residual_tol) {
+            optimality_history.push_back(final_optimality);
+            if (least_squares_converged(final_norm, final_optimality, residual_tol, opt_tol)) {
                 step_history.push_back(0.0);
                 alpha_history.push_back(0.0);
                 damping_history.push_back(current_damping);
@@ -1363,7 +2374,16 @@ py::dict solve_deim_online_gauss_newton(
             for (int attempt = 0; attempt < n_attempts; ++attempt) {
                 used_damping = current_damping;
                 const auto t_solve0 = clock_type::now();
-                solved = solve_step(target.jacobian, target.residual, current_damping, rcond);
+                const vector_type reg_residual = reference_residual(problem, reference, q);
+                solved = solve_step(
+                    target.jacobian,
+                    target.residual,
+                    current_damping,
+                    problem.basis,
+                    reg_residual,
+                    reference.enabled() ? reference.weight : 0.0,
+                    rcond
+                );
                 const auto t_solve1 = clock_type::now();
                 problem.timings.step_solve_seconds += elapsed_seconds(t_solve0, t_solve1);
                 final_method = solved.method;
@@ -1371,27 +2391,44 @@ py::dict solve_deim_online_gauss_newton(
                 if (!solved.step.allFinite()) {
                     break;
                 }
+                if (max_step_norm > 0.0 && std::isfinite(max_step_norm) && step_norm > max_step_norm) {
+                    solved.step *= max_step_norm / step_norm;
+                    step_norm = max_step_norm;
+                    problem.timings.trust_region_clipped_steps += 1;
+                }
 
                 accepted_alpha = 1.0;
                 accepted_q = q + solved.step;
                 accepted_norm = std::numeric_limits<double>::infinity();
-                bool armijo_accepted = !line_search;
+                bool armijo_accepted = !(line_search || branch_guard.enabled());
 
-                if (line_search) {
+                if (line_search || branch_guard.enabled()) {
                     const auto t_ls0 = clock_type::now();
+                    double best_merit = std::numeric_limits<double>::infinity();
                     double best_norm = std::numeric_limits<double>::infinity();
                     vector_type best_q = accepted_q;
+                    const double merit0 =
+                        regularized_merit_norm(target, problem, reference, q)
+                        + branch_penalty(problem, branch_guard, q);
                     const int n_search = std::max(1, max_line_search);
                     for (int search_iter = 0; search_iter < n_search; ++search_iter) {
                         const double alpha = std::pow(0.5, static_cast<double>(search_iter));
                         vector_type trial_q = q + alpha * solved.step;
+                        if (!branch_within_radius(problem, branch_guard, trial_q)) {
+                            problem.timings.branch_guard_rejections += 1;
+                            continue;
+                        }
                         TargetSystem trial_target = assemble_deim_target(problem, deim, trial_q);
                         const double trial_norm = trial_target.residual.norm();
-                        if (trial_norm < best_norm) {
+                        const double trial_merit =
+                            regularized_merit_norm(trial_target, problem, reference, trial_q)
+                            + branch_penalty(problem, branch_guard, trial_q);
+                        if (trial_merit < best_merit) {
+                            best_merit = trial_merit;
                             best_norm = trial_norm;
                             best_q = trial_q;
                         }
-                        if (trial_norm <= (1.0 - sufficient_decrease * alpha) * final_norm) {
+                        if (trial_merit <= (1.0 - sufficient_decrease * alpha) * merit0) {
                             accepted_q = trial_q;
                             accepted_alpha = alpha;
                             accepted_norm = trial_norm;
@@ -1401,6 +2438,9 @@ py::dict solve_deim_online_gauss_newton(
                     }
                     const auto t_ls1 = clock_type::now();
                     problem.timings.line_search_seconds += elapsed_seconds(t_ls0, t_ls1);
+                    if (!armijo_accepted && branch_guard.enabled()) {
+                        problem.timings.branch_merit_rejections += 1;
+                    }
                     if (!armijo_accepted) {
                         accepted_q = best_q;
                         accepted_alpha = 0.0;
@@ -1409,10 +2449,12 @@ py::dict solve_deim_online_gauss_newton(
                 } else if (adaptive_damping) {
                     TargetSystem trial_target = assemble_deim_target(problem, deim, accepted_q);
                     accepted_norm = trial_target.residual.norm();
-                    armijo_accepted = accepted_norm < final_norm;
+                    armijo_accepted = regularized_merit_norm(trial_target, problem, reference, accepted_q)
+                        < regularized_merit_norm(target, problem, reference, q);
                 }
 
-                if (armijo_accepted || !adaptive_damping) {
+                if ((armijo_accepted || (!adaptive_damping && !branch_guard.enabled()))
+                    && branch_within_radius(problem, branch_guard, accepted_q)) {
                     step_accepted = true;
                     break;
                 }
@@ -1427,18 +2469,34 @@ py::dict solve_deim_online_gauss_newton(
             if (!step_accepted) {
                 break;
             }
+            const double previous_norm = final_norm;
             q = accepted_q;
-            if (adaptive_damping && accepted_norm < final_norm && current_damping > 0.0) {
+            {
+                TargetSystem accepted_target = assemble_deim_target(problem, deim, q);
+                final_norm = accepted_target.residual.norm();
+                final_optimality = regularized_optimality_norm(accepted_target, problem, reference, q);
+            }
+            if (adaptive_damping && final_norm < previous_norm && current_damping > 0.0) {
                 current_damping *= damping_decrease;
+            }
+            if (least_squares_converged(final_norm, final_optimality, residual_tol, opt_tol)) {
+                residual_history.push_back(final_norm);
+                optimality_history.push_back(final_optimality);
+                converged = true;
+                break;
             }
             if (step_norm <= step_tol * std::max(1.0, q.norm())) {
                 TargetSystem final_target = assemble_deim_target(problem, deim, q);
                 final_norm = final_target.residual.norm();
+                final_optimality = regularized_optimality_norm(final_target, problem, reference, q);
                 residual_history.push_back(final_norm);
-                converged = final_norm <= residual_tol;
+                optimality_history.push_back(final_optimality);
+                converged = !branch_guard.require_residual_convergence
+                    || least_squares_converged(final_norm, final_optimality, residual_tol, opt_tol);
                 break;
             }
         }
+        problem.timings.final_branch_distance = branch_distance(problem, branch_guard, q);
         update_all_state(problem, q);
     }
 
@@ -1447,8 +2505,10 @@ py::dict solve_deim_online_gauss_newton(
     out["converged"] = converged;
     out["iterations"] = iterations;
     out["residual_norm"] = final_norm;
+    out["optimality_norm"] = final_optimality;
     out["linear_solver"] = final_method;
     out["residual_norm_history"] = std_vector_to_array(residual_history);
+    out["optimality_norm_history"] = std_vector_to_array(optimality_history);
     out["step_norm_history"] = std_vector_to_array(step_history);
     out["line_search_alpha_history"] = std_vector_to_array(alpha_history);
     out["damping_history"] = std_vector_to_array(damping_history);
@@ -1458,9 +2518,439 @@ py::dict solve_deim_online_gauss_newton(
     return out;
 }
 
+py::dict solve_bound_constrained_online_gauss_newton(
+    py::handle residual_metadata_capsule,
+    py::sequence residual_param_order,
+    py::dict residual_static_args,
+    py::handle tangent_metadata_capsule,
+    py::sequence tangent_param_order,
+    py::dict tangent_static_args,
+    py::handle trial_basis_obj,
+    py::handle offset_obj,
+    py::handle initial_coefficients_obj,
+    py::handle row_dofs_obj,
+    py::handle coefficient_arg_names_obj,
+    py::handle bound_constraints_obj,
+    const std::string& constraint_method,
+    py::handle element_weights_obj,
+    py::handle row_weights_obj,
+    py::handle gnat_lift_obj,
+    py::sequence residual_state_updates_obj,
+    py::sequence tangent_state_updates_obj,
+    py::sequence residual_symbolic_state_updates_obj,
+    py::sequence tangent_symbolic_state_updates_obj,
+    int max_iterations,
+    double residual_tol,
+    double optimality_tol,
+    double step_tol,
+    double damping,
+    bool adaptive_damping,
+    int max_damping_retries,
+    double damping_increase,
+    double damping_decrease,
+    bool line_search,
+    int max_line_search,
+    double sufficient_decrease,
+    double active_tol,
+    double feasibility_tol,
+    double barrier_initial,
+    double barrier_decay,
+    double fraction_to_boundary,
+    double max_step_norm,
+    py::handle reference_coefficients_obj,
+    double max_reference_distance,
+    double state_merit_weight,
+    bool require_residual_convergence,
+    double rcond
+)
+{
+    OnlineProblem problem;
+    problem.residual_metadata = metadata_from_capsule(residual_metadata_capsule);
+    problem.tangent_metadata = metadata_from_capsule(tangent_metadata_capsule);
+    problem.residual_args = build_native_args(residual_param_order, residual_static_args);
+    problem.tangent_args = build_native_args(tangent_param_order, tangent_static_args);
+    problem.basis = as_matrix(trial_basis_obj, "trial_basis");
+    problem.offset = as_vector(offset_obj, "offset");
+    vector_type q = as_vector(initial_coefficients_obj, "initial_coefficients");
+    if (problem.basis.rows() != problem.offset.size() || problem.basis.cols() != q.size()) {
+        throw py::value_error("trial_basis, offset, and initial_coefficients have incompatible dimensions.");
+    }
+    problem.row_dofs = as_index_vector(row_dofs_obj, "row_dofs");
+    if (problem.row_dofs.empty()) {
+        throw py::value_error("row_dofs must not be empty.");
+    }
+    problem.coefficient_arg_names = string_list(coefficient_arg_names_obj.cast<py::sequence>());
+    BoundConstraints bounds = parse_bound_constraints(bound_constraints_obj, q.size());
+    BranchGuard branch_guard = parse_branch_guard(
+        reference_coefficients_obj,
+        q.size(),
+        max_reference_distance,
+        state_merit_weight,
+        require_residual_convergence
+    );
+
+    const std::string method = constraint_method.empty() ? "pdas" : constraint_method;
+    if (method != "pdas" && method != "ipm") {
+        throw py::value_error("constraint_method must be 'pdas' or 'ipm'.");
+    }
+    if (!std::isfinite(active_tol) || active_tol < 0.0 || !std::isfinite(feasibility_tol) || feasibility_tol < 0.0) {
+        throw py::value_error("active_tol and feasibility_tol must be finite and nonnegative.");
+    }
+    if (!std::isfinite(barrier_initial) || barrier_initial <= 0.0) {
+        throw py::value_error("barrier_initial must be finite and positive.");
+    }
+    if (!std::isfinite(barrier_decay) || barrier_decay <= 0.0 || barrier_decay > 1.0) {
+        throw py::value_error("barrier_decay must be in the interval (0, 1].");
+    }
+
+    if (!gnat_lift_obj.is_none() && py::isinstance<py::dict>(gnat_lift_obj)) {
+        problem.sparse_lift = parse_csr_matrix(gnat_lift_obj.cast<py::dict>(), "gnat_lift");
+        if (problem.sparse_lift.cols != static_cast<std::int64_t>(problem.row_dofs.size())) {
+            throw py::value_error("sparse gnat_lift column count must match row_dofs size.");
+        }
+        problem.has_sparse_lift = true;
+        problem.timings.sparse_lift_nonzeros = static_cast<std::int64_t>(problem.sparse_lift.data.size());
+        problem.timings.sparse_lift_rows = problem.sparse_lift.rows;
+        problem.timings.sparse_lift_cols = problem.sparse_lift.cols;
+    } else if (!gnat_lift_obj.is_none()) {
+        problem.lift = as_matrix(gnat_lift_obj, "gnat_lift");
+        if (problem.lift.cols() != static_cast<Eigen::Index>(problem.row_dofs.size())) {
+            throw py::value_error("gnat_lift column count must match row_dofs size.");
+        }
+        problem.has_dense_lift = true;
+    }
+
+    update_all_state(problem, q);
+    LocalBlocks probe = call_kernel(problem.tangent_metadata, problem.tangent_args);
+    problem.element_weights = optional_weights(element_weights_obj, probe.n_entities, "element_weights");
+    problem.has_row_weights = !row_weights_obj.is_none();
+    problem.row_weights = optional_weights(row_weights_obj, static_cast<Eigen::Index>(problem.row_dofs.size()), "row_weights");
+    problem.residual_state_updates = parse_affine_state_updates(residual_state_updates_obj, q.size());
+    problem.tangent_state_updates = parse_affine_state_updates(tangent_state_updates_obj, q.size());
+    problem.residual_symbolic_state_updates = parse_symbolic_state_updates(residual_symbolic_state_updates_obj);
+    problem.tangent_symbolic_state_updates = parse_symbolic_state_updates(tangent_symbolic_state_updates_obj);
+
+    return run_bound_constrained_online_solver(
+        problem,
+        q,
+        bounds,
+        branch_guard,
+        method,
+        [](OnlineProblem& p, const vector_type& coeffs) { return assemble_target(p, coeffs); },
+        method == "ipm" ? "cpp_native_ipm_online" : "cpp_native_pdas_online",
+        max_iterations,
+        residual_tol,
+        optimality_tol,
+        step_tol,
+        damping,
+        adaptive_damping,
+        max_damping_retries,
+        damping_increase,
+        damping_decrease,
+        line_search,
+        max_line_search,
+        sufficient_decrease,
+        active_tol,
+        feasibility_tol,
+        barrier_initial,
+        barrier_decay,
+        fraction_to_boundary,
+        max_step_norm,
+        rcond
+    );
+}
+
+py::dict solve_bound_constrained_galerkin_online_gauss_newton(
+    py::handle residual_metadata_capsule,
+    py::sequence residual_param_order,
+    py::dict residual_static_args,
+    py::handle tangent_metadata_capsule,
+    py::sequence tangent_param_order,
+    py::dict tangent_static_args,
+    py::handle trial_basis_obj,
+    py::handle offset_obj,
+    py::handle initial_coefficients_obj,
+    py::handle row_dofs_obj,
+    py::handle coefficient_arg_names_obj,
+    py::handle bound_constraints_obj,
+    const std::string& constraint_method,
+    py::handle element_weights_obj,
+    py::handle row_weights_obj,
+    py::handle gnat_lift_obj,
+    py::sequence residual_state_updates_obj,
+    py::sequence tangent_state_updates_obj,
+    py::sequence residual_symbolic_state_updates_obj,
+    py::sequence tangent_symbolic_state_updates_obj,
+    int max_iterations,
+    double residual_tol,
+    double optimality_tol,
+    double step_tol,
+    double damping,
+    bool adaptive_damping,
+    int max_damping_retries,
+    double damping_increase,
+    double damping_decrease,
+    bool line_search,
+    int max_line_search,
+    double sufficient_decrease,
+    double active_tol,
+    double feasibility_tol,
+    double barrier_initial,
+    double barrier_decay,
+    double fraction_to_boundary,
+    double max_step_norm,
+    py::handle reference_coefficients_obj,
+    double max_reference_distance,
+    double state_merit_weight,
+    bool require_residual_convergence,
+    double rcond
+)
+{
+    if (!gnat_lift_obj.is_none()) {
+        throw py::value_error("native Galerkin targets do not accept gnat_lift; pass row_dofs for the test rows instead.");
+    }
+
+    OnlineProblem problem;
+    problem.residual_metadata = metadata_from_capsule(residual_metadata_capsule);
+    problem.tangent_metadata = metadata_from_capsule(tangent_metadata_capsule);
+    problem.residual_args = build_native_args(residual_param_order, residual_static_args);
+    problem.tangent_args = build_native_args(tangent_param_order, tangent_static_args);
+    problem.basis = as_matrix(trial_basis_obj, "trial_basis");
+    problem.offset = as_vector(offset_obj, "offset");
+    vector_type q = as_vector(initial_coefficients_obj, "initial_coefficients");
+    if (problem.basis.rows() != problem.offset.size() || problem.basis.cols() != q.size()) {
+        throw py::value_error("trial_basis, offset, and initial_coefficients have incompatible dimensions.");
+    }
+    problem.row_dofs = as_index_vector(row_dofs_obj, "row_dofs");
+    if (problem.row_dofs.empty()) {
+        throw py::value_error("row_dofs must not be empty.");
+    }
+    problem.coefficient_arg_names = string_list(coefficient_arg_names_obj.cast<py::sequence>());
+    BoundConstraints bounds = parse_bound_constraints(bound_constraints_obj, q.size());
+    BranchGuard branch_guard = parse_branch_guard(
+        reference_coefficients_obj,
+        q.size(),
+        max_reference_distance,
+        state_merit_weight,
+        require_residual_convergence
+    );
+
+    const std::string method = constraint_method.empty() ? "pdas" : constraint_method;
+    if (method != "pdas" && method != "ipm") {
+        throw py::value_error("constraint_method must be 'pdas' or 'ipm'.");
+    }
+    if (!std::isfinite(active_tol) || active_tol < 0.0 || !std::isfinite(feasibility_tol) || feasibility_tol < 0.0) {
+        throw py::value_error("active_tol and feasibility_tol must be finite and nonnegative.");
+    }
+    if (!std::isfinite(barrier_initial) || barrier_initial <= 0.0) {
+        throw py::value_error("barrier_initial must be finite and positive.");
+    }
+    if (!std::isfinite(barrier_decay) || barrier_decay <= 0.0 || barrier_decay > 1.0) {
+        throw py::value_error("barrier_decay must be in the interval (0, 1].");
+    }
+
+    update_all_state(problem, q);
+    LocalBlocks probe = call_kernel(problem.tangent_metadata, problem.tangent_args);
+    problem.element_weights = optional_weights(element_weights_obj, probe.n_entities, "element_weights");
+    problem.has_row_weights = !row_weights_obj.is_none();
+    problem.row_weights = optional_weights(row_weights_obj, static_cast<Eigen::Index>(problem.row_dofs.size()), "row_weights");
+    problem.residual_state_updates = parse_affine_state_updates(residual_state_updates_obj, q.size());
+    problem.tangent_state_updates = parse_affine_state_updates(tangent_state_updates_obj, q.size());
+    problem.residual_symbolic_state_updates = parse_symbolic_state_updates(residual_symbolic_state_updates_obj);
+    problem.tangent_symbolic_state_updates = parse_symbolic_state_updates(tangent_symbolic_state_updates_obj);
+
+    return run_bound_constrained_online_solver(
+        problem,
+        q,
+        bounds,
+        branch_guard,
+        method,
+        [](OnlineProblem& p, const vector_type& coeffs) { return assemble_galerkin_target(p, coeffs); },
+        method == "ipm" ? "cpp_native_galerkin_ipm_online" : "cpp_native_galerkin_pdas_online",
+        max_iterations,
+        residual_tol,
+        optimality_tol,
+        step_tol,
+        damping,
+        adaptive_damping,
+        max_damping_retries,
+        damping_increase,
+        damping_decrease,
+        line_search,
+        max_line_search,
+        sufficient_decrease,
+        active_tol,
+        feasibility_tol,
+        barrier_initial,
+        barrier_decay,
+        fraction_to_boundary,
+        max_step_norm,
+        rcond
+    );
+}
+
+py::dict solve_bound_constrained_deim_online_gauss_newton(
+    py::handle residual_metadata_capsule,
+    py::sequence residual_param_order,
+    py::dict residual_static_args,
+    py::handle tangent_metadata_capsule,
+    py::sequence tangent_param_order,
+    py::dict tangent_static_args,
+    py::handle trial_basis_obj,
+    py::handle offset_obj,
+    py::handle initial_coefficients_obj,
+    py::handle row_dofs_obj,
+    py::handle coefficient_arg_names_obj,
+    py::handle selected_basis_obj,
+    py::handle residual_terms_obj,
+    py::handle bound_constraints_obj,
+    const std::string& constraint_method,
+    py::handle element_weights_obj,
+    py::handle row_weights_obj,
+    py::handle gnat_lift_obj,
+    py::sequence residual_state_updates_obj,
+    py::sequence tangent_state_updates_obj,
+    py::sequence residual_symbolic_state_updates_obj,
+    py::sequence tangent_symbolic_state_updates_obj,
+    int max_iterations,
+    double residual_tol,
+    double optimality_tol,
+    double step_tol,
+    double damping,
+    bool adaptive_damping,
+    int max_damping_retries,
+    double damping_increase,
+    double damping_decrease,
+    bool line_search,
+    int max_line_search,
+    double sufficient_decrease,
+    double active_tol,
+    double feasibility_tol,
+    double barrier_initial,
+    double barrier_decay,
+    double fraction_to_boundary,
+    double max_step_norm,
+    py::handle reference_coefficients_obj,
+    double max_reference_distance,
+    double state_merit_weight,
+    bool require_residual_convergence,
+    double rcond
+)
+{
+    OnlineProblem problem;
+    problem.residual_metadata = metadata_from_capsule(residual_metadata_capsule);
+    problem.tangent_metadata = metadata_from_capsule(tangent_metadata_capsule);
+    problem.residual_args = build_native_args(residual_param_order, residual_static_args);
+    problem.tangent_args = build_native_args(tangent_param_order, tangent_static_args);
+    problem.basis = as_matrix(trial_basis_obj, "trial_basis");
+    problem.offset = as_vector(offset_obj, "offset");
+    vector_type q = as_vector(initial_coefficients_obj, "initial_coefficients");
+    if (problem.basis.rows() != problem.offset.size() || problem.basis.cols() != q.size()) {
+        throw py::value_error("trial_basis, offset, and initial_coefficients have incompatible dimensions.");
+    }
+    problem.row_dofs = as_index_vector(row_dofs_obj, "row_dofs");
+    if (problem.row_dofs.empty()) {
+        throw py::value_error("row_dofs must not be empty.");
+    }
+    problem.coefficient_arg_names = string_list(coefficient_arg_names_obj.cast<py::sequence>());
+    BoundConstraints bounds = parse_bound_constraints(bound_constraints_obj, q.size());
+    BranchGuard branch_guard = parse_branch_guard(
+        reference_coefficients_obj,
+        q.size(),
+        max_reference_distance,
+        state_merit_weight,
+        require_residual_convergence
+    );
+
+    const std::string method = constraint_method.empty() ? "pdas" : constraint_method;
+    if (method != "pdas" && method != "ipm") {
+        throw py::value_error("constraint_method must be 'pdas' or 'ipm'.");
+    }
+    if (!std::isfinite(active_tol) || active_tol < 0.0 || !std::isfinite(feasibility_tol) || feasibility_tol < 0.0) {
+        throw py::value_error("active_tol and feasibility_tol must be finite and nonnegative.");
+    }
+    if (!std::isfinite(barrier_initial) || barrier_initial <= 0.0) {
+        throw py::value_error("barrier_initial must be finite and positive.");
+    }
+    if (!std::isfinite(barrier_decay) || barrier_decay <= 0.0 || barrier_decay > 1.0) {
+        throw py::value_error("barrier_decay must be in the interval (0, 1].");
+    }
+
+    DeimTarget deim;
+    const matrix_type selected_basis = as_matrix(selected_basis_obj, "selected_basis");
+    if (selected_basis.rows() != static_cast<Eigen::Index>(problem.row_dofs.size())) {
+        throw py::value_error("selected_basis row count must match row_dofs size.");
+    }
+    deim.interpolation_operator = interpolation_operator_from_selected_basis(selected_basis, rcond);
+    deim.residual_terms = as_matrix(residual_terms_obj, "residual_terms");
+    if (deim.residual_terms.rows() != selected_basis.cols()) {
+        throw py::value_error("residual_terms row count must match selected_basis column count.");
+    }
+    if (deim.residual_terms.cols() == 0) {
+        throw py::value_error("residual_terms must contain at least one target residual row.");
+    }
+    const Eigen::Index target_rows = deim.residual_terms.cols();
+
+    if (!gnat_lift_obj.is_none() && py::isinstance<py::dict>(gnat_lift_obj)) {
+        problem.sparse_lift = parse_csr_matrix(gnat_lift_obj.cast<py::dict>(), "gnat_lift");
+        if (problem.sparse_lift.cols != static_cast<std::int64_t>(target_rows)) {
+            throw py::value_error("sparse gnat_lift column count must match DEIM target residual size.");
+        }
+        problem.has_sparse_lift = true;
+        problem.timings.sparse_lift_nonzeros = static_cast<std::int64_t>(problem.sparse_lift.data.size());
+        problem.timings.sparse_lift_rows = problem.sparse_lift.rows;
+        problem.timings.sparse_lift_cols = problem.sparse_lift.cols;
+    } else if (!gnat_lift_obj.is_none()) {
+        problem.lift = as_matrix(gnat_lift_obj, "gnat_lift");
+        if (problem.lift.cols() != target_rows) {
+            throw py::value_error("gnat_lift column count must match DEIM target residual size.");
+        }
+        problem.has_dense_lift = true;
+    }
+
+    update_all_state(problem, q);
+    LocalBlocks probe = call_kernel(problem.tangent_metadata, problem.tangent_args);
+    problem.element_weights = optional_weights(element_weights_obj, probe.n_entities, "element_weights");
+    problem.has_row_weights = !row_weights_obj.is_none();
+    problem.row_weights = optional_weights(row_weights_obj, static_cast<Eigen::Index>(problem.row_dofs.size()), "row_weights");
+    problem.residual_state_updates = parse_affine_state_updates(residual_state_updates_obj, q.size());
+    problem.tangent_state_updates = parse_affine_state_updates(tangent_state_updates_obj, q.size());
+    problem.residual_symbolic_state_updates = parse_symbolic_state_updates(residual_symbolic_state_updates_obj);
+    problem.tangent_symbolic_state_updates = parse_symbolic_state_updates(tangent_symbolic_state_updates_obj);
+
+    return run_bound_constrained_online_solver(
+        problem,
+        q,
+        bounds,
+        branch_guard,
+        method,
+        [&deim](OnlineProblem& p, const vector_type& coeffs) { return assemble_deim_target(p, deim, coeffs); },
+        method == "ipm" ? "cpp_native_deim_ipm_online" : "cpp_native_deim_pdas_online",
+        max_iterations,
+        residual_tol,
+        optimality_tol,
+        step_tol,
+        damping,
+        adaptive_damping,
+        max_damping_retries,
+        damping_increase,
+        damping_decrease,
+        line_search,
+        max_line_search,
+        sufficient_decrease,
+        active_tol,
+        feasibility_tol,
+        barrier_initial,
+        barrier_decay,
+        fraction_to_boundary,
+        max_step_norm,
+        rcond
+    );
+}
+
 }  // namespace
 
-PYBIND11_MODULE(_pycutfem_mor_online_gauss_newton_2026_05_15_mor_online_gauss_newton_v5, m)
+PYBIND11_MODULE(_pycutfem_mor_online_gauss_newton_2026_05_17_mor_online_gauss_newton_v16, m)
 {
     m.doc() = "pycutfem MOR native online Gauss-Newton driver";
     m.def(
@@ -1486,6 +2976,7 @@ PYBIND11_MODULE(_pycutfem_mor_online_gauss_newton_2026_05_15_mor_online_gauss_ne
         py::arg("tangent_symbolic_state_updates") = py::tuple(),
         py::arg("max_iterations") = 8,
         py::arg("residual_tol") = 1.0e-10,
+        py::arg("optimality_tol") = -1.0,
         py::arg("step_tol") = 1.0e-12,
         py::arg("damping") = 0.0,
         py::arg("adaptive_damping") = false,
@@ -1495,6 +2986,12 @@ PYBIND11_MODULE(_pycutfem_mor_online_gauss_newton_2026_05_15_mor_online_gauss_ne
         py::arg("line_search") = false,
         py::arg("max_line_search") = 6,
         py::arg("sufficient_decrease") = 1.0e-4,
+        py::arg("reference_coefficients") = py::none(),
+        py::arg("reference_weight") = 0.0,
+        py::arg("max_step_norm") = std::numeric_limits<double>::infinity(),
+        py::arg("max_reference_distance") = std::numeric_limits<double>::infinity(),
+        py::arg("state_merit_weight") = 0.0,
+        py::arg("require_residual_convergence") = false,
         py::arg("rcond") = -1.0
     );
     m.def(
@@ -1522,6 +3019,7 @@ PYBIND11_MODULE(_pycutfem_mor_online_gauss_newton_2026_05_15_mor_online_gauss_ne
         py::arg("tangent_symbolic_state_updates") = py::tuple(),
         py::arg("max_iterations") = 8,
         py::arg("residual_tol") = 1.0e-10,
+        py::arg("optimality_tol") = -1.0,
         py::arg("step_tol") = 1.0e-12,
         py::arg("damping") = 0.0,
         py::arg("adaptive_damping") = false,
@@ -1531,6 +3029,155 @@ PYBIND11_MODULE(_pycutfem_mor_online_gauss_newton_2026_05_15_mor_online_gauss_ne
         py::arg("line_search") = false,
         py::arg("max_line_search") = 6,
         py::arg("sufficient_decrease") = 1.0e-4,
+        py::arg("reference_coefficients") = py::none(),
+        py::arg("reference_weight") = 0.0,
+        py::arg("max_step_norm") = std::numeric_limits<double>::infinity(),
+        py::arg("max_reference_distance") = std::numeric_limits<double>::infinity(),
+        py::arg("state_merit_weight") = 0.0,
+        py::arg("require_residual_convergence") = false,
+        py::arg("rcond") = -1.0
+    );
+    m.def(
+        "solve_bound_constrained_online_gauss_newton",
+        &solve_bound_constrained_online_gauss_newton,
+        py::arg("residual_metadata_capsule"),
+        py::arg("residual_param_order"),
+        py::arg("residual_static_args"),
+        py::arg("tangent_metadata_capsule"),
+        py::arg("tangent_param_order"),
+        py::arg("tangent_static_args"),
+        py::arg("trial_basis"),
+        py::arg("offset"),
+        py::arg("initial_coefficients"),
+        py::arg("row_dofs"),
+        py::arg("coefficient_arg_names"),
+        py::arg("bound_constraints"),
+        py::arg("constraint_method") = "pdas",
+        py::arg("element_weights") = py::none(),
+        py::arg("row_weights") = py::none(),
+        py::arg("gnat_lift") = py::none(),
+        py::arg("residual_state_updates") = py::tuple(),
+        py::arg("tangent_state_updates") = py::tuple(),
+        py::arg("residual_symbolic_state_updates") = py::tuple(),
+        py::arg("tangent_symbolic_state_updates") = py::tuple(),
+        py::arg("max_iterations") = 8,
+        py::arg("residual_tol") = 1.0e-10,
+        py::arg("optimality_tol") = -1.0,
+        py::arg("step_tol") = 1.0e-12,
+        py::arg("damping") = 0.0,
+        py::arg("adaptive_damping") = false,
+        py::arg("max_damping_retries") = 4,
+        py::arg("damping_increase") = 10.0,
+        py::arg("damping_decrease") = 0.25,
+        py::arg("line_search") = false,
+        py::arg("max_line_search") = 6,
+        py::arg("sufficient_decrease") = 1.0e-4,
+        py::arg("active_tol") = 1.0e-10,
+        py::arg("feasibility_tol") = 1.0e-10,
+        py::arg("barrier_initial") = 1.0e-4,
+        py::arg("barrier_decay") = 0.25,
+        py::arg("fraction_to_boundary") = 0.995,
+        py::arg("max_step_norm") = std::numeric_limits<double>::infinity(),
+        py::arg("reference_coefficients") = py::none(),
+        py::arg("max_reference_distance") = std::numeric_limits<double>::infinity(),
+        py::arg("state_merit_weight") = 0.0,
+        py::arg("require_residual_convergence") = false,
+        py::arg("rcond") = -1.0
+    );
+    m.def(
+        "solve_bound_constrained_galerkin_online_gauss_newton",
+        &solve_bound_constrained_galerkin_online_gauss_newton,
+        py::arg("residual_metadata_capsule"),
+        py::arg("residual_param_order"),
+        py::arg("residual_static_args"),
+        py::arg("tangent_metadata_capsule"),
+        py::arg("tangent_param_order"),
+        py::arg("tangent_static_args"),
+        py::arg("trial_basis"),
+        py::arg("offset"),
+        py::arg("initial_coefficients"),
+        py::arg("row_dofs"),
+        py::arg("coefficient_arg_names"),
+        py::arg("bound_constraints"),
+        py::arg("constraint_method") = "pdas",
+        py::arg("element_weights") = py::none(),
+        py::arg("row_weights") = py::none(),
+        py::arg("gnat_lift") = py::none(),
+        py::arg("residual_state_updates") = py::tuple(),
+        py::arg("tangent_state_updates") = py::tuple(),
+        py::arg("residual_symbolic_state_updates") = py::tuple(),
+        py::arg("tangent_symbolic_state_updates") = py::tuple(),
+        py::arg("max_iterations") = 8,
+        py::arg("residual_tol") = 1.0e-10,
+        py::arg("optimality_tol") = -1.0,
+        py::arg("step_tol") = 1.0e-12,
+        py::arg("damping") = 0.0,
+        py::arg("adaptive_damping") = false,
+        py::arg("max_damping_retries") = 4,
+        py::arg("damping_increase") = 10.0,
+        py::arg("damping_decrease") = 0.25,
+        py::arg("line_search") = false,
+        py::arg("max_line_search") = 6,
+        py::arg("sufficient_decrease") = 1.0e-4,
+        py::arg("active_tol") = 1.0e-10,
+        py::arg("feasibility_tol") = 1.0e-10,
+        py::arg("barrier_initial") = 1.0e-4,
+        py::arg("barrier_decay") = 0.25,
+        py::arg("fraction_to_boundary") = 0.995,
+        py::arg("max_step_norm") = std::numeric_limits<double>::infinity(),
+        py::arg("reference_coefficients") = py::none(),
+        py::arg("max_reference_distance") = std::numeric_limits<double>::infinity(),
+        py::arg("state_merit_weight") = 0.0,
+        py::arg("require_residual_convergence") = false,
+        py::arg("rcond") = -1.0
+    );
+    m.def(
+        "solve_bound_constrained_deim_online_gauss_newton",
+        &solve_bound_constrained_deim_online_gauss_newton,
+        py::arg("residual_metadata_capsule"),
+        py::arg("residual_param_order"),
+        py::arg("residual_static_args"),
+        py::arg("tangent_metadata_capsule"),
+        py::arg("tangent_param_order"),
+        py::arg("tangent_static_args"),
+        py::arg("trial_basis"),
+        py::arg("offset"),
+        py::arg("initial_coefficients"),
+        py::arg("row_dofs"),
+        py::arg("coefficient_arg_names"),
+        py::arg("selected_basis"),
+        py::arg("residual_terms"),
+        py::arg("bound_constraints"),
+        py::arg("constraint_method") = "pdas",
+        py::arg("element_weights") = py::none(),
+        py::arg("row_weights") = py::none(),
+        py::arg("gnat_lift") = py::none(),
+        py::arg("residual_state_updates") = py::tuple(),
+        py::arg("tangent_state_updates") = py::tuple(),
+        py::arg("residual_symbolic_state_updates") = py::tuple(),
+        py::arg("tangent_symbolic_state_updates") = py::tuple(),
+        py::arg("max_iterations") = 8,
+        py::arg("residual_tol") = 1.0e-10,
+        py::arg("optimality_tol") = -1.0,
+        py::arg("step_tol") = 1.0e-12,
+        py::arg("damping") = 0.0,
+        py::arg("adaptive_damping") = false,
+        py::arg("max_damping_retries") = 4,
+        py::arg("damping_increase") = 10.0,
+        py::arg("damping_decrease") = 0.25,
+        py::arg("line_search") = false,
+        py::arg("max_line_search") = 6,
+        py::arg("sufficient_decrease") = 1.0e-4,
+        py::arg("active_tol") = 1.0e-10,
+        py::arg("feasibility_tol") = 1.0e-10,
+        py::arg("barrier_initial") = 1.0e-4,
+        py::arg("barrier_decay") = 0.25,
+        py::arg("fraction_to_boundary") = 0.995,
+        py::arg("max_step_norm") = std::numeric_limits<double>::infinity(),
+        py::arg("reference_coefficients") = py::none(),
+        py::arg("max_reference_distance") = std::numeric_limits<double>::infinity(),
+        py::arg("state_merit_weight") = 0.0,
+        py::arg("require_residual_convergence") = false,
         py::arg("rcond") = -1.0
     );
 }

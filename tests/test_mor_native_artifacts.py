@@ -4,6 +4,8 @@ import numpy as np
 
 from pycutfem.mor import (
     AffineStateUpdateSpec,
+    BoundConstraintSpec,
+    NativeAdjointDWRSpec,
     NativeGnatTargetSpec,
     NativeKernelReference,
     NativeReducedArtifact,
@@ -70,6 +72,31 @@ def test_native_reduced_artifact_roundtrip_preserves_sparse_target_and_kernel_me
             objective="gnat",
             metadata={"sampler": "unit"},
         ),
+        bound_constraints=BoundConstraintSpec(
+            rows=np.array([1, 2], dtype=np.int64),
+            lower=np.array([0.0, -np.inf], dtype=float),
+            upper=np.array([1.0, 0.5], dtype=float),
+            row_scaling=np.array([2.0, 1.0], dtype=float),
+            metadata={"fields": ("alpha", "phi")},
+        ),
+        adjoint_dwr=NativeAdjointDWRSpec(
+            qoi_name="alpha_mass",
+            qoi_kernel=NativeKernelReference(
+                kernel_id="qoi_kernel",
+                abi="native-kernel-v1",
+                param_order=("gdofs_map", "alpha_loc"),
+            ),
+            qoi_current_gradient_kernel=NativeKernelReference(
+                kernel_id="qoi_gradient_kernel",
+                abi="native-kernel-v1",
+                param_order=("gdofs_map", "alpha_loc"),
+            ),
+            adjoint_basis=np.array([[1.0], [0.5], [0.0]], dtype=float),
+            solver_options={"backend": "cpp", "rcond": 1.0e-12},
+            estimator_options={"effectivity_bounds": (0.5, 2.0)},
+            certification={"passed": False, "reason": "not_run"},
+            metadata={"type": "dwr"},
+        ),
         solver_options={"max_iterations": 8, "line_search": True},
         metadata={"basis_signature": "test"},
     )
@@ -87,4 +114,15 @@ def test_native_reduced_artifact_roundtrip_preserves_sparse_target_and_kernel_me
     np.testing.assert_allclose(loaded.target.lift.to_dense(), lift.to_dense())
     np.testing.assert_allclose(loaded.trial_basis, artifact.trial_basis)
     np.testing.assert_allclose(loaded.offset, artifact.offset)
+    assert loaded.bound_constraints is not None
+    np.testing.assert_array_equal(loaded.bound_constraints.rows, np.array([1, 2], dtype=np.int64))
+    np.testing.assert_allclose(loaded.bound_constraints.row_scaling, np.array([2.0, 1.0]))
+    reduced_bounds = loaded.bound_constraints.reduce(trial_basis=loaded.trial_basis, offset=loaded.offset)
+    assert reduced_bounds.n_constraints == 2
+    assert loaded.adjoint_dwr is not None
+    assert loaded.adjoint_dwr.qoi_name == "alpha_mass"
+    assert loaded.adjoint_dwr.qoi_current_gradient_kernel is not None
+    assert loaded.adjoint_dwr.qoi_current_gradient_kernel.kernel_id == "qoi_gradient_kernel"
+    np.testing.assert_allclose(loaded.adjoint_dwr.adjoint_basis, np.array([[1.0], [0.5], [0.0]], dtype=float))
+    assert loaded.adjoint_dwr.estimator_options["effectivity_bounds"] == (0.5, 2.0)
     assert loaded.solver_options["line_search"] is True

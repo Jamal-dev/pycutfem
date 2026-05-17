@@ -197,19 +197,19 @@ def _normalize_pairs(
         if isinstance(coefficient, Function) and not isinstance(
             coefficient, (VectorFunction, HdivFunction, TrialFunction, TestFunction)
         ):
-            if not isinstance(direction, TrialFunction):
+            if not isinstance(direction, (TrialFunction, TestFunction)):
                 raise GateauxDerivativeError(
-                    f"Scalar coefficient {coefficient!r} must map to a TrialFunction direction, "
+                    f"Scalar coefficient {coefficient!r} must map to a TrialFunction/TestFunction direction, "
                     f"got {type(direction).__name__}."
                 )
-        if isinstance(coefficient, VectorFunction) and not isinstance(direction, VectorTrialFunction):
+        if isinstance(coefficient, VectorFunction) and not isinstance(direction, (VectorTrialFunction, VectorTestFunction)):
             raise GateauxDerivativeError(
-                f"Vector coefficient {coefficient!r} must map to a VectorTrialFunction direction, "
+                f"Vector coefficient {coefficient!r} must map to a VectorTrialFunction/VectorTestFunction direction, "
                 f"got {type(direction).__name__}."
             )
-        if isinstance(coefficient, HdivFunction) and not isinstance(direction, HdivTrialFunction):
+        if isinstance(coefficient, HdivFunction) and not isinstance(direction, (HdivTrialFunction, HdivTestFunction)):
             raise GateauxDerivativeError(
-                f"H(div) coefficient {coefficient!r} must map to an HdivTrialFunction direction, "
+                f"H(div) coefficient {coefficient!r} must map to an HdivTrialFunction/HdivTestFunction direction, "
                 f"got {type(direction).__name__}."
             )
         pairs.append(_CoefficientDirectionPair(coefficient=coefficient, direction=direction))

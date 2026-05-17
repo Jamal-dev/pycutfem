@@ -193,6 +193,24 @@ class NativeSparseMatrix:
             out[row, self.indices[start:stop]] = self.data[start:stop]
         return out
 
+    def row_subset(self, rows: Any) -> "NativeSparseMatrix":
+        row_ids = np.asarray(rows, dtype=np.int64).reshape(-1)
+        if np.any(row_ids < 0) or np.any(row_ids >= self.shape[0]):
+            raise ValueError("sparse row subset contains out-of-range rows.")
+        indptr = np.zeros(row_ids.size + 1, dtype=np.int64)
+        indices_parts: list[np.ndarray] = []
+        data_parts: list[np.ndarray] = []
+        nnz = 0
+        for out_row, row in enumerate(row_ids):
+            start, stop = int(self.indptr[int(row)]), int(self.indptr[int(row) + 1])
+            indices_parts.append(self.indices[start:stop])
+            data_parts.append(self.data[start:stop])
+            nnz += stop - start
+            indptr[out_row + 1] = nnz
+        indices = np.concatenate(indices_parts) if indices_parts else np.zeros(0, dtype=np.int64)
+        data = np.concatenate(data_parts) if data_parts else np.zeros(0, dtype=float)
+        return NativeSparseMatrix(shape=(int(row_ids.size), self.shape[1]), indptr=indptr, indices=indices, data=data)
+
     def matvec(self, vector: Any) -> np.ndarray:
         vec = np.asarray(vector, dtype=float).reshape(-1)
         if vec.size != self.shape[1]:

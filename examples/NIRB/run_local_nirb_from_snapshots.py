@@ -23,26 +23,57 @@ def _load_scalar(path: Path) -> float | None:
     return float(np.asarray(np.load(path), dtype=float).reshape(-1)[0])
 
 
-def _prediction_loop(model, forces: np.ndarray) -> np.ndarray:
-    columns = [model.predict_full(forces[:, index])[:, 0] for index in range(forces.shape[1])]
+def _context_from_batch(batch, n_samples: int, input_features: tuple[str, ...]) -> dict[str, np.ndarray] | None:
+    if not input_features:
+        return None
+    context: dict[str, np.ndarray] = {}
+    for name in input_features:
+        if name == "time":
+            if batch.times is None:
+                raise ValueError("--input-features includes time, but snapshot metadata has no time_s column")
+            context["time"] = np.asarray(batch.times[:n_samples], dtype=float)
+        elif name == "coupling_iter":
+            if batch.subiterations is None:
+                raise ValueError(
+                    "--input-features includes coupling_iter, but snapshot metadata has no coupling_iter column"
+                )
+            context["coupling_iter"] = np.asarray(batch.subiterations[:n_samples], dtype=float)
+        else:
+            raise ValueError(f"Unsupported input feature {name!r}")
+    return context
+
+
+def _prediction_loop(model, forces: np.ndarray, context: dict[str, np.ndarray] | None = None) -> np.ndarray:
+    columns = []
+    for index in range(forces.shape[1]):
+        sample_context = None
+        if context is not None:
+            sample_context = {key: np.asarray(value, dtype=float).reshape(-1)[index] for key, value in context.items()}
+        columns.append(model.predict_full(forces[:, index], context=sample_context)[:, 0])
     return np.column_stack(columns)
 
 
-def _time_prediction(model, forces: np.ndarray, *, repeats: int) -> dict[str, float | np.ndarray]:
+def _time_prediction(
+    model,
+    forces: np.ndarray,
+    *,
+    repeats: int,
+    context: dict[str, np.ndarray] | None = None,
+) -> dict[str, float | np.ndarray]:
     repeats = max(1, int(repeats))
 
     batch_times: list[float] = []
     batch_prediction = None
     for _ in range(repeats):
         started = time.perf_counter()
-        batch_prediction = model.predict_full(forces)
+        batch_prediction = model.predict_full(forces, context=context)
         batch_times.append(time.perf_counter() - started)
 
     loop_times: list[float] = []
     loop_prediction = None
     for _ in range(repeats):
         started = time.perf_counter()
-        loop_prediction = _prediction_loop(model, forces)
+        loop_prediction = _prediction_loop(model, forces, context=context)
         loop_times.append(time.perf_counter() - started)
 
     if batch_prediction is None or loop_prediction is None:
@@ -66,8 +97,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--force-modes", type=int, default=45)
     parser.add_argument("--displacement-modes", type=int, default=9)
     parser.add_argument("--zero-anchor-weight", type=int, default=0)
-    parser.add_argument("--regression-kind", choices=("poly_lasso", "poly_ls", "poly_ridge", "tps_rbf"), default="poly_lasso")
+    parser.add_argument(
+        "--regression-kind",
+        choices=("poly_lasso", "poly_ls", "poly_ridge", "tps_rbf", "knn"),
+        default="poly_lasso",
+    )
     parser.add_argument("--regularization", type=float, default=0.0)
+    parser.add_argument("--knn-neighbors", type=int, default=8)
+    parser.add_argument("--knn-power", type=float, default=2.0)
+    parser.add_argument(
+        "--input-features",
+        default="",
+        help=(
+            "Comma-separated context features appended to reduced force coordinates. "
+            "Supported: time,coupling_iter."
+        ),
+    )
     parser.add_argument("--timing-repeats", type=int, default=3)
     parser.add_argument("--max-eval-snapshots", type=int, default=None)
     parser.add_argument(
@@ -124,6 +169,13 @@ def main() -> None:
     else:
         forces_eval = forces
         reference_eval = reference
+    input_features = tuple(
+        item.strip()
+        for item in str(args.input_features).replace(";", ",").split(",")
+        if item.strip()
+    )
+    input_features = tuple("coupling_iter" if item == "subiteration" else item for item in input_features)
+    context_eval = _context_from_batch(batch, forces_eval.shape[1], input_features)
 
     config = OfflineConfig(
         dataset_path=str(args.snapshot_dir),
@@ -134,14 +186,17 @@ def main() -> None:
             kind=str(args.regression_kind),
             degree=2,
             criterion="bic",
-            standardize_inputs=False,
+            standardize_inputs=bool(str(args.regression_kind) == "knn"),
             regularization=float(args.regularization),
+            n_neighbors=int(args.knn_neighbors),
+            power=float(args.knn_power),
         ),
         use_quadratic_decoder=True,
         dataset_force_key=str(args.force_key),
         dataset_displacement_key=str(args.displacement_key),
         zero_anchor_weight=int(args.zero_anchor_weight),
         interface_matrix_path=None if interface_matrix_path is None else str(interface_matrix_path),
+        input_feature_names=input_features,
         metadata={"benchmark": "example2", "source": "local_pycutfem_cosim"},
     )
 
@@ -149,7 +204,7 @@ def main() -> None:
     model = run_offline_pipeline(config)
     train_time_s = time.perf_counter() - train_start
 
-    timing = _time_prediction(model, forces_eval, repeats=int(args.timing_repeats))
+    timing = _time_prediction(model, forces_eval, repeats=int(args.timing_repeats), context=context_eval)
     prediction = np.asarray(timing["batch_prediction"], dtype=float)
     prediction_path = output_dir / "nirb_full_prediction.npy"
     np.save(prediction_path, prediction)
@@ -186,6 +241,9 @@ def main() -> None:
         "zero_anchor_weight": int(args.zero_anchor_weight),
         "regression_kind": str(args.regression_kind),
         "regularization": float(args.regularization),
+        "knn_neighbors": int(args.knn_neighbors),
+        "knn_power": float(args.knn_power),
+        "input_features": list(input_features),
         "interface_matrix_path": None if interface_matrix_path is None else str(interface_matrix_path),
         "snapshots_trained": int(forces.shape[1]),
         "snapshots_evaluated": int(forces_eval.shape[1]),

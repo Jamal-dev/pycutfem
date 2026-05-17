@@ -24,6 +24,13 @@ def _finite_vector(value: Any, label: str) -> np.ndarray:
     return np.ascontiguousarray(arr, dtype=np.float64)
 
 
+def _int_vector(value: Any, label: str) -> np.ndarray:
+    arr = np.asarray(value, dtype=np.int64).reshape(-1)
+    if np.any(arr < 0):
+        raise ValueError(f"{label} must contain nonnegative row ids.")
+    return np.unique(arr).astype(np.int64, copy=False)
+
+
 @dataclass(frozen=True)
 class NativeStateArraySpec:
     """Named mutable array exposed to a native online solve."""
@@ -221,6 +228,69 @@ def coerce_affine_state_updates(
     return tuple(coerce_affine_state_update(item) for item in updates)
 
 
+def build_dirichlet_lift_state_updates(
+    static_args: Mapping[str, Any],
+    coefficient_arg_names: Sequence[str],
+    *,
+    trial_basis: Any,
+    offset: Any,
+    fixed_rows: Any,
+    lift_values: Any,
+) -> tuple[AffineStateUpdateSpec, ...]:
+    """Build affine native updates that enforce fixed-row lifting values.
+
+    The generated native kernels use element-local coefficient arrays.  These
+    updates preserve the reduced decoded state on free rows and overwrite fixed
+    global rows with the supplied lift values inside the C++ online loop.
+    """
+
+    if "gdofs_map" not in static_args:
+        raise ValueError("static_args must contain gdofs_map.")
+    gdofs = np.asarray(static_args["gdofs_map"], dtype=np.int64)
+    if gdofs.ndim != 2:
+        raise ValueError("gdofs_map must be a rank-2 array.")
+    basis = _finite_matrix(trial_basis, "trial_basis")
+    base_offset = _finite_vector(offset, "offset")
+    lift = _finite_vector(lift_values, "lift_values")
+    if basis.shape[0] != base_offset.size or lift.size != base_offset.size:
+        raise ValueError("trial_basis, offset, and lift_values row counts must match.")
+    fixed = _int_vector(fixed_rows, "fixed_rows")
+    if fixed.size and int(fixed[-1]) >= base_offset.size:
+        raise ValueError("fixed_rows contains rows outside the state vector.")
+
+    lifted_offset = np.array(base_offset, dtype=np.float64, copy=True)
+    homogeneous_basis = np.array(basis, dtype=np.float64, copy=True)
+    if fixed.size:
+        lifted_offset[fixed] = lift[fixed]
+        homogeneous_basis[fixed, :] = 0.0
+
+    safe = np.where(gdofs >= 0, gdofs, 0)
+    valid = gdofs >= 0
+    flat_safe = safe.reshape(-1)
+    flat_valid = valid.reshape(-1)
+    local_offset = np.ascontiguousarray(lifted_offset[flat_safe], dtype=np.float64)
+    local_basis = np.ascontiguousarray(homogeneous_basis[flat_safe, :], dtype=np.float64)
+    if np.any(~flat_valid):
+        local_offset[~flat_valid] = 0.0
+        local_basis[~flat_valid, :] = 0.0
+
+    updates: list[AffineStateUpdateSpec] = []
+    for raw_name in coefficient_arg_names:
+        name = str(raw_name)
+        target = static_args.get(name)
+        if not isinstance(target, np.ndarray) or tuple(target.shape) != tuple(gdofs.shape):
+            continue
+        updates.append(
+            AffineStateUpdateSpec(
+                name=name,
+                basis=local_basis,
+                offset=local_offset,
+                metadata={"kind": "dirichlet_lift", "fixed_rows": int(fixed.size)},
+            )
+        )
+    return tuple(updates)
+
+
 def apply_affine_state_updates(
     updates: Sequence[Mapping[str, Any] | AffineStateUpdateSpec],
     coefficients: Any,
@@ -243,6 +313,7 @@ __all__ = [
     "StateTransactionSpec",
     "SymbolicStateUpdateKernelSpec",
     "apply_affine_state_updates",
+    "build_dirichlet_lift_state_updates",
     "coerce_affine_state_update",
     "coerce_affine_state_updates",
 ]

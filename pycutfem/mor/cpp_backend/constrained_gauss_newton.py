@@ -10,7 +10,7 @@ from pycutfem.jit.cpp_backend.cache import _looks_like_incomplete_binary_import,
 from pycutfem.jit.cpp_backend.compiler import compile_extension
 
 
-ONLINE_GAUSS_NEWTON_CPP_ABI = "2026-05-17-mor-online-gauss-newton-v16"
+CONSTRAINED_GAUSS_NEWTON_CPP_ABI = "2026-05-15-mor-constrained-gauss-newton-v1"
 _MODULE: Any | None = None
 
 
@@ -40,21 +40,20 @@ def module() -> Any:
         return _MODULE
 
     cache = _cache_dir()
-    modname = f"_pycutfem_mor_online_gauss_newton_{ONLINE_GAUSS_NEWTON_CPP_ABI.replace('-', '_')}"
+    modname = f"_pycutfem_mor_constrained_gauss_newton_{CONSTRAINED_GAUSS_NEWTON_CPP_ABI.replace('-', '_')}"
     built = cache / f"{modname}{_ext_suffix()}"
     lock = cache / f"{modname}.lock"
-    src = Path(__file__).with_name("online_gauss_newton_module.cpp")
-    include_dirs = [Path(__file__).parents[2] / "jit" / "cpp_backend"]
+    src = Path(__file__).with_name("constrained_gauss_newton_module.cpp")
 
     with _module_build_lock(lock):
         if not built.exists():
-            compile_extension(modname, src, cache, include_dirs=include_dirs)
+            compile_extension(modname, src, cache)
         try:
             _MODULE = _import_module(modname, built)
         except Exception as exc:
             if not _looks_like_incomplete_binary_import(exc):
                 raise
             built.unlink(missing_ok=True)
-            compile_extension(modname, src, cache, include_dirs=include_dirs)
+            compile_extension(modname, src, cache)
             _MODULE = _import_module(modname, built)
     return _MODULE

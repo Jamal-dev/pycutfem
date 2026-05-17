@@ -151,6 +151,7 @@ class NIRBSolidPredictor:
     interface_shape: tuple[int, ...] | None = None
     zero_load_tolerance: float = 0.0
     reduced_interface_decoder: ReducedInterfaceDecoder | None = None
+    online_context: dict[str, float] = field(default_factory=dict)
     _interface_decoder: Any = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -180,6 +181,28 @@ class NIRBSolidPredictor:
             reduced_interface_decoder=reduced_interface_decoder,
         )
 
+    def set_online_context(
+        self,
+        *,
+        time: float | None = None,
+        step: int | None = None,
+        coupling_iter: int | None = None,
+    ) -> None:
+        context: dict[str, float] = {}
+        if time is not None:
+            context["time"] = float(time)
+        if step is not None:
+            context["step"] = float(step)
+        if coupling_iter is not None:
+            context["coupling_iter"] = float(coupling_iter)
+            context["subiteration"] = float(coupling_iter)
+        self.online_context = context
+
+    def _model_context(self) -> dict[str, float] | None:
+        if not tuple(getattr(self.model, "input_feature_names", ()) or ()):
+            return None
+        return dict(self.online_context)
+
     def _zero_full_displacement(self) -> np.ndarray:
         if self.full_shape is None:
             raise RuntimeError("full_shape is required to return a zero full displacement")
@@ -203,7 +226,7 @@ class NIRBSolidPredictor:
             )
         force = force_vector.reshape(-1, 1)
         started = perf_counter()
-        reduced = np.asarray(self.model.predict_reduced(force), dtype=float)
+        reduced = np.asarray(self.model.predict_reduced(force, context=self._model_context()), dtype=float)
         elapsed = perf_counter() - started
         if reduced.ndim != 2 or reduced.shape[1] != 1:
             raise ValueError("NIRB solid model must return a single feature-major reduced displacement column")
@@ -243,7 +266,13 @@ class NIRBSolidPredictor:
 
         started = perf_counter()
         if hasattr(self.model, "predict_reduced_from_force_coefficients"):
-            reduced = np.asarray(self.model.predict_reduced_from_force_coefficients(coeffs), dtype=float)
+            reduced = np.asarray(
+                self.model.predict_reduced_from_force_coefficients(
+                    coeffs,
+                    context=self._model_context(),
+                ),
+                dtype=float,
+            )
         else:
             reduced = np.asarray(self.model.regressor.predict(coeffs.reshape(1, -1)), dtype=float).T
         elapsed = perf_counter() - started

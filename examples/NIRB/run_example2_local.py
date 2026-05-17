@@ -30,7 +30,7 @@ from pycutfem.linalg import (
     kratos_iqnils_next_iterate_cpp,
 )
 from pycutfem.mor.interface import build_restriction_matrix
-from pycutfem.nirb.coupling import NIRBInterfaceTangentCorrector, NIRBSolidPredictor
+from pycutfem.nirb.coupling import NIRBInterfaceTangentCorrector, NIRBSolidPrediction, NIRBSolidPredictor
 from pycutfem.operators import LocalAssemblyResult, RuntimeOperator
 from pycutfem.solvers.nonlinear_solver import (
     LinearSolverParameters,
@@ -139,6 +139,190 @@ _EX2L_KRATOS_MATCHED_QUAD_ORDER = 1
 # default. A one-step structural accept remains available only as an explicit
 # experiment switch while auditing monitored stage semantics.
 _EX2L_KRATOS_STRUCT_ONE_STEP_ACCEPT_FACTOR = 1.0e12
+
+
+@dataclass(frozen=True)
+class _SolidIntrusiveROMBasis:
+    """Linear displacement basis for the intrusive structural ROM.
+
+    The basis is stored in the same flattened local nodal-value order as
+    ``solid["d_k"].nodal_values.ravel()``. During the online solve it is
+    converted to the Newton solver active-DOF order and re-orthonormalized
+    after removing Dirichlet rows.
+    """
+
+    basis_local: np.ndarray
+    mean_local: np.ndarray
+    singular_values: np.ndarray
+    energy_fraction: np.ndarray
+    source_path: str
+
+    @property
+    def n_modes(self) -> int:
+        return int(self.basis_local.shape[1])
+
+    @classmethod
+    def from_npz(
+        cls,
+        path: Path,
+        *,
+        full_size: int,
+        n_modes: int | None = None,
+    ) -> "_SolidIntrusiveROMBasis":
+        source = Path(path)
+        with np.load(source, allow_pickle=False) as data:
+            if "basis" not in data.files:
+                raise RuntimeError(f"Solid intrusive ROM basis file has no 'basis' array: {source}")
+            basis = np.asarray(data["basis"], dtype=float)
+            if basis.ndim != 2:
+                raise RuntimeError(f"Solid intrusive ROM basis must be 2D, got shape {basis.shape}.")
+            if int(basis.shape[0]) != int(full_size) and int(basis.shape[1]) == int(full_size):
+                basis = basis.T
+            if int(basis.shape[0]) != int(full_size):
+                raise RuntimeError(
+                    "Solid intrusive ROM basis row count does not match the solid displacement field: "
+                    f"{basis.shape[0]} != {int(full_size)}"
+                )
+            max_modes = int(basis.shape[1])
+            keep = max_modes if n_modes is None or int(n_modes) <= 0 else min(int(n_modes), max_modes)
+            basis = np.asarray(basis[:, :keep], dtype=float)
+            mean = (
+                np.asarray(data["mean"], dtype=float).reshape(-1)
+                if "mean" in data.files
+                else np.zeros((int(full_size),), dtype=float)
+            )
+            if int(mean.size) != int(full_size):
+                raise RuntimeError(
+                    "Solid intrusive ROM mean size does not match the solid displacement field: "
+                    f"{int(mean.size)} != {int(full_size)}"
+                )
+            singular_values = (
+                np.asarray(data["singular_values"], dtype=float).reshape(-1)[:keep]
+                if "singular_values" in data.files
+                else np.zeros((keep,), dtype=float)
+            )
+            energy_fraction = (
+                np.asarray(data["energy_fraction"], dtype=float).reshape(-1)[:keep]
+                if "energy_fraction" in data.files
+                else np.zeros((keep,), dtype=float)
+            )
+        if int(basis.shape[1]) == 0:
+            raise RuntimeError("Solid intrusive ROM basis has zero modes.")
+        if not (np.all(np.isfinite(basis)) and np.all(np.isfinite(mean))):
+            raise RuntimeError("Solid intrusive ROM basis/mean contains non-finite values.")
+        return cls(
+            basis_local=basis,
+            mean_local=mean,
+            singular_values=singular_values,
+            energy_fraction=energy_fraction,
+            source_path=str(source),
+        )
+
+
+@dataclass(frozen=True)
+class _SolidIntrusiveROMActiveBasis:
+    basis_active: np.ndarray
+    basis_local: np.ndarray
+    mean_active: np.ndarray
+    mean_local: np.ndarray
+    active_dofs: np.ndarray
+    condition: float
+
+
+@dataclass(frozen=True)
+class _SolidIntrusiveROMSolveInfo:
+    used: bool
+    converged: bool
+    fallback_used: bool
+    iterations: int
+    reduced_residual_norm: float
+    reduced_residual_rel: float
+    full_residual_inf: float
+    full_residual_rel: float
+    tangent_condition: float
+    interface_update_rel: float
+    interface_step_ratio: float
+    trust_alpha: float
+    reason: str
+
+
+def _solid_intrusive_rom_prepare_active_basis(
+    *,
+    raw_basis: _SolidIntrusiveROMBasis,
+    dh: DofHandler,
+    vector: VectorFunction,
+    active_dofs: np.ndarray,
+) -> _SolidIntrusiveROMActiveBasis:
+    local_basis = np.asarray(raw_basis.basis_local, dtype=float)
+    local_mean = np.asarray(raw_basis.mean_local, dtype=float).reshape(-1)
+    gdofs = np.asarray(vector._g_dofs, dtype=int).reshape(-1)
+    if int(gdofs.size) != int(local_basis.shape[0]):
+        raise RuntimeError(
+            "Solid intrusive ROM basis local row count does not match vector local dofs: "
+            f"{int(local_basis.shape[0])} != {int(gdofs.size)}"
+        )
+    ndof = int(dh.total_dofs)
+    full_basis = np.zeros((ndof, int(local_basis.shape[1])), dtype=float)
+    full_mean = np.zeros((ndof,), dtype=float)
+    full_basis[gdofs, :] = local_basis
+    full_mean[gdofs] = local_mean
+    active = np.asarray(active_dofs, dtype=int).reshape(-1)
+    active_basis = np.asarray(full_basis[active, :], dtype=float)
+    active_mean = np.asarray(full_mean[active], dtype=float)
+    q_basis, r_basis = np.linalg.qr(active_basis, mode="reduced")
+    diag = np.abs(np.diag(r_basis)) if r_basis.ndim == 2 else np.zeros(0, dtype=float)
+    tol = max(float(active_basis.shape[0]), float(active_basis.shape[1]), 1.0) * np.finfo(float).eps
+    if diag.size:
+        tol *= max(float(diag[0]), 1.0)
+    rank = int(np.count_nonzero(diag > tol)) if diag.size else 0
+    if rank <= 0:
+        raise RuntimeError("Solid intrusive ROM active basis is rank deficient after Dirichlet filtering.")
+    q_basis = np.asarray(q_basis[:, :rank], dtype=float)
+    full_q = np.zeros((ndof, rank), dtype=float)
+    full_q[active, :] = q_basis
+    local_q = np.asarray(full_q[gdofs, :], dtype=float)
+    try:
+        cond = float(np.linalg.cond(active_basis[:, :rank]))
+    except np.linalg.LinAlgError:
+        cond = float("inf")
+    return _SolidIntrusiveROMActiveBasis(
+        basis_active=q_basis,
+        basis_local=local_q,
+        mean_active=active_mean,
+        mean_local=local_mean,
+        active_dofs=active,
+        condition=float(cond),
+    )
+
+
+def _solid_intrusive_rom_active_values(
+    *,
+    dh: DofHandler,
+    vector: VectorFunction,
+    active_dofs: np.ndarray,
+) -> np.ndarray:
+    full = np.zeros((int(dh.total_dofs),), dtype=float)
+    gdofs = np.asarray(vector._g_dofs, dtype=int).reshape(-1)
+    full[gdofs] = np.asarray(vector.nodal_values, dtype=float).reshape(-1)
+    return np.asarray(full[np.asarray(active_dofs, dtype=int)], dtype=float)
+
+
+def _solid_intrusive_rom_write_coefficients(
+    *,
+    basis: _SolidIntrusiveROMActiveBasis,
+    vector: VectorFunction,
+    coefficients: np.ndarray,
+) -> None:
+    coeffs = np.asarray(coefficients, dtype=float).reshape(-1)
+    if int(coeffs.size) != int(basis.basis_local.shape[1]):
+        raise ValueError(
+            f"Solid ROM coefficient size mismatch: {int(coeffs.size)} != {int(basis.basis_local.shape[1])}"
+        )
+    local = np.asarray(basis.mean_local, dtype=float).reshape(-1) + np.asarray(
+        basis.basis_local,
+        dtype=float,
+    ) @ coeffs
+    vector.nodal_values[:] = local.reshape(np.asarray(vector.nodal_values).shape)
 
 
 def _coord_key(x: float, y: float, ndigits: int = 12) -> tuple[float, float]:
@@ -3226,6 +3410,28 @@ def _boundary_vector_snapshot(dh: DofHandler, vector: VectorFunction, tag: str) 
     return coords_x, values
 
 
+def _assign_boundary_vector_values(
+    *,
+    dh: DofHandler,
+    vector: VectorFunction,
+    tag: str,
+    values: np.ndarray,
+) -> None:
+    coords_x, gdofs_x = _boundary_field_data(dh, vector.components[0].field_name, tag)
+    coords_y, gdofs_y = _boundary_field_data(dh, vector.components[1].field_name, tag)
+    if coords_x.shape != coords_y.shape:
+        raise RuntimeError(f"Mismatched boundary DOF counts for tag {tag!r}: {coords_x.shape} vs {coords_y.shape}")
+    if coords_x.size and not np.allclose(coords_x, coords_y):
+        raise RuntimeError(f"Mismatched vector boundary coordinate ordering for tag {tag!r}")
+    vals = np.asarray(values, dtype=float).reshape(-1, 2)
+    if vals.shape[0] != coords_x.shape[0]:
+        raise ValueError(
+            f"Expected {coords_x.shape[0]} boundary vector values for tag {tag!r}, got {vals.shape[0]}."
+        )
+    vector.components[0].set_nodal_values(gdofs_x, vals[:, 0])
+    vector.components[1].set_nodal_values(gdofs_y, vals[:, 1])
+
+
 def _flatten_vector_snapshot(dh: DofHandler, vector: VectorFunction) -> np.ndarray:
     _, values = _vector_field_matrix(dh, vector)
     return np.asarray(values, dtype=float).reshape(-1)
@@ -3554,6 +3760,21 @@ def _solve_kratos_exact_structure_backend(
         "displacement": CoordinateLookup(coords, disp, dim=2),
         "interface_displacement": CoordinateLookup(interface_coords, iface_disp, dim=2),
     }
+
+
+def _sync_kratos_exact_structure_backend_displacement(
+    *,
+    backend: dict[str, object],
+    displacement: CoordinateLookup,
+) -> None:
+    KM = backend["KM"]
+    for node in backend["all_nodes"]:
+        values = np.asarray(displacement(float(node.X0), float(node.Y0)), dtype=float).reshape(2)
+        disp_vec = KM.Array3()
+        disp_vec[0] = float(values[0])
+        disp_vec[1] = float(values[1])
+        disp_vec[2] = 0.0
+        node.SetSolutionStepValue(KM.DISPLACEMENT, 0, disp_vec)
 
 
 def _maybe_build_kratos_local_solid_backend(
@@ -6588,6 +6809,31 @@ def _write_csv_rows(path: Path, *, fieldnames: list[str], rows: list[dict[str, o
         writer.writerows(rows)
 
 
+def _write_failed_step_rows(
+    *,
+    output_dir: Path,
+    step: int,
+    attempt: int,
+    marker: dict[str, int],
+    step_rows: list[dict[str, object]],
+) -> Path | None:
+    failed_rows = list(step_rows[int(marker["step_rows"]):])
+    if not failed_rows:
+        return None
+    fieldnames: list[str] = []
+    for row in failed_rows:
+        for key in row:
+            if key not in fieldnames:
+                fieldnames.append(str(key))
+    path = (
+        Path(output_dir)
+        / "failed_step_rows"
+        / f"step_{int(step):04d}_attempt_{int(attempt):02d}.csv"
+    )
+    _write_csv_rows(path, fieldnames=fieldnames, rows=failed_rows)
+    return path
+
+
 def _write_vtk_pvd_collection(path: Path, *, rows: list[dict[str, object]], vtk_key: str) -> None:
     """Write a ParaView time-series collection for the accepted-step VTK files."""
 
@@ -6804,6 +7050,16 @@ def _flush_progress_artifacts(
             "load_return_max",
             "force_update_active",
             "force_omega",
+            "force_safe_step_active",
+            "force_safe_step_reason",
+            "force_adaptive_step_active",
+            "force_adaptive_step_reason",
+            "force_update_trust_active",
+            "force_update_trust_corrected",
+            "force_update_trust_alpha",
+            "force_update_trust_update_rel",
+            "force_update_trust_step_ratio",
+            "force_update_trust_reason",
             "nirb_force_trust_modified",
             "nirb_force_trust_projection_rel",
             "nirb_force_trust_coefficient_ratio",
@@ -6823,6 +7079,26 @@ def _flush_progress_artifacts(
             "nirb_interface_reason",
             "nirb_exact_fallback_used",
             "nirb_fallback_reason",
+            "nirb_exact_interface_trust_active",
+            "nirb_exact_interface_trust_corrected",
+            "nirb_exact_interface_trust_rejected",
+            "nirb_exact_interface_trust_alpha",
+            "nirb_exact_interface_trust_disp_rel",
+            "nirb_exact_interface_trust_step_ratio",
+            "nirb_exact_interface_trust_reason",
+            "solid_rom_used",
+            "solid_rom_converged",
+            "solid_rom_exact_fallback_used",
+            "solid_rom_iterations",
+            "solid_rom_reduced_residual_norm",
+            "solid_rom_reduced_residual_rel",
+            "solid_rom_full_residual_inf",
+            "solid_rom_full_residual_rel",
+            "solid_rom_tangent_condition",
+            "solid_rom_interface_trust_alpha",
+            "solid_rom_interface_disp_rel",
+            "solid_rom_interface_step_ratio",
+            "solid_rom_reason",
             "nirb_force_trust_update_alpha",
             "nirb_force_trust_next_projection_rel",
             "nirb_force_trust_next_coefficient_ratio",
@@ -6832,10 +7108,14 @@ def _flush_progress_artifacts(
             "fluid_hrom_trial_load_rel_error",
             "fluid_hrom_disabled_by_trial_monitor",
             "fluid_hrom_disabled_by_contraction_monitor",
+            "fluid_hrom_disabled_by_cost_monitor",
+            "fluid_hrom_cost_ratio",
             "fluid_hrom_load_contraction_ratio",
             "fluid_hrom_manifold_distance",
             "fluid_hrom_eta_gamma",
             "fluid_hrom_dwr_error",
+            "fluid_hrom_estimated_residual_norm",
+            "fluid_hrom_iterations",
             "fluid_hrom_exact_accept_forced",
             "fluid_hrom_interface_trust_alpha",
             "fluid_hrom_interface_load_rel",
@@ -8864,6 +9144,189 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--force-history", type=int, default=3)
     parser.add_argument("--force-regularization", type=float, default=0.0)
     parser.add_argument(
+        "--force-safe-next-step-after-coupling-iter",
+        type=int,
+        default=0,
+        help=(
+            "If an accepted step needs at least this many coupling iterations, start the next step with "
+            "the safer force-update policy below and reset carried IQN history. 0 disables this gate."
+        ),
+    )
+    parser.add_argument(
+        "--force-safe-next-step-after-load-rel",
+        type=float,
+        default=float("-inf"),
+        help=(
+            "Previous accepted-step final relative load residual required by "
+            "--force-safe-next-step-after-coupling-iter. The default disables this extra filter."
+        ),
+    )
+    parser.add_argument(
+        "--force-safe-next-step-start-step",
+        type=int,
+        default=1,
+        help="First absolute FSI step where the next-step safe-relaxation gate may activate.",
+    )
+    parser.add_argument(
+        "--force-safe-next-step-update",
+        choices=("constant", "aitken", "iqnils"),
+        default="constant",
+        help="Force-update mode used while the next-step safe-relaxation gate is active.",
+    )
+    parser.add_argument(
+        "--force-safe-next-step-relaxation",
+        type=float,
+        default=0.05,
+        help="Relaxation factor used while the next-step safe-relaxation gate is active.",
+    )
+    parser.add_argument(
+        "--force-safe-next-step-cooldown-steps",
+        type=int,
+        default=1,
+        help=(
+            "Number of accepted steps, including the triggered next step, that keep the safer "
+            "force-update policy active after the high-coupling-iteration gate fires."
+        ),
+    )
+    parser.add_argument(
+        "--force-safe-next-step-retrigger",
+        action="store_true",
+        help=(
+            "Allow consecutive high-iteration accepted steps to extend the safe force-update "
+            "cooldown even when the previous accepted step already used the safe policy."
+        ),
+    )
+    parser.add_argument(
+        "--force-safe-preserve-iqn-history",
+        action="store_true",
+        help=(
+            "Do not clear carried IQN histories when the next-step safe gate activates. "
+            "Useful when safe mode keeps IQN-ILS and only changes certification/mesh policy."
+        ),
+    )
+    parser.add_argument(
+        "--force-safe-nirb-interface-trust",
+        choices=("inherit", "none", "clip", "fallback"),
+        default="inherit",
+        help=(
+            "Optional NIRB interface-displacement trust policy used while the next-step safe "
+            "force-update gate is active. 'inherit' uses the regular --nirb-interface-trust settings."
+        ),
+    )
+    parser.add_argument(
+        "--force-safe-nirb-interface-max-step-ratio",
+        type=float,
+        default=float("inf"),
+        help="Safe-step override for --nirb-interface-max-step-ratio.",
+    )
+    parser.add_argument(
+        "--force-safe-nirb-interface-max-disp-rel",
+        type=float,
+        default=float("inf"),
+        help="Safe-step override for --nirb-interface-max-disp-rel.",
+    )
+    parser.add_argument(
+        "--force-safe-nirb-interface-min-correction-alpha",
+        type=float,
+        default=0.0,
+        help="Safe-step override for --nirb-interface-min-correction-alpha.",
+    )
+    parser.add_argument(
+        "--force-safe-use-exact-mesh",
+        action="store_true",
+        help=(
+            "While the next-step safe gate is active, bypass the reduced mesh surrogate and "
+            "solve the local full-order ALE mesh extension for that coupling stage."
+        ),
+    )
+    parser.add_argument(
+        "--force-adaptive-step-after-coupling-iter",
+        type=int,
+        default=0,
+        help=(
+            "Switch the force-update policy inside the current FSI step once this coupling "
+            "iteration is reached and --force-adaptive-step-after-load-rel is exceeded. "
+            "0 disables same-step adaptation."
+        ),
+    )
+    parser.add_argument(
+        "--force-adaptive-step-start-step",
+        type=int,
+        default=1,
+        help=(
+            "First absolute FSI step where the same-step adaptive force policy may activate. "
+            "This keeps late-window stabilizers out of the early transient."
+        ),
+    )
+    parser.add_argument(
+        "--force-adaptive-step-after-load-rel",
+        type=float,
+        default=float("inf"),
+        help=(
+            "Current relative load residual required before the same-step adaptive force "
+            "policy is activated."
+        ),
+    )
+    parser.add_argument(
+        "--force-adaptive-step-update",
+        choices=("constant", "aitken", "iqnils"),
+        default="iqnils",
+        help="Force-update mode used after the same-step adaptive gate activates.",
+    )
+    parser.add_argument(
+        "--force-adaptive-step-relaxation",
+        type=float,
+        default=0.05,
+        help="Relaxation factor used after the same-step adaptive force gate activates.",
+    )
+    parser.add_argument(
+        "--force-adaptive-step-reset-history",
+        action="store_true",
+        help="Clear current-step and carried IQN histories when the same-step adaptive gate activates.",
+    )
+    parser.add_argument(
+        "--force-update-trust",
+        choices=("none", "clip"),
+        default="none",
+        help=(
+            "Trust-region limiter for the next interface-load guess after the force-update accelerator. "
+            "'clip' damps unsafe IQN/Aitken updates before they are sent to the fluid solve."
+        ),
+    )
+    parser.add_argument(
+        "--force-update-trust-scope",
+        choices=("always", "safe"),
+        default="safe",
+        help=(
+            "Apply --force-update-trust on every nonconverged coupling update, or only while the "
+            "next-step safe-relaxation gate is active."
+        ),
+    )
+    parser.add_argument(
+        "--force-update-trust-start-step",
+        type=int,
+        default=1,
+        help="First absolute FSI step where --force-update-trust may clip/reject load updates.",
+    )
+    parser.add_argument(
+        "--force-update-max-step-ratio",
+        type=float,
+        default=float("inf"),
+        help="Maximum next-load update magnitude relative to the previous load residual.",
+    )
+    parser.add_argument(
+        "--force-update-max-load-rel",
+        type=float,
+        default=float("inf"),
+        help="Maximum relative change allowed in the next interface-load guess.",
+    )
+    parser.add_argument(
+        "--force-update-min-correction-alpha",
+        type=float,
+        default=0.0,
+        help="Reject the force-update trust clip if the required damping alpha is below this value.",
+    )
+    parser.add_argument(
         "--step-retries",
         type=int,
         default=0,
@@ -9122,6 +9585,35 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--fluid-hrom-cost-gate",
+        action="store_true",
+        help=(
+            "Disable sampled-LSPG HROM online when measured accepted-HROM stage cost is not cheaper "
+            "than measured exact-fluid fallback cost."
+        ),
+    )
+    parser.add_argument(
+        "--fluid-hrom-cost-gate-factor",
+        type=float,
+        default=1.0,
+        help=(
+            "Allow HROM only while mean(HROM stage time) <= factor * mean(exact stage time). "
+            "Use values below 1.0 to require a strict cost margin."
+        ),
+    )
+    parser.add_argument(
+        "--fluid-hrom-cost-gate-min-samples",
+        type=int,
+        default=2,
+        help="Minimum accepted-HROM and exact-fluid timing samples before the HROM cost gate is active.",
+    )
+    parser.add_argument(
+        "--fluid-hrom-cost-gate-disable-steps",
+        type=int,
+        default=25,
+        help="Number of global steps to disable HROM after the cost gate rejects it.",
+    )
+    parser.add_argument(
         "--fluid-hrom-interface-trust",
         choices=("none", "fallback", "clip"),
         default="none",
@@ -9233,9 +9725,76 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fluid-hrom-certified-relaxation-shrink", type=float, default=0.5)
     parser.add_argument(
         "--solid-operator",
-        choices=("exact", "nirb", "porous"),
+        choices=("exact", "nirb", "intrusive_rom", "solid_rom", "porous"),
         default="exact",
-        help="Use the full structural solve, a trained NIRB solid surrogate, or the U-Pl porous flap.",
+        help=(
+            "Use the full structural solve, a trained NIRB solid surrogate, "
+            "an intrusive projected solid ROM, or the U-Pl porous flap."
+        ),
+    )
+    parser.add_argument(
+        "--solid-rom-basis-path",
+        type=Path,
+        default=None,
+        help="Path to a solid intrusive ROM basis .npz when --solid-operator=intrusive_rom.",
+    )
+    parser.add_argument(
+        "--solid-rom-start-step",
+        type=int,
+        default=1,
+        help="First accepted global step that may try the intrusive solid ROM.",
+    )
+    parser.add_argument(
+        "--solid-rom-modes",
+        type=int,
+        default=0,
+        help="Number of solid ROM modes to use from the basis file. 0 uses all stored modes.",
+    )
+    parser.add_argument(
+        "--solid-rom-max-newton-iter",
+        type=int,
+        default=8,
+        help="Maximum reduced Newton iterations for one intrusive solid ROM coupling stage.",
+    )
+    parser.add_argument(
+        "--solid-rom-reduced-tol",
+        type=float,
+        default=1.0e-8,
+        help="Absolute projected residual tolerance for the intrusive solid ROM stage.",
+    )
+    parser.add_argument(
+        "--solid-rom-reduced-rtol",
+        type=float,
+        default=1.0e-8,
+        help="Relative projected residual tolerance for the intrusive solid ROM stage.",
+    )
+    parser.add_argument(
+        "--solid-rom-full-residual-tol",
+        type=float,
+        default=float("inf"),
+        help=(
+            "Optional full active-DOF residual infinity-norm certification threshold. "
+            "The default leaves this diagnostic non-gating because the ROM residual is only "
+            "Galerkin-orthogonal, not full-space zero."
+        ),
+    )
+    parser.add_argument(
+        "--solid-rom-interface-trust",
+        choices=("none", "fallback"),
+        default="none",
+        help=(
+            "Per-stage interface displacement trust region for the intrusive solid ROM. "
+            "'fallback' runs the exact solid for that stage when the proposed interface jump "
+            "is outside the configured limits."
+        ),
+    )
+    parser.add_argument("--solid-rom-interface-max-step-ratio", type=float, default=float("inf"))
+    parser.add_argument("--solid-rom-interface-max-disp-rel", type=float, default=float("inf"))
+    parser.add_argument(
+        "--solid-rom-fallback-exact",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run exact solid for the current coupling stage if the intrusive solid ROM fails certification.",
     )
     parser.add_argument("--porous-pressure-order", type=int, default=None)
     parser.add_argument("--porous-porosity", type=float, default=0.32)
@@ -9282,6 +9841,51 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--nirb-exact-after-start-step",
+        type=int,
+        default=1,
+        help=(
+            "First absolute FSI step where same-step exact-solid fallback gates "
+            "(--nirb-exact-after-*) may activate."
+        ),
+    )
+    parser.add_argument(
+        "--nirb-exact-window-start-step",
+        type=int,
+        default=0,
+        help=(
+            "First absolute FSI step of a bounded exact-solid fallback window. "
+            "0 disables the window gate."
+        ),
+    )
+    parser.add_argument(
+        "--nirb-exact-window-end-step",
+        type=int,
+        default=0,
+        help=(
+            "Last absolute FSI step of the bounded exact-solid fallback window. "
+            "0 leaves the window gate disabled."
+        ),
+    )
+    parser.add_argument(
+        "--nirb-exact-window-coupling-iter",
+        type=int,
+        default=1,
+        help=(
+            "First coupling iteration inside the bounded exact-solid fallback window "
+            "that should use the exact solid instead of the NIRB predictor."
+        ),
+    )
+    parser.add_argument(
+        "--nirb-exact-after-load-rel-min-coupling-iter",
+        type=int,
+        default=2,
+        help=(
+            "First coupling iteration where --nirb-exact-after-load-rel may trigger. "
+            "Use values larger than 2 to correct only persistent load-residual failures."
+        ),
+    )
+    parser.add_argument(
         "--nirb-exact-after-disp-rel",
         type=float,
         default=float("inf"),
@@ -9289,6 +9893,84 @@ def parse_args() -> argparse.Namespace:
             "Use the exact solid fallback for the next NIRB stage when the previous coupling iteration's "
             "relative interface-displacement residual is above this value."
         ),
+    )
+    parser.add_argument(
+        "--nirb-exact-next-step-after-coupling-iter",
+        type=int,
+        default=0,
+        help=(
+            "Use exact solid fallback for every coupling iteration of a step when the previous accepted "
+            "step used at least this many coupling iterations and also satisfies "
+            "--nirb-exact-next-step-after-load-rel. A value <=0 disables this step-level gate."
+        ),
+    )
+    parser.add_argument(
+        "--nirb-exact-next-step-after-load-rel",
+        type=float,
+        default=float("inf"),
+        help=(
+            "Previous accepted-step final load residual required by "
+            "--nirb-exact-next-step-after-coupling-iter. This prevents a high-iteration but cleanly "
+            "converged step from forcing exact solid on the next step."
+        ),
+    )
+    parser.add_argument(
+        "--nirb-exact-next-step-start-step",
+        type=int,
+        default=1,
+        help="First absolute FSI step where the next-step exact-solid gate may activate.",
+    )
+    parser.add_argument(
+        "--nirb-exact-next-step-cooldown-steps",
+        type=int,
+        default=1,
+        help=(
+            "Number of accepted steps, including the triggered next step, that keep exact solid fallback "
+            "active after --nirb-exact-next-step-after-coupling-iter fires."
+        ),
+    )
+    parser.add_argument(
+        "--nirb-exact-step-gate-max-stages-per-step",
+        type=int,
+        default=1,
+        help=(
+            "Maximum exact-solid fallback stages allowed in a step-level NIRB correction gate. "
+            "The default applies one exact correction as a reset, then returns to the NIRB predictor."
+        ),
+    )
+    parser.add_argument(
+        "--nirb-exact-step-interface-trust",
+        choices=("none", "clip", "fallback"),
+        default="none",
+        help=(
+            "Trust-region policy applied to exact-solid step-gate interface displacements before the "
+            "fluid solve. 'clip' blends the exact interface toward the previous coupling iterate; "
+            "'fallback' holds the previous interface if the exact jump is outside the limits."
+        ),
+    )
+    parser.add_argument(
+        "--nirb-exact-step-interface-max-step-ratio",
+        type=float,
+        default=float("inf"),
+        help=(
+            "Maximum exact-solid interface update divided by the previous coupling displacement update "
+            "norm. Use inf to disable this part of the exact-interface trust region."
+        ),
+    )
+    parser.add_argument(
+        "--nirb-exact-step-interface-max-disp-rel",
+        type=float,
+        default=float("inf"),
+        help=(
+            "Maximum relative exact-solid interface displacement update allowed by "
+            "--nirb-exact-step-interface-trust. Use inf to disable this part."
+        ),
+    )
+    parser.add_argument(
+        "--nirb-exact-step-interface-min-correction-alpha",
+        type=float,
+        default=0.0,
+        help="Minimum accepted clipping factor for exact-solid interface trust-region correction.",
     )
     parser.add_argument(
         "--nirb-exact-fallback-guess",
@@ -9394,6 +10076,16 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=2.0,
         help="Multiplier on the training coefficient quantile used by --nirb-force-manifold-trust=clip.",
+    )
+    parser.add_argument(
+        "--nirb-force-manifold-min-update-alpha",
+        type=float,
+        default=0.0,
+        help=(
+            "When --nirb-force-manifold-trust=limit, skip the clamp if the admissible update "
+            "fraction would be below this value. This prevents zero-alpha force updates from "
+            "freezing the FSI residual."
+        ),
     )
     parser.add_argument(
         "--nirb-force-coordinate-update",
@@ -9506,6 +10198,31 @@ def run_local_example2(
     force_iteration_horizon: int = 50,
     force_history: int = 3,
     force_regularization: float = 0.0,
+    force_safe_next_step_after_coupling_iter: int = 0,
+    force_safe_next_step_after_load_rel: float = float("-inf"),
+    force_safe_next_step_start_step: int = 1,
+    force_safe_next_step_update: str = "constant",
+    force_safe_next_step_relaxation: float = 0.05,
+    force_safe_next_step_cooldown_steps: int = 1,
+    force_safe_next_step_retrigger: bool = False,
+    force_safe_preserve_iqn_history: bool = False,
+    force_safe_nirb_interface_trust: str = "inherit",
+    force_safe_nirb_interface_max_step_ratio: float = float("inf"),
+    force_safe_nirb_interface_max_disp_rel: float = float("inf"),
+    force_safe_nirb_interface_min_correction_alpha: float = 0.0,
+    force_safe_use_exact_mesh: bool = False,
+    force_adaptive_step_after_coupling_iter: int = 0,
+    force_adaptive_step_start_step: int = 1,
+    force_adaptive_step_after_load_rel: float = float("inf"),
+    force_adaptive_step_update: str = "iqnils",
+    force_adaptive_step_relaxation: float = 0.05,
+    force_adaptive_step_reset_history: bool = False,
+    force_update_trust: str = "none",
+    force_update_trust_scope: str = "safe",
+    force_update_trust_start_step: int = 1,
+    force_update_max_step_ratio: float = float("inf"),
+    force_update_max_load_rel: float = float("inf"),
+    force_update_min_correction_alpha: float = 0.0,
     step_retries: int = 0,
     step_retry_relaxations: str | None = None,
     step_retry_updates: str | None = None,
@@ -9542,6 +10259,10 @@ def run_local_example2(
     fluid_hrom_trial_exact_correct: bool = False,
     fluid_hrom_max_trial_load_rel_error: float = float("inf"),
     fluid_hrom_disable_steps_after_trial_failure: int = 0,
+    fluid_hrom_cost_gate: bool = False,
+    fluid_hrom_cost_gate_factor: float = 1.0,
+    fluid_hrom_cost_gate_min_samples: int = 2,
+    fluid_hrom_cost_gate_disable_steps: int = 25,
     fluid_hrom_interface_trust: str = "none",
     fluid_hrom_interface_max_step_ratio: float = float("inf"),
     fluid_hrom_interface_max_load_rel: float = float("inf"),
@@ -9557,6 +10278,17 @@ def run_local_example2(
     fluid_hrom_certified_relaxation_growth: float = 1.25,
     fluid_hrom_certified_relaxation_shrink: float = 0.5,
     solid_operator: str = "exact",
+    solid_rom_basis_path: Path | None = None,
+    solid_rom_start_step: int = 1,
+    solid_rom_modes: int = 0,
+    solid_rom_max_newton_iter: int = 8,
+    solid_rom_reduced_tol: float = 1.0e-8,
+    solid_rom_reduced_rtol: float = 1.0e-8,
+    solid_rom_full_residual_tol: float = float("inf"),
+    solid_rom_interface_trust: str = "none",
+    solid_rom_interface_max_step_ratio: float = float("inf"),
+    solid_rom_interface_max_disp_rel: float = float("inf"),
+    solid_rom_fallback_exact: bool = True,
     porous_pressure_order: int | None = None,
     porous_porosity: float = 0.32,
     porous_biot_coefficient: float = 0.8,
@@ -9567,7 +10299,21 @@ def run_local_example2(
     nirb_fallback_exact: bool = True,
     nirb_exact_after_coupling_iter: int = 0,
     nirb_exact_after_load_rel: float = float("inf"),
+    nirb_exact_after_start_step: int = 1,
+    nirb_exact_window_start_step: int = 0,
+    nirb_exact_window_end_step: int = 0,
+    nirb_exact_window_coupling_iter: int = 1,
+    nirb_exact_after_load_rel_min_coupling_iter: int = 2,
     nirb_exact_after_disp_rel: float = float("inf"),
+    nirb_exact_next_step_after_coupling_iter: int = 0,
+    nirb_exact_next_step_after_load_rel: float = float("inf"),
+    nirb_exact_next_step_start_step: int = 1,
+    nirb_exact_next_step_cooldown_steps: int = 1,
+    nirb_exact_step_gate_max_stages_per_step: int = 1,
+    nirb_exact_step_interface_trust: str = "none",
+    nirb_exact_step_interface_max_step_ratio: float = float("inf"),
+    nirb_exact_step_interface_max_disp_rel: float = float("inf"),
+    nirb_exact_step_interface_min_correction_alpha: float = 0.0,
     nirb_exact_fallback_guess: str = "zero",
     nirb_interface_tangent_path: Path | None = None,
     nirb_interface_tangent_blend: float = 0.0,
@@ -9582,6 +10328,7 @@ def run_local_example2(
     nirb_force_manifold_max_projection_rel: float = float("inf"),
     nirb_force_manifold_quantile: float = 0.99,
     nirb_force_manifold_coeff_factor: float = 2.0,
+    nirb_force_manifold_min_update_alpha: float = 0.0,
     nirb_force_coordinate_update: str = "none",
     nirb_force_coordinate_trust: str = "none",
     nirb_force_coordinate_max_step_ratio: float = float("inf"),
@@ -9710,10 +10457,26 @@ def run_local_example2(
         raise ValueError("--fluid-hrom-model-path is required when --fluid-operator=sampled_lspg_hybrid")
     use_exact_fluid_operator = fluid_operator_mode in {"exact", "sampled_lspg_hybrid"}
     solid_operator_mode = str(solid_operator).strip().lower()
-    if solid_operator_mode not in {"exact", "nirb", "porous"}:
+    solid_operator_mode = solid_operator_mode.replace("-", "_")
+    if solid_operator_mode == "solid_rom":
+        solid_operator_mode = "intrusive_rom"
+    if solid_operator_mode not in {"exact", "nirb", "intrusive_rom", "porous"}:
         raise ValueError(f"Unsupported solid_operator={solid_operator!r}")
     if solid_operator_mode == "nirb" and nirb_model_path is None:
         raise ValueError("--nirb-model-path is required when --solid-operator=nirb")
+    if solid_operator_mode == "intrusive_rom" and solid_rom_basis_path is None:
+        raise ValueError("--solid-rom-basis-path is required when --solid-operator=intrusive_rom")
+    solid_rom_start_step_value = max(1, int(solid_rom_start_step))
+    solid_rom_modes_value = max(0, int(solid_rom_modes))
+    solid_rom_max_newton_iter_value = max(1, int(solid_rom_max_newton_iter))
+    solid_rom_reduced_tol_value = max(0.0, float(solid_rom_reduced_tol))
+    solid_rom_reduced_rtol_value = max(0.0, float(solid_rom_reduced_rtol))
+    solid_rom_full_residual_tol_value = float(solid_rom_full_residual_tol)
+    solid_rom_interface_trust_value = str(solid_rom_interface_trust).strip().lower()
+    if solid_rom_interface_trust_value not in {"none", "fallback"}:
+        raise ValueError("--solid-rom-interface-trust must be one of: none, fallback")
+    solid_rom_interface_max_step_ratio_value = float(solid_rom_interface_max_step_ratio)
+    solid_rom_interface_max_disp_rel_value = float(solid_rom_interface_max_disp_rel)
     porous_pressure_order_value = int(
         porous_pressure_order if porous_pressure_order is not None else max(1, int(poly_order) - 1)
     )
@@ -9730,6 +10493,9 @@ def run_local_example2(
     nirb_force_manifold_max_projection_rel_value = float(nirb_force_manifold_max_projection_rel)
     nirb_force_manifold_quantile_value = float(np.clip(float(nirb_force_manifold_quantile), 0.0, 1.0))
     nirb_force_manifold_coeff_factor_value = max(1.0, float(nirb_force_manifold_coeff_factor))
+    nirb_force_manifold_min_update_alpha_value = float(
+        np.clip(float(nirb_force_manifold_min_update_alpha), 0.0, 1.0)
+    )
     nirb_force_coordinate_update_value = str(nirb_force_coordinate_update).strip().lower()
     if nirb_force_coordinate_update_value not in {"none", "pod", "pod_clipped", "adaptive"}:
         raise ValueError(
@@ -9829,7 +10595,7 @@ def run_local_example2(
         exact_structure_backend_mode = (
             "kratos_live"
             if (
-                solid_operator_mode not in {"nirb", "porous"}
+                solid_operator_mode not in {"nirb", "intrusive_rom", "porous"}
                 and bool(use_exact_fluid_operator)
                 and mesh_source_value == "reference"
                 and restart_payload is None
@@ -9850,6 +10616,8 @@ def run_local_example2(
         structure_auto_reasons: list[str] = []
         if solid_operator_mode == "nirb":
             structure_auto_reasons.append("solid_operator=nirb")
+        if solid_operator_mode == "intrusive_rom":
+            structure_auto_reasons.append("solid_operator=intrusive_rom")
         if solid_operator_mode == "porous":
             structure_auto_reasons.append("solid_operator=porous")
         if not bool(use_exact_fluid_operator):
@@ -9868,8 +10636,34 @@ def run_local_example2(
         raise RuntimeError("The persistent Kratos exact-structure backend is not yet supported with restart_from.")
     if solid_operator_mode == "nirb" and exact_structure_backend_mode == "kratos_live":
         raise RuntimeError("solid_operator='nirb' cannot be combined with the kratos_live structure backend.")
+    if solid_operator_mode == "intrusive_rom" and exact_structure_backend_mode == "kratos_live":
+        raise RuntimeError(
+            "solid_operator='intrusive_rom' cannot be combined with the persistent kratos_live structure backend."
+        )
     if solid_operator_mode == "porous" and exact_structure_backend_mode == "kratos_live":
         raise RuntimeError("solid_operator='porous' cannot be combined with the kratos_live structure backend.")
+    nirb_exact_fallback_backend_value = _env_str(
+        "PYCUTFEM_EX2_NIRB_EXACT_FALLBACK_BACKEND",
+        "local",
+    ).strip().lower()
+    if nirb_exact_fallback_backend_value in {"", "local", "pycutfem"}:
+        nirb_exact_fallback_backend_value = "local"
+    elif nirb_exact_fallback_backend_value in {"kratos", "kratos_live", "live"}:
+        nirb_exact_fallback_backend_value = "kratos_live"
+    else:
+        raise ValueError(
+            "Unsupported NIRB exact-solid fallback backend "
+            f"{nirb_exact_fallback_backend_value!r}. Use one of: local, kratos_live."
+        )
+    if not (
+        (solid_operator_mode == "nirb" and bool(nirb_fallback_exact))
+        or (solid_operator_mode == "intrusive_rom" and bool(solid_rom_fallback_exact))
+    ):
+        nirb_exact_fallback_backend_value = "local"
+    if nirb_exact_fallback_backend_value == "kratos_live" and mesh_source_value != "reference":
+        raise RuntimeError("The NIRB Kratos exact-solid fallback requires mesh_source='reference'.")
+    if nirb_exact_fallback_backend_value == "kratos_live" and restart_payload is not None:
+        raise RuntimeError("The NIRB Kratos exact-solid fallback is not yet supported with restart_from.")
     requested_exact_fluid_linear_backend = str(
         os.getenv("PYCUTFEM_EX2_EXACT_FLUID_LINEAR_BACKEND", "") or ""
     ).strip().lower()
@@ -9946,6 +10740,7 @@ def run_local_example2(
         or exact_structure_backend_mode == "kratos_live"
         or exact_fluid_backend_mode == "kratos_live"
         or hrom_exact_fallback_backend_mode == "kratos_live"
+        or nirb_exact_fallback_backend_value == "kratos_live"
         or mesh_backend_value == "kratos"
     )
     kratos_thread_env = _configure_kratos_thread_env(enable=bool(need_kratos_runtime or need_local_amgcl_openmp_cap))
@@ -9972,6 +10767,9 @@ def run_local_example2(
         if exact_structure_backend_mode == "kratos_live"
         else None
     )
+    kratos_nirb_exact_fallback_backend: dict[str, object] | None = None
+    kratos_nirb_exact_fallback_backend_step = 0
+    kratos_nirb_exact_fallback_backend_used_this_step = False
     kratos_exact_fluid_backend = None
     if exact_fluid_backend_mode == "kratos_live":
         try:
@@ -10029,6 +10827,11 @@ def run_local_example2(
         "[config] "
         f"exact_structure_backend requested={requested_exact_structure_backend_mode or 'auto'} "
         f"resolved={exact_structure_backend_mode}",
+    )
+    _log(
+        verbose,
+        "[config] "
+        f"nirb_exact_fallback_backend={nirb_exact_fallback_backend_value}",
     )
     if bool(kratos_thread_env.get("enabled")):
         effective_env = dict(kratos_thread_env.get("effective", {}))
@@ -10107,6 +10910,21 @@ def run_local_example2(
     np.save(co_sim_dir / "map_used.npy", map_used)
     np.save(co_sim_dir / "coords_interf.npy", solid_iface_coords)
     np.save(co_sim_dir / "coords_interf_fluid.npy", fluid_iface_coords)
+    solid_intrusive_rom_basis_raw: _SolidIntrusiveROMBasis | None = None
+    if solid_operator_mode == "intrusive_rom":
+        solid_intrusive_rom_basis_raw = _SolidIntrusiveROMBasis.from_npz(
+            Path(solid_rom_basis_path),
+            full_size=int(np.asarray(solid["d_k"].nodal_values).size),
+            n_modes=(None if int(solid_rom_modes_value) <= 0 else int(solid_rom_modes_value)),
+        )
+        _log(
+            verbose,
+            "[solid-rom] "
+            f"loaded intrusive basis from {Path(solid_rom_basis_path)} "
+            f"modes={int(solid_intrusive_rom_basis_raw.n_modes)} "
+            f"start_step={int(solid_rom_start_step_value)} "
+            f"fallback_exact={int(bool(solid_rom_fallback_exact))}",
+        )
     if solid_operator_mode == "nirb":
         nirb_solid_predictor = NIRBSolidPredictor.from_path(
             Path(nirb_model_path),
@@ -10240,6 +11058,8 @@ def run_local_example2(
     sampled_lspg_hybrid_consecutive_gate_skips = 0
     sampled_lspg_hybrid_step_gate_skips = 0
     sampled_lspg_hybrid_disabled_gate_skips = 0
+    sampled_lspg_hybrid_cost_gate_skips = 0
+    sampled_lspg_hybrid_cost_gate_disable_count = 0
     sampled_lspg_hybrid_exact_accept_forced_count = 0
     sampled_lspg_hybrid_trial_stage_count = 0
     sampled_lspg_hybrid_exact_correction_count = 0
@@ -10258,16 +11078,105 @@ def run_local_example2(
     nirb_interface_reject_count = 0
     nirb_interface_correction_count = 0
     nirb_exact_fallback_count = 0
+    nirb_exact_step_gate_iqn_reset_count = 0
+    nirb_exact_step_gate_cooldown_trigger_count = 0
+    nirb_exact_interface_correction_count = 0
+    nirb_exact_interface_reject_count = 0
+    force_safe_next_step_update_value = str(force_safe_next_step_update or "constant").strip().lower()
+    if force_safe_next_step_update_value not in {"constant", "aitken", "iqnils"}:
+        raise ValueError(f"Unsupported force_safe_next_step_update={force_safe_next_step_update!r}.")
+    force_adaptive_step_update_value = str(force_adaptive_step_update or "iqnils").strip().lower()
+    if force_adaptive_step_update_value not in {"constant", "aitken", "iqnils"}:
+        raise ValueError(f"Unsupported force_adaptive_step_update={force_adaptive_step_update!r}.")
+    force_safe_next_step_after_coupling_iter_value = max(
+        0,
+        int(force_safe_next_step_after_coupling_iter),
+    )
+    force_safe_next_step_after_load_rel_value = float(force_safe_next_step_after_load_rel)
+    force_adaptive_step_after_coupling_iter_value = max(
+        0,
+        int(force_adaptive_step_after_coupling_iter),
+    )
+    force_adaptive_step_start_step_value = max(1, int(force_adaptive_step_start_step))
+    force_adaptive_step_after_load_rel_value = float(force_adaptive_step_after_load_rel)
+    force_safe_next_step_start_step_value = max(1, int(force_safe_next_step_start_step))
+    force_safe_next_step_relaxation_value = float(
+        np.clip(
+            float(force_safe_next_step_relaxation),
+            float(force_relaxation_min),
+            float(force_relaxation_max),
+        )
+    )
+    force_adaptive_step_relaxation_value = float(
+        np.clip(
+            float(force_adaptive_step_relaxation),
+            float(force_relaxation_min),
+            float(force_relaxation_max),
+        )
+    )
+    force_safe_next_step_cooldown_steps_value = max(1, int(force_safe_next_step_cooldown_steps))
+    force_safe_next_step_retrigger_value = bool(force_safe_next_step_retrigger)
+    force_safe_preserve_iqn_history_value = bool(force_safe_preserve_iqn_history)
+    force_adaptive_step_reset_history_value = bool(force_adaptive_step_reset_history)
+    force_safe_nirb_interface_trust_value = (
+        str(force_safe_nirb_interface_trust or "inherit").strip().lower()
+    )
+    if force_safe_nirb_interface_trust_value not in {"inherit", "none", "clip", "fallback"}:
+        raise ValueError(
+            "force_safe_nirb_interface_trust must be one of: inherit, none, clip, fallback; "
+            f"got {force_safe_nirb_interface_trust!r}."
+        )
+    force_safe_nirb_interface_max_step_ratio_value = float(
+        force_safe_nirb_interface_max_step_ratio
+    )
+    force_safe_nirb_interface_max_disp_rel_value = float(
+        force_safe_nirb_interface_max_disp_rel
+    )
+    force_safe_nirb_interface_min_correction_alpha_value = float(
+        np.clip(float(force_safe_nirb_interface_min_correction_alpha), 0.0, 1.0)
+    )
+    force_safe_use_exact_mesh_value = bool(force_safe_use_exact_mesh)
+    if force_adaptive_step_after_load_rel_value < 0.0:
+        raise ValueError("force_adaptive_step_after_load_rel must be non-negative.")
+    if force_safe_nirb_interface_max_step_ratio_value < 0.0:
+        raise ValueError("force_safe_nirb_interface_max_step_ratio must be non-negative.")
+    if force_safe_nirb_interface_max_disp_rel_value < 0.0:
+        raise ValueError("force_safe_nirb_interface_max_disp_rel must be non-negative.")
+    force_update_trust_value = str(force_update_trust or "none").strip().lower()
+    if force_update_trust_value not in {"none", "clip"}:
+        raise ValueError(f"Unsupported force_update_trust={force_update_trust!r}.")
+    force_update_trust_scope_value = str(force_update_trust_scope or "safe").strip().lower()
+    if force_update_trust_scope_value not in {"always", "safe"}:
+        raise ValueError(f"Unsupported force_update_trust_scope={force_update_trust_scope!r}.")
+    force_update_trust_start_step_value = max(1, int(force_update_trust_start_step))
+    force_update_max_step_ratio_value = float(force_update_max_step_ratio)
+    force_update_max_load_rel_value = float(force_update_max_load_rel)
+    force_update_min_correction_alpha_value = float(
+        np.clip(float(force_update_min_correction_alpha), 0.0, 1.0)
+    )
+    force_safe_step_iqn_reset_count = 0
+    force_safe_step_trigger_count = 0
+    force_adaptive_step_trigger_count = 0
+    force_update_trust_clip_count = 0
+    force_update_trust_reject_count = 0
     nirb_force_coordinate_safety_clip_count = 0
     nirb_force_coordinate_safety_fallback_count = 0
     nirb_force_coordinate_newton_safety_count = 0
     fluid_hrom_disabled_until_step = -1
+    fluid_hrom_cost_samples: list[float] = []
+    fluid_exact_cost_samples: list[float] = []
     fluid_hrom_min_previous_load_rel_value = max(0.0, float(fluid_hrom_min_previous_load_rel))
     fluid_hrom_max_previous_load_rel_value = float(fluid_hrom_max_previous_load_rel)
     fluid_hrom_max_trial_load_rel_error_value = float(fluid_hrom_max_trial_load_rel_error)
     if fluid_hrom_max_trial_load_rel_error_value < 0.0:
         raise ValueError("fluid_hrom_max_trial_load_rel_error must be non-negative.")
     fluid_hrom_disable_steps_after_trial_failure_value = max(0, int(fluid_hrom_disable_steps_after_trial_failure))
+    fluid_hrom_cost_gate_value = bool(fluid_hrom_cost_gate)
+    fluid_hrom_cost_gate_factor_value = float(fluid_hrom_cost_gate_factor)
+    fluid_hrom_cost_gate_min_samples_value = max(1, int(fluid_hrom_cost_gate_min_samples))
+    fluid_hrom_cost_gate_disable_steps_value = max(1, int(fluid_hrom_cost_gate_disable_steps))
+    if not np.isfinite(float(fluid_hrom_cost_gate_factor_value)) or float(fluid_hrom_cost_gate_factor_value) < 0.0:
+        raise ValueError("fluid_hrom_cost_gate_factor must be finite and non-negative.")
     fluid_hrom_interface_trust_value = str(fluid_hrom_interface_trust).strip().lower()
     if fluid_hrom_interface_trust_value not in {"none", "fallback", "clip"}:
         raise ValueError(f"Unsupported fluid_hrom_interface_trust={fluid_hrom_interface_trust!r}.")
@@ -10374,6 +11283,10 @@ def run_local_example2(
             f"trial_exact_correct={int(bool(fluid_hrom_trial_exact_correct))} "
             f"trial_load_error_gate={float(fluid_hrom_max_trial_load_rel_error_value):.3e} "
             f"disable_steps_after_trial_failure={int(fluid_hrom_disable_steps_after_trial_failure_value)} "
+            f"cost_gate={int(bool(fluid_hrom_cost_gate_value))} "
+            f"cost_gate_factor={float(fluid_hrom_cost_gate_factor_value):.3e} "
+            f"cost_gate_min_samples={int(fluid_hrom_cost_gate_min_samples_value)} "
+            f"cost_gate_disable_steps={int(fluid_hrom_cost_gate_disable_steps_value)} "
             f"interface_trust={fluid_hrom_interface_trust_value} "
             f"interface_max_step_ratio={float(fluid_hrom_interface_max_step_ratio_value):.3e} "
             f"interface_max_load_rel={float(fluid_hrom_interface_max_load_rel_value):.3e} "
@@ -10407,11 +11320,62 @@ def run_local_example2(
     )
     nirb_exact_after_coupling_iter_value = max(0, int(nirb_exact_after_coupling_iter))
     nirb_exact_after_load_rel_value = float(nirb_exact_after_load_rel)
+    nirb_exact_after_start_step_value = max(1, int(nirb_exact_after_start_step))
+    nirb_exact_window_start_step_value = max(0, int(nirb_exact_window_start_step))
+    nirb_exact_window_end_step_value = max(0, int(nirb_exact_window_end_step))
+    nirb_exact_window_coupling_iter_value = max(1, int(nirb_exact_window_coupling_iter))
+    nirb_exact_after_load_rel_min_coupling_iter_value = max(
+        2,
+        int(nirb_exact_after_load_rel_min_coupling_iter),
+    )
     nirb_exact_after_disp_rel_value = float(nirb_exact_after_disp_rel)
+    nirb_exact_next_step_after_coupling_iter_value = max(
+        0,
+        int(nirb_exact_next_step_after_coupling_iter),
+    )
+    nirb_exact_next_step_after_load_rel_value = float(nirb_exact_next_step_after_load_rel)
+    nirb_exact_next_step_start_step_value = max(1, int(nirb_exact_next_step_start_step))
+    nirb_exact_next_step_cooldown_steps_value = max(
+        1,
+        int(nirb_exact_next_step_cooldown_steps),
+    )
+    nirb_exact_step_gate_max_stages_per_step_value = max(
+        1,
+        int(nirb_exact_step_gate_max_stages_per_step),
+    )
+    nirb_exact_step_interface_trust_value = (
+        str(nirb_exact_step_interface_trust or "none").strip().lower()
+    )
+    if nirb_exact_step_interface_trust_value not in {"none", "clip", "fallback"}:
+        raise ValueError(
+            "nirb_exact_step_interface_trust must be one of: none, clip, fallback; "
+            f"got {nirb_exact_step_interface_trust!r}."
+        )
+    nirb_exact_step_interface_max_step_ratio_value = float(
+        nirb_exact_step_interface_max_step_ratio
+    )
+    nirb_exact_step_interface_max_disp_rel_value = float(
+        nirb_exact_step_interface_max_disp_rel
+    )
+    nirb_exact_step_interface_min_correction_alpha_value = float(
+        np.clip(float(nirb_exact_step_interface_min_correction_alpha), 0.0, 1.0)
+    )
     if nirb_exact_after_load_rel_value < 0.0:
         raise ValueError("nirb_exact_after_load_rel must be non-negative.")
     if nirb_exact_after_disp_rel_value < 0.0:
         raise ValueError("nirb_exact_after_disp_rel must be non-negative.")
+    if (
+        int(nirb_exact_window_start_step_value) > 0
+        and int(nirb_exact_window_end_step_value) > 0
+        and int(nirb_exact_window_end_step_value) < int(nirb_exact_window_start_step_value)
+    ):
+        raise ValueError("nirb_exact_window_end_step must be >= nirb_exact_window_start_step.")
+    if nirb_exact_next_step_after_load_rel_value < 0.0:
+        raise ValueError("nirb_exact_next_step_after_load_rel must be non-negative.")
+    if nirb_exact_step_interface_max_step_ratio_value < 0.0:
+        raise ValueError("nirb_exact_step_interface_max_step_ratio must be non-negative.")
+    if nirb_exact_step_interface_max_disp_rel_value < 0.0:
+        raise ValueError("nirb_exact_step_interface_max_disp_rel must be non-negative.")
     nirb_exact_fallback_guess_value = str(nirb_exact_fallback_guess or "zero").strip().lower()
     if nirb_exact_fallback_guess_value not in {"current", "zero", "previous"}:
         raise ValueError(
@@ -10429,6 +11393,268 @@ def run_local_example2(
         geometry.walls_tag,
         geometry.cylinder_tag,
     )
+
+    solid_intrusive_rom_solver: NewtonSolver | None = None
+    solid_intrusive_rom_bcs: list[BoundaryCondition] | None = None
+    solid_intrusive_rom_bcs_homog: list[BoundaryCondition] | None = None
+    solid_intrusive_rom_active_basis: _SolidIntrusiveROMActiveBasis | None = None
+    solid_intrusive_rom_fallback_count = 0
+    solid_intrusive_rom_reject_count = 0
+
+    def _ensure_solid_intrusive_rom_solver() -> NewtonSolver:
+        nonlocal solid_intrusive_rom_solver
+        nonlocal solid_intrusive_rom_bcs
+        nonlocal solid_intrusive_rom_bcs_homog
+        nonlocal solid_intrusive_rom_active_basis
+        if solid_intrusive_rom_solver is not None:
+            return solid_intrusive_rom_solver
+        if solid_intrusive_rom_basis_raw is None:
+            raise RuntimeError("Solid intrusive ROM requested without a loaded basis.")
+        solid_res, solid_jac, solid_bcs, solid_bcs_homog = _solid_residual_and_jacobian(
+            prob=solid,
+            traction_lookup=zero_load_lookup,
+            mu_s=mu_s,
+            lambda_s=lambda_s,
+            interface_tag=geometry.interface_tag,
+            clamp_tag=geometry.clamp_tag,
+            quad_order=solid_quad_order,
+        )
+        exact_structure_linear_backend = _env_str(
+            "PYCUTFEM_EX2_SOLID_ROM_ASSEMBLY_LINEAR_BACKEND",
+            str(linear_backend),
+        ).strip().lower()
+        solid_intrusive_rom_solver = NewtonSolver(
+            residual_form=solid_res,
+            jacobian_form=solid_jac,
+            dof_handler=solid["dh"],
+            mixed_element=solid["me"],
+            bcs=solid_bcs,
+            bcs_homog=solid_bcs_homog,
+            newton_params=NewtonParameters(
+                newton_tol=float(solid_rom_reduced_tol_value),
+                newton_rtol=float(solid_rom_reduced_rtol_value),
+                residual_norm="linf",
+                max_newton_iter=int(solid_rom_max_newton_iter_value),
+                print_level=0,
+                line_search=False,
+                globalization="none",
+            ),
+            lin_params=LinearSolverParameters(backend=str(exact_structure_linear_backend)),
+            quad_order=solid_quad_order,
+            backend=str(backend),
+        )
+        solid_intrusive_rom_bcs = solid_bcs
+        solid_intrusive_rom_bcs_homog = solid_bcs_homog
+        solid_intrusive_rom_active_basis = _solid_intrusive_rom_prepare_active_basis(
+            raw_basis=solid_intrusive_rom_basis_raw,
+            dh=solid["dh"],
+            vector=solid["d_k"],
+            active_dofs=np.asarray(solid_intrusive_rom_solver.active_dofs, dtype=int),
+        )
+        _log(
+            verbose,
+            "[solid-rom] "
+            f"prepared active basis modes={int(solid_intrusive_rom_active_basis.basis_active.shape[1])} "
+            f"active_dofs={int(solid_intrusive_rom_active_basis.basis_active.shape[0])} "
+            f"basis_cond={float(solid_intrusive_rom_active_basis.condition):.3e}",
+        )
+        return solid_intrusive_rom_solver
+
+    def _solid_intrusive_rom_runtime_operators(
+        *,
+        solver: NewtonSolver,
+        current_structure_load_lookup: CoordinateLookup,
+        load_guess_vals: np.ndarray,
+    ) -> list[RuntimeOperator]:
+        solid_point_load_full = _boundary_point_load_vector(
+            solid["dh"],
+            vector=solid["d_k"],
+            tag=geometry.interface_tag,
+            values=load_guess_vals,
+        )
+        solid_point_load_red = np.asarray(
+            solid_point_load_full[np.asarray(solver.active_dofs, dtype=int)],
+            dtype=float,
+        )
+        ops: list[RuntimeOperator] = []
+        use_kratos_local_global_solid_system = (
+            kratos_local_solid_backend is not None
+            and _env_bool(
+                "PYCUTFEM_EX2_LOCAL_STRUCTURE_USE_KRATOS_GLOBAL_SYSTEM",
+                False,
+            )
+        )
+        use_kratos_local_structure_conditions = (
+            kratos_local_solid_backend is not None
+            and _env_bool(
+                "PYCUTFEM_EX2_LOCAL_STRUCTURE_USE_KRATOS_POINT_CONDITIONS",
+                False,
+            )
+        )
+        if bool(use_kratos_local_global_solid_system):
+            ops.append(
+                _KratosLocalSolidGlobalSystemOperator(
+                    backend=kratos_local_solid_backend,
+                    d_k=solid["d_k"],
+                    structure_load=current_structure_load_lookup,
+                )
+            )
+        else:
+            if kratos_local_solid_backend is not None:
+                ops.append(
+                    _KratosLocalSolidSystemOperator(
+                        backend=kratos_local_solid_backend,
+                        d_k=solid["d_k"],
+                        structure_load=(
+                            current_structure_load_lookup
+                            if bool(use_kratos_local_structure_conditions)
+                            else None
+                        ),
+                    )
+                )
+            if not bool(use_kratos_local_structure_conditions):
+                ops.append(_ReducedResidualShiftOperator(solid_point_load_red))
+        return ops
+
+    def _solve_intrusive_solid_rom_stage(
+        *,
+        current_structure_load_lookup: CoordinateLookup,
+        load_guess_vals: np.ndarray,
+        step_value: int,
+        coupling_iter_value: int,
+    ) -> _SolidIntrusiveROMSolveInfo:
+        solver = _ensure_solid_intrusive_rom_solver()
+        if solid_intrusive_rom_active_basis is None:
+            raise RuntimeError("Solid intrusive ROM active basis was not prepared.")
+        basis = solid_intrusive_rom_active_basis
+        solver.set_runtime_operators(
+            _solid_intrusive_rom_runtime_operators(
+                solver=solver,
+                current_structure_load_lookup=current_structure_load_lookup,
+                load_guess_vals=load_guess_vals,
+            )
+        )
+        bcs_now = solid_intrusive_rom_bcs_homog or solid_intrusive_rom_bcs or []
+        solver._current_bcs = bcs_now
+        current_active = _solid_intrusive_rom_active_values(
+            dh=solid["dh"],
+            vector=solid["d_k"],
+            active_dofs=basis.active_dofs,
+        )
+        q = np.asarray(basis.basis_active.T @ (current_active - basis.mean_active), dtype=float).reshape(-1)
+        initial_reduced_norm = float("nan")
+        final_reduced_norm = float("inf")
+        final_full_inf = float("inf")
+        tangent_condition = float("inf")
+
+        def _assemble_reduced(coefficients: np.ndarray):
+            _solid_intrusive_rom_write_coefficients(
+                basis=basis,
+                vector=solid["d_k"],
+                coefficients=coefficients,
+            )
+            solid["dh"].apply_bcs(bcs_now, solid["d_k"])
+            coeffs = {solid["d_k"].name: solid["d_k"]}
+            A_active, R_active = solver._assemble_system_reduced(coeffs, need_matrix=True)
+            if A_active is None:
+                raise RuntimeError("Solid intrusive ROM assembly did not return a tangent matrix.")
+            R_vec = np.asarray(R_active, dtype=float).reshape(-1)
+            J_red = np.asarray(basis.basis_active.T @ (A_active @ basis.basis_active), dtype=float)
+            R_red = np.asarray(basis.basis_active.T @ R_vec, dtype=float).reshape(-1)
+            return J_red, R_red, R_vec
+
+        converged = False
+        reason = "max_iterations"
+        for iteration in range(1, int(solid_rom_max_newton_iter_value) + 1):
+            J_red, R_red, R_full = _assemble_reduced(q)
+            reduced_norm = float(np.linalg.norm(R_red, ord=2))
+            full_inf = float(np.linalg.norm(R_full, ord=np.inf)) if R_full.size else 0.0
+            if not np.isfinite(initial_reduced_norm):
+                initial_reduced_norm = max(float(reduced_norm), 1.0e-30)
+            final_reduced_norm = float(reduced_norm)
+            final_full_inf = float(full_inf)
+            try:
+                tangent_condition = float(np.linalg.cond(J_red))
+            except np.linalg.LinAlgError:
+                tangent_condition = float("inf")
+            if (
+                reduced_norm <= float(solid_rom_reduced_tol_value)
+                or reduced_norm / max(initial_reduced_norm, 1.0e-30) <= float(solid_rom_reduced_rtol_value)
+            ):
+                converged = True
+                reason = "reduced_residual_converged"
+                break
+            try:
+                step_q = np.linalg.solve(J_red, -R_red)
+            except np.linalg.LinAlgError:
+                step_q, *_ = np.linalg.lstsq(J_red, -R_red, rcond=None)
+            if not np.all(np.isfinite(step_q)):
+                reason = "nonfinite_reduced_step"
+                break
+            accepted_step = False
+            best_q = q.copy()
+            best_norm = float(reduced_norm)
+            for alpha in (1.0, 0.5, 0.25, 0.125, 0.0625):
+                q_trial = q + float(alpha) * np.asarray(step_q, dtype=float).reshape(-1)
+                if not np.all(np.isfinite(q_trial)):
+                    continue
+                try:
+                    _J_trial, R_trial, _R_full_trial = _assemble_reduced(q_trial)
+                except Exception:
+                    continue
+                trial_norm = float(np.linalg.norm(R_trial, ord=2))
+                if np.isfinite(trial_norm) and trial_norm <= best_norm * (1.0 + 1.0e-10):
+                    best_q = q_trial
+                    best_norm = trial_norm
+                    accepted_step = True
+                    break
+            if not bool(accepted_step):
+                reason = "line_search_failed"
+                break
+            q = best_q
+
+        J_red, R_red, R_full = _assemble_reduced(q)
+        final_reduced_norm = float(np.linalg.norm(R_red, ord=2))
+        final_full_inf = float(np.linalg.norm(R_full, ord=np.inf)) if R_full.size else 0.0
+        reduced_rel = final_reduced_norm / max(float(initial_reduced_norm), 1.0e-30)
+        full_rel = final_full_inf / max(float(np.linalg.norm(R_full, ord=2)), 1.0e-30)
+        if not bool(converged) and (
+            final_reduced_norm <= float(solid_rom_reduced_tol_value)
+            or reduced_rel <= float(solid_rom_reduced_rtol_value)
+        ):
+            converged = True
+            reason = "reduced_residual_converged_final"
+        if bool(converged) and np.isfinite(float(solid_rom_full_residual_tol_value)):
+            if final_full_inf > float(solid_rom_full_residual_tol_value):
+                converged = False
+                reason = f"full_residual>{float(solid_rom_full_residual_tol_value):.3e}"
+        _log(
+            verbose,
+            "[solid-rom] "
+            f"step={step_value} coupling_iter={coupling_iter_value} "
+            f"converged={int(bool(converged))} "
+            f"iters={int(iteration)} "
+            f"red_norm={float(final_reduced_norm):.3e} "
+            f"red_rel={float(reduced_rel):.3e} "
+            f"full_inf={float(final_full_inf):.3e} "
+            f"cond={float(tangent_condition):.3e} "
+            f"reason={reason}",
+        )
+        return _SolidIntrusiveROMSolveInfo(
+            used=True,
+            converged=bool(converged),
+            fallback_used=False,
+            iterations=int(iteration),
+            reduced_residual_norm=float(final_reduced_norm),
+            reduced_residual_rel=float(reduced_rel),
+            full_residual_inf=float(final_full_inf),
+            full_residual_rel=float(full_rel),
+            tangent_condition=float(tangent_condition),
+            interface_update_rel=float("nan"),
+            interface_step_ratio=float("nan"),
+            trust_alpha=1.0,
+            reason=str(reason),
+        )
 
     def _solve_local_exact_solid_stage(
         *,
@@ -10602,52 +11828,142 @@ def run_local_example2(
             if not bool(use_kratos_local_structure_conditions):
                 solid_runtime_ops.append(_ReducedResidualShiftOperator(solid_point_load_red))
         solid_solver.set_runtime_operators(solid_runtime_ops)
-        if nirb_exact_fallback_guess_value == "zero":
-            solid_guess = [np.zeros_like(np.asarray(solid["d_k"].nodal_values, dtype=float))]
-        elif nirb_exact_fallback_guess_value == "previous":
-            solid_guess = [np.asarray(solid_prev_step_snapshot[0], dtype=float).copy()]
+        current_guess_snapshot = _snapshot_function_values([solid["d_k"]])
+        candidate_guesses = {
+            "zero": [np.zeros_like(np.asarray(solid["d_k"].nodal_values, dtype=float))],
+            "previous": [np.asarray(solid_prev_step_snapshot[0], dtype=float).copy()],
+            "current": current_guess_snapshot,
+        }
+        guess_order = [str(nirb_exact_fallback_guess_value)]
+        for candidate_name in ("previous", "zero", "current"):
+            if candidate_name not in guess_order:
+                guess_order.append(candidate_name)
+        last_error: Exception | None = None
+        failed_guess_names: list[str] = []
+        for guess_name in guess_order:
+            solid_guess = [
+                np.asarray(values, dtype=float).copy()
+                for values in candidate_guesses[str(guess_name)]
+            ]
+            if not all(np.all(np.isfinite(values)) for values in solid_guess):
+                failed_guess_names.append(f"{guess_name}:nonfinite_guess")
+                continue
+            _restore_function_values([solid["d_k"]], solid_guess)
+            _restore_function_values([solid["d_prev"]], solid_prev_step_snapshot)
+            _maybe_dump_structure_stage_probe(
+                output_dir=output_dir,
+                step=int(step_value),
+                coupling_iter=int(coupling_iter_value),
+                stage_label="pre_structure_solve_nirb_fallback",
+                dt=float(dt_value),
+                solid=solid,
+                interface_tag=geometry.interface_tag,
+                structure_load_lookup=current_structure_load_lookup,
+                point_load_full=solid_point_load_full,
+            )
+            try:
+                solid_solver.solve_time_interval(
+                    functions=[solid["d_k"]],
+                    prev_functions=[solid["d_prev"]],
+                    time_params=TimeStepperParameters(
+                        dt=1.0,
+                        max_steps=1,
+                        final_time=1.0,
+                        stop_on_steady=False,
+                        step_initial_guess_callback=_guess_callback_from_snapshots_with_dirichlet(
+                            snapshots=solid_guess,
+                            dh=solid["dh"],
+                            bcs=solid_bcs,
+                        ),
+                    ),
+                )
+            except Exception as exc:
+                last_error = exc
+                failed_guess_names.append(f"{guess_name}:{exc}")
+                _log(
+                    verbose,
+                    "[nirb] "
+                    f"step={step_value} coupling_iter={coupling_iter_value} "
+                    f"exact_solid_fallback_guess_failed={guess_name} "
+                    f"reason={exc}",
+                )
+                continue
+            if guess_name != nirb_exact_fallback_guess_value:
+                _log(
+                    verbose,
+                    "[nirb] "
+                    f"step={step_value} coupling_iter={coupling_iter_value} "
+                    f"exact_solid_fallback_guess_recovered={guess_name}",
+                )
+            _maybe_dump_structure_stage_probe(
+                output_dir=output_dir,
+                step=int(step_value),
+                coupling_iter=int(coupling_iter_value),
+                stage_label="post_structure_solve_nirb_fallback",
+                dt=float(dt_value),
+                solid=solid,
+                interface_tag=geometry.interface_tag,
+                structure_load_lookup=current_structure_load_lookup,
+                point_load_full=solid_point_load_full,
+            )
+            _restore_function_values([solid["d_prev"]], solid_prev_step_snapshot)
+            break
         else:
-            solid_guess = _snapshot_function_values([solid["d_k"]])
-        _restore_function_values([solid["d_k"]], solid_guess)
-        _restore_function_values([solid["d_prev"]], solid_prev_step_snapshot)
-        _maybe_dump_structure_stage_probe(
-            output_dir=output_dir,
-            step=int(step_value),
-            coupling_iter=int(coupling_iter_value),
-            stage_label="pre_structure_solve_nirb_fallback",
-            dt=float(dt_value),
-            solid=solid,
-            interface_tag=geometry.interface_tag,
-            structure_load_lookup=current_structure_load_lookup,
-            point_load_full=solid_point_load_full,
+            _restore_function_values([solid["d_prev"]], solid_prev_step_snapshot)
+            raise RuntimeError(
+                "NIRB exact solid fallback failed for all initial guesses: "
+                + " | ".join(failed_guess_names)
+            ) from last_error
+
+    def _solve_nirb_exact_solid_stage(
+        *,
+        current_structure_load_lookup: CoordinateLookup,
+        load_guess_vals: np.ndarray,
+        solid_prev_step_snapshot: list[np.ndarray],
+        step_value: int,
+        coupling_iter_value: int,
+    ) -> None:
+        nonlocal kratos_nirb_exact_fallback_backend
+        nonlocal kratos_nirb_exact_fallback_backend_step
+        nonlocal kratos_nirb_exact_fallback_backend_used_this_step
+        if nirb_exact_fallback_backend_value == "kratos_live":
+            if kratos_nirb_exact_fallback_backend is None:
+                kratos_nirb_exact_fallback_backend = _build_kratos_exact_structure_backend(
+                    benchmark_root=Path(setup.reference.root),
+                    dt=float(dt_value),
+                )
+            if int(kratos_nirb_exact_fallback_backend_step) != int(step_value):
+                kratos_nirb_exact_fallback_backend["time"] = float(
+                    max(0, int(step_value) - 1) * float(dt_value)
+                )
+                _advance_kratos_exact_structure_backend_step(
+                    backend=kratos_nirb_exact_fallback_backend
+                )
+                kratos_nirb_exact_fallback_backend_step = int(step_value)
+            kratos_nirb_exact_fallback_backend_used_this_step = True
+            _log(
+                verbose,
+                "[nirb] "
+                f"step={step_value} coupling_iter={coupling_iter_value} "
+                "exact_solid_fallback_backend=kratos_live",
+            )
+            kratos_state = _solve_kratos_exact_structure_backend(
+                backend=kratos_nirb_exact_fallback_backend,
+                structure_load=current_structure_load_lookup,
+            )
+            _transfer_vector_field(
+                target_dh=solid["dh"],
+                target_vec=solid["d_k"],
+                source_lookup=kratos_state["displacement"],
+            )
+            return
+        _solve_local_exact_solid_stage(
+            current_structure_load_lookup=current_structure_load_lookup,
+            load_guess_vals=load_guess_vals,
+            solid_prev_step_snapshot=solid_prev_step_snapshot,
+            step_value=step_value,
+            coupling_iter_value=coupling_iter_value,
         )
-        solid_solver.solve_time_interval(
-            functions=[solid["d_k"]],
-            prev_functions=[solid["d_prev"]],
-            time_params=TimeStepperParameters(
-                dt=1.0,
-                max_steps=1,
-                final_time=1.0,
-                stop_on_steady=False,
-                step_initial_guess_callback=_guess_callback_from_snapshots_with_dirichlet(
-                    snapshots=solid_guess,
-                    dh=solid["dh"],
-                    bcs=solid_bcs,
-                ),
-            ),
-        )
-        _maybe_dump_structure_stage_probe(
-            output_dir=output_dir,
-            step=int(step_value),
-            coupling_iter=int(coupling_iter_value),
-            stage_label="post_structure_solve_nirb_fallback",
-            dt=float(dt_value),
-            solid=solid,
-            interface_tag=geometry.interface_tag,
-            structure_load_lookup=current_structure_load_lookup,
-            point_load_full=solid_point_load_full,
-        )
-        _restore_function_values([solid["d_prev"]], solid_prev_step_snapshot)
 
     disp_snapshots: list[np.ndarray] = (
         _column_list_from_matrix(np.load(co_sim_dir / "disp_data.npy"))
@@ -10729,6 +12045,28 @@ def run_local_example2(
         if restart_payload is not None and (co_sim_dir / "iters.npy").exists()
         else []
     )
+    previous_nirb_step_gate_coupling_iters = (
+        int(coupling_iters_per_step[-1]) if coupling_iters_per_step else 0
+    )
+    previous_nirb_step_gate_load_rel = float("nan")
+    if step_rows:
+        try:
+            last_step_id = max(int(row.get("step", 0) or 0) for row in step_rows)
+            last_step_rows = [
+                row
+                for row in step_rows
+                if int(row.get("step", 0) or 0) == int(last_step_id)
+            ]
+            if last_step_rows:
+                previous_nirb_step_gate_load_rel = float(
+                    last_step_rows[-1].get("load_rel", float("nan"))
+                )
+        except (TypeError, ValueError):
+            previous_nirb_step_gate_load_rel = float("nan")
+    nirb_exact_step_gate_cooldown_remaining = 0
+    force_safe_step_cooldown_remaining = 0
+    previous_nirb_step_gate_exact_active = False
+    previous_force_safe_step_active = False
     converged_steps = 0
     t_total_start = time.perf_counter()
     iqn_old_dr_mats: deque[np.ndarray] = deque(maxlen=max(int(force_history) - 1, 0))
@@ -10822,7 +12160,116 @@ def run_local_example2(
 
     for step in range(int(restart_step) + 1, step_count + 1):
         t_now = min(end_time_value, step * dt_value)
+        kratos_nirb_exact_fallback_backend_used_this_step = False
         _section(verbose, f"[time] start step={step}/{step_count} t={t_now:.6f}s dt={dt_value:.6e}")
+        nirb_exact_step_gate_reason = ""
+        nirb_exact_step_gate_triggered = (
+            nirb_solid_predictor is not None
+            and int(step) >= int(nirb_start_step_value)
+            and int(step) >= int(nirb_exact_next_step_start_step_value)
+            and int(nirb_exact_next_step_after_coupling_iter_value) > 0
+            and np.isfinite(float(nirb_exact_next_step_after_load_rel_value))
+            and int(previous_nirb_step_gate_coupling_iters)
+            >= int(nirb_exact_next_step_after_coupling_iter_value)
+            and np.isfinite(float(previous_nirb_step_gate_load_rel))
+            and float(previous_nirb_step_gate_load_rel)
+            > float(nirb_exact_next_step_after_load_rel_value)
+        )
+        if bool(nirb_exact_step_gate_triggered):
+            nirb_exact_step_gate_cooldown_remaining = max(
+                int(nirb_exact_step_gate_cooldown_remaining),
+                int(nirb_exact_next_step_cooldown_steps_value),
+            )
+            nirb_exact_step_gate_cooldown_trigger_count += 1
+            nirb_exact_step_gate_reason = (
+                "previous_step_high_coupling:"
+                f"step={int(step)}>=start{int(nirb_exact_next_step_start_step_value)},"
+                f"iters={int(previous_nirb_step_gate_coupling_iters)}"
+                f">={int(nirb_exact_next_step_after_coupling_iter_value)},"
+                f"load_rel={float(previous_nirb_step_gate_load_rel):.6e}"
+                f">{float(nirb_exact_next_step_after_load_rel_value):.6e}"
+            )
+        elif int(nirb_exact_step_gate_cooldown_remaining) > 0:
+            nirb_exact_step_gate_reason = (
+                "previous_step_high_coupling_cooldown:"
+                f"remaining={int(nirb_exact_step_gate_cooldown_remaining)},"
+                f"last_iters={int(previous_nirb_step_gate_coupling_iters)},"
+                f"last_load_rel={float(previous_nirb_step_gate_load_rel):.6e}"
+            )
+        if bool(nirb_exact_step_gate_reason):
+            _log(
+                verbose,
+                "[nirb] "
+                f"step={step} exact_solid_step_gate=1 "
+                f"cooldown_remaining={int(nirb_exact_step_gate_cooldown_remaining)} "
+                f"max_stages={int(nirb_exact_step_gate_max_stages_per_step_value)} "
+                f"reason={nirb_exact_step_gate_reason}",
+            )
+            iqn_old_dr_mats.clear()
+            iqn_old_dg_mats.clear()
+            force_coeff_iqn_old_dr_mats.clear()
+            force_coeff_iqn_old_dg_mats.clear()
+            nirb_exact_step_gate_iqn_reset_count += 1
+            _log(
+                verbose,
+                "[nirb] "
+                f"step={step} exact_solid_step_gate_iqn_history_reset=1",
+            )
+        nirb_exact_step_gate_remaining_stages = (
+            int(nirb_exact_step_gate_max_stages_per_step_value)
+            if bool(nirb_exact_step_gate_reason)
+            else 0
+        )
+        nirb_exact_gate_disabled_for_step = False
+        force_safe_step_reason = ""
+        force_safe_step_triggered = (
+            int(force_safe_next_step_after_coupling_iter_value) > 0
+            and int(step) >= int(force_safe_next_step_start_step_value)
+            and (
+                bool(force_safe_next_step_retrigger_value)
+                or not bool(previous_force_safe_step_active)
+            )
+            and int(previous_nirb_step_gate_coupling_iters)
+            >= int(force_safe_next_step_after_coupling_iter_value)
+            and np.isfinite(float(previous_nirb_step_gate_load_rel))
+            and float(previous_nirb_step_gate_load_rel)
+            > float(force_safe_next_step_after_load_rel_value)
+        )
+        if bool(force_safe_step_triggered):
+            force_safe_step_cooldown_remaining = max(
+                int(force_safe_step_cooldown_remaining),
+                int(force_safe_next_step_cooldown_steps_value),
+            )
+            force_safe_step_trigger_count += 1
+            force_safe_step_reason = (
+                "previous_step_high_coupling:"
+                f"step={int(step)}>=start{int(force_safe_next_step_start_step_value)},"
+                f"iters={int(previous_nirb_step_gate_coupling_iters)}"
+                f">={int(force_safe_next_step_after_coupling_iter_value)}"
+                f",load_rel={float(previous_nirb_step_gate_load_rel):.6e}"
+                f">{float(force_safe_next_step_after_load_rel_value):.6e}"
+            )
+        elif int(force_safe_step_cooldown_remaining) > 0:
+            force_safe_step_reason = (
+                "previous_step_high_coupling_cooldown:"
+                f"remaining={int(force_safe_step_cooldown_remaining)},"
+                f"last_iters={int(previous_nirb_step_gate_coupling_iters)}"
+            )
+        if bool(force_safe_step_reason):
+            _log(
+                verbose,
+                "[force-safe] "
+                f"step={step} active=1 update={force_safe_next_step_update_value} "
+                f"omega={float(force_safe_next_step_relaxation_value):.3e} "
+                f"cooldown_remaining={int(force_safe_step_cooldown_remaining)} "
+                f"reason={force_safe_step_reason}",
+            )
+            if not bool(force_safe_preserve_iqn_history_value):
+                iqn_old_dr_mats.clear()
+                iqn_old_dg_mats.clear()
+                force_coeff_iqn_old_dr_mats.clear()
+                force_coeff_iqn_old_dg_mats.clear()
+                force_safe_step_iqn_reset_count += 1
         if kratos_exact_structure_backend is not None:
             _advance_kratos_exact_structure_backend_step(backend=kratos_exact_structure_backend)
         if kratos_exact_fluid_backend is not None:
@@ -10905,10 +12352,15 @@ def run_local_example2(
             and kratos_hrom_exact_fallback_backend is None
             and kratos_mesh_backend is None
         )
+        base_force_update_for_step = str(force_update).lower()
+        base_force_relaxation_for_step = float(force_relaxation)
+        if bool(force_safe_step_reason):
+            base_force_update_for_step = str(force_safe_next_step_update_value)
+            base_force_relaxation_for_step = float(force_safe_next_step_relaxation_value)
         if allow_step_retries:
             retry_policies = _build_coupling_retry_policies(
-                force_update=str(force_update).lower(),
-                force_relaxation=float(force_relaxation),
+                force_update=str(base_force_update_for_step),
+                force_relaxation=float(base_force_relaxation_for_step),
                 force_relaxation_min=float(force_relaxation_min),
                 force_relaxation_max=float(force_relaxation_max),
                 base_max_coupling_iters=int(max_coupling_iters),
@@ -10920,8 +12372,8 @@ def run_local_example2(
         else:
             retry_policies = [
                 _CouplingRetryPolicy(
-                    force_update=str(force_update).lower(),
-                    force_relaxation=float(force_relaxation),
+                    force_update=str(base_force_update_for_step),
+                    force_relaxation=float(base_force_relaxation_for_step),
                     max_coupling_iters=int(max_coupling_iters),
                     reset_interface_history=False,
                 )
@@ -10929,7 +12381,7 @@ def run_local_example2(
 
         step_converged = False
         last_disp_abs = last_disp_rel = last_load_abs = last_load_rel = float("nan")
-        last_force_omega = float(force_relaxation)
+        last_force_omega = float(base_force_relaxation_for_step)
         last_returned_load_lookup: CoordinateLookup | None = None
         last_mesh_vel_fluid_lookup: CoordinateLookup | None = None
         last_mesh_accel_fluid_lookup: CoordinateLookup | None = None
@@ -10939,8 +12391,8 @@ def run_local_example2(
         last_impedance_reaction_point_lookup: CoordinateLookup | None = None
         last_nirb_prediction = None
         coupling_iter = 0
-        active_force_update = str(force_update).lower()
-        active_force_relaxation = float(force_relaxation)
+        active_force_update = str(base_force_update_for_step).lower()
+        active_force_relaxation = float(base_force_relaxation_for_step)
         attempt_index = 1
         increment_elapsed = float("nan")
 
@@ -11024,6 +12476,7 @@ def run_local_example2(
             load_history_keep_for_old_iqn: list[bool] = []
             force_coordinate_safety_disabled = False
             force_coordinate_safety_step_tripped = False
+            force_adaptive_step_reason = ""
             last_force_coordinate_update_active = False
             last_force_coordinate_update_backend = "inactive"
             prev_disp_iter_vals = np.asarray(step_prev_disp_iter_vals, dtype=float).copy()
@@ -11080,20 +12533,87 @@ def run_local_example2(
                     nirb_exact_fallback_used = False
                     nirb_fallback_reason = ""
                     nirb_exact_gate_reason = ""
+                    nirb_exact_gate_from_step_gate = False
+                    nirb_exact_interface_trust_active = False
+                    nirb_exact_interface_trust_corrected = False
+                    nirb_exact_interface_trust_rejected = False
+                    nirb_exact_interface_trust_alpha = 1.0
+                    nirb_exact_interface_trust_disp_rel = float("nan")
+                    nirb_exact_interface_trust_step_ratio = float("nan")
+                    nirb_exact_interface_trust_reason = "inactive"
+                    solid_rom_used = False
+                    solid_rom_converged = False
+                    solid_rom_exact_fallback_used = False
+                    solid_rom_iterations = 0
+                    solid_rom_reduced_residual_norm = float("nan")
+                    solid_rom_reduced_residual_rel = float("nan")
+                    solid_rom_full_residual_inf = float("nan")
+                    solid_rom_full_residual_rel = float("nan")
+                    solid_rom_tangent_condition = float("nan")
+                    solid_rom_interface_trust_alpha = 1.0
+                    solid_rom_interface_disp_rel = float("nan")
+                    solid_rom_interface_step_ratio = float("nan")
+                    solid_rom_reason = "inactive"
                     if (
                         nirb_solid_predictor is not None
                         and int(step) >= int(nirb_start_step_value)
                     ):
+                        if hasattr(nirb_solid_predictor, "set_online_context"):
+                            nirb_solid_predictor.set_online_context(
+                                time=float(t_now),
+                                step=int(step),
+                                coupling_iter=int(coupling_iter),
+                            )
                         if (
-                            int(nirb_exact_after_coupling_iter_value) > 0
+                            nirb_interface_predictor is not None
+                            and hasattr(nirb_interface_predictor, "set_online_context")
+                        ):
+                            nirb_interface_predictor.set_online_context(
+                                time=float(t_now),
+                                step=int(step),
+                                coupling_iter=int(coupling_iter),
+                            )
+                        nirb_exact_gate_from_step_gate = False
+                        if bool(nirb_exact_gate_disabled_for_step):
+                            nirb_exact_gate_reason = ""
+                        elif (
+                            bool(nirb_exact_step_gate_reason)
+                            and int(nirb_exact_step_gate_remaining_stages) > 0
+                        ):
+                            nirb_exact_gate_reason = str(nirb_exact_step_gate_reason)
+                            nirb_exact_gate_from_step_gate = True
+                            nirb_exact_step_gate_remaining_stages = max(
+                                0,
+                                int(nirb_exact_step_gate_remaining_stages) - 1,
+                            )
+                        elif (
+                            int(nirb_exact_window_start_step_value) > 0
+                            and int(nirb_exact_window_end_step_value) > 0
+                            and int(nirb_exact_window_start_step_value)
+                            <= int(step)
+                            <= int(nirb_exact_window_end_step_value)
+                            and int(coupling_iter) >= int(nirb_exact_window_coupling_iter_value)
+                        ):
+                            nirb_exact_gate_reason = (
+                                "bounded_exact_window:"
+                                f"step={int(step)}"
+                                f"in[{int(nirb_exact_window_start_step_value)},"
+                                f"{int(nirb_exact_window_end_step_value)}],"
+                                f"iter>={int(nirb_exact_window_coupling_iter_value)}"
+                            )
+                        elif (
+                            int(step) >= int(nirb_exact_after_start_step_value)
+                            and int(nirb_exact_after_coupling_iter_value) > 0
                             and int(coupling_iter) >= int(nirb_exact_after_coupling_iter_value)
                         ):
                             nirb_exact_gate_reason = (
                                 f"coupling_iter>={int(nirb_exact_after_coupling_iter_value)}"
                             )
                         elif (
-                            np.isfinite(float(nirb_exact_after_load_rel_value))
-                            and int(coupling_iter) > 1
+                            int(step) >= int(nirb_exact_after_start_step_value)
+                            and np.isfinite(float(nirb_exact_after_load_rel_value))
+                            and int(coupling_iter)
+                            >= int(nirb_exact_after_load_rel_min_coupling_iter_value)
                             and np.isfinite(float(last_load_rel))
                             and float(last_load_rel) > float(nirb_exact_after_load_rel_value)
                         ):
@@ -11101,7 +12621,8 @@ def run_local_example2(
                                 f"previous_load_rel>{float(nirb_exact_after_load_rel_value):.6e}"
                             )
                         elif (
-                            np.isfinite(float(nirb_exact_after_disp_rel_value))
+                            int(step) >= int(nirb_exact_after_start_step_value)
+                            and np.isfinite(float(nirb_exact_after_disp_rel_value))
                             and int(coupling_iter) > 1
                             and np.isfinite(float(last_disp_rel))
                             and float(last_disp_rel) > float(nirb_exact_after_disp_rel_value)
@@ -11201,13 +12722,50 @@ def run_local_example2(
                             "exact_solid_fallback=1 "
                             f"reason={nirb_fallback_reason}",
                         )
-                        _solve_local_exact_solid_stage(
-                            current_structure_load_lookup=current_structure_load_lookup,
-                            load_guess_vals=load_guess_vals,
-                            solid_prev_step_snapshot=solid_prev_step,
-                            step_value=int(step),
-                            coupling_iter_value=int(coupling_iter),
+                        fallback_solid_snapshot = _snapshot_function_values(
+                            _solid_current_functions(solid)
                         )
+                        try:
+                            _solve_nirb_exact_solid_stage(
+                                current_structure_load_lookup=current_structure_load_lookup,
+                                load_guess_vals=load_guess_vals,
+                                solid_prev_step_snapshot=solid_prev_step,
+                                step_value=int(step),
+                                coupling_iter_value=int(coupling_iter),
+                            )
+                        except Exception as fallback_exc:
+                            nirb_exact_gate_disabled_for_step = True
+                            _restore_function_values(
+                                _solid_current_functions(solid),
+                                fallback_solid_snapshot,
+                            )
+                            held_interface = np.asarray(prev_disp_iter_vals, dtype=float).reshape(-1, 2)
+                            held_full_displacement = _flatten_vector_snapshot(solid["dh"], solid["d_k"])
+                            nirb_prediction = NIRBSolidPrediction(
+                                full_displacement=np.asarray(
+                                    held_full_displacement,
+                                    dtype=float,
+                                ).reshape(-1),
+                                elapsed_s=0.0,
+                                interface_displacement=held_interface,
+                                reduced_displacement=None,
+                                reduced_interface_displacement=None,
+                            )
+                            last_nirb_prediction = nirb_prediction
+                            nirb_interface_corrected = True
+                            nirb_interface_correction_count += 1
+                            nirb_fallback_reason = (
+                                f"{nirb_fallback_reason};"
+                                f"exact_gate_failed_held:{fallback_exc}"
+                            )
+                            _log(
+                                verbose,
+                                "[nirb] "
+                                f"step={step} coupling_iter={coupling_iter} "
+                                "exact_solid_gate_failed=1 "
+                                "using_previous_interface=1 "
+                                f"reason={fallback_exc}",
+                            )
                     elif nirb_solid_predictor is not None and int(step) >= int(nirb_start_step_value):
                         if nirb_interface_predictor is not None:
                             if (
@@ -11296,9 +12854,10 @@ def run_local_example2(
                             if not bool(nirb_fallback_exact):
                                 raise RuntimeError(
                                     "NIRB solid predictor returned non-finite interface displacement values."
-                                )
+                            )
                             nirb_exact_fallback_used = True
                             nirb_exact_fallback_count += 1
+                            fallback_nirb_prediction = nirb_prediction
                             nirb_prediction = None
                             _log(
                                 verbose,
@@ -11306,23 +12865,88 @@ def run_local_example2(
                                 f"step={step} coupling_iter={coupling_iter} "
                                 "exact_solid_fallback=1 reason=nonfinite_interface_displacement",
                             )
-                            _solve_local_exact_solid_stage(
-                                current_structure_load_lookup=current_structure_load_lookup,
-                                load_guess_vals=load_guess_vals,
-                                solid_prev_step_snapshot=solid_prev_step,
-                                step_value=int(step),
-                                coupling_iter_value=int(coupling_iter),
+                            fallback_solid_snapshot = _snapshot_function_values(
+                                _solid_current_functions(solid)
                             )
-                            last_nirb_prediction = None
-                        if nirb_prediction is not None and str(nirb_interface_trust_value) != "none":
+                            try:
+                                _solve_nirb_exact_solid_stage(
+                                    current_structure_load_lookup=current_structure_load_lookup,
+                                    load_guess_vals=load_guess_vals,
+                                    solid_prev_step_snapshot=solid_prev_step,
+                                    step_value=int(step),
+                                    coupling_iter_value=int(coupling_iter),
+                                )
+                                last_nirb_prediction = None
+                            except Exception as fallback_exc:
+                                _restore_function_values(
+                                    _solid_current_functions(solid),
+                                    fallback_solid_snapshot,
+                                )
+                                held_interface = np.asarray(prev_disp_iter_vals, dtype=float).reshape(-1, 2)
+                                held_full_displacement = _flatten_vector_snapshot(solid["dh"], solid["d_k"])
+                                nirb_prediction = replace(
+                                    fallback_nirb_prediction,
+                                    full_displacement=np.asarray(held_full_displacement, dtype=float).reshape(-1),
+                                    interface_displacement=held_interface,
+                                    reduced_displacement=None,
+                                    reduced_interface_displacement=None,
+                                )
+                                predicted_interface = np.asarray(
+                                    nirb_prediction.interface_displacement,
+                                    dtype=float,
+                                )
+                                nirb_interface_corrected = True
+                                nirb_interface_correction_count += 1
+                                nirb_fallback_reason = (
+                                    "nonfinite_interface_displacement;"
+                                    f"exact_fallback_failed_held:{fallback_exc}"
+                                )
+                                _log(
+                                    verbose,
+                                    "[nirb] "
+                                    f"step={step} coupling_iter={coupling_iter} "
+                                    "exact_solid_fallback_failed=1 "
+                                    "using_previous_interface=1 "
+                                    f"reason={fallback_exc}",
+                                )
+                        nirb_interface_trust_mode_for_iter = str(nirb_interface_trust_value)
+                        nirb_interface_max_step_ratio_for_iter = float(
+                            nirb_interface_max_step_ratio_value
+                        )
+                        nirb_interface_max_disp_rel_for_iter = float(
+                            nirb_interface_max_disp_rel_value
+                        )
+                        nirb_interface_min_alpha_for_iter = float(
+                            nirb_interface_min_correction_alpha_value
+                        )
+                        if (
+                            bool(force_safe_step_reason)
+                            and str(force_safe_nirb_interface_trust_value) != "inherit"
+                        ):
+                            nirb_interface_trust_mode_for_iter = str(
+                                force_safe_nirb_interface_trust_value
+                            )
+                            nirb_interface_max_step_ratio_for_iter = float(
+                                force_safe_nirb_interface_max_step_ratio_value
+                            )
+                            nirb_interface_max_disp_rel_for_iter = float(
+                                force_safe_nirb_interface_max_disp_rel_value
+                            )
+                            nirb_interface_min_alpha_for_iter = float(
+                                force_safe_nirb_interface_min_correction_alpha_value
+                            )
+                        if (
+                            nirb_prediction is not None
+                            and str(nirb_interface_trust_mode_for_iter) != "none"
+                        ):
                             trust_result = _fluid_hrom_interface_trust_region(
                                 current_values=np.asarray(prev_disp_iter_vals, dtype=float),
                                 proposed_values=np.asarray(predicted_interface, dtype=float).reshape(-1, 2),
                                 previous_load_abs=float(last_disp_abs),
-                                mode=str(nirb_interface_trust_value),
-                                max_step_ratio=float(nirb_interface_max_step_ratio_value),
-                                max_load_rel=float(nirb_interface_max_disp_rel_value),
-                                min_correction_alpha=float(nirb_interface_min_correction_alpha_value),
+                                mode=str(nirb_interface_trust_mode_for_iter),
+                                max_step_ratio=float(nirb_interface_max_step_ratio_for_iter),
+                                max_load_rel=float(nirb_interface_max_disp_rel_for_iter),
+                                min_correction_alpha=float(nirb_interface_min_alpha_for_iter),
                             )
                             nirb_interface_trust_alpha = float(trust_result.alpha)
                             nirb_interface_disp_rel = float(trust_result.update_rel)
@@ -11342,6 +12966,7 @@ def run_local_example2(
                                     )
                                 nirb_exact_fallback_used = True
                                 nirb_exact_fallback_count += 1
+                                fallback_nirb_prediction = nirb_prediction
                                 nirb_prediction = None
                                 _log(
                                     verbose,
@@ -11350,14 +12975,57 @@ def run_local_example2(
                                     "exact_solid_fallback=1 "
                                     f"reason={nirb_fallback_reason}",
                                 )
-                                _solve_local_exact_solid_stage(
-                                    current_structure_load_lookup=current_structure_load_lookup,
-                                    load_guess_vals=load_guess_vals,
-                                    solid_prev_step_snapshot=solid_prev_step,
-                                    step_value=int(step),
-                                    coupling_iter_value=int(coupling_iter),
+                                fallback_solid_snapshot = _snapshot_function_values(
+                                    _solid_current_functions(solid)
                                 )
-                                last_nirb_prediction = None
+                                try:
+                                    _solve_nirb_exact_solid_stage(
+                                        current_structure_load_lookup=current_structure_load_lookup,
+                                        load_guess_vals=load_guess_vals,
+                                        solid_prev_step_snapshot=solid_prev_step,
+                                        step_value=int(step),
+                                        coupling_iter_value=int(coupling_iter),
+                                    )
+                                    last_nirb_prediction = None
+                                except Exception as fallback_exc:
+                                    _restore_function_values(
+                                        _solid_current_functions(solid),
+                                        fallback_solid_snapshot,
+                                    )
+                                    clipped_interface = (
+                                        np.asarray(prev_disp_iter_vals, dtype=float)
+                                        + float(trust_result.alpha)
+                                        * (
+                                            np.asarray(predicted_interface, dtype=float).reshape(-1, 2)
+                                            - np.asarray(prev_disp_iter_vals, dtype=float)
+                                        )
+                                    )
+                                    nirb_prediction = replace(
+                                        fallback_nirb_prediction,
+                                        interface_displacement=np.asarray(
+                                            clipped_interface,
+                                            dtype=float,
+                                        ).reshape(-1, 2),
+                                    )
+                                    predicted_interface = np.asarray(
+                                        nirb_prediction.interface_displacement,
+                                        dtype=float,
+                                    )
+                                    nirb_interface_corrected = True
+                                    nirb_interface_correction_count += 1
+                                    nirb_fallback_reason = (
+                                        f"{nirb_fallback_reason};exact_fallback_failed_clipped:"
+                                        f"{fallback_exc}"
+                                    )
+                                    _log(
+                                        verbose,
+                                        "[nirb] "
+                                        f"step={step} coupling_iter={coupling_iter} "
+                                        "exact_solid_fallback_failed=1 "
+                                        "using_clipped_interface=1 "
+                                        f"alpha={float(trust_result.alpha):.3e} "
+                                        f"reason={fallback_exc}",
+                                    )
                             if bool(trust_result.corrected):
                                 nirb_interface_corrected = True
                                 nirb_interface_correction_count += 1
@@ -11383,6 +13051,92 @@ def run_local_example2(
                                 )
                         if nirb_prediction is not None:
                             last_nirb_prediction = nirb_prediction
+                    elif solid_operator_mode == "intrusive_rom" and int(step) >= int(solid_rom_start_step_value):
+                        solid_rom_used = True
+                        solid_rom_snapshot = _snapshot_function_values(
+                            _solid_current_functions(solid)
+                        )
+                        try:
+                            rom_info = _solve_intrusive_solid_rom_stage(
+                                current_structure_load_lookup=current_structure_load_lookup,
+                                load_guess_vals=load_guess_vals,
+                                step_value=int(step),
+                                coupling_iter_value=int(coupling_iter),
+                            )
+                            solid_rom_converged = bool(rom_info.converged)
+                            solid_rom_iterations = int(rom_info.iterations)
+                            solid_rom_reduced_residual_norm = float(rom_info.reduced_residual_norm)
+                            solid_rom_reduced_residual_rel = float(rom_info.reduced_residual_rel)
+                            solid_rom_full_residual_inf = float(rom_info.full_residual_inf)
+                            solid_rom_full_residual_rel = float(rom_info.full_residual_rel)
+                            solid_rom_tangent_condition = float(rom_info.tangent_condition)
+                            solid_rom_reason = str(rom_info.reason)
+                        except Exception as rom_exc:
+                            solid_rom_converged = False
+                            solid_rom_reason = f"exception:{rom_exc}"
+                            _log(
+                                verbose,
+                                "[solid-rom] "
+                                f"step={step} coupling_iter={coupling_iter} failed=1 "
+                                f"reason={rom_exc}",
+                            )
+                        if bool(solid_rom_converged):
+                            _, proposed_interface_values = _boundary_vector_snapshot(
+                                solid["dh"],
+                                solid["d_k"],
+                                geometry.interface_tag,
+                            )
+                            if solid_rom_interface_trust_value != "none":
+                                trust_result = _fluid_hrom_interface_trust_region(
+                                    current_values=np.asarray(prev_disp_iter_vals, dtype=float),
+                                    proposed_values=np.asarray(proposed_interface_values, dtype=float),
+                                    previous_load_abs=float(last_disp_abs),
+                                    mode=str(solid_rom_interface_trust_value),
+                                    max_step_ratio=float(solid_rom_interface_max_step_ratio_value),
+                                    max_load_rel=float(solid_rom_interface_max_disp_rel_value),
+                                    min_correction_alpha=0.0,
+                                )
+                                solid_rom_interface_trust_alpha = float(trust_result.alpha)
+                                solid_rom_interface_disp_rel = float(trust_result.update_rel)
+                                solid_rom_interface_step_ratio = float(trust_result.step_ratio)
+                                if not bool(trust_result.accepted):
+                                    solid_rom_converged = False
+                                    solid_rom_reason = f"interface_trust:{trust_result.reason}"
+                                    _log(
+                                        verbose,
+                                        "[solid-rom] "
+                                        f"step={step} coupling_iter={coupling_iter} "
+                                        "interface_trust_rejected=1 "
+                                        f"disp_rel={float(solid_rom_interface_disp_rel):.3e} "
+                                        f"step_ratio={float(solid_rom_interface_step_ratio):.3e}",
+                                    )
+                        if not bool(solid_rom_converged):
+                            solid_intrusive_rom_reject_count += 1
+                            if not bool(solid_rom_fallback_exact):
+                                raise RuntimeError(
+                                    "Intrusive solid ROM failed certification and exact fallback is disabled: "
+                                    f"{solid_rom_reason}"
+                                )
+                            solid_rom_exact_fallback_used = True
+                            solid_intrusive_rom_fallback_count += 1
+                            _restore_function_values(
+                                _solid_current_functions(solid),
+                                solid_rom_snapshot,
+                            )
+                            _log(
+                                verbose,
+                                "[solid-rom] "
+                                f"step={step} coupling_iter={coupling_iter} "
+                                "exact_solid_fallback=1 "
+                                f"reason={solid_rom_reason}",
+                            )
+                            _solve_nirb_exact_solid_stage(
+                                current_structure_load_lookup=current_structure_load_lookup,
+                                load_guess_vals=load_guess_vals,
+                                solid_prev_step_snapshot=solid_prev_step,
+                                step_value=int(step),
+                                coupling_iter_value=int(coupling_iter),
+                            )
                     elif solid_operator_mode == "porous":
                         solid_res, solid_jac, solid_bcs, solid_bcs_homog = _porous_solid_residual_and_jacobian(
                             prob=solid,
@@ -11715,6 +13469,87 @@ def run_local_example2(
                             a_prev_lookup=prev_iface_mesh_acc_lookup,
                             bossak_alpha=float(bossak_alpha),
                         )
+                    nirb_exact_interface_trust_mode_for_iter = str(
+                        nirb_exact_step_interface_trust_value
+                    )
+                    nirb_exact_interface_max_step_ratio_for_iter = float(
+                        nirb_exact_step_interface_max_step_ratio_value
+                    )
+                    nirb_exact_interface_max_disp_rel_for_iter = float(
+                        nirb_exact_step_interface_max_disp_rel_value
+                    )
+                    nirb_exact_interface_min_alpha_for_iter = float(
+                        nirb_exact_step_interface_min_correction_alpha_value
+                    )
+                    if (
+                        bool(force_safe_step_reason)
+                        and nirb_exact_interface_trust_mode_for_iter == "none"
+                        and str(force_safe_nirb_interface_trust_value) in {"clip", "fallback"}
+                    ):
+                        nirb_exact_interface_trust_mode_for_iter = str(
+                            force_safe_nirb_interface_trust_value
+                        )
+                        nirb_exact_interface_max_step_ratio_for_iter = float(
+                            force_safe_nirb_interface_max_step_ratio_value
+                        )
+                        nirb_exact_interface_max_disp_rel_for_iter = float(
+                            force_safe_nirb_interface_max_disp_rel_value
+                        )
+                        nirb_exact_interface_min_alpha_for_iter = float(
+                            force_safe_nirb_interface_min_correction_alpha_value
+                        )
+                    if (
+                        bool(nirb_exact_fallback_used)
+                        and bool(nirb_exact_gate_reason)
+                        and nirb_exact_interface_trust_mode_for_iter != "none"
+                    ):
+                        trust_result = _fluid_hrom_interface_trust_region(
+                            current_values=np.asarray(prev_disp_iter_vals, dtype=float),
+                            proposed_values=np.asarray(solid_disp_solid_lookup.values, dtype=float),
+                            previous_load_abs=float(last_disp_abs),
+                            mode=nirb_exact_interface_trust_mode_for_iter,
+                            max_step_ratio=float(nirb_exact_interface_max_step_ratio_for_iter),
+                            max_load_rel=float(nirb_exact_interface_max_disp_rel_for_iter),
+                            min_correction_alpha=float(nirb_exact_interface_min_alpha_for_iter),
+                        )
+                        nirb_exact_interface_trust_active = True
+                        nirb_exact_interface_trust_alpha = float(trust_result.alpha)
+                        nirb_exact_interface_trust_disp_rel = float(trust_result.update_rel)
+                        nirb_exact_interface_trust_step_ratio = float(trust_result.step_ratio)
+                        nirb_exact_interface_trust_reason = str(trust_result.reason)
+                        trusted_interface_values = np.asarray(
+                            trust_result.values if bool(trust_result.accepted) else prev_disp_iter_vals,
+                            dtype=float,
+                        ).reshape(-1, 2)
+                        if not bool(trust_result.accepted):
+                            nirb_exact_interface_trust_rejected = True
+                            nirb_exact_interface_reject_count += 1
+                            nirb_exact_interface_trust_reason = (
+                                f"held_previous:{nirb_exact_interface_trust_reason}"
+                            )
+                        if bool(trust_result.corrected) or not bool(trust_result.accepted):
+                            nirb_exact_interface_trust_corrected = True
+                            nirb_exact_interface_correction_count += 1
+                            _assign_boundary_vector_values(
+                                dh=solid["dh"],
+                                vector=solid["d_k"],
+                                tag=geometry.interface_tag,
+                                values=trusted_interface_values,
+                            )
+                            solid_disp_solid_lookup = CoordinateLookup(
+                                solid_iface_coords,
+                                trusted_interface_values,
+                                dim=2,
+                            )
+                            _log(
+                                verbose,
+                                "[nirb] "
+                                f"step={step} coupling_iter={coupling_iter} "
+                                "exact_interface_trust_corrected=1 "
+                                f"alpha={float(nirb_exact_interface_trust_alpha):.3e} "
+                                f"disp_rel={float(nirb_exact_interface_trust_disp_rel):.3e} "
+                                f"reason={nirb_exact_interface_trust_reason}",
+                            )
                     if nirb_prediction is not None and nirb_interface_tangent is not None:
                         previous_nirb_tangent_load_values = np.asarray(load_guess_vals, dtype=float).reshape(-1).copy()
                         previous_nirb_tangent_interface_values = np.asarray(
@@ -11739,6 +13574,45 @@ def run_local_example2(
                     reaction_point_load_lookup = None
                     reaction_solid_load_lookup = None
                     stress_point_load_lookup = None
+                    fluid_newton_accepted_after_maxiter = False
+                    fluid_hrom_used = False
+                    fluid_hrom_trial_used = False
+                    fluid_hrom_trial_load_rel_error = float("nan")
+                    fluid_hrom_trial_disabled_by_monitor = False
+                    fluid_hrom_disabled_by_contraction_monitor = False
+                    hrom_trial_return_load_values: np.ndarray | None = None
+                    fluid_hrom_fallback_reason = ""
+                    fluid_hrom_manifold_distance = float("nan")
+                    fluid_hrom_eta_gamma = float("nan")
+                    fluid_hrom_dwr_error = float("nan")
+                    fluid_hrom_estimated_residual_norm = float("nan")
+                    fluid_hrom_iterations = 0
+                    fluid_hrom_info: dict[str, object] | None = None
+                    fluid_hrom_interface_trust_alpha = 1.0
+                    fluid_hrom_interface_load_rel = float("nan")
+                    fluid_hrom_interface_step_ratio = float("nan")
+                    fluid_hrom_interface_corrected = False
+                    fluid_hrom_interface_rejected = False
+                    fluid_hrom_interface_reason = ""
+                    fluid_hrom_certified_relaxation_reason = "inactive"
+                    fluid_hrom_disabled_by_cost_monitor = False
+                    fluid_hrom_cost_ratio = float("nan")
+                    fluid_hrom_load_contraction_ratio = float("nan")
+                    fluid_hrom_stage_sample_local_state_writes = False
+                    hrom_reaction_point_load_lookup: CoordinateLookup | None = None
+                    hrom_reaction_solid_load_lookup: CoordinateLookup | None = None
+                    hrom_stress_point_load_lookup: CoordinateLookup | None = None
+                    hrom_accel_lookup: CoordinateLookup | None = None
+                    hrom_reaction_source = ""
+                    fluid_hrom_impedance_used = False
+                    fluid_hrom_impedance_blend_used = 0.0
+                    fluid_hrom_impedance_rel = float("nan")
+                    fluid_hrom_adaptive_pre_dumped = False
+                    fluid_stage_used_kratos_hrom_fallback = False
+                    hrom_load_only_commit = False
+                    hrom_history: object | None = None
+                    hrom_state_guess: list[np.ndarray] | None = None
+                    hrom_a_guess: np.ndarray | None = None
                     if kratos_exact_fluid_backend is not None:
                         t_fluid0 = time.perf_counter()
                         kratos_fluid_state = _solve_kratos_exact_fluid_backend(
@@ -11933,7 +13807,16 @@ def run_local_example2(
                                     dim=2,
                                 ),
                             )
-                        elif reduced_mesh_surrogate is not None:
+                        elif (
+                            reduced_mesh_surrogate is not None
+                            and not (
+                                (
+                                    bool(force_safe_step_reason)
+                                    and bool(force_safe_use_exact_mesh_value)
+                                )
+                                or bool(nirb_exact_fallback_used)
+                            )
+                        ):
                             mesh_values = reduced_mesh_surrogate.predict_nodal_displacement(
                                 np.asarray(solid_disp_solid_lookup.values, dtype=float)
                             )
@@ -12493,6 +14376,8 @@ def run_local_example2(
                             fluid_hrom_manifold_distance = float("nan")
                             fluid_hrom_eta_gamma = float("nan")
                             fluid_hrom_dwr_error = float("nan")
+                            fluid_hrom_estimated_residual_norm = float("nan")
+                            fluid_hrom_iterations = 0
                             fluid_hrom_info: dict[str, object] | None = None
                             fluid_hrom_interface_trust_alpha = 1.0
                             fluid_hrom_interface_load_rel = float("nan")
@@ -12501,6 +14386,8 @@ def run_local_example2(
                             fluid_hrom_interface_rejected = False
                             fluid_hrom_interface_reason = ""
                             fluid_hrom_certified_relaxation_reason = "inactive"
+                            fluid_hrom_disabled_by_cost_monitor = False
+                            fluid_hrom_cost_ratio = float("nan")
                             fluid_hrom_stage_sample_local_state_writes = False
                             hrom_reaction_point_load_lookup: CoordinateLookup | None = None
                             hrom_reaction_solid_load_lookup: CoordinateLookup | None = None
@@ -12557,6 +14444,27 @@ def run_local_example2(
                                 int(fluid_hrom_max_coupling_iter_value) <= 0
                                 or int(coupling_iter) <= int(fluid_hrom_max_coupling_iter_value)
                             )
+                            hrom_cost_ok = True
+                            if (
+                                bool(fluid_hrom_cost_gate_value)
+                                and int(len(fluid_hrom_cost_samples)) >= int(fluid_hrom_cost_gate_min_samples_value)
+                                and int(len(fluid_exact_cost_samples)) >= int(fluid_hrom_cost_gate_min_samples_value)
+                            ):
+                                mean_hrom_cost = float(np.mean(np.asarray(fluid_hrom_cost_samples, dtype=float)))
+                                mean_exact_cost = float(np.mean(np.asarray(fluid_exact_cost_samples, dtype=float)))
+                                fluid_hrom_cost_ratio = mean_hrom_cost / max(float(mean_exact_cost), 1.0e-15)
+                                hrom_cost_ok = bool(
+                                    np.isfinite(float(fluid_hrom_cost_ratio))
+                                    and float(fluid_hrom_cost_ratio) <= float(fluid_hrom_cost_gate_factor_value)
+                                )
+                                if not bool(hrom_cost_ok):
+                                    fluid_hrom_disabled_by_cost_monitor = True
+                                    if int(step) > int(fluid_hrom_disabled_until_step):
+                                        sampled_lspg_hybrid_cost_gate_disable_count += 1
+                                    fluid_hrom_disabled_until_step = max(
+                                        int(fluid_hrom_disabled_until_step),
+                                        int(step) + int(fluid_hrom_cost_gate_disable_steps_value),
+                                    )
                             hrom_disabled_ok = int(step) > int(fluid_hrom_disabled_until_step)
                             use_hrom_stage = bool(
                                 hrom_iteration_gate
@@ -12567,6 +14475,7 @@ def run_local_example2(
                                 and hrom_consecutive_ok
                                 and hrom_step_budget_ok
                                 and hrom_coupling_iter_ok
+                                and hrom_cost_ok
                                 and hrom_disabled_ok
                             )
                             if bool(hrom_iteration_gate) and not bool(use_hrom_stage):
@@ -12582,6 +14491,8 @@ def run_local_example2(
                                     sampled_lspg_hybrid_step_gate_skips += 1
                                 if not bool(hrom_coupling_iter_ok):
                                     sampled_lspg_hybrid_coupling_iter_gate_skips += 1
+                                if not bool(hrom_cost_ok):
+                                    sampled_lspg_hybrid_cost_gate_skips += 1
                                 if not bool(hrom_disabled_ok):
                                     sampled_lspg_hybrid_disabled_gate_skips += 1
                                 _log(
@@ -12600,6 +14511,8 @@ def run_local_example2(
                                     f"step_hrom_stages={int(step_hrom_stages)} "
                                     f"max_stages_per_step={int(fluid_hrom_max_stages_per_step_value)} "
                                     f"max_coupling_iter={int(fluid_hrom_max_coupling_iter_value)} "
+                                    f"cost_ratio={float(fluid_hrom_cost_ratio):.3e} "
+                                    f"cost_gate={float(fluid_hrom_cost_gate_factor_value):.3e} "
                                     f"disabled_until_step={int(fluid_hrom_disabled_until_step)}",
                                 )
                             hrom_pre_stage_load_rel = float(last_load_rel)
@@ -12699,6 +14612,10 @@ def run_local_example2(
                                         if sampled_lspg_hybrid_model is not None
                                         else float("nan")
                                     )
+                                    fluid_hrom_estimated_residual_norm = float(
+                                        fluid_hrom_info.get("estimated_residual_norm", float("nan"))
+                                    )
+                                    fluid_hrom_iterations = int(fluid_hrom_info.get("iterations", 0))
                                     if np.isfinite(float(fluid_hrom_max_manifold_distance_value)):
                                         if not np.isfinite(float(fluid_hrom_manifold_distance)):
                                             sampled_lspg_hybrid_manifold_gate_failures += 1
@@ -13014,7 +14931,16 @@ def run_local_example2(
                                             if load_transfer_value == "reaction" and hrom_reaction_point_load_lookup is not None:
                                                 candidate_lookup = hrom_reaction_point_load_lookup
                                                 estimator_lookup = None
-                                                if str(hrom_reaction_source) != "local_reaction_rows" and bool(
+                                                if (
+                                                    str(hrom_reaction_source) != "reduced_reaction"
+                                                    and sampled_lspg_hybrid_model is not None
+                                                    and sampled_lspg_hybrid_model.has_reduced_reaction
+                                                ):
+                                                    estimator_lookup = sampled_lspg_hybrid_model.reduced_reaction_lookup(
+                                                        np.asarray(fluid_hrom_info["coefficients"], dtype=float),
+                                                        base_lookup=current_load_lookup,
+                                                    )
+                                                elif str(hrom_reaction_source) != "local_reaction_rows" and bool(
                                                     hrom_local_reaction_available
                                                 ):
                                                     estimator_lookup = _fluid_interface_reaction_loads_local_rows(
@@ -13205,6 +15131,11 @@ def run_local_example2(
                                 except Exception as exc:
                                     fluid_hrom_fallback_reason = str(exc)
                                     fluid_hrom_used = False
+                                    if int(fluid_hrom_disable_steps_after_trial_failure_value) > 0:
+                                        fluid_hrom_disabled_until_step = max(
+                                            int(fluid_hrom_disabled_until_step),
+                                            int(step) + int(fluid_hrom_disable_steps_after_trial_failure_value),
+                                        )
                                     if not bool(fluid_hrom_fallback_exact):
                                         raise
                                     _restore_fluid_dvms_state(fluid.get("dvms_state"), hrom_history)
@@ -13427,8 +15358,12 @@ def run_local_example2(
                         if bool(fluid_hrom_used):
                             consecutive_hrom_stages += 1
                             step_hrom_stages += 1
+                            if bool(fluid_hrom_cost_gate_value):
+                                fluid_hrom_cost_samples.append(float(fluid_elapsed))
                         else:
                             consecutive_hrom_stages = 0
+                            if bool(fluid_hrom_cost_gate_value) and not bool(use_hrom_stage):
+                                fluid_exact_cost_samples.append(float(fluid_elapsed))
         
                         if load_transfer_value == "reaction" or bool(monitor_interface_loads):
                             t_reaction0 = time.perf_counter()
@@ -13616,6 +15551,45 @@ def run_local_example2(
                     last_disp_rel = disp_rel
                     last_load_abs = load_abs
                     last_load_rel = load_rel
+                    if (
+                        not bool(step_converged)
+                        and not bool(force_adaptive_step_reason)
+                        and int(force_adaptive_step_after_coupling_iter_value) > 0
+                        and int(step) >= int(force_adaptive_step_start_step_value)
+                        and int(coupling_iter) >= int(force_adaptive_step_after_coupling_iter_value)
+                        and np.isfinite(float(force_adaptive_step_after_load_rel_value))
+                        and np.isfinite(float(load_rel))
+                        and float(load_rel) > float(force_adaptive_step_after_load_rel_value)
+                    ):
+                        force_adaptive_step_reason = (
+                            "same_step_load_residual:"
+                            f"iter={int(coupling_iter)}"
+                            f">={int(force_adaptive_step_after_coupling_iter_value)},"
+                            f"load_rel={float(load_rel):.6e}"
+                            f">{float(force_adaptive_step_after_load_rel_value):.6e}"
+                        )
+                        active_force_update = str(force_adaptive_step_update_value)
+                        active_force_relaxation = float(force_adaptive_step_relaxation_value)
+                        force_adaptive_step_trigger_count += 1
+                        if bool(force_adaptive_step_reset_history_value):
+                            load_guess_history.clear()
+                            load_return_history.clear()
+                            force_coeff_guess_history.clear()
+                            force_coeff_return_history.clear()
+                            iqn_old_dr_mats.clear()
+                            iqn_old_dg_mats.clear()
+                            force_coeff_iqn_old_dr_mats.clear()
+                            force_coeff_iqn_old_dg_mats.clear()
+                            prev_force_residual = None
+                        _log(
+                            verbose,
+                            "[force-adaptive] "
+                            f"step={step} coupling_iter={coupling_iter} "
+                            f"update={active_force_update} "
+                            f"omega={float(active_force_relaxation):.3e} "
+                            f"reset_history={int(bool(force_adaptive_step_reset_history_value))} "
+                            f"reason={force_adaptive_step_reason}",
+                        )
                     omega_force = float(active_force_relaxation)
                     if str(active_force_update).lower() == "aitken":
                         omega_force = _aitken_relaxation_factor(
@@ -13668,6 +15642,10 @@ def run_local_example2(
                         "load_return_max": load_return_max,
                         "force_update_active": str(active_force_update),
                         "force_omega": float(omega_force),
+                        "force_safe_step_active": bool(force_safe_step_reason),
+                        "force_safe_step_reason": str(force_safe_step_reason),
+                        "force_adaptive_step_active": bool(force_adaptive_step_reason),
+                        "force_adaptive_step_reason": str(force_adaptive_step_reason),
                         "nirb_force_trust_modified": bool(nirb_force_trust_modified),
                         "nirb_force_trust_projection_rel": float(nirb_force_trust_projection_rel),
                         "nirb_force_trust_coefficient_ratio": float(nirb_force_trust_coefficient_ratio),
@@ -13687,6 +15665,56 @@ def run_local_example2(
                         "nirb_interface_reason": str(nirb_interface_reason),
                         "nirb_exact_fallback_used": bool(nirb_exact_fallback_used),
                         "nirb_fallback_reason": str(nirb_fallback_reason),
+                        "nirb_exact_interface_trust_active": bool(
+                            nirb_exact_interface_trust_active
+                        ),
+                        "nirb_exact_interface_trust_corrected": bool(
+                            nirb_exact_interface_trust_corrected
+                        ),
+                        "nirb_exact_interface_trust_rejected": bool(
+                            nirb_exact_interface_trust_rejected
+                        ),
+                        "nirb_exact_interface_trust_alpha": float(
+                            nirb_exact_interface_trust_alpha
+                        ),
+                        "nirb_exact_interface_trust_disp_rel": float(
+                            nirb_exact_interface_trust_disp_rel
+                        ),
+                        "nirb_exact_interface_trust_step_ratio": float(
+                            nirb_exact_interface_trust_step_ratio
+                        ),
+                        "nirb_exact_interface_trust_reason": str(
+                            nirb_exact_interface_trust_reason
+                        ),
+                        "solid_rom_used": bool(solid_rom_used),
+                        "solid_rom_converged": bool(solid_rom_converged),
+                        "solid_rom_exact_fallback_used": bool(solid_rom_exact_fallback_used),
+                        "solid_rom_iterations": int(solid_rom_iterations),
+                        "solid_rom_reduced_residual_norm": float(
+                            solid_rom_reduced_residual_norm
+                        ),
+                        "solid_rom_reduced_residual_rel": float(
+                            solid_rom_reduced_residual_rel
+                        ),
+                        "solid_rom_full_residual_inf": float(
+                            solid_rom_full_residual_inf
+                        ),
+                        "solid_rom_full_residual_rel": float(
+                            solid_rom_full_residual_rel
+                        ),
+                        "solid_rom_tangent_condition": float(
+                            solid_rom_tangent_condition
+                        ),
+                        "solid_rom_interface_trust_alpha": float(
+                            solid_rom_interface_trust_alpha
+                        ),
+                        "solid_rom_interface_disp_rel": float(
+                            solid_rom_interface_disp_rel
+                        ),
+                        "solid_rom_interface_step_ratio": float(
+                            solid_rom_interface_step_ratio
+                        ),
+                        "solid_rom_reason": str(solid_rom_reason),
                     }
                     keep_snapshot = snapshot_mode == "all"
                     disp_converged = bool((disp_abs <= coupling_abs_tol) or (disp_rel <= coupling_rel_tol))
@@ -13785,6 +15813,8 @@ def run_local_example2(
                         fluid_elapsed += time.perf_counter() - t_hrom_finalize0
                         if fluid_times:
                             fluid_times[-1] = float(fluid_elapsed)
+                        if bool(fluid_hrom_cost_gate_value) and bool(fluid_hrom_used) and fluid_hrom_cost_samples:
+                            fluid_hrom_cost_samples[-1] = float(fluid_elapsed)
                         row["fluid_time_s"] = float(fluid_elapsed)
                     row["fluid_hrom_used"] = bool(fluid_hrom_used)
                     row["fluid_hrom_trial_used"] = bool(fluid_hrom_trial_used)
@@ -13793,10 +15823,16 @@ def run_local_example2(
                     row["fluid_hrom_disabled_by_contraction_monitor"] = bool(
                         fluid_hrom_disabled_by_contraction_monitor
                     )
+                    row["fluid_hrom_disabled_by_cost_monitor"] = bool(
+                        fluid_hrom_disabled_by_cost_monitor
+                    )
+                    row["fluid_hrom_cost_ratio"] = float(fluid_hrom_cost_ratio)
                     row["fluid_hrom_load_contraction_ratio"] = float(fluid_hrom_load_contraction_ratio)
                     row["fluid_hrom_manifold_distance"] = float(fluid_hrom_manifold_distance)
                     row["fluid_hrom_eta_gamma"] = float(fluid_hrom_eta_gamma)
                     row["fluid_hrom_dwr_error"] = float(fluid_hrom_dwr_error)
+                    row["fluid_hrom_estimated_residual_norm"] = float(fluid_hrom_estimated_residual_norm)
+                    row["fluid_hrom_iterations"] = int(fluid_hrom_iterations)
                     row["fluid_hrom_exact_accept_forced"] = bool(hrom_exact_accept_forced)
                     row["fluid_hrom_interface_trust_alpha"] = float(fluid_hrom_interface_trust_alpha)
                     row["fluid_hrom_interface_load_rel"] = float(fluid_hrom_interface_load_rel)
@@ -13894,6 +15930,12 @@ def run_local_example2(
                     hrom_relaxed_history_update = bool(
                         fluid_hrom_used and sampled_lspg_hybrid_history_policy == "relaxed"
                     )
+                    force_update_trust_active = False
+                    force_update_trust_corrected = False
+                    force_update_trust_alpha = float("nan")
+                    force_update_trust_update_rel = float("nan")
+                    force_update_trust_step_ratio = float("nan")
+                    force_update_trust_reason = "inactive"
                     if bool(hrom_relaxed_history_update):
                         update_iface_coords = np.asarray(
                             fluid_iface_coords if accelerate_on_fluid_load else solid_iface_coords,
@@ -14204,7 +16246,27 @@ def run_local_example2(
                         nirb_force_trust_next_projection_rel = float(limit_result.projection_rel)
                         nirb_force_trust_next_coefficient_ratio = float(limit_result.coefficient_ratio)
                         nirb_force_trust_next_reason = str(limit_result.reason)
-                        if bool(limit_result.modified):
+                        if (
+                            bool(limit_result.modified)
+                            and float(limit_alpha) < float(nirb_force_manifold_min_update_alpha_value)
+                        ):
+                            nirb_force_trust_next_reason = (
+                                f"skipped_low_alpha:{float(limit_alpha):.6e}"
+                                f"<{float(nirb_force_manifold_min_update_alpha_value):.6e};"
+                                f"{limit_result.reason}"
+                            )
+                            _log(
+                                verbose,
+                                "[nirb] "
+                                f"step={step} coupling_iter={coupling_iter} "
+                                "force_manifold_update_limit_skipped=1 "
+                                f"alpha={float(limit_alpha):.3e} "
+                                f"min_alpha={float(nirb_force_manifold_min_update_alpha_value):.3e} "
+                                f"proj_rel={float(limit_result.projection_rel):.3e} "
+                                f"coeff_ratio={float(limit_result.coefficient_ratio):.3e} "
+                                f"reason={limit_result.reason}",
+                            )
+                        elif bool(limit_result.modified):
                             limited_structure_lookup = CoordinateLookup(
                                 solid_iface_coords,
                                 np.asarray(limit_result.values, dtype=float).reshape(-1, 2),
@@ -14227,10 +16289,87 @@ def run_local_example2(
                                 f"coeff_ratio={float(limit_result.coefficient_ratio):.3e} "
                                 f"reason={limit_result.reason}",
                             )
+                    force_update_trust_enabled = (
+                        str(force_update_trust_value) != "none"
+                        and not bool(step_converged)
+                        and int(step) >= int(force_update_trust_start_step_value)
+                        and (
+                            str(force_update_trust_scope_value) == "always"
+                            or bool(force_safe_step_reason)
+                        )
+                    )
+                    if bool(force_update_trust_enabled):
+                        force_update_trust_active = True
+                        update_coords = np.asarray(
+                            fluid_iface_coords if accelerate_on_fluid_load else solid_iface_coords,
+                            dtype=float,
+                        )
+                        proposed_update_values = np.asarray(current_load_lookup.values, dtype=float)
+                        if proposed_update_values.shape != np.asarray(accel_guess_vals, dtype=float).shape:
+                            proposed_update_values = np.asarray(
+                                _resample_lookup_to_coords(
+                                    current_load_lookup,
+                                    update_coords,
+                                ).values,
+                                dtype=float,
+                            )
+                        trust_result = _fluid_hrom_interface_trust_region(
+                            current_values=np.asarray(accel_guess_vals, dtype=float),
+                            proposed_values=proposed_update_values,
+                            previous_load_abs=float(load_abs),
+                            mode=str(force_update_trust_value),
+                            max_step_ratio=float(force_update_max_step_ratio_value),
+                            max_load_rel=float(force_update_max_load_rel_value),
+                            min_correction_alpha=float(force_update_min_correction_alpha_value),
+                        )
+                        force_update_trust_alpha = float(trust_result.alpha)
+                        force_update_trust_update_rel = float(trust_result.update_rel)
+                        force_update_trust_step_ratio = float(trust_result.step_ratio)
+                        force_update_trust_reason = str(trust_result.reason)
+                        if not bool(trust_result.accepted):
+                            force_update_trust_reject_count += 1
+                            current_load_lookup = CoordinateLookup(
+                                update_coords,
+                                np.asarray(accel_guess_vals, dtype=float).copy(),
+                                dim=2,
+                            )
+                            force_update_trust_reason = (
+                                f"rejected_hold_current:{force_update_trust_reason}"
+                            )
+                            _log(
+                                verbose,
+                                "[force-trust] "
+                                f"step={step} coupling_iter={coupling_iter} rejected=1 "
+                                f"alpha={float(force_update_trust_alpha):.3e} "
+                                f"update_rel={float(force_update_trust_update_rel):.3e} "
+                                f"reason={force_update_trust_reason}",
+                            )
+                        elif bool(trust_result.corrected):
+                            force_update_trust_corrected = True
+                            force_update_trust_clip_count += 1
+                            current_load_lookup = CoordinateLookup(
+                                update_coords,
+                                np.asarray(trust_result.values, dtype=float),
+                                dim=2,
+                            )
+                            _log(
+                                verbose,
+                                "[force-trust] "
+                                f"step={step} coupling_iter={coupling_iter} clipped=1 "
+                                f"alpha={float(force_update_trust_alpha):.3e} "
+                                f"update_rel={float(force_update_trust_update_rel):.3e} "
+                                f"step_ratio={float(force_update_trust_step_ratio):.3e}",
+                            )
                     row["nirb_force_trust_update_alpha"] = float(nirb_force_trust_update_alpha)
                     row["nirb_force_trust_next_projection_rel"] = float(nirb_force_trust_next_projection_rel)
                     row["nirb_force_trust_next_coefficient_ratio"] = float(nirb_force_trust_next_coefficient_ratio)
                     row["nirb_force_trust_next_reason"] = str(nirb_force_trust_next_reason)
+                    row["force_update_trust_active"] = bool(force_update_trust_active)
+                    row["force_update_trust_corrected"] = bool(force_update_trust_corrected)
+                    row["force_update_trust_alpha"] = float(force_update_trust_alpha)
+                    row["force_update_trust_update_rel"] = float(force_update_trust_update_rel)
+                    row["force_update_trust_step_ratio"] = float(force_update_trust_step_ratio)
+                    row["force_update_trust_reason"] = str(force_update_trust_reason)
                     _maybe_dump_coupling_update_probe(
                         output_dir=output_dir,
                         step=int(step),
@@ -14274,6 +16413,20 @@ def run_local_example2(
                         f"(disp_rel={float(last_disp_rel):.6e}, load_rel={float(last_load_rel):.6e})."
                     )
             except Exception as exc:
+                failed_rows_path = _write_failed_step_rows(
+                    output_dir=output_dir,
+                    step=int(step),
+                    attempt=int(attempt_index),
+                    marker=step_marker,
+                    step_rows=step_rows,
+                )
+                if failed_rows_path is not None:
+                    _log(
+                        verbose,
+                        "[diagnostics] "
+                        f"step={step} attempt={attempt_index} "
+                        f"failed_step_rows={failed_rows_path}",
+                    )
                 _truncate_step_progress(
                     marker=step_marker,
                     disp_snapshots=disp_snapshots,
@@ -14329,6 +16482,20 @@ def run_local_example2(
 
         converged_steps += 1
         coupling_iters_per_step.append(int(coupling_iter))
+        previous_nirb_step_gate_coupling_iters = int(coupling_iter)
+        previous_nirb_step_gate_load_rel = float(last_load_rel)
+        previous_nirb_step_gate_exact_active = bool(nirb_exact_step_gate_reason)
+        previous_force_safe_step_active = bool(force_safe_step_reason)
+        if bool(nirb_exact_step_gate_reason) and int(nirb_exact_step_gate_cooldown_remaining) > 0:
+            nirb_exact_step_gate_cooldown_remaining = max(
+                0,
+                int(nirb_exact_step_gate_cooldown_remaining) - 1,
+            )
+        if bool(force_safe_step_reason) and int(force_safe_step_cooldown_remaining) > 0:
+            force_safe_step_cooldown_remaining = max(
+                0,
+                int(force_safe_step_cooldown_remaining) - 1,
+            )
         if last_nirb_prediction is not None and nirb_solid_predictor is not None:
             _assign_nirb_full_displacement(
                 predictor=nirb_solid_predictor,
@@ -14346,6 +16513,11 @@ def run_local_example2(
             solid["p_prev"].nodal_values[:] = solid["p_k"].nodal_values[:]
         if kratos_exact_structure_backend is not None:
             _finalize_kratos_exact_structure_backend_step(backend=kratos_exact_structure_backend)
+        if (
+            kratos_nirb_exact_fallback_backend is not None
+            and bool(kratos_nirb_exact_fallback_backend_used_this_step)
+        ):
+            _finalize_kratos_exact_structure_backend_step(backend=kratos_nirb_exact_fallback_backend)
         fluid["u_prev"].nodal_values[:] = fluid["u_k"].nodal_values[:]
         fluid["p_prev"].nodal_values[:] = fluid["p_k"].nodal_values[:]
         fluid["d_prev2"].nodal_values[:] = fluid["d_prev"].nodal_values[:]
@@ -14766,6 +16938,8 @@ def run_local_example2(
         "fluid_hrom_step_gate_skips": int(sampled_lspg_hybrid_step_gate_skips),
         "fluid_hrom_coupling_iter_gate_skips": int(sampled_lspg_hybrid_coupling_iter_gate_skips),
         "fluid_hrom_disabled_gate_skips": int(sampled_lspg_hybrid_disabled_gate_skips),
+        "fluid_hrom_cost_gate_skips": int(sampled_lspg_hybrid_cost_gate_skips),
+        "fluid_hrom_cost_gate_disable_count": int(sampled_lspg_hybrid_cost_gate_disable_count),
         "fluid_hrom_exact_accept_forced_count": int(sampled_lspg_hybrid_exact_accept_forced_count),
         "fluid_hrom_trial_stage_count": int(sampled_lspg_hybrid_trial_stage_count),
         "fluid_hrom_exact_correction_count": int(sampled_lspg_hybrid_exact_correction_count),
@@ -14814,6 +16988,24 @@ def run_local_example2(
         "fluid_hrom_disable_steps_after_trial_failure": (
             None if sampled_lspg_hybrid_model is None else int(fluid_hrom_disable_steps_after_trial_failure_value)
         ),
+        "fluid_hrom_cost_gate": (
+            None if sampled_lspg_hybrid_model is None else bool(fluid_hrom_cost_gate_value)
+        ),
+        "fluid_hrom_cost_gate_factor": (
+            None if sampled_lspg_hybrid_model is None else float(fluid_hrom_cost_gate_factor_value)
+        ),
+        "fluid_hrom_cost_gate_min_samples": (
+            None if sampled_lspg_hybrid_model is None else int(fluid_hrom_cost_gate_min_samples_value)
+        ),
+        "fluid_hrom_cost_gate_disable_steps": (
+            None if sampled_lspg_hybrid_model is None else int(fluid_hrom_cost_gate_disable_steps_value)
+        ),
+        "fluid_hrom_mean_stage_time_s": (
+            None if not fluid_hrom_cost_samples else float(np.mean(np.asarray(fluid_hrom_cost_samples, dtype=float)))
+        ),
+        "fluid_hrom_exact_mean_stage_time_s": (
+            None if not fluid_exact_cost_samples else float(np.mean(np.asarray(fluid_exact_cost_samples, dtype=float)))
+        ),
         "fluid_hrom_interface_trust": (
             None if sampled_lspg_hybrid_model is None else str(fluid_hrom_interface_trust_value)
         ),
@@ -14856,6 +17048,25 @@ def run_local_example2(
         "reduced_fluid_cpp_backend": reduced_fluid_cpp_backend_status(),
         "reduced_dvms_cpp_backend": reduced_dvms_cpp_backend_status(),
         "solid_operator": str(solid_operator_mode),
+        "solid_rom_basis_path": None if solid_rom_basis_path is None else str(Path(solid_rom_basis_path)),
+        "solid_rom_start_step": int(solid_rom_start_step_value),
+        "solid_rom_modes": (
+            None if solid_intrusive_rom_active_basis is None else int(solid_intrusive_rom_active_basis.basis_active.shape[1])
+        ),
+        "solid_rom_max_newton_iter": int(solid_rom_max_newton_iter_value),
+        "solid_rom_reduced_tol": float(solid_rom_reduced_tol_value),
+        "solid_rom_reduced_rtol": float(solid_rom_reduced_rtol_value),
+        "solid_rom_full_residual_tol": float(solid_rom_full_residual_tol_value),
+        "solid_rom_interface_trust": str(solid_rom_interface_trust_value),
+        "solid_rom_interface_max_step_ratio": float(solid_rom_interface_max_step_ratio_value),
+        "solid_rom_interface_max_disp_rel": float(solid_rom_interface_max_disp_rel_value),
+        "solid_rom_fallback_exact": bool(solid_rom_fallback_exact),
+        "solid_rom_fallback_count": int(solid_intrusive_rom_fallback_count),
+        "solid_rom_reject_count": int(solid_intrusive_rom_reject_count),
+        "solid_rom_used_count": int(sum(1 for row in step_rows if bool(row.get("solid_rom_used", False)))),
+        "solid_rom_exact_fallback_used_count": int(
+            sum(1 for row in step_rows if bool(row.get("solid_rom_exact_fallback_used", False)))
+        ),
         "porous_pressure_order": int(porous_pressure_order_value) if solid_operator_mode == "porous" else None,
         "porous_material": (
             {
@@ -14876,9 +17087,40 @@ def run_local_example2(
         "nirb_model_path": None if nirb_model_path is None else str(Path(nirb_model_path)),
         "nirb_start_step": int(nirb_start_step_value),
         "nirb_fallback_exact": bool(nirb_fallback_exact),
+        "nirb_exact_fallback_backend": str(nirb_exact_fallback_backend_value),
         "nirb_exact_after_coupling_iter": int(nirb_exact_after_coupling_iter_value),
         "nirb_exact_after_load_rel": float(nirb_exact_after_load_rel_value),
+        "nirb_exact_after_start_step": int(nirb_exact_after_start_step_value),
+        "nirb_exact_window_start_step": int(nirb_exact_window_start_step_value),
+        "nirb_exact_window_end_step": int(nirb_exact_window_end_step_value),
+        "nirb_exact_window_coupling_iter": int(nirb_exact_window_coupling_iter_value),
+        "nirb_exact_after_load_rel_min_coupling_iter": int(
+            nirb_exact_after_load_rel_min_coupling_iter_value
+        ),
         "nirb_exact_after_disp_rel": float(nirb_exact_after_disp_rel_value),
+        "nirb_exact_next_step_after_coupling_iter": int(
+            nirb_exact_next_step_after_coupling_iter_value
+        ),
+        "nirb_exact_next_step_after_load_rel": float(
+            nirb_exact_next_step_after_load_rel_value
+        ),
+        "nirb_exact_next_step_start_step": int(nirb_exact_next_step_start_step_value),
+        "nirb_exact_next_step_cooldown_steps": int(
+            nirb_exact_next_step_cooldown_steps_value
+        ),
+        "nirb_exact_step_gate_max_stages_per_step": int(
+            nirb_exact_step_gate_max_stages_per_step_value
+        ),
+        "nirb_exact_step_interface_trust": str(nirb_exact_step_interface_trust_value),
+        "nirb_exact_step_interface_max_step_ratio": float(
+            nirb_exact_step_interface_max_step_ratio_value
+        ),
+        "nirb_exact_step_interface_max_disp_rel": float(
+            nirb_exact_step_interface_max_disp_rel_value
+        ),
+        "nirb_exact_step_interface_min_correction_alpha": float(
+            nirb_exact_step_interface_min_correction_alpha_value
+        ),
         "nirb_exact_fallback_guess": str(nirb_exact_fallback_guess_value),
         "nirb_interface_model_path": None if nirb_interface_model_path is None else str(Path(nirb_interface_model_path)),
         "nirb_interface_tangent_path": (
@@ -14894,10 +17136,17 @@ def run_local_example2(
         "nirb_interface_reject_count": int(nirb_interface_reject_count),
         "nirb_interface_correction_count": int(nirb_interface_correction_count),
         "nirb_exact_fallback_count": int(nirb_exact_fallback_count),
+        "nirb_exact_step_gate_iqn_reset_count": int(nirb_exact_step_gate_iqn_reset_count),
+        "nirb_exact_step_gate_cooldown_trigger_count": int(
+            nirb_exact_step_gate_cooldown_trigger_count
+        ),
+        "nirb_exact_interface_correction_count": int(nirb_exact_interface_correction_count),
+        "nirb_exact_interface_reject_count": int(nirb_exact_interface_reject_count),
         "nirb_force_manifold_trust": str(nirb_force_manifold_trust_value),
         "nirb_force_manifold_max_projection_rel": float(nirb_force_manifold_max_projection_rel_value),
         "nirb_force_manifold_quantile": float(nirb_force_manifold_quantile_value),
         "nirb_force_manifold_coeff_factor": float(nirb_force_manifold_coeff_factor_value),
+        "nirb_force_manifold_min_update_alpha": float(nirb_force_manifold_min_update_alpha_value),
         "nirb_force_coordinate_update": str(nirb_force_coordinate_update_value),
         "nirb_force_coordinate_trust": str(nirb_force_coordinate_trust_value),
         "nirb_force_coordinate_max_step_ratio": float(nirb_force_coordinate_max_step_ratio_value),
@@ -14966,6 +17215,46 @@ def run_local_example2(
         "force_iteration_horizon": int(force_iteration_horizon),
         "force_history": int(force_history),
         "force_regularization": float(force_regularization),
+        "force_safe_next_step_after_coupling_iter": int(
+            force_safe_next_step_after_coupling_iter_value
+        ),
+        "force_safe_next_step_after_load_rel": float(force_safe_next_step_after_load_rel_value),
+        "force_safe_next_step_start_step": int(force_safe_next_step_start_step_value),
+        "force_safe_next_step_update": str(force_safe_next_step_update_value),
+        "force_safe_next_step_relaxation": float(force_safe_next_step_relaxation_value),
+        "force_safe_next_step_cooldown_steps": int(force_safe_next_step_cooldown_steps_value),
+        "force_safe_next_step_retrigger": bool(force_safe_next_step_retrigger_value),
+        "force_safe_preserve_iqn_history": bool(force_safe_preserve_iqn_history_value),
+        "force_safe_nirb_interface_trust": str(force_safe_nirb_interface_trust_value),
+        "force_safe_nirb_interface_max_step_ratio": float(
+            force_safe_nirb_interface_max_step_ratio_value
+        ),
+        "force_safe_nirb_interface_max_disp_rel": float(
+            force_safe_nirb_interface_max_disp_rel_value
+        ),
+        "force_safe_nirb_interface_min_correction_alpha": float(
+            force_safe_nirb_interface_min_correction_alpha_value
+        ),
+        "force_safe_use_exact_mesh": bool(force_safe_use_exact_mesh_value),
+        "force_adaptive_step_after_coupling_iter": int(
+            force_adaptive_step_after_coupling_iter_value
+        ),
+        "force_adaptive_step_start_step": int(force_adaptive_step_start_step_value),
+        "force_adaptive_step_after_load_rel": float(force_adaptive_step_after_load_rel_value),
+        "force_adaptive_step_update": str(force_adaptive_step_update_value),
+        "force_adaptive_step_relaxation": float(force_adaptive_step_relaxation_value),
+        "force_adaptive_step_reset_history": bool(force_adaptive_step_reset_history_value),
+        "force_adaptive_step_trigger_count": int(force_adaptive_step_trigger_count),
+        "force_safe_step_iqn_reset_count": int(force_safe_step_iqn_reset_count),
+        "force_safe_step_trigger_count": int(force_safe_step_trigger_count),
+        "force_update_trust": str(force_update_trust_value),
+        "force_update_trust_scope": str(force_update_trust_scope_value),
+        "force_update_trust_start_step": int(force_update_trust_start_step_value),
+        "force_update_max_step_ratio": float(force_update_max_step_ratio_value),
+        "force_update_max_load_rel": float(force_update_max_load_rel_value),
+        "force_update_min_correction_alpha": float(force_update_min_correction_alpha_value),
+        "force_update_trust_clip_count": int(force_update_trust_clip_count),
+        "force_update_trust_reject_count": int(force_update_trust_reject_count),
         "step_retries": int(step_retries),
         "step_retry_relaxations": None if step_retry_relaxations is None else str(step_retry_relaxations),
         "step_retry_updates": None if step_retry_updates is None else str(step_retry_updates),
@@ -15030,6 +17319,41 @@ def main() -> None:
         force_iteration_horizon=int(args.force_iteration_horizon),
         force_history=int(args.force_history),
         force_regularization=float(args.force_regularization),
+        force_safe_next_step_after_coupling_iter=int(
+            args.force_safe_next_step_after_coupling_iter
+        ),
+        force_safe_next_step_after_load_rel=float(args.force_safe_next_step_after_load_rel),
+        force_safe_next_step_start_step=int(args.force_safe_next_step_start_step),
+        force_safe_next_step_update=str(args.force_safe_next_step_update),
+        force_safe_next_step_relaxation=float(args.force_safe_next_step_relaxation),
+        force_safe_next_step_cooldown_steps=int(args.force_safe_next_step_cooldown_steps),
+        force_safe_next_step_retrigger=bool(args.force_safe_next_step_retrigger),
+        force_safe_preserve_iqn_history=bool(args.force_safe_preserve_iqn_history),
+        force_safe_nirb_interface_trust=str(args.force_safe_nirb_interface_trust),
+        force_safe_nirb_interface_max_step_ratio=float(
+            args.force_safe_nirb_interface_max_step_ratio
+        ),
+        force_safe_nirb_interface_max_disp_rel=float(
+            args.force_safe_nirb_interface_max_disp_rel
+        ),
+        force_safe_nirb_interface_min_correction_alpha=float(
+            args.force_safe_nirb_interface_min_correction_alpha
+        ),
+        force_safe_use_exact_mesh=bool(args.force_safe_use_exact_mesh),
+        force_adaptive_step_after_coupling_iter=int(
+            args.force_adaptive_step_after_coupling_iter
+        ),
+        force_adaptive_step_start_step=int(args.force_adaptive_step_start_step),
+        force_adaptive_step_after_load_rel=float(args.force_adaptive_step_after_load_rel),
+        force_adaptive_step_update=str(args.force_adaptive_step_update),
+        force_adaptive_step_relaxation=float(args.force_adaptive_step_relaxation),
+        force_adaptive_step_reset_history=bool(args.force_adaptive_step_reset_history),
+        force_update_trust=str(args.force_update_trust),
+        force_update_trust_scope=str(args.force_update_trust_scope),
+        force_update_trust_start_step=int(args.force_update_trust_start_step),
+        force_update_max_step_ratio=float(args.force_update_max_step_ratio),
+        force_update_max_load_rel=float(args.force_update_max_load_rel),
+        force_update_min_correction_alpha=float(args.force_update_min_correction_alpha),
         step_retries=int(args.step_retries),
         step_retry_relaxations=args.step_retry_relaxations,
         step_retry_updates=args.step_retry_updates,
@@ -15066,6 +17390,10 @@ def main() -> None:
         fluid_hrom_trial_exact_correct=bool(args.fluid_hrom_trial_exact_correct),
         fluid_hrom_max_trial_load_rel_error=float(args.fluid_hrom_max_trial_load_rel_error),
         fluid_hrom_disable_steps_after_trial_failure=int(args.fluid_hrom_disable_steps_after_trial_failure),
+        fluid_hrom_cost_gate=bool(args.fluid_hrom_cost_gate),
+        fluid_hrom_cost_gate_factor=float(args.fluid_hrom_cost_gate_factor),
+        fluid_hrom_cost_gate_min_samples=int(args.fluid_hrom_cost_gate_min_samples),
+        fluid_hrom_cost_gate_disable_steps=int(args.fluid_hrom_cost_gate_disable_steps),
         fluid_hrom_interface_trust=str(args.fluid_hrom_interface_trust),
         fluid_hrom_interface_max_step_ratio=float(args.fluid_hrom_interface_max_step_ratio),
         fluid_hrom_interface_max_load_rel=float(args.fluid_hrom_interface_max_load_rel),
@@ -15081,6 +17409,17 @@ def main() -> None:
         fluid_hrom_certified_relaxation_growth=float(args.fluid_hrom_certified_relaxation_growth),
         fluid_hrom_certified_relaxation_shrink=float(args.fluid_hrom_certified_relaxation_shrink),
         solid_operator=str(args.solid_operator),
+        solid_rom_basis_path=args.solid_rom_basis_path,
+        solid_rom_start_step=int(args.solid_rom_start_step),
+        solid_rom_modes=int(args.solid_rom_modes),
+        solid_rom_max_newton_iter=int(args.solid_rom_max_newton_iter),
+        solid_rom_reduced_tol=float(args.solid_rom_reduced_tol),
+        solid_rom_reduced_rtol=float(args.solid_rom_reduced_rtol),
+        solid_rom_full_residual_tol=float(args.solid_rom_full_residual_tol),
+        solid_rom_interface_trust=str(args.solid_rom_interface_trust),
+        solid_rom_interface_max_step_ratio=float(args.solid_rom_interface_max_step_ratio),
+        solid_rom_interface_max_disp_rel=float(args.solid_rom_interface_max_disp_rel),
+        solid_rom_fallback_exact=bool(args.solid_rom_fallback_exact),
         porous_pressure_order=args.porous_pressure_order,
         porous_porosity=float(args.porous_porosity),
         porous_biot_coefficient=float(args.porous_biot_coefficient),
@@ -15091,7 +17430,29 @@ def main() -> None:
         nirb_fallback_exact=bool(args.nirb_fallback_exact),
         nirb_exact_after_coupling_iter=int(args.nirb_exact_after_coupling_iter),
         nirb_exact_after_load_rel=float(args.nirb_exact_after_load_rel),
+        nirb_exact_after_start_step=int(args.nirb_exact_after_start_step),
+        nirb_exact_window_start_step=int(args.nirb_exact_window_start_step),
+        nirb_exact_window_end_step=int(args.nirb_exact_window_end_step),
+        nirb_exact_window_coupling_iter=int(args.nirb_exact_window_coupling_iter),
+        nirb_exact_after_load_rel_min_coupling_iter=int(
+            args.nirb_exact_after_load_rel_min_coupling_iter
+        ),
         nirb_exact_after_disp_rel=float(args.nirb_exact_after_disp_rel),
+        nirb_exact_next_step_after_coupling_iter=int(args.nirb_exact_next_step_after_coupling_iter),
+        nirb_exact_next_step_after_load_rel=float(args.nirb_exact_next_step_after_load_rel),
+        nirb_exact_next_step_start_step=int(args.nirb_exact_next_step_start_step),
+        nirb_exact_next_step_cooldown_steps=int(args.nirb_exact_next_step_cooldown_steps),
+        nirb_exact_step_gate_max_stages_per_step=int(args.nirb_exact_step_gate_max_stages_per_step),
+        nirb_exact_step_interface_trust=str(args.nirb_exact_step_interface_trust),
+        nirb_exact_step_interface_max_step_ratio=float(
+            args.nirb_exact_step_interface_max_step_ratio
+        ),
+        nirb_exact_step_interface_max_disp_rel=float(
+            args.nirb_exact_step_interface_max_disp_rel
+        ),
+        nirb_exact_step_interface_min_correction_alpha=float(
+            args.nirb_exact_step_interface_min_correction_alpha
+        ),
         nirb_exact_fallback_guess=str(args.nirb_exact_fallback_guess),
         nirb_interface_tangent_path=args.nirb_interface_tangent_path,
         nirb_interface_tangent_blend=float(args.nirb_interface_tangent_blend),
@@ -15106,6 +17467,7 @@ def main() -> None:
         nirb_force_manifold_max_projection_rel=float(args.nirb_force_manifold_max_projection_rel),
         nirb_force_manifold_quantile=float(args.nirb_force_manifold_quantile),
         nirb_force_manifold_coeff_factor=float(args.nirb_force_manifold_coeff_factor),
+        nirb_force_manifold_min_update_alpha=float(args.nirb_force_manifold_min_update_alpha),
         nirb_force_coordinate_update=str(args.nirb_force_coordinate_update),
         nirb_force_coordinate_trust=str(args.nirb_force_coordinate_trust),
         nirb_force_coordinate_max_step_ratio=float(args.nirb_force_coordinate_max_step_ratio),

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 import numpy as np
+from scipy.spatial import cKDTree
 from scipy.spatial.distance import cdist
 from sklearn.linear_model import LassoLarsIC
 from sklearn.preprocessing import StandardScaler as SklearnStandardScaler
@@ -198,6 +199,58 @@ class PolynomialLeastSquaresRegressor:
             x_eval = self.scaler_.transform(x_eval)
         design = self.feature_map_.transform(x_eval)
         return design @ self.coefficients_.T
+
+
+@dataclass
+class KNearestRegressor:
+    n_neighbors: int = 8
+    power: float = 2.0
+    regularization: float = 1.0e-12
+    standardize_inputs: bool = True
+    scaler_: SklearnStandardScaler | None = None
+    inputs_: np.ndarray | None = None
+    outputs_: np.ndarray | None = None
+    tree_: cKDTree | None = None
+
+    def fit(self, inputs: np.ndarray, outputs: np.ndarray) -> "KNearestRegressor":
+        x_train = _as_sample_matrix(inputs)
+        y_train = _as_target_matrix(outputs, n_samples=x_train.shape[0])
+
+        if self.standardize_inputs:
+            self.scaler_ = SklearnStandardScaler(with_mean=True, with_std=True)
+            x_scaled = self.scaler_.fit_transform(x_train)
+        else:
+            self.scaler_ = None
+            x_scaled = x_train
+
+        self.inputs_ = np.asarray(x_scaled, dtype=float)
+        self.outputs_ = np.asarray(y_train, dtype=float)
+        self.tree_ = cKDTree(self.inputs_)
+        return self
+
+    def predict(self, inputs: np.ndarray) -> np.ndarray:
+        if self.inputs_ is None or self.outputs_ is None or self.tree_ is None:
+            raise RuntimeError("KNearestRegressor must be fit before predict")
+        x_eval = _as_sample_matrix(inputs)
+        if self.scaler_ is not None:
+            x_eval = self.scaler_.transform(x_eval)
+
+        k = max(1, min(int(self.n_neighbors), int(self.inputs_.shape[0])))
+        distances, indices = self.tree_.query(np.asarray(x_eval, dtype=float), k=k)
+        distances = np.asarray(distances, dtype=float)
+        indices = np.asarray(indices, dtype=int)
+        if distances.ndim == 1:
+            distances = distances[:, None]
+            indices = indices[:, None]
+
+        tol = max(float(self.regularization), 1.0e-300)
+        weights = 1.0 / np.maximum(distances, tol) ** max(float(self.power), 0.0)
+        exact_rows = np.any(distances <= tol, axis=1)
+        if np.any(exact_rows):
+            weights[exact_rows, :] = np.where(distances[exact_rows, :] <= tol, 1.0, 0.0)
+        weights /= np.maximum(np.sum(weights, axis=1, keepdims=True), tol)
+        gathered = self.outputs_[indices]
+        return np.einsum("nk,nko->no", weights, gathered)
 
 
 def fit_tps_rbf(inputs: np.ndarray, outputs: np.ndarray, *, smoothing: float = 0.0) -> ThinPlateSplineRBF:
