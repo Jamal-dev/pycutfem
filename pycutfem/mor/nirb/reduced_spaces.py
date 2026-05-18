@@ -29,7 +29,7 @@ def _mass_matrix(mass: np.ndarray | None, n_dofs: int) -> np.ndarray:
     arr = np.asarray(mass, dtype=float)
     if arr.ndim == 1:
         if int(arr.size) != int(n_dofs):
-            raise ValueError("diagonal mass size must match the interface dimension.")
+            raise ValueError("diagonal mass size must match the reduced-space dimension.")
         if np.any(arr <= 0.0):
             raise ValueError("diagonal mass entries must be positive.")
         return np.diag(arr)
@@ -41,25 +41,25 @@ def _mass_matrix(mass: np.ndarray | None, n_dofs: int) -> np.ndarray:
 
 
 @dataclass(frozen=True)
-class ReducedInterfaceSpace:
-    """Mass-weighted reduced basis for interface loads or displacements.
+class ReducedSpace:
+    """Mass-weighted reduced basis for any vector-valued reduced quantity.
 
     The basis columns need not be perfectly orthonormal in the supplied mass
     inner product.  Projection solves the small Gram system
     ``(Phi.T M Phi) c = Phi.T M x`` so offline artifacts can use POD bases,
-    hand-picked interface modes, or restricted nonlinear-manifold bases.
+    hand-picked modes, or restricted nonlinear-manifold bases.
     """
 
     basis: np.ndarray
     mass: np.ndarray | None = None
-    name: str = "interface"
+    name: str = "space"
     _mass_matrix: np.ndarray = field(init=False, repr=False)
     _gram: np.ndarray = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         basis = _as_matrix(self.basis, name=f"{self.name}.basis")
         if basis.shape[0] <= 0:
-            raise ValueError("interface basis must contain at least one row.")
+            raise ValueError("reduced-space basis must contain at least one row.")
         object.__setattr__(self, "basis", basis)
         mass = _mass_matrix(self.mass, int(basis.shape[0]))
         gram = basis.T @ (mass @ basis)
@@ -116,7 +116,7 @@ class ReducedInterfaceSpace:
         if right_vec.size == self.n_modes:
             right_vec = self.reconstruct(right_vec)
         if int(left_vec.size) != self.n_dofs or int(right_vec.size) != self.n_dofs:
-            raise ValueError("interface inner-product arguments have incompatible sizes.")
+            raise ValueError("reduced-space inner-product arguments have incompatible sizes.")
         return float(left_vec @ (self._mass_matrix @ right_vec))
 
     def norm(self, values: np.ndarray) -> float:
@@ -140,11 +140,11 @@ class ReducedInterfaceSpace:
 
 @dataclass(frozen=True)
 class ReducedTransfer:
-    """Small matrix transfer between two reduced interface spaces."""
+    """Small matrix transfer between two reduced output spaces."""
 
     matrix: np.ndarray
-    source: ReducedInterfaceSpace
-    target: ReducedInterfaceSpace
+    source: ReducedSpace
+    target: ReducedSpace
 
     def __post_init__(self) -> None:
         matrix = _as_matrix(self.matrix, name="transfer.matrix")
@@ -157,8 +157,8 @@ class ReducedTransfer:
     def from_full_transfer(
         cls,
         *,
-        source: ReducedInterfaceSpace,
-        target: ReducedInterfaceSpace,
+        source: ReducedSpace,
+        target: ReducedSpace,
         full_transfer: np.ndarray,
     ) -> "ReducedTransfer":
         transfer = _as_matrix(full_transfer, name="full_transfer")
@@ -180,13 +180,13 @@ class ReducedTransfer:
 
 
 @dataclass(frozen=True)
-class ReducedInterfaceDecoder:
-    """Reduced output map for a quadratic solid displacement manifold."""
+class ReducedOutputDecoder:
+    """Reduced output map induced by a full-order decoder."""
 
     linear_map: np.ndarray
     quadratic_map: np.ndarray
     bias: np.ndarray
-    output_space: ReducedInterfaceSpace
+    output_space: ReducedSpace
     feature_map: QuadraticFeatureMap | None = None
 
     def __post_init__(self) -> None:
@@ -215,10 +215,10 @@ class ReducedInterfaceDecoder:
         linear_basis: np.ndarray,
         quadratic_basis: np.ndarray,
         mean: np.ndarray | None,
-        output_space: ReducedInterfaceSpace,
+        output_space: ReducedSpace,
         restriction_matrix: np.ndarray | None = None,
         feature_map: QuadraticFeatureMap | None = None,
-    ) -> "ReducedInterfaceDecoder":
+    ) -> "ReducedOutputDecoder":
         linear_full = _as_matrix(linear_basis, name="linear_basis")
         quadratic_full = _as_matrix(quadratic_basis, name="quadratic_basis")
         if restriction_matrix is None:
@@ -250,15 +250,15 @@ class ReducedInterfaceDecoder:
             feature_map=feature_map,
         )
 
-    def decode_coefficients(self, reduced_displacement: np.ndarray) -> np.ndarray:
-        coords = _as_vector(reduced_displacement, name="reduced_displacement")
+    def decode_coefficients(self, reduced_output: np.ndarray) -> np.ndarray:
+        coords = _as_vector(reduced_output, name="reduced_output")
         if int(coords.size) != int(self.linear_map.shape[1]):
-            raise ValueError(f"expected {self.linear_map.shape[1]} displacement coordinates, got {coords.size}.")
+            raise ValueError(f"expected {self.linear_map.shape[1]} output coordinates, got {coords.size}.")
         features = self.feature_map.transform(coords.reshape(-1, 1))[:, 0]
         return np.asarray(self.bias + self.linear_map @ coords + self.quadratic_map @ features, dtype=float)
 
-    def decode_interface(self, reduced_displacement: np.ndarray) -> np.ndarray:
-        return self.output_space.reconstruct(self.decode_coefficients(reduced_displacement))
+    def decode_output(self, reduced_output: np.ndarray) -> np.ndarray:
+        return self.output_space.reconstruct(self.decode_coefficients(reduced_output))
 
 
 def iqnils_iteration_matrices(
@@ -372,7 +372,7 @@ class ReducedIQNILS:
         x = _as_vector(current, name="current")
         g = _as_vector(returned, name="returned")
         if x.shape != g.shape:
-            raise ValueError("current and returned reduced loads must have the same shape.")
+            raise ValueError("current and returned reduced coordinates must have the same shape.")
         if bool(converged):
             return g.copy()
         self.x_history.append(x.copy())
@@ -404,8 +404,8 @@ class ReducedIQNILS:
 
 __all__ = [
     "ReducedIQNILS",
-    "ReducedInterfaceDecoder",
-    "ReducedInterfaceSpace",
+    "ReducedOutputDecoder",
+    "ReducedSpace",
     "ReducedTransfer",
     "iqnils_iteration_matrices",
     "iqnils_next_iterate",

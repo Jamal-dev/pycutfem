@@ -7,7 +7,7 @@ return deterministic enrichment actions that an offline driver can execute.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
 import numpy as np
@@ -63,6 +63,165 @@ class AdaptiveMORDecision:
             "accepted": bool(self.accepted),
             "actions": tuple(action.to_dict() for action in self.actions),
             "metadata": dict(self.metadata or {}),
+        }
+
+
+@dataclass(frozen=True)
+class OnlineErrorCalibrationDecision:
+    """Online acceptance decision for a cheap error indicator."""
+
+    accepted: bool
+    estimate: float
+    certified_bound: float
+    tolerance: float
+    effective_estimate_tolerance: float
+    reliability_factor: float
+    sample_count: int
+    reason: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "accepted": bool(self.accepted),
+            "estimate": float(self.estimate),
+            "certified_bound": float(self.certified_bound),
+            "tolerance": float(self.tolerance),
+            "effective_estimate_tolerance": float(self.effective_estimate_tolerance),
+            "reliability_factor": float(self.reliability_factor),
+            "sample_count": int(self.sample_count),
+            "reason": str(self.reason),
+        }
+
+
+@dataclass
+class OnlineErrorCalibrator:
+    """Calibrate a cheap online error indicator against occasional truth samples.
+
+    The calibrator learns a reliability factor ``beta`` such that
+    ``true_error ~= beta * estimate``.  A stage is accepted when the certified
+    bound ``beta * estimate`` is below the requested tolerance and the raw
+    estimate is not above the optional hard cap.
+    """
+
+    tolerance: float
+    max_estimate_tolerance: float | None = None
+    quantile: float = 0.9
+    safety_factor: float = 1.25
+    min_samples: int = 4
+    ratio_floor: float = 1.0e-12
+    _ratios: list[float] = field(default_factory=list, init=False, repr=False)
+    _estimates: list[float] = field(default_factory=list, init=False, repr=False)
+    _true_errors: list[float] = field(default_factory=list, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self.tolerance = float(self.tolerance)
+        if not np.isfinite(self.tolerance) or self.tolerance < 0.0:
+            raise ValueError("online error calibrator tolerance must be finite and nonnegative.")
+        if self.max_estimate_tolerance is not None:
+            self.max_estimate_tolerance = float(self.max_estimate_tolerance)
+            if not np.isfinite(self.max_estimate_tolerance) or self.max_estimate_tolerance < 0.0:
+                raise ValueError("max_estimate_tolerance must be finite and nonnegative when provided.")
+        self.quantile = float(np.clip(float(self.quantile), 0.0, 1.0))
+        self.safety_factor = float(self.safety_factor)
+        if not np.isfinite(self.safety_factor) or self.safety_factor <= 0.0:
+            raise ValueError("safety_factor must be finite and positive.")
+        self.min_samples = max(1, int(self.min_samples))
+        self.ratio_floor = max(float(self.ratio_floor), 1.0e-300)
+
+    @property
+    def sample_count(self) -> int:
+        return int(len(self._ratios))
+
+    @property
+    def reliability_factor(self) -> float:
+        if int(len(self._ratios)) < int(self.min_samples):
+            return 1.0
+        ratios = np.asarray(self._ratios, dtype=float)
+        finite = ratios[np.isfinite(ratios) & (ratios >= 0.0)]
+        if finite.size < int(self.min_samples):
+            return 1.0
+        return float(max(np.quantile(finite, float(self.quantile)) * float(self.safety_factor), self.ratio_floor))
+
+    @property
+    def effective_estimate_tolerance(self) -> float:
+        beta = max(float(self.reliability_factor), self.ratio_floor)
+        tol = float(self.tolerance) / beta if beta > 0.0 else 0.0
+        if self.max_estimate_tolerance is not None:
+            tol = min(float(tol), float(self.max_estimate_tolerance))
+        return float(max(tol, 0.0))
+
+    def certified_bound(self, estimate: Any) -> float:
+        value = float(estimate)
+        if not np.isfinite(value) or value < 0.0:
+            return float("inf")
+        return float(self.reliability_factor) * value
+
+    def evaluate(self, estimate: Any) -> OnlineErrorCalibrationDecision:
+        value = float(estimate)
+        beta = float(self.reliability_factor)
+        effective_tol = float(self.effective_estimate_tolerance)
+        bound = self.certified_bound(value)
+        if not np.isfinite(value) or value < 0.0:
+            return OnlineErrorCalibrationDecision(
+                accepted=False,
+                estimate=value,
+                certified_bound=float("inf"),
+                tolerance=float(self.tolerance),
+                effective_estimate_tolerance=effective_tol,
+                reliability_factor=beta,
+                sample_count=self.sample_count,
+                reason="nonfinite_estimate",
+            )
+        if value > effective_tol:
+            return OnlineErrorCalibrationDecision(
+                accepted=False,
+                estimate=value,
+                certified_bound=bound,
+                tolerance=float(self.tolerance),
+                effective_estimate_tolerance=effective_tol,
+                reliability_factor=beta,
+                sample_count=self.sample_count,
+                reason="estimate_above_effective_tolerance",
+            )
+        return OnlineErrorCalibrationDecision(
+            accepted=bool(bound <= float(self.tolerance)),
+            estimate=value,
+            certified_bound=bound,
+            tolerance=float(self.tolerance),
+            effective_estimate_tolerance=effective_tol,
+            reliability_factor=beta,
+            sample_count=self.sample_count,
+            reason="accepted" if bound <= float(self.tolerance) else "bound_above_tolerance",
+        )
+
+    def record(self, *, estimate: Any, true_error: Any) -> OnlineErrorCalibrationDecision:
+        est = float(estimate)
+        err = float(true_error)
+        if np.isfinite(est) and est >= 0.0 and np.isfinite(err) and err >= 0.0:
+            ratio = err / max(est, self.ratio_floor)
+            self._estimates.append(est)
+            self._true_errors.append(err)
+            self._ratios.append(float(ratio))
+        return self.evaluate(est)
+
+    def to_dict(self) -> dict[str, Any]:
+        true_errors = np.asarray(self._true_errors, dtype=float)
+        estimates = np.asarray(self._estimates, dtype=float)
+        ratios = np.asarray(self._ratios, dtype=float)
+        return {
+            "tolerance": float(self.tolerance),
+            "max_estimate_tolerance": (
+                None if self.max_estimate_tolerance is None else float(self.max_estimate_tolerance)
+            ),
+            "quantile": float(self.quantile),
+            "safety_factor": float(self.safety_factor),
+            "min_samples": int(self.min_samples),
+            "sample_count": int(self.sample_count),
+            "reliability_factor": float(self.reliability_factor),
+            "effective_estimate_tolerance": float(self.effective_estimate_tolerance),
+            "estimate_mean": None if estimates.size == 0 else float(np.mean(estimates)),
+            "true_error_mean": None if true_errors.size == 0 else float(np.mean(true_errors)),
+            "true_error_max": None if true_errors.size == 0 else float(np.max(true_errors)),
+            "ratio_quantile": None if ratios.size == 0 else float(np.quantile(ratios, float(self.quantile))),
         }
 
 
@@ -238,6 +397,8 @@ def augment_rows_from_dwr_localization(
 __all__ = [
     "AdaptiveEnrichmentAction",
     "AdaptiveMORDecision",
+    "OnlineErrorCalibrationDecision",
+    "OnlineErrorCalibrator",
     "augment_rows_from_dwr_localization",
     "select_certified_adaptive_enrichment_actions",
 ]

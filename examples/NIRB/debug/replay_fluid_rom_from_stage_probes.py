@@ -600,6 +600,33 @@ def _parse_steps(spec: str | None) -> list[int] | None:
     return values
 
 
+def _parse_stage_pair_file(path: Path | None) -> set[tuple[int, int]] | None:
+    if path is None:
+        return None
+    result: set[tuple[int, int]] = set()
+    with Path(path).open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            text = line.strip()
+            if not text or text.startswith("#"):
+                continue
+            lower = text.lower().replace(" ", "")
+            if line_number == 1 and lower in {"step,coupling_iter", "step,couplingiteration"}:
+                continue
+            if "," in text:
+                left, right = text.split(",", 1)
+            elif ":" in text:
+                left, right = text.split(":", 1)
+            else:
+                pieces = text.split()
+                if len(pieces) != 2:
+                    raise ValueError(f"Invalid stage-pair line {line_number} in {path}: {text!r}")
+                left, right = pieces
+            result.add((int(left.strip()), int(right.strip())))
+    if not result:
+        raise ValueError(f"No stage pairs were read from {path}.")
+    return result
+
+
 def _checkpoint_root(path: Path) -> Path:
     root = Path(path).resolve()
     if root.is_dir() and (root / "checkpoints").is_dir():
@@ -1855,12 +1882,18 @@ def _find_fluid_stage_probe_pairs_from_roots(
     *,
     final_only: bool,
     steps: set[int] | None,
+    coupling_iters: set[int] | None = None,
+    stage_pairs: set[tuple[int, int]] | None = None,
 ) -> list[Any]:
     """Collect stage pairs from one or more roots with deterministic de-duplication."""
 
     unique: dict[tuple[int, int], Any] = {}
     for root in roots:
         for pair in find_fluid_stage_probe_pairs(root, final_only=bool(final_only), steps=steps):
+            if coupling_iters is not None and int(pair.coupling_iter) not in coupling_iters:
+                continue
+            if stage_pairs is not None and (int(pair.step), int(pair.coupling_iter)) not in stage_pairs:
+                continue
             unique.setdefault((int(pair.step), int(pair.coupling_iter)), pair)
     return [unique[key] for key in sorted(unique)]
 
@@ -3767,6 +3800,7 @@ def _save_sampled_lspg_hrom_model(
     args: argparse.Namespace,
     training_source: list[str],
     training_steps: list[int],
+    training_coupling_iters: list[int] | None = None,
     training_coefficients: np.ndarray | None = None,
     reaction_operator: dict[str, Any] | None = None,
     sampled_reaction_operator: dict[str, Any] | None = None,
@@ -3840,6 +3874,10 @@ def _save_sampled_lspg_hrom_model(
         recommended_switch_iter=np.asarray(4, dtype=int),
         training_sources=np.asarray([str(item) for item in training_source]),
         training_steps=np.asarray(training_steps, dtype=int),
+        training_coupling_iters=np.asarray(
+            [] if training_coupling_iters is None else [int(item) for item in training_coupling_iters],
+            dtype=int,
+        ),
         training_all_iters=np.asarray(bool(args.training_all_iters), dtype=bool),
         training_weight_mode=np.asarray(str(args.training_weight_mode)),
         training_weight_late_start_step=np.asarray(
@@ -3850,6 +3888,22 @@ def _save_sampled_lspg_hrom_model(
         training_weight_final_factor=np.asarray(float(args.training_weight_final_factor), dtype=float),
         training_weight_iteration_factor=np.asarray(float(args.training_weight_iteration_factor), dtype=float),
         training_all_states=np.asarray(bool(args.training_all_states), dtype=bool),
+        operator_training_all_states=np.asarray(
+            bool(getattr(args, "operator_training_all_states_effective", args.training_all_states)),
+            dtype=bool,
+        ),
+        reaction_training_all_states=np.asarray(
+            bool(getattr(args, "reaction_training_all_states_effective", args.training_all_states)),
+            dtype=bool,
+        ),
+        interface_enrichment_all_states=np.asarray(
+            bool(getattr(args, "interface_enrichment_all_states_effective", args.training_all_states)),
+            dtype=bool,
+        ),
+        coefficient_training_all_states=np.asarray(
+            bool(getattr(args, "coefficient_training_all_states_effective", args.training_all_states)),
+            dtype=bool,
+        ),
         training_coefficient_mean=np.asarray(coeff_mean, dtype=float),
         training_coefficient_scale=np.asarray(coeff_scale, dtype=float),
         training_coefficient_radius=np.asarray(float(coeff_radius), dtype=float),
@@ -4036,6 +4090,24 @@ def parse_args() -> argparse.Namespace:
         help="Comma/range step list used for stage-probe basis fitting and GNAT residual training.",
     )
     parser.add_argument(
+        "--training-coupling-iters",
+        type=str,
+        default=None,
+        help=(
+            "Comma/range coupling-iteration list used for stage-probe basis fitting and GNAT residual training. "
+            "This is intended for local feature-atlas banks whose validity region is tied to a coupling stage."
+        ),
+    )
+    parser.add_argument(
+        "--training-stage-pairs",
+        type=Path,
+        default=None,
+        help=(
+            "CSV/text file with exact 'step,coupling_iter' rows used for feature-atlas region training. "
+            "When supplied, only those exact stage pairs are used."
+        ),
+    )
+    parser.add_argument(
         "--training-all-iters",
         action="store_true",
         help="Train from every paired coupling iteration for the selected training steps.",
@@ -4047,6 +4119,44 @@ def parse_args() -> argparse.Namespace:
             "Use every available state probe inside each selected training coupling iteration. "
             "For increment bases this adds exact Newton iterate probes when they exist; for absolute bases "
             "this adds pre, Newton-iterate, and post states instead of post states only."
+        ),
+    )
+    parser.add_argument(
+        "--operator-training-all-states",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Use exact Newton/intermediate states in residual-basis and empirical-cubature training. "
+            "The default follows --training-all-states. Use --no-operator-training-all-states to enrich "
+            "the primal basis on all states while keeping GNAT/cubature fitting on the cheaper final-state "
+            "operator trajectory."
+        ),
+    )
+    parser.add_argument(
+        "--reaction-training-all-states",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Use exact Newton/intermediate states when fitting reduced and sampled interface-reaction "
+            "operators. The default follows --training-all-states."
+        ),
+    )
+    parser.add_argument(
+        "--interface-enrichment-all-states",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Use exact Newton/intermediate states for interface-load basis enrichment. "
+            "The default follows --training-all-states."
+        ),
+    )
+    parser.add_argument(
+        "--coefficient-training-all-states",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Use exact Newton/intermediate states when saving the training coefficient cloud used by "
+            "the online manifold-distance gate. The default follows --training-all-states."
         ),
     )
     parser.add_argument(
@@ -4462,10 +4572,39 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    basis_all_states = bool(args.training_all_states)
+    operator_training_all_states = (
+        basis_all_states
+        if args.operator_training_all_states is None
+        else bool(args.operator_training_all_states)
+    )
+    reaction_training_all_states = (
+        basis_all_states
+        if args.reaction_training_all_states is None
+        else bool(args.reaction_training_all_states)
+    )
+    interface_enrichment_all_states = (
+        basis_all_states
+        if args.interface_enrichment_all_states is None
+        else bool(args.interface_enrichment_all_states)
+    )
+    coefficient_training_all_states = (
+        basis_all_states
+        if args.coefficient_training_all_states is None
+        else bool(args.coefficient_training_all_states)
+    )
+    args.operator_training_all_states_effective = bool(operator_training_all_states)
+    args.reaction_training_all_states_effective = bool(reaction_training_all_states)
+    args.interface_enrichment_all_states_effective = bool(interface_enrichment_all_states)
+    args.coefficient_training_all_states_effective = bool(coefficient_training_all_states)
     _progress(
         "start "
         f"probe_dir={args.probe_dir} steps={args.steps} "
-        f"training_steps={args.training_steps} training_all_iters={bool(args.training_all_iters)}"
+        f"training_steps={args.training_steps} training_stage_pairs={args.training_stage_pairs} "
+        f"training_all_iters={bool(args.training_all_iters)} "
+        f"basis_all_states={bool(basis_all_states)} "
+        f"operator_all_states={bool(operator_training_all_states)} "
+        f"reaction_all_states={bool(reaction_training_all_states)}"
     )
     setup = load_example2_local_setup()
     mesh_f, _mesh_s = _load_reference_partitioned_meshes(setup=setup)
@@ -4488,6 +4627,8 @@ def main() -> None:
     dt = float(setup.boundaries.time_step)
     bossak = _bossak_coefficients(alpha=float(args.bossak_alpha), dt=float(dt))
     training_steps = _parse_steps(args.training_steps)
+    training_coupling_iters = _parse_steps(args.training_coupling_iters)
+    training_stage_pairs = _parse_stage_pair_file(args.training_stage_pairs)
     training_roots = _training_probe_roots(args, fallback_to_probe_dir=str(args.basis_kind) == "increment")
     gnat_training_pairs = []
     training_pair_weights: dict[tuple[int, int], float] | None = None
@@ -4502,6 +4643,8 @@ def main() -> None:
             training_roots,
             final_only=not bool(args.training_all_iters),
             steps=training_steps,
+            coupling_iters=None if training_coupling_iters is None else set(training_coupling_iters),
+            stage_pairs=training_stage_pairs,
         )
         _progress(
             "fit increment basis: "
@@ -4528,7 +4671,7 @@ def main() -> None:
             velocity_modes=int(args.velocity_modes),
             pressure_modes=int(args.pressure_modes),
             pair_weights=training_pair_weights,
-            include_intermediate_states=bool(args.training_all_states),
+            include_intermediate_states=bool(basis_all_states),
             supremizer_enrichment=False,
         )
         training_kind = (
@@ -4542,6 +4685,8 @@ def main() -> None:
             training_roots,
             final_only=not bool(args.training_all_iters),
             steps=training_steps,
+            coupling_iters=None if training_coupling_iters is None else set(training_coupling_iters),
+            stage_pairs=training_stage_pairs,
         )
         _progress(
             "fit post-state basis: "
@@ -4557,7 +4702,7 @@ def main() -> None:
             final_factor=float(args.training_weight_final_factor),
             iteration_factor=float(args.training_weight_iteration_factor),
         )
-        if bool(args.training_all_states):
+        if bool(basis_all_states):
             train_state_paths = _training_state_probe_paths_from_pairs(
                 train_pairs,
                 include_pre=True,
@@ -4580,7 +4725,7 @@ def main() -> None:
                 reference_velocity=float(reference_velocity),
             ),
         )
-        training_kind = "stage-probe-all-states" if bool(args.training_all_states) else "stage-probe-post-fluid-solve"
+        training_kind = "stage-probe-all-states" if bool(basis_all_states) else "stage-probe-post-fluid-solve"
     else:
         checkpoint_paths = _checkpoint_paths(args.training_checkpoints, max_snapshots=int(args.max_training_snapshots))
         _progress(
@@ -4645,7 +4790,7 @@ def main() -> None:
                 dt=float(dt),
                 reference_velocity=float(reference_velocity),
                 pair_weights=training_pair_weights,
-                include_intermediate_states=bool(args.training_all_states),
+                include_intermediate_states=bool(interface_enrichment_all_states),
                 weight_mode=str(args.interface_load_enrichment_weight),
                 weight_exponent=float(args.interface_load_enrichment_weight_exponent),
                 max_weight=float(args.interface_load_enrichment_max_weight),
@@ -4838,7 +4983,7 @@ def main() -> None:
             block_scale_relative_floor=float(args.lspg_block_scale_relative_floor),
             pair_weights=training_pair_weights,
             trajectory_source=str(args.training_residual_trajectory),
-            include_intermediate_states=bool(args.training_all_states),
+            include_intermediate_states=bool(operator_training_all_states),
             incompressibility_stabilization_scale=float(args.rom_incompressibility_scale),
         )
 
@@ -5037,7 +5182,7 @@ def main() -> None:
                     pair_weights=training_pair_weights,
                     trajectory_source=str(args.training_residual_trajectory),
                     training_state_selection=str(args.gnat_element_training_state_selection),
-                    include_intermediate_states=bool(args.training_all_states),
+                    include_intermediate_states=bool(operator_training_all_states),
                     incompressibility_stabilization_scale=float(args.rom_incompressibility_scale),
             )
             if args.save_hrom_model is not None and saved_hrom_model_path is None:
@@ -5050,7 +5195,7 @@ def main() -> None:
                     fluid_iface_coords=fluid_iface_coords,
                     dt=float(dt),
                     reference_velocity=float(reference_velocity),
-                    include_intermediate_states=bool(args.training_all_states),
+                    include_intermediate_states=bool(coefficient_training_all_states),
                 )
                 if args.accepted_checkpoint_enrichment_dir is not None:
                     checkpoint_training_coefficients = _project_training_state_coefficients_from_checkpoints(
@@ -5082,7 +5227,7 @@ def main() -> None:
                         fluid_iface_coords=fluid_iface_coords,
                         dt=float(dt),
                         reference_velocity=float(reference_velocity),
-                        include_intermediate_states=bool(args.training_all_states),
+                        include_intermediate_states=bool(reaction_training_all_states),
                         ridge=float(args.reaction_operator_ridge),
                         incremental=str(args.reaction_operator_kind).strip().lower() == "incremental",
                         validation_stride=int(args.reaction_operator_validation_stride),
@@ -5111,7 +5256,7 @@ def main() -> None:
                         fluid_iface_coords=fluid_iface_coords,
                         dt=float(dt),
                         reference_velocity=float(reference_velocity),
-                        include_intermediate_states=bool(args.training_all_states),
+                        include_intermediate_states=bool(reaction_training_all_states),
                         modes=int(args.sampled_reaction_modes),
                         energy=float(args.sampled_reaction_energy),
                         oversampling=int(args.sampled_reaction_oversampling),
@@ -5169,6 +5314,7 @@ def main() -> None:
                     args=args,
                     training_source=[str(item) for item in training_source],
                     training_steps=training_pair_steps,
+                    training_coupling_iters=training_coupling_iters,
                     training_coefficients=training_coefficients_for_model,
                     reaction_operator=reaction_operator,
                     sampled_reaction_operator=sampled_reaction_operator,
@@ -5182,8 +5328,13 @@ def main() -> None:
                             "kind": training_kind,
                             "source": training_source,
                             "steps": training_pair_steps,
+                            "coupling_iters": training_coupling_iters,
                             "all_iters": bool(args.training_all_iters),
-                            "all_states": bool(args.training_all_states),
+                            "all_states": bool(basis_all_states),
+                            "operator_all_states": bool(operator_training_all_states),
+                            "reaction_all_states": bool(reaction_training_all_states),
+                            "interface_enrichment_all_states": bool(interface_enrichment_all_states),
+                            "coefficient_all_states": bool(coefficient_training_all_states),
                             "weights": training_weight_summary,
                         },
                         "interface_load_enrichment": interface_enrichment_summary,
@@ -5351,8 +5502,19 @@ def main() -> None:
             "kind": training_kind,
             "sources": training_source,
             "training_steps": training_pair_steps,
+            "training_coupling_iters": training_coupling_iters,
+            "training_stage_pairs_file": None
+            if args.training_stage_pairs is None
+            else str(Path(args.training_stage_pairs)),
+            "training_stage_pair_count": 0
+            if training_stage_pairs is None
+            else int(len(training_stage_pairs)),
             "training_all_iters": bool(args.training_all_iters),
-            "training_all_states": bool(args.training_all_states),
+            "training_all_states": bool(basis_all_states),
+            "operator_training_all_states": bool(operator_training_all_states),
+            "reaction_training_all_states": bool(reaction_training_all_states),
+            "interface_enrichment_all_states": bool(interface_enrichment_all_states),
+            "coefficient_training_all_states": bool(coefficient_training_all_states),
             "replay_step_overlap": training_replay_overlap,
             "requested_velocity_modes": int(args.velocity_modes),
             "requested_pressure_modes": int(args.pressure_modes),

@@ -13,8 +13,8 @@ from pycutfem.mor.metrics import (
     snapshot_l2_error,
     speedup,
 )
-from pycutfem.nirb.dataset import load_cosim_snapshot_batch
-from pycutfem.nirb.offline import OfflineConfig, RegressionConfig, run_offline_pipeline
+from examples.utils.nirb import load_cosim_snapshot_batch
+from pycutfem.mor.nirb.offline import OfflineConfig, RegressionConfig, run_offline_pipeline
 
 
 def _load_scalar(path: Path) -> float | None:
@@ -33,11 +33,12 @@ def _context_from_batch(batch, n_samples: int, input_features: tuple[str, ...]) 
                 raise ValueError("--input-features includes time, but snapshot metadata has no time_s column")
             context["time"] = np.asarray(batch.times[:n_samples], dtype=float)
         elif name == "coupling_iter":
-            if batch.subiterations is None:
+            values = [dict(item).get("coupling_iter") for item in batch.sample_metadata[:n_samples]]
+            if any(value is None for value in values):
                 raise ValueError(
                     "--input-features includes coupling_iter, but snapshot metadata has no coupling_iter column"
                 )
-            context["coupling_iter"] = np.asarray(batch.subiterations[:n_samples], dtype=float)
+            context["coupling_iter"] = np.asarray(values, dtype=float)
         else:
             raise ValueError(f"Unsupported input feature {name!r}")
     return context
@@ -49,7 +50,7 @@ def _prediction_loop(model, forces: np.ndarray, context: dict[str, np.ndarray] |
         sample_context = None
         if context is not None:
             sample_context = {key: np.asarray(value, dtype=float).reshape(-1)[index] for key, value in context.items()}
-        columns.append(model.predict_full(forces[:, index], context=sample_context)[:, 0])
+        columns.append(model.predict(forces[:, index], context=sample_context)[:, 0])
     return np.column_stack(columns)
 
 
@@ -66,7 +67,7 @@ def _time_prediction(
     batch_prediction = None
     for _ in range(repeats):
         started = time.perf_counter()
-        batch_prediction = model.predict_full(forces, context=context)
+        batch_prediction = model.predict(forces, context=context)
         batch_times.append(time.perf_counter() - started)
 
     loop_times: list[float] = []
@@ -140,8 +141,10 @@ def main() -> None:
         force_key=str(args.force_key),
         displacement_key=str(args.displacement_key),
     )
-    forces = np.asarray(batch.interface_forces, dtype=float)
-    reference = np.asarray(batch.full_displacements, dtype=float)
+    dataset_path = output_dir / "generic_nirb_snapshots.npz"
+    batch.save(dataset_path)
+    forces = np.asarray(batch["interface_load"], dtype=float)
+    reference = np.asarray(batch["solid_displacement"], dtype=float)
     co_sim_dir = Path(batch.metadata["co_sim_dir"])
     interface_matrix_path = Path(args.interface_matrix_path) if args.interface_matrix_path is not None else None
     if interface_matrix_path is None and not bool(args.no_interface_matrix):
@@ -178,10 +181,10 @@ def main() -> None:
     context_eval = _context_from_batch(batch, forces_eval.shape[1], input_features)
 
     config = OfflineConfig(
-        dataset_path=str(args.snapshot_dir),
+        dataset_path=str(dataset_path),
         model_path=str(model_path),
-        force_modes=int(args.force_modes),
-        displacement_modes=int(args.displacement_modes),
+        input_modes=int(args.force_modes),
+        output_modes=int(args.displacement_modes),
         regression=RegressionConfig(
             kind=str(args.regression_kind),
             degree=2,
@@ -192,11 +195,11 @@ def main() -> None:
             power=float(args.knn_power),
         ),
         use_quadratic_decoder=True,
-        dataset_force_key=str(args.force_key),
-        dataset_displacement_key=str(args.displacement_key),
+        dataset_input_field="interface_load",
+        dataset_output_field="solid_displacement",
         zero_anchor_weight=int(args.zero_anchor_weight),
-        interface_matrix_path=None if interface_matrix_path is None else str(interface_matrix_path),
-        input_feature_names=input_features,
+        output_matrix_path=None if interface_matrix_path is None else str(interface_matrix_path),
+        context_feature_names=input_features,
         metadata={"benchmark": "example2", "source": "local_pycutfem_cosim"},
     )
 
@@ -210,9 +213,13 @@ def main() -> None:
     np.save(prediction_path, prediction)
 
     run_root = Path(batch.metadata["run_root"])
-    fom_structure_time_s = float(np.sum(batch.solid_times)) if batch.solid_times is not None else None
+    solid_times = np.asarray(
+        [dict(item).get("solid_time", np.nan) for item in batch.sample_metadata],
+        dtype=float,
+    )
+    fom_structure_time_s = float(np.nansum(solid_times)) if np.all(np.isfinite(solid_times)) else None
     if fom_structure_time_s is not None and args.max_eval_snapshots is not None:
-        fom_structure_time_s = float(np.sum(batch.solid_times[: forces_eval.shape[1]]))
+        fom_structure_time_s = float(np.sum(solid_times[: forces_eval.shape[1]]))
     total_time = _load_scalar(co_sim_dir / "total_solving_time.npy")
     if total_time is None:
         summary = batch.metadata.get("summary", {})

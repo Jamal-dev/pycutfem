@@ -1,6 +1,6 @@
 dataset_path: examples/NIRB/artifacts/example1/train_snapshots.npz
-displacement_modes: 9
-force_modes: 3
+output_modes: 9
+input_modes: 3
 metadata:
   benchmark: example1
 model_path: examples/NIRB/artifacts/example1/model.pkl

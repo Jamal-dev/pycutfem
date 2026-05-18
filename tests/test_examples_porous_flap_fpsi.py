@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from pycutfem.mor.snapshots import SnapshotBatch
-from pycutfem.nirb.dataset import load_cosim_snapshot_batch
+from examples.utils.nirb import load_cosim_snapshot_batch
 
 from examples.poromechanics.porous_flap_fpsi import (
     build_porous_flap_interface_stations,
@@ -89,8 +89,8 @@ def test_porous_flap_fpsi_constant_relaxation_converges_and_writes_outputs(tmp_p
         force_key="load_guess_data",
         displacement_key="porous_state_data",
     )
-    np.testing.assert_allclose(co_sim_batch.interface_forces, result.load_guess_data)
-    np.testing.assert_allclose(co_sim_batch.full_displacements, result.porous_state_data)
+    np.testing.assert_allclose(co_sim_batch["interface_load"], result.load_guess_data)
+    np.testing.assert_allclose(co_sim_batch["solid_displacement"], result.porous_state_data)
 
     saved_batch = SnapshotBatch.load(output / "fpsi_snapshot_batch.npz")
     np.testing.assert_allclose(saved_batch.interface_forces, result.load_guess_data)

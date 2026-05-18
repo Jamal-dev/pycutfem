@@ -23,27 +23,26 @@ def _as_snapshot_matrix(values: np.ndarray) -> np.ndarray:
 @dataclass
 class OnlineConfig:
     model_path: str
-    forces_path: str
+    input_path: str
     predictions_path: str
-    interface_only: bool = False
+    restricted_output: bool = False
 
     @classmethod
     def from_mapping(cls, mapping: dict[str, Any]) -> "OnlineConfig":
-        return cls(**mapping)
+        return cls(**dict(mapping))
 
 
-def load_force_matrix(path: str | Path) -> np.ndarray:
+def load_input_matrix(path: str | Path) -> np.ndarray:
     source = Path(path)
     if source.suffix == ".npy":
         return _as_snapshot_matrix(np.load(source))
     if source.suffix == ".npz":
         with np.load(source) as data:
-            if "forces" in data:
-                return _as_snapshot_matrix(data["forces"])
-            if "interface_forces" in data:
-                return _as_snapshot_matrix(data["interface_forces"])
-        raise ValueError(f"could not find a force matrix in {source}")
-    raise ValueError(f"unsupported force file suffix: {source.suffix}")
+            for key in ("input", "input_snapshots"):
+                if key in data:
+                    return _as_snapshot_matrix(data[key])
+        raise ValueError(f"could not find an input matrix in {source}")
+    raise ValueError(f"unsupported input file suffix: {source.suffix}")
 
 
 def run_online_pipeline(config: OnlineConfig | dict[str, Any]) -> np.ndarray:
@@ -51,14 +50,25 @@ def run_online_pipeline(config: OnlineConfig | dict[str, Any]) -> np.ndarray:
         config = OnlineConfig.from_mapping(config)
 
     model: TrainedNIRBModel = load_model(config.model_path)
-    forces = load_force_matrix(config.forces_path)
-    predictions = model.predict_interface(forces) if config.interface_only else model.predict_full(forces)
+    input_values = load_input_matrix(config.input_path)
+    predictions = (
+        model.predict_restricted(input_values)
+        if bool(config.restricted_output)
+        else model.predict(input_values)
+    )
 
     target = Path(config.predictions_path)
     target.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         target,
         predictions=predictions,
-        interface_only=np.array(config.interface_only, dtype=bool),
+        restricted_output=np.array(config.restricted_output, dtype=bool),
     )
     return predictions
+
+
+__all__ = [
+    "OnlineConfig",
+    "load_input_matrix",
+    "run_online_pipeline",
+]

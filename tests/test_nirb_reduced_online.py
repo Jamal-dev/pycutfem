@@ -3,12 +3,12 @@ import numpy as np
 from examples.NIRB.reduced_fluid import ReducedFluidSolveResult
 from examples.NIRB.reduced_mesh import ReducedMeshMotionOperator, ReducedMeshMotionState
 from examples.NIRB.reduced_online import ReducedFSIState, ReducedOnlineFSISolver
-from pycutfem.nirb.reduced_interface import ReducedIQNILS, ReducedInterfaceSpace
+from pycutfem.mor.nirb.reduced_spaces import ReducedIQNILS, ReducedSpace
 
 
 def test_reduced_online_fsi_solver_converges_without_full_reconstruction() -> None:
-    load_space = ReducedInterfaceSpace(basis=np.eye(1), name="load")
-    displacement_space = ReducedInterfaceSpace(basis=np.eye(1), name="disp")
+    load_space = ReducedSpace(basis=np.eye(1), name="load")
+    displacement_space = ReducedSpace(basis=np.eye(1), name="disp")
     mesh_operator = ReducedMeshMotionOperator(
         stiffness=np.eye(1),
         interface_coupling=-np.eye(1),

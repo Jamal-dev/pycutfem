@@ -3,10 +3,10 @@ from pathlib import Path
 
 import numpy as np
 
-from pycutfem.mor.snapshots import SnapshotBatch
-from pycutfem.nirb.offline import OfflineConfig, RegressionConfig, run_offline_pipeline
-from pycutfem.nirb.online import OnlineConfig, run_online_pipeline
-from pycutfem.nirb.validation import ValidationConfig, validate_rom
+from pycutfem.mor.snapshots import NamedSnapshotBatch
+from pycutfem.mor.nirb.offline import OfflineConfig, RegressionConfig, run_offline_pipeline
+from pycutfem.mor.nirb.online import OnlineConfig, run_online_pipeline
+from pycutfem.mor.nirb.validation import ValidationConfig, validate_rom
 
 
 def test_synthetic_nirb_pipeline_round_trips_through_training_prediction_and_validation(tmp_path: Path):
@@ -42,9 +42,8 @@ def test_synthetic_nirb_pipeline_round_trips_through_training_prediction_and_val
     displacements = displacement_mean + displacement_basis @ reduced_displacements
 
     dataset_path = tmp_path / "synthetic_snapshots.npz"
-    SnapshotBatch(
-        interface_forces=forces,
-        full_displacements=displacements,
+    NamedSnapshotBatch(
+        fields={"input": forces, "output": displacements},
         metadata={"benchmark": "synthetic"},
     ).save(dataset_path)
 
@@ -57,23 +56,23 @@ def test_synthetic_nirb_pipeline_round_trips_through_training_prediction_and_val
         OfflineConfig(
             dataset_path=str(dataset_path),
             model_path=str(model_path),
-            force_modes=2,
-            displacement_modes=2,
+            input_modes=2,
+            output_modes=2,
             regression=RegressionConfig(kind="poly_lasso", standardize_inputs=False),
             use_quadratic_decoder=False,
         )
     )
-    full_predictions = model.predict_full(forces)
+    full_predictions = model.predict(forces)
 
     assert np.allclose(full_predictions, displacements, atol=1.0e-8)
 
-    np.savez_compressed(tmp_path / "forces.npz", forces=forces)
+    np.savez_compressed(tmp_path / "forces.npz", input=forces)
     online_predictions = run_online_pipeline(
         OnlineConfig(
             model_path=str(model_path),
-            forces_path=str(tmp_path / "forces.npz"),
+            input_path=str(tmp_path / "forces.npz"),
             predictions_path=str(predictions_path),
-            interface_only=False,
+            restricted_output=False,
         )
     )
     np.savez_compressed(reference_path, reference=displacements)
@@ -86,8 +85,8 @@ def test_synthetic_nirb_pipeline_round_trips_through_training_prediction_and_val
             thresholds={"mean_sample_l2_error": 1.0e-8, "max_online_relative_displacement_error": 1.0e-8},
             fom_iterations=[10, 12, 11],
             rom_iterations=[10, 12, 11],
-            fom_solid_time=10.0,
-            rom_solid_time=0.1,
+            fom_model_time=10.0,
+            rom_model_time=0.1,
             fom_total_time=50.0,
             rom_total_time=10.0,
         )

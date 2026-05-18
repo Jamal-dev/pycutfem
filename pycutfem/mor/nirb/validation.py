@@ -44,15 +44,20 @@ class ValidationConfig:
     thresholds: dict[str, float] = field(default_factory=dict)
     fom_iterations: list[float] | None = None
     rom_iterations: list[float] | None = None
-    fom_solid_time: float | None = None
-    rom_solid_time: float | None = None
+    fom_model_time: float | None = None
+    rom_model_time: float | None = None
     fom_total_time: float | None = None
     rom_total_time: float | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_mapping(cls, mapping: dict[str, Any]) -> "ValidationConfig":
-        return cls(**mapping)
+        values = dict(mapping)
+        if "fom_solid_time" in values and "fom_model_time" not in values:
+            values["fom_model_time"] = values.pop("fom_solid_time")
+        if "rom_solid_time" in values and "rom_model_time" not in values:
+            values["rom_model_time"] = values.pop("rom_solid_time")
+        return cls(**values)
 
 
 def validate_rom(config: ValidationConfig | dict[str, Any]) -> dict[str, Any]:
@@ -61,19 +66,21 @@ def validate_rom(config: ValidationConfig | dict[str, Any]) -> dict[str, Any]:
 
     reference = _load_snapshot_matrix(
         config.reference_path,
-        preferred_keys=("reference", "displacements", "full_displacements", "predictions"),
+        preferred_keys=("reference", "output", "output_snapshots", "predictions"),
     )
     prediction = _load_snapshot_matrix(
         config.prediction_path,
-        preferred_keys=("predictions", "displacements", "full_displacements"),
+        preferred_keys=("predictions", "output", "output_snapshots"),
     )
 
     metrics = {
         "mean_sample_l2_error": mean_sample_l2_error(reference, prediction),
         "snapshot_l2_error": snapshot_l2_error(reference, prediction),
-        "max_online_relative_displacement_error": max_online_relative_displacement_error(reference, prediction),
-        "online_relative_displacement_error": online_relative_displacement_error(reference, prediction).tolist(),
+        "max_online_relative_output_error": max_online_relative_displacement_error(reference, prediction),
+        "online_relative_output_error": online_relative_displacement_error(reference, prediction).tolist(),
     }
+    metrics["max_online_relative_displacement_error"] = metrics["max_online_relative_output_error"]
+    metrics["online_relative_displacement_error"] = metrics["online_relative_output_error"]
 
     if config.fom_iterations is not None and config.rom_iterations is not None:
         metrics["iteration_overhead"] = accumulated_iteration_overhead(
@@ -81,15 +88,16 @@ def validate_rom(config: ValidationConfig | dict[str, Any]) -> dict[str, Any]:
             np.asarray(config.rom_iterations, dtype=float),
         )
 
-    if config.fom_solid_time is not None and config.rom_solid_time is not None:
+    if config.fom_model_time is not None and config.rom_model_time is not None:
         metrics.update(
             build_speedup_report(
-                fom_solid_time=config.fom_solid_time,
-                rom_solid_time=config.rom_solid_time,
+                fom_solid_time=config.fom_model_time,
+                rom_solid_time=config.rom_model_time,
                 fom_total_time=config.fom_total_time,
                 rom_total_time=config.rom_total_time,
             )
         )
+        metrics["model_speedup"] = metrics["solid_speedup"]
 
     passes = {}
     for name, threshold in config.thresholds.items():

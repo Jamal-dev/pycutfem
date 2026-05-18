@@ -4,7 +4,11 @@ This directory reproduces the paper's Example 2 inside `pycutfem`.
 The target is not to reuse the author's reduced-order outputs as the primary
 workflow, but to generate the full-order snapshots locally, validate them
 against the public Kratos benchmark, and then feed those snapshots into the
-general `pycutfem.mor` and `pycutfem.nirb` modules.
+general `pycutfem.mor` and `pycutfem.mor.nirb` modules.
+
+The reusable NIRB implementation is now under `pycutfem.mor.nirb` and uses
+generic input/output names.  FSI-specific loaders and solid/interface adapters
+for this example live under `examples/utils/nirb`.
 
 The benchmark path is now:
 

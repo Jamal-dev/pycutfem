@@ -2,9 +2,9 @@ from pathlib import Path
 
 import numpy as np
 
-from pycutfem.mor.snapshots import SnapshotBatch
-from pycutfem.nirb.coupling import NIRBSolidPredictor
-from pycutfem.nirb.offline import OfflineConfig, RegressionConfig, run_offline_pipeline
+from pycutfem.mor.snapshots import NamedSnapshotBatch
+from examples.utils.nirb import NIRBSolidPredictor
+from pycutfem.mor.nirb.offline import OfflineConfig, RegressionConfig, run_offline_pipeline
 
 
 def test_offline_pipeline_accepts_full_interface_restriction_matrix(tmp_path: Path):
@@ -27,7 +27,7 @@ def test_offline_pipeline_accepts_full_interface_restriction_matrix(tmp_path: Pa
     dataset_path = tmp_path / "dataset.npz"
     model_path = tmp_path / "model.pkl"
     interface_matrix_path = tmp_path / "interface.npy"
-    SnapshotBatch(interface_forces=forces, full_displacements=displacements).save(dataset_path)
+    NamedSnapshotBatch(fields={"input": forces, "output": displacements}).save(dataset_path)
 
     interface_matrix = np.array(
         [
@@ -41,16 +41,16 @@ def test_offline_pipeline_accepts_full_interface_restriction_matrix(tmp_path: Pa
         OfflineConfig(
             dataset_path=str(dataset_path),
             model_path=str(model_path),
-            force_modes=2,
-            displacement_modes=2,
+            input_modes=2,
+            output_modes=2,
             regression=RegressionConfig(kind="tps_rbf"),
             use_quadratic_decoder=False,
-            interface_matrix_path=str(interface_matrix_path),
+            output_matrix_path=str(interface_matrix_path),
         )
     )
 
-    predicted_full = model.predict_full(forces)
-    predicted_interface = model.predict_interface(forces)
+    predicted_full = model.predict(forces)
+    predicted_interface = model.predict_restricted(forces)
     assert np.allclose(predicted_interface, interface_matrix @ predicted_full, atol=1.0e-8)
 
 
@@ -72,14 +72,14 @@ def test_nirb_predictor_uses_runtime_interface_restriction_for_algorithm2(tmp_pa
 
     dataset_path = tmp_path / "dataset.npz"
     model_path = tmp_path / "model.pkl"
-    SnapshotBatch(interface_forces=reduced_forces, full_displacements=displacements).save(dataset_path)
+    NamedSnapshotBatch(fields={"input": reduced_forces, "output": displacements}).save(dataset_path)
 
     model = run_offline_pipeline(
         OfflineConfig(
             dataset_path=str(dataset_path),
             model_path=str(model_path),
-            force_modes=2,
-            displacement_modes=2,
+            input_modes=2,
+            output_modes=2,
             regression=RegressionConfig(kind="tps_rbf"),
             use_quadratic_decoder=False,
         )
@@ -107,6 +107,6 @@ def test_nirb_predictor_uses_runtime_interface_restriction_for_algorithm2(tmp_pa
     assert np.allclose(prediction.interface_displacement, interface_matrix @ full_from_reduced, atol=1.0e-8)
     assert np.allclose(
         prediction.interface_displacement,
-        (interface_matrix @ model.predict_full(reduced_forces[:, 2]))[:, 0],
+        (interface_matrix @ model.predict(reduced_forces[:, 2]))[:, 0],
         atol=1.0e-8,
     )

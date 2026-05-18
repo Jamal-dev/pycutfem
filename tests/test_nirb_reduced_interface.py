@@ -2,13 +2,13 @@ from pathlib import Path
 
 import numpy as np
 
-from pycutfem.mor.snapshots import SnapshotBatch
-from pycutfem.nirb.coupling import NIRBSolidPredictor
-from pycutfem.nirb.offline import OfflineConfig, RegressionConfig, run_offline_pipeline
-from pycutfem.nirb.reduced_interface import (
+from pycutfem.mor.snapshots import NamedSnapshotBatch
+from examples.utils.nirb import NIRBSolidPredictor
+from pycutfem.mor.nirb.offline import OfflineConfig, RegressionConfig, run_offline_pipeline
+from pycutfem.mor.nirb.reduced_spaces import (
     ReducedIQNILS,
-    ReducedInterfaceDecoder,
-    ReducedInterfaceSpace,
+    ReducedOutputDecoder,
+    ReducedSpace,
     ReducedTransfer,
 )
 
@@ -22,7 +22,7 @@ def test_reduced_interface_space_projects_with_mass_matrix() -> None:
         ]
     )
     mass = np.array([2.0, 0.5, 1.0])
-    space = ReducedInterfaceSpace(basis=basis, mass=mass)
+    space = ReducedSpace(basis=basis, mass=mass)
     coefficients = np.array([0.25, -0.5])
     values = space.reconstruct(coefficients)
 
@@ -31,7 +31,7 @@ def test_reduced_interface_space_projects_with_mass_matrix() -> None:
 
 
 def test_reduced_transfer_matches_projected_full_transfer() -> None:
-    source = ReducedInterfaceSpace(
+    source = ReducedSpace(
         basis=np.array(
             [
                 [1.0, 0.0],
@@ -41,7 +41,7 @@ def test_reduced_transfer_matches_projected_full_transfer() -> None:
         ),
         name="source",
     )
-    target = ReducedInterfaceSpace(
+    target = ReducedSpace(
         basis=np.array(
             [
                 [1.0, 0.0],
@@ -85,13 +85,13 @@ def test_nirb_predictor_can_return_reduced_interface_without_full_decode(tmp_pat
 
     dataset_path = tmp_path / "dataset.npz"
     model_path = tmp_path / "model.pkl"
-    SnapshotBatch(interface_forces=reduced_forces, full_displacements=displacements).save(dataset_path)
+    NamedSnapshotBatch(fields={"input": reduced_forces, "output": displacements}).save(dataset_path)
     model = run_offline_pipeline(
         OfflineConfig(
             dataset_path=str(dataset_path),
             model_path=str(model_path),
-            force_modes=2,
-            displacement_modes=2,
+            input_modes=2,
+            output_modes=2,
             regression=RegressionConfig(kind="tps_rbf"),
             use_quadratic_decoder=False,
         )
@@ -103,20 +103,20 @@ def test_nirb_predictor_can_return_reduced_interface_without_full_decode(tmp_pat
             [0.0, 0.0, 1.0, 0.0],
         ]
     )
-    interface_space = ReducedInterfaceSpace(basis=np.eye(2), name="solid-interface")
-    reduced_decoder = ReducedInterfaceDecoder.from_full_decoder(
-        linear_basis=model.decoder.linear_basis,
-        quadratic_basis=model.decoder.quadratic_basis,
-        mean=model.decoder.mean,
+    interface_space = ReducedSpace(basis=np.eye(2), name="solid-interface")
+    reduced_decoder = ReducedOutputDecoder.from_full_decoder(
+        linear_basis=model.output_decoder.linear_basis,
+        quadratic_basis=model.output_decoder.quadratic_basis,
+        mean=model.output_decoder.mean,
         output_space=interface_space,
         restriction_matrix=restriction,
-        feature_map=model.decoder.feature_map,
+        feature_map=model.output_decoder.feature_map,
     )
     predictor = NIRBSolidPredictor(model=model, reduced_interface_decoder=reduced_decoder)
 
-    force_coeffs = model.force_basis.project(reduced_forces[:, 2].reshape(-1, 1))[:, 0]
+    force_coeffs = model.input_basis.project(reduced_forces[:, 2].reshape(-1, 1))[:, 0]
     prediction = predictor.predict_reduced_interface_from_force_coefficients(force_coeffs)
-    full_prediction = model.predict_full(reduced_forces[:, 2])[:, 0]
+    full_prediction = model.predict(reduced_forces[:, 2])[:, 0]
 
     assert prediction.full_displacement is None
     assert prediction.interface_displacement is None

@@ -29,8 +29,17 @@ from pycutfem.linalg import (
     kratos_iqnils_iteration_matrices_cpp,
     kratos_iqnils_next_iterate_cpp,
 )
+from pycutfem.mor import (
+    GappyPODQuantityOperator,
+    LocalReducedModelBankEntry,
+    OnlineErrorCalibrator,
+    SampleStateTransaction,
+    build_stage_break_even_certificate,
+    load_local_reduced_model_bank_manifest,
+    select_local_reduced_model_bank,
+)
 from pycutfem.mor.interface import build_restriction_matrix
-from pycutfem.nirb.coupling import NIRBInterfaceTangentCorrector, NIRBSolidPrediction, NIRBSolidPredictor
+from examples.utils.nirb import NIRBInterfaceTangentCorrector, NIRBSolidPrediction, NIRBSolidPredictor
 from pycutfem.operators import LocalAssemblyResult, RuntimeOperator
 from pycutfem.solvers.nonlinear_solver import (
     LinearSolverParameters,
@@ -7104,6 +7113,9 @@ def _flush_progress_artifacts(
             "nirb_force_trust_next_coefficient_ratio",
             "nirb_force_trust_next_reason",
             "fluid_hrom_used",
+            "fluid_hrom_model_id",
+            "fluid_hrom_model_selection_reason",
+            "fluid_hrom_model_selection_distance",
             "fluid_hrom_trial_used",
             "fluid_hrom_trial_load_rel_error",
             "fluid_hrom_disabled_by_trial_monitor",
@@ -7113,6 +7125,11 @@ def _flush_progress_artifacts(
             "fluid_hrom_load_contraction_ratio",
             "fluid_hrom_manifold_distance",
             "fluid_hrom_eta_gamma",
+            "fluid_hrom_eta_bound",
+            "fluid_hrom_eta_effective_tolerance",
+            "fluid_hrom_eta_reliability_factor",
+            "fluid_hrom_eta_true_error",
+            "fluid_hrom_prior_gate_reason",
             "fluid_hrom_dwr_error",
             "fluid_hrom_estimated_residual_norm",
             "fluid_hrom_iterations",
@@ -7655,6 +7672,7 @@ class _SampledLSPGHybridModel:
     reaction_sample_element_ids: np.ndarray | None = None
     reaction_sample_to_coefficients: np.ndarray | None = None
     reaction_sample_output_positions: np.ndarray | None = None
+    reaction_operator: GappyPODQuantityOperator | None = None
     impedance_matrix: np.ndarray | None = None
     impedance_bias: np.ndarray | None = None
     impedance_coords: np.ndarray | None = None
@@ -7690,6 +7708,7 @@ class _SampledLSPGHybridModel:
             and self.reaction_sample_element_ids is not None
             and self.reaction_sample_to_coefficients is not None
             and self.reaction_sample_output_positions is not None
+            and self.reaction_operator is not None
         )
 
     @property
@@ -7741,25 +7760,18 @@ class _SampledLSPGHybridModel:
         if not self.has_sampled_reaction:
             raise RuntimeError("Fluid HROM model does not contain a sampled nonlinear reaction operator.")
         coords = np.asarray(self.reaction_coords, dtype=float)
-        basis = np.asarray(self.reaction_basis, dtype=float)
-        mean = np.asarray(self.reaction_mean, dtype=float).reshape(-1)
-        sample_positions = np.asarray(self.reaction_sample_output_positions, dtype=int).reshape(-1)
-        sample_to_coefficients = np.asarray(self.reaction_sample_to_coefficients, dtype=float)
+        operator = self.reaction_operator
+        if operator is None:
+            raise RuntimeError("Sampled nonlinear reaction operator is not initialized.")
         values = np.asarray(sample_row_values, dtype=float).reshape(-1)
         if coords.ndim != 2 or int(coords.shape[1]) != 2:
             raise RuntimeError("Sampled reaction coordinates must have shape (n_points, 2).")
         output_size = 2 * int(coords.shape[0])
-        if basis.ndim != 2 or int(basis.shape[0]) != output_size or int(mean.size) != output_size:
-            raise RuntimeError("Sampled reaction basis/mean shape is incompatible with reaction coordinates.")
-        if int(values.size) != int(sample_positions.size):
+        if int(operator.n_features) != output_size:
+            raise RuntimeError("Sampled reaction operator output size is incompatible with reaction coordinates.")
+        if int(values.size) != int(operator.n_samples):
             raise RuntimeError("Sampled reaction values size does not match sample output positions.")
-        if np.any(sample_positions < 0) or np.any(sample_positions >= output_size):
-            raise RuntimeError("Sampled reaction output positions are out of range.")
-        if sample_to_coefficients.shape != (int(basis.shape[1]), int(sample_positions.size)):
-            raise RuntimeError("Sampled reaction reconstruction map has incompatible shape.")
-        sample_delta = values - mean[sample_positions]
-        coefficients = sample_to_coefficients @ sample_delta
-        reconstructed = mean + basis @ coefficients
+        reconstructed = operator.reconstruct_from_samples(values)
         if not np.all(np.isfinite(reconstructed)):
             raise RuntimeError("Sampled nonlinear reaction operator produced non-finite values.")
         return CoordinateLookup(coords, reconstructed.reshape(-1, 2), dim=2)
@@ -7956,6 +7968,7 @@ def _load_sampled_lspg_hybrid_model(path: Path, *, total_dofs: int, n_elements: 
             if "reaction_sample_output_positions" in data.files
             else None
         )
+        reaction_operator: GappyPODQuantityOperator | None = None
         if str(reaction_nonlinear_kind).strip().lower() not in {"", "none"}:
             if (
                 reaction_coords is None
@@ -7998,6 +8011,19 @@ def _load_sampled_lspg_hybrid_model(path: Path, *, total_dofs: int, n_elements: 
                 and np.all(np.isfinite(reaction_sample_to_coefficients))
             ):
                 raise RuntimeError("Sampled nonlinear reaction arrays must be finite.")
+            reaction_operator = GappyPODQuantityOperator(
+                basis=reaction_basis,
+                sample_rows=reaction_sample_output_positions,
+                offset=reaction_mean,
+                sample_to_coefficients=reaction_sample_to_coefficients,
+                name="fluid_interface_reaction",
+                metadata={
+                    "source_path": str(source),
+                    "reaction_nonlinear_kind": str(reaction_nonlinear_kind),
+                    "sample_row_dofs": np.asarray(reaction_sample_row_dofs, dtype=int).tolist(),
+                    "sample_element_ids": np.asarray(reaction_sample_element_ids, dtype=int).tolist(),
+                },
+            )
         impedance_matrix = np.asarray(data["impedance_matrix"], dtype=float) if "impedance_matrix" in data.files else None
         impedance_bias = (
             np.asarray(data["impedance_bias"], dtype=float).reshape(-1)
@@ -8132,6 +8158,7 @@ def _load_sampled_lspg_hybrid_model(path: Path, *, total_dofs: int, n_elements: 
             reaction_sample_element_ids=reaction_sample_element_ids,
             reaction_sample_to_coefficients=reaction_sample_to_coefficients,
             reaction_sample_output_positions=reaction_sample_output_positions,
+            reaction_operator=reaction_operator,
             impedance_matrix=impedance_matrix,
             impedance_bias=impedance_bias,
             impedance_coords=impedance_coords,
@@ -8342,6 +8369,21 @@ def _solve_sampled_lspg_hybrid_fluid_stage(
         raise ValueError(f"Unsupported sampled fluid GNAT step backend {gnat_step_backend!r}.")
     if gnat_step_backend_value == "c++":
         gnat_step_backend_value = "cpp"
+    dvms_transaction = None
+    dvms_state = prob.get("dvms_state")
+    if bool(sample_writer is not None) and dvms_state is not None:
+        dvms_arrays: dict[str, np.ndarray] = {}
+        for name in (
+            "predicted_subscale_velocity",
+            "momentum_projection",
+            "mass_projection",
+            "old_mass_residual",
+        ):
+            values = getattr(dvms_state, name, None)
+            if values is not None:
+                dvms_arrays[name] = np.asarray(values)
+        if dvms_arrays:
+            dvms_transaction = SampleStateTransaction(dvms_arrays)
 
     def slice_element_locals(
         field_locals: dict[str, np.ndarray] | None,
@@ -8517,7 +8559,11 @@ def _solve_sampled_lspg_hybrid_fluid_stage(
                 alpha = 0.5**search_iter
                 trial_coeffs = coeffs + float(alpha) * step
                 first_before = bool(first_assembly)
-                residual_trial, _trial_matrix, trial_norm = assemble(trial_coeffs)
+                if dvms_transaction is None:
+                    residual_trial, _trial_matrix, trial_norm = assemble(trial_coeffs)
+                else:
+                    with dvms_transaction.trial():
+                        residual_trial, _trial_matrix, trial_norm = assemble(trial_coeffs)
                 del residual_trial, _trial_matrix
                 if trial_norm < best_norm:
                     best_norm = float(trial_norm)
@@ -8661,9 +8707,9 @@ class _NIRBForceManifoldTrust:
         coeff_factor: float,
         max_projection_rel: float,
     ) -> "_NIRBForceManifoldTrust":
-        force_basis = getattr(model, "force_basis", None)
+        force_basis = getattr(model, "input_basis", None)
         if force_basis is None:
-            raise RuntimeError("NIRB force-manifold trust requires a model with a force_basis.")
+            raise RuntimeError("NIRB force-manifold trust requires a model with an input_basis.")
         basis = np.asarray(getattr(force_basis, "basis"), dtype=float)
         mean = np.asarray(getattr(force_basis, "mean"), dtype=float).reshape(-1)
         if basis.ndim != 2 or basis.shape[0] != mean.size:
@@ -9376,6 +9422,28 @@ def parse_args() -> argparse.Namespace:
         help="Deployable .npz sampled-LSPG fluid HROM model when --fluid-operator=sampled_lspg_hybrid.",
     )
     parser.add_argument(
+        "--fluid-hrom-bank-manifest",
+        type=Path,
+        default=None,
+        help=(
+            "JSON manifest for a local sampled-LSPG HROM bank. Each bank entry has its own basis/sample "
+            "matrix/reaction operator and an active step interval. This is the deployable path for nonlinear "
+            "regime-local V/P spaces."
+        ),
+    )
+    parser.add_argument(
+        "--fluid-hrom-bank-feature",
+        choices=("none", "stage", "stage_load", "stage_load_interface"),
+        default="none",
+        help=(
+            "Feature vector used to select among overlapping local HROM banks. 'none' keeps step/priority-only "
+            "selection. 'stage' uses step and coupling iteration; 'stage_load' also uses previous load/disp "
+            "residuals and interface-load RMS; 'stage_load_interface' also includes interface displacement and "
+            "mesh-velocity RMS. Entries with feature_center/feature_scale and max_feature_distance can then "
+            "act as nonlinear regime-local V/P/P-sampling banks."
+        ),
+    )
+    parser.add_argument(
         "--fluid-hrom-switch-iter",
         type=int,
         default=None,
@@ -9549,6 +9617,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--fluid-hrom-max-candidate-load-rel",
+        type=float,
+        default=float("inf"),
+        help=(
+            "Reject a candidate HROM stage before commit when its interface-load relative residual is above "
+            "this value. Setting this near the coupling tolerance uses HROM only as a certified final "
+            "coupling correction and prevents accepted HROM stages from adding outer iterations."
+        ),
+    )
+    parser.add_argument(
         "--fluid-hrom-require-exact-accept",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -9695,6 +9773,58 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--fluid-hrom-eta-policy",
+        choices=("fixed", "calibrated"),
+        default="fixed",
+        help=(
+            "Interface-load estimator policy. 'fixed' uses --fluid-hrom-interface-load-tolerance directly. "
+            "'calibrated' learns a reliability factor from HROM attempts that fall back to exact fluid."
+        ),
+    )
+    parser.add_argument(
+        "--fluid-hrom-eta-max-tolerance",
+        type=float,
+        default=float("inf"),
+        help=(
+            "Hard cap for calibrated eta_Gamma acceptance. Use this to prevent the learned reliability factor "
+            "from accepting arbitrarily large indicator values."
+        ),
+    )
+    parser.add_argument(
+        "--fluid-hrom-eta-min-calibration-samples",
+        type=int,
+        default=4,
+        help="Number of exact-correction samples needed before eta_Gamma reliability calibration changes the gate.",
+    )
+    parser.add_argument(
+        "--fluid-hrom-eta-quantile",
+        type=float,
+        default=0.9,
+        help="Quantile of observed true_error/eta_Gamma ratios used by the calibrated eta policy.",
+    )
+    parser.add_argument(
+        "--fluid-hrom-eta-safety-factor",
+        type=float,
+        default=1.25,
+        help="Safety multiplier applied to the calibrated eta_Gamma reliability quantile.",
+    )
+    parser.add_argument(
+        "--fluid-hrom-prior-gate-cooldown-steps",
+        type=int,
+        default=0,
+        help=(
+            "When calibrated eta failures repeat, skip HROM attempts for this many global steps and run FOM "
+            "directly. The same cooldown is applied after certified manifold, interface-trust, "
+            "and precommit-contraction failures. This removes rejected-HROM overhead while periodically retrying."
+        ),
+    )
+    parser.add_argument(
+        "--fluid-hrom-prior-gate-failure-threshold",
+        type=int,
+        default=3,
+        help="Consecutive calibrated eta failures before the prior gate enters cooldown.",
+    )
+    parser.add_argument(
         "--fluid-hrom-max-dwr-error",
         type=float,
         default=float("inf"),
@@ -9710,6 +9840,24 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Directory where HROM-attempted stages that fall back to exact fluid are dumped as pre/post "
             "fluid-stage probes for later incremental POD and HROM retraining."
+        ),
+    )
+    parser.add_argument(
+        "--fluid-hrom-adaptive-db-record-prior-skips",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Also dump exact pre/post fluid-stage probes during calibrated prior-gate cooldown skips. "
+            "This collects training data in the regions where the current local bank is not trusted."
+        ),
+    )
+    parser.add_argument(
+        "--fluid-hrom-adaptive-db-skip-stride",
+        type=int,
+        default=0,
+        help=(
+            "Global-step stride for prior-skip adaptive DB recording. Use 0 or 1 to record every eligible "
+            "cooldown step; larger values keep the enrichment database smaller."
         ),
     )
     parser.add_argument(
@@ -10234,6 +10382,8 @@ def run_local_example2(
     reduced_mesh_surrogate_path: Path | None = None,
     fluid_operator: str = "exact",
     fluid_hrom_model_path: Path | None = None,
+    fluid_hrom_bank_manifest: Path | None = None,
+    fluid_hrom_bank_feature: str = "none",
     fluid_hrom_switch_iter: int | None = None,
     fluid_hrom_late_switch_step: int = 0,
     fluid_hrom_late_switch_iter: int | None = None,
@@ -10255,6 +10405,7 @@ def run_local_example2(
     fluid_hrom_max_consecutive_stages: int = 0,
     fluid_hrom_max_stages_per_step: int = 0,
     fluid_hrom_max_load_contraction_ratio: float = float("inf"),
+    fluid_hrom_max_candidate_load_rel: float = float("inf"),
     fluid_hrom_require_exact_accept: bool = False,
     fluid_hrom_trial_exact_correct: bool = False,
     fluid_hrom_max_trial_load_rel_error: float = float("inf"),
@@ -10272,8 +10423,17 @@ def run_local_example2(
     fluid_hrom_max_manifold_distance: float = float("inf"),
     fluid_hrom_interface_load_tolerance: float = float("inf"),
     fluid_hrom_use_estimator_load_on_accept: bool = False,
+    fluid_hrom_eta_policy: str = "fixed",
+    fluid_hrom_eta_max_tolerance: float = float("inf"),
+    fluid_hrom_eta_min_calibration_samples: int = 4,
+    fluid_hrom_eta_quantile: float = 0.9,
+    fluid_hrom_eta_safety_factor: float = 1.25,
+    fluid_hrom_prior_gate_cooldown_steps: int = 0,
+    fluid_hrom_prior_gate_failure_threshold: int = 3,
     fluid_hrom_max_dwr_error: float = float("inf"),
     fluid_hrom_adaptive_db_dir: Path | None = None,
+    fluid_hrom_adaptive_db_record_prior_skips: bool = False,
+    fluid_hrom_adaptive_db_skip_stride: int = 0,
     fluid_hrom_certified_relaxation: str = "none",
     fluid_hrom_certified_relaxation_growth: float = 1.25,
     fluid_hrom_certified_relaxation_shrink: float = 0.5,
@@ -10453,8 +10613,11 @@ def run_local_example2(
         if legacy_exact_flag in {"1", "true", "yes"}:
             fluid_operator_mode = "exact"
     use_sampled_lspg_hybrid_fluid = fluid_operator_mode == "sampled_lspg_hybrid"
-    if bool(use_sampled_lspg_hybrid_fluid) and fluid_hrom_model_path is None:
-        raise ValueError("--fluid-hrom-model-path is required when --fluid-operator=sampled_lspg_hybrid")
+    if bool(use_sampled_lspg_hybrid_fluid) and fluid_hrom_model_path is None and fluid_hrom_bank_manifest is None:
+        raise ValueError(
+            "--fluid-hrom-model-path or --fluid-hrom-bank-manifest is required "
+            "when --fluid-operator=sampled_lspg_hybrid"
+        )
     use_exact_fluid_operator = fluid_operator_mode in {"exact", "sampled_lspg_hybrid"}
     solid_operator_mode = str(solid_operator).strip().lower()
     solid_operator_mode = solid_operator_mode.replace("-", "_")
@@ -11030,6 +11193,22 @@ def run_local_example2(
     mu_s = float(setup.material.shear_modulus)
     lambda_s = float(setup.material.lame_lambda)
     sampled_lspg_hybrid_model: _SampledLSPGHybridModel | None = None
+    sampled_lspg_hybrid_default_model: _SampledLSPGHybridModel | None = None
+    sampled_lspg_hybrid_bank_entries: tuple[LocalReducedModelBankEntry, ...] = ()
+    sampled_lspg_hybrid_bank_models: dict[str, _SampledLSPGHybridModel] = {}
+    sampled_lspg_hybrid_bank_selection_count: dict[str, int] = {}
+    sampled_lspg_hybrid_active_model_id = ""
+    sampled_lspg_hybrid_active_selection_reason = ""
+    sampled_lspg_hybrid_active_selection_distance = float("nan")
+    sampled_lspg_hybrid_bank_feature_mode = str(fluid_hrom_bank_feature or "none").strip().lower()
+    sampled_lspg_hybrid_bank_feature_names: tuple[str, ...] = ()
+    if sampled_lspg_hybrid_bank_feature_mode not in {
+        "none",
+        "stage",
+        "stage_load",
+        "stage_load_interface",
+    }:
+        raise ValueError(f"Unsupported fluid_hrom_bank_feature={fluid_hrom_bank_feature!r}.")
     sampled_lspg_hybrid_start_step = max(1, int(fluid_hrom_start_step))
     sampled_lspg_hybrid_switch_iter = 0
     sampled_lspg_hybrid_late_switch_step = max(0, int(fluid_hrom_late_switch_step))
@@ -11065,6 +11244,7 @@ def run_local_example2(
     sampled_lspg_hybrid_exact_correction_count = 0
     sampled_lspg_hybrid_trial_monitor_failures = 0
     sampled_lspg_hybrid_contraction_monitor_failures = 0
+    sampled_lspg_hybrid_candidate_load_gate_failures = 0
     sampled_lspg_hybrid_interface_reject_count = 0
     sampled_lspg_hybrid_interface_correction_count = 0
     sampled_lspg_hybrid_manifold_gate_failures = 0
@@ -11165,6 +11345,7 @@ def run_local_example2(
     fluid_hrom_disabled_until_step = -1
     fluid_hrom_cost_samples: list[float] = []
     fluid_exact_cost_samples: list[float] = []
+    fluid_hrom_cost_certificate: dict[str, object] | None = None
     fluid_hrom_min_previous_load_rel_value = max(0.0, float(fluid_hrom_min_previous_load_rel))
     fluid_hrom_max_previous_load_rel_value = float(fluid_hrom_max_previous_load_rel)
     fluid_hrom_max_trial_load_rel_error_value = float(fluid_hrom_max_trial_load_rel_error)
@@ -11191,8 +11372,19 @@ def run_local_example2(
         raise ValueError(f"Unsupported fluid_hrom_reaction_source={fluid_hrom_reaction_source!r}.")
     fluid_hrom_max_manifold_distance_value = float(fluid_hrom_max_manifold_distance)
     fluid_hrom_interface_load_tolerance_value = float(fluid_hrom_interface_load_tolerance)
+    fluid_hrom_eta_policy_value = str(fluid_hrom_eta_policy or "fixed").strip().lower()
+    if fluid_hrom_eta_policy_value not in {"fixed", "calibrated"}:
+        raise ValueError(f"Unsupported fluid_hrom_eta_policy={fluid_hrom_eta_policy!r}.")
+    fluid_hrom_eta_max_tolerance_value = float(fluid_hrom_eta_max_tolerance)
+    fluid_hrom_eta_min_calibration_samples_value = max(1, int(fluid_hrom_eta_min_calibration_samples))
+    fluid_hrom_eta_quantile_value = float(np.clip(float(fluid_hrom_eta_quantile), 0.0, 1.0))
+    fluid_hrom_eta_safety_factor_value = float(fluid_hrom_eta_safety_factor)
+    fluid_hrom_prior_gate_cooldown_steps_value = max(0, int(fluid_hrom_prior_gate_cooldown_steps))
+    fluid_hrom_prior_gate_failure_threshold_value = max(1, int(fluid_hrom_prior_gate_failure_threshold))
     fluid_hrom_max_dwr_error_value = float(fluid_hrom_max_dwr_error)
     fluid_hrom_adaptive_db_path = None if fluid_hrom_adaptive_db_dir is None else Path(fluid_hrom_adaptive_db_dir)
+    fluid_hrom_adaptive_db_record_prior_skips_value = bool(fluid_hrom_adaptive_db_record_prior_skips)
+    fluid_hrom_adaptive_db_skip_stride_value = max(0, int(fluid_hrom_adaptive_db_skip_stride))
     fluid_hrom_certified_relaxation_value = str(fluid_hrom_certified_relaxation or "none").strip().lower()
     if fluid_hrom_certified_relaxation_value not in {"none", "adaptive"}:
         raise ValueError(
@@ -11210,6 +11402,10 @@ def run_local_example2(
         raise ValueError("fluid_hrom_max_manifold_distance must be non-negative.")
     if fluid_hrom_interface_load_tolerance_value < 0.0:
         raise ValueError("fluid_hrom_interface_load_tolerance must be non-negative.")
+    if fluid_hrom_eta_max_tolerance_value < 0.0:
+        raise ValueError("fluid_hrom_eta_max_tolerance must be non-negative.")
+    if not np.isfinite(float(fluid_hrom_eta_safety_factor_value)) or float(fluid_hrom_eta_safety_factor_value) <= 0.0:
+        raise ValueError("fluid_hrom_eta_safety_factor must be finite and positive.")
     if fluid_hrom_max_dwr_error_value < 0.0:
         raise ValueError("fluid_hrom_max_dwr_error must be non-negative.")
     if fluid_hrom_min_previous_load_rel_value > fluid_hrom_max_previous_load_rel_value:
@@ -11223,12 +11419,165 @@ def run_local_example2(
     fluid_hrom_max_load_contraction_ratio_value = float(fluid_hrom_max_load_contraction_ratio)
     if fluid_hrom_max_load_contraction_ratio_value < 0.0:
         raise ValueError("fluid_hrom_max_load_contraction_ratio must be non-negative.")
-    if bool(use_sampled_lspg_hybrid_fluid):
-        sampled_lspg_hybrid_model = _load_sampled_lspg_hybrid_model(
-            Path(fluid_hrom_model_path),
-            total_dofs=int(fluid["dh"].total_dofs),
-            n_elements=int(mesh_f.n_elements),
+    fluid_hrom_max_candidate_load_rel_value = float(fluid_hrom_max_candidate_load_rel)
+    if fluid_hrom_max_candidate_load_rel_value < 0.0:
+        raise ValueError("fluid_hrom_max_candidate_load_rel must be non-negative.")
+    fluid_hrom_base_max_manifold_distance_value = float(fluid_hrom_max_manifold_distance_value)
+    fluid_hrom_base_interface_load_tolerance_value = float(fluid_hrom_interface_load_tolerance_value)
+    fluid_hrom_base_max_load_contraction_ratio_value = float(fluid_hrom_max_load_contraction_ratio_value)
+    fluid_hrom_base_max_candidate_load_rel_value = float(fluid_hrom_max_candidate_load_rel_value)
+
+    def _fluid_hrom_bank_feature_vector(
+        *,
+        step_value: int,
+        time_value: float,
+        coupling_iter_value: int,
+        previous_disp_abs: float,
+        previous_load_rel: float,
+        previous_disp_rel: float,
+        previous_load_abs: float,
+        load_values: np.ndarray,
+        interface_disp_values: np.ndarray,
+        mesh_velocity_values: np.ndarray,
+        solid_rom_full_residual_rel_value: float,
+        solid_rom_interface_disp_rel_value: float,
+        dt_stage: float,
+    ) -> np.ndarray | None:
+        mode = str(sampled_lspg_hybrid_bank_feature_mode)
+        if mode == "none":
+            return None
+
+        def _log_rel(value: float) -> float:
+            val = float(value)
+            if not np.isfinite(val) or val < 0.0:
+                return 16.0
+            return float(np.log10(max(val, 1.0e-16)))
+
+        def _rms(values: np.ndarray) -> float:
+            arr = np.asarray(values, dtype=float).reshape(-1)
+            if arr.size == 0:
+                return 0.0
+            return float(np.linalg.norm(arr) / np.sqrt(float(arr.size)))
+
+        def _max_abs(values: np.ndarray) -> float:
+            arr = np.asarray(values, dtype=float).reshape(-1)
+            if arr.size == 0:
+                return 0.0
+            return float(np.max(np.abs(arr)))
+
+        named_feature_names = tuple(sampled_lspg_hybrid_bank_feature_names)
+        if named_feature_names:
+            load_guess_max_value = _max_abs(np.asarray(load_values, dtype=float))
+            interface_disp_max_value = _max_abs(np.asarray(interface_disp_values, dtype=float))
+            mesh_velocity_rms_value = _rms(np.asarray(mesh_velocity_values, dtype=float))
+            feature_values = {
+                "step": float(step_value),
+                "time_s": float(time_value),
+                "coupling_iter": float(coupling_iter_value),
+                "disp_abs": float(previous_disp_abs),
+                "disp_rel": float(previous_disp_rel),
+                "load_abs": float(previous_load_abs),
+                "load_rel": float(previous_load_rel),
+                "log10_disp_abs": _log_rel(float(previous_disp_abs)),
+                "log10_disp_rel": _log_rel(float(previous_disp_rel)),
+                "log10_load_abs": _log_rel(float(previous_load_abs)),
+                "log10_load_rel": _log_rel(float(previous_load_rel)),
+                "disp_max": float(interface_disp_max_value),
+                "interface_disp_max": float(interface_disp_max_value),
+                "interface_disp_rms": _rms(np.asarray(interface_disp_values, dtype=float)),
+                "load_guess_max": float(load_guess_max_value),
+                "load_guess_rms": _rms(np.asarray(load_values, dtype=float)),
+                # This is a prior selector.  The true returned load is not known
+                # until after the fluid stage, so use the current load guess as
+                # the online-available surrogate for manifests that still carry
+                # the legacy post-stage feature.
+                "load_return_max": float(load_guess_max_value),
+                "mesh_velocity_rms": float(mesh_velocity_rms_value),
+                "dt_mesh_velocity_rms": float(dt_stage) * float(mesh_velocity_rms_value),
+                "solid_rom_full_residual_rel": float(solid_rom_full_residual_rel_value),
+                "solid_rom_interface_disp_rel": float(solid_rom_interface_disp_rel_value),
+            }
+            try:
+                return np.asarray([feature_values[name] for name in named_feature_names], dtype=float)
+            except KeyError as exc:
+                raise ValueError(
+                    "Unsupported fluid HROM bank feature name in manifest: "
+                    f"{str(exc)}. Rebuild the atlas with online-available features."
+                ) from exc
+
+        items: list[float] = [float(step_value), float(coupling_iter_value)]
+        if mode in {"stage_load", "stage_load_interface"}:
+            items.extend(
+                [
+                    _log_rel(float(previous_load_rel)),
+                    _log_rel(float(previous_disp_rel)),
+                    _rms(np.asarray(load_values, dtype=float)),
+                ]
+            )
+        if mode == "stage_load_interface":
+            items.extend(
+                [
+                    _rms(np.asarray(interface_disp_values, dtype=float)),
+                    float(dt_stage) * _rms(np.asarray(mesh_velocity_values, dtype=float)),
+                ]
+            )
+        return np.asarray(items, dtype=float)
+
+    def _new_fluid_hrom_eta_calibrator() -> OnlineErrorCalibrator | None:
+        if not (
+            fluid_hrom_eta_policy_value == "calibrated"
+            and np.isfinite(float(fluid_hrom_interface_load_tolerance_value))
+        ):
+            return None
+        return OnlineErrorCalibrator(
+            tolerance=float(fluid_hrom_interface_load_tolerance_value),
+            max_estimate_tolerance=(
+                float(fluid_hrom_eta_max_tolerance_value)
+                if np.isfinite(float(fluid_hrom_eta_max_tolerance_value))
+                else None
+            ),
+            quantile=float(fluid_hrom_eta_quantile_value),
+            safety_factor=float(fluid_hrom_eta_safety_factor_value),
+            min_samples=int(fluid_hrom_eta_min_calibration_samples_value),
         )
+
+    fluid_hrom_eta_calibrator: OnlineErrorCalibrator | None = _new_fluid_hrom_eta_calibrator()
+    fluid_hrom_eta_calibrators_by_model: dict[str, OnlineErrorCalibrator] = {}
+    fluid_hrom_disabled_until_step_by_model: dict[str, int] = {}
+    fluid_hrom_eta_prior_disabled_until_step_by_model: dict[str, int] = {}
+    fluid_hrom_eta_prior_consecutive_failures_by_model: dict[str, int] = {}
+    fluid_hrom_eta_prior_disabled_until_step = -1
+    fluid_hrom_eta_prior_consecutive_failures = 0
+    fluid_hrom_eta_prior_gate_skips = 0
+    fluid_hrom_eta_calibration_count = 0
+    if bool(use_sampled_lspg_hybrid_fluid):
+        if fluid_hrom_bank_manifest is not None:
+            sampled_lspg_hybrid_bank_entries = load_local_reduced_model_bank_manifest(
+                Path(fluid_hrom_bank_manifest)
+            )
+            for entry in sampled_lspg_hybrid_bank_entries:
+                sampled_lspg_hybrid_bank_models[str(entry.model_id)] = _load_sampled_lspg_hybrid_model(
+                    Path(entry.path),
+                    total_dofs=int(fluid["dh"].total_dofs),
+                    n_elements=int(mesh_f.n_elements),
+                )
+                sampled_lspg_hybrid_bank_selection_count[str(entry.model_id)] = 0
+                raw_feature_names = (entry.metadata or {}).get("feature_names")
+                if raw_feature_names is not None and not sampled_lspg_hybrid_bank_feature_names:
+                    sampled_lspg_hybrid_bank_feature_names = tuple(
+                        str(item) for item in raw_feature_names
+                    )
+            first_entry = sampled_lspg_hybrid_bank_entries[0]
+            sampled_lspg_hybrid_default_model = sampled_lspg_hybrid_bank_models[str(first_entry.model_id)]
+        if fluid_hrom_model_path is not None:
+            sampled_lspg_hybrid_default_model = _load_sampled_lspg_hybrid_model(
+                Path(fluid_hrom_model_path),
+                total_dofs=int(fluid["dh"].total_dofs),
+                n_elements=int(mesh_f.n_elements),
+            )
+        sampled_lspg_hybrid_model = sampled_lspg_hybrid_default_model
+        if sampled_lspg_hybrid_model is None:
+            raise RuntimeError("No sampled-LSPG fluid HROM model was loaded.")
         sampled_lspg_hybrid_switch_iter = (
             max(1, int(fluid_hrom_switch_iter))
             if fluid_hrom_switch_iter is not None
@@ -11258,6 +11607,9 @@ def run_local_example2(
             verbose,
             "[fluid-hrom] "
             f"loaded sampled-LSPG model from {sampled_lspg_hybrid_model.source_path} "
+            f"bank_manifest={fluid_hrom_bank_manifest} "
+            f"bank_count={int(len(sampled_lspg_hybrid_bank_entries))} "
+            f"bank_feature={sampled_lspg_hybrid_bank_feature_mode} "
             f"modes={sampled_lspg_hybrid_model.n_modes} "
             f"sample_rows={sampled_lspg_hybrid_model.sample_row_dofs.size} "
             f"sample_elements={sampled_lspg_hybrid_model.sample_element_ids.size} "
@@ -11297,8 +11649,27 @@ def run_local_example2(
             f"interface_load_tolerance={float(fluid_hrom_interface_load_tolerance_value):.3e} "
             f"use_estimator_load_on_accept={int(bool(fluid_hrom_use_estimator_load_on_accept))} "
             f"max_dwr_error={float(fluid_hrom_max_dwr_error_value):.3e} "
-            f"adaptive_db={fluid_hrom_adaptive_db_path}",
+            f"adaptive_db={fluid_hrom_adaptive_db_path} "
+            f"adaptive_db_prior_skip_record={int(bool(fluid_hrom_adaptive_db_record_prior_skips_value))} "
+            f"adaptive_db_skip_stride={int(fluid_hrom_adaptive_db_skip_stride_value)}",
         )
+        if sampled_lspg_hybrid_bank_entries:
+            for entry in sampled_lspg_hybrid_bank_entries:
+                bank_model = sampled_lspg_hybrid_bank_models[str(entry.model_id)]
+                _log(
+                    verbose,
+                    "[fluid-hrom-bank] "
+                    f"id={entry.model_id} "
+                    f"path={bank_model.source_path} "
+                    f"step_start={int(entry.step_start)} "
+                    f"step_end={entry.step_end} "
+                    f"priority={int(entry.priority)} "
+                    f"modes={int(bank_model.n_modes)} "
+                    f"sample_rows={int(bank_model.sample_row_dofs.size)} "
+                    f"sample_elements={int(bank_model.sample_element_ids.size)} "
+                    f"has_sampled_reaction={int(bool(bank_model.has_sampled_reaction))} "
+                    f"has_reduced_reaction={int(bool(bank_model.has_reduced_reaction))}",
+                )
     porous_material = _default_upl_material_from_lame(
         mu_s=mu_s,
         lambda_s=lambda_s,
@@ -13608,6 +13979,9 @@ def run_local_example2(
                     fluid_hrom_impedance_blend_used = 0.0
                     fluid_hrom_impedance_rel = float("nan")
                     fluid_hrom_adaptive_pre_dumped = False
+                    sampled_lspg_hybrid_active_model_id = ""
+                    sampled_lspg_hybrid_active_selection_reason = "inactive"
+                    sampled_lspg_hybrid_active_selection_distance = float("nan")
                     fluid_stage_used_kratos_hrom_fallback = False
                     hrom_load_only_commit = False
                     hrom_history: object | None = None
@@ -13722,6 +14096,10 @@ def run_local_example2(
                                         "adaptive_hrom_attempt": np.asarray(1, dtype=int),
                                         "adaptive_stage_role": np.asarray("post"),
                                         "adaptive_reason": np.asarray(str(fluid_hrom_fallback_reason or "exact_correction")),
+                                        "adaptive_model_id": np.asarray(str(sampled_lspg_hybrid_active_model_id)),
+                                        "adaptive_model_selection_reason": np.asarray(
+                                            str(sampled_lspg_hybrid_active_selection_reason)
+                                        ),
                                         "adaptive_manifold_distance": np.asarray(float(fluid_hrom_manifold_distance)),
                                         "adaptive_eta_gamma": np.asarray(float(fluid_hrom_eta_gamma)),
                                         "adaptive_dwr_error": np.asarray(float(fluid_hrom_dwr_error)),
@@ -14375,6 +14753,11 @@ def run_local_example2(
                             fluid_hrom_fallback_reason = ""
                             fluid_hrom_manifold_distance = float("nan")
                             fluid_hrom_eta_gamma = float("nan")
+                            fluid_hrom_eta_bound = float("nan")
+                            fluid_hrom_eta_effective_tolerance = float(fluid_hrom_interface_load_tolerance_value)
+                            fluid_hrom_eta_reliability_factor = 1.0
+                            fluid_hrom_eta_true_error = float("nan")
+                            fluid_hrom_prior_gate_reason = ""
                             fluid_hrom_dwr_error = float("nan")
                             fluid_hrom_estimated_residual_norm = float("nan")
                             fluid_hrom_iterations = 0
@@ -14391,6 +14774,9 @@ def run_local_example2(
                             fluid_hrom_stage_sample_local_state_writes = False
                             hrom_reaction_point_load_lookup: CoordinateLookup | None = None
                             hrom_reaction_solid_load_lookup: CoordinateLookup | None = None
+                            hrom_candidate_reaction_point_load_lookup: CoordinateLookup | None = None
+                            hrom_candidate_estimator_load_lookup: CoordinateLookup | None = None
+                            hrom_candidate_eta_gamma = float("nan")
                             hrom_stress_point_load_lookup: CoordinateLookup | None = None
                             hrom_accel_lookup: CoordinateLookup | None = None
                             hrom_reaction_source = ""
@@ -14403,6 +14789,180 @@ def run_local_example2(
                             hrom_history: object | None = None
                             hrom_state_guess: list[np.ndarray] | None = None
                             hrom_a_guess: np.ndarray | None = None
+                            sampled_lspg_hybrid_model = sampled_lspg_hybrid_default_model
+                            sampled_lspg_hybrid_active_model_id = "default" if sampled_lspg_hybrid_model is not None else ""
+                            sampled_lspg_hybrid_active_selection_reason = "single_model"
+                            sampled_lspg_hybrid_active_selection_distance = float("nan")
+                            sampled_lspg_hybrid_active_metadata: dict[str, object] = {}
+                            if sampled_lspg_hybrid_bank_entries:
+                                bank_feature = _fluid_hrom_bank_feature_vector(
+                                    step_value=int(step),
+                                    time_value=float(t_now),
+                                    coupling_iter_value=int(coupling_iter),
+                                    previous_disp_abs=float(last_disp_abs),
+                                    previous_load_rel=float(last_load_rel),
+                                    previous_disp_rel=float(last_disp_rel),
+                                    previous_load_abs=float(last_load_abs),
+                                    load_values=np.asarray(load_guess_vals, dtype=float),
+                                    interface_disp_values=np.asarray(
+                                        solid_disp_fluid_lookup.values,
+                                        dtype=float,
+                                    ),
+                                    mesh_velocity_values=np.asarray(
+                                        mesh_vel_fluid_lookup.values,
+                                        dtype=float,
+                                    ),
+                                    solid_rom_full_residual_rel_value=float(solid_rom_full_residual_rel),
+                                    solid_rom_interface_disp_rel_value=float(solid_rom_interface_disp_rel),
+                                    dt_stage=float(dt_value),
+                                )
+                                selection = select_local_reduced_model_bank(
+                                    sampled_lspg_hybrid_bank_entries,
+                                    step=int(step),
+                                    feature=bank_feature,
+                                )
+                                sampled_lspg_hybrid_active_selection_reason = str(selection.reason)
+                                sampled_lspg_hybrid_active_selection_distance = float(selection.distance)
+                                if selection.entry is not None:
+                                    sampled_lspg_hybrid_active_model_id = str(selection.entry.model_id)
+                                    sampled_lspg_hybrid_model = sampled_lspg_hybrid_bank_models[
+                                        sampled_lspg_hybrid_active_model_id
+                                    ]
+                                    sampled_lspg_hybrid_active_metadata = dict(
+                                        selection.entry.metadata or {}
+                                    )
+                                    sampled_lspg_hybrid_bank_selection_count[
+                                        sampled_lspg_hybrid_active_model_id
+                                    ] = (
+                                        int(
+                                            sampled_lspg_hybrid_bank_selection_count.get(
+                                                sampled_lspg_hybrid_active_model_id,
+                                                0,
+                                            )
+                                        )
+                                        + 1
+                                    )
+                                elif fluid_hrom_model_path is not None and sampled_lspg_hybrid_default_model is not None:
+                                    sampled_lspg_hybrid_active_model_id = "default_fallback"
+                                    sampled_lspg_hybrid_active_selection_reason = (
+                                        f"default_fallback:{selection.reason}"
+                                    )
+                                    sampled_lspg_hybrid_model = sampled_lspg_hybrid_default_model
+                                else:
+                                    sampled_lspg_hybrid_active_model_id = ""
+                                    sampled_lspg_hybrid_model = None
+                            fluid_hrom_active_model_key = str(
+                                sampled_lspg_hybrid_active_model_id or "__none__"
+                            )
+                            fluid_hrom_max_manifold_distance_value = float(
+                                fluid_hrom_base_max_manifold_distance_value
+                            )
+                            fluid_hrom_interface_load_tolerance_value = float(
+                                fluid_hrom_base_interface_load_tolerance_value
+                            )
+                            fluid_hrom_max_load_contraction_ratio_value = float(
+                                fluid_hrom_base_max_load_contraction_ratio_value
+                            )
+                            fluid_hrom_max_candidate_load_rel_value = float(
+                                fluid_hrom_base_max_candidate_load_rel_value
+                            )
+
+                            def _active_bank_float(
+                                *names: str,
+                                default: float,
+                            ) -> float:
+                                for name in names:
+                                    if name in sampled_lspg_hybrid_active_metadata:
+                                        raw_value = sampled_lspg_hybrid_active_metadata[name]
+                                        if isinstance(raw_value, str) and raw_value.strip().lower() in {
+                                            "inf",
+                                            "+inf",
+                                            "infinity",
+                                        }:
+                                            return float("inf")
+                                        return float(raw_value)
+                                return float(default)
+
+                            fluid_hrom_max_manifold_distance_value = _active_bank_float(
+                                "fluid_hrom_max_manifold_distance",
+                                "max_manifold_distance",
+                                default=fluid_hrom_max_manifold_distance_value,
+                            )
+                            fluid_hrom_interface_load_tolerance_value = _active_bank_float(
+                                "fluid_hrom_interface_load_tolerance",
+                                "interface_load_tolerance",
+                                default=fluid_hrom_interface_load_tolerance_value,
+                            )
+                            fluid_hrom_max_load_contraction_ratio_value = _active_bank_float(
+                                "fluid_hrom_max_load_contraction_ratio",
+                                "max_load_contraction_ratio",
+                                default=fluid_hrom_max_load_contraction_ratio_value,
+                            )
+                            fluid_hrom_max_candidate_load_rel_value = _active_bank_float(
+                                "fluid_hrom_max_candidate_load_rel",
+                                "max_candidate_load_rel",
+                                default=fluid_hrom_max_candidate_load_rel_value,
+                            )
+                            fluid_hrom_eta_effective_tolerance = float(
+                                fluid_hrom_interface_load_tolerance_value
+                            )
+                            fluid_hrom_disabled_until_step = int(
+                                fluid_hrom_disabled_until_step_by_model.get(
+                                    fluid_hrom_active_model_key,
+                                    -1,
+                                )
+                            )
+                            fluid_hrom_eta_prior_disabled_until_step = int(
+                                fluid_hrom_eta_prior_disabled_until_step_by_model.get(
+                                    fluid_hrom_active_model_key,
+                                    -1,
+                                )
+                            )
+                            fluid_hrom_eta_prior_consecutive_failures = int(
+                                fluid_hrom_eta_prior_consecutive_failures_by_model.get(
+                                    fluid_hrom_active_model_key,
+                                    0,
+                                )
+                            )
+                            if (
+                                sampled_lspg_hybrid_model is not None
+                                and fluid_hrom_active_model_key not in fluid_hrom_eta_calibrators_by_model
+                            ):
+                                active_eta_calibrator = _new_fluid_hrom_eta_calibrator()
+                                if active_eta_calibrator is not None:
+                                    fluid_hrom_eta_calibrators_by_model[
+                                        fluid_hrom_active_model_key
+                                    ] = active_eta_calibrator
+                            fluid_hrom_eta_calibrator = fluid_hrom_eta_calibrators_by_model.get(
+                                fluid_hrom_active_model_key
+                            )
+                            active_hrom_max_iterations = (
+                                max(1, int(fluid_hrom_max_iterations))
+                                if fluid_hrom_max_iterations is not None
+                                else (
+                                    int(sampled_lspg_hybrid_model.max_iterations)
+                                    if sampled_lspg_hybrid_model is not None
+                                    else int(sampled_lspg_hybrid_max_iterations)
+                                )
+                            )
+                            active_hrom_residual_tol = (
+                                float(fluid_hrom_residual_tol)
+                                if fluid_hrom_residual_tol is not None
+                                else (
+                                    float(sampled_lspg_hybrid_model.residual_tol)
+                                    if sampled_lspg_hybrid_model is not None
+                                    else float(sampled_lspg_hybrid_residual_tol)
+                                )
+                            )
+                            active_hrom_incompressibility_scale = (
+                                float(fluid_hrom_incompressibility_scale)
+                                if fluid_hrom_incompressibility_scale is not None
+                                else (
+                                    float(sampled_lspg_hybrid_model.incompressibility_stabilization_scale)
+                                    if sampled_lspg_hybrid_model is not None
+                                    else float(sampled_lspg_hybrid_incompressibility_scale)
+                                )
+                            )
                             active_hrom_switch_iter = int(sampled_lspg_hybrid_switch_iter)
                             if (
                                 sampled_lspg_hybrid_late_switch_iter is not None
@@ -14450,13 +15010,46 @@ def run_local_example2(
                                 and int(len(fluid_hrom_cost_samples)) >= int(fluid_hrom_cost_gate_min_samples_value)
                                 and int(len(fluid_exact_cost_samples)) >= int(fluid_hrom_cost_gate_min_samples_value)
                             ):
-                                mean_hrom_cost = float(np.mean(np.asarray(fluid_hrom_cost_samples, dtype=float)))
-                                mean_exact_cost = float(np.mean(np.asarray(fluid_exact_cost_samples, dtype=float)))
-                                fluid_hrom_cost_ratio = mean_hrom_cost / max(float(mean_exact_cost), 1.0e-15)
-                                hrom_cost_ok = bool(
-                                    np.isfinite(float(fluid_hrom_cost_ratio))
-                                    and float(fluid_hrom_cost_ratio) <= float(fluid_hrom_cost_gate_factor_value)
-                                )
+                                if float(fluid_hrom_cost_gate_factor_value) > 0.0:
+                                    cost_certificate = build_stage_break_even_certificate(
+                                        exact_stage_times=fluid_exact_cost_samples,
+                                        reduced_stage_times=fluid_hrom_cost_samples,
+                                        required_speedup=1.0 / float(fluid_hrom_cost_gate_factor_value),
+                                        min_samples=int(fluid_hrom_cost_gate_min_samples_value),
+                                        metadata={
+                                            "stage": "fluid_hrom",
+                                            "step": int(step),
+                                            "coupling_iter": int(coupling_iter),
+                                        },
+                                    )
+                                    fluid_hrom_cost_certificate = cost_certificate.to_dict()
+                                    fluid_hrom_cost_ratio = (
+                                        float(cost_certificate.reduced_mean_time)
+                                        / max(float(cost_certificate.exact_mean_time), 1.0e-15)
+                                    )
+                                    hrom_cost_ok = bool(cost_certificate.passed)
+                                else:
+                                    fluid_hrom_cost_ratio = float("inf")
+                                    hrom_cost_ok = False
+                                    fluid_hrom_cost_certificate = {
+                                        "passed": False,
+                                        "exact_mean_time": float(
+                                            np.mean(np.asarray(fluid_exact_cost_samples, dtype=float))
+                                        ),
+                                        "reduced_mean_time": float(
+                                            np.mean(np.asarray(fluid_hrom_cost_samples, dtype=float))
+                                        ),
+                                        "speedup": 0.0,
+                                        "required_speedup": float("inf"),
+                                        "exact_count": int(len(fluid_exact_cost_samples)),
+                                        "reduced_count": int(len(fluid_hrom_cost_samples)),
+                                        "metadata": {
+                                            "min_samples": int(fluid_hrom_cost_gate_min_samples_value),
+                                            "enough_samples": True,
+                                            "stage": "fluid_hrom",
+                                            "factor_zero_reject": True,
+                                        },
+                                    }
                                 if not bool(hrom_cost_ok):
                                     fluid_hrom_disabled_by_cost_monitor = True
                                     if int(step) > int(fluid_hrom_disabled_until_step):
@@ -14466,6 +15059,17 @@ def run_local_example2(
                                         int(step) + int(fluid_hrom_cost_gate_disable_steps_value),
                                     )
                             hrom_disabled_ok = int(step) > int(fluid_hrom_disabled_until_step)
+                            hrom_prior_eta_ok = True
+                            if (
+                                fluid_hrom_eta_calibrator is not None
+                                and int(fluid_hrom_prior_gate_cooldown_steps_value) > 0
+                                and int(step) <= int(fluid_hrom_eta_prior_disabled_until_step)
+                            ):
+                                hrom_prior_eta_ok = False
+                                fluid_hrom_prior_gate_reason = (
+                                    "eta_prior_cooldown_until_step_"
+                                    f"{int(fluid_hrom_eta_prior_disabled_until_step)}"
+                                )
                             use_hrom_stage = bool(
                                 hrom_iteration_gate
                                 and hrom_start_step_ok
@@ -14477,6 +15081,7 @@ def run_local_example2(
                                 and hrom_coupling_iter_ok
                                 and hrom_cost_ok
                                 and hrom_disabled_ok
+                                and hrom_prior_eta_ok
                             )
                             if bool(hrom_iteration_gate) and not bool(use_hrom_stage):
                                 if not bool(hrom_start_step_ok):
@@ -14495,10 +15100,14 @@ def run_local_example2(
                                     sampled_lspg_hybrid_cost_gate_skips += 1
                                 if not bool(hrom_disabled_ok):
                                     sampled_lspg_hybrid_disabled_gate_skips += 1
+                                if not bool(hrom_prior_eta_ok):
+                                    fluid_hrom_eta_prior_gate_skips += 1
                                 _log(
                                     verbose,
                                     "[fluid-hrom] "
                                     f"step={step} coupling_iter={coupling_iter} gate_skip=1 "
+                                    f"model_id={sampled_lspg_hybrid_active_model_id} "
+                                    f"model_selection={sampled_lspg_hybrid_active_selection_reason} "
                                     f"start_step={int(sampled_lspg_hybrid_start_step)} "
                                     f"switch_iter={int(active_hrom_switch_iter)} "
                                     f"previous_load_rel={float(last_load_rel):.3e} "
@@ -14513,8 +15122,53 @@ def run_local_example2(
                                     f"max_coupling_iter={int(fluid_hrom_max_coupling_iter_value)} "
                                     f"cost_ratio={float(fluid_hrom_cost_ratio):.3e} "
                                     f"cost_gate={float(fluid_hrom_cost_gate_factor_value):.3e} "
-                                    f"disabled_until_step={int(fluid_hrom_disabled_until_step)}",
+                                    f"disabled_until_step={int(fluid_hrom_disabled_until_step)} "
+                                    f"eta_prior_reason={fluid_hrom_prior_gate_reason}",
                                 )
+                            if (
+                                fluid_hrom_adaptive_db_path is not None
+                                and bool(fluid_hrom_adaptive_db_record_prior_skips_value)
+                                and bool(hrom_iteration_gate)
+                                and not bool(use_hrom_stage)
+                                and not bool(fluid_hrom_adaptive_pre_dumped)
+                                and (
+                                    not bool(hrom_prior_eta_ok)
+                                    or str(sampled_lspg_hybrid_active_selection_reason).startswith("no_active")
+                                )
+                                and int(coupling_iter) == int(active_hrom_switch_iter)
+                                and (
+                                    int(fluid_hrom_adaptive_db_skip_stride_value) <= 1
+                                    or (int(step) % int(fluid_hrom_adaptive_db_skip_stride_value)) == 0
+                                )
+                            ):
+                                _maybe_dump_exact_fluid_probe(
+                                    output_dir=fluid_hrom_adaptive_db_path,
+                                    step=int(step),
+                                    coupling_iter=int(coupling_iter),
+                                    stage_label="pre_fluid_solve",
+                                    bc_scale=float(bc_scale),
+                                    dt=float(dt_value),
+                                    bossak_alpha=float(bossak_alpha),
+                                    fluid=fluid,
+                                    reaction_point_load_lookup=None,
+                                    reaction_solid_load_lookup=None,
+                                    force=True,
+                                    extra_payload={
+                                        "adaptive_hrom_attempt": np.asarray(0, dtype=int),
+                                        "adaptive_stage_role": np.asarray("pre"),
+                                        "adaptive_reason": np.asarray(
+                                            str(fluid_hrom_prior_gate_reason or "hrom_gate_skip")
+                                        ),
+                                        "adaptive_model_id": np.asarray(str(sampled_lspg_hybrid_active_model_id)),
+                                        "adaptive_model_selection_reason": np.asarray(
+                                            str(sampled_lspg_hybrid_active_selection_reason)
+                                        ),
+                                        "adaptive_manifold_distance": np.asarray(float(fluid_hrom_manifold_distance)),
+                                        "adaptive_eta_gamma": np.asarray(float(fluid_hrom_eta_gamma)),
+                                        "adaptive_dwr_error": np.asarray(float(fluid_hrom_dwr_error)),
+                                    },
+                                )
+                                fluid_hrom_adaptive_pre_dumped = True
                             hrom_pre_stage_load_rel = float(last_load_rel)
                             if bool(use_hrom_stage):
                                 hrom_history = _snapshot_fluid_dvms_state(fluid.get("dvms_state"))
@@ -14584,14 +15238,14 @@ def run_local_example2(
                                         bossak_alpha=float(bossak_alpha),
                                         dynamic_tau=float(dynamic_tau),
                                         incompressibility_stabilization_scale=float(
-                                            sampled_lspg_hybrid_incompressibility_scale
+                                            active_hrom_incompressibility_scale
                                         ),
                                         quad_order=quad_order,
                                         backend=str(backend),
                                         fluid_prev_step=fluid_prev_step,
                                         fluid_a_prev_stage=fluid_a_prev_stage,
-                                        max_iterations=int(sampled_lspg_hybrid_max_iterations),
-                                        residual_tol=float(sampled_lspg_hybrid_residual_tol),
+                                        max_iterations=int(active_hrom_max_iterations),
+                                        residual_tol=float(active_hrom_residual_tol),
                                         line_search=bool(sampled_lspg_hybrid_model.line_search),
                                         reduced_objective=str(sampled_lspg_hybrid_reduced_objective),
                                         gnat_step_backend=str(fluid_hrom_gnat_step_backend),
@@ -14987,6 +15641,9 @@ def run_local_example2(
                                                     )
                                                 else:
                                                     fluid_hrom_eta_gamma = float("nan")
+                                                hrom_candidate_reaction_point_load_lookup = candidate_lookup
+                                                hrom_candidate_estimator_load_lookup = estimator_lookup
+                                                hrom_candidate_eta_gamma = float(fluid_hrom_eta_gamma)
                                             else:
                                                 fluid_hrom_eta_gamma = float("nan")
                                             if not np.isfinite(float(fluid_hrom_eta_gamma)):
@@ -14995,14 +15652,41 @@ def run_local_example2(
                                                     "sampled-LSPG eta_Gamma gate failed: no independent "
                                                     "interface-load estimator is available"
                                                 )
-                                            if float(fluid_hrom_eta_gamma) > float(
-                                                fluid_hrom_interface_load_tolerance_value
-                                            ):
+                                            if fluid_hrom_eta_calibrator is not None:
+                                                eta_decision = fluid_hrom_eta_calibrator.evaluate(
+                                                    float(fluid_hrom_eta_gamma)
+                                                )
+                                                fluid_hrom_eta_bound = float(eta_decision.certified_bound)
+                                                fluid_hrom_eta_effective_tolerance = float(
+                                                    eta_decision.effective_estimate_tolerance
+                                                )
+                                                fluid_hrom_eta_reliability_factor = float(
+                                                    eta_decision.reliability_factor
+                                                )
+                                                eta_gate_passed = bool(eta_decision.accepted)
+                                                eta_gate_reason = str(eta_decision.reason)
+                                            else:
+                                                fluid_hrom_eta_bound = float(fluid_hrom_eta_gamma)
+                                                fluid_hrom_eta_effective_tolerance = float(
+                                                    fluid_hrom_interface_load_tolerance_value
+                                                )
+                                                fluid_hrom_eta_reliability_factor = 1.0
+                                                eta_gate_passed = bool(
+                                                    float(fluid_hrom_eta_gamma)
+                                                    <= float(fluid_hrom_interface_load_tolerance_value)
+                                                )
+                                                eta_gate_reason = (
+                                                    "accepted" if bool(eta_gate_passed) else "fixed_tolerance_failed"
+                                                )
+                                            if not bool(eta_gate_passed):
                                                 sampled_lspg_hybrid_eta_gamma_gate_failures += 1
                                                 raise RuntimeError(
                                                     "sampled-LSPG eta_Gamma gate failed: "
                                                     f"eta_Gamma={float(fluid_hrom_eta_gamma):.6e} "
-                                                    f"> {float(fluid_hrom_interface_load_tolerance_value):.6e}"
+                                                    f"bound={float(fluid_hrom_eta_bound):.6e} "
+                                                    f"tol={float(fluid_hrom_interface_load_tolerance_value):.6e} "
+                                                    f"effective_eta_tol={float(fluid_hrom_eta_effective_tolerance):.6e} "
+                                                    f"reason={eta_gate_reason}"
                                                 )
                                             if (
                                                 bool(fluid_hrom_use_estimator_load_on_accept)
@@ -15084,7 +15768,10 @@ def run_local_example2(
                                                     f"step_ratio={float(trust_result.step_ratio):.3e}",
                                                 )
                                         if (
-                                            np.isfinite(float(fluid_hrom_max_load_contraction_ratio_value))
+                                            (
+                                                np.isfinite(float(fluid_hrom_max_load_contraction_ratio_value))
+                                                or np.isfinite(float(fluid_hrom_max_candidate_load_rel_value))
+                                            )
                                             and hrom_accel_lookup is not None
                                             and np.isfinite(float(hrom_pre_stage_load_rel))
                                             and float(hrom_pre_stage_load_rel) > 1.0e-15
@@ -15101,6 +15788,26 @@ def run_local_example2(
                                                 float(hrom_pre_stage_load_rel),
                                                 1.0e-15,
                                             )
+                                            if (
+                                                np.isfinite(float(fluid_hrom_max_candidate_load_rel_value))
+                                                and (
+                                                    not np.isfinite(float(candidate_load_rel))
+                                                    or float(candidate_load_rel)
+                                                    > float(fluid_hrom_max_candidate_load_rel_value)
+                                                )
+                                            ):
+                                                sampled_lspg_hybrid_candidate_load_gate_failures += 1
+                                                fluid_hrom_disabled_until_step = max(
+                                                    int(fluid_hrom_disabled_until_step),
+                                                    int(step),
+                                                )
+                                                raise RuntimeError(
+                                                    "sampled-LSPG candidate load gate failed: "
+                                                    f"candidate_load_rel={float(candidate_load_rel):.6e} "
+                                                    f"gate={float(fluid_hrom_max_candidate_load_rel_value):.6e} "
+                                                    f"ratio={float(candidate_contraction_ratio):.6e} "
+                                                    f"previous_load_rel={float(hrom_pre_stage_load_rel):.6e}"
+                                                )
                                             if (
                                                 not np.isfinite(float(candidate_contraction_ratio))
                                                 or float(candidate_contraction_ratio)
@@ -15131,6 +15838,18 @@ def run_local_example2(
                                 except Exception as exc:
                                     fluid_hrom_fallback_reason = str(exc)
                                     fluid_hrom_used = False
+                                    if (
+                                        int(fluid_hrom_prior_gate_cooldown_steps_value) > 0
+                                        and (
+                                            "manifold gate failed" in fluid_hrom_fallback_reason
+                                            or "interface trust monitor failed" in fluid_hrom_fallback_reason
+                                            or "precommit contraction monitor failed" in fluid_hrom_fallback_reason
+                                        )
+                                    ):
+                                        fluid_hrom_disabled_until_step = max(
+                                            int(fluid_hrom_disabled_until_step),
+                                            int(step) + int(fluid_hrom_prior_gate_cooldown_steps_value),
+                                        )
                                     if int(fluid_hrom_disable_steps_after_trial_failure_value) > 0:
                                         fluid_hrom_disabled_until_step = max(
                                             int(fluid_hrom_disabled_until_step),
@@ -15158,6 +15877,10 @@ def run_local_example2(
                                                 "adaptive_hrom_attempt": np.asarray(1, dtype=int),
                                                 "adaptive_stage_role": np.asarray("pre"),
                                                 "adaptive_reason": np.asarray(str(fluid_hrom_fallback_reason)),
+                                                "adaptive_model_id": np.asarray(str(sampled_lspg_hybrid_active_model_id)),
+                                                "adaptive_model_selection_reason": np.asarray(
+                                                    str(sampled_lspg_hybrid_active_selection_reason)
+                                                ),
                                                 "adaptive_manifold_distance": np.asarray(float(fluid_hrom_manifold_distance)),
                                                 "adaptive_eta_gamma": np.asarray(float(fluid_hrom_eta_gamma)),
                                                 "adaptive_dwr_error": np.asarray(float(fluid_hrom_dwr_error)),
@@ -15401,6 +16124,69 @@ def run_local_example2(
                                     solid_iface_coords,
                                 )
                             if (
+                                fluid_hrom_eta_calibrator is not None
+                                and not bool(fluid_hrom_used)
+                                and hrom_candidate_reaction_point_load_lookup is not None
+                                and reaction_point_load_lookup is not None
+                                and np.isfinite(float(hrom_candidate_eta_gamma))
+                            ):
+                                calibration_load_lookup = hrom_candidate_reaction_point_load_lookup
+                                if (
+                                    bool(fluid_hrom_use_estimator_load_on_accept)
+                                    and hrom_candidate_estimator_load_lookup is not None
+                                ):
+                                    calibration_load_lookup = hrom_candidate_estimator_load_lookup
+                                candidate_values_on_exact = _resample_lookup_to_coords(
+                                    calibration_load_lookup,
+                                    np.asarray(reaction_point_load_lookup.coords, dtype=float),
+                                ).values
+                                _true_eta_abs, fluid_hrom_eta_true_error = _relative_change(
+                                    np.asarray(reaction_point_load_lookup.values, dtype=float),
+                                    np.asarray(candidate_values_on_exact, dtype=float),
+                                )
+                                eta_decision = fluid_hrom_eta_calibrator.record(
+                                    estimate=float(hrom_candidate_eta_gamma),
+                                    true_error=float(fluid_hrom_eta_true_error),
+                                )
+                                fluid_hrom_eta_calibration_count = int(fluid_hrom_eta_calibrator.sample_count)
+                                fluid_hrom_eta_bound = float(eta_decision.certified_bound)
+                                fluid_hrom_eta_effective_tolerance = float(
+                                    eta_decision.effective_estimate_tolerance
+                                )
+                                fluid_hrom_eta_reliability_factor = float(eta_decision.reliability_factor)
+                                if bool(eta_decision.accepted):
+                                    fluid_hrom_eta_prior_consecutive_failures = 0
+                                elif (
+                                    int(fluid_hrom_eta_calibrator.sample_count)
+                                    >= int(fluid_hrom_eta_min_calibration_samples_value)
+                                ):
+                                    fluid_hrom_eta_prior_consecutive_failures += 1
+                                    if (
+                                        int(fluid_hrom_prior_gate_cooldown_steps_value) > 0
+                                        and int(fluid_hrom_eta_prior_consecutive_failures)
+                                        >= int(fluid_hrom_prior_gate_failure_threshold_value)
+                                    ):
+                                        fluid_hrom_eta_prior_disabled_until_step = max(
+                                            int(fluid_hrom_eta_prior_disabled_until_step),
+                                            int(step) + int(fluid_hrom_prior_gate_cooldown_steps_value),
+                                        )
+                                        fluid_hrom_eta_prior_consecutive_failures = 0
+                                        fluid_hrom_prior_gate_reason = (
+                                            "eta_calibrated_failure_cooldown_until_step_"
+                                            f"{int(fluid_hrom_eta_prior_disabled_until_step)}"
+                                        )
+                                _log(
+                                    verbose,
+                                    "[fluid-hrom] "
+                                    f"step={step} coupling_iter={coupling_iter} "
+                                    "eta_calibration=1 "
+                                    f"eta={float(hrom_candidate_eta_gamma):.3e} "
+                                    f"true_error={float(fluid_hrom_eta_true_error):.3e} "
+                                    f"beta={float(fluid_hrom_eta_reliability_factor):.3e} "
+                                    f"eta_eff_tol={float(fluid_hrom_eta_effective_tolerance):.3e} "
+                                    f"decision={eta_decision.reason}",
+                                )
+                            if (
                                 fluid_hrom_adaptive_db_path is not None
                                 and bool(fluid_hrom_adaptive_pre_dumped)
                                 and not bool(fluid_hrom_used)
@@ -15421,6 +16207,10 @@ def run_local_example2(
                                         "adaptive_hrom_attempt": np.asarray(1, dtype=int),
                                         "adaptive_stage_role": np.asarray("post"),
                                         "adaptive_reason": np.asarray(str(fluid_hrom_fallback_reason or "exact_correction")),
+                                        "adaptive_model_id": np.asarray(str(sampled_lspg_hybrid_active_model_id)),
+                                        "adaptive_model_selection_reason": np.asarray(
+                                            str(sampled_lspg_hybrid_active_selection_reason)
+                                        ),
                                         "adaptive_manifold_distance": np.asarray(float(fluid_hrom_manifold_distance)),
                                         "adaptive_eta_gamma": np.asarray(float(fluid_hrom_eta_gamma)),
                                         "adaptive_dwr_error": np.asarray(float(fluid_hrom_dwr_error)),
@@ -15626,6 +16416,149 @@ def run_local_example2(
                     disp_max = float(np.max(np.linalg.norm(np.asarray(solid_disp_solid_lookup.values, dtype=float), axis=1)))
                     load_guess_max = float(np.max(np.linalg.norm(accel_guess_vals, axis=1)))
                     load_return_max = float(np.max(np.linalg.norm(accel_return_vals, axis=1)))
+                    # Exact-fluid-only stages do not necessarily enter the
+                    # sampled-HROM setup path, but the shared timeseries schema
+                    # still records HROM diagnostics.
+                    try:
+                        fluid_hrom_eta_bound
+                    except UnboundLocalError:
+                        fluid_hrom_eta_bound = float("nan")
+                    try:
+                        sampled_lspg_hybrid_active_model_id
+                    except UnboundLocalError:
+                        sampled_lspg_hybrid_active_model_id = ""
+                    try:
+                        fluid_hrom_used
+                    except UnboundLocalError:
+                        fluid_hrom_used = False
+                    try:
+                        sampled_lspg_hybrid_active_selection_reason
+                    except UnboundLocalError:
+                        sampled_lspg_hybrid_active_selection_reason = "inactive"
+                    try:
+                        sampled_lspg_hybrid_active_selection_distance
+                    except UnboundLocalError:
+                        sampled_lspg_hybrid_active_selection_distance = float("nan")
+                    try:
+                        fluid_hrom_trial_used
+                    except UnboundLocalError:
+                        fluid_hrom_trial_used = False
+                    try:
+                        fluid_hrom_trial_load_rel_error
+                    except UnboundLocalError:
+                        fluid_hrom_trial_load_rel_error = float("nan")
+                    try:
+                        fluid_hrom_trial_disabled_by_monitor
+                    except UnboundLocalError:
+                        fluid_hrom_trial_disabled_by_monitor = False
+                    try:
+                        fluid_hrom_disabled_by_contraction_monitor
+                    except UnboundLocalError:
+                        fluid_hrom_disabled_by_contraction_monitor = False
+                    try:
+                        fluid_hrom_disabled_by_cost_monitor
+                    except UnboundLocalError:
+                        fluid_hrom_disabled_by_cost_monitor = False
+                    try:
+                        fluid_hrom_cost_ratio
+                    except UnboundLocalError:
+                        fluid_hrom_cost_ratio = float("nan")
+                    try:
+                        fluid_hrom_load_contraction_ratio
+                    except UnboundLocalError:
+                        fluid_hrom_load_contraction_ratio = float("nan")
+                    try:
+                        fluid_hrom_manifold_distance
+                    except UnboundLocalError:
+                        fluid_hrom_manifold_distance = float("nan")
+                    try:
+                        fluid_hrom_eta_gamma
+                    except UnboundLocalError:
+                        fluid_hrom_eta_gamma = float("nan")
+                    try:
+                        fluid_hrom_eta_effective_tolerance
+                    except UnboundLocalError:
+                        fluid_hrom_eta_effective_tolerance = float("nan")
+                    try:
+                        fluid_hrom_eta_reliability_factor
+                    except UnboundLocalError:
+                        fluid_hrom_eta_reliability_factor = float("nan")
+                    try:
+                        fluid_hrom_eta_true_error
+                    except UnboundLocalError:
+                        fluid_hrom_eta_true_error = float("nan")
+                    try:
+                        fluid_hrom_prior_gate_reason
+                    except UnboundLocalError:
+                        fluid_hrom_prior_gate_reason = ""
+                    try:
+                        fluid_hrom_dwr_error
+                    except UnboundLocalError:
+                        fluid_hrom_dwr_error = float("nan")
+                    try:
+                        fluid_hrom_estimated_residual_norm
+                    except UnboundLocalError:
+                        fluid_hrom_estimated_residual_norm = float("nan")
+                    try:
+                        fluid_hrom_iterations
+                    except UnboundLocalError:
+                        fluid_hrom_iterations = 0
+                    try:
+                        hrom_exact_accept_forced
+                    except UnboundLocalError:
+                        hrom_exact_accept_forced = False
+                    try:
+                        fluid_hrom_interface_trust_alpha
+                    except UnboundLocalError:
+                        fluid_hrom_interface_trust_alpha = 1.0
+                    try:
+                        fluid_hrom_interface_load_rel
+                    except UnboundLocalError:
+                        fluid_hrom_interface_load_rel = float("nan")
+                    try:
+                        fluid_hrom_interface_step_ratio
+                    except UnboundLocalError:
+                        fluid_hrom_interface_step_ratio = float("nan")
+                    try:
+                        fluid_hrom_interface_corrected
+                    except UnboundLocalError:
+                        fluid_hrom_interface_corrected = False
+                    try:
+                        fluid_hrom_interface_rejected
+                    except UnboundLocalError:
+                        fluid_hrom_interface_rejected = False
+                    try:
+                        fluid_hrom_interface_reason
+                    except UnboundLocalError:
+                        fluid_hrom_interface_reason = ""
+                    try:
+                        fluid_hrom_impedance_used
+                    except UnboundLocalError:
+                        fluid_hrom_impedance_used = False
+                    try:
+                        fluid_hrom_impedance_blend_used
+                    except UnboundLocalError:
+                        fluid_hrom_impedance_blend_used = 0.0
+                    try:
+                        fluid_hrom_impedance_rel
+                    except UnboundLocalError:
+                        fluid_hrom_impedance_rel = float("nan")
+                    try:
+                        hrom_reaction_source
+                    except UnboundLocalError:
+                        hrom_reaction_source = ""
+                    try:
+                        fluid_hrom_certified_relaxation_reason
+                    except UnboundLocalError:
+                        fluid_hrom_certified_relaxation_reason = "inactive"
+                    try:
+                        fluid_hrom_fallback_reason
+                    except UnboundLocalError:
+                        fluid_hrom_fallback_reason = ""
+                    try:
+                        fluid_hrom_stage_sample_local_state_writes
+                    except UnboundLocalError:
+                        fluid_hrom_stage_sample_local_state_writes = False
                     row = {
                         "step": int(step),
                         "time_s": float(t_now),
@@ -15815,8 +16748,23 @@ def run_local_example2(
                             fluid_times[-1] = float(fluid_elapsed)
                         if bool(fluid_hrom_cost_gate_value) and bool(fluid_hrom_used) and fluid_hrom_cost_samples:
                             fluid_hrom_cost_samples[-1] = float(fluid_elapsed)
-                        row["fluid_time_s"] = float(fluid_elapsed)
+                    if bool(use_sampled_lspg_hybrid_fluid) and sampled_lspg_hybrid_model is not None:
+                        fluid_hrom_disabled_until_step_by_model[
+                            fluid_hrom_active_model_key
+                        ] = int(fluid_hrom_disabled_until_step)
+                        fluid_hrom_eta_prior_disabled_until_step_by_model[
+                            fluid_hrom_active_model_key
+                        ] = int(fluid_hrom_eta_prior_disabled_until_step)
+                        fluid_hrom_eta_prior_consecutive_failures_by_model[
+                            fluid_hrom_active_model_key
+                        ] = int(fluid_hrom_eta_prior_consecutive_failures)
+                    row["fluid_time_s"] = float(fluid_elapsed)
                     row["fluid_hrom_used"] = bool(fluid_hrom_used)
+                    row["fluid_hrom_model_id"] = str(sampled_lspg_hybrid_active_model_id)
+                    row["fluid_hrom_model_selection_reason"] = str(sampled_lspg_hybrid_active_selection_reason)
+                    row["fluid_hrom_model_selection_distance"] = float(
+                        sampled_lspg_hybrid_active_selection_distance
+                    )
                     row["fluid_hrom_trial_used"] = bool(fluid_hrom_trial_used)
                     row["fluid_hrom_trial_load_rel_error"] = float(fluid_hrom_trial_load_rel_error)
                     row["fluid_hrom_disabled_by_trial_monitor"] = bool(fluid_hrom_trial_disabled_by_monitor)
@@ -15830,6 +16778,11 @@ def run_local_example2(
                     row["fluid_hrom_load_contraction_ratio"] = float(fluid_hrom_load_contraction_ratio)
                     row["fluid_hrom_manifold_distance"] = float(fluid_hrom_manifold_distance)
                     row["fluid_hrom_eta_gamma"] = float(fluid_hrom_eta_gamma)
+                    row["fluid_hrom_eta_bound"] = float(fluid_hrom_eta_bound)
+                    row["fluid_hrom_eta_effective_tolerance"] = float(fluid_hrom_eta_effective_tolerance)
+                    row["fluid_hrom_eta_reliability_factor"] = float(fluid_hrom_eta_reliability_factor)
+                    row["fluid_hrom_eta_true_error"] = float(fluid_hrom_eta_true_error)
+                    row["fluid_hrom_prior_gate_reason"] = str(fluid_hrom_prior_gate_reason)
                     row["fluid_hrom_dwr_error"] = float(fluid_hrom_dwr_error)
                     row["fluid_hrom_estimated_residual_norm"] = float(fluid_hrom_estimated_residual_norm)
                     row["fluid_hrom_iterations"] = int(fluid_hrom_iterations)
@@ -16865,8 +17818,26 @@ def run_local_example2(
         "solid_quad_order": int(solid_quad_order),
         "fluid_operator": str(fluid_operator_mode),
         "fluid_hrom_model_path": (
-            None if sampled_lspg_hybrid_model is None else str(sampled_lspg_hybrid_model.source_path)
+            None if sampled_lspg_hybrid_default_model is None else str(sampled_lspg_hybrid_default_model.source_path)
         ),
+        "fluid_hrom_bank_manifest": None if fluid_hrom_bank_manifest is None else str(Path(fluid_hrom_bank_manifest)),
+        "fluid_hrom_bank_count": int(len(sampled_lspg_hybrid_bank_entries)),
+        "fluid_hrom_bank_feature": str(sampled_lspg_hybrid_bank_feature_mode),
+        "fluid_hrom_bank_selection_count": {
+            str(key): int(value) for key, value in sampled_lspg_hybrid_bank_selection_count.items()
+        },
+        "fluid_hrom_bank_entries": [
+            {
+                **entry.to_dict(),
+                "loaded_path": str(sampled_lspg_hybrid_bank_models[str(entry.model_id)].source_path),
+                "modes": int(sampled_lspg_hybrid_bank_models[str(entry.model_id)].n_modes),
+                "sample_rows": int(sampled_lspg_hybrid_bank_models[str(entry.model_id)].sample_row_dofs.size),
+                "sample_elements": int(sampled_lspg_hybrid_bank_models[str(entry.model_id)].sample_element_ids.size),
+                "has_sampled_reaction": bool(sampled_lspg_hybrid_bank_models[str(entry.model_id)].has_sampled_reaction),
+                "has_reduced_reaction": bool(sampled_lspg_hybrid_bank_models[str(entry.model_id)].has_reduced_reaction),
+            }
+            for entry in sampled_lspg_hybrid_bank_entries
+        ],
         "fluid_hrom_switch_iter": (
             None if sampled_lspg_hybrid_model is None else int(sampled_lspg_hybrid_switch_iter)
         ),
@@ -16945,6 +17916,9 @@ def run_local_example2(
         "fluid_hrom_exact_correction_count": int(sampled_lspg_hybrid_exact_correction_count),
         "fluid_hrom_trial_monitor_failures": int(sampled_lspg_hybrid_trial_monitor_failures),
         "fluid_hrom_contraction_monitor_failures": int(sampled_lspg_hybrid_contraction_monitor_failures),
+        "fluid_hrom_candidate_load_gate_failures": int(
+            sampled_lspg_hybrid_candidate_load_gate_failures
+        ),
         "fluid_hrom_interface_reject_count": int(sampled_lspg_hybrid_interface_reject_count),
         "fluid_hrom_interface_correction_count": int(sampled_lspg_hybrid_interface_correction_count),
         "fluid_hrom_manifold_gate_failures": int(sampled_lspg_hybrid_manifold_gate_failures),
@@ -16952,9 +17926,14 @@ def run_local_example2(
         "fluid_hrom_eta_gamma_gate_failures": int(sampled_lspg_hybrid_eta_gamma_gate_failures),
         "fluid_hrom_adaptive_stage_dump_count": int(sampled_lspg_hybrid_adaptive_stage_dump_count),
         "fluid_hrom_adaptive_db_dir": None if fluid_hrom_adaptive_db_path is None else str(fluid_hrom_adaptive_db_path),
+        "fluid_hrom_adaptive_db_record_prior_skips": bool(fluid_hrom_adaptive_db_record_prior_skips_value),
+        "fluid_hrom_adaptive_db_skip_stride": int(fluid_hrom_adaptive_db_skip_stride_value),
         "fluid_hrom_disabled_until_step": (
             None if sampled_lspg_hybrid_model is None else int(fluid_hrom_disabled_until_step)
         ),
+        "fluid_hrom_disabled_until_step_by_model": {
+            str(key): int(value) for key, value in fluid_hrom_disabled_until_step_by_model.items()
+        },
         "fluid_hrom_max_previous_load_rel": (
             None if sampled_lspg_hybrid_model is None else float(fluid_hrom_max_previous_load_rel_value)
         ),
@@ -16975,6 +17954,9 @@ def run_local_example2(
         ),
         "fluid_hrom_max_load_contraction_ratio": (
             None if sampled_lspg_hybrid_model is None else float(fluid_hrom_max_load_contraction_ratio_value)
+        ),
+        "fluid_hrom_max_candidate_load_rel": (
+            None if sampled_lspg_hybrid_model is None else float(fluid_hrom_max_candidate_load_rel_value)
         ),
         "fluid_hrom_require_exact_accept": (
             None if sampled_lspg_hybrid_model is None else bool(fluid_hrom_require_exact_accept)
@@ -17006,6 +17988,7 @@ def run_local_example2(
         "fluid_hrom_exact_mean_stage_time_s": (
             None if not fluid_exact_cost_samples else float(np.mean(np.asarray(fluid_exact_cost_samples, dtype=float)))
         ),
+        "fluid_hrom_cost_certificate": fluid_hrom_cost_certificate,
         "fluid_hrom_interface_trust": (
             None if sampled_lspg_hybrid_model is None else str(fluid_hrom_interface_trust_value)
         ),
@@ -17032,6 +18015,46 @@ def run_local_example2(
         ),
         "fluid_hrom_use_estimator_load_on_accept": (
             None if sampled_lspg_hybrid_model is None else bool(fluid_hrom_use_estimator_load_on_accept)
+        ),
+        "fluid_hrom_eta_policy": (
+            None if sampled_lspg_hybrid_model is None else str(fluid_hrom_eta_policy_value)
+        ),
+        "fluid_hrom_eta_max_tolerance": (
+            None if sampled_lspg_hybrid_model is None else float(fluid_hrom_eta_max_tolerance_value)
+        ),
+        "fluid_hrom_eta_min_calibration_samples": (
+            None if sampled_lspg_hybrid_model is None else int(fluid_hrom_eta_min_calibration_samples_value)
+        ),
+        "fluid_hrom_eta_quantile": (
+            None if sampled_lspg_hybrid_model is None else float(fluid_hrom_eta_quantile_value)
+        ),
+        "fluid_hrom_eta_safety_factor": (
+            None if sampled_lspg_hybrid_model is None else float(fluid_hrom_eta_safety_factor_value)
+        ),
+        "fluid_hrom_eta_calibration": (
+            None if fluid_hrom_eta_calibrator is None else fluid_hrom_eta_calibrator.to_dict()
+        ),
+        "fluid_hrom_eta_calibration_by_model": {
+            str(key): calibrator.to_dict()
+            for key, calibrator in fluid_hrom_eta_calibrators_by_model.items()
+        },
+        "fluid_hrom_eta_prior_gate_skips": int(fluid_hrom_eta_prior_gate_skips),
+        "fluid_hrom_eta_prior_disabled_until_step": int(fluid_hrom_eta_prior_disabled_until_step),
+        "fluid_hrom_eta_prior_disabled_until_step_by_model": {
+            str(key): int(value)
+            for key, value in fluid_hrom_eta_prior_disabled_until_step_by_model.items()
+        },
+        "fluid_hrom_eta_prior_consecutive_failures_by_model": {
+            str(key): int(value)
+            for key, value in fluid_hrom_eta_prior_consecutive_failures_by_model.items()
+        },
+        "fluid_hrom_eta_calibration_count": int(
+            sum(
+                int(calibrator.sample_count)
+                for calibrator in fluid_hrom_eta_calibrators_by_model.values()
+            )
+            if fluid_hrom_eta_calibrators_by_model
+            else int(fluid_hrom_eta_calibration_count)
         ),
         "fluid_hrom_max_dwr_error": (
             None if sampled_lspg_hybrid_model is None else float(fluid_hrom_max_dwr_error_value)
@@ -17365,6 +18388,8 @@ def main() -> None:
         reduced_mesh_surrogate_path=args.reduced_mesh_surrogate_path,
         fluid_operator=str(args.fluid_operator),
         fluid_hrom_model_path=args.fluid_hrom_model_path,
+        fluid_hrom_bank_manifest=args.fluid_hrom_bank_manifest,
+        fluid_hrom_bank_feature=str(args.fluid_hrom_bank_feature),
         fluid_hrom_switch_iter=args.fluid_hrom_switch_iter,
         fluid_hrom_late_switch_step=int(args.fluid_hrom_late_switch_step),
         fluid_hrom_late_switch_iter=args.fluid_hrom_late_switch_iter,
@@ -17386,6 +18411,7 @@ def main() -> None:
         fluid_hrom_max_consecutive_stages=int(args.fluid_hrom_max_consecutive_stages),
         fluid_hrom_max_stages_per_step=int(args.fluid_hrom_max_stages_per_step),
         fluid_hrom_max_load_contraction_ratio=float(args.fluid_hrom_max_load_contraction_ratio),
+        fluid_hrom_max_candidate_load_rel=float(args.fluid_hrom_max_candidate_load_rel),
         fluid_hrom_require_exact_accept=bool(args.fluid_hrom_require_exact_accept),
         fluid_hrom_trial_exact_correct=bool(args.fluid_hrom_trial_exact_correct),
         fluid_hrom_max_trial_load_rel_error=float(args.fluid_hrom_max_trial_load_rel_error),
@@ -17403,8 +18429,17 @@ def main() -> None:
         fluid_hrom_max_manifold_distance=float(args.fluid_hrom_max_manifold_distance),
         fluid_hrom_interface_load_tolerance=float(args.fluid_hrom_interface_load_tolerance),
         fluid_hrom_use_estimator_load_on_accept=bool(args.fluid_hrom_use_estimator_load_on_accept),
+        fluid_hrom_eta_policy=str(args.fluid_hrom_eta_policy),
+        fluid_hrom_eta_max_tolerance=float(args.fluid_hrom_eta_max_tolerance),
+        fluid_hrom_eta_min_calibration_samples=int(args.fluid_hrom_eta_min_calibration_samples),
+        fluid_hrom_eta_quantile=float(args.fluid_hrom_eta_quantile),
+        fluid_hrom_eta_safety_factor=float(args.fluid_hrom_eta_safety_factor),
+        fluid_hrom_prior_gate_cooldown_steps=int(args.fluid_hrom_prior_gate_cooldown_steps),
+        fluid_hrom_prior_gate_failure_threshold=int(args.fluid_hrom_prior_gate_failure_threshold),
         fluid_hrom_max_dwr_error=float(args.fluid_hrom_max_dwr_error),
         fluid_hrom_adaptive_db_dir=args.fluid_hrom_adaptive_db_dir,
+        fluid_hrom_adaptive_db_record_prior_skips=bool(args.fluid_hrom_adaptive_db_record_prior_skips),
+        fluid_hrom_adaptive_db_skip_stride=int(args.fluid_hrom_adaptive_db_skip_stride),
         fluid_hrom_certified_relaxation=str(args.fluid_hrom_certified_relaxation),
         fluid_hrom_certified_relaxation_growth=float(args.fluid_hrom_certified_relaxation_growth),
         fluid_hrom_certified_relaxation_shrink=float(args.fluid_hrom_certified_relaxation_shrink),

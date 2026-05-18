@@ -20,8 +20,8 @@ from pycutfem.mor.metrics import (
 from pycutfem.mor.pod import fit_pod, project_to_basis
 from pycutfem.mor.quadratic_manifold import fit_quadratic_decoder
 from pycutfem.mor.regressors import PolynomialLassoRegressor
-from pycutfem.mor.snapshots import SnapshotBatch
-from pycutfem.nirb.offline import OfflineConfig, RegressionConfig, run_offline_pipeline
+from pycutfem.mor.snapshots import NamedSnapshotBatch
+from pycutfem.mor.nirb.offline import OfflineConfig, RegressionConfig, run_offline_pipeline
 
 from examples.NIRB.common import (
     DOUBLE_FLAP_REPO_URL,
@@ -247,9 +247,8 @@ def prepare_example2_artifacts(
 
     forces, displacements = _build_training_snapshots(payload_root)
     train_dataset_path = example_root / "rom4_train_snapshots.npz"
-    SnapshotBatch(
-        interface_forces=forces,
-        full_displacements=displacements,
+    NamedSnapshotBatch(
+        fields={"input": forces, "output": displacements},
         metadata={
             "benchmark": "example2",
             "training_cases": [reynolds_from_case(case) for case in TRAINING_CASES],
@@ -266,8 +265,8 @@ def prepare_example2_artifacts(
         {
             "dataset_path": _repo_relative(train_dataset_path),
             "model_path": _repo_relative(example_root / "rom4_model.pkl"),
-            "force_modes": EXAMPLE2_FORCE_MODES,
-            "displacement_modes": EXAMPLE2_DISPLACEMENT_MODES,
+            "input_modes": EXAMPLE2_FORCE_MODES,
+            "output_modes": EXAMPLE2_DISPLACEMENT_MODES,
             "regression": {
                 "kind": "poly_lasso",
                 "degree": 2,
@@ -275,7 +274,7 @@ def prepare_example2_artifacts(
                 "standardize_inputs": False,
             },
             "use_quadratic_decoder": True,
-            "interface_matrix_path": _repo_relative(interface_matrix_path),
+            "output_matrix_path": _repo_relative(interface_matrix_path),
             "metadata": {"benchmark": "example2", "rom": "ROM4"},
         },
         config_path,
@@ -305,15 +304,15 @@ def run_example2(
         include_online_vtk=include_online_vtk,
     )
 
-    train_snapshots = np.load(paths["train_dataset"])
-    train_forces = np.asarray(train_snapshots["interface_forces"], dtype=float)
-    train_displacements = np.asarray(train_snapshots["full_displacements"], dtype=float)
+    train_snapshots = NamedSnapshotBatch.load(paths["train_dataset"])
+    train_forces = np.asarray(train_snapshots["input"], dtype=float)
+    train_displacements = np.asarray(train_snapshots["output"], dtype=float)
 
     mode_sweep = run_mode_cross_validation(
         train_forces,
         train_displacements,
-        force_modes=list(range(15, 61, 5)),
-        displacement_modes=[EXAMPLE2_DISPLACEMENT_MODES],
+        input_modes=list(range(15, 61, 5)),
+        output_modes=[EXAMPLE2_DISPLACEMENT_MODES],
         regressor_factory=lambda: PolynomialLassoRegressor(
             degree=2,
             criterion="bic",
@@ -325,10 +324,10 @@ def run_example2(
     )
     dump_json(mode_sweep.entries, paths["root"] / "mode_sweep.json")
 
-    sorted_entries = sorted(mode_sweep.entries, key=lambda entry: entry.force_modes)
+    sorted_entries = sorted(mode_sweep.entries, key=lambda entry: entry.input_modes)
     figure, axis_left = plt.subplots(figsize=(8, 4.5))
     axis_left.semilogy(
-        [entry.force_modes for entry in sorted_entries],
+        [entry.input_modes for entry in sorted_entries],
         [entry.validation_error for entry in sorted_entries],
         marker="o",
         color="black",
@@ -339,7 +338,7 @@ def run_example2(
     axis_left.grid(True, alpha=0.3)
     axis_right = axis_left.twinx()
     axis_right.semilogy(
-        [entry.force_modes for entry in sorted_entries],
+        [entry.input_modes for entry in sorted_entries],
         [entry.regression_error for entry in sorted_entries],
         marker="s",
         color="red",
@@ -356,8 +355,8 @@ def run_example2(
         OfflineConfig(
             dataset_path=str(paths["train_dataset"]),
             model_path=str(paths["model"]),
-            force_modes=EXAMPLE2_FORCE_MODES,
-            displacement_modes=EXAMPLE2_DISPLACEMENT_MODES,
+            input_modes=EXAMPLE2_FORCE_MODES,
+            output_modes=EXAMPLE2_DISPLACEMENT_MODES,
             regression=RegressionConfig(
                 kind="poly_lasso",
                 degree=2,
@@ -365,13 +364,13 @@ def run_example2(
                 standardize_inputs=False,
             ),
             use_quadratic_decoder=True,
-            interface_matrix_path=str(paths["interface_matrix"]),
+            output_matrix_path=str(paths["interface_matrix"]),
             metadata={"benchmark": "example2", "rom": "ROM4"},
         )
     )
 
     started = time.perf_counter()
-    _ = model.predict_interface(train_forces)
+    _ = model.predict_restricted(train_forces)
     interface_inference_elapsed = time.perf_counter() - started
 
     offline_metrics = _evaluate_offline_rom4(train_forces, train_displacements, random_state=0)
@@ -434,8 +433,8 @@ def run_example2(
     result = {
         "benchmark": "example2",
         "paper_selected_modes": {
-            "force_modes": EXAMPLE2_FORCE_MODES,
-            "displacement_modes": EXAMPLE2_DISPLACEMENT_MODES,
+            "input_modes": EXAMPLE2_FORCE_MODES,
+            "output_modes": EXAMPLE2_DISPLACEMENT_MODES,
         },
         "training_cases_reynolds": [reynolds_from_case(case_name) for case_name in TRAINING_CASES],
         "mode_sweep": {

@@ -15,8 +15,8 @@ from pycutfem.mor.metrics import (
     mean_sample_l2_error,
 )
 from pycutfem.mor.regressors import ThinPlateSplineRBF
-from pycutfem.mor.snapshots import SnapshotBatch
-from pycutfem.nirb.offline import OfflineConfig, RegressionConfig, run_offline_pipeline
+from pycutfem.mor.snapshots import NamedSnapshotBatch
+from pycutfem.mor.nirb.offline import OfflineConfig, RegressionConfig, run_offline_pipeline
 
 from examples.NIRB.common import (
     ARTERIAL_REPO_URL,
@@ -47,9 +47,11 @@ def prepare_example1_artifacts(cache_root: Path, artifacts_root: Path) -> dict[s
     example_root.mkdir(parents=True, exist_ok=True)
 
     train_dataset_path = example_root / "train_snapshots.npz"
-    SnapshotBatch(
-        interface_forces=np.load(repo / "FOM_DATA" / "first_mu" / "pres_TRAIN_DATA.npy"),
-        full_displacements=np.load(repo / "FOM_DATA" / "first_mu" / "sec_TRAIN_DATA.npy"),
+    NamedSnapshotBatch(
+        fields={
+            "input": np.load(repo / "FOM_DATA" / "first_mu" / "pres_TRAIN_DATA.npy"),
+            "output": np.load(repo / "FOM_DATA" / "first_mu" / "sec_TRAIN_DATA.npy"),
+        },
         metadata={"benchmark": "example1", "paper_modes": [EXAMPLE1_FORCE_MODES, EXAMPLE1_DISPLACEMENT_MODES]},
     ).save(train_dataset_path)
 
@@ -75,8 +77,8 @@ def prepare_example1_artifacts(cache_root: Path, artifacts_root: Path) -> dict[s
         {
             "dataset_path": _repo_relative(train_dataset_path),
             "model_path": _repo_relative(example_root / "model.pkl"),
-            "force_modes": EXAMPLE1_FORCE_MODES,
-            "displacement_modes": EXAMPLE1_DISPLACEMENT_MODES,
+            "input_modes": EXAMPLE1_FORCE_MODES,
+            "output_modes": EXAMPLE1_DISPLACEMENT_MODES,
             "regression": {"kind": "tps_rbf", "smoothing": 0.0},
             "use_quadratic_decoder": False,
             "metadata": {"benchmark": "example1"},
@@ -107,15 +109,15 @@ def run_example1(
     artifacts_root = default_artifacts_root() if artifacts_root is None else Path(artifacts_root)
     paths = prepare_example1_artifacts(cache_root=cache_root, artifacts_root=artifacts_root)
 
-    train_snapshots = np.load(paths["train_dataset"])
-    train_forces = np.asarray(train_snapshots["interface_forces"], dtype=float)
-    train_displacements = np.asarray(train_snapshots["full_displacements"], dtype=float)
+    train_snapshots = NamedSnapshotBatch.load(paths["train_dataset"])
+    train_forces = np.asarray(train_snapshots["input"], dtype=float)
+    train_displacements = np.asarray(train_snapshots["output"], dtype=float)
 
     mode_sweep = run_mode_cross_validation(
         train_forces,
         train_displacements,
-        force_modes=list(range(1, 7)),
-        displacement_modes=list(range(1, 13)),
+        input_modes=list(range(1, 7)),
+        output_modes=list(range(1, 13)),
         regressor_factory=lambda: ThinPlateSplineRBF(),
         test_fraction=0.2,
         random_state=0,
@@ -124,8 +126,8 @@ def run_example1(
     dump_json(mode_sweep.entries, paths["results"].with_name("mode_sweep.json"))
     plot_heatmap(
         mode_sweep.entries,
-        x_attr="force_modes",
-        y_attr="displacement_modes",
+        x_attr="input_modes",
+        y_attr="output_modes",
         value_attr="validation_error",
         path=paths["results"].with_name("mode_sweep_heatmap.png"),
         title="Example 1 Held-Out Error",
@@ -137,8 +139,8 @@ def run_example1(
         OfflineConfig(
             dataset_path=str(paths["train_dataset"]),
             model_path=str(paths["model"]),
-            force_modes=EXAMPLE1_FORCE_MODES,
-            displacement_modes=EXAMPLE1_DISPLACEMENT_MODES,
+            input_modes=EXAMPLE1_FORCE_MODES,
+            output_modes=EXAMPLE1_DISPLACEMENT_MODES,
             regression=RegressionConfig(kind="tps_rbf"),
             use_quadratic_decoder=False,
             metadata={"benchmark": "example1"},
@@ -151,10 +153,10 @@ def run_example1(
     other_reference = np.load(paths["other_reference"])
 
     started = time.perf_counter()
-    same_prediction = model.predict_full(same_forces)
+    same_prediction = model.predict(same_forces)
     same_elapsed = time.perf_counter() - started
     started = time.perf_counter()
-    other_prediction = model.predict_full(other_forces)
+    other_prediction = model.predict(other_forces)
     other_elapsed = time.perf_counter() - started
 
     np.savez_compressed(paths["results"].with_name("same_mu_prediction.npz"), predictions=same_prediction)

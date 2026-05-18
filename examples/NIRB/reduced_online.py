@@ -8,7 +8,7 @@ import numpy as np
 
 from examples.NIRB.reduced_fluid import ReducedFluidSolveResult
 from examples.NIRB.reduced_mesh import ReducedMeshMotionOperator, ReducedMeshMotionState
-from pycutfem.nirb.reduced_interface import ReducedIQNILS, ReducedInterfaceSpace
+from pycutfem.mor.nirb.reduced_spaces import ReducedIQNILS, ReducedSpace
 
 
 SolidReducedSolve = Callable[[np.ndarray], tuple[np.ndarray, np.ndarray]]
@@ -88,8 +88,8 @@ class ReducedOnlineFSISolver:
     ALE-DVMS implementation.
     """
 
-    load_space: ReducedInterfaceSpace
-    displacement_space: ReducedInterfaceSpace
+    load_space: ReducedSpace
+    displacement_space: ReducedSpace
     solid_solve: SolidReducedSolve
     mesh_operator: ReducedMeshMotionOperator
     fluid_solve: FluidReducedSolve

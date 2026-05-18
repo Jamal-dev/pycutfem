@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import csv
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from time import perf_counter
@@ -9,7 +11,135 @@ import numpy as np
 
 from pycutfem.mor.interface import InterfaceRestriction
 from pycutfem.mor.io import load_model
-from pycutfem.nirb.reduced_interface import ReducedInterfaceDecoder
+from pycutfem.mor.snapshots import NamedSnapshotBatch
+from pycutfem.mor.nirb.reduced_spaces import ReducedOutputDecoder
+
+
+def _as_snapshot_matrix(values: np.ndarray) -> np.ndarray:
+    matrix = np.asarray(values, dtype=float)
+    if matrix.ndim == 1:
+        matrix = matrix[:, None]
+    if matrix.ndim != 2:
+        raise ValueError("expected a feature-major snapshot matrix")
+    return matrix
+
+
+def _array_path(co_sim_dir: Path, key: str) -> Path:
+    name = key if key.endswith(".npy") else f"{key}.npy"
+    return co_sim_dir / name
+
+
+def _resolve_co_sim_dir(path: str | Path) -> tuple[Path, Path]:
+    root = Path(path)
+    if (root / "coSimData").is_dir():
+        return root / "coSimData", root
+    return root, root.parent
+
+
+def _load_json_if_present(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _load_snapshot_metadata(path: Path, n_snapshots: int) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+    if not path.exists():
+        return None, None, None
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    if len(rows) != n_snapshots:
+        return None, None, None
+    times = np.asarray([float(row.get("time_s", 0.0) or 0.0) for row in rows], dtype=float)
+    subiterations = np.asarray([int(row.get("coupling_iter", 0) or 0) for row in rows], dtype=int)
+    converged = np.asarray(
+        [str(row.get("converged", "")).strip().lower() in {"1", "true", "yes"} for row in rows],
+        dtype=bool,
+    )
+    return times, subiterations, converged
+
+
+def load_cosim_snapshot_batch(
+    path: str | Path,
+    *,
+    force_key: str = "load_guess_data",
+    displacement_key: str = "disp_data",
+    input_field: str = "interface_load",
+    output_field: str = "solid_displacement",
+) -> NamedSnapshotBatch:
+    """Load Example-2-style FSI ``coSimData`` arrays as a generic snapshot batch."""
+
+    co_sim_dir, run_root = _resolve_co_sim_dir(path)
+    force_path = _array_path(co_sim_dir, force_key)
+    if not force_path.exists() and force_key == "load_guess_data":
+        force_path = _array_path(co_sim_dir, "load_data")
+        force_key = "load_data"
+    displacement_path = _array_path(co_sim_dir, displacement_key)
+    if not force_path.exists():
+        raise FileNotFoundError(force_path)
+    if not displacement_path.exists():
+        raise FileNotFoundError(displacement_path)
+
+    input_snapshots = _as_snapshot_matrix(np.load(force_path))
+    output_snapshots = _as_snapshot_matrix(np.load(displacement_path))
+    if input_snapshots.shape[1] != output_snapshots.shape[1]:
+        raise ValueError(
+            "coSimData input and output snapshot counts differ: "
+            f"{input_snapshots.shape[1]} != {output_snapshots.shape[1]}"
+        )
+
+    n_snapshots = int(input_snapshots.shape[1])
+    times, subiterations, converged = _load_snapshot_metadata(run_root / "snapshot_metadata.csv", n_snapshots)
+    solid_times = None
+    fluid_times = None
+    solid_time_path = co_sim_dir / "structure_time.npy"
+    fluid_time_path = co_sim_dir / "fluid_time.npy"
+    if solid_time_path.exists():
+        values = np.asarray(np.load(solid_time_path), dtype=float).reshape(-1)
+        if values.size == n_snapshots:
+            solid_times = values
+    if fluid_time_path.exists():
+        values = np.asarray(np.load(fluid_time_path), dtype=float).reshape(-1)
+        if values.size == n_snapshots:
+            fluid_times = values
+
+    summary = _load_json_if_present(run_root / "summary.json")
+    parameters = None
+    if "reynolds" in summary:
+        parameters = np.full((n_snapshots, 1), float(summary["reynolds"]), dtype=float)
+
+    sample_metadata = []
+    for index in range(n_snapshots):
+        sample_metadata.append(
+            {
+                "subiteration": None if subiterations is None else int(subiterations[index]),
+                "coupling_iter": None if subiterations is None else int(subiterations[index]),
+                "solid_time": None if solid_times is None else float(solid_times[index]),
+                "fluid_time": None if fluid_times is None else float(fluid_times[index]),
+            }
+        )
+
+    return NamedSnapshotBatch(
+        fields={
+            str(input_field): input_snapshots,
+            str(output_field): output_snapshots,
+        },
+        parameters=parameters,
+        times=times,
+        converged=converged,
+        sample_metadata=tuple(sample_metadata),
+        metadata={
+            "source": "coSimData",
+            "co_sim_dir": str(co_sim_dir),
+            "run_root": str(run_root),
+            "input_field": str(input_field),
+            "output_field": str(output_field),
+            "force_key": force_key,
+            "displacement_key": displacement_key,
+            "force_path": str(force_path),
+            "displacement_path": str(displacement_path),
+            "summary": summary,
+        },
+    )
 
 
 @dataclass(frozen=True)
@@ -150,16 +280,16 @@ class NIRBSolidPredictor:
     interface_matrix: np.ndarray | None = None
     interface_shape: tuple[int, ...] | None = None
     zero_load_tolerance: float = 0.0
-    reduced_interface_decoder: ReducedInterfaceDecoder | None = None
+    reduced_interface_decoder: ReducedOutputDecoder | None = None
     online_context: dict[str, float] = field(default_factory=dict)
     _interface_decoder: Any = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.interface_matrix is not None:
             restriction = InterfaceRestriction(matrix=np.asarray(self.interface_matrix, dtype=float))
-            self._interface_decoder = restriction.restrict_decoder(self.model.decoder)
-        elif getattr(self.model, "interface_restriction", None) is not None:
-            self._interface_decoder = self.model.interface_restriction.restrict_decoder(self.model.decoder)
+            self._interface_decoder = restriction.restrict_decoder(self.model.output_decoder)
+        elif getattr(self.model, "output_restriction", None) is not None:
+            self._interface_decoder = self.model.output_restriction.restrict_decoder(self.model.output_decoder)
 
     @classmethod
     def from_path(
@@ -170,7 +300,7 @@ class NIRBSolidPredictor:
         interface_matrix: np.ndarray | None = None,
         interface_shape: tuple[int, ...] | None = None,
         zero_load_tolerance: float = 0.0,
-        reduced_interface_decoder: ReducedInterfaceDecoder | None = None,
+        reduced_interface_decoder: ReducedOutputDecoder | None = None,
     ) -> "NIRBSolidPredictor":
         return cls(
             model=load_model(path),
@@ -199,7 +329,7 @@ class NIRBSolidPredictor:
         self.online_context = context
 
     def _model_context(self) -> dict[str, float] | None:
-        if not tuple(getattr(self.model, "input_feature_names", ()) or ()):
+        if not tuple(getattr(self.model, "context_feature_names", ()) or ()):
             return None
         return dict(self.online_context)
 
@@ -221,7 +351,7 @@ class NIRBSolidPredictor:
             return NIRBSolidPrediction(
                 full_displacement=None,
                 interface_displacement=None,
-                reduced_displacement=np.zeros((int(self.model.decoder.n_linear_modes),), dtype=float),
+                reduced_displacement=np.zeros((int(self.model.output_decoder.n_linear_modes),), dtype=float),
                 elapsed_s=0.0,
             )
         force = force_vector.reshape(-1, 1)
@@ -247,11 +377,11 @@ class NIRBSolidPredictor:
         """
 
         coeffs = np.asarray(force_coefficients, dtype=float).reshape(-1)
-        n_force_modes = int(np.asarray(self.model.force_basis.basis).shape[1])
+        n_force_modes = int(np.asarray(self.model.input_basis.basis).shape[1])
         if int(coeffs.size) != n_force_modes:
             raise ValueError(f"expected {n_force_modes} force coefficients, got {coeffs.size}.")
         if np.linalg.norm(coeffs) <= float(self.zero_load_tolerance):
-            reduced_zero = np.zeros((int(self.model.decoder.n_linear_modes),), dtype=float)
+            reduced_zero = np.zeros((int(self.model.output_decoder.n_linear_modes),), dtype=float)
             return NIRBSolidPrediction(
                 full_displacement=None,
                 interface_displacement=None,
@@ -265,9 +395,9 @@ class NIRBSolidPredictor:
             )
 
         started = perf_counter()
-        if hasattr(self.model, "predict_reduced_from_force_coefficients"):
+        if hasattr(self.model, "predict_reduced_from_input_coefficients"):
             reduced = np.asarray(
-                self.model.predict_reduced_from_force_coefficients(
+                self.model.predict_reduced_from_input_coefficients(
                     coeffs,
                     context=self._model_context(),
                 ),
@@ -345,7 +475,7 @@ class NIRBSolidPredictor:
 
     def reconstruct_full(self, reduced_displacement: np.ndarray) -> np.ndarray:
         reduced = np.asarray(reduced_displacement, dtype=float).reshape(-1, 1)
-        displacement = np.asarray(self.model.decoder.decode(reduced), dtype=float)
+        displacement = np.asarray(self.model.output_decoder.decode(reduced), dtype=float)
         if displacement.ndim != 2 or displacement.shape[1] != 1:
             raise ValueError("NIRB solid model must return a single feature-major displacement column")
         vector = displacement[:, 0]
@@ -383,7 +513,7 @@ class NIRBSolidPredictor:
             return NIRBSolidPrediction(
                 full_displacement=None,
                 interface_displacement=self._zero_interface_displacement(),
-                reduced_displacement=np.zeros((int(self.model.decoder.n_linear_modes),), dtype=float),
+                reduced_displacement=np.zeros((int(self.model.output_decoder.n_linear_modes),), dtype=float),
                 elapsed_s=0.0,
             )
         prediction = self.predict_reduced(force_vector)
@@ -424,3 +554,13 @@ class NIRBSolidPredictor:
             ),
             elapsed_s=float(elapsed),
         )
+
+
+__all__ = [
+    "CouplingIterationRecord",
+    "CouplingTrace",
+    "NIRBInterfaceTangentCorrector",
+    "NIRBSolidPrediction",
+    "NIRBSolidPredictor",
+    "load_cosim_snapshot_batch",
+]
