@@ -3,7 +3,7 @@
 
 The script is intentionally example-facing: it knows about common column names
 written by the NIRB/FSI ``timeseries.csv`` files, but all clustering and atlas
-logic lives in ``pycutfem.mor.feature_atlas``.
+logic lives in ``pycutfem.mor.regime_atlas``.
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ from typing import Iterable
 
 import numpy as np
 
-from pycutfem.mor import feature_atlas_to_bank_manifest, select_feature_atlas_size
+from pycutfem.mor.regime_atlas import feature_atlas_to_bank_manifest, select_feature_atlas_size
 
 
 DEFAULT_LOG_FEATURES = (

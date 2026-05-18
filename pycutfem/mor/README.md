@@ -1680,40 +1680,54 @@ print(certificate.estimate, guard.certified_bound)
 
 ---
 
-## Topic 14: Feature atlases and local model banks
+## Topic 14: Nonlinear regime atlases and local model banks
 
 ### Idea
 
 A single global reduced basis may be inefficient or inaccurate for strongly
 nonlinear trajectories.  Local model banks use different reduced models for
-different regimes.  A feature atlas defines those regimes using cheap online
-features rather than arbitrary time intervals.
+different regimes.  A regime atlas defines those regimes using generic,
+online-available features and then validates whether the local model in each
+region is accurate enough to deploy.
 
 ### First-principles derivation
 
-Build a feature vector for each candidate online stage.  For an FSI or
-interface-dominated problem, a feature vector might be
+Build a feature vector for each candidate online stage:
 
 $$
-f_i=
+z_i=
 \left[
-\log_{10}\|r_\Gamma\|,
-\log_{10}\|\Delta d_\Gamma\|,
-\|f_\Gamma\|_{\mathrm{rms}},
-\|d_\Gamma\|_{\mathrm{rms}},
-\rho_{\mathrm{contract}},
-\eta_\Gamma
+z_{i1},
+z_{i2},
+\ldots,
+z_{id}
 \right].
 $$
 
-Cluster feature vectors into regions.  Each region may get its own trial basis,
-sampling rows, reaction operator, cubature weights, and calibration state.
+The columns are application-defined: parameters, time, previous reduced state,
+residual indicators, sensor values, continuation step data, or any other
+quantity available before selecting the local model.
+
+An atlas proposes regions:
+
+$$
+z_i\in\Omega_r.
+$$
+
+Each region may get its own trial basis, sampling rows, decoder, regression
+map, cubature weights, and calibration state.  A deployable region must pass a
+validation gate:
+
+$$
+E_r^{\mathrm{val}}\le \tau.
+$$
+
 During online deployment, select a bank only if the feature lies inside its
-valid radius:
+certified radius:
 
 $$
 \left\|
-\frac{f_{\mathrm{online}}-f_{\mathrm{center}}}{f_{\mathrm{scale}}}
+\frac{z_{\mathrm{online}}-z_{\mathrm{center}}}{z_{\mathrm{scale}}}
 \right\|_2
 \le d_{\max}.
 $$
@@ -1736,58 +1750,63 @@ local spaces.
 
 ### API mapping
 
+The full regime-discovery implementation lives in
+`pycutfem.mor.regime_atlas`.  See
+`pycutfem/mor/regime_atlas/README.md` for the complete help-file treatment.
+The older `pycutfem.mor.feature_atlas` and `pycutfem.mor.local_banks` public
+modules have been removed; use `pycutfem.mor.regime_atlas` for atlas and bank
+imports.
+
 | Concept | API object |
 | --- | --- |
+| dataset contract | `RegimeDataset`, `RegimeAtlas`, `RegimeRegion` |
 | feature scaling | `robust_feature_center_scale`, `scale_feature_matrix` |
-| clustering | `fit_k_medoids`, `fit_feature_atlas` |
-| atlas diagnostics | `diagnose_feature_atlas`, `select_feature_atlas_size` |
-| manifest conversion | `feature_atlas_to_bank_manifest` |
-| local bank selection | `select_local_reduced_model_bank` |
+| geometry partitioning | `KMedoidsPartitioner`, `EpsilonCoverPartitioner`, `HierarchicalPartitioner` |
+| outlier and soft partitioning | `DensityPartitioner`, `MixturePartitioner` |
+| error-driven splitting | `ResidualGreedySplitter`, `ResidualGreedyConfig` |
+| atlas validation and selection | `RegimeValidationSummary`, `RegimeAtlasSelector` |
+| manifest conversion | `build_regime_bank_manifest`, `feature_atlas_to_bank_manifest` |
+| online novelty and bank selection | `RegimeOnlineSelector`, `select_local_reduced_model_bank` |
 | subspace comparison | `subspace_principal_angles`, `subspace_chordal_distance` |
 
 ### Expected result
 
-The example builds two synthetic feature clusters, converts the atlas to a bank
-manifest, selects the `late` bank for step 12, and computes finite subspace
-angle diagnostics.
+The example builds two synthetic regimes, validates that the local atlas has
+two regions, selects an online feature inside one certified radius, and rejects
+an unsupported feature.
 
 ### Example
 
 ```python
 import numpy as np
 from pycutfem.mor import (
-    LocalReducedModelBankEntry,
-    diagnose_feature_atlas,
-    feature_atlas_to_bank_manifest,
-    fit_feature_atlas,
-    select_local_reduced_model_bank,
+    KMedoidsPartitioner,
+    RegimeOnlineSelector,
     subspace_chordal_distance,
     subspace_principal_angles,
 )
 
-rng = np.random.default_rng(7)
 features = np.vstack(
     [
-        rng.normal(loc=(-1.0, 0.0), scale=0.1, size=(20, 2)),
-        rng.normal(loc=(1.0, 0.5), scale=0.1, size=(20, 2)),
+        np.linspace(-1.0, -0.8, 12),
+        np.linspace(0.8, 1.0, 12),
     ]
-)
+).reshape(-1, 1)
 
-atlas = fit_feature_atlas(features, n_regions=2, feature_names=("residual", "load"))
-diagnostics = diagnose_feature_atlas(atlas, min_support=5)
-manifest = feature_atlas_to_bank_manifest(atlas, model_path_template="region_{region_id}.npz")
+atlas = KMedoidsPartitioner(n_regions=2, radius_quantile=1.0).fit(features)
+selector = RegimeOnlineSelector(atlas=atlas, fallback_policy={"kind": "global_rom"})
 
-entries = (
-    LocalReducedModelBankEntry(model_id="early", path="early.npz", step_start=1, step_end=10),
-    LocalReducedModelBankEntry(model_id="late", path="late.npz", step_start=11),
-)
-selection = select_local_reduced_model_bank(entries, step=12)
+inside = selector.select(feature=np.array([-0.9]))
+outside = selector.select(feature=np.array([10.0]))
 
+assert atlas.n_regions == 2
+assert inside.selected
+assert outside.reason == "outside_certified_region"
+
+rng = np.random.default_rng(7)
 Qa, _ = np.linalg.qr(rng.normal(size=(8, 3)))
 Qb, _ = np.linalg.qr(rng.normal(size=(8, 3)))
-assert len(manifest["banks"]) > 0
-assert selection.model_id == "late"
-print(diagnostics.passed, len(manifest["banks"]), selection.model_id)
+print(atlas.support_counts, inside.region_id, outside.reason)
 print(subspace_principal_angles(Qa, Qb), subspace_chordal_distance(Qa, Qb))
 ```
 
@@ -2441,15 +2460,51 @@ The names below are the public MOR API.  Unless noted, import them from the pack
 - `select_certified_adaptive_enrichment_actions`
 - `augment_rows_from_dwr_localization`
 
-### `local_banks.py`
+### `regime_atlas/`
 
+- `RegimeDataset`
+- `RegimeRegion`
+- `RegimeAtlas`
+- `RegimeValidationSplit`
+- `RegimeValidationReport`
+- `RegimeValidationSummary`
+- `RegimePartitioner`
+- `RegimePartitionerConfig`
+- `KMedoidsPartitioner`
+- `EpsilonCoverPartitioner`
+- `HierarchicalPartitioner`
+- `DensityPartitioner`
+- `MixturePartitioner`
+- `TreeRouter`
+- `SubspacePartition`
+- `SubspacePartitioner`
+- `ResidualGreedyConfig`
+- `ResidualGreedySplitEvent`
+- `ResidualGreedyResult`
+- `ResidualGreedySplitter`
+- `RegimeAtlasCandidate`
+- `RegimeAtlasSelection`
+- `RegimeAtlasSelector`
+- `RegimeBankManifest`
+- `RegimeNoveltyDecision`
+- `RegimeOnlineSelector`
 - `LocalReducedModelBankEntry`
 - `LocalReducedModelSelection`
+- `as_feature_matrix`
+- `as_index_vector`
+- `make_validation_split`
+- `summarize_region_errors`
+- `boundary_halo_score`
+- `coerce_regime_dataset`
+- `normalize_region_labels`
+- `labels_to_atlas`
+- `make_regime_partitioner`
+- `fit_kmedoids_regime_atlas`
+- `subspace_distance_matrix`
+- `build_regime_bank_manifest`
+- `load_regime_bank_manifest`
 - `load_local_reduced_model_bank_manifest`
 - `select_local_reduced_model_bank`
-
-### `feature_atlas.py`
-
 - `FeatureAtlasDiagnostics`
 - `FeatureAtlasFit`
 - `FeatureAtlasRegion`
@@ -2464,6 +2519,10 @@ The names below are the public MOR API.  Unless noted, import them from the pack
 - `select_feature_atlas_size`
 - `subspace_chordal_distance`
 - `subspace_principal_angles`
+
+The old `feature_atlas.py` and `local_banks.py` public shims have been removed.
+Import atlas and bank tools from `pycutfem.mor.regime_atlas` or the top-level
+`pycutfem.mor` namespace.
 
 ### `readiness.py`
 

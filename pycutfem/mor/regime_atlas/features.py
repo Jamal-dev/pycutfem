@@ -1,9 +1,9 @@
-"""Feature-based local reduced-model atlas utilities.
+"""Feature-based helpers for nonlinear-regime atlas utilities.
 
 The atlas is an offline design tool for nonlinear ROM/HROM deployments.  It
 groups sampled stages by cheap regime features instead of arbitrary time
 intervals, then emits local-bank manifest metadata that the online driver can
-use through :mod:`pycutfem.mor.local_banks`.
+use through :mod:`pycutfem.mor.regime_atlas.banking`.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
-from .local_banks import LocalReducedModelBankEntry
+from .banking import LocalReducedModelBankEntry
 
 
 def _as_feature_matrix(features: np.ndarray) -> np.ndarray:

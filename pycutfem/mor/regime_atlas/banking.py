@@ -125,6 +125,44 @@ class LocalReducedModelSelection:
         }
 
 
+@dataclass(frozen=True)
+class RegimeBankManifest:
+    """Versioned deployable local-regime bank manifest."""
+
+    entries: tuple[LocalReducedModelBankEntry, ...]
+    certificates: Mapping[str, Any] | None = None
+    fallback_policy: Mapping[str, Any] | None = None
+    metadata: Mapping[str, Any] | None = None
+    schema_version: int = 2
+
+    def __post_init__(self) -> None:
+        entries = tuple(self.entries)
+        if not entries:
+            raise ValueError("RegimeBankManifest requires at least one entry.")
+        ids = [entry.model_id for entry in entries]
+        if len(set(ids)) != len(ids):
+            raise ValueError("RegimeBankManifest entry ids must be unique.")
+        object.__setattr__(self, "entries", entries)
+        object.__setattr__(self, "certificates", dict(self.certificates or {}))
+        object.__setattr__(self, "fallback_policy", dict(self.fallback_policy or {}))
+        object.__setattr__(self, "metadata", dict(self.metadata or {}))
+        object.__setattr__(self, "schema_version", int(self.schema_version))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": int(self.schema_version),
+            "banks": [entry.to_dict() for entry in self.entries],
+            "certificates": dict(self.certificates or {}),
+            "fallback_policy": dict(self.fallback_policy or {}),
+            "metadata": dict(self.metadata or {}),
+        }
+
+    def save(self, path: str | Path) -> None:
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(self.to_dict(), indent=2), encoding="utf-8")
+
+
 def _entry_from_mapping(item: Mapping[str, Any], *, base_dir: Path) -> LocalReducedModelBankEntry:
     raw_path = Path(str(item.get("path", "")))
     if not raw_path.is_absolute():
@@ -194,6 +232,46 @@ def load_local_reduced_model_bank_manifest(path: str | Path) -> tuple[LocalReduc
     return entries
 
 
+def load_regime_bank_manifest(path: str | Path) -> RegimeBankManifest:
+    """Load a versioned regime-bank manifest.
+
+    Version 1 local-bank manifests are accepted and upgraded in memory with
+    empty certificates and fallback metadata.
+    """
+
+    manifest_path = Path(path)
+    with manifest_path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if isinstance(payload, list):
+        entries = tuple(_entry_from_mapping(item, base_dir=manifest_path.parent) for item in payload)
+        return RegimeBankManifest(entries=entries, schema_version=1)
+    version = int(payload.get("schema_version", 1))
+    entries = tuple(_entry_from_mapping(item, base_dir=manifest_path.parent) for item in payload.get("banks", []))
+    return RegimeBankManifest(
+        entries=entries,
+        certificates=dict(payload.get("certificates", {})),
+        fallback_policy=dict(payload.get("fallback_policy", {})),
+        metadata=dict(payload.get("metadata", {})),
+        schema_version=version,
+    )
+
+
+def build_regime_bank_manifest(
+    entries: Sequence[LocalReducedModelBankEntry],
+    *,
+    certificates: Mapping[str, Any] | None = None,
+    fallback_policy: Mapping[str, Any] | None = None,
+    metadata: Mapping[str, Any] | None = None,
+) -> RegimeBankManifest:
+    return RegimeBankManifest(
+        entries=tuple(entries),
+        certificates=certificates,
+        fallback_policy=fallback_policy,
+        metadata=metadata,
+        schema_version=2,
+    )
+
+
 def select_local_reduced_model_bank(
     entries: Sequence[LocalReducedModelBankEntry],
     *,
@@ -206,34 +284,36 @@ def select_local_reduced_model_bank(
     if not active:
         return LocalReducedModelSelection(None, reason="no_active_step_interval")
     scored = []
+    use_feature_distance = feature is not None and any(entry.feature_center is not None for entry in active)
     for entry in active:
         distance = float(entry.feature_distance(feature))
+        if use_feature_distance and entry.feature_center is None:
+            distance = float("inf")
         if (
             entry.max_feature_distance is not None
             and (not np.isfinite(distance) or distance > float(entry.max_feature_distance))
         ):
             continue
-        scored.append(
-            (
-                -int(entry.priority),
-                distance,
-                int(entry.step_start),
-                entry.model_id,
-                entry,
-            )
-        )
+        if use_feature_distance:
+            score = (distance, -int(entry.priority), int(entry.step_start), entry.model_id, entry, distance)
+        else:
+            score = (-int(entry.priority), distance, int(entry.step_start), entry.model_id, entry, distance)
+        scored.append(score)
     if not scored:
         return LocalReducedModelSelection(None, reason="no_active_feature_radius")
     scored.sort(key=lambda item: (item[0], item[1], -item[2], item[3]))
-    selected = scored[0][-1]
-    distance = float(scored[0][1])
-    reason = "priority_feature" if selected.feature_center is not None and feature is not None else "step_priority"
+    selected = scored[0][4]
+    distance = float(scored[0][5])
+    reason = "feature_priority" if use_feature_distance else "step_priority"
     return LocalReducedModelSelection(selected, reason=reason, distance=distance)
 
 
 __all__ = [
     "LocalReducedModelBankEntry",
     "LocalReducedModelSelection",
+    "RegimeBankManifest",
+    "build_regime_bank_manifest",
     "load_local_reduced_model_bank_manifest",
+    "load_regime_bank_manifest",
     "select_local_reduced_model_bank",
 ]
